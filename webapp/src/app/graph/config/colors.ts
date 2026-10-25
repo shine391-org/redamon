@@ -72,12 +72,16 @@ export const NODE_COLORS: Record<string, string> = {
   ChainFinding: '#ff7a00',    // Vivid orange - outshines the whole warm band
   ChainFailure: '#8c5a5a',    // Grey-red - a dead end must never read as a success
 
-  // ACTIVE DIRECTORY (bloodhound_ingest, post-exploitation) - Purple family:
+// ACTIVE DIRECTORY (bloodhound_ingest, post-exploitation) - Purple family:
   // directory objects read as one coherent foreign namespace, distinct from
   // the recon graph's web/host palette.
   ADUser: '#8b5cf6',          // Violet-500 - directory principal
   ADGroup: '#7c3aed',         // Violet-600 - grouping carries more weight
   ADComputer: '#6d28d9',      // Violet-700 - machine accounts, the foothold side
+  // CREDENTIALS (mimikatz_parse, post-exploitation) - the highest-value
+  // harvest: darker than secrets found in web content so a credential from a
+  // foothold outranks a leaked API key at a glance.
+  Credential: '#b91c1c',      // Red-700 - captured auth material
 
   Default: '#6b7280',        // Gray - Fallback
 }

@@ -1004,7 +1004,7 @@ TOOL_REGISTRY = {
             '   - Use only when you need a completely clean state'
         ),
     },
-    "graph_diff": {
+  "graph_diff": {
         "purpose": "Diff the project graph between two Scan Timeline points",
         "when_to_use": "After a scan: what is new, gone or changed since the last saved version",
         "args_format": '"mode": "last_two" | "versions", "from_version": "current|<id|seq>", "to_version": "current|<id|seq>"',
@@ -1043,6 +1043,27 @@ TOOL_REGISTRY = {
             'left untouched.\n'
             '   - Returns a counts summary only (nodes/relationships by type, skipped '
             'records); query_graph for the imported AD data afterwards'
+        ),
+    },
+    "mimikatz_parse": {
+        "purpose": "Parse a mimikatz transcript into Credential graph nodes",
+        "when_to_use": "Post-exploitation after dumping credentials over a session (transcript saved to workspace)",
+        "args_format": '"path": "<workspace .txt transcript>", "origin_host": "<hostname the dump came from>", "acknowledged": true',
+        "description": (
+            '**mimikatz_parse** (credential harvest — DANGEROUS, approval per run)\n'
+            '   - Parses a mimikatz transcript saved in the workspace (run mimikatz '
+            'via the existing session tools — metasploit_console/kiwi — and save '
+            'the output with fs_write first) into tenant-scoped Credential nodes '
+            '(NTLM / LM / SHA1 hashes, plaintext) with an ORIGIN edge to the '
+            'source host when the graph knows it. Re-parsing the same transcript '
+            'is idempotent.\n'
+            '   - Supported formats: sekurlsa::logonpasswords, lsadump::sam, '
+            'lsadump::dcsync. Garbage lines are skipped, never fatal.\n'
+            '   - Dangerous: per-run approval, and the call must pass '
+            '"acknowledged": true — without it the tool refuses and the graph is '
+            'left untouched.\n'
+            '   - The response carries COUNTS ONLY (e.g. NTLM: 12, plaintext: 2) — '
+            'secret values live in the graph/workspace, never in tool output'
         ),
     },
 }

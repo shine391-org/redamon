@@ -2103,7 +2103,7 @@ class PhaseAwareToolExecutor:
             if graph_summary_tool:
                 self._all_tools["graph_summary"] = graph_summary_tool
 
-        # graph_diff: read-only Scan Timeline delta tool (Type D, WI-1). The
+      # graph_diff: read-only Scan Timeline delta tool (Type D, WI-1). The
         # factory imports langchain/psycopg lazily and live-side capture only
         # needs manager.graph.query when it exists, so registration is
         # unconditional — saved-version diffs work even without a graph session.
@@ -2115,6 +2115,11 @@ class PhaseAwareToolExecutor:
         # so registration is unconditional.
         from bloodhound_ingest_tool import build_bloodhound_ingest_tool
         self._all_tools["bloodhound_ingest"] = build_bloodhound_ingest_tool()
+
+        # mimikatz_parse: transcript -> Credential nodes (Type D, WI-3). Lazy
+        # imports only; opens its own Neo4j connection at call time.
+        from mimikatz_parse_tool import build_mimikatz_parse_tool
+        self._all_tools["mimikatz_parse"] = build_mimikatz_parse_tool()
 
         # Register web search tool
         if web_search_tool:
@@ -2569,6 +2574,12 @@ class PhaseAwareToolExecutor:
                 # Type D in-process tool; flat dict args pass through as-is.
                 output = await active_tool.ainvoke(tool_args)
             elif tool_name == "bloodhound_ingest":
+                # Type D in-process tool; flat dict args pass through as-is
+                # (the acknowledged=true refusal lives inside the tool).
+                output = await active_tool.ainvoke(tool_args)
+            elif tool_name == "mimikatz_parse":
+                # Type D in-process tool; flat dict args pass through as-is
+                # (the acknowledged=true refusal lives inside the tool).
                 # Type D in-process tool; flat dict args pass through as-is
                 # (the acknowledged=true refusal lives inside the tool).
                 output = await active_tool.ainvoke(tool_args)

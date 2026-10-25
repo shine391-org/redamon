@@ -467,7 +467,7 @@ KEY_CONSTRAINTS = [
         ]
     },
     {
-        "label": "ADUser",
+      "label": "ADUser",
         "constraint": "aduser_tenant_unique",
         "var": "adu",
         "key_properties": [
@@ -492,6 +492,19 @@ KEY_CONSTRAINTS = [
         "var": "adc",
         "key_properties": [
             "object_identifier",
+            "user_id",
+            "project_id"
+        ]
+    },
+    {
+        "label": "Credential",
+        "constraint": "credential_tenant_unique",
+        "var": "cred",
+        "key_properties": [
+            "kind",
+            "username",
+            "domain",
+            "value",
             "user_id",
             "project_id"
         ]

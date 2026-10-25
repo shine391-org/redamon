@@ -10399,6 +10399,7 @@
     "graph_diff",
     "kali_shell",
     "metasploit_console",
+    "mimikatz_parse",
     "msf_restart",
     "proxy_brain",
     "query_graph",
