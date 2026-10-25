@@ -2110,6 +2110,12 @@ class PhaseAwareToolExecutor:
         from graph_diff_tool import build_graph_diff_tool
         self._all_tools["graph_diff"] = build_graph_diff_tool(self)
 
+        # bloodhound_ingest: BloodHound collector import (Type D, WI-2). Lazy
+        # imports only; the tool opens its own Neo4j connection at call time,
+        # so registration is unconditional.
+        from bloodhound_ingest_tool import build_bloodhound_ingest_tool
+        self._all_tools["bloodhound_ingest"] = build_bloodhound_ingest_tool()
+
         # Register web search tool
         if web_search_tool:
             self._all_tools["web_search"] = web_search_tool
@@ -2561,6 +2567,10 @@ class PhaseAwareToolExecutor:
                 output = await active_tool.ainvoke(adjusted)
             elif tool_name == "graph_diff":
                 # Type D in-process tool; flat dict args pass through as-is.
+                output = await active_tool.ainvoke(tool_args)
+            elif tool_name == "bloodhound_ingest":
+                # Type D in-process tool; flat dict args pass through as-is
+                # (the acknowledged=true refusal lives inside the tool).
                 output = await active_tool.ainvoke(tool_args)
             else:
                 output = await active_tool.ainvoke(tool_args)
