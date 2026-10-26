@@ -505,7 +505,7 @@ def _nvd_query(product: str, version: str, max_results: int, keys, *,
         vendor, prod = cpe_info
         params["cpeName"] = f"cpe:2.3:a:{vendor}:{prod}:*:*:*:*:*:*:*:*"
 
-    def send(key):
+    def send(key=None):
         headers = {"apiKey": key} if key else {}
         return requests.get(NVD_API_URL, params=params, headers=headers, timeout=30), bool(key)
 
@@ -607,7 +607,7 @@ def _vulners_query(product: str, version: str, keys, *, admitted: bool = False):
     if not version:
         return cb.CallResult([], cb.Outcome.NO_DATA, "no version")
 
-    def send(key):
+    def send(key=None):
         params = {"software": f"{product} {version}", "version": version, "type": "software"}
         # Vulners accepts the key only in the X-Api-Key header since 2025-10-02. A
         # key in the query string gets the same 403 Cloudflare challenge as no key,
