@@ -28,7 +28,11 @@ CPE_MAPPINGS = {
     "nginx": ("f5", "nginx"),
     "apache": ("apache", "http_server"),
     "iis": ("microsoft", "internet_information_services"),
+    # Detector labels spell these with the vendor prefix; without the alias the
+    # label misses the mapping above and the lookup is skipped as unmapped.
+    "microsoft iis": ("microsoft", "internet_information_services"),
     "tomcat": ("apache", "tomcat"),
+    "apache tomcat": ("apache", "tomcat"),
     "lighttpd": ("lighttpd", "lighttpd"),
     "caddy": ("caddyserver", "caddy"),
     "litespeed": ("litespeedtech", "litespeed_web_server"),
@@ -484,19 +488,22 @@ def _nvd_query(product: str, version: str, max_results: int, keys, *,
     product_normalized = normalize_product_name(product)
     cpe_info = CPE_MAPPINGS.get(product_normalized)
 
+    if not cpe_info:
+        # An unmapped product must not fall back to keywordSearch: that is a
+        # full-text search over CVE descriptions, so a protocol or CDN label
+        # ("HTTP/3" parses to product http, version 3; "Cloudflare http proxy"
+        # from nmap) matched the word "http" and imported CVE-1999-era records
+        # as if they applied to the target. Without a CPE binding there is no
+        # claim of applicability — answer empty instead of guessing.
+        return cb.CallResult([], cb.Outcome.NO_DATA, "no CPE mapping")
+
     params = {"resultsPerPage": max_results}
-    if cpe_info and version:
+    if version:
         vendor, prod = cpe_info
         params["cpeName"] = f"cpe:2.3:a:{vendor}:{prod}:{version}:*:*:*:*:*:*:*"
-    elif cpe_info:
+    else:
         vendor, prod = cpe_info
         params["cpeName"] = f"cpe:2.3:a:{vendor}:{prod}:*:*:*:*:*:*:*:*"
-    else:
-        # Fallback to keyword search for unknown products
-        keyword = product
-        if version:
-            keyword += f" {version}"
-        params["keywordSearch"] = keyword
 
     def send(key):
         headers = {"apiKey": key} if key else {}
@@ -763,6 +770,14 @@ def run_cve_lookup(
         # A paused or stopped source is skipped silently; the scope summarises it.
         if not breaker.allow():
             continue
+        if not use_vulners and not CPE_MAPPINGS.get(name):
+            # Vulners searches by software name and needs no CPE binding; NVD
+            # without one would only full-text match CVE descriptions (the
+            # garbage-CVE path). Skipped here rather than only inside
+            # _nvd_query so the run also skips the per-technology NVD pacing
+            # sleep it would otherwise pay for an answer it cannot use.
+            print(f"[*][CVE] [{i}/{len(tech_to_lookup)}] {tech}... no CPE mapping — skipped")
+            continue
         print(f"[*][CVE] [{i}/{len(tech_to_lookup)}] {tech}...", end=" ", flush=True)
 
         if use_vulners:
@@ -818,7 +833,7 @@ def run_cve_lookup(
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for tech_data in cve_results.values():
         for cve in tech_data.get("cves", []):
-            sev = cve.get("severity", "").upper()
+            sev = (cve.get("severity") or "").upper()
             if sev in severity_counts:
                 severity_counts[sev] += 1
 
