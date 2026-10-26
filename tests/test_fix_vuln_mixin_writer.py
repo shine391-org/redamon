@@ -639,5 +639,41 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertEqual(len(session.links("d:Domain")), 2)
 
 
+class TestTechnologyCveOnlyInput(unittest.TestCase):
+    def _payload(self):
+        return {
+            "domain": "example.test",
+            "metadata": {"root_domain": "example.test"},
+            "technology_cves": {"by_technology": {
+                "Nginx:1.24.0": {"product": "nginx", "version": "1.24.0",
+                                 "cves": [{"id": "CVE-2026-0001", "severity": "HIGH"}]},
+            }},
+        }
+
+    def _assert_written(self, payload):
+        session = _Session([{"name": "Nginx", "version": "1.24.0"}])
+        stats = _writer(session).update_graph_from_vuln_scan(payload, U, P)
+        self.assertEqual(stats["errors"], [])
+        self.assertEqual(session.cve_links, [("Nginx", "1.24.0", "CVE-2026-0001")])
+        # A CVE backfill must not reset scan counters or attach unrelated URLs.
+        self.assertFalse(any("SET d.vuln_scan_timestamp" in q for q, _ in session.calls))
+        self.assertFalse(any("HAS_BASE_URL" in q for q, _ in session.calls))
+
+    def test_missing_scan_namespace_still_writes_cves(self):
+        self._assert_written(self._payload())
+
+    def test_empty_scan_namespace_still_writes_cves(self):
+        self._assert_written({**self._payload(), "vuln_scan": {}})
+
+    def test_null_scan_namespace_still_writes_cves(self):
+        self._assert_written({**self._payload(), "vuln_scan": None})
+
+    def test_no_scan_or_cve_data_still_stops_before_db_access(self):
+        session = _Session()
+        stats = _writer(session).update_graph_from_vuln_scan({"technology_cves": {}}, U, P)
+        self.assertTrue(stats["errors"])
+        self.assertEqual(session.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
