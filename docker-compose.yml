@@ -731,6 +731,11 @@ services:
       - NET_RAW
     security_opt:
       - seccomp:unconfined
+    devices:
+      # Ligolo-ng pivot proxy needs a TUN interface; NET_ADMIN is already
+      # granted above. Without the device node ligolo-proxy fails to create
+      # its tunnel interface.
+      - /dev/net/tun:/dev/net/tun
     ports:
       # SECURITY (STRIDE S10/E1/I9): the MCP tool servers, progress streams,
       # tunnel-manager and ngrok API are consumed ONLY by the agent/webapp over
