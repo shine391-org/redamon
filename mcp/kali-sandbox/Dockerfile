@@ -592,6 +592,8 @@ RUN cd /tmp \
     && install -m755 /tmp/wagent/agent.exe /opt/tools/windows/ligolo-agent.exe \
     && rm -rf /tmp/*
 
-# Pacu — AWS exploitation framework (account enumeration + IAM privesc path
-# analysis). pip resolution verified against this image's index (2026-10-26).
-RUN pip install --no-cache-dir pacu
+# Pacu needs an older AWS SDK than GuardDog; keep it out of the MCP/tool venv.
+RUN python3 -m venv /opt/pacu-venv \
+    && /opt/pacu-venv/bin/pip install --no-cache-dir pacu==1.7.0 boto3==1.28.85 botocore==1.31.85 \
+    && /opt/pacu-venv/bin/pip check \
+    && ln -s /opt/pacu-venv/bin/pacu /usr/local/bin/pacu
