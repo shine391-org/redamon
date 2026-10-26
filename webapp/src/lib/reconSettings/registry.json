@@ -10375,6 +10375,7 @@
    "unit": "none",
    "validator": "free_text",
    "values": [
+    "bloodhound_ingest",
     "cve_intel",
     "execute_amass",
     "execute_arjun",
@@ -10395,8 +10396,10 @@
     "execute_subfinder",
     "execute_wpscan",
     "google_dork",
+    "graph_diff",
     "kali_shell",
     "metasploit_console",
+    "mimikatz_parse",
     "msf_restart",
     "proxy_brain",
     "query_graph",

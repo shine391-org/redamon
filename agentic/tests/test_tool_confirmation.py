@@ -190,6 +190,12 @@ class TestDangerousTools(unittest.TestCase):
             'proxy_brain',
             # Supply-chain L3: downloads attacker-authored tarballs.
             'execute_guarddog',
+          # Post-exploitation AD import (WI-2): consumes foothold-derived
+            # collector output; approval per run + acknowledged=true.
+            'bloodhound_ingest',
+            # Post-exploitation credential harvest (WI-3): parses foothold-derived
+            # mimikatz dumps; approval per run + acknowledged=true.
+            'mimikatz_parse',
         }
         self.assertEqual(DANGEROUS_TOOLS, expected)
 

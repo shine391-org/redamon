@@ -1004,6 +1004,68 @@ TOOL_REGISTRY = {
             '   - Use only when you need a completely clean state'
         ),
     },
+  "graph_diff": {
+        "purpose": "Diff the project graph between two Scan Timeline points",
+        "when_to_use": "After a scan: what is new, gone or changed since the last saved version",
+        "args_format": '"mode": "last_two" | "versions", "from_version": "current|<id|seq>", "to_version": "current|<id|seq>"',
+        "description": (
+            '**graph_diff** (graph orientation)\n'
+            '   - Compare the attack-surface graph between two points of the Scan '
+            'Timeline: the live graph vs the most recent saved version (mode '
+            '"last_two"), or two explicit versions by id/seq/"current" (mode '
+            '"versions").\n'
+            '   - Read-only. Nodes are matched by identity (an IP is its address), '
+            'never by internal ids; volatile scan stamps are ignored so a re-scan '
+            'is not reported as a wall of changes.\n'
+            '   - Returns JSON: nodes added/removed/changed grouped by label with '
+            'counts and examples, plus relationship add/remove by type and a '
+            'one-line summary for a quick read.\n'
+            '   - Use it to see what the latest scan actually brought before '
+            'planning the next move'
+        ),
+    },
+   "bloodhound_ingest": {
+        "purpose": "Import BloodHound collector JSON into the graph as AD nodes",
+        "when_to_use": "Post-exploitation AD mapping once a domain credential produced collector files",
+        "args_format": '"path": "<workspace path to *_users/groups/computers.json or their dir>", "acknowledged": true',
+        "description": (
+            '**bloodhound_ingest** (AD mapping — DANGEROUS, approval per run)\n'
+            '   - Imports BloodHound 4 collector files (bloodhound-python / SharpHound) '
+            'from the workspace into the project graph as ADUser / ADGroup / ADComputer '
+            'nodes with MEMBER_OF, HAS_MEMBER and HAS_SESSION relationships, keyed by '
+            'the collector SIDs — re-running the same import is idempotent.\n'
+            '   - PRECONDITION: a valid domain credential already in the graph (check '
+            'with query_graph first). Collecting is NOT part of this tool: it only '
+            'imports files already in the workspace (e.g. produced via kali_shell '
+            'bloodhound-python).\n'
+            '   - Dangerous: per-run approval, and the call must pass '
+            '"acknowledged": true — without it the tool refuses and the graph is '
+            'left untouched.\n'
+            '   - Returns a counts summary only (nodes/relationships by type, skipped '
+            'records); query_graph for the imported AD data afterwards'
+        ),
+    },
+    "mimikatz_parse": {
+        "purpose": "Parse a mimikatz transcript into Credential graph nodes",
+        "when_to_use": "Post-exploitation after dumping credentials over a session (transcript saved to workspace)",
+        "args_format": '"path": "<workspace .txt transcript>", "origin_host": "<hostname the dump came from>", "acknowledged": true',
+        "description": (
+            '**mimikatz_parse** (credential harvest — DANGEROUS, approval per run)\n'
+            '   - Parses a mimikatz transcript saved in the workspace (run mimikatz '
+            'via the existing session tools — metasploit_console/kiwi — and save '
+            'the output with fs_write first) into tenant-scoped Credential nodes '
+            '(NTLM / LM / SHA1 hashes, plaintext) with an ORIGIN edge to the '
+            'source host when the graph knows it. Re-parsing the same transcript '
+            'is idempotent.\n'
+            '   - Supported formats: sekurlsa::logonpasswords, lsadump::sam, '
+            'lsadump::dcsync. Garbage lines are skipped, never fatal.\n'
+            '   - Dangerous: per-run approval, and the call must pass '
+            '"acknowledged": true — without it the tool refuses and the graph is '
+            'left untouched.\n'
+            '   - The response carries COUNTS ONLY (e.g. NTLM: 12, plaintext: 2) — '
+            'secret values live in the graph/workspace, never in tool output'
+        ),
+    },
 }
 
 # =========================================================================
