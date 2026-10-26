@@ -767,9 +767,6 @@ def run_cve_lookup(
         name, version = parse_technology_string(tech)
         name = normalize_product_name(name)
 
-        # A paused or stopped source is skipped silently; the scope summarises it.
-        if not breaker.allow():
-            continue
         if not use_vulners and not CPE_MAPPINGS.get(name):
             # Vulners searches by software name and needs no CPE binding; NVD
             # without one would only full-text match CVE descriptions (the
@@ -777,6 +774,9 @@ def run_cve_lookup(
             # _nvd_query so the run also skips the per-technology NVD pacing
             # sleep it would otherwise pay for an answer it cannot use.
             print(f"[*][CVE] [{i}/{len(tech_to_lookup)}] {tech}... no CPE mapping — skipped")
+            continue
+        # Only calls that will reach the provider may consume its recovery probe.
+        if not breaker.allow():
             continue
         print(f"[*][CVE] [{i}/{len(tech_to_lookup)}] {tech}...", end=" ", flush=True)
 

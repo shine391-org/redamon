@@ -86,3 +86,43 @@ def test_detector_label_aliases_are_mapped():
     # them on the exact-CPE path instead of being skipped as unmapped.
     assert CPE_MAPPINGS["apache tomcat"] == ("apache", "tomcat")
     assert CPE_MAPPINGS["microsoft iis"] == ("microsoft", "internet_information_services")
+
+
+def test_unmapped_product_does_not_consume_recovery_probe(http, monkeypatch):
+    from recon.helpers import circuit_breaker as cb
+
+    get, _ = http
+    get.return_value = _resp(200, {"vulnerabilities": []})
+    now = [1000.0]
+    monkeypatch.setattr(cb, "_now", lambda: now[0])
+    breaker = cb.get_breaker("nvd", label="CVE-NVD")
+    breaker.force_open("simulated prior root outage")
+    now[0] += cb.COOLDOWN_S + 1
+
+    # The first root has only an unmapped protocol; the next must retain the
+    # half-open admission and recover without waiting for the probe timeout.
+    run_cve_lookup(_recon("HTTP/3"), source="nvd")
+    get.assert_not_called()
+    run_cve_lookup(_recon("nginx/1.24.0"), source="nvd")
+
+    get.assert_called_once()
+    assert get.call_args.kwargs["params"]["cpeName"] == (
+        "cpe:2.3:a:f5:nginx:1.24.0:*:*:*:*:*:*:*")
+    assert breaker.recoveries == 1
+    assert not breaker.is_open
+
+
+def test_unmapped_product_does_not_wait_for_provider_pause(http, monkeypatch):
+    from recon.helpers import circuit_breaker as cb
+
+    get, _ = http
+    monkeypatch.setattr(cb, "_now", lambda: 1000.0)
+    waits = []
+    monkeypatch.setattr(cb, "_sleep", waits.append)
+    breaker = cb.get_breaker("nvd", label="CVE-NVD")
+    breaker.record(Outcome.RATE_LIMIT, "HTTP 429", retry_after=30)
+
+    run_cve_lookup(_recon("HTTP/3"), source="nvd")
+
+    get.assert_not_called()
+    assert waits == []
