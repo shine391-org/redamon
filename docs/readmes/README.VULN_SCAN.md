@@ -2,7 +2,7 @@
 
 ## Complete Technical Documentation
 
-> **Module:** `recon/nuclei_scan.py`  
+> **Module:** `recon/main_recon_modules/vuln_scan.py`  
 > **Purpose:** Template-based web application vulnerability scanning using ProjectDiscovery's Nuclei  
 > **Author:** RedAmon Security Suite
 
@@ -13,7 +13,7 @@
 1. [Overview](#overview)
 2. [Features](#features)
 3. [CVE Lookup (Technology-Based)](#cve-lookup-technology-based)
-4. [Installation](#installation)
+4. [Requirements](#requirements)
 5. [Configuration Parameters](#configuration-parameters)
 6. [Architecture & Flow](#architecture--flow)
 7. [Function Reference](#function-reference)
@@ -28,15 +28,15 @@
 
 ## Overview
 
-The `nuclei_scan.py` module integrates ProjectDiscovery's Nuclei scanner into RedAmon's reconnaissance pipeline. Nuclei is a fast, template-based vulnerability scanner that excels at web application security testing.
+The `vuln_scan.py` module integrates ProjectDiscovery's Nuclei scanner into RedAmon's reconnaissance pipeline. Nuclei is a fast, template-based vulnerability scanner that excels at web application security testing. The same module also runs the technology-based CVE lookup and RedAmon's own security checks, which work without Nuclei.
 
-**⚠️ Important:** Nuclei runs exclusively via Docker. No native installation is supported.
+**⚠️ Important:** Nuclei runs exclusively via Docker, as a sibling container the recon container starts with `docker run`. No native installation is supported.
 
 ### Why Nuclei?
 
 | Feature | Nmap NSE | Nuclei |
 |---------|----------|--------|
-| Templates | ~150 scripts | **8,000+ templates** |
+| Templates | Scripts shipped with nmap | **Thousands of community templates** |
 | Update Frequency | With nmap releases | **Daily community updates** |
 | Web App Depth | Surface-level | **Deep application testing** |
 | CVE Coverage | Older CVEs | **Recent CVEs (within days)** |
@@ -45,40 +45,37 @@ The `nuclei_scan.py` module integrates ProjectDiscovery's Nuclei scanner into Re
 ### How It Works
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Recon Data     │────▶│  nuclei_scan.py  │────▶│  Enriched JSON  │
-│  (hostnames,    │     │                  │     │  with web vulns,│
-│   IPs, ports)   │     │  1. Build URLs   │     │  CVEs, exposed  │
-└─────────────────┘     │  2. Run Katana   │     │  panels, etc.   │
-                        │  3. Run Nuclei   │     └─────────────────┘
-        ┌───────────────│  4. Parse JSONL  │
-        │               │  5. Classify     │
-        ▼               └──────────────────┘
-┌─────────────────┐
-│   Nmap Data     │  (Used to discover HTTP/HTTPS ports)
-│   (optional)    │
-└─────────────────┘
+┌──────────────────┐     ┌─────────────────────────┐     ┌──────────────────┐
+│  Recon Data      │────▶│  vuln_scan.py           │────▶│  vuln_scan key   │
+│  • DNS hosts/IPs │     │                         │     │  (findings, CVEs,│
+│  • http_probe    │     │  1. Build target URLs   │     │   coverage,      │
+│    live URLs     │     │  2. DETECTION pass      │     │   security_      │
+│  • resource_enum │     │  3. DAST pass (opt.)    │     │   checks)        │
+│    endpoints     │     │  4. Drop false positives│     │                  │
+└──────────────────┘     │  5. Classify, aggregate │     │  technology_cves │
+                         │  6. CVE lookup          │     │  (top level)     │
+                         │  7. Security checks     │     └──────────────────┘
+                         └─────────────────────────┘
 ```
 
 ### DAST Mode Pipeline
 
-When `NUCLEI_DAST_MODE = True`, Katana crawler is integrated:
+When `NUCLEI_DAST_MODE = True`, a second Nuclei pass fuzzes the parameterized URLs that resource enumeration (GROUP 5: Katana, GAU, Kiterunner and the other crawlers, see [README.RESOURCE_ENUM.md](README.RESOURCE_ENUM.md)) already found:
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Base URLs  │────▶│   KATANA    │────▶│   NUCLEI    │────▶│   Results   │
-│             │     │  (Crawler)  │     │  (Scanner)  │     │             │
-│ example.com │     │             │     │             │     │ • XSS: 5    │
-│             │     │ Discovers:  │     │ -dast mode  │     │ • SQLi: 2   │
-│             │     │ ?param URLs │     │ fuzzes all  │     │ • SSTI: 1   │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+┌──────────────────────┐     ┌─────────────────────┐     ┌─────────────┐
+│ resource_enum        │────▶│   NUCLEI DAST pass  │────▶│   Results   │
+│ .discovered_urls     │     │                     │     │             │
+│                      │     │  -dast, no tag or   │     │ • XSS       │
+│ keeps URLs with      │     │  template filters   │     │ • SQLi      │
+│ ?key=value only      │     │                     │     │ • SSTI      │
+└──────────────────────┘     └─────────────────────┘     └─────────────┘
 ```
 
-**Why Katana is needed for DAST:**
+**Why DAST needs parameterized URLs:**
 - Nuclei DAST templates inject payloads into URL parameters
 - Without parameters (`?key=value`), DAST finds nothing
-- Katana discovers these parameters by crawling the site
-- JavaScript parsing finds hidden API endpoints
+- `vuln_scan.py` does not crawl: with no such URL in `resource_enum`, the DAST pass is skipped and only the detection pass runs
 
 ---
 
@@ -86,66 +83,69 @@ When `NUCLEI_DAST_MODE = True`, Katana crawler is integrated:
 
 | Feature | Description |
 |---------|-------------|
-| **9000+ Templates** | CVEs, misconfigs, exposures, takeovers, default logins |
+| **Template Scanning** | CVEs, misconfigs, exposures, takeovers, default logins |
 | **CVE Detection** | Automatic CVE ID and CVSS extraction |
-| **Smart URL Building** | Uses nmap data to discover HTTP/HTTPS ports |
-| **Katana Integration** | Web crawler discovers URLs with parameters for DAST |
+| **Smart URL Building** | Union of httpx live URLs, resource_enum endpoints and not-yet-probed hostnames |
+| **Two Passes** | A detection pass with your tags/templates, plus an optional DAST pass on parameterized URLs |
 | **DAST Mode** | Active fuzzing for XSS, SQLi, SSTI, Command Injection |
-| **Auto-Update Templates** | Automatic template updates before each scan |
+| **Auto-Update Templates** | Template update (`-ut`) before each scan, into a persistent Docker volume |
+| **Custom Templates** | Per-project selection of uploaded templates |
+| **False-Positive Filter** | Drops findings whose response is a rate-limit or WAF block page (optionally AI-assisted) |
+| **AI Tag Selection** | Optionally lets an LLM prune `NUCLEI_TAGS` to the detected tech stack |
 | **Category Classification** | Auto-categorizes findings (XSS, SQLi, RCE, etc.) |
-| **Authenticated Crawling** | Custom headers support for login-protected pages |
-| **Incremental Saving** | Results saved progressively |
+| **Authenticated Scanning** | The project's authenticated-session headers, when every scanned host is in scope |
+| **Runtime Cap & Coverage** | Each pass stops at `NUCLEI_MAX_RUNTIME`; per-host coverage is recorded |
 | **CVE Lookup** | Technology-based CVE lookup (like Nmap's vulners) |
+| **Security Checks** | RedAmon's own checks for what Nuclei does not cover |
 
 ---
 
 ## CVE Lookup (Technology-Based)
 
-The Nuclei module includes an integrated CVE lookup feature that queries the NVD (National Vulnerability Database) for known vulnerabilities based on technologies detected by httpx. This replicates what Nmap's `vulners` script does.
+The module includes an integrated CVE lookup that queries the NVD (National Vulnerability Database), or Vulners, for known vulnerabilities in the versioned technologies RedAmon detected. This replicates what Nmap's `vulners` script does. It runs after the Nuclei passes (and also when Nuclei is disabled or unavailable), whenever `CVE_LOOKUP_ENABLED` is on and `http_probe` data exists.
 
 ### How It Works
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  httpx detects  │────▶│  CVE Lookup      │────▶│  technology_cves│
-│  technologies:  │     │                  │     │  in JSON output │
-│  • Nginx:1.19.0 │     │  Query NVD API   │     │                 │
-│  • PHP:5.6.40   │     │  for each tech   │     │  23 CVEs found  │
-│  • jQuery:3.5.1 │     │  with version    │     │  2 CRITICAL     │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
+┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Versioned techs:   │────▶│  run_cve_lookup  │────▶│ technology_cves │
+│  • httpx techs and  │     │                  │     │ in JSON output  │
+│    Server headers   │     │  NVD (or Vulners)│     │                 │
+│  • banner_grab      │     │  per product +   │     │ by_technology,  │
+│  • nmap services    │     │  version         │     │ summary         │
+└─────────────────────┘     └──────────────────┘     └─────────────────┘
 ```
+
+Products without a version, and generic names (operating systems, CDNs, analytics tags), are skipped.
 
 ### Configuration
 
 ```python
-# CVE Lookup Configuration (project_settings.py)
-# =============================================================================
+# Project settings (runtime keys)
 
 # Enable/disable technology-based CVE lookup
 CVE_LOOKUP_ENABLED = True
 
-# Data source: "nvd" (free, rate limited) or "vulners" (needs API key)
+# Data source: "nvd" (free, rate limited) or "vulners" (needs a Vulners API key)
 CVE_LOOKUP_SOURCE = "nvd"
 
-# Maximum CVEs to return per technology
+# Maximum CVEs to keep per technology
 CVE_LOOKUP_MAX_CVES = 20
 
 # Minimum CVSS score to include (0.0 = all, 4.0 = medium+, 7.0 = high+)
 CVE_LOOKUP_MIN_CVSS = 0.0
-
-# Vulners API key (optional - for better results with vulners source)
-# Get free API key at: https://vulners.com/
-VULNERS_API_KEY = ""
 ```
+
+The NVD and Vulners API keys are not project settings: they come from the user's account (Global Settings → Tool API Keys) as `NVD_API_KEY` / `VULNERS_API_KEY`, with key rotation.
 
 ### Supported Technologies
 
-The CVE lookup supports 40+ common technologies with proper CPE (Common Platform Enumeration) mappings:
+Product names are mapped to CPEs (Common Platform Enumeration) by the `CPE_MAPPINGS` table in `recon/helpers/cve_helpers.py`, which covers, for example:
 
 | Category | Technologies |
 |----------|--------------|
 | **Web Servers** | nginx, Apache, IIS, Tomcat, Lighttpd, Caddy |
-| **Languages** | PHP, Python, Node.js, Ruby, Java |
+| **Languages** | PHP, Python, Node.js, Ruby, Perl |
 | **Databases** | MySQL, MariaDB, PostgreSQL, MongoDB, Redis, Elasticsearch |
 | **CMS/Frameworks** | WordPress, Drupal, Joomla, Django, Laravel, Spring |
 | **JavaScript** | jQuery, Angular, React, Vue, Bootstrap |
@@ -154,37 +154,38 @@ The CVE lookup supports 40+ common technologies with proper CPE (Common Platform
 
 ### Example Output
 
-When scanning `testphp.vulnweb.com`:
+For a host whose responses name nginx 1.19.0 and PHP 5.6.40:
 
 ```
 ============================================================
-CVE LOOKUP - Technology-Based Vulnerability Discovery
+[*][CVE] Technology-Based Vulnerability Discovery
 ============================================================
-    Source: NVD
-    Min CVSS: 0.0
+[*][CVE] Source: NVD
+[*][CVE] Min CVSS: 0.0
 
-[*] Technologies with versions: 3
-    [1/3] Nginx:1.19.0... ✓ 6 CVEs found
-    [2/3] PHP:5.6.40... ✓ 17 CVEs found
-    [3/3] nginx/1.19.0... ✓ 6 CVEs found
+[*][CVE] Technologies with versions: 2
+[*][CVE] [1/2] Nginx:1.19.0... ✓ 6 CVEs found
+[*][CVE] [2/2] PHP:5.6.40... ✓ 17 CVEs found
 
-[+] CVE LOOKUP SUMMARY:
-    Total unique CVEs: 23
-    🔴 CRITICAL: 2
-    🟠 HIGH: 10
-    🟡 MEDIUM: 10
+[+][CVE] CVE LOOKUP SUMMARY:
+[+][CVE] Total unique CVEs: 23
+[!][CVE] CRITICAL: 2
+[!][CVE] HIGH: 10
+[*][CVE] MEDIUM: 10
 ============================================================
 ```
 
 ### JSON Output Structure
+
+`run_cve_lookup()` writes `technology_cves` at the **top level** of the recon data (beside `vuln_scan`, not inside it):
 
 ```json
 {
   "technology_cves": {
     "lookup_timestamp": "2025-12-31T14:30:00.000000",
     "source": "nvd",
-    "technologies_checked": 3,
-    "technologies_with_cves": 3,
+    "technologies_checked": 2,
+    "technologies_with_cves": 2,
     "by_technology": {
       "Nginx:1.19.0": {
         "technology": "Nginx:1.19.0",
@@ -199,8 +200,10 @@ CVE LOOKUP - Technology-Based Vulnerability Discovery
             "cvss": 7.7,
             "severity": "HIGH",
             "description": "A security issue in nginx resolver...",
-            "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-23017",
-            "source": "nvd"
+            "published": "2021-06-01T13:15:07.853",
+            "references": ["..."],
+            "source": "nvd",
+            "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-23017"
           }
         ]
       },
@@ -214,13 +217,8 @@ CVE LOOKUP - Technology-Based Vulnerability Discovery
         "cves": [...]
       }
     },
-    "all_cves": [
-      {"id": "CVE-2017-8923", "cvss": 9.8, "severity": "CRITICAL", ...},
-      {"id": "CVE-2019-9641", "cvss": 9.8, "severity": "CRITICAL", ...},
-      ...
-    ],
     "summary": {
-      "total_cves": 23,
+      "total_unique_cves": 23,
       "critical": 2,
       "high": 10,
       "medium": 10,
@@ -229,6 +227,8 @@ CVE LOOKUP - Technology-Based Vulnerability Discovery
   }
 }
 ```
+
+The graph writer (`update_graph_from_vuln_scan`) and MITRE enrichment (`recon/main_recon_modules/add_mitre.py`) read `technology_cves.by_technology`. In the domain pipeline's GROUP 6 fan-out, `run_vuln_scan_isolated()` returns only the `vuln_scan` key, so a `technology_cves` computed there stays on the wrapper's copy.
 
 ### Nuclei Template CVEs vs Technology CVE Lookup
 
@@ -251,18 +251,19 @@ The NVD API has rate limits:
 - **Without API key:** 5 requests per 30 seconds
 - **With API key:** 50 requests per 30 seconds
 
-The script automatically adds delays between requests to avoid rate limiting.
+`run_cve_lookup()` waits 6 seconds between NVD queries without a key and 0.6 seconds with one. A rate-limited or failing source is paused by its circuit breaker (`recon/helpers/circuit_breaker.py`), and the run logs a hint to configure an NVD key.
 
 ### Vulners Integration (Optional)
 
-For better results (like Nmap's vulners script), you can use the Vulners API:
+For results like Nmap's vulners script, use the Vulners API:
 
 1. Get a free API key at [vulners.com](https://vulners.com/)
-2. Configure in the webapp project settings or environment variables:
+2. Add it in Global Settings → Tool API Keys, and set in the project settings:
    ```python
    CVE_LOOKUP_SOURCE = "vulners"
-   VULNERS_API_KEY = "your-api-key-here"
    ```
+
+Without a Vulners key, the lookup uses NVD even when the source is `"vulners"`.
 
 Vulners provides:
 - Faster responses
@@ -271,36 +272,18 @@ Vulners provides:
 
 ---
 
-## Installation
+## Requirements
 
-### Requirements
+- **Docker** reachable from the recon container. `run_vuln_scan()` checks `docker` is on the path and `docker info` answers; otherwise it skips the Nuclei passes (and keeps the previous Nuclei findings) but still runs the CVE lookup and the security checks.
+- Nothing to install by hand. On each scan:
+  - `pull_nuclei_docker_image()` pulls the image, so a moving tag stays current, and falls back to the copy already on the host when the pull fails
+  - `ensure_templates_volume()` creates the `nuclei-templates` Docker volume, downloads the templates into it on first use and updates them when `NUCLEI_AUTO_UPDATE_TEMPLATES` is on
+  - each pass mounts its targets and output directories and runs nuclei inside the container
+  - the JSONL results are parsed into the recon data
 
-- **Docker** installed and running
-- That's it! Templates are included in the Docker image
-
-### Setup
-
-```bash
-# Make sure Docker is running
-sudo systemctl start docker
-
-# Run the scan - image will be pulled automatically
-python3 recon/main.py
-```
-
-The Python script handles everything:
-- Pulls the Docker image automatically if needed
-- Mounts targets and output directories
-- Runs nuclei inside the container
-- Parses results and updates your recon JSON
-
-### Verify Docker is Ready
+To pre-pull the image:
 
 ```bash
-# Check Docker is running
-docker info
-
-# Optionally pre-pull the image
 docker pull projectdiscovery/nuclei:latest
 ```
 
@@ -308,7 +291,17 @@ docker pull projectdiscovery/nuclei:latest
 
 ## Configuration Parameters
 
-All parameters are configured via the webapp project settings (stored in PostgreSQL) or as defaults in `project_settings.py`:
+All parameters are set in the webapp project settings (stored in PostgreSQL) and reach the module as the runtime keys below; `recon/project_settings.py` holds the fallback defaults. Each field's meaning and bounds are in the settings registry (`recon_settings/registry.yaml`).
+
+At scan start the engagement ceiling caps `NUCLEI_RATE_LIMIT`, the memory governor can lower `NUCLEI_BULK_SIZE` and `NUCLEI_CONCURRENCY`, and stealth mode sets `NUCLEI_RATE_LIMIT = 5`, `NUCLEI_BULK_SIZE = 5`, `NUCLEI_CONCURRENCY = 2`, turns off DAST, headless and Interactsh, and adds `dos`, `fuzz`, `intrusive`, `sqli` and `rce` to `NUCLEI_EXCLUDE_TAGS`.
+
+### Toggle
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `NUCLEI_ENABLED` | `bool` | `True` | Run the Nuclei passes. When off, `vuln_scan` holds an empty result (`execution_mode: "disabled"`) and the CVE lookup and security checks still run |
+
+The module runs only when `vuln_scan` is in the project's scan modules (`SCAN_MODULES`).
 
 ### Severity Filtering
 
@@ -327,49 +320,49 @@ All parameters are configured via the webapp project settings (stored in Postgre
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NUCLEI_TEMPLATES` | `list` | `[]` | Specific template folders (empty = all) |
-| `NUCLEI_EXCLUDE_TEMPLATES` | `list` | `["fuzzing"]` | Templates to exclude |
-| `NUCLEI_CUSTOM_TEMPLATES` | `list` | `[]` | Paths to custom templates (manual entry) |
+| `NUCLEI_TEMPLATES` | `list` | `[]` | Specific template paths to include (`-t`) |
+| `NUCLEI_EXCLUDE_TEMPLATES` | `list` | `[]` | Template paths to exclude |
+| `NUCLEI_CUSTOM_TEMPLATES` | `list` | `[]` | Paths to custom templates (manual entry, passed as `-t`) |
 | `NUCLEI_SELECTED_CUSTOM_TEMPLATES` | `list` | `[]` | Per-project selected custom templates from the upload UI |
+
+**Tags decide whether the built-in templates load.** With `NUCLEI_TAGS` set and no explicit `-t` path, the detection pass loads the whole built-in pool (`-t /root/nuclei-templates/`) filtered by the tags, plus any selected custom templates. With `NUCLEI_TAGS` empty, only the selected custom templates run. With no tags and no template of any kind, the detection pass is skipped (the DAST pass, which has its own template set, can still run).
 
 **Custom Templates:**
 
 Custom nuclei templates (`mcp/nuclei-templates/`) can be uploaded, viewed, and deleted directly from Project Settings → Nuclei → Template Options. Each template has a **per-project checkbox** — only checked templates are included in that project's scans. Templates are global (shared across all projects), but selection is per-project.
 
 **Management:**
-- **Upload** `.yaml`/`.yml` templates — validated for nuclei format (`id:`, `info.name:`, `info.severity:`)
+- **Upload** `.yaml`/`.yml` templates — validated for nuclei format (`id:`, `info.name:`, `info.severity:`); a `.yml` name is saved as `.yaml`, since Nuclei v3 reads a `.yml` path as a list of paths
 - **Select** templates per project via checkboxes — only selected templates run during scans
 - **View** all uploaded templates with severity badges and metadata
 - **Delete** individual templates
 - API: `GET/POST/DELETE /api/nuclei-templates`
 
 **How it works:**
-- Selected templates are individually passed as `-t /custom-templates/{path}` flags to nuclei
+- The orchestrator passes the templates' host path as `HOST_CUSTOM_TEMPLATES_PATH`; it is mounted read-only at `/custom-templates`, and each selected template is passed as `-t /custom-templates/{path}`
 - Recon logs list each selected template by name at scan start
-- The AI agent also sees all templates automatically — at startup, the nuclei MCP server dynamically appends template paths to the `execute_nuclei` tool description
+- The AI agent also sees all templates automatically — at startup, the nuclei MCP server (`mcp/servers/nuclei_server.py`) appends the template paths to the `execute_nuclei` tool description
 
-Currently available custom template sets:
-- **Spring Boot Actuator** — 7 templates with 200+ bypass paths for `/actuator`, `/heapdump`, `/env`, `/jolokia`, `/gateway` endpoints including URL encoding, semicolon injection, and alternate base path evasion
+Currently available custom templates: Spring Boot Actuator templates (`springboot-*.yaml`: actuator discovery, `/env`, `/heapdump`, `/jolokia`, gateway SSRF, with URL-encoding, semicolon and alternate-base-path bypasses) and an AEM JSON exposure template.
 
-**Template Folders:**
+**Template paths** (inside the templates volume, as upstream `nuclei-templates` lays them out):
 ```
-cves/               - Known CVE exploits
-vulnerabilities/    - General vulnerabilities
-misconfiguration/   - Security misconfigurations
-exposures/          - Exposed files/panels/data
-technologies/       - Technology detection
-default-logins/     - Default credentials
-takeovers/          - Subdomain takeovers
-file/               - Interesting files
-fuzzing/            - Fuzzing templates (noisy)
+http/cves/               - Known CVE exploits
+http/vulnerabilities/    - General vulnerabilities
+http/misconfiguration/   - Security misconfigurations
+http/exposures/          - Exposed files/panels/data
+http/technologies/       - Technology detection
+http/default-logins/     - Default credentials
+http/takeovers/          - Subdomain takeovers
+dast/                    - DAST fuzzing templates (used by the DAST pass)
 ```
 
 ### Tag Filtering
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NUCLEI_TAGS` | `list` | `[]` | Template tags to include |
-| `NUCLEI_EXCLUDE_TAGS` | `list` | `["dos"]` | Tags to exclude |
+| `NUCLEI_TAGS` | `list` | `["cve", "xss", "sqli", "rce", "lfi", "ssrf", "xxe", "ssti"]` | Template tags to include (empty = custom templates only) |
+| `NUCLEI_EXCLUDE_TAGS` | `list` | `["dos", "fuzz"]` | Tags to exclude |
 
 **Popular Tags:**
 ```
@@ -387,18 +380,20 @@ default-login - Default credentials
 takeover    - Subdomain takeover
 tech        - Technology detection
 dos         - Denial of service (excluded by default)
-fuzz        - Fuzzing templates
+fuzz        - Fuzzing templates (excluded by default)
 ```
 
 ### Rate Limiting & Performance
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NUCLEI_RATE_LIMIT` | `int` | `100` | Requests per second |
+| `NUCLEI_RATE_LIMIT` | `int` | `100` | Requests per second, across all templates and targets |
 | `NUCLEI_BULK_SIZE` | `int` | `25` | Hosts to process in parallel |
 | `NUCLEI_CONCURRENCY` | `int` | `25` | Templates to run in parallel |
-| `NUCLEI_TIMEOUT` | `int` | `10` | Request timeout (seconds) |
+| `NUCLEI_TIMEOUT` | `int` | `10` | Per-request timeout (seconds), not a cap on the run |
 | `NUCLEI_RETRIES` | `int` | `1` | Retries for failed requests |
+| `NUCLEI_MAX_HOST_ERROR` | `int` | `30` | Errors tolerated from one host before nuclei stops probing it (`-mhe`) |
+| `NUCLEI_MAX_RUNTIME` | `int` | `86400` | Wall-clock cap for one pass (seconds). At the cap the container is killed, its partial findings are kept and the run is recorded as truncated |
 
 **Recommended Settings:**
 
@@ -413,177 +408,127 @@ fuzz        - Fuzzing templates
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NUCLEI_DAST_MODE` | `bool` | `True` | Enable DAST mode for active fuzzing |
-| `NUCLEI_AUTO_UPDATE_TEMPLATES` | `bool` | `True` | Auto-update templates before scan |
-| `NUCLEI_NEW_TEMPLATES_ONLY` | `bool` | `False` | Only use newly added templates |
+| `NUCLEI_DAST_MODE` | `bool` | `False` | Add a DAST pass on resource_enum's parameterized URLs |
+| `NUCLEI_AUTO_UPDATE_TEMPLATES` | `bool` | `True` | Update templates (`-ut`) before the scan; it fetches from the public template repository |
+| `NUCLEI_NEW_TEMPLATES_ONLY` | `bool` | `False` | Only use newly added templates (`-nt`) |
 | `NUCLEI_HEADLESS` | `bool` | `False` | Enable headless browser for JS apps |
 
-### Katana Web Crawler (DAST Mode)
-
-When `NUCLEI_DAST_MODE` is enabled, **Katana** automatically crawls target websites to discover URLs with parameters for active fuzzing.
+### AI Assistance
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `KATANA_DOCKER_IMAGE` | `str` | `"projectdiscovery/katana:latest"` | Docker image for Katana |
-| `KATANA_DEPTH` | `int` | `3` | Maximum crawl depth (links to follow) |
-| `KATANA_MAX_URLS` | `int` | `500` | Maximum URLs to discover |
-| `KATANA_RATE_LIMIT` | `int` | `50` | Requests per second |
-| `KATANA_TIMEOUT` | `int` | `300` | Crawl timeout (seconds) |
-| `KATANA_JS_CRAWL` | `bool` | `True` | Parse JavaScript for URLs |
-| `KATANA_PARAMS_ONLY` | `bool` | `True` | Only keep URLs with `?parameters` |
-| `KATANA_SCOPE` | `str` | `"dn"` | Crawl scope: `dn`/`rdn`/`fqdn` |
-| `KATANA_CUSTOM_HEADERS` | `list` | `[]` | Custom headers for auth crawling |
+| `NUCLEI_AI_TAGS` | `bool` | `False` | Let an LLM replace `NUCLEI_TAGS` with a subset that fits the technologies and Server headers http_probe found (detection pass only) |
+| `NUCLEI_TAGS_AI_USE_JEV` | `bool` | `False` | Use TypeSafe AI Jev instead of the LLM for the tag selector |
+| `NUCLEI_AI_RESPONSE_FILTER` | `bool` | `False` | Ask the LLM whether a suspicious-status response (403/406/418/429/503/451) to an injection template is a block page |
 
-**Scope Options:**
-- `dn` - Domain name (stays within same domain)
-- `rdn` - Root domain (includes all subdomains)
-- `fqdn` - Fully qualified domain name (exact hostname only)
-
-**Authenticated Crawling:**
-```python
-# For sites requiring authentication
-KATANA_CUSTOM_HEADERS = [
-    "Cookie: session=abc123; token=xyz789",
-    "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
-]
-```
+The AI-in-pipeline switch (`AI_IN_PIPELINE`) turns `NUCLEI_AI_TAGS`, `NUCLEI_AI_RESPONSE_FILTER` and the security checks' `WAF_AI_CLASSIFIER` on or off together; the model is `AI_PIPELINE_MODEL`. When the AI is unavailable, the user's tags and the static filter are used.
 
 ### Network Settings
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `NUCLEI_SYSTEM_RESOLVERS` | `bool` | `True` | Use system DNS resolvers |
-| `NUCLEI_FOLLOW_REDIRECTS` | `bool` | `True` | Follow HTTP redirects |
+| `NUCLEI_FOLLOW_REDIRECTS` | `bool` | `True` | Follow HTTP redirects (same-host only when session headers are attached) |
 | `NUCLEI_MAX_REDIRECTS` | `int` | `10` | Maximum redirects to follow |
-| `NUCLEI_SCAN_ALL_IPS` | `bool` | `False` | Scan IPs in addition to hostnames |
-| `NUCLEI_INTERACTSH` | `bool` | `True` | Enable OOB testing (blind vulns) |
+| `NUCLEI_SCAN_ALL_IPS` | `bool` | `False` | Also scan `http(s)://<ip>` for every resolved IP no other target URL covers |
+| `NUCLEI_INTERACTSH` | `bool` | `True` | Enable OOB testing (blind vulns); always off when session headers are attached, since callbacks go to a third-party collector |
 
 ### Docker Settings
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NUCLEI_DOCKER_IMAGE` | `str` | `"projectdiscovery/nuclei:latest"` | Docker image to use |
+| `NUCLEI_DOCKER_IMAGE` | `str` | `"projectdiscovery/nuclei:latest"` | Docker image to use; a value outside the shipped allowlist is pinned back to the default at scan start |
 
 **Docker Mode Advantages:**
 - No Go installation required
 - No binary management
-- Templates included in image
-- Easy updates (image pulled automatically)
+- Templates kept in a persistent volume
+- Easy updates (image pulled on each scan)
 - Isolated execution
 
 **How it works:**
-The Python script automatically runs:
+`build_nuclei_command()` produces, for each pass:
 ```bash
-docker run --rm \
-  -v /tmp/targets:/targets:ro \
-  -v /tmp/output:/output \
+docker run --rm --net=host \
+  --name redamon-nuclei-detection-<id> \
+  -v /tmp/redamon/.nuclei_temp_<id>:/targets:ro \
+  -v /tmp/redamon/.nuclei_temp_<id>:/output \
+  -v nuclei-templates:/root/nuclei-templates \
+  [-v <HOST_CUSTOM_TEMPLATES_PATH>:/custom-templates:ro] \
   projectdiscovery/nuclei:latest \
   [nuclei arguments...]
 ```
+
+`--net=host` lets Nuclei reach loopback and local-lab targets; the name lets the runtime-cap watchdog `docker kill` that exact container.
 
 ---
 
 ## Architecture & Flow
 
-> **Pipeline context:** Vulnerability scanning runs in **GROUP 6 Phase A** of the parallelized recon pipeline — concurrently with the dedicated **GraphQL security scanner** (`recon/graphql_scan/`). Both scanners read `BaseURL` / `Endpoint` / `Technology` and emit `Vulnerability` nodes, but have zero data dependency on each other, so they run in parallel via `ThreadPoolExecutor` using `_isolated` wrappers that deep-copy `combined_result` to avoid races. Phase B (MITRE CWE/CAPEC enrichment) runs sequentially after Phase A completes — it depends on Nuclei's CVEs. Both phases depend on resource enumeration (GROUP 5) output. Graph DB updates happen in a background thread.
+> **Pipeline context:** Vulnerability scanning runs in **GROUP 6 Phase A** of the recon pipeline (`recon/main.py`). In domain mode, `run_vuln_scan_isolated()` runs in one `ThreadPoolExecutor` with the other active scanners the project enabled (the GraphQL scanner `recon/graphql_scan/`, subdomain takeover, VHost/SNI, web cache poisoning, origin discovery); each `_isolated` wrapper deep-copies `combined_result` so there is no shared-dict race, and only its own key is merged back. In IP mode `run_vuln_scan()` runs first on its own, then the others fan out. Phase B (MITRE CWE/CAPEC enrichment) runs after Phase A — it depends on Nuclei's CVEs. Both phases depend on resource enumeration (GROUP 5) output, and the whole group is skipped when http_probe found no live URL (then only the certificate-hygiene checks run, from stored certificate data). Graph DB updates happen in a background thread.
 
-### Execution Flow
-
-```
-1. INITIALIZATION
-   └── Check Docker availability
-   └── Pull nuclei image if needed
-   └── Ensure templates volume exists
-   └── Auto-update templates (if enabled)
-
-2. TARGET EXTRACTION
-   └── Parse recon_data JSON
-   └── Extract unique IPs and hostnames
-   └── Build IP-to-hostname mapping
-
-3. URL BUILDING
-   └── Generate HTTP/HTTPS URLs for hostnames
-   └── Use nmap data for non-standard ports
-   └── Optionally include IP-based URLs
-
-4. KATANA CRAWLING (if DAST mode enabled)
-   └── Pull Katana Docker image
-   └── Crawl each base URL
-   └── Parse JavaScript for hidden URLs
-   └── Filter URLs with parameters (?key=value)
-   └── Return discovered URLs for fuzzing
-
-5. SCAN EXECUTION
-   └── Create temporary targets file (base URLs + Katana URLs)
-   └── Build nuclei Docker command with all parameters
-   └── Add -dast flag for active fuzzing
-   └── Execute nuclei container with JSONL output
-   └── Monitor progress
-
-6. RESULT PROCESSING
-   └── Parse JSONL output line by line
-   └── Extract CVEs from findings
-   └── Classify by category and severity
-   └── Aggregate statistics
-
-7. DATA ENRICHMENT
-   └── Add "nuclei" section to recon_data
-   └── Include discovered_urls section
-   └── Save incrementally to JSON file
-   └── Generate summary statistics
-```
-
-### DAST Mode with Katana Flow
+### Execution Flow (`run_vuln_scan`)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         DAST MODE WORKFLOW                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
-│  │  Base URLs   │───▶│   KATANA     │───▶│   NUCLEI     │───▶│  Results  │ │
-│  │              │    │  (Crawler)   │    │  (Scanner)   │    │           │ │
-│  │ example.com  │    │              │    │              │    │ SQLi: 2   │ │
-│  │ api.example  │    │ Discovers:   │    │ Fuzzes with: │    │ XSS: 5    │ │
-│  │              │    │ /search?q=   │    │ -dast flag   │    │ RCE: 1    │ │
-│  │              │    │ /api?id=     │    │              │    │           │ │
-│  │              │    │ /user?name=  │    │ Payloads:    │    │           │ │
-│  └──────────────┘    │ /login?user= │    │ ' OR 1=1--   │    └───────────┘ │
-│                      │              │    │ <script>     │                   │
-│                      └──────────────┘    │ {{7*7}}      │                   │
-│                             │            └──────────────┘                   │
-│                             │                   │                           │
-│                             ▼                   ▼                           │
-│                   ┌─────────────────────────────────────┐                  │
-│                   │        discovered_urls JSON         │                  │
-│                   │  • base_urls: [example.com, ...]    │                  │
-│                   │  • dast_urls_with_params: [...]     │                  │
-│                   │  • all_scanned_urls: [...]          │                  │
-│                   └─────────────────────────────────────┘                  │
-└─────────────────────────────────────────────────────────────────────────────┘
+1. PRECHECKS (when NUCLEI_ENABLED)
+   └── is_docker_installed() / is_docker_running()
+   └── pull_nuclei_docker_image()
+   └── ensure_templates_volume() (creates, downloads, -ut when auto-update is on)
+   └── Any failure → skip the Nuclei passes, keep the previous Nuclei findings,
+       record the live URLs as "failed" coverage
+
+2. TARGETS
+   └── extract_targets_from_recon(): hostnames and IPs from the DNS section
+       (the root domain only when it is a target)
+   └── build_target_urls(): resource_enum base and endpoint URLs
+       + http_probe URLs answering < 500
+       + http(s)://<host> for hostnames neither already covers (mock IP
+         hostnames skipped)
+       + http(s)://<ip> for uncovered IPs when NUCLEI_SCAN_ALL_IPS
+   └── DAST URLs: resource_enum.discovered_urls holding "?" and "="
+
+3. OPTIONAL AI STEPS
+   └── set_fp_ai_ctx() arms the AI false-positive filter
+   └── NUCLEI_AI_TAGS: get_ai_tags() may replace NUCLEI_TAGS
+
+4. PASS A: DETECTION   (skipped when no tags and no templates)
+   └── targets_detection.txt in /tmp/redamon/.nuclei_temp_<id>
+   └── build_nuclei_command(...) with tags, templates, custom templates,
+       session headers (merge_auth_headers, in-scope hosts only)
+   └── _execute_nuclei_pass(): stream output, watch -stats, kill at
+       NUCLEI_MAX_RUNTIME, parse the JSONL, is_false_positive() per line,
+       parse_nuclei_finding() for the rest
+
+5. PASS B: DAST        (NUCLEI_DAST_MODE and at least one parameterized URL)
+   └── targets_dast.txt; build_nuclei_command(force_dast_pass=True):
+       -dast, no tag/template filters
+
+6. RESULT
+   └── Aggregate by target, category, template; deduplicate CVEs by id
+   └── recon_data["vuln_scan"] = {...} with per-host coverage
+   └── Written to output_file only when one is passed
+   └── The run's temp dir is removed
+
+7. CVE LOOKUP          (CVE_LOOKUP_ENABLED and http_probe data)
+   └── run_cve_lookup() → recon_data["technology_cves"]
+
+8. SECURITY CHECKS     (SECURITY_CHECK_ENABLED and any check on)
+   └── run_security_checks() → recon_data["vuln_scan"]["security_checks"]
 ```
 
-### Why Katana for DAST?
-
-| Problem | Solution with Katana |
-|---------|---------------------|
-| DAST needs URLs with parameters | Katana discovers `?param=value` URLs |
-| JavaScript hides endpoints | Katana parses JS files for URLs |
-| Forms have hidden inputs | Katana extracts form action URLs |
-| APIs have undocumented endpoints | Katana follows links recursively |
-| Auth required for some pages | Custom headers support authentication |
+A pass that exits non-zero (a Docker error, an OOM kill, a fatal nuclei error) still has its partial JSONL ingested, but the findings of everything it did not reach are kept rather than pruned.
 
 ### Data Flow
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          project_settings.py                               │
+│              project settings (webapp) → recon/project_settings.py         │
 │  NUCLEI_SEVERITY, NUCLEI_RATE_LIMIT, NUCLEI_TAGS, NUCLEI_DOCKER_IMAGE... │
 └─────────────────────────────────┬────────────────────────────────────────┘
                                   │
                                   ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          nuclei_scan.py                                   │
+│                          vuln_scan.py                                    │
 │                                                                          │
 │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────────┐  │
 │  │ extract_targets │───▶│ build_target    │───▶│ build_nuclei        │  │
@@ -592,117 +537,160 @@ docker run --rm \
 │           │                     │                        │               │
 │           ▼                     ▼                        ▼               │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                    run_nuclei_scan()                             │    │
+│  │                    run_vuln_scan()                               │    │
 │  │  ┌───────────────┐  ┌───────────────┐  ┌───────────────────┐   │    │
-│  │  │ Docker        │─▶│ parse_nuclei  │─▶│ aggregate         │   │    │
-│  │  │ (nuclei CLI)  │  │ _finding()    │  │ results           │   │    │
+│  │  │ _execute_     │─▶│ is_false_     │─▶│ parse_nuclei      │   │    │
+│  │  │ nuclei_pass() │  │ positive()    │  │ _finding()        │   │    │
 │  │  └───────────────┘  └───────────────┘  └───────────────────┘   │    │
+│  │  then run_cve_lookup() and run_security_checks()                │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
-                    ┌──────────────────────────┐
-                    │   recon_<domain>.json    │
-                    │   with "nuclei" section  │
-                    └──────────────────────────┘
+                    ┌──────────────────────────────┐
+                    │   recon_<domain>.json        │
+                    │   "vuln_scan" (+ security_   │
+                    │   checks), "technology_cves" │
+                    └──────────────────────────────┘
 ```
 
 ---
 
 ## Function Reference
 
-### `is_docker_installed() -> bool`
+The module's own functions live in `recon/main_recon_modules/vuln_scan.py`; the helpers it imports from `recon.helpers` live in `docker_helpers.py`, `target_helpers.py`, `nuclei_helpers.py`, `cve_helpers.py` and `security_checks.py` under `recon/helpers/`.
 
-**Purpose:** Checks if Docker is available in PATH.
+### `run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = None) -> dict`
 
-**Returns:** `True` if `docker` command is found.
-
----
-
-### `is_docker_running() -> bool`
-
-**Purpose:** Checks if Docker daemon is running.
-
-**Mechanism:** Runs `docker info` and checks return code.
-
-**Returns:** `True` if Docker daemon is accessible.
+**Purpose:** Main entry point; runs the flow above and returns `recon_data` with `vuln_scan` (and `technology_cves`) added.
 
 ---
 
-### `pull_nuclei_docker_image() -> bool`
+### `run_vuln_scan_isolated(combined_result: dict, settings: dict) -> dict`
 
-**Purpose:** Pulls the nuclei Docker image if not present.
+**Purpose:** Thread-safe wrapper for the GROUP 6 fan-out. Deep-copies `combined_result`, runs `run_vuln_scan()` on the copy with no incremental saves, and returns only the copy's `vuln_scan` dict (security checks included).
 
-**Returns:** `True` if pull succeeded.
+---
+
+### `enrich_recon_file(recon_file: Path) -> dict`
+
+**Purpose:** Standalone use: loads settings with `get_settings()`, runs `run_vuln_scan()` on a recon JSON file and saves the result back to it.
+
+---
+
+### `_execute_nuclei_pass(cmd, output_file, label, runtime_cap=0, container_name=None) -> tuple`
+
+**Purpose:** Runs one nuclei container and parses its JSONL output.
+
+**Behavior:**
+1. Streams nuclei's output to the log; `_nuclei_watch_stats()` warns once when, for 10 minutes, more than half of the requests error with no match
+2. A watchdog timer `docker kill`s the named container at `runtime_cap` (`NUCLEI_MAX_RUNTIME`); the partial output is still parsed
+3. Each JSONL line goes through `is_false_positive()`; kept lines go through `parse_nuclei_finding()`
+4. A non-zero exit marks Nuclei as degraded for the run, so its earlier findings are kept
+
+**Returns:** `(findings, false_positives, duration_seconds, return_code)`
+
+---
+
+### `is_docker_installed() -> bool` / `is_docker_running() -> bool`
+
+**Purpose:** `docker` is on the path / `docker info` returns 0.
+
+---
+
+### `pull_nuclei_docker_image(docker_image: str) -> bool`
+
+**Purpose:** Pulls the image through `pull_image_or_use_local()`.
+
+**Returns:** `True` when the pull succeeded, or when it failed but the image is already on the host.
+
+---
+
+### `ensure_templates_volume(docker_image: str, auto_update: bool = False) -> bool`
+
+**Purpose:** Ensures the `nuclei-templates` Docker volume exists and has templates.
+
+**Behavior:**
+1. Creates the volume if it is missing
+2. Otherwise checks it holds `.yaml` files
+3. Runs `nuclei -ut` into the volume when it is new or empty, or when `auto_update` is on (10-minute limit)
+4. A timed-out update is killed and returns `False`, because a half-written template set fails to load; Nuclei is then skipped for the run
+
+**Returns:** `True` if templates are ready.
 
 ---
 
 ### `extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]`
 
-**Purpose:** Extracts IPs, hostnames, and mappings from recon data.
-
-**Identical to nmap_scan.py implementation** - extracts from:
-- Root domain DNS records
-- Subdomain DNS records
+**Purpose:** Extracts IPs, hostnames, and the IP-to-hostnames mapping from the DNS section:
+- Root domain DNS records, only when the root is a target (`metadata.include_root_domain`)
+- Subdomain DNS records (hostnames with records, and their IPs)
 
 **Returns:** `(ips, hostnames, ip_to_hostnames)`
 
 ---
 
-### `build_target_urls(hostnames: Set[str], ips: Set[str], nmap_data: Optional[dict]) -> List[str]`
+### `build_target_urls(hostnames, ips, recon_data=None, scan_all_ips=False) -> List[str]`
 
-**Purpose:** Builds list of target URLs for nuclei.
+**Purpose:** The detection pass's target list: the deduplicated union of
+1. resource_enum base URLs and endpoint URLs (`build_target_urls_from_resource_enum()`: a templated path such as `/users/{id}` is never a target, and endpoints known only from an API specification count only when they declare GET or HEAD, up to `MAX_DECLARED_NUCLEI_URLS`)
+2. http_probe URLs answering below 500 (`build_target_urls_from_httpx()`)
+3. `http://` and `https://` for every hostname sources 1 and 2 do not already cover, except mock IP hostnames (`10-0-0-1` for an IP with no PTR record)
+4. `http(s)://<ip>` for uncovered IPs, only with `scan_all_ips` (IPv6 in brackets)
 
-**Logic:**
-```python
-# For each hostname:
-urls.append(f"http://{hostname}")
-urls.append(f"https://{hostname}")
-
-# Add non-standard ports from nmap data:
-# e.g., http://example.com:8080, https://example.com:8443
-
-# If NUCLEI_SCAN_ALL_IPS:
-#   Also add IP-based URLs
-```
-
-**Port Detection:**
-- Default HTTP: 80, 8080, 8000, 8888
-- Default HTTPS: 443, 8443, 4443, 9443
-- Additional ports from nmap service detection
+**Returns:** Sorted list of URLs.
 
 ---
 
-### `build_nuclei_command(targets_file: str, output_file: str, use_proxy: bool) -> List[str]`
+### `build_nuclei_command(targets_file, output_file, docker_image, ..., force_dast_pass=False, auth_headers=None, container_name=None, max_host_error=0) -> List[str]`
 
-**Purpose:** Constructs the nuclei Docker CLI command.
+**Purpose:** Constructs the nuclei Docker CLI command for one pass. The keyword arguments mirror the settings above.
 
-**Generated Command Structure:**
+**Generated Command Structure** (detection pass, default settings):
 ```bash
-docker run --rm \
-  -v /targets:/targets:ro \
-  -v /output:/output \
+docker run --rm --net=host --name redamon-nuclei-detection-<id> \
+  -v /tmp/redamon/.nuclei_temp_<id>:/targets:ro \
+  -v /tmp/redamon/.nuclei_temp_<id>:/output \
+  -v nuclei-templates:/root/nuclei-templates \
   projectdiscovery/nuclei:latest \
-  -l /targets/targets.txt \
+  -l /targets/targets_detection.txt \
   -jsonl \
-  -o /output/output.jsonl \
+  -o /output/nuclei_detection.jsonl \
   -silent \
   -nc \
+  -duc \
+  -stats -stats-interval 30 \
   -severity critical,high,medium,low \
-  -t cves/ -t vulnerabilities/ \
-  -exclude-templates fuzzing/ \
-  -tags cve,xss,sqli \
-  -exclude-tags dos \
+  -t /root/nuclei-templates/ \
+  -tags cve,xss,sqli,rce,lfi,ssrf,xxe,ssti \
+  -exclude-tags dos,fuzz \
   -rate-limit 100 \
   -bulk-size 25 \
   -concurrency 25 \
   -timeout 10 \
   -retries 1 \
-  -as \                      # Automatic scan
+  -mhe 30 \
   -system-resolvers \
   -follow-redirects \
   -max-redirects 10
 ```
+
+- `force_dast_pass=True` adds `-dast` and drops every tag and template filter, which would otherwise empty-intersect with the DAST template set.
+- `auth_headers` become `-H` flags; with them, redirects use `-follow-host-redirects` and `-no-interactsh` is forced.
+- When HTTP traffic capture is on and reachable, `-proxy <capture proxy>` and an `X-Redamon-Ctx` header are added.
+
+---
+
+### `is_false_positive(finding: dict) -> tuple`
+
+**Purpose:** Decides whether a raw nuclei finding is a false positive.
+
+**Rules:**
+1. A response with a rate-limit marker (`429`, "Too Many Requests", "try again later", ...) is a false positive, whatever the template
+2. For injection templates (`sqli`, `xss`, `rce`, `lfi`, `ssti`, `injection` tags), a `403` response with a WAF marker ("Access Denied", "ModSecurity", "Cloudflare", ...) is a false positive
+3. With `NUCLEI_AI_RESPONSE_FILTER` on, an injection finding the keyword lists missed, whose response's first 50 characters hold a suspicious status (403, 406, 418, 429, 503, 451), is classified by the LLM; a "blocked" verdict with confidence of at least 70 is a false positive
+
+**Returns:** `(is_false_positive, reason)`. Dropped findings are listed in `vuln_scan.false_positives`.
 
 ---
 
@@ -724,121 +712,79 @@ map fails the whole write. That list is what CVE enrichment, reports and the
 Mute Rules CVE fields (`has_cve`, `cve_year`, `cve_ids`) read. Regression tests:
 `recon/tests/test_nuclei_cve_findings_reach_graph.py`.
 
-**Category Classification:**
+**Category Classification:** the first tag that contains one of these keys (checked in this order) decides; no match is `general`.
 
-| Tags Containing | Category |
-|-----------------|----------|
+| Tag Containing | Category |
+|----------------|----------|
 | `xss` | xss |
 | `sqli` | sqli |
 | `rce` | rce |
 | `lfi` | lfi |
+| `rfi` | rfi |
 | `ssrf` | ssrf |
 | `xxe` | xxe |
 | `ssti` | ssti |
 | `cve` | cve |
 | `exposure` | exposure |
 | `misconfig` | misconfiguration |
-| `default-login` | authentication |
+| `default-login`, `auth-bypass` | authentication |
 | `panel` | exposed_panel |
+| `tech` | technology |
 | `takeover` | takeover |
+| `dos` | dos |
+| `idor` | idor |
+| `csrf` | csrf |
+| `redirect` | open_redirect |
+| `crlf` | crlf |
+| `injection` | injection |
+| `file-upload` | file_upload |
+| `traversal` | path_traversal |
+| `disclosure` | information_disclosure |
 | `ssl`, `tls` | ssl_tls |
-| `cloud`, `aws`, `azure`, `gcp` | cloud |
+| `cloud`, `aws`, `azure`, `gcp`, `kubernetes`, `docker` | cloud |
 
 **Returns:**
 ```python
 {
     "template_id": "CVE-2021-44228",
+    "template_path": "http/cves/2021/CVE-2021-44228.yaml",
     "name": "Apache Log4j RCE",
     "description": "...",
     "severity": "critical",
-    "category": "cve",
+    "category": "rce",
     "tags": ["cve", "rce", "log4j"],
+    "reference": [...],
     "cves": [{"id": "CVE-2021-44228", "cvss": 10.0, "url": "..."}],
+    "cvss_score": 10.0,
+    "cvss_metrics": "CVSS:3.1/...",
+    "cwe_id": ["cwe-502"],
     "target": "https://example.com",
     "matched_at": "https://example.com/api/login",
+    "matcher_name": "",
+    "extracted_results": [],
     "curl_command": "curl ...",
-    ...
+    "request": "...",
+    "response": "...",      # first 500 characters
+    "timestamp": "...",
+    "raw": {...}            # the raw nuclei line
 }
 ```
 
 ---
 
-### `run_nuclei_scan(recon_data: dict, output_file: Path = None) -> dict`
+### `run_cve_lookup(recon_data, enabled=True, source="nvd", max_cves=20, min_cvss=0.0, vulners_api_key=None, nvd_api_key=None, nvd_key_rotator=None, vulners_key_rotator=None) -> dict`
 
-**Purpose:** Main orchestrator function for nuclei scanning.
+**Purpose:** The technology-based CVE lookup described [above](#cve-lookup-technology-based).
 
-**Phases:**
-1. Check Docker availability
-2. Pull nuclei image if needed
-3. Ensure templates volume exists (with auto-update if enabled)
-4. Extract targets from recon data
-5. Build target URLs (using nmap data if available)
-6. **Run Katana crawler** (if DAST mode enabled)
-7. Create temporary files (base URLs + Katana discovered URLs)
-8. Execute nuclei Docker container with -dast flag
-9. Parse JSONL results
-10. Aggregate and classify findings
-11. Add to recon_data["nuclei"] including discovered_urls
-12. Save incrementally
-
-**Returns:** Enriched `recon_data` with `nuclei` section.
+**Returns:** `{"technology_cves": {...}}`, merged into `recon_data`.
 
 ---
 
-### `pull_katana_docker_image() -> bool`
+### `run_security_checks(recon_data, enabled_checks, timeout, tls_expiry_days, max_workers, ...) -> dict`
 
-**Purpose:** Pulls the Katana Docker image if not already present.
+**Purpose:** RedAmon's own checks (see [Custom Security Checks](#custom-security-checks)).
 
-**Returns:** `True` if pull succeeded or image already exists.
-
----
-
-### `run_katana_crawler(target_urls: List[str]) -> List[str]`
-
-**Purpose:** Run Katana web crawler to discover URLs with parameters for DAST fuzzing.
-
-**Args:**
-- `target_urls`: Base URLs to start crawling from
-
-**Behavior:**
-1. Pulls Katana Docker image
-2. For each base URL, runs Katana with configured depth/rate
-3. Parses JavaScript files for hidden endpoints
-4. Filters URLs to only those with `?parameters`
-5. Returns deduplicated list of discovered URLs
-
-**Docker Command Generated:**
-```bash
-docker run --rm \
-  projectdiscovery/katana:latest \
-  -u https://example.com \
-  -d 3 \                    # Crawl depth
-  -silent \
-  -nc \
-  -rl 50 \                  # Rate limit
-  -timeout 300 \
-  -fs dn \                  # Scope
-  -murl 500 \               # Max URLs
-  -jc \                     # JavaScript crawl
-  -H "Cookie: session=..."   # Custom headers (optional)
-```
-
-**Returns:** List of URLs with parameters (e.g., `["https://example.com/search?q=test"]`)
-
----
-
-### `ensure_templates_volume() -> bool`
-
-**Purpose:** Ensures the nuclei-templates Docker volume exists and has templates.
-
-**Behavior:**
-1. Checks if `nuclei-templates` Docker volume exists
-2. Creates volume if missing
-3. Checks if templates are downloaded (looks for .yaml files)
-4. Downloads/updates templates if needed or if `NUCLEI_AUTO_UPDATE_TEMPLATES` is True
-5. Templates persist across scans in the Docker volume
-
-**Returns:** `True` if templates are ready.
+**Returns:** `{"security_checks": {...}}`; `run_vuln_scan()` stores it as `vuln_scan.security_checks`.
 
 ---
 
@@ -880,7 +826,7 @@ info:
 │   │ nuclei-templates│                   │ Docker Volume   │            │
 │   │    (GitHub)     │                   │ nuclei-templates│            │
 │   │                 │   nuclei -ut      │                 │            │
-│   │  9000+ YAML     │ ───────────────▶  │  Local copy of  │            │
+│   │  YAML           │ ───────────────▶  │  Local copy of  │            │
 │   │  templates      │                   │  all templates  │            │
 │   │                 │                   │                 │            │
 │   │ Updated daily   │                   │ Persists across │            │
@@ -899,23 +845,23 @@ info:
 
 ### Automatic Template Updates
 
-RedAmon automatically updates templates when `NUCLEI_AUTO_UPDATE_TEMPLATES = True` (default):
+RedAmon updates templates when `NUCLEI_AUTO_UPDATE_TEMPLATES = True` (default):
 
 ```python
 # In project settings
 NUCLEI_AUTO_UPDATE_TEMPLATES = True  # Runs "nuclei -ut" before each scan
 ```
 
-**What happens on each scan:**
-1. Check if `nuclei-templates` Docker volume exists
-2. If `NUCLEI_AUTO_UPDATE_TEMPLATES = True`, run `nuclei -ut`
+**What happens on each scan** (`ensure_templates_volume()`):
+1. Check if the `nuclei-templates` Docker volume exists; create it if not
+2. If the volume is new or empty, or `NUCLEI_AUTO_UPDATE_TEMPLATES = True`, run `nuclei -ut` into it (10-minute limit)
 3. Templates are downloaded/updated in the persistent volume
-4. Scan proceeds with latest templates
+4. The scan itself runs with `-duc`, so nuclei does not check for updates again
 
 **Console output when updating:**
 ```
-[*] Checking for template updates...
-[✓] Templates updated successfully
+[*][Docker] Checking for template updates...
+[✓][Docker] Templates updated successfully
 ```
 
 ### Manual Template Update
@@ -942,27 +888,9 @@ docker volume rm nuclei-templates
 | **Community contributions** | Continuous | New CVEs within hours/days |
 | **Your local volume** | Per scan (if auto-update on) | Synced on demand |
 
-**Recent template releases (example):**
-- November 2025: 197 new templates, 83 CVEs
-- October 2025: 243 new templates (Hacktoberfest)
-- New 2025 CVEs like CVE-2025-53677, CVE-2025-3515
-
-### What Gets Updated
-
-| Template Category | Contents | Count |
-|-------------------|----------|-------|
-| `cves/` | CVE-specific exploit templates | ~3,500 |
-| `vulnerabilities/` | Generic vulnerability checks | ~2,000 |
-| `misconfiguration/` | Security misconfigs | ~1,500 |
-| `exposures/` | Exposed files/panels | ~1,000 |
-| `technologies/` | Tech detection | ~500 |
-| `default-logins/` | Default credentials | ~200 |
-| `dast/` | Active fuzzing (XSS, SQLi) | ~100 |
-| **Total** | | **~9,000+** |
-
 ### Disabling Auto-Update
 
-For faster scan startup (skip update check):
+For faster scan startup, or to keep the scan from fetching anything from the public template repository:
 
 ```python
 # In project settings
@@ -971,18 +899,19 @@ NUCLEI_AUTO_UPDATE_TEMPLATES = False
 
 **Console output when disabled:**
 ```
-[✓] Templates volume ready (auto-update disabled)
+[✓][Docker] Templates volume ready (auto-update disabled)
 ```
+
+An empty volume is still filled on first use.
 
 ### Verifying Template Status
 
 ```bash
-# Check templates in volume
+# Count templates in volume
 docker run --rm \
   -v nuclei-templates:/root/nuclei-templates \
   alpine \
   sh -c "find /root/nuclei-templates -name '*.yaml' | wc -l"
-# Expected: ~9000+
 
 # Check template version
 docker run --rm \
@@ -998,11 +927,13 @@ docker run --rm \
 | "Templates not updating" | Delete volume: `docker volume rm nuclei-templates` |
 | "Template parse error" | Update Nuclei image: `docker pull projectdiscovery/nuclei:latest` |
 | "Breaking changes" | Nuclei engine version must match template requirements |
-| Slow updates | Normal on first run (~2-5 min for 9000+ templates) |
+| "Template update timed out" | The update was stopped after 10 minutes and Nuclei skipped for the run; run the manual update above |
 
 ---
 
 ## Nuclei Arguments Explained
+
+The flags `build_nuclei_command()` can pass:
 
 ### Output Formats
 
@@ -1012,14 +943,14 @@ docker run --rm \
 | `-o <file>` | Output file path |
 | `-silent` | Suppress banner and progress |
 | `-nc` | No color output |
+| `-duc` | Disable the automatic update check |
+| `-stats -stats-interval 30` | Progress heartbeat every 30 seconds |
 
 ### Target Selection
 
 | Flag | Description |
 |------|-------------|
 | `-l <file>` | List of targets from file |
-| `-u <url>` | Single target URL |
-| `-eh` | Exclude hosts |
 
 ### Template Selection
 
@@ -1030,8 +961,8 @@ docker run --rm \
 | `-tags <tags>` | Include templates with tags |
 | `-exclude-tags <tags>` | Exclude templates with tags |
 | `-severity <levels>` | Filter by severity |
-| `-as` | Automatic scan (smart template selection) |
 | `-nt` | New templates only |
+| `-dast` | Run DAST (fuzzing) templates |
 
 ### Rate Limiting
 
@@ -1040,6 +971,7 @@ docker run --rm \
 | `-rate-limit <n>` | Maximum requests per second |
 | `-bulk-size <n>` | Hosts to scan in parallel |
 | `-concurrency <n>` | Templates to run in parallel |
+| `-mhe <n>` | Errors tolerated per host before it is skipped |
 
 ### Network Options
 
@@ -1049,7 +981,9 @@ docker run --rm \
 | `-retries <n>` | Number of retries |
 | `-system-resolvers` | Use system DNS |
 | `-follow-redirects` | Follow HTTP redirects |
+| `-follow-host-redirects` | Follow redirects on the same host only |
 | `-max-redirects <n>` | Max redirect depth |
+| `-proxy <url>` | Send traffic through the capture proxy |
 
 ### Advanced Features
 
@@ -1058,73 +992,23 @@ docker run --rm \
 | `-headless` | Enable headless browser |
 | `-no-interactsh` | Disable OOB testing |
 | `-H <header>` | Custom HTTP headers |
-| `-var <var=val>` | Template variables |
 
 ---
 
 ## Template Categories
 
-### CVE Templates (`cves/`)
+The built-in templates live in the `nuclei-templates` volume at `/root/nuclei-templates/`, laid out by upstream `nuclei-templates`:
 
-```
-cves/
-├── 2024/
-│   ├── CVE-2024-XXXX.yaml
-│   └── ...
-├── 2023/
-├── 2022/
-└── ...
-```
-
-**Coverage:** 3000+ CVE templates updated within days of disclosure.
-
-### Vulnerability Templates (`vulnerabilities/`)
-
-```
-vulnerabilities/
-├── generic/
-│   ├── basic-xss.yaml
-│   ├── sqli-error-based.yaml
-│   └── ...
-├── wordpress/
-├── joomla/
-├── drupal/
-└── ...
-```
-
-### Misconfiguration Templates (`misconfiguration/`)
-
-```
-misconfiguration/
-├── apache/
-├── nginx/
-├── cors/
-├── headers/
-└── ...
-```
-
-### Exposure Templates (`exposures/`)
-
-```
-exposures/
-├── configs/
-│   ├── git-config.yaml
-│   ├── env-file.yaml
-│   └── ...
-├── files/
-├── logs/
-└── ...
-```
-
-### Technology Templates (`technologies/`)
-
-```
-technologies/
-├── tech-detect.yaml
-├── waf-detect/
-├── cms-detect/
-└── ...
-```
+| Path | Contents |
+|------|----------|
+| `http/cves/<year>/` | CVE templates, updated within days of disclosure |
+| `http/vulnerabilities/` | Generic and product vulnerabilities (WordPress, Joomla, Drupal, ...) |
+| `http/misconfiguration/` | Server, CORS and header misconfigurations |
+| `http/exposures/` | Exposed configs, files and logs (`.git/config`, `.env`, ...) |
+| `http/technologies/` | Technology, WAF and CMS detection |
+| `http/default-logins/` | Default credentials |
+| `http/takeovers/` | Subdomain takeovers |
+| `dast/` | Fuzzing templates the DAST pass runs |
 
 ---
 
@@ -1134,7 +1018,7 @@ technologies/
 
 ```json
 {
-  "nuclei": {
+  "vuln_scan": {
     "scan_metadata": {
       "scan_timestamp": "2024-01-15T12:00:00.000000",
       "scan_duration_seconds": 245.5,
@@ -1144,65 +1028,46 @@ technologies/
       "docker_image": "projectdiscovery/nuclei:latest",
       "anonymous_mode": false,
       "severity_filter": ["critical", "high", "medium", "low"],
-      "tags_filter": [],
-      "exclude_tags": ["dos", "ddos"],
+      "tags_filter": ["cve", "xss", "sqli", "rce", "lfi", "ssrf", "xxe", "ssti"],
+      "tags_ai_selected": false,
+      "exclude_tags": ["dos", "fuzz"],
       "rate_limit": 100,
       "dast_mode": true,
+      "dast_pass_executed": true,
       "dast_urls_discovered": 47,
-      "katana_crawl_depth": 3,
-      "katana_js_crawl": true,
-      "katana_params_only": true,
-      "katana_scope": "dn",
+      "katana_crawl_depth": 2,
       "total_urls_scanned": 52,
       "total_hostnames": 5,
-      "total_ips": 2
+      "total_ips": 2,
+      "false_positives_filtered": 1,
+      "coverage": {
+        "at": "2024-01-15T11:58:00+00:00",
+        "hosts": {
+          "https://example.com:443": {"status": "complete", "inputs": 2, "outputs": 1, "reason": null}
+        }
+      }
     },
-    
+
     "discovered_urls": {
       "base_urls": [
-        "http://example.com",
-        "https://example.com",
-        "http://api.example.com"
+        "http://api.example.com",
+        "https://example.com"
       ],
       "dast_urls_with_params": [
         "http://example.com/search?q=test",
-        "http://example.com/api/users?id=1",
-        "http://example.com/login?redirect=/dashboard",
-        "http://example.com/product?category=books&sort=price"
+        "http://example.com/api/users?id=1"
       ],
       "all_scanned_urls": [
-        "http://example.com",
-        "https://example.com",
-        "http://example.com/search?q=test",
+        "http://api.example.com",
+        "http://example.com/api/users?id=1",
         "..."
       ]
     },
-    
+
     "by_target": {
       "https://example.com": {
         "findings": [
-          {
-            "template_id": "CVE-2021-44228",
-            "name": "Apache Log4j RCE",
-            "description": "Remote code execution via JNDI injection",
-            "severity": "critical",
-            "category": "cve",
-            "tags": ["cve", "rce", "log4j", "jndi"],
-            "cves": [
-              {
-                "id": "CVE-2021-44228",
-                "cvss": 10.0,
-                "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-44228"
-              }
-            ],
-            "cvss_score": 10.0,
-            "target": "https://example.com",
-            "matched_at": "https://example.com/api/v1/login",
-            "curl_command": "curl -X POST ...",
-            "request": "POST /api/v1/login HTTP/1.1...",
-            "response": "HTTP/1.1 200 OK...",
-            "timestamp": "2024-01-15T12:05:00.000000"
-          }
+          { "...": "parse_nuclei_finding() output, see above" }
         ],
         "severity_counts": {
           "critical": 1,
@@ -1213,7 +1078,7 @@ technologies/
         }
       }
     },
-    
+
     "summary": {
       "total_findings": 50,
       "critical": 1,
@@ -1223,48 +1088,39 @@ technologies/
       "info": 19,
       "unknown": 0
     },
-    
+
     "vulnerabilities": {
-      "total": 31,
-      "critical": [
-        {
-          "template_id": "CVE-2021-44228",
-          "name": "Apache Log4j RCE",
-          "target": "https://example.com",
-          "matched_at": "https://example.com/api/v1/login",
-          "category": "cve",
-          "cves": ["CVE-2021-44228"],
-          "cvss": 10.0
-        }
-      ],
-      "high": [...],
-      "medium": [...],
-      "low": [...],
-      "info": [...],
-      "unknown": []
+      "critical": 1,
+      "high": 5,
+      "medium": 15,
+      "low": 10,
+      "info": 19,
+      "unknown": 0
     },
-    
+
     "all_cves": [
       {
         "id": "CVE-2021-44228",
         "cvss": 10.0,
         "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-44228"
-      },
-      {
-        "id": "CVE-2021-45046",
-        "cvss": 9.0,
-        "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-45046"
       }
     ],
-    
+
     "by_category": {
-      "cve": [...],
-      "xss": [...],
-      "sqli": [...],
-      "misconfiguration": [...],
-      "exposure": [...]
+      "rce": [
+        {
+          "template_id": "CVE-2021-44228",
+          "name": "Apache Log4j RCE",
+          "target": "https://example.com",
+          "matched_at": "https://example.com/api/v1/login",
+          "category": "rce",
+          "cves": ["CVE-2021-44228"],
+          "cvss": 10.0
+        }
+      ],
+      "xss": [...]
     },
-    
+
     "by_template": {
       "CVE-2021-44228": {
         "name": "Apache Log4j RCE",
@@ -1272,10 +1128,22 @@ technologies/
         "findings_count": 3,
         "targets": ["https://example.com", "https://api.example.com"]
       }
-    }
+    },
+
+    "false_positives": [
+      {"template_id": "...", "matched_at": "...", "reason": "Rate limiting detected (...)"}
+    ],
+
+    "security_checks": { "...": "see Custom Security Checks" }
   }
 }
 ```
+
+- `templates_available` is a fixed approximation, not a count of the volume.
+- `vulnerabilities` holds per-severity counts (the same figures as `summary`).
+- `all_cves` is deduplicated by id and sorted by CVSS, highest first.
+- `coverage.hosts` is keyed by `scheme://host:port`: `complete` when every pass that targeted the host finished, `partial` when one was stopped (e.g. by the runtime cap), `failed` when none ran or all failed; `inputs` counts the URLs sent, `outputs` the findings.
+- When Nuclei is disabled, `vuln_scan` keeps this shape with empty values and `execution_mode: "disabled"`. When it could not run (no Docker, no templates, no template selected), `vuln_scan` holds only `scan_metadata.coverage`, marking the hosts `failed`, and the `security_checks` added after it.
 
 ---
 
@@ -1304,13 +1172,14 @@ technologies/
 │                    COMPLETE VULNERABILITY SCAN                   │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  1. Nmap Scan                       2. Nuclei Scan              │
+│  1. Nmap Scan (GROUP 3.5)           2. Nuclei Scan (GROUP 6)    │
 │  ─────────────                      ────────────                │
-│  • Port discovery                   • Uses nmap ports data      │
-│  • Service detection                • Web application CVEs      │
-│  • OS fingerprinting                • Exposed panels/files      │
-│  • Network vulns                    • Default credentials       │
-│  • Banner grabbing                  • Cloud misconfigs          │
+│  • Service/version detection        • URLs from httpx and       │
+│    on the open ports                  resource_enum             │
+│  • NSE vuln scripts                 • Web application CVEs      │
+│  • Versions feed the CVE lookup     • Exposed panels/files      │
+│                                     • Default credentials       │
+│                                     • Cloud misconfigs          │
 │                                     • Technology detection      │
 │           │                                   │                 │
 │           └──────────────┬───────────────────┘                 │
@@ -1326,33 +1195,26 @@ technologies/
 
 ## Usage Examples
 
-### Basic Usage (via main.py)
+### Basic Usage (full pipeline)
 
-```python
-# Include "vuln_scan" in SCAN_MODULES in project settings
-SCAN_MODULES = ["domain_discovery", "port_scan", "http_probe", "vuln_scan"]
+The module runs when the project's scan modules include `vuln_scan` (they do by default). Start a recon scan from the webapp; the orchestrator spawns the recon container, which runs `recon/main.py` with the project's settings.
 
-# Run the full pipeline
-python3 recon/main.py
-```
+### Partial Recon
+
+`recon/partial_recon_modules/vulnerability_scanning.py` re-runs `run_vuln_scan()` on demand (`run_nuclei`) against the graph's BaseURLs and endpoints and any URLs the user typed in, and `run_security_checks_partial` runs the security checks alone.
 
 ### Standalone Enrichment
 
 ```python
-from nuclei_scan import enrich_recon_file
+from recon.main_recon_modules.vuln_scan import enrich_recon_file
 from pathlib import Path
 
 enriched = enrich_recon_file(Path("output/recon_example.com.json"))
 ```
 
-### Command Line
-
-```bash
-# Enrich an existing recon file
-python3 recon/nuclei_scan.py output/recon_example.com.json
-```
-
 ### Custom Configuration Profiles
+
+Values to enter in the project settings (shown as runtime keys):
 
 **Quick Web Scan (Fast):**
 ```python
@@ -1372,9 +1234,8 @@ NUCLEI_INTERACTSH = True
 
 **CVE-Only Scan:**
 ```python
-NUCLEI_TEMPLATES = ["cves"]
+NUCLEI_TAGS = ["cve"]
 NUCLEI_SEVERITY = ["critical", "high", "medium"]
-NUCLEI_TAGS = []
 ```
 
 **Web Application Pentest:**
@@ -1384,24 +1245,14 @@ NUCLEI_SEVERITY = ["critical", "high", "medium"]
 NUCLEI_HEADLESS = True
 ```
 
-**DAST Mode with Katana (Active Fuzzing):**
+**DAST Mode (Active Fuzzing):**
 ```python
-# Enable DAST mode - Katana will crawl for URLs with parameters
+# Enable the DAST pass; it fuzzes resource_enum's parameterized URLs
 NUCLEI_DAST_MODE = True
 NUCLEI_SEVERITY = ["critical", "high", "medium"]
-
-# Katana crawler settings
-KATANA_DEPTH = 3              # How deep to crawl
-KATANA_MAX_URLS = 500         # Max URLs to discover
-KATANA_JS_CRAWL = True        # Parse JavaScript files
-KATANA_PARAMS_ONLY = True     # Only URLs with ?params
-
-# For authenticated scanning (optional)
-KATANA_CUSTOM_HEADERS = [
-    "Cookie: session=your_session_cookie",
-    "Authorization: Bearer your_jwt_token"
-]
 ```
+
+The crawl that finds those URLs is configured in resource enumeration (Katana depth, max URLs, JavaScript crawling: see [README.RESOURCE_ENUM.md](README.RESOURCE_ENUM.md)). For authenticated scanning, attach an authenticated-session profile to the project: its headers reach both passes when every scanned host is in scope.
 
 **DAST Expected Findings:**
 - SQL Injection in search forms
@@ -1416,32 +1267,13 @@ KATANA_CUSTOM_HEADERS = [
 
 ### Common Issues
 
-#### "Docker not found"
+#### "[!][Nuclei] Docker not found" / "Docker daemon is not running"
 
-```bash
-# Install Docker
-sudo apt install docker.io  # Debian/Ubuntu
-# or
-sudo pacman -S docker       # Arch
+Nuclei runs through the host's Docker daemon. Check that Docker is running on the host (`docker info`) and that the recon container can reach it. The CVE lookup and the security checks still run, and the previous Nuclei findings are kept.
 
-# Start Docker daemon
-sudo systemctl start docker
-sudo systemctl enable docker
+#### "Include Tags is empty AND no custom templates are selected"
 
-# Add user to docker group (optional, avoids sudo)
-sudo usermod -aG docker $USER
-# Log out and back in for group change to take effect
-```
-
-#### "Docker daemon is not running"
-
-```bash
-# Start Docker
-sudo systemctl start docker
-
-# Check status
-sudo systemctl status docker
-```
+Empty `NUCLEI_TAGS` means custom templates only. Add tags (e.g. `cve`, `xss`, `sqli`) or select a custom template; until then the detection pass is skipped.
 
 #### Scan too slow
 
@@ -1453,14 +1285,21 @@ NUCLEI_CONCURRENCY = 50
 NUCLEI_SEVERITY = ["critical", "high"]  # Skip lower severities
 ```
 
+A log line "N% of ... requests are erroring with no matches after 10 min" means the targets are mostly failing (a tarpit or dead hosts): lower `NUCLEI_MAX_RUNTIME` or `NUCLEI_MAX_HOST_ERROR`.
+
+#### Pass stopped at the runtime cap
+
+"hit the ...h runtime cap (NUCLEI_MAX_RUNTIME)" means the pass was killed; its partial findings are kept and its hosts are marked `partial`. Raise `NUCLEI_MAX_RUNTIME` (up to 7 days) or narrow the tags.
+
 #### Too many false positives
 
 ```python
 # Be more selective
 NUCLEI_SEVERITY = ["critical", "high"]
 NUCLEI_EXCLUDE_TAGS = ["dos", "fuzz", "intrusive"]
-NUCLEI_EXCLUDE_TEMPLATES = ["fuzzing"]
 ```
+
+Check `vuln_scan.false_positives` for what the filter already dropped.
 
 #### Memory issues
 
@@ -1474,20 +1313,11 @@ NUCLEI_CONCURRENCY = 10
 
 **Problem:** `NUCLEI_DAST_MODE = True` but no XSS/SQLi findings.
 
-**Cause:** DAST templates need URLs with parameters (`?key=value`) to fuzz.
+**Cause:** DAST templates need URLs with parameters (`?key=value`) to fuzz, and they come only from `resource_enum`.
 
 **Solution:**
-```python
-# Make sure Katana is configured properly
-NUCLEI_DAST_MODE = True
-KATANA_DEPTH = 3              # Increase if site is deep
-KATANA_MAX_URLS = 1000        # Increase for larger sites
-KATANA_PARAMS_ONLY = True     # Must be True for DAST
-KATANA_JS_CRAWL = True        # Parse JavaScript
-
-# Check the discovered_urls in output JSON
-# If dast_urls_with_params is empty, Katana didn't find parameterized URLs
-```
+- Check `vuln_scan.scan_metadata.dast_pass_executed` and `discovered_urls.dast_urls_with_params` in the output JSON: an empty list means resource enumeration found no parameterized URL, and the log says "DAST pass skipped (no parameterized URLs available)"
+- Make sure resource enumeration runs (`resource_enum` in the scan modules) and crawls deep enough
 
 **Manual test:**
 ```bash
@@ -1495,22 +1325,6 @@ KATANA_JS_CRAWL = True        # Parse JavaScript
 docker run --rm projectdiscovery/katana:latest \
   -u https://example.com -d 3 -jc -silent | grep "?"
 ```
-
-#### Katana not finding URLs behind login
-
-**Solution:** Use custom headers for authentication:
-```python
-KATANA_CUSTOM_HEADERS = [
-    "Cookie: session=abc123; PHPSESSID=xyz789",
-    "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
-]
-```
-
-**How to get the cookie:**
-1. Log into the site in your browser
-2. Open DevTools (F12) → Network tab
-3. Refresh the page
-4. Click any request → Headers → Copy the Cookie header value
 
 #### Templates not updating
 
@@ -1526,10 +1340,10 @@ Run nuclei manually via Docker to debug:
 
 ```bash
 docker run --rm \
-  -v $(pwd):/data \
+  -v nuclei-templates:/root/nuclei-templates \
   projectdiscovery/nuclei:latest \
   -u https://example.com \
-  -t cves/ \
+  -tags cve \
   -severity critical,high \
   -v -debug
 ```
@@ -1542,11 +1356,12 @@ docker run --rm \
 
 | Risk | Mitigation |
 |------|------------|
-| Rate limiting/bans | Reduce `NUCLEI_RATE_LIMIT` |
+| Rate limiting/bans | Reduce `NUCLEI_RATE_LIMIT`, or set the engagement ceiling (`ROE_GLOBAL_MAX_RPS`) |
 | WAF blocking | Reduce concurrency, use delays |
 | Service disruption | Exclude `dos` and `fuzz` tags |
-| Detection | Reduce rate limit |
+| Detection | Reduce rate limit, or use stealth mode |
 | Account lockouts | Exclude `brute` tag |
+| Session leakage | With session headers, OAST and cross-host redirects are disabled automatically |
 
 ### Safe Defaults
 
@@ -1554,7 +1369,6 @@ docker run --rm \
 NUCLEI_RATE_LIMIT = 50
 NUCLEI_SEVERITY = ["critical", "high", "medium"]
 NUCLEI_EXCLUDE_TAGS = ["dos", "fuzz", "intrusive"]
-NUCLEI_EXCLUDE_TEMPLATES = ["fuzzing"]
 ```
 
 ---
@@ -1563,11 +1377,11 @@ NUCLEI_EXCLUDE_TEMPLATES = ["fuzzing"]
 
 | Package | Purpose |
 |---------|---------|
-| Docker | Container runtime for nuclei and katana |
-| `projectdiscovery/nuclei:latest` | Nuclei Docker image (auto-pulled) |
-| `projectdiscovery/katana:latest` | Katana crawler Docker image (auto-pulled for DAST) |
+| Docker | Container runtime for nuclei |
+| `projectdiscovery/nuclei:latest` | Nuclei Docker image (pulled on each scan) |
 | `nuclei-templates` volume | Persistent template storage (auto-created) |
-| Python 3.8+ | Script runtime |
+| `alpine` image | Checks the templates volume and removes root-owned output files |
+| Python 3.11 | The recon image's runtime |
 
 ---
 
@@ -1594,14 +1408,15 @@ NUCLEI_EXCLUDE_TEMPLATES = ["fuzzing"]
 
 ## Custom Security Checks
 
-In addition to Nuclei templates, RedAmon includes custom Python-based security checks that detect vulnerabilities **not covered by Nuclei**.
+In addition to Nuclei templates, RedAmon includes custom Python-based security checks (`recon/helpers/security_checks.py`) that detect vulnerabilities **not covered by Nuclei**. They run after the Nuclei passes, also when Nuclei is disabled.
 
 ### Why Custom Checks?
 
 | Check Type | Nuclei Coverage | Custom Check Adds |
 |------------|-----------------|-------------------|
 | **Direct IP Access** | No | WAF bypass via IP (blocked-vs-allowed payload differential) + unauthenticated `PURGE`/`BAN` cache endpoint |
-| **TLS Expiry** | No | Warns before cert expires |
+| **TLS** | No | Expiry warning, plus hygiene from the certificate data tlsx/httpx already hold |
+| **Security Headers** | Partial | Only headers Nuclei does not check |
 | **DNS Security** | No | SPF, DMARC, DNSSEC, Zone Transfer |
 | **Rate Limiting** | No | Brute-force protection detection |
 | **Service Exposure** | Partial | Redis no-auth, K8s API, SMTP relay |
@@ -1615,6 +1430,27 @@ In addition to Nuclei templates, RedAmon includes custom Python-based security c
 | `session_no_secure` | Medium | Session cookie missing Secure flag |
 | `session_no_httponly` | Medium | Session cookie missing HttpOnly flag |
 | `basic_auth_no_tls` | High | Basic Auth over unencrypted HTTP |
+
+#### TLS / Certificates
+| Check | Severity | Description |
+|-------|----------|-------------|
+| `tls_expiring_soon` | Low | Certificate expires within `SECURITY_CHECK_TLS_EXPIRY_DAYS` |
+| `tls_expired` | High | Certificate already expired |
+| `tls_self_signed` | Medium | Self-signed certificate |
+| `tls_hostname_mismatch` | Low / Medium | Certificate does not name the host |
+| `tls_weak_version` | Medium | A weak TLS version negotiated or supported |
+| `tls_weak_cipher` | Medium | A weak cipher negotiated or supported |
+| `tls_wildcard_overbroad` | Low | Wildcard certificate with an overbroad SAN list |
+
+The hygiene checks (all but `tls_expiring_soon`) read stored certificate data and send nothing; they also run when the active scans are skipped.
+
+#### Security Headers
+| Check | Severity | Description |
+|-------|----------|-------------|
+| `missing_referrer_policy` | Low | No `Referrer-Policy` |
+| `missing_permissions_policy` | Low | No `Permissions-Policy` |
+| `missing_coop` / `missing_corp` / `missing_coep` | Info | No cross-origin isolation headers |
+| `cache_control_missing` | Info | No `no-store` / `no-cache` / `private` |
 
 #### DNS Security
 | Check | Severity | Description |
@@ -1644,6 +1480,54 @@ In addition to Nuclei templates, RedAmon includes custom Python-based security c
 |-------|----------|-------------|
 | `no_rate_limiting` | Medium | No rate limit on login endpoints |
 
+#### Direct IP Access
+| Check | Severity | Description |
+|-------|----------|-------------|
+| `direct_ip_http` / `direct_ip_https` | Varies | Content served on the bare IP over HTTP / HTTPS |
+| `ip_api_exposed` | High / Medium | An API path (`/api`, `/api/v1`, `/api/v2`, `/graphql`, `/rest`, `/v1`, `/v2`) answers on the bare IP over plain HTTP: `200` + JSON is High, an API's own `401`/`403` is Medium |
+| `waf_bypass` (`payload_differential`) | High | The edge blocks a WAF-signature probe that the origin, addressed by IP with the real Host header, serves |
+| `cache_purge_exposed` | High | The cache at the IP accepts an unauthenticated `PURGE`/`BAN` that a bogus control method does not get |
+
+**The catch-all control (`ip_api_exposed`).** Many servers answer every path
+alike (`200 {"code":"NOT_FOUND"}`, an SPA shell). After a `200` + JSON hit the
+check asks the same server for a path that cannot exist next to it
+(`<parent prefix>rdm-<12 hex>`, through the same `_hh_get`, headers and
+`allow_redirects=False`; `recon/helpers/catchall.py`). The same answer means the
+hit proves nothing: the path is skipped and the next one tried. A real hit
+records `control_check: passed` in its evidence and as a `control_check`
+property; a control that could not be sent or read keeps the finding as
+`control_check: failed` (never evidence either way). "The same answer" is the
+same status (2xx/3xx by class, others exactly) and normalised bodies (the echoed
+path, nonce, hostname and request ids stripped) within 64 bytes or 5%, word
+counts within 5 or 10%, sharing at least 90% of their tokens. One control is
+sent per IP and path prefix per run (`ControlCache`), never to an RoE-excluded
+host, and the run logs how many it sent. JS Recon's endpoint validation uses
+the same control (`validation_status: catch_all`, no Endpoint node).
+
+**The payload differential (`waf_bypass`).** A bypass needs the edge to block
+the probe (403, 406, 429, 501, 999 or 202) **and** the origin to serve it: a
+**2xx** answer whose normalised body shares at least 80% of its tokens with the
+page the edge serves for a benign request to `https://<host>/` (one extra
+request, sent only once a probe is a candidate). A 302 to login, a 401, a 404
+or a 421 from the origin is the origin refusing; a 2xx default page that is not
+the site, or an edge with no 2xx page of its own, gives no finding either. The
+evidence carries `edge_status`, `origin_status`, `edge_baseline_status` and
+`body_similarity`, and the Priority Board rates the method's confidence 0.95.
+The `waf-bypass` guinea pig exercises it.
+
+**Challenge pages.** A Cloudflare challenge (`cf-mitigated`,
+`challenge-platform`, "Just a moment...") or an Akamai "Access Denied" page with
+a reference number is the edge answering, not the target. `ip_api_exposed`
+stops probing a challenged IP and reports nothing for it, and the host is
+recorded once per run as a `challenge_blocked` coverage gap of `vuln_scan`, so
+the report's Coverage Limitations shows it was not really checked. A challenged
+control is "no conclusion" and records the same gap.
+
+**User-Agent.** The checks send `DEFAULT_BROWSER_UA`
+(`recon/helpers/user_agent.py`), the full desktop Chrome string httpx and katana
+default to; a bare `Mozilla/5.0` or a truncated Chrome string is what bot rules
+match first.
+
 ### Configuration
 
 All checks are enabled by default. Disable in the webapp project settings:
@@ -1657,42 +1541,51 @@ SECURITY_CHECK_LOGIN_NO_HTTPS = True
 SECURITY_CHECK_SPF_MISSING = True
 SECURITY_CHECK_REDIS_NO_AUTH = True
 SECURITY_CHECK_NO_RATE_LIMITING = True
-# ... see project_settings.py for full list
+# ... one SECURITY_CHECK_<NAME> key per check (see the settings registry)
 
 # Performance
 SECURITY_CHECK_TIMEOUT = 10   # Request timeout (seconds)
 SECURITY_CHECK_MAX_WORKERS = 10  # Parallel workers
+SECURITY_CHECK_TLS_EXPIRY_DAYS = 30  # tls_expiring_soon threshold
 ```
+
+Stealth mode turns off `direct_ip_http`, `direct_ip_https`, `waf_bypass`, `admin_port_exposed`, `database_exposed`, `redis_no_auth`, `kubernetes_api_exposed`, `smtp_open_relay`, `zone_transfer` and `no_rate_limiting`. `WAF_AI_CLASSIFIER` (driven by the AI-in-pipeline switch) adds an LLM classification of WAF/CDN presence when the static check misses.
 
 ### Output Structure
 
-Custom security check findings are stored in `security_checks`:
+Custom security check findings are stored in `vuln_scan.security_checks`:
 
 ```json
 {
-  "security_checks": {
-    "scan_timestamp": "2025-01-04T12:00:00",
-    "findings": [
-      {
-        "type": "redis_no_auth",
-        "severity": "critical",
-        "name": "Redis Without Authentication",
-        "ip": "192.168.1.100",
-        "port": 6379,
-        "evidence": "PING command returned PONG without authentication",
-        "recommendation": "Enable Redis AUTH and use strong passwords."
+  "vuln_scan": {
+    "security_checks": {
+      "scan_timestamp": "2025-01-04T12:00:00",
+      "checks_enabled": {"redis_no_auth": true, "spf_missing": true, "...": true},
+      "targets_checked": {"hostnames": 5, "ips": 2},
+      "findings": [
+        {
+          "type": "redis_no_auth",
+          "severity": "critical",
+          "name": "Redis Without Authentication",
+          "description": "Redis at 192.168.1.100:6379 responds to commands without authentication. ...",
+          "ip": "192.168.1.100",
+          "port": 6379,
+          "evidence": "PING command returned PONG without authentication",
+          "recommendation": "Enable Redis AUTH and use strong passwords. Never expose Redis to the internet."
+        }
+      ],
+      "by_type": {
+        "redis_no_auth": [...]
+      },
+      "summary": {
+        "total_findings": 5,
+        "critical": 1,
+        "high": 2,
+        "medium": 2,
+        "low": 0,
+        "info": 0
       }
-    ],
-    "summary": {
-      "total_findings": 5,
-      "critical": 1,
-      "high": 2,
-      "medium": 2
     }
   }
 }
 ```
-
----
-
-*Documentation generated for RedAmon v1.0 - Nuclei Scanner Module with Katana DAST Integration*

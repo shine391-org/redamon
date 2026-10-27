@@ -11,6 +11,7 @@ import { Brain, ChevronDown, ChevronRight, Copy, Check } from 'lucide-react'
 import styles from './ThinkingCard.module.css'
 import { TodoListWidget } from './TodoListWidget'
 import { formatTokenCount } from '@/lib/formatTokens'
+import { copyText } from '@/lib/copyText'
 import type { ThinkingItem } from './AgentTimeline'
 
 interface ThinkingCardProps {
@@ -34,7 +35,7 @@ export function ThinkingCard({ item, isExpanded, onToggleExpand }: ThinkingCardP
         tool_name: item.tool_name,
         tool_args: item.tool_args,
       }
-      await navigator.clipboard.writeText(JSON.stringify(data, null, 2))
+      await copyText(JSON.stringify(data, null, 2))
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch {

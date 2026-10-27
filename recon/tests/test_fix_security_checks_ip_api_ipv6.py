@@ -14,6 +14,7 @@ Addresses are RFC 5737 / RFC 3849 documentation ranges.
 from __future__ import annotations
 
 import json
+import re
 from unittest import mock
 
 import pytest
@@ -58,6 +59,7 @@ def _ip_api(responses_by_path, ip=V4):
 class TestIpApiExposedSeverity:
     def test_a_json_200_is_still_high_and_unchanged(self):
         f, _ = _ip_api({"/api": _resp(200, {"Content-Type": "application/json"}, '{"ok":1}')})
+        f["evidence"] = re.sub(r"/rdm-[0-9a-f]{12}", "/rdm-*", f["evidence"])
         assert f == {
             "type": "ip_api_exposed",
             "severity": "high",
@@ -69,7 +71,9 @@ class TestIpApiExposedSeverity:
             "path": "/api",
             "status_code": 200,
             "content_type": "application/json",
-            "evidence": "API endpoint returned 200 with application/json",
+            "evidence": "API endpoint returned 200 with application/json; control_check: passed "
+                        "(/rdm-* answered 404, the hit 200)",
+            "control_check": "passed",
         }
 
     @pytest.mark.parametrize("status,body", [
@@ -147,7 +151,8 @@ class TestIpv6UrlsAreBracketed:
 
     def test_ip_api_exposed(self):
         f, calls = _ip_api({"/api": _resp(200, {"Content-Type": "application/json"}, "{}")}, ip=V6)
-        assert calls == [f"http://[{V6}]/api"]
+        assert calls[0] == f"http://[{V6}]/api"
+        assert len(calls) == 2 and calls[1].startswith(f"http://[{V6}]/rdm-")   # the catch-all control
         assert f["url"] == f"http://[{V6}]/api" and f["matched_ip"] == V6
 
     def test_cache_purge(self):
@@ -158,8 +163,10 @@ class TestIpv6UrlsAreBracketed:
         assert f["url"] == f"http://[{V6}]/"
 
     def test_waf_bypass_origin_urls(self):
+        # The edge blocks the probes and serves the site; the origin serves both.
         get = mock.MagicMock(side_effect=lambda url, *a, **k: _resp(
-            403 if "example.test" in url else 200, {"Server": "cloudflare"} if "example" in url else {}))
+            403 if "example.test" in url and sc._WAF_PROBE_PARAM in url else 200,
+            {"Server": "cloudflare"} if "example" in url else {}))
         with mock.patch.object(sc.requests, "get", get):
             f = sc.check_waf_bypass("www.example.test", V6, timeout=1)
         origin_urls = [c.args[0] for c in get.call_args_list if "example.test" not in c.args[0]]
@@ -197,7 +204,11 @@ class TestIpv6UrlsAreBracketed:
 
 class TestIpv4UrlsAreByteIdentical:
     def test_every_direct_ip_url(self):
-        get = mock.MagicMock(return_value=_resp(200, {"Content-Type": "application/json"}, "{}"))
+        def answer(url, *a, **k):
+            if "/rdm-" in url:      # the catch-all control: a real API 404s a made-up path
+                return _resp(404, {"Content-Type": "application/json"}, '{"error":"not found"}')
+            return _resp(200, {"Content-Type": "application/json"}, "{}")
+        get = mock.MagicMock(side_effect=answer)
         req = mock.MagicMock(return_value=_resp(405))
         with mock.patch.object(sc.requests, "get", get), \
              mock.patch.object(sc.requests, "request", req):
@@ -206,5 +217,177 @@ class TestIpv4UrlsAreByteIdentical:
             sc.check_ip_api_exposed(V4, timeout=1)
             sc.check_cache_purge_exposed(V4, timeout=1)
         urls = [c.args[0] for c in get.call_args_list] + [c.args[1] for c in req.call_args_list]
-        assert set(urls) == {f"http://{V4}", f"https://{V4}", f"http://{V4}/api",
-                             f"http://{V4}/", f"https://{V4}/"}
+        controls = [u for u in urls if "/rdm-" in u]
+        assert len(controls) == 1 and controls[0].startswith(f"http://{V4}/rdm-")
+        assert set(urls) - set(controls) == {f"http://{V4}", f"https://{V4}", f"http://{V4}/api",
+                                             f"http://{V4}/", f"https://{V4}/"}
+
+
+NOT_FOUND = _resp(200, {"Content-Type": "application/json"}, '{"code":"NOT_FOUND"}')
+API_PATHS = ("/api", "/api/v1", "/api/v2", "/graphql", "/rest", "/v1", "/v2")
+
+
+def _catch_all_get(body_by_path=None, default=None):
+    """A server answering every path, made-up ones included, with one JSON body."""
+    calls = []
+    body_by_path = body_by_path or {}
+
+    def get(url, *a, **k):
+        calls.append(url)
+        path = "/" + url.split("/", 3)[3] if url.count("/") >= 3 else "/"
+        return body_by_path.get(path, default or NOT_FOUND)
+
+    return get, calls
+
+
+class TestTheCatchAllControl:
+    """API Endpoint Exposed on IP (High) used to fire on any 200 + JSON:
+    a server answering `200 {"code":"NOT_FOUND"}` to every path tripped it."""
+
+    def test_a_catch_all_json_server_gives_no_finding(self):
+        get, calls = _catch_all_get()
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            assert sc.check_ip_api_exposed(V4, timeout=1) is None
+        hits = [u for u in calls if "/rdm-" not in u]
+        assert hits == [f"http://{V4}{p}" for p in API_PATHS]
+        # one control per prefix: /rdm-... and /api/rdm-...
+        controls = sorted(u.rsplit("/", 1)[0] for u in calls if "/rdm-" in u)
+        assert controls == [f"http://{V4}", f"http://{V4}/api"]
+
+    def test_a_real_api_with_a_404_control_is_a_finding_that_passed(self):
+        get, calls = _catch_all_get(
+            {"/api/v1": _resp(200, {"Content-Type": "application/json"}, '{"service":"orders","version":"2.1"}')},
+            default=_resp(404, {"Content-Type": "application/json"}, '{"code":"NOT_FOUND"}'))
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            f = sc.check_ip_api_exposed(V4, timeout=1)
+        assert f["path"] == "/api/v1" and f["severity"] == "high"
+        assert f["control_check"] == "passed"
+        assert "control_check: passed" in f["evidence"]
+
+    def test_a_catch_all_on_one_prefix_does_not_hide_a_real_api_on_another(self):
+        def answer(url, *a, **k):
+            path = "/" + url.split("/", 3)[3]
+            if path.startswith("/api/"):
+                return NOT_FOUND                        # /api/* is a catch-all router
+            if path == "/v1":
+                return _resp(200, {"Content-Type": "application/json"}, '{"name":"inventory","v":"1.4"}')
+            return _resp(404, {"Content-Type": "text/html"}, "nf")
+        with mock.patch.object(sc.requests, "get", side_effect=answer):
+            f = sc.check_ip_api_exposed(V4, timeout=1)
+        assert f["path"] == "/v1" and f["control_check"] == "passed"
+
+    def test_a_failed_control_keeps_the_finding_and_says_so(self):
+        def answer(url, *a, **k):
+            if "/rdm-" in url:
+                raise requests.ConnectionError("reset")
+            return NOT_FOUND
+        with mock.patch.object(sc.requests, "get", side_effect=answer):
+            f = sc.check_ip_api_exposed(V4, timeout=1)
+        assert f["path"] == "/api" and f["severity"] == "high"
+        assert f["control_check"] == "failed"
+        assert "control_check: failed" in f["evidence"]
+
+    def test_the_control_is_sent_like_the_check(self):
+        get = mock.MagicMock(side_effect=lambda url, *a, **k: NOT_FOUND if "/rdm-" not in url
+                             else _resp(404, {}, "nf"))
+        with mock.patch.object(sc.requests, "get", get):
+            sc.check_ip_api_exposed(V4, timeout=1)
+        hit, control = get.call_args_list[0], get.call_args_list[1]
+        assert "/rdm-" in control.args[0]
+        assert control.kwargs == hit.kwargs     # same timeout, headers, no redirects
+        assert control.kwargs["allow_redirects"] is False
+
+    def test_the_control_goes_through_host_health(self):
+        def answer(url, *a, **k):
+            if "/rdm-" in url:
+                raise requests.ConnectionError("reset")
+            return NOT_FOUND
+        with mock.patch.object(sc.requests, "get", side_effect=answer), \
+             mock.patch.object(sc, "_hh_failed") as failed, mock.patch.object(sc, "_hh_alive") as alive:
+            sc.check_ip_api_exposed(V4, timeout=1)
+        assert [c.args[0] for c in failed.call_args_list if "/rdm-" in c.args[0]]
+        assert f"http://{V4}/api" in [c.args[0] for c in alive.call_args_list]
+
+
+# run_direct_ip_checks runs each direct-IP check unless told otherwise.
+ONLY_IP_API = {"ip_api_exposed": True, "direct_ip_http": False, "direct_ip_https": False,
+               "cache_purge_exposed": False, "waf_bypass": False}
+
+
+def _recon_with_ip(ip=V4):
+    return {"domain": "example.test", "dns": {
+        "domain": {}, "subdomains": {"api.example.test": {
+            "has_records": True, "ips": {"ipv4": [ip], "ipv6": []}}}}}
+
+
+class TestTheControlInTheRun:
+    def test_the_run_shares_one_control_cache_and_reports_its_size(self, capsys):
+        get, calls = _catch_all_get()
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            out = sc.run_security_checks(_recon_with_ip(), ONLY_IP_API, timeout=1, max_workers=1)
+        assert out["security_checks"]["findings"] == []
+        assert len([u for u in calls if "/rdm-" in u]) == 2
+        assert "Catch-all control probes sent: 2" in capsys.readouterr().out
+        assert sc._CONTROL_CACHE is None        # reset after the run
+
+    def test_an_roe_excluded_host_gets_no_control(self):
+        get, calls = _catch_all_get()
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            sc.run_security_checks(_recon_with_ip(), ONLY_IP_API, timeout=1, max_workers=1,
+                                   roe_excluded_hosts=[V4])
+        assert not [u for u in calls if "/rdm-" in u]
+
+    def test_no_control_runs_when_the_check_is_off(self):
+        get, calls = _catch_all_get()
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            sc.run_security_checks(_recon_with_ip(), {**ONLY_IP_API, "ip_api_exposed": False,
+                                                      "direct_ip_http": True}, timeout=1, max_workers=1)
+        assert calls and not [u for u in calls if "/rdm-" in u]
+
+
+CF_CHALLENGE = _resp(403, {"Content-Type": "application/json", "cf-mitigated": "challenge"},
+                     '{"error":"challenge"}')
+CHALLENGE_PAGE = _resp(403, {"Content-Type": "text/html"},
+                       '<html><head><title>Just a moment...</title></head><body>'
+                       '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script></body></html>')
+
+
+def _challenge_gaps():
+    return [g for g in cb.coverage_report().gaps if g["source"] == "challenge_blocked"]
+
+
+class TestChallengePages:
+    """A bot challenge is the edge's answer, not the target's: it is never a
+    finding, and the host is recorded as not really checked."""
+
+    def test_a_challenged_api_path_is_never_a_finding(self):
+        """The JSON content type and 403 would otherwise make it a medium."""
+        get, calls = _catch_all_get(default=CF_CHALLENGE)
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            assert sc.check_ip_api_exposed(V4, timeout=1) is None
+        assert calls == [f"http://{V4}/api"]        # the host is challenged: stop probing it
+
+    def test_a_challenged_host_is_one_coverage_gap(self):
+        get, _ = _catch_all_get(default=CHALLENGE_PAGE)
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            sc.check_ip_api_exposed(V4, timeout=1)
+            sc.check_ip_api_exposed(V4, timeout=1)
+        gaps = _challenge_gaps()
+        assert len(gaps) == 1
+        assert (gaps[0]["module"], gaps[0]["reason"], gaps[0]["skipped"]) == ("vuln_scan", V4, 1)
+        report = cb.coverage_report()
+        assert "security_check" not in report.degraded_sources   # an entry: no prune effect
+
+    def test_a_challenged_control_keeps_the_finding_and_notes_the_host(self):
+        def answer(url, *a, **k):
+            return CHALLENGE_PAGE if "/rdm-" in url else NOT_FOUND
+        with mock.patch.object(sc.requests, "get", side_effect=answer):
+            f = sc.check_ip_api_exposed(V4, timeout=1)
+        assert f["control_check"] == "failed" and "challenge page" in f["evidence"]
+        assert [g["reason"] for g in _challenge_gaps()] == [V4]
+
+    def test_an_ordinary_403_is_not_a_challenge(self):
+        get, _ = _catch_all_get(default=_resp(403, {"Content-Type": "text/html"}, "<h1>Forbidden</h1>"))
+        with mock.patch.object(sc.requests, "get", side_effect=get):
+            sc.check_ip_api_exposed(V4, timeout=1)
+        assert _challenge_gaps() == []

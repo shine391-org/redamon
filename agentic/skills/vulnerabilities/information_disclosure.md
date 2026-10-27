@@ -215,11 +215,11 @@ execute_curl url: "https://target.tld/api/me"
 
 ```
 1. /.env returns AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
-2. kali_shell: aws sts get-caller-identity --profile leaked
+2. execute_code: boto3 `sts.get_caller_identity()` with the leaked keys
 3. Enumerate IAM perms; if SES / S3 / Lambda perms present, escalate
 ```
 
-(AWS CLI may not be present in the Kali image; use `execute_code` with `boto3` or fall back to the AWS REST API via `execute_curl` + SigV4.)
+(The Kali image has no AWS CLI; use `execute_code` with `boto3` or fall back to the AWS REST API via `execute_curl` + SigV4.)
 
 ### Source maps -> hidden admin endpoints
 

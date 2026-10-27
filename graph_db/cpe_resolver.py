@@ -163,6 +163,21 @@ def _parse_cpe_string(cpe: str):
     return None
 
 
+#: The cache http_probe.download_wappalyzer_database refreshes (24h TTL, pinned
+#: WAPPALYZER_NPM_VERSION), relative to the directory holding recon/. Reading
+#: any other copy resolves CPEs against fingerprints nothing updates.
+WAPPALYZER_CACHE_RELPATH = Path(
+    "recon", "main_recon_modules", "data", "wappalyzer_cache", "technologies.json")
+
+
+def _wappalyzer_cache_candidates():
+    """recon/ beside graph_db/ (the checkout, and /app in the recon and
+    orchestrator containers), or one level further up."""
+    here = Path(__file__).parent
+    return [here.parent / WAPPALYZER_CACHE_RELPATH,
+            here.parent.parent / WAPPALYZER_CACHE_RELPATH]
+
+
 def _load_wappalyzer_reverse_cpe():
     """
     Lazy-load the Wappalyzer technology cache and build a reverse CPE lookup.
@@ -174,12 +189,7 @@ def _load_wappalyzer_reverse_cpe():
         return _WAPPALYZER_REVERSE_CPE
 
     _WAPPALYZER_REVERSE_CPE = {}
-    # Try multiple paths (works from different execution contexts)
-    candidates = [
-        Path(__file__).parent.parent / "recon" / "data" / "wappalyzer_cache" / "technologies.json",
-        Path(__file__).parent.parent.parent / "recon" / "data" / "wappalyzer_cache" / "technologies.json",
-    ]
-    for cache_path in candidates:
+    for cache_path in _wappalyzer_cache_candidates():
         if cache_path.exists():
             try:
                 with open(cache_path) as f:

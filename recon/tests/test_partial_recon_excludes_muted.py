@@ -6,7 +6,9 @@ operator had suppressed as noise was still used to DRIVE a new scan -- and the
 scan then re-created findings from it. Mute held everywhere it was read for
 DISPLAY and nowhere it was read for INPUT.
 
-This is a ninth read path; the feature plan's inventory listed eight.
+This is a ninth read path; the feature plan's inventory listed eight. Plan 12.12
+then replaced that query: JS Recon writes its GraphQL endpoints as Endpoint
+nodes, so the seed reads those, and no finding label seeds the scan.
 
 Asserted on the query source rather than against a live database: the defect was
 a missing clause in the Cypher, the surrounding function needs a real Neo4j
@@ -45,32 +47,17 @@ def cypher_blocks(src: str) -> list:
 
 
 class TestMutedFindingsDoNotSeedAScan(unittest.TestCase):
-    def test_the_graphql_seed_query_excludes_muted_findings(self):
-        # The exact query that regressed. An operator's mute is excluded; a
-        # node-filter rule mute is not (it only hides noise from display, and
-        # full recon scans its in-memory results regardless), so the accepted
-        # forms are the bare exclusion or the operator-only carve-out.
-        block = next(b for b in cypher_blocks(source()) if "JsReconFinding" in b)
-        carve_out = "NOT (jr:Muted AND NOT coalesce(jr.muted_by, '') STARTS WITH 'rule:')"
-        self.assertTrue("NOT jr:Muted" in block or carve_out in block,
-                        "a suppressed JsReconFinding would be re-scanned as a target")
-
-    def test_the_carve_out_only_admits_rule_mutes(self):
-        # Guards the carve-out's direction: `STARTS WITH 'rule:'` must sit
-        # inside the NOT, or every operator mute would seed a scan again.
-        block = next(b for b in cypher_blocks(source()) if "JsReconFinding" in b)
-        if "STARTS WITH 'rule:'" in block:
-            self.assertIn("AND NOT (jr:Muted AND NOT coalesce(jr.muted_by, '') STARTS WITH 'rule:')", block)
-
-    def test_the_mute_filter_did_not_break_the_finding_type_predicate(self):
-        # The original WHERE was `A OR B`. Appending `AND NOT ...` without
-        # parenthesising would silently change it to `A OR (B AND NOT muted)`,
-        # letting muted graphql findings back in through the first branch.
-        block = next(b for b in cypher_blocks(source()) if "JsReconFinding" in b)
-        where = block[block.index("WHERE"):block.index("RETURN")]
-        self.assertRegex(
-            where, r"WHERE\s*\(",
-            "the OR predicate must stay parenthesised when the mute filter is ANDed on")
+    def test_the_graphql_seed_reads_endpoints_not_findings(self):
+        # The GraphQL seed used to read JsReconFinding, and once let muted ones
+        # back in. JS Recon writes its GraphQL endpoints as Endpoint nodes (an
+        # asset, never muted), and the finding query matched nothing, so plan
+        # 12.12 replaced it: no finding label seeds the GraphQL scan any more.
+        blocks = [b for b in cypher_blocks(source()) if "endpoint_type" in b]
+        self.assertTrue(blocks, "the GraphQL Endpoint seed query is missing")
+        for block in blocks:
+            self.assertIn("e.endpoint_type IN ['graphql', 'graphql_introspection']", block)
+        self.assertFalse([b for b in cypher_blocks(source()) if "JsReconFinding" in b
+                          and "graphql" in b.lower()])
 
     def test_every_seed_query_reading_a_finding_label_excludes_muted(self):
         # The general rule, so the next seed query added here cannot repeat it.

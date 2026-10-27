@@ -73,33 +73,134 @@ def _cb_enabled() -> bool:
         return False
 
 
+# Inside one batch group (or partial root), an open latch is probed again after
+# this long, doubling up to the maximum, by one thread at a time; the same
+# half-open rhythm as circuit_breaker.Breaker.
+RESOLVER_COOLDOWN_S = 120.0
+RESOLVER_COOLDOWN_MAX_S = 1800.0
+
+
 class _ResolverBreaker:
-    """Shared DNS resolver liveness, canary-gated (see the block comment)."""
+    """Shared DNS resolver liveness, canary-gated (see the block comment).
+
+    It used to latch for the rest of the process, and batch groups and partial
+    roots run one after another in one process: after one bad moment, every
+    later group resolved nothing (so it scanned nothing), had its ownership
+    check refused, and recorded no DNS gap. Now recheck() gives each group and
+    each root a fresh canary probe, an open latch is probed again after a
+    cooldown inside a group, and every lookup it skips is recorded by host.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._open = False
-        self._canary = None
-        self._noted = False
+        self._clock = time.monotonic
+        self.reset()
 
     def reset(self):
+        """Tests only: forget everything, the canary included."""
         with self._lock:
             self._open = False
             self._canary = None
             self._noted = False
+            self._probing = False
+            self._cooldown = RESOLVER_COOLDOWN_S
+            self._retry_at = 0.0
+            self._skipped = set()
 
     def set_canary(self, name: str):
+        """The most recent root that answered: the likeliest to answer again."""
         if not name:
             return
         with self._lock:
-            if self._canary is None:
-                self._canary = name
+            self._canary = name
 
     def is_open(self) -> bool:
         if not _cb_enabled():
             return False
         with self._lock:
-            return self._open
+            if not self._open:
+                return False
+            if self._probing or self._clock() < self._retry_at:
+                return True
+            self._probing = True
+        alive = self._probe()
+        with self._lock:
+            if alive:
+                self._close_locked()
+            else:
+                self._cooldown = min(self._cooldown * 2, RESOLVER_COOLDOWN_MAX_S)
+                self._retry_at = self._clock() + self._cooldown
+        if alive:
+            print("[+][DNS] Resolver answering again: lookups resumed")
+        return not alive
+
+    def recheck(self) -> bool:
+        """At the start of a batch group or a partial root: one canary probe
+        if the latch is open. True when lookups may run. Either way a new trip
+        in this group is noted in this group's coverage."""
+        if not _cb_enabled():
+            return True
+        with self._lock:
+            self._noted = False
+            self._skipped = set()
+            if not self._open:
+                return True
+            if self._probing:
+                return False
+            self._probing = True
+        alive = self._probe()
+        with self._lock:
+            if alive:
+                self._close_locked()
+            else:
+                self._noted = True
+                self._retry_at = self._clock() + self._cooldown
+        if alive:
+            print("[+][DNS] Resolver answering again: lookups resumed")
+            return True
+        print("[!][DNS] Resolver still down: skipping this group's lookups")
+        self._note_gap()
+        return False
+
+    def note_skipped(self, hostname: str) -> None:
+        """A lookup skipped because the latch is open: nothing re-checked this
+        host, so its findings are kept for every source (the note_degraded
+        default for hosts). Once per host per group."""
+        if not hostname:
+            return
+        with self._lock:
+            if hostname in self._skipped:
+                return
+            self._skipped.add(hostname)
+        try:
+            from recon.helpers import circuit_breaker as cb
+            cb.note_degraded("domain_recon", hosts=[hostname], host_source="dns",
+                             reason="DNS resolver down")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close_locked(self):
+        self._open = False
+        self._noted = False
+        self._cooldown = RESOLVER_COOLDOWN_S
+        self._retry_at = 0.0
+        self._probing = False
+
+    def _probe(self) -> bool:
+        """One canary probe; the caller set _probing."""
+        try:
+            return self._canary_responds()
+        finally:
+            with self._lock:
+                self._probing = False
+
+    @staticmethod
+    def _note_gap():
+        try:
+            from recon.helpers import circuit_breaker as cb
+            cb.note_degraded("domain_recon", sources=["dns"], reason="DNS resolver down")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _canary_responds(self) -> bool:
         """True if the canary root gets ANY definitive DNS response (even
@@ -119,29 +220,30 @@ class _ResolverBreaker:
 
     def note_transient(self) -> bool:
         """Record a transient resolution failure. Returns True when the resolver
-        is now considered DOWN (the caller should stop retrying this run)."""
+        is now considered DOWN (the caller should stop retrying this group).
+        One thread asks the canary at a time; the others retry as usual."""
         if not _cb_enabled():
             return False
         with self._lock:
             if self._open:
                 return True
-            have_canary = self._canary is not None
-        if not have_canary:
-            return False  # can't distinguish a dead resolver from a dead name
-        if self._canary_responds():
+            if self._canary is None:
+                return False  # can't distinguish a dead resolver from a dead name
+            if self._probing:
+                return False
+            self._probing = True
+        if self._probe():
             return False  # resolver is fine; this specific name is unreachable
         with self._lock:
             self._open = True
+            self._cooldown = RESOLVER_COOLDOWN_S
+            self._retry_at = self._clock() + self._cooldown
             noted = self._noted
             self._noted = True
         if not noted:
             print("[!][DNS] Resolver appears down (canary root did not answer) - "
-                  "skipping remaining lookups this run")
-            try:
-                from recon.helpers import circuit_breaker as cb
-                cb.note_degraded("domain_recon", sources=["dns"], reason="DNS resolver down")
-            except Exception:  # noqa: BLE001
-                pass
+                  "skipping remaining lookups this group")
+            self._note_gap()
         return True
 
 
@@ -944,9 +1046,10 @@ def dns_lookup_single(hostname: str, rtype: str, max_retries: int = 3) -> list:
         List of DNS records or None if not found/failed
     """
     
-    # A resolver already proven down this run: skip immediately, don't retry
+    # A resolver already proven down this group: skip immediately, don't retry
     # into a timeout wall (inert under the off switch).
     if resolver_breaker.is_open():
+        resolver_breaker.note_skipped(hostname)
         return None
 
     definitive = _dns_definitive_errors()
@@ -962,8 +1065,9 @@ def dns_lookup_single(hostname: str, rtype: str, max_retries: int = 3) -> list:
         except (dns.resolver.NoNameservers, dns.resolver.Timeout,
                 dns.resolver.LifetimeTimeout) as e:
             # Transient. The canary decides whether the resolver itself is down;
-            # if so, stop retrying every remaining record type/host this run.
+            # if so, stop retrying every remaining record type/host this group.
             if resolver_breaker.note_transient():
+                resolver_breaker.note_skipped(hostname)
                 return None
             if attempt < max_retries - 1:
                 delay = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
@@ -974,6 +1078,7 @@ def dns_lookup_single(hostname: str, rtype: str, max_retries: int = 3) -> list:
             # An unexpected resolver error is treated as transient (canary-gated)
             # but a dns.name syntax error was already handled above.
             if resolver_breaker.note_transient():
+                resolver_breaker.note_skipped(hostname)
                 return None
             if attempt < max_retries - 1:
                 delay = 2 ** attempt
@@ -1204,7 +1309,36 @@ def _refresh_shared_resolvers(src: Path, shared: Path) -> None:
         print(f"[!][Puredns] Could not refresh the shared resolver list: {e}")
 
 
-def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) -> list:
+# Why puredns was meant to run and did not, as the coverage note words it.
+_PUREDNS_SKIP_REASONS = {
+    "breaker_open": "paused after repeated failures",
+    "no_resolvers": "no resolver list",
+    "no_output": "produced no output",
+    "timeout": "timed out",
+    "docker_missing": "Docker not found",
+    "error": "failed",
+}
+
+
+def _puredns_skipped(subdomains: list, reason: str) -> tuple:
+    """``(subdomains, "skipped:<reason>")``, recording the cut for the report.
+
+    Subdomains are assets, not findings, so this is a gap note with no prune
+    effect; it reaches the report's Coverage Limitations block.
+    """
+    try:
+        from recon.helpers import circuit_breaker as cb
+        cb.note_degraded("puredns", entries=[{
+            "source": "puredns",
+            "reason": f"{_PUREDNS_SKIP_REASONS[reason]}; names not wildcard-checked by puredns",
+            "skipped": len(subdomains),
+        }])
+    except Exception:  # noqa: BLE001 - a lost note must not fail discovery
+        pass
+    return subdomains, f"skipped:{reason}"
+
+
+def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) -> tuple:
     """
     Filter subdomains using puredns resolve to remove wildcards and DNS-poisoned entries.
 
@@ -1212,21 +1346,23 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
     discovery tools, validates each entry against public DNS resolvers, and returns
     only the subdomains that are confirmed to exist (not wildcards or poisoned).
 
-    On any error, returns the original unfiltered list (graceful degradation).
+    Returns ``(names, status)``: status "filtered", or "skipped:<reason>" with the
+    input list unchanged. "disabled" (configuration or stealth mode) and
+    "no_input" are not cuts; every other skip is recorded as a coverage gap.
     """
     if settings is None:
         settings = {}
 
     if not settings.get('PUREDNS_ENABLED', True):
         print(f"[-][Puredns] Disabled — skipping wildcard filtering")
-        return subdomains
+        return subdomains, "skipped:disabled"
 
     if not subdomains:
         print(f"[-][Puredns] No subdomains to validate")
-        return subdomains
+        return subdomains, "skipped:no_input"
 
     if _source_skipped("puredns", "Puredns"):
-        return subdomains  # graceful: the unfiltered list is still usable
+        return _puredns_skipped(subdomains, "breaker_open")
 
     docker_image = settings.get('PUREDNS_DOCKER_IMAGE', 'frost19k/puredns:latest')
     threads = settings.get('PUREDNS_THREADS', 0)
@@ -1250,7 +1386,7 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
     _refresh_shared_resolvers(resolver_src, resolver_shared)
     if not resolver_shared.exists():
         print(f"[!][Puredns] No resolver list found — skipping")
-        return subdomains
+        return _puredns_skipped(subdomains, "no_resolvers")
 
     # Write input subdomain list
     with open(input_file, 'w') as f:
@@ -1284,26 +1420,26 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
             removed = len(subdomains) - len(filtered)
             print(f"[+][Puredns] Validated: {len(filtered)} real, {removed} filtered (wildcards/poisoned)")
             _source_record("puredns", _outcome("OK"))
-            return filtered
+            return filtered, "filtered"
         else:
             print(f"[!][Puredns] No output file produced — returning unfiltered list")
             if result.stderr:
                 print(f"[!][Puredns] stderr: {result.stderr[:500]}")
             _source_record("puredns", _outcome("TRANSIENT"),
                            detail=f"no output (exit {result.returncode})")
-            return subdomains
+            return _puredns_skipped(subdomains, "no_output")
 
     except subprocess.TimeoutExpired:
         print("[!][Puredns] Timed out (600s) — returning unfiltered list")
         _source_record("puredns", _outcome("TRANSIENT"), detail="timeout")
-        return subdomains
+        return _puredns_skipped(subdomains, "timeout")
     except FileNotFoundError:
         print("[!][Puredns] Docker not found — cannot run")
-        return subdomains
+        return _puredns_skipped(subdomains, "docker_missing")
     except Exception as e:
         print(f"[!][Puredns] Error: {e} — returning unfiltered list")
         _source_record("puredns", _outcome("TRANSIENT"), detail=type(e).__name__)
-        return subdomains
+        return _puredns_skipped(subdomains, "error")
     finally:
         # Cleanup temp files (may be root-owned from Docker)
         for tmp in [input_file, output_file]:
@@ -1320,6 +1456,18 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
                     )
                 except Exception:  # noqa: BLE001 - best-effort cleanup
                     pass
+
+
+def _guessing_sources(bruteforce: bool, settings: dict) -> set:
+    """Discovery sources that guess names from a wordlist instead of observing
+    them. knockpy --recon alone reads passive sources; amass guesses only with
+    -brute, and its passive names come back in the same set."""
+    guessing = set()
+    if bruteforce:
+        guessing.add("knockpy")
+    if settings.get('AMASS_ENABLED', False) and settings.get('AMASS_BRUTE', False):
+        guessing.add("amass")
+    return guessing
 
 
 def discover_subdomains(domain: str, bruteforce: bool = False,
@@ -1428,7 +1576,7 @@ def discover_subdomains(domain: str, bruteforce: bool = False,
 
     # Puredns wildcard filtering (after discovery fan-in, before DNS resolution)
     pre_filter_count = len(all_subs)
-    all_subs = run_puredns_resolve(all_subs, domain, settings)
+    all_subs, wildcard_filter = run_puredns_resolve(all_subs, domain, settings)
     if len(all_subs) < pre_filter_count:
         print(f"[+][Puredns] Wildcard filtering: {pre_filter_count} → {len(all_subs)} subdomains")
 
@@ -1439,7 +1587,8 @@ def discover_subdomains(domain: str, bruteforce: bool = False,
             "scan_timestamp": datetime.now().isoformat(),
             "target_domain": domain,
             "anonymous_mode": False,
-            "bruteforce_mode": bruteforce
+            "bruteforce_mode": bruteforce,
+            "wildcard_filter": wildcard_filter,
         },
         "domain": domain,
         "subdomains": all_subs,
@@ -1449,10 +1598,27 @@ def discover_subdomains(domain: str, bruteforce: bool = False,
     }
     
     # DNS Resolution for domain + all subdomains
+    from recon.helpers import wildcard_control
     if resolve:
         dns_workers = (settings or {}).get('DNS_MAX_WORKERS', 50)
         dns_record_parallel = (settings or {}).get('DNS_RECORD_PARALLELISM', True)
         result["dns"] = resolve_all_dns(domain, all_subs, max_workers=dns_workers, record_parallelism=dns_record_parallel, settings=settings)
+        # RedAmon's own wildcard check, whatever puredns did: it stands in when
+        # puredns was skipped and records which zones are wildcards.
+        control = wildcard_control.filter_discovered(
+            domain, all_subs, result["dns"], sourced_subs, settings or {},
+            guessing=_guessing_sources(bruteforce, settings or {}))
+        if control.dropped:
+            dropped = set(control.dropped)
+            all_subs = [s for s in all_subs if s not in dropped]
+            for s in dropped:
+                (result["dns"].get("subdomains") or {}).pop(s, None)
+            result["subdomains"] = all_subs
+            result["subdomain_count"] = len(all_subs)
+        result["wildcard_zones"] = control.zones
+        result["metadata"]["wildcard_dropped"] = len(control.dropped)
+    elif wildcard_filter != "filtered":
+        wildcard_control.note_unchecked(len(all_subs), wildcard_control.REASON_DNS_OFF)
 
     # Build subdomain status map from DNS results
     subdomain_status_map = {}
@@ -1463,9 +1629,10 @@ def discover_subdomains(domain: str, bruteforce: bool = False,
             if info.get("has_records", False):
                 subdomain_status_map[s] = "resolved"
     else:
-        # DNS step was skipped (resolve=False) — assume all are resolved
+        # Nothing was resolved, brute-forced guesses included: "unverified" is
+        # the value every writer uses for a name nobody resolved.
         for s in all_subs:
-            subdomain_status_map[s] = "resolved"
+            subdomain_status_map[s] = "unverified"
     result["subdomain_status_map"] = subdomain_status_map
 
     # Save JSON output (use project_id for filename if provided, fallback to domain)

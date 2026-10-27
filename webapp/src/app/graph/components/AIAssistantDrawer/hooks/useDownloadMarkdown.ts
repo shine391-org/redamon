@@ -212,7 +212,9 @@ export function useDownloadMarkdown(deps: DownloadMarkdownDeps) {
         lines.push('')
       } else if (item.type === 'tool_execution') {
         const time = item.timestamp.toLocaleTimeString()
-        const statusIcon = item.status === 'success' ? 'OK' : item.status === 'error' ? 'FAIL' : 'RUNNING'
+        const statusIcon = item.status === 'success' ? 'OK'
+          : item.status === 'error' ? (item.interrupted ? 'INTERRUPTED' : 'FAIL')
+          : item.finished ? 'ANALYZING' : 'RUNNING'
         lines.push(`### Tool: \`${item.tool_name}\`  \`${time}\`  [${statusIcon}]`)
         lines.push('')
 

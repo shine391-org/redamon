@@ -494,6 +494,173 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
 }
 
 
+# The Project column behind every agent setting that has one. fetch_agent_settings
+# reads each column through this map and /defaults names each default after it,
+# so both directions use the real column name. A naming rule cannot do that: the
+# ssrf*, rce*, sqli*, pathTraversal* and deserialization* families, authProfile and
+# agentGuardrailEnabled fit no prefix, and a setting left out here is never loaded.
+AGENT_SETTING_COLUMNS: dict[str, str] = {
+    'OPENAI_MODEL': 'agentOpenaiModel',
+    'INFORMATIONAL_SYSTEM_PROMPT': 'agentInformationalSystemPrompt',
+    'EXPL_SYSTEM_PROMPT': 'agentExplSystemPrompt',
+    'POST_EXPL_SYSTEM_PROMPT': 'agentPostExplSystemPrompt',
+    'ACTIVATE_POST_EXPL_PHASE': 'agentActivatePostExplPhase',
+    'POST_EXPL_PHASE_TYPE': 'agentPostExplPhaseType',
+    'LHOST': 'agentLhost',
+    'LPORT': 'agentLport',
+    'BIND_PORT_ON_TARGET': 'agentBindPortOnTarget',
+    'PAYLOAD_USE_HTTPS': 'agentPayloadUseHttps',
+    'NGROK_TUNNEL_ENABLED': 'agentNgrokTunnelEnabled',
+    'CHISEL_TUNNEL_ENABLED': 'agentChiselTunnelEnabled',
+    'MAX_ITERATIONS': 'agentMaxIterations',
+    'EXECUTION_TRACE_MEMORY_STEPS': 'agentExecutionTraceMemorySteps',
+    'REQUIRE_APPROVAL_FOR_EXPLOITATION': 'agentRequireApprovalForExploitation',
+    'REQUIRE_APPROVAL_FOR_POST_EXPLOITATION': 'agentRequireApprovalForPostExploitation',
+    'REQUIRE_TOOL_CONFIRMATION': 'agentRequireToolConfirmation',
+    'TOOL_OUTPUT_MAX_CHARS': 'agentToolOutputMaxChars',
+    'PLAN_MAX_PARALLEL_TOOLS': 'agentPlanMaxParallelTools',
+    'CYPHER_MAX_RETRIES': 'agentCypherMaxRetries',
+    'LLM_PARSE_MAX_RETRIES': 'agentLlmParseMaxRetries',
+    'CREATE_GRAPH_IMAGE_ON_INIT': 'agentCreateGraphImageOnInit',
+    'LOG_MAX_MB': 'agentLogMaxMb',
+    'LOG_BACKUP_COUNT': 'agentLogBackupCount',
+    'TOOL_PHASE_MAP': 'agentToolPhaseMap',
+    'BRUTE_FORCE_MAX_WORDLIST_ATTEMPTS': 'agentBruteForceMaxWordlistAttempts',
+    'BRUTEFORCE_SPEED': 'agentBruteforceSpeed',
+    'KALI_INSTALL_ENABLED': 'agentKaliInstallEnabled',
+    'KALI_INSTALL_ALLOWED_PACKAGES': 'agentKaliInstallAllowedPackages',
+    'KALI_INSTALL_FORBIDDEN_PACKAGES': 'agentKaliInstallForbiddenPackages',
+    'HYDRA_ENABLED': 'hydraEnabled',
+    'HYDRA_THREADS': 'hydraThreads',
+    'HYDRA_WAIT_BETWEEN_CONNECTIONS': 'hydraWaitBetweenConnections',
+    'HYDRA_CONNECTION_TIMEOUT': 'hydraConnectionTimeout',
+    'HYDRA_STOP_ON_FIRST_FOUND': 'hydraStopOnFirstFound',
+    'HYDRA_EXTRA_CHECKS': 'hydraExtraChecks',
+    'HYDRA_VERBOSE': 'hydraVerbose',
+    'HYDRA_MAX_WORDLIST_ATTEMPTS': 'hydraMaxWordlistAttempts',
+    'SHODAN_ENABLED': 'shodanEnabled',
+    'CAPTURE_PROXY_ENABLED': 'captureProxyEnabled',
+    'STEALTH_MODE': 'stealthMode',
+    'AGENT_GUARDRAIL_ENABLED': 'agentGuardrailEnabled',
+    # Fireteam (multi-agent)
+    'FIRETEAM_ENABLED': 'fireteamEnabled',
+    'FIRETEAM_MAX_CONCURRENT': 'fireteamMaxConcurrent',
+    'FIRETEAM_MAX_MEMBERS': 'fireteamMaxMembers',
+    'FIRETEAM_MEMBER_MAX_ITERATIONS': 'fireteamMemberMaxIterations',
+    'FIRETEAM_TIMEOUT_SEC': 'fireteamTimeoutSec',
+    'FIRETEAM_ALLOWED_PHASES': 'fireteamAllowedPhases',
+    'FIRETEAM_CONFIRMATION_TIMEOUT_SEC': 'fireteamConfirmationTimeoutSec',
+    'FIRETEAM_PROPENSITY': 'fireteamPropensity',
+    'LATS_ENABLED': 'agentLatsEnabled',
+    'LATS_SHADOW_MODE': 'agentLatsShadowMode',
+    'LATS_MIN_HYPOTHESES': 'agentLatsMinHypotheses',
+    'LATS_BRANCHING': 'agentLatsBranching',
+    'LATS_MAX_DEPTH': 'agentLatsMaxDepth',
+    'LATS_MAX_ROLLOUTS': 'agentLatsMaxRollouts',
+    'LATS_MAX_TREE_NODES': 'agentLatsMaxTreeNodes',
+    'LATS_UCT_C': 'agentLatsUctC',
+    'LATS_PRUNE_FLOOR': 'agentLatsPruneFloor',
+    'PHISHING_SMTP_CONFIG': 'phishingSmtpConfig',
+    'DOS_MAX_DURATION': 'dosMaxDuration',
+    'DOS_MAX_ATTEMPTS': 'dosMaxAttempts',
+    'DOS_CONCURRENT_CONNECTIONS': 'dosConcurrentConnections',
+    'DOS_ASSESSMENT_ONLY': 'dosAssessmentOnly',
+    # SQL injection (sqlmap)
+    'SQLI_LEVEL': 'sqliLevel',
+    'SQLI_RISK': 'sqliRisk',
+    'SQLI_TAMPER_SCRIPTS': 'sqliTamperScripts',
+    # SSRF
+    'SSRF_OOB_CALLBACK_ENABLED': 'ssrfOobCallbackEnabled',
+    'SSRF_CLOUD_METADATA_ENABLED': 'ssrfCloudMetadataEnabled',
+    'SSRF_GOPHER_ENABLED': 'ssrfGopherEnabled',
+    'SSRF_DNS_REBINDING_ENABLED': 'ssrfDnsRebindingEnabled',
+    'SSRF_PAYLOAD_REFERENCE_ENABLED': 'ssrfPayloadReferenceEnabled',
+    'SSRF_REQUEST_TIMEOUT': 'ssrfRequestTimeout',
+    'SSRF_PORT_SCAN_PORTS': 'ssrfPortScanPorts',
+    'SSRF_INTERNAL_RANGES': 'ssrfInternalRanges',
+    'SSRF_OOB_PROVIDER': 'ssrfOobProvider',
+    'SSRF_CLOUD_PROVIDERS': 'ssrfCloudProviders',
+    'SSRF_CUSTOM_INTERNAL_TARGETS': 'ssrfCustomInternalTargets',
+    # RCE
+    'RCE_OOB_CALLBACK_ENABLED': 'rceOobCallbackEnabled',
+    'RCE_DESERIALIZATION_ENABLED': 'rceDeserializationEnabled',
+    'RCE_AGGRESSIVE_PAYLOADS': 'rceAggressivePayloads',
+    # Path Traversal / LFI / RFI
+    'PATH_TRAVERSAL_OOB_CALLBACK_ENABLED': 'pathTraversalOobCallbackEnabled',
+    'PATH_TRAVERSAL_PHP_WRAPPERS_ENABLED': 'pathTraversalPhpWrappersEnabled',
+    'PATH_TRAVERSAL_ARCHIVE_EXTRACTION_ENABLED': 'pathTraversalArchiveExtractionEnabled',
+    'PATH_TRAVERSAL_PAYLOAD_REFERENCE_ENABLED': 'pathTraversalPayloadReferenceEnabled',
+    'PATH_TRAVERSAL_REQUEST_TIMEOUT': 'pathTraversalRequestTimeout',
+    'PATH_TRAVERSAL_OOB_PROVIDER': 'pathTraversalOobProvider',
+    # Insecure deserialization
+    'DESERIALIZATION_OOB_CALLBACK_ENABLED': 'deserializationOobCallbackEnabled',
+    'DESERIALIZATION_OOB_PROVIDER': 'deserializationOobProvider',
+    'DESERIALIZATION_TIMING_ENABLED': 'deserializationTimingEnabled',
+    'DESERIALIZATION_FIND_SINKS_ENABLED': 'deserializationFindSinksEnabled',
+    'DESERIALIZATION_RUNTIMES': 'deserializationRuntimes',
+    'DESERIALIZATION_EXEC_GADGETS_ENABLED': 'deserializationExecGadgetsEnabled',
+    'DESERIALIZATION_PHAR_ENABLED': 'deserializationPharEnabled',
+    'ATTACK_SKILL_CONFIG': 'attackSkillConfig',
+    'ROE_RAW_TEXT': 'roeRawText',
+    'ROE_CLIENT_NAME': 'roeClientName',
+    'ROE_CLIENT_CONTACT_NAME': 'roeClientContactName',
+    'ROE_CLIENT_CONTACT_EMAIL': 'roeClientContactEmail',
+    'ROE_CLIENT_CONTACT_PHONE': 'roeClientContactPhone',
+    'ROE_EMERGENCY_CONTACT': 'roeEmergencyContact',
+    'ROE_ENGAGEMENT_START_DATE': 'roeEngagementStartDate',
+    'ROE_ENGAGEMENT_END_DATE': 'roeEngagementEndDate',
+    'ROE_ENGAGEMENT_TYPE': 'roeEngagementType',
+    'ROE_EXCLUDED_HOSTS': 'roeExcludedHosts',
+    'ROE_EXCLUDED_HOST_REASONS': 'roeExcludedHostReasons',
+    'ROE_TIME_WINDOW_ENABLED': 'roeTimeWindowEnabled',
+    'ROE_TIME_WINDOW_TIMEZONE': 'roeTimeWindowTimezone',
+    'ROE_TIME_WINDOW_DAYS': 'roeTimeWindowDays',
+    'ROE_TIME_WINDOW_START_TIME': 'roeTimeWindowStartTime',
+    'ROE_TIME_WINDOW_END_TIME': 'roeTimeWindowEndTime',
+    'ROE_FORBIDDEN_TOOLS': 'roeForbiddenTools',
+    'ROE_FORBIDDEN_CATEGORIES': 'roeForbiddenCategories',
+    'ROE_MAX_SEVERITY_PHASE': 'roeMaxSeverityPhase',
+    'ROE_ALLOW_DOS': 'roeAllowDos',
+    'ROE_ALLOW_SOCIAL_ENGINEERING': 'roeAllowSocialEngineering',
+    'ROE_ALLOW_PHYSICAL_ACCESS': 'roeAllowPhysicalAccess',
+    'ROE_ALLOW_DATA_EXFILTRATION': 'roeAllowDataExfiltration',
+    'ROE_ALLOW_ACCOUNT_LOCKOUT': 'roeAllowAccountLockout',
+    'ROE_ALLOW_PRODUCTION_TESTING': 'roeAllowProductionTesting',
+    'ROE_GLOBAL_MAX_RPS': 'roeGlobalMaxRps',
+    'ROE_SENSITIVE_DATA_HANDLING': 'roeSensitiveDataHandling',
+    'ROE_DATA_RETENTION_DAYS': 'roeDataRetentionDays',
+    'ROE_REQUIRE_DATA_ENCRYPTION': 'roeRequireDataEncryption',
+    'ROE_STATUS_UPDATE_FREQUENCY': 'roeStatusUpdateFrequency',
+    'ROE_CRITICAL_FINDING_NOTIFY': 'roeCriticalFindingNotify',
+    'ROE_INCIDENT_PROCEDURE': 'roeIncidentProcedure',
+    'ROE_THIRD_PARTY_PROVIDERS': 'roeThirdPartyProviders',
+    'ROE_COMPLIANCE_FRAMEWORKS': 'roeComplianceFrameworks',
+    'ROE_NOTES': 'roeNotes',
+}
+
+# Settings coerced to their type on load.
+_AGENT_SETTING_CASTS: dict[str, Any] = {
+    'PLAN_MAX_PARALLEL_TOOLS': int,
+    'FIRETEAM_ENABLED': bool,
+    'FIRETEAM_MAX_CONCURRENT': int,
+    'FIRETEAM_MAX_MEMBERS': int,
+    'FIRETEAM_MEMBER_MAX_ITERATIONS': int,
+    'FIRETEAM_TIMEOUT_SEC': int,
+    'FIRETEAM_ALLOWED_PHASES': list,
+    'FIRETEAM_CONFIRMATION_TIMEOUT_SEC': int,
+    'FIRETEAM_PROPENSITY': int,
+    'LATS_ENABLED': bool,
+    'LATS_SHADOW_MODE': bool,
+    'LATS_MIN_HYPOTHESES': int,
+    'LATS_BRANCHING': int,
+    'LATS_MAX_DEPTH': int,
+    'LATS_MAX_ROLLOUTS': int,
+    'LATS_MAX_TREE_NODES': int,
+    'LATS_UCT_C': float,
+    'LATS_PRUNE_FLOOR': float,
+}
+
+
 _SKILL_OVERRIDE_STR_FIELDS = ('value', 'baseSha256', 'overrideId', 'changeSetId', 'pluginId')
 
 
@@ -560,68 +727,19 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
     # Start with defaults, then override with API values
     settings = DEFAULT_AGENT_SETTINGS.copy()
 
-    # Map camelCase API fields to SCREAMING_SNAKE_CASE
-    settings['OPENAI_MODEL'] = project.get('agentOpenaiModel', DEFAULT_AGENT_SETTINGS['OPENAI_MODEL'])
-    settings['INFORMATIONAL_SYSTEM_PROMPT'] = project.get('agentInformationalSystemPrompt', DEFAULT_AGENT_SETTINGS['INFORMATIONAL_SYSTEM_PROMPT'])
-    settings['EXPL_SYSTEM_PROMPT'] = project.get('agentExplSystemPrompt', DEFAULT_AGENT_SETTINGS['EXPL_SYSTEM_PROMPT'])
-    settings['POST_EXPL_SYSTEM_PROMPT'] = project.get('agentPostExplSystemPrompt', DEFAULT_AGENT_SETTINGS['POST_EXPL_SYSTEM_PROMPT'])
-    settings['ACTIVATE_POST_EXPL_PHASE'] = project.get('agentActivatePostExplPhase', DEFAULT_AGENT_SETTINGS['ACTIVATE_POST_EXPL_PHASE'])
-    settings['POST_EXPL_PHASE_TYPE'] = project.get('agentPostExplPhaseType', DEFAULT_AGENT_SETTINGS['POST_EXPL_PHASE_TYPE'])
-    settings['LHOST'] = project.get('agentLhost', DEFAULT_AGENT_SETTINGS['LHOST'])
-    settings['LPORT'] = project.get('agentLport', DEFAULT_AGENT_SETTINGS['LPORT'])
-    settings['BIND_PORT_ON_TARGET'] = project.get('agentBindPortOnTarget', DEFAULT_AGENT_SETTINGS['BIND_PORT_ON_TARGET'])
-    settings['PAYLOAD_USE_HTTPS'] = project.get('agentPayloadUseHttps', DEFAULT_AGENT_SETTINGS['PAYLOAD_USE_HTTPS'])
-    settings['NGROK_TUNNEL_ENABLED'] = project.get('agentNgrokTunnelEnabled', DEFAULT_AGENT_SETTINGS['NGROK_TUNNEL_ENABLED'])
-    settings['CHISEL_TUNNEL_ENABLED'] = project.get('agentChiselTunnelEnabled', DEFAULT_AGENT_SETTINGS['CHISEL_TUNNEL_ENABLED'])
-    settings['MAX_ITERATIONS'] = project.get('agentMaxIterations', DEFAULT_AGENT_SETTINGS['MAX_ITERATIONS'])
-    settings['EXECUTION_TRACE_MEMORY_STEPS'] = project.get('agentExecutionTraceMemorySteps', DEFAULT_AGENT_SETTINGS['EXECUTION_TRACE_MEMORY_STEPS'])
-    settings['REQUIRE_APPROVAL_FOR_EXPLOITATION'] = project.get('agentRequireApprovalForExploitation', DEFAULT_AGENT_SETTINGS['REQUIRE_APPROVAL_FOR_EXPLOITATION'])
-    settings['REQUIRE_APPROVAL_FOR_POST_EXPLOITATION'] = project.get('agentRequireApprovalForPostExploitation', DEFAULT_AGENT_SETTINGS['REQUIRE_APPROVAL_FOR_POST_EXPLOITATION'])
-    settings['REQUIRE_TOOL_CONFIRMATION'] = project.get('agentRequireToolConfirmation', DEFAULT_AGENT_SETTINGS['REQUIRE_TOOL_CONFIRMATION'])
-    settings['TOOL_OUTPUT_MAX_CHARS'] = project.get('agentToolOutputMaxChars', DEFAULT_AGENT_SETTINGS['TOOL_OUTPUT_MAX_CHARS'])
-    settings['PLAN_MAX_PARALLEL_TOOLS'] = int(project.get('agentPlanMaxParallelTools', DEFAULT_AGENT_SETTINGS['PLAN_MAX_PARALLEL_TOOLS']))
-    settings['CYPHER_MAX_RETRIES'] = project.get('agentCypherMaxRetries', DEFAULT_AGENT_SETTINGS['CYPHER_MAX_RETRIES'])
-    settings['LLM_PARSE_MAX_RETRIES'] = project.get('agentLlmParseMaxRetries', DEFAULT_AGENT_SETTINGS['LLM_PARSE_MAX_RETRIES'])
-    settings['CREATE_GRAPH_IMAGE_ON_INIT'] = project.get('agentCreateGraphImageOnInit', DEFAULT_AGENT_SETTINGS['CREATE_GRAPH_IMAGE_ON_INIT'])
-    settings['LOG_MAX_MB'] = project.get('agentLogMaxMb', DEFAULT_AGENT_SETTINGS['LOG_MAX_MB'])
-    settings['LOG_BACKUP_COUNT'] = project.get('agentLogBackupCount', DEFAULT_AGENT_SETTINGS['LOG_BACKUP_COUNT'])
-    settings['TOOL_PHASE_MAP'] = project.get('agentToolPhaseMap', DEFAULT_AGENT_SETTINGS['TOOL_PHASE_MAP'])
+    for key, column in AGENT_SETTING_COLUMNS.items():
+        value = project.get(column, DEFAULT_AGENT_SETTINGS[key])
+        cast = _AGENT_SETTING_CASTS.get(key)
+        settings[key] = cast(value) if cast else value
+
     # User-managed MCP servers (UI-driven, see /settings/mcp). The webapp
     # /api/projects/[id] route includes user.settings.mcpServers in its
     # response. Stored here as a raw list of dicts; parse_user_servers()
     # validates and converts to MCPServer instances at orchestrator setup.
     settings['USER_MCP_SERVERS'] = project.get('userMcpServers', []) or []
-    settings['BRUTE_FORCE_MAX_WORDLIST_ATTEMPTS'] = project.get('agentBruteForceMaxWordlistAttempts', DEFAULT_AGENT_SETTINGS['BRUTE_FORCE_MAX_WORDLIST_ATTEMPTS'])
-    settings['BRUTEFORCE_SPEED'] = project.get('agentBruteforceSpeed', DEFAULT_AGENT_SETTINGS['BRUTEFORCE_SPEED'])
-    settings['KALI_INSTALL_ENABLED'] = project.get('agentKaliInstallEnabled', DEFAULT_AGENT_SETTINGS['KALI_INSTALL_ENABLED'])
-    settings['KALI_INSTALL_ALLOWED_PACKAGES'] = project.get('agentKaliInstallAllowedPackages', DEFAULT_AGENT_SETTINGS['KALI_INSTALL_ALLOWED_PACKAGES'])
-    settings['KALI_INSTALL_FORBIDDEN_PACKAGES'] = project.get('agentKaliInstallForbiddenPackages', DEFAULT_AGENT_SETTINGS['KALI_INSTALL_FORBIDDEN_PACKAGES'])
-    settings['HYDRA_ENABLED'] = project.get('hydraEnabled', DEFAULT_AGENT_SETTINGS['HYDRA_ENABLED'])
-    settings['HYDRA_THREADS'] = project.get('hydraThreads', DEFAULT_AGENT_SETTINGS['HYDRA_THREADS'])
-    settings['HYDRA_WAIT_BETWEEN_CONNECTIONS'] = project.get('hydraWaitBetweenConnections', DEFAULT_AGENT_SETTINGS['HYDRA_WAIT_BETWEEN_CONNECTIONS'])
-    settings['HYDRA_CONNECTION_TIMEOUT'] = project.get('hydraConnectionTimeout', DEFAULT_AGENT_SETTINGS['HYDRA_CONNECTION_TIMEOUT'])
-    settings['HYDRA_STOP_ON_FIRST_FOUND'] = project.get('hydraStopOnFirstFound', DEFAULT_AGENT_SETTINGS['HYDRA_STOP_ON_FIRST_FOUND'])
-    settings['HYDRA_EXTRA_CHECKS'] = project.get('hydraExtraChecks', DEFAULT_AGENT_SETTINGS['HYDRA_EXTRA_CHECKS'])
-    settings['HYDRA_VERBOSE'] = project.get('hydraVerbose', DEFAULT_AGENT_SETTINGS['HYDRA_VERBOSE'])
-    settings['HYDRA_MAX_WORDLIST_ATTEMPTS'] = project.get('hydraMaxWordlistAttempts', DEFAULT_AGENT_SETTINGS['HYDRA_MAX_WORDLIST_ATTEMPTS'])
-    settings['SHODAN_ENABLED'] = project.get('shodanEnabled', DEFAULT_AGENT_SETTINGS['SHODAN_ENABLED'])
-    settings['CAPTURE_PROXY_ENABLED'] = project.get('captureProxyEnabled', DEFAULT_AGENT_SETTINGS['CAPTURE_PROXY_ENABLED'])
+    # A relation the project route includes, not a column.
     settings['AUTH_PROFILE'] = project.get('authProfile', DEFAULT_AGENT_SETTINGS['AUTH_PROFILE'])
-    settings['STEALTH_MODE'] = project.get('stealthMode', DEFAULT_AGENT_SETTINGS['STEALTH_MODE'])
-    settings['AGENT_GUARDRAIL_ENABLED'] = project.get('agentGuardrailEnabled', DEFAULT_AGENT_SETTINGS['AGENT_GUARDRAIL_ENABLED'])
-    # Fireteam (multi-agent)
-    settings['FIRETEAM_ENABLED'] = bool(project.get('fireteamEnabled', DEFAULT_AGENT_SETTINGS['FIRETEAM_ENABLED']))
-    settings['FIRETEAM_MAX_CONCURRENT'] = int(project.get('fireteamMaxConcurrent', DEFAULT_AGENT_SETTINGS['FIRETEAM_MAX_CONCURRENT']))
-    settings['FIRETEAM_MAX_MEMBERS'] = int(project.get('fireteamMaxMembers', DEFAULT_AGENT_SETTINGS['FIRETEAM_MAX_MEMBERS']))
-    settings['FIRETEAM_MEMBER_MAX_ITERATIONS'] = int(project.get('fireteamMemberMaxIterations', DEFAULT_AGENT_SETTINGS['FIRETEAM_MEMBER_MAX_ITERATIONS']))
-    settings['FIRETEAM_TIMEOUT_SEC'] = int(project.get('fireteamTimeoutSec', DEFAULT_AGENT_SETTINGS['FIRETEAM_TIMEOUT_SEC']))
-    settings['FIRETEAM_ALLOWED_PHASES'] = list(project.get('fireteamAllowedPhases', DEFAULT_AGENT_SETTINGS['FIRETEAM_ALLOWED_PHASES']))
-    settings['FIRETEAM_CONFIRMATION_TIMEOUT_SEC'] = int(project.get('fireteamConfirmationTimeoutSec', DEFAULT_AGENT_SETTINGS['FIRETEAM_CONFIRMATION_TIMEOUT_SEC']))
-    settings['FIRETEAM_PROPENSITY'] = int(project.get('fireteamPropensity', DEFAULT_AGENT_SETTINGS['FIRETEAM_PROPENSITY']))
-    # LATS (exploit-path tree search). LATS_ALLOWED_PHASES is assembled from the
-    # two phase booleans; the rest map camelCase agentLats* -> LATS_* directly.
-    settings['LATS_ENABLED'] = bool(project.get('agentLatsEnabled', DEFAULT_AGENT_SETTINGS['LATS_ENABLED']))
-    settings['LATS_SHADOW_MODE'] = bool(project.get('agentLatsShadowMode', DEFAULT_AGENT_SETTINGS['LATS_SHADOW_MODE']))
+    # LATS_ALLOWED_PHASES is assembled from the two LATS phase booleans.
     _lats_phase_defaults = {'exploitation': True, 'post_exploitation': False}
     _lats_phases = [
         p for p, key in (('exploitation', 'agentLatsPhaseExploitation'),
@@ -629,50 +747,6 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
         if bool(project.get(key, _lats_phase_defaults[p]))
     ]
     settings['LATS_ALLOWED_PHASES'] = _lats_phases or list(DEFAULT_AGENT_SETTINGS['LATS_ALLOWED_PHASES'])
-    settings['LATS_MIN_HYPOTHESES'] = int(project.get('agentLatsMinHypotheses', DEFAULT_AGENT_SETTINGS['LATS_MIN_HYPOTHESES']))
-    settings['LATS_BRANCHING'] = int(project.get('agentLatsBranching', DEFAULT_AGENT_SETTINGS['LATS_BRANCHING']))
-    settings['LATS_MAX_DEPTH'] = int(project.get('agentLatsMaxDepth', DEFAULT_AGENT_SETTINGS['LATS_MAX_DEPTH']))
-    settings['LATS_MAX_ROLLOUTS'] = int(project.get('agentLatsMaxRollouts', DEFAULT_AGENT_SETTINGS['LATS_MAX_ROLLOUTS']))
-    settings['LATS_MAX_TREE_NODES'] = int(project.get('agentLatsMaxTreeNodes', DEFAULT_AGENT_SETTINGS['LATS_MAX_TREE_NODES']))
-    settings['LATS_UCT_C'] = float(project.get('agentLatsUctC', DEFAULT_AGENT_SETTINGS['LATS_UCT_C']))
-    settings['LATS_PRUNE_FLOOR'] = float(project.get('agentLatsPruneFloor', DEFAULT_AGENT_SETTINGS['LATS_PRUNE_FLOOR']))
-    settings['PHISHING_SMTP_CONFIG'] = project.get('phishingSmtpConfig', DEFAULT_AGENT_SETTINGS['PHISHING_SMTP_CONFIG'])
-    settings['DOS_MAX_DURATION'] = project.get('dosMaxDuration', DEFAULT_AGENT_SETTINGS['DOS_MAX_DURATION'])
-    settings['DOS_MAX_ATTEMPTS'] = project.get('dosMaxAttempts', DEFAULT_AGENT_SETTINGS['DOS_MAX_ATTEMPTS'])
-    settings['DOS_CONCURRENT_CONNECTIONS'] = project.get('dosConcurrentConnections', DEFAULT_AGENT_SETTINGS['DOS_CONCURRENT_CONNECTIONS'])
-    settings['DOS_ASSESSMENT_ONLY'] = project.get('dosAssessmentOnly', DEFAULT_AGENT_SETTINGS['DOS_ASSESSMENT_ONLY'])
-    # SSRF
-    settings['SSRF_OOB_CALLBACK_ENABLED'] = project.get('ssrfOobCallbackEnabled', DEFAULT_AGENT_SETTINGS['SSRF_OOB_CALLBACK_ENABLED'])
-    settings['SSRF_CLOUD_METADATA_ENABLED'] = project.get('ssrfCloudMetadataEnabled', DEFAULT_AGENT_SETTINGS['SSRF_CLOUD_METADATA_ENABLED'])
-    settings['SSRF_GOPHER_ENABLED'] = project.get('ssrfGopherEnabled', DEFAULT_AGENT_SETTINGS['SSRF_GOPHER_ENABLED'])
-    settings['SSRF_DNS_REBINDING_ENABLED'] = project.get('ssrfDnsRebindingEnabled', DEFAULT_AGENT_SETTINGS['SSRF_DNS_REBINDING_ENABLED'])
-    settings['SSRF_PAYLOAD_REFERENCE_ENABLED'] = project.get('ssrfPayloadReferenceEnabled', DEFAULT_AGENT_SETTINGS['SSRF_PAYLOAD_REFERENCE_ENABLED'])
-    settings['SSRF_REQUEST_TIMEOUT'] = project.get('ssrfRequestTimeout', DEFAULT_AGENT_SETTINGS['SSRF_REQUEST_TIMEOUT'])
-    settings['SSRF_PORT_SCAN_PORTS'] = project.get('ssrfPortScanPorts', DEFAULT_AGENT_SETTINGS['SSRF_PORT_SCAN_PORTS'])
-    settings['SSRF_INTERNAL_RANGES'] = project.get('ssrfInternalRanges', DEFAULT_AGENT_SETTINGS['SSRF_INTERNAL_RANGES'])
-    settings['SSRF_OOB_PROVIDER'] = project.get('ssrfOobProvider', DEFAULT_AGENT_SETTINGS['SSRF_OOB_PROVIDER'])
-    settings['SSRF_CLOUD_PROVIDERS'] = project.get('ssrfCloudProviders', DEFAULT_AGENT_SETTINGS['SSRF_CLOUD_PROVIDERS'])
-    settings['SSRF_CUSTOM_INTERNAL_TARGETS'] = project.get('ssrfCustomInternalTargets', DEFAULT_AGENT_SETTINGS['SSRF_CUSTOM_INTERNAL_TARGETS'])
-    # RCE
-    settings['RCE_OOB_CALLBACK_ENABLED'] = project.get('rceOobCallbackEnabled', DEFAULT_AGENT_SETTINGS['RCE_OOB_CALLBACK_ENABLED'])
-    settings['RCE_DESERIALIZATION_ENABLED'] = project.get('rceDeserializationEnabled', DEFAULT_AGENT_SETTINGS['RCE_DESERIALIZATION_ENABLED'])
-    settings['RCE_AGGRESSIVE_PAYLOADS'] = project.get('rceAggressivePayloads', DEFAULT_AGENT_SETTINGS['RCE_AGGRESSIVE_PAYLOADS'])
-    # Path Traversal / LFI / RFI
-    settings['PATH_TRAVERSAL_OOB_CALLBACK_ENABLED'] = project.get('pathTraversalOobCallbackEnabled', DEFAULT_AGENT_SETTINGS['PATH_TRAVERSAL_OOB_CALLBACK_ENABLED'])
-    settings['PATH_TRAVERSAL_PHP_WRAPPERS_ENABLED'] = project.get('pathTraversalPhpWrappersEnabled', DEFAULT_AGENT_SETTINGS['PATH_TRAVERSAL_PHP_WRAPPERS_ENABLED'])
-    settings['PATH_TRAVERSAL_ARCHIVE_EXTRACTION_ENABLED'] = project.get('pathTraversalArchiveExtractionEnabled', DEFAULT_AGENT_SETTINGS['PATH_TRAVERSAL_ARCHIVE_EXTRACTION_ENABLED'])
-    settings['PATH_TRAVERSAL_PAYLOAD_REFERENCE_ENABLED'] = project.get('pathTraversalPayloadReferenceEnabled', DEFAULT_AGENT_SETTINGS['PATH_TRAVERSAL_PAYLOAD_REFERENCE_ENABLED'])
-    settings['PATH_TRAVERSAL_REQUEST_TIMEOUT'] = project.get('pathTraversalRequestTimeout', DEFAULT_AGENT_SETTINGS['PATH_TRAVERSAL_REQUEST_TIMEOUT'])
-    settings['PATH_TRAVERSAL_OOB_PROVIDER'] = project.get('pathTraversalOobProvider', DEFAULT_AGENT_SETTINGS['PATH_TRAVERSAL_OOB_PROVIDER'])
-    # Insecure deserialization
-    settings['DESERIALIZATION_OOB_CALLBACK_ENABLED'] = project.get('deserializationOobCallbackEnabled', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_OOB_CALLBACK_ENABLED'])
-    settings['DESERIALIZATION_OOB_PROVIDER'] = project.get('deserializationOobProvider', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_OOB_PROVIDER'])
-    settings['DESERIALIZATION_TIMING_ENABLED'] = project.get('deserializationTimingEnabled', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_TIMING_ENABLED'])
-    settings['DESERIALIZATION_FIND_SINKS_ENABLED'] = project.get('deserializationFindSinksEnabled', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_FIND_SINKS_ENABLED'])
-    settings['DESERIALIZATION_RUNTIMES'] = project.get('deserializationRuntimes', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_RUNTIMES'])
-    settings['DESERIALIZATION_EXEC_GADGETS_ENABLED'] = project.get('deserializationExecGadgetsEnabled', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_EXEC_GADGETS_ENABLED'])
-    settings['DESERIALIZATION_PHAR_ENABLED'] = project.get('deserializationPharEnabled', DEFAULT_AGENT_SETTINGS['DESERIALIZATION_PHAR_ENABLED'])
-    settings['ATTACK_SKILL_CONFIG'] = project.get('attackSkillConfig', DEFAULT_AGENT_SETTINGS['ATTACK_SKILL_CONFIG'])
     settings['USER_ATTACK_SKILLS'] = project.get('userAttackSkills', DEFAULT_AGENT_SETTINGS['USER_ATTACK_SKILLS'])
     settings['SKILL_TEXT_OVERRIDES'] = (
         _coerce_skill_text_overrides(project.get('skillTextOverrides'))
@@ -695,45 +769,9 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
      settings['SCOPE_GROUPS_DROPPED']) = _scope_groups.scope_groups_from_project(project)
     settings['PROJECT_UPDATED_AT'] = project.get('updatedAt')
 
-    # Engagement limits. ROE_ENABLED is DERIVED, never read from the column.
-    # One implementation, in recon_settings.engagement, which recon and the
-    # orchestrator call too.
+    # ROE_ENABLED is DERIVED, never read from the column. One implementation, in
+    # recon_settings.engagement, which recon and the orchestrator call too.
     settings['ROE_ENABLED'] = derive_roe_enabled(project)
-    settings['ROE_RAW_TEXT'] = project.get('roeRawText', DEFAULT_AGENT_SETTINGS['ROE_RAW_TEXT'])
-    settings['ROE_CLIENT_NAME'] = project.get('roeClientName', DEFAULT_AGENT_SETTINGS['ROE_CLIENT_NAME'])
-    settings['ROE_CLIENT_CONTACT_NAME'] = project.get('roeClientContactName', DEFAULT_AGENT_SETTINGS['ROE_CLIENT_CONTACT_NAME'])
-    settings['ROE_CLIENT_CONTACT_EMAIL'] = project.get('roeClientContactEmail', DEFAULT_AGENT_SETTINGS['ROE_CLIENT_CONTACT_EMAIL'])
-    settings['ROE_CLIENT_CONTACT_PHONE'] = project.get('roeClientContactPhone', DEFAULT_AGENT_SETTINGS['ROE_CLIENT_CONTACT_PHONE'])
-    settings['ROE_EMERGENCY_CONTACT'] = project.get('roeEmergencyContact', DEFAULT_AGENT_SETTINGS['ROE_EMERGENCY_CONTACT'])
-    settings['ROE_ENGAGEMENT_START_DATE'] = project.get('roeEngagementStartDate', DEFAULT_AGENT_SETTINGS['ROE_ENGAGEMENT_START_DATE'])
-    settings['ROE_ENGAGEMENT_END_DATE'] = project.get('roeEngagementEndDate', DEFAULT_AGENT_SETTINGS['ROE_ENGAGEMENT_END_DATE'])
-    settings['ROE_ENGAGEMENT_TYPE'] = project.get('roeEngagementType', DEFAULT_AGENT_SETTINGS['ROE_ENGAGEMENT_TYPE'])
-    settings['ROE_EXCLUDED_HOSTS'] = project.get('roeExcludedHosts', DEFAULT_AGENT_SETTINGS['ROE_EXCLUDED_HOSTS'])
-    settings['ROE_EXCLUDED_HOST_REASONS'] = project.get('roeExcludedHostReasons', DEFAULT_AGENT_SETTINGS['ROE_EXCLUDED_HOST_REASONS'])
-    settings['ROE_TIME_WINDOW_ENABLED'] = project.get('roeTimeWindowEnabled', DEFAULT_AGENT_SETTINGS['ROE_TIME_WINDOW_ENABLED'])
-    settings['ROE_TIME_WINDOW_TIMEZONE'] = project.get('roeTimeWindowTimezone', DEFAULT_AGENT_SETTINGS['ROE_TIME_WINDOW_TIMEZONE'])
-    settings['ROE_TIME_WINDOW_DAYS'] = project.get('roeTimeWindowDays', DEFAULT_AGENT_SETTINGS['ROE_TIME_WINDOW_DAYS'])
-    settings['ROE_TIME_WINDOW_START_TIME'] = project.get('roeTimeWindowStartTime', DEFAULT_AGENT_SETTINGS['ROE_TIME_WINDOW_START_TIME'])
-    settings['ROE_TIME_WINDOW_END_TIME'] = project.get('roeTimeWindowEndTime', DEFAULT_AGENT_SETTINGS['ROE_TIME_WINDOW_END_TIME'])
-    settings['ROE_FORBIDDEN_TOOLS'] = project.get('roeForbiddenTools', DEFAULT_AGENT_SETTINGS['ROE_FORBIDDEN_TOOLS'])
-    settings['ROE_FORBIDDEN_CATEGORIES'] = project.get('roeForbiddenCategories', DEFAULT_AGENT_SETTINGS['ROE_FORBIDDEN_CATEGORIES'])
-    settings['ROE_MAX_SEVERITY_PHASE'] = project.get('roeMaxSeverityPhase', DEFAULT_AGENT_SETTINGS['ROE_MAX_SEVERITY_PHASE'])
-    settings['ROE_ALLOW_DOS'] = project.get('roeAllowDos', DEFAULT_AGENT_SETTINGS['ROE_ALLOW_DOS'])
-    settings['ROE_ALLOW_SOCIAL_ENGINEERING'] = project.get('roeAllowSocialEngineering', DEFAULT_AGENT_SETTINGS['ROE_ALLOW_SOCIAL_ENGINEERING'])
-    settings['ROE_ALLOW_PHYSICAL_ACCESS'] = project.get('roeAllowPhysicalAccess', DEFAULT_AGENT_SETTINGS['ROE_ALLOW_PHYSICAL_ACCESS'])
-    settings['ROE_ALLOW_DATA_EXFILTRATION'] = project.get('roeAllowDataExfiltration', DEFAULT_AGENT_SETTINGS['ROE_ALLOW_DATA_EXFILTRATION'])
-    settings['ROE_ALLOW_ACCOUNT_LOCKOUT'] = project.get('roeAllowAccountLockout', DEFAULT_AGENT_SETTINGS['ROE_ALLOW_ACCOUNT_LOCKOUT'])
-    settings['ROE_ALLOW_PRODUCTION_TESTING'] = project.get('roeAllowProductionTesting', DEFAULT_AGENT_SETTINGS['ROE_ALLOW_PRODUCTION_TESTING'])
-    settings['ROE_GLOBAL_MAX_RPS'] = project.get('roeGlobalMaxRps', DEFAULT_AGENT_SETTINGS['ROE_GLOBAL_MAX_RPS'])
-    settings['ROE_SENSITIVE_DATA_HANDLING'] = project.get('roeSensitiveDataHandling', DEFAULT_AGENT_SETTINGS['ROE_SENSITIVE_DATA_HANDLING'])
-    settings['ROE_DATA_RETENTION_DAYS'] = project.get('roeDataRetentionDays', DEFAULT_AGENT_SETTINGS['ROE_DATA_RETENTION_DAYS'])
-    settings['ROE_REQUIRE_DATA_ENCRYPTION'] = project.get('roeRequireDataEncryption', DEFAULT_AGENT_SETTINGS['ROE_REQUIRE_DATA_ENCRYPTION'])
-    settings['ROE_STATUS_UPDATE_FREQUENCY'] = project.get('roeStatusUpdateFrequency', DEFAULT_AGENT_SETTINGS['ROE_STATUS_UPDATE_FREQUENCY'])
-    settings['ROE_CRITICAL_FINDING_NOTIFY'] = project.get('roeCriticalFindingNotify', DEFAULT_AGENT_SETTINGS['ROE_CRITICAL_FINDING_NOTIFY'])
-    settings['ROE_INCIDENT_PROCEDURE'] = project.get('roeIncidentProcedure', DEFAULT_AGENT_SETTINGS['ROE_INCIDENT_PROCEDURE'])
-    settings['ROE_THIRD_PARTY_PROVIDERS'] = project.get('roeThirdPartyProviders', DEFAULT_AGENT_SETTINGS['ROE_THIRD_PARTY_PROVIDERS'])
-    settings['ROE_COMPLIANCE_FRAMEWORKS'] = project.get('roeComplianceFrameworks', DEFAULT_AGENT_SETTINGS['ROE_COMPLIANCE_FRAMEWORKS'])
-    settings['ROE_NOTES'] = project.get('roeNotes', DEFAULT_AGENT_SETTINGS['ROE_NOTES'])
 
     # --- Fetch user-level LLM providers and settings from DB ---
     user_id = project.get('userId', '')
@@ -1190,7 +1228,7 @@ def is_tool_allowed_in_phase(tool_name: str, phase: str) -> bool:
     1. Foundational fs_*/job_* tools: always allowed (phase-agnostic, like query_graph).
     2. Project's TOOL_PHASE_MAP override (per-project, per-tool, set via UI).
     3. MCP manifest default_phases (for tools declared by user-managed MCP servers).
-    4. Default to all phases (when nothing else specifies).
+    4. Otherwise denied: a tool no map names is allowed in no phase.
     """
     # fs_* (workspace filesystem) and job_* (background runner) are infrastructure
     # tools - blocking them by phase makes no sense. They cannot reach the network

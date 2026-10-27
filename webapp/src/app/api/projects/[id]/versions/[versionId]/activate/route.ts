@@ -31,7 +31,7 @@ import {
   withSnapshotSlot,
   SESSION_LABELS,
 } from '@/lib/scanSnapshot'
-import { clearProjectGraph, restoreGraph } from '@/lib/graphRestore'
+import { clearProjectGraph, restoreGraph, sweepOrphanReferenceNodes } from '@/lib/graphRestore'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { invalidateCache } from '@/app/api/graph/cache'
 import { acquireActivationLock, releaseActivationLock } from '@/lib/activationLock'
@@ -146,8 +146,14 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
         const session = getGraphSession()
         try {
           // F1: agent session nodes are NOT version state - they survive the swap.
-          await clearProjectGraph(session, id, SESSION_LABELS)
-          await restoreGraph(session, snapshot.nodes, snapshot.relationships, { projectId: id })
+          // The orphan sweep waits for the restore: run in between, it deletes a
+          // CVE only this project linked, and the version's link to it is lost.
+          await clearProjectGraph(session, id, SESSION_LABELS, { sweep: false })
+          await restoreGraph(session, snapshot.nodes, snapshot.relationships, {
+            projectId: id,
+            ...(snapshot.referenceLinks ? { referenceLinks: snapshot.referenceLinks } : {}),
+          })
+          await sweepOrphanReferenceNodes(session)
         } finally {
           await session.close()
         }

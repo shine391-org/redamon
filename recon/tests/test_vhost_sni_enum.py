@@ -581,13 +581,20 @@ class TestCollectGraphCandidates:
         assert "app-prod.internal.example.com" in out
 
     def test_pulls_ptr(self):
+        # IP mode records each PTR hostname in the dns block with its address.
         recon = {
-            "ip_recon": {
-                "5.5.5.5": {"reverse_dns": "web-prod-7.internal.example.com"},
-            },
+            "dns": {"subdomains": {
+                "web-prod-7.internal.example.com": {"ips": {"ipv4": ["5.5.5.5"], "ipv6": []}},
+            }},
         }
         out = _collect_graph_candidates(recon, "5.5.5.5")
         assert "web-prod-7.internal.example.com" in out
+
+    def test_an_ip_recon_key_is_not_a_source(self):
+        # Nothing writes combined_result["ip_recon"]; reading it only hid that
+        # the PTR names already arrive through the dns block.
+        recon = {"ip_recon": {"5.5.5.5": {"reverse_dns": "web-prod-7.internal.example.com"}}}
+        assert _collect_graph_candidates(recon, "5.5.5.5") == []
 
     def test_empty_recon_returns_empty(self):
         assert _collect_graph_candidates({}, "5.5.5.5") == []
@@ -654,6 +661,21 @@ class TestBuildFindingRecord:
         assert f["type"] == "host_header_bypass"
         assert "Routing Inconsistency" in f["name"]
         assert f["id"].endswith("_both")
+
+    def test_both_layers_serving_the_same_page_is_a_hidden_vhost(self):
+        f = _build_finding_record(self._anomaly(layer="both", severity="medium", layers_differ=False),
+                                  "1.2.3.4", {})
+        assert f["type"] == "hidden_vhost"
+        assert f["name"] == "Hidden Virtual Host: admin.example.com"
+        assert "SNI" in f["description"]
+        # The id keeps its layer, so an existing finding is renamed in place.
+        assert f["id"].endswith("_both")
+
+    def test_both_layers_disagreeing_is_a_routing_inconsistency(self):
+        f = _build_finding_record(self._anomaly(layer="both", severity="medium", layers_differ=True),
+                                  "1.2.3.4", {})
+        assert f["type"] == "host_header_bypass"
+        assert f["name"] == "Routing Inconsistency (L7 vs L4): admin.example.com"
 
     def test_id_is_deterministic(self):
         f1 = _build_finding_record(self._anomaly(), "1.2.3.4", {})
@@ -796,9 +818,11 @@ class TestRunVhostSniEnrichment:
         assert cr["vhost_sni"]["summary"]["high_severity"] == 0
 
     def test_l7_only_anomaly_creates_low_finding(self):
-        # blog (no internal keyword) returns different status -> low
+        # blog (no internal keyword) returns different status -> low. It comes
+        # from a certificate SAN: a name DNS points at this IP is never hidden.
         cr = self._basic_recon()
-        cr["dns"] = {"subdomains": {"blog.example.com": {"ips": {"ipv4": ["1.2.3.4"], "ipv6": []}}}}
+        cr["http_probe"] = {"by_url": {"https://1.2.3.4": {
+            "host": "1.2.3.4", "tls": {"certificate": {"san": ["blog.example.com"]}}}}}
         settings = self._basic_settings()
         settings["VHOST_SNI_CUSTOM_WORDLIST"] = ""  # only graph candidate
         responses = {

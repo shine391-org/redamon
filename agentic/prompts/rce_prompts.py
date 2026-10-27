@@ -442,11 +442,9 @@ When you already have SSRF (or detect it during Step 4 probing), pivot to RCE
 through internal services. Most reliable chains:
 
 ```
-# php-fpm via gopher:// (use Gopherus to build FCGI records)
-kali_shell({{"command": "gopherus --exploit fastcgi /var/www/html/index.php"}})
+# php-fpm via gopher:// (build the FCGI records in Python with execute_code)
 
 # Redis via gopher:// (cron write or RDB module load)
-kali_shell({{"command": "gopherus --exploit redis"}})
 
 # Reach internal Jenkins script console / Spring Actuator /actuator/jolokia or /env
 # /actuator/env (Spring Cloud) -> set spring.cloud.bootstrap.location to attacker URL
@@ -744,7 +742,7 @@ inject, observe oracle.
 Decode the suspect blob (cookie, header, body field):
 
 ```
-echo "BLOB" | base64 -d | xxd | head -10
+echo "BLOB" | base64 -d | hexdump -C | head -10
 ```
 
 Magic bytes:

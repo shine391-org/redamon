@@ -42,6 +42,7 @@ function makeReportData(overrides: Partial<ReportData> = {}): ReportData {
       suppressedCount: 0,
       suppressedByPeople: 0, suppressedByMultiMute: 0, suppressedByAgents: 0, suppressedByRules: 0,
       suppressedRules: [],
+      judged: { personFalsePositive: 0, resolved: 0, aiFlagged: 0 },
       nodeCounts: [],
       subdomainStats: { total: 0, resolved: 0, uniqueIps: 0 },
       endpointCoverage: { baseUrls: 0, endpoints: 0, parameters: 0 },
@@ -280,7 +281,8 @@ describe('Conditional Section Rendering', () => {
     expect(html).toContain('id="secrets"')
     expect(html).toContain('Secret Detection')
     expect(html).toContain('AWSAccessKey')
-    expect(html).toContain('validated')
+    // The status in words, as the Red Zone and JS Recon tables show it.
+    expect(html).toContain('<td>LIVE</td>')
   })
 
   test('AI Surface section renders the corroborated AI Attack Surface findings (§9)', () => {
@@ -598,6 +600,117 @@ describe('Suppressed findings: people and rules are reported apart', () => {
   })
 })
 
+describe('Findings the Priority Board judged: three scope lines', () => {
+  function withJudged(judged: ReportData['graphOverview']['judged']) {
+    const data = makeReportData()
+    data.graphOverview.judged = judged
+    return generateReportHtml(data, null)
+  }
+
+  test('each count gets its own line, worded for who decided', () => {
+    const html = withJudged({ personFalsePositive: 3, resolved: 5, aiFlagged: 2 })
+    expect(html).toContain('<tr><td>Judged false positive by a person</td><td>3 finding(s) excluded from this report</td></tr>')
+    expect(html).toContain('<tr><td>Resolved (fixed, gone, inactive)</td><td>5 finding(s) excluded from this report</td></tr>')
+    expect(html).toContain('<tr><td>Flagged as likely false positive by AI review</td><td>2 finding(s), still counted in this report</td></tr>')
+  })
+
+  test('a zero count prints no line', () => {
+    const html = withJudged({ personFalsePositive: 0, resolved: 4, aiFlagged: 0 })
+    expect(html).not.toContain('Judged false positive by a person')
+    expect(html).not.toContain('Flagged as likely false positive by AI review')
+    expect(html).toContain('Resolved (fixed, gone, inactive)')
+  })
+
+  test('counts that could not be read print nothing, never a 0', () => {
+    const html = withJudged(null)
+    expect(html).not.toContain('Judged false positive by a person')
+    expect(html).not.toContain('Resolved (fixed, gone, inactive)')
+    expect(html).not.toContain('Flagged as likely false positive by AI review')
+  })
+
+  test('a report built before the field existed renders unchanged', () => {
+    const data = makeReportData()
+    delete (data.graphOverview as Partial<ReportData['graphOverview']>).judged
+    expect(() => generateReportHtml(data, null)).not.toThrow()
+  })
+})
+
+describe('Disposition leads the executive summary (plan 10.2)', () => {
+  const summary = (over: Partial<NonNullable<ReportData['disposition']>> = {}): NonNullable<ReportData['disposition']> => ({
+    reportable: 12, candidate: 340, info: 900, excluded: 6,
+    blockers: [
+      { blocker: 'not triaged yet', count: 200 },
+      { blocker: 'credible, with impact worth planning for', count: 100 },
+      { blocker: 'AI review: likely false positive', count: 20 },
+      { blocker: 'no rule placed this higher', count: 10 },
+      { blocker: 'KEV-listed, confidently detected and reachable', count: 6 },
+      { blocker: 'likely real, likely exploited, real impact, reachable', count: 3 },
+      { blocker: 'an older rule', count: 1 },
+    ],
+    ...over,
+  })
+  const executive = (html: string) =>
+    html.slice(html.indexOf('id="executive-summary"'), html.indexOf('id="scope"'))
+
+  test('reportable, candidate and info lead, in the shared labels', () => {
+    const exec = executive(generateReportHtml(makeReportData({ disposition: summary() }), null))
+    expect(exec).toContain('data-testid="disposition-summary"')
+    expect(exec).toMatch(/data-testid="disposition-reportable">12<.*Reportable/s)
+    expect(exec).toMatch(/data-testid="disposition-candidate">340<.*Candidate/s)
+    expect(exec).toMatch(/data-testid="disposition-info">900<.*Info/s)
+    // It comes before any severity count.
+    expect(exec.indexOf('disposition-summary')).toBeLessThan(exec.indexOf('Known CVEs'))
+  })
+
+  test('candidates are grouped by blocker: the top five, then the rest summed', () => {
+    const exec = executive(generateReportHtml(makeReportData({ disposition: summary() }), null))
+    for (const name of ['not triaged yet', 'credible, with impact worth planning for',
+      'AI review: likely false positive', 'no rule placed this higher',
+      'KEV-listed, confidently detected and reachable']) {
+      expect(exec).toContain(`<td>${name}</td>`)
+    }
+    expect(exec).not.toContain('likely real, likely exploited, real impact, reachable</td>')
+    expect(exec).toContain('<tr><td>2 other blockers</td><td>4</td></tr>')
+  })
+
+  test('the raw "Total Findings" headline gives way to the disposition', () => {
+    const html = generateReportHtml(makeReportData({ disposition: summary() }), null)
+    expect(html).not.toContain('Total Findings')
+  })
+
+  test('no candidates, no blocker table', () => {
+    const html = generateReportHtml(makeReportData({ disposition: summary({ candidate: 0, blockers: [] }) }), null)
+    expect(html).toContain('data-testid="disposition-summary"')
+    expect(html).not.toContain('Candidates by blocker')
+  })
+
+  test('a blocker is escaped like every other value', () => {
+    const html = generateReportHtml(makeReportData({
+      disposition: summary({ blockers: [{ blocker: '<img src=x onerror=alert(1)>', count: 1 }] }),
+    }), null)
+    expect(html).not.toContain('<img src=x')
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;')
+  })
+
+  test('counts that could not be read print no summary, never zeros, and keep the old headline', () => {
+    for (const disposition of [null, undefined]) {
+      const html = generateReportHtml(makeReportData({ disposition }), null)
+      expect(html).not.toContain('data-testid="disposition-summary"')
+      expect(html).toContain('Total Findings')
+    }
+  })
+
+  test('both severity breakdowns are relabelled as the scanners\' unverified claim', () => {
+    const data = makeReportData({ disposition: summary() })
+    data.vulnerabilities.severityDistribution = [{ severity: 'high', count: 3 }]
+    const html = generateReportHtml(data, null)
+    const risk = html.slice(html.indexOf('id="risk-summary"'))
+    expect(executive(html)).toContain('Scanner severity (not yet verified)')
+    expect(risk).toContain('<h3>Scanner severity (not yet verified)</h3>')
+    expect(html).not.toContain('Other Vulnerabilities Severity Distribution')
+  })
+})
+
 describe('HTML Escaping / XSS Prevention', () => {
   test('an apostrophe is escaped, so a single-quoted attribute cannot be closed', () => {
     const data = makeReportData()
@@ -863,6 +976,48 @@ describe('Coverage Limitations (circuit breakers)', () => {
   })
 })
 
+describe('JavaScript section coverage (plan 09.2)', () => {
+  const cov = (over: Partial<NonNullable<ReportData['jsRecon']['coverage']>> = {}) => ({
+    recorded: true, complete: 3, partial: 0, noInput: 1, failed: 2, notScanned: 1,
+    failedReasons: [{ reason: 'host unreachable', hosts: 2 }], partialReasons: [], ...over,
+  })
+  const withJs = (totalFindings: number, coverage?: ReturnType<typeof cov>) => {
+    const base = makeReportData()
+    return generateReportHtml(makeReportData({ jsRecon: { ...base.jsRecon, totalFindings, coverage } }), null)
+  }
+
+  test('zero findings on analyzed hosts renders the section, saying so', () => {
+    const html = withJs(0, cov())
+    expect(html).toContain('id="js-recon"')
+    expect(html).toContain('href="#js-recon"')
+    expect(html).toContain('JavaScript analysis: 3 hosts analyzed, no findings; 1 host served no JavaScript; '
+      + '3 hosts not analyzed (2 host unreachable, 1 never looked at).')
+    expect(html).not.toContain('<h3>Findings Detail</h3>')
+  })
+
+  test('a host only partly analyzed counts as analyzed and is named', () => {
+    const html = withJs(0, cov({ partial: 1, failed: 0, notScanned: 0, noInput: 0,
+      failedReasons: [], partialReasons: [{ reason: 'file cap', hosts: 1 }] }))
+    expect(html).toContain('JavaScript analysis: 4 hosts analyzed, no findings; 1 only partly (file cap).')
+  })
+
+  test('with findings, the coverage line sits under the counts', () => {
+    const html = withJs(2, cov({ failed: 0, notScanned: 0, noInput: 0, failedReasons: [] }))
+    expect(html).toContain('JavaScript analysis: 3 hosts analyzed.')
+  })
+
+  test('no coverage recorded and no findings: no section, as before', () => {
+    expect(withJs(0, cov({ recorded: false }))).not.toContain('id="js-recon"')
+    expect(withJs(0)).not.toContain('id="js-recon"')
+  })
+
+  test('a reason is target-adjacent text and is escaped', () => {
+    const html = withJs(0, cov({ failedReasons: [{ reason: '<script>x</script>', hosts: 2 }] }))
+    expect(html).not.toContain('<script>x</script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+})
+
 describe('RoE provenance', () => {
   test('the report names the document and when it applied', () => {
     const data = makeReportData()
@@ -921,5 +1076,77 @@ describe('Endpoints known only from an API specification', () => {
       endpointCoverage: { baseUrls: 1, endpoints: 7, parameters: 4, declaredEndpoints: 9999, declaredParameters: 13 } } }), null)
     expect(html).toContain('<div class="metric-value-sm">7</div><div class="metric-label-sm">Endpoints (+9999 declared)</div>')
     expect(html).toContain('<div class="metric-value-sm">4</div><div class="metric-label-sm">Parameters (+13 declared)</div>')
+  })
+})
+
+describe('keys that are public by design (plan 05.2)', () => {
+  const publicKeys = { total: 4, byType: [{ secretType: 'GCP API Key', count: 3 }, { secretType: 'Sentry DSN', count: 1 }] }
+
+  test('they are listed on their own line, apart from the severity counts', () => {
+    const html = generateReportHtml(makeReportData({
+      secrets: {
+        total: 1, bySeverity: [{ severity: 'high', count: 1 }], bySource: [], byType: [],
+        findings: [], publicClientKeys: publicKeys,
+      },
+    }), null)
+    expect(html).toContain('1 secret(s) detected across web resources and JavaScript files.')
+    expect(html).toContain('Expected-public client keys: 4 (GCP API Key: 3, Sentry DSN: 1)')
+    expect(html).toContain('not counted above')
+  })
+
+  test('the section appears when only public client keys were found', () => {
+    const html = generateReportHtml(makeReportData({
+      secrets: { total: 0, bySeverity: [], bySource: [], byType: [], findings: [], publicClientKeys: publicKeys },
+    }), null)
+    expect(html).toContain('id="secrets"')
+    expect(html).toContain('No secret was detected beyond keys that are public by design.')
+    expect(html).toContain('Expected-public client keys: 4')
+  })
+
+  test('report data stored before the split renders as before', () => {
+    const html = generateReportHtml(makeReportData({
+      secrets: { total: 2, bySeverity: [], bySource: [], byType: [], findings: [] },
+    }), null)
+    expect(html).toContain('2 secret(s) detected')
+    expect(html).not.toContain('Expected-public client keys')
+  })
+
+  test('the GitHub section names public client keys found in repositories', () => {
+    const html = generateReportHtml(makeReportData({
+      cveIntelligence: { cveChains: [], exploits: [],
+        githubSecrets: { repos: 1, secrets: 0, publicClientKeys: 2, sensitiveFiles: 0 } },
+    }), null)
+    expect(html).toContain('id="github-secrets"')
+    expect(html).toContain('<tr><td>Expected-public client keys (not counted)</td><td>2</td></tr>')
+  })
+})
+
+describe('secret validation labels (plan 05.7)', () => {
+  test('a JS secret shows what the validator learned, in words', () => {
+    const row = { secretType: 'GitHub Token Classic', severity: 'high', source: 'js_recon', sourceUrl: null,
+                  sample: 'ghp_ab...wxyz', confidence: 'high', keyType: 'auth' }
+    const html = generateReportHtml(makeReportData({
+      secrets: { total: 3, bySeverity: [], bySource: [], byType: [], findings: [
+        { ...row, validationStatus: 'rejected' },
+        { ...row, validationStatus: 'unknown' },
+        { ...row, validationStatus: 'invalid' },
+      ] },
+    }), null)
+    expect(html).toContain('<td>rejected</td>')
+    expect(html).toContain('<td>could not check</td>')
+    expect(html).toContain('<td>invalid</td>')
+    expect(html).not.toContain('<td>unknown</td>')
+  })
+
+  test('a TruffleHog credential checked and dead reads "Not live" under either word', () => {
+    const finding = { detectorName: 'AWS', verified: false, source: 'github', findingKind: 'secret',
+                      redacted: 'AKIA...', asset: 'org/repo', location: 'a.py', commit: 'abc', line: 1,
+                      link: null, repository: 'org/repo', file: 'a.py' }
+    const html = generateReportHtml(makeReportData({
+      trufflehog: { totalFindings: 2, verifiedFindings: 0, liveFindings: 0, repositories: 1, sources: [],
+                    findings: [{ ...finding, validationStatus: 'rejected' },
+                               { ...finding, validationStatus: 'unvalidated' }] },
+    }), null)
+    expect(html.match(/Not live/g)?.length).toBe(2)
   })
 })

@@ -1522,8 +1522,10 @@ class TestRunNmap(unittest.TestCase):
         mock_nmap_mod = MagicMock()
         mock_nmap_mod.run_nmap_scan = mock_nmap_scan
 
-        mock_main_mod = MagicMock()
-        mock_main_mod.merge_nmap_into_port_scan = mock_merge
+        # run_nmap takes the merge from recon.helpers.nmap_merge (plan 12.15:
+        # importing recon.main re-ran the pipeline's top level).
+        mock_merge_mod = MagicMock()
+        mock_merge_mod.merge_nmap_into_port_scan = mock_merge
 
         mock_graph_db = MagicMock()
         mock_graph_db.Neo4jClient = mock_neo4j_cls
@@ -1533,7 +1535,7 @@ class TestRunNmap(unittest.TestCase):
         modules_to_mock = {
             'recon.project_settings': mock_project_settings,
             'recon.main_recon_modules.nmap_scan': mock_nmap_mod,
-            'recon.main': mock_main_mod,
+            'recon.helpers.nmap_merge': mock_merge_mod,
             'graph_db': mock_graph_db,
         }
         for name, mod in modules_to_mock.items():
@@ -1724,8 +1726,8 @@ class TestRunNmapStructuredTargets(unittest.TestCase):
         mock_nmap_mod = MagicMock()
         mock_nmap_mod.run_nmap_scan = mock_nmap_scan
 
-        mock_main_mod = MagicMock()
-        mock_main_mod.merge_nmap_into_port_scan = mock_merge
+        mock_merge_mod = MagicMock()
+        mock_merge_mod.merge_nmap_into_port_scan = mock_merge
 
         mock_graph_db = MagicMock()
         mock_graph_db.Neo4jClient = mock_neo4j_cls
@@ -1734,7 +1736,7 @@ class TestRunNmapStructuredTargets(unittest.TestCase):
         modules_to_mock = {
             'recon.project_settings': mock_project_settings,
             'recon.main_recon_modules.nmap_scan': mock_nmap_mod,
-            'recon.main': mock_main_mod,
+            'recon.helpers.nmap_merge': mock_merge_mod,
             'graph_db': mock_graph_db,
         }
         for name, mod in modules_to_mock.items():
@@ -3772,7 +3774,8 @@ class TestRunJsRecon(unittest.TestCase):
     """Tests for run_jsrecon using module-level mocks."""
 
     def _run_with_mocks(self, config, neo4j_connected=True, graph_endpoints=None, graph_baseurls=None,
-                        graph_subdomains=None, settings_override=None):
+                        graph_subdomains=None, settings_override=None, graph_js_files=(),
+                        js_recon_output=None):
         """Helper that sets up all mocks and runs run_jsrecon."""
         mock_settings = MagicMock()
         mock_settings.return_value = {
@@ -3785,6 +3788,9 @@ class TestRunJsRecon(unittest.TestCase):
 
         # Mock run_js_recon: mutates combined_result by adding 'js_recon' key
         def mock_js_recon_fn(combined_result, settings=None):
+            if js_recon_output is not None:
+                combined_result['js_recon'] = js_recon_output
+                return combined_result
             combined_result['js_recon'] = {
                 'scan_metadata': {'mode': 'post_recon', 'js_files_analyzed': 3, 'duration_seconds': 5.0},
                 'secrets': [
@@ -3839,6 +3845,13 @@ class TestRunJsRecon(unittest.TestCase):
                 record.__getitem__ = lambda self, key: _graph_subdomains
                 result.single.return_value = record
                 result.__iter__ = lambda self: iter([])
+            elif "JsReconFinding" in query and "js_file" in query:
+                records = []
+                for url in graph_js_files:
+                    record = MagicMock()
+                    record.__getitem__ = lambda self, key, u=url: u
+                    records.append(record)
+                result.__iter__ = lambda self, r=records: iter(r)
             else:
                 result.__iter__ = lambda self: iter([])
                 result.single.return_value = None
@@ -3914,6 +3927,38 @@ class TestRunJsRecon(unittest.TestCase):
         mocks = self._run_with_mocks({"domain": "example.com", "user_inputs": []})
         mocks["run_js_recon"].assert_called_once()
         mocks["neo4j_client"].update_graph_from_js_recon.assert_called_once()
+
+    def test_a_run_that_found_nothing_still_stamps_its_coverage(self):
+        """Plan 09.1: "analyzed, no findings" is the answer the BaseURL stamp
+        records, so the writer runs whenever the run covered a host."""
+        coverage = {"at": "2026-10-25T08:00:00+00:00", "hosts": {"https://example.com:443": {
+            "status": "complete", "inputs": 2, "outputs": 0, "reason": None}}}
+        mocks = self._run_with_mocks({"domain": "example.com", "user_inputs": []}, js_recon_output={
+            "scan_metadata": {"js_files_analyzed": 2, "coverage": coverage},
+            "secrets": [], "endpoints": [], "summary": {}})
+        mocks["neo4j_client"].update_graph_from_js_recon.assert_called_once()
+        written = mocks["neo4j_client"].update_graph_from_js_recon.call_args.kwargs["recon_data"]
+        self.assertEqual(written["js_recon"]["scan_metadata"]["coverage"], coverage)
+
+    def test_a_run_that_covered_no_host_and_found_nothing_writes_nothing(self):
+        mocks = self._run_with_mocks({"domain": "example.com", "user_inputs": []}, js_recon_output={
+            "scan_metadata": {"js_files_analyzed": 0, "coverage": {"at": "x", "hosts": {}}},
+            "secrets": [], "endpoints": [], "summary": {}})
+        mocks["neo4j_client"].update_graph_from_js_recon.assert_not_called()
+
+    def test_js_files_a_full_run_analyzed_are_read_again(self):
+        """Plan 06.1: a bundle under /static/ never became an Endpoint (the
+        crawler's exclude list), so the graph's Endpoints alone never fed it to a
+        partial run. The js_file nodes the last run wrote name it."""
+        bundle = "https://example.com/static/js/main.4f3a.js"
+        mocks = self._run_with_mocks(
+            {"domain": "example.com", "user_inputs": []},
+            graph_js_files=[bundle, "https://example.com/static/js/main.4f3a.js.map#src/config.ts",
+                            "upload://local.js", "https://cdn.vendor-example.test/lib.js"],
+        )
+        resource_enum = mocks["run_js_recon"].call_args[0][0]["resource_enum"]
+        self.assertEqual(resource_enum["js_urls"], [bundle])
+        self.assertNotIn(bundle, resource_enum["discovered_urls"])
 
     def test_user_urls_injected(self):
         """User-provided URLs are added to JS Recon targets."""
@@ -4546,11 +4591,15 @@ class TestRunOsintEnrichment(unittest.TestCase):
             # Patch _build_recon_data_from_graph at the submodule level (where it's actually called)
             _orig_build_recon = _osint_enrichment_mod._build_recon_data_from_graph
             _osint_enrichment_mod._build_recon_data_from_graph = MagicMock(return_value=recon_data)
+            # The IP attribution tag read has its own tests; these count the graph update.
+            _orig_ownership = _osint_enrichment_mod.attach_graph_ownership
+            _osint_enrichment_mod.attach_graph_ownership = MagicMock()
 
             try:
                 pr.run_osint_enrichment(config)
             finally:
                 _osint_enrichment_mod._build_recon_data_from_graph = _orig_build_recon
+                _osint_enrichment_mod.attach_graph_ownership = _orig_ownership
         finally:
             for name, mod in saved.items():
                 if mod is None:

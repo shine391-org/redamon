@@ -3,6 +3,7 @@ import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { DECLARED_ONLY } from '@/lib/declaredOnly'
+import { ipVersionIs } from '@/lib/ipVersion'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -121,8 +122,8 @@ export async function GET(request: NextRequest) {
     const infraResult = await session.run(
       `MATCH (ip:IP {project_id: $pid})
        RETURN count(ip) AS total,
-              count(CASE WHEN ip.version = 'ipv4' THEN 1 END) AS ipv4,
-              count(CASE WHEN ip.version = 'ipv6' THEN 1 END) AS ipv6,
+              count(CASE WHEN ${ipVersionIs('ip', 'ipv4')} THEN 1 END) AS ipv4,
+              count(CASE WHEN ${ipVersionIs('ip', 'ipv6')} THEN 1 END) AS ipv6,
               count(CASE WHEN ip.is_cdn = true THEN 1 END) AS cdnCount,
               count(DISTINCT CASE WHEN ip.asn IS NOT NULL THEN ip.asn END) AS uniqueAsns,
               count(DISTINCT CASE WHEN ip.cdn_name IS NOT NULL THEN ip.cdn_name END) AS uniqueCdns`,

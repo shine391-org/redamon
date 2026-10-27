@@ -128,10 +128,10 @@ function registryDefault(key: string): Lookup {
  * The value a preset field resets to when the preset does not name it.
  *
  * `/api/projects/defaults` wins where it has the key, because the recon and agent
- * backends are the runtime source of truth and override a few Prisma defaults.
- * It does not cover every column (about fifty are absent), so the Prisma default
- * fills the rest. Without that fallback those columns would keep whatever the
- * previous configuration had, and settings would stick across presets.
+ * backends are the runtime source of truth (test_prisma_default_parity.py keeps
+ * their defaults equal to Prisma's). It does not cover every column, so the
+ * Prisma default fills the rest. Without that fallback those columns would keep
+ * whatever the previous configuration had, and settings would stick across presets.
  */
 export function defaultFor(key: string, backendDefaults: Record<string, unknown>): Lookup {
   if (hasOwn(backendDefaults, key)) return { found: true, value: backendDefaults[key] }

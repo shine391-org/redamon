@@ -69,10 +69,11 @@ const complete = (tool_name: string, raw_output: string, extra: any = {}) =>
 const think = (thought: string) =>
   ({ id: `th-${t}`, type: 'thinking', data: { thought, reasoning: '' }, createdAt: at() })
 
-async function restore(messages: any[], captured: { items: ChatItem[] }) {
-  const full = { ...conv, messages }
+async function restore(messages: any[], captured: { items: ChatItem[] }, convOverrides: any = {}) {
+  const c = { ...conv, ...convOverrides }
+  const full = { ...c, messages }
   const { result } = renderHook(() => useConversationRestoration(makeDeps(captured, full)))
-  await act(async () => { await result.current.handleSelectConversation(conv) })
+  await act(async () => { await result.current.handleSelectConversation(c) })
 }
 
 const tools = (items: ChatItem[]) => items.filter(i => (i as any).type === 'tool_execution')
@@ -118,7 +119,7 @@ describe('useConversationRestoration - repeated tool/thought survival', () => {
       start('execute_code', { code: 'x' }),
       complete('execute_code', 'done'),
       start('execute_code', { code: 'y' }),   // running, no complete yet
-    ], cap)
+    ], cap, { agentRunning: true })
     const ts = tools(cap.items)
     expect(ts).toHaveLength(2)
     expect(ts.filter(x => (x as any).status === 'running')).toHaveLength(1)
@@ -130,5 +131,155 @@ describe('useConversationRestoration - repeated tool/thought survival', () => {
     await restore([start('execute_httpx', { u: 'x' }), complete('execute_httpx', 'r')], cap)
     expect(tools(cap.items)).toHaveLength(1)
     expect((tools(cap.items)[0] as any).status).toBe('success')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// "Agent stuck" incident: cards that kept "Running" after the run had ended,
+// and a reconnected page that never caught up with what it missed.
+// ---------------------------------------------------------------------------
+
+const finished = (tool_name: string, extra: any = {}) =>
+  ({ id: `tf-${t}`, type: 'tool_finished', data: { tool_name, success: true, duration_ms: 12000, ...extra }, createdAt: at() })
+
+describe('useConversationRestoration - run state after the run ended', () => {
+  test('a tool cut off by Stop restores as interrupted, not as a ticking running card', async () => {
+    const cap = { items: [] as ChatItem[] }
+    await restore([start('execute_code', { code: 'x' }, { step_id: 'S1' })], cap, { agentRunning: false })
+    const [card] = tools(cap.items) as any[]
+    expect(card.status).toBe('error')
+    expect(card.interrupted).toBe(true)
+    expect(card.step_id).toBe('S1')
+  })
+
+  test('a tool that returned before its analysis restores as finished while the run goes on', async () => {
+    const cap = { items: [] as ChatItem[] }
+    await restore([
+      start('tradecraft_lookup', { cve_id: 'CVE-2026-109618' }, { step_id: 'S1' }),
+      finished('tradecraft_lookup', { step_id: 'S1' }),
+    ], cap, { agentRunning: true })
+    const [card] = tools(cap.items) as any[]
+    expect(card.status).toBe('running')
+    expect(card.finished).toBe(true)
+    expect(card.finishedSuccess).toBe(true)
+    expect(card.duration).toBe(12000)
+  })
+
+  test('a returned tool in a run that is over keeps the tool verdict, not "interrupted"', async () => {
+    const cap = { items: [] as ChatItem[] }
+    await restore([
+      start('execute_curl', { u: '/' }, { step_id: 'S1' }),
+      finished('execute_curl', { step_id: 'S1', success: false }),
+    ], cap, { agentRunning: false })
+    const [card] = tools(cap.items) as any[]
+    expect(card.status).toBe('error')
+    expect(card.interrupted).toBeFalsy()
+  })
+
+  test('tool_finished rows do not render as cards of their own', async () => {
+    const cap = { items: [] as ChatItem[] }
+    await restore([
+      start('execute_curl', { u: '/' }, { step_id: 'S1' }),
+      finished('execute_curl', { step_id: 'S1' }),
+      complete('execute_curl', 'out', { step_id: 'S1' }),
+    ], cap)
+    expect(tools(cap.items)).toHaveLength(1)
+    expect((tools(cap.items)[0] as any).status).toBe('success')
+  })
+})
+
+describe('useConversationRestoration - reconnect resync for a session started in this tab', () => {
+  function mount(full: any) {
+    const cap = { items: [] as ChatItem[] }
+    const deps = makeDeps(cap, full)
+    deps.setIsStopping = vi.fn()
+    const hook = renderHook(() => useConversationRestoration(deps))
+    return { cap, deps, hook }
+  }
+
+  test('server says the run is over: re-read, stop the spinner, settle the stuck card', async () => {
+    const full = { ...conv, agentRunning: true, messages: [
+      start('execute_code', { code: 'x' }, { step_id: 'S1' }),
+    ] }
+    const { cap, deps, hook } = mount(full)
+    act(() => { hook.result.current.setConversationId('c1') })
+    await act(async () => {
+      await hook.result.current.resyncActiveConversation('s1', { agentRunning: false, clientRunning: true })
+    })
+    expect(deps.loadConversation).toHaveBeenCalledWith('c1')
+    expect(deps.setIsLoading).toHaveBeenLastCalledWith(false)
+    expect(deps.setIsStopping).toHaveBeenLastCalledWith(false)
+    const [card] = tools(cap.items) as any[]
+    expect(card.interrupted).toBe(true)
+  })
+
+  test('server says the run goes on: re-read and keep the spinner', async () => {
+    const full = { ...conv, agentRunning: true, messages: [
+      start('execute_code', { code: 'x' }, { step_id: 'S1' }),
+    ] }
+    const { cap, deps, hook } = mount(full)
+    act(() => { hook.result.current.setConversationId('c1') })
+    await act(async () => {
+      await hook.result.current.resyncActiveConversation('s1', { agentRunning: true, clientRunning: false })
+    })
+    expect(deps.setIsLoading).toHaveBeenLastCalledWith(true)
+    expect((tools(cap.items)[0] as any).status).toBe('running')
+  })
+
+  test('idle page and idle server: no needless DB read', async () => {
+    const { deps, hook } = mount({ ...conv, messages: [] })
+    act(() => { hook.result.current.setConversationId('c1') })
+    await act(async () => {
+      await hook.result.current.resyncActiveConversation('s1', { agentRunning: false, clientRunning: false })
+    })
+    expect(deps.loadConversation).not.toHaveBeenCalled()
+  })
+
+  test('an older agent without agent_running keeps the history-restore behaviour only', async () => {
+    const { deps, hook } = mount({ ...conv, messages: [] })
+    act(() => { hook.result.current.setConversationId('c1') })
+    await act(async () => { await hook.result.current.resyncActiveConversation('s1', {}) })
+    expect(deps.loadConversation).not.toHaveBeenCalled()
+  })
+
+  test('nothing persisted yet: the spinner still stops when the server is idle', async () => {
+    const { cap, deps, hook } = mount({ ...conv, messages: [] })
+    await act(async () => {
+      await hook.result.current.resyncActiveConversation('s1', { agentRunning: false, clientRunning: true })
+    })
+    expect(deps.loadConversation).not.toHaveBeenCalled()
+    expect(deps.setIsLoading).toHaveBeenLastCalledWith(false)
+    expect(cap.items).toEqual([])
+  })
+})
+
+describe('useConversationRestoration - events that arrive while the resync reads the DB', () => {
+  test('a STOPPED during the read wins: the spinner is not turned back on, the card settles', async () => {
+    const full = { ...conv, agentRunning: true, messages: [
+      start('execute_code', { code: 'x' }, { step_id: 'S1' }),
+    ] }
+    const cap = { items: [] as ChatItem[] }
+    const deps = makeDeps(cap, full)
+    deps.setIsStopping = vi.fn()
+    let resolveLoad!: (v: unknown) => void
+    deps.loadConversation = vi.fn(() => new Promise(r => { resolveLoad = r }))
+    let pageRunning = true
+    const hook = renderHook(() => useConversationRestoration(deps))
+    act(() => { hook.result.current.setConversationId('c1') })
+
+    let pending!: Promise<void>
+    act(() => {
+      pending = hook.result.current.resyncActiveConversation('s1', {
+        agentRunning: true, clientRunning: true, isRunActive: () => pageRunning,
+      })
+    })
+    expect(deps.setIsLoading.mock.calls).toEqual([[true]])   // applied at CONNECTED
+
+    pageRunning = false   // STOPPED arrives over the socket while the DB read is in flight
+    await act(async () => { resolveLoad(full); await pending })
+
+    expect(deps.setIsLoading.mock.calls).toEqual([[true]])   // never re-applied after the read
+    const [card] = tools(cap.items) as any[]
+    expect(card.interrupted).toBe(true)
   })
 })

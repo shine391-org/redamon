@@ -8,7 +8,7 @@ The Recon Orchestrator acts as a bridge between the webapp and the recon Docker 
 
 - **Container Lifecycle Management** - Start, stop, and monitor recon containers
 - **Real-time Log Streaming** - SSE-based log streaming to the frontend
-- **Phase Detection** - Automatic detection of recon phases from log output
+- **Phase Detection** - The pipeline's own group headers set each scan's phase (see Phase Detection)
 - **Status Tracking** - Track running/completed/error states per project
 
 ## Architecture
@@ -123,7 +123,7 @@ Returns current recon status for a project.
 - `running` - Recon in progress
 - `completed` - Recon finished successfully
 - `error` - Recon failed
-- `stopping` - Container being stopped
+- `stopping` - A stop is draining the run (see Stop Recon); still a live run
 
 ### Stream Logs (SSE)
 
@@ -156,10 +156,56 @@ data: {"status": "completed", "completedAt": "2024-01-15T10:45:00Z", "error": nu
 ### Stop Recon
 
 ```
-POST /recon/{projectId}/stop
+POST /recon/{projectId}/stop[?graceful=false]
+POST /recon/{projectId}/partial/{runId}/stop[?graceful=false]
 ```
 
-Gracefully stops a running recon container.
+The stop is **asynchronous**: it answers `stopping` at once and a background
+task (`_end_run_container` in `container_manager.py`) ends the run:
+
+1. SIGTERM to the recon (or partial-recon) container. Its handler
+   (`recon/helpers/shutdown.py`) sends SIGTERM to its own processes, refuses to
+   start new ones, drops new graph writes, lands the writes already queued,
+   runs the node-filter sweep (the mute rules) and exits 143. The prune never
+   runs on a stopped run.
+2. The run's tool containers are removed at once, and again every 2 s while
+   the recon container drains: they are siblings created through the broker,
+   selected by the `redamon.broker-owned=1` + `redamon.run_id=<run>` labels,
+   never by image name, so another project's scan is never touched.
+3. When the container exits, or after `RECON_STOP_GRACE_S` (default 45 s, set
+   in the orchestrator's `environment:` block), SIGKILL. The exit code is
+   logged (`[stop] ... exited with code 143`), then the container is removed.
+
+While a run is `stopping` it is live everywhere: its exit code is not read as
+`error`, it keeps its memory reservation, and a new full or partial start is
+refused. It then reads `idle`, which the webapp records as a canceled ScanJob.
+`?graceful=false` (the project delete) kills at once and answers only when the
+container is gone, so a draining run never writes into a deleted project; it
+also cuts short a graceful stop already draining. The orchestrator's own
+shutdown stops each run with a 5 s grace.
+
+In-process Python traffic already in flight (security checks, OSINT calls, JS
+downloads) is not killed: the run starts no new phase, and the grace bounds it.
+Tool containers of runs started before run labels existed carry none, so a stop
+leaves them to finish.
+
+### Pause and Resume Recon
+
+```
+POST /recon/{projectId}/pause
+POST /recon/{projectId}/resume
+```
+
+Pause freezes the recon container first (it is the one that starts tools), then
+every running tool container labelled with its run: `docker pause` reaches one
+cgroup only, and the tools are siblings. Resume re-checks the project's RoE time
+window first, through the same `_fetch_project_for_preflight` +
+`_check_roe_time_window` a start uses: outside it the answer is 403 with the
+start's message, a webapp outage is 503 (fail closed), and either way nothing is
+unpaused. Inside it, the run's paused tools are unpaused, then the recon
+container; a tool that exited meanwhile is not in the listing. Every Docker call
+goes through `_run_blocking`. A long pause can time out tool connections, so
+circuit breakers may mark hosts degraded after the resume.
 
 ### List Running
 
@@ -232,18 +278,34 @@ Server-Sent Events stream of TruffleHog log lines. Event format follows the same
 
 ## Phase Detection
 
-The orchestrator automatically detects recon phases from log output:
+A full scan's progress label comes from the pipeline's own group headers,
+which `recon/main.py` prints from its main thread, in run order, in both
+targeting modes (`PIPELINE_HEADER_PHASES` in `container_manager.py`; pinned by
+`recon/tests/test_pipeline_headers.py`):
 
-| Phase | Pattern | Description |
-|-------|---------|-------------|
-| 1 | `[Phase 1]`, `domain.*discovery` | Domain Discovery |
-| 2 | `[Phase 2]`, `port.*scan` | Port Scanning |
-| 3 | `[Phase 3]`, `http.*prob` | HTTP Probing |
-| 4 | `[Phase 4]`, `resource.*enum` | Resource Enumeration |
-| 4b | `JS Recon Scanner`, `JsRecon` | JS Recon (post-resource_enum) |
-| 5 | `[Phase 5]`, `vuln.*scan` | Vulnerability Scanning |
-| 6 | `[Phase 6]`, `mitre`, `cwe`, `capec` | MITRE Enrichment |
-| 7 | `[Phase 7]`, `github.*secret` | GitHub Secret Hunt |
+| Phase | Header (`[*][Pipeline] ...`) | Label |
+|-------|------------------------------|-------|
+| 1 | `GROUP 1:` | Domain Discovery (IP mode: reverse DNS, DNS, IP WHOIS) |
+| 2 | `GROUP 3:`, `GROUP 3.5:`, `GROUP 3.6:`, `GROUP 3b:` | Port Scanning |
+| 3 | `GROUP 4:` | HTTP Probing |
+| 4 | `GROUP 5:` | Resource Enumeration |
+| 4.5 | `GROUP 4.5:`, `GROUP 5b:`, `GROUP 5.5:` | AI Surface Recon, JS Recon, Supply-Chain Recon |
+| 5 | `GROUP 6:` (IP mode's inline Nuclei), `GROUP 6 Phase A:` | Vulnerability Scanning |
+| 6 | `GROUP 6 Phase B:` | CVE & MITRE |
+
+Once a log has shown a header (`PhaseTracker`), only headers move the phase:
+the background graph writer's `[graph-db]` lines, Nmap's banner, lines a
+parallel fan-out interleaves, the end-of-run summaries and IP mode's
+`IP STEP n:` prelude cannot. A `[Batch] Group` marker resets it, since each
+group runs the phases again. The tool-name `PHASE_PATTERNS` serve only a log
+with no header yet (partial recon), and never move the phase backwards.
+
+Each running scan has one `_PhaseCursor`: the log stream feeds it, and when no
+stream is attached a status poll (`_get_status_sync`, at most every
+`PHASE_POLL_INTERVAL_S` = 10 s, the 30 s reaper included) reads the new lines
+with `container.logs(since=..., timestamps=True)`. Every line is parsed once,
+by timestamp, so `get_recon_status` reports the phase with nobody watching and
+a stream attached later replays the log without rewinding it.
 
 ## Configuration
 

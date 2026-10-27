@@ -172,6 +172,20 @@ class TestTick(unittest.TestCase):
         self.assertEqual(len(disp), 1)
         self.assertIn("/a/dispatch", disp[0]["url"])
 
+    def test_a_transient_refusal_stops_the_tick_too(self):
+        # An orchestrator-wide 503 (plan 12.6) would otherwise burn one attempt
+        # per queued candidate in a single tick.
+        summary, calls = _run_tick([
+            ("/candidates", {"candidates": [
+                _cand("a", project="pa"), _cand("b", project="pb"),
+            ], "activeCount": 0}),
+            ("/job-queue/a/dispatch", {"ok": False, "blocked": "transient", "temporary": True}),
+            ("/job-queue/b/dispatch", {"ok": True}),
+        ])
+        disp = [c for c in calls if "/dispatch" in c["url"]]
+        self.assertEqual(len(disp), 1)
+        self.assertEqual(summary["dispatched"], 0)
+
     def test_per_project_block_lets_later_jobs_through(self):
         summary, calls = _run_tick([
             ("/candidates", {"candidates": [

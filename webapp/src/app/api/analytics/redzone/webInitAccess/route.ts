@@ -3,6 +3,7 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 import { DECLARED_ONLY } from '@/lib/declaredOnly'
 import { deriveWebInitGrade, WEB_INIT_HEADER_CHECKS } from '@/app/graph/components/RedZoneTables/webInitGrade'
 
@@ -78,7 +79,7 @@ export async function GET(request: NextRequest) {
        WITH bu, authEps, count(DISTINCT dep) AS declaredAuthCount
        OPTIONAL MATCH (bu)-[:HAS_VULNERABILITY]->(v:Vulnerability)
          WHERE (v.type IN $allTypes OR v.vulnerability_type IN $allTypes OR v.name IN $allTypes)
-           AND ${notMuted('v')}
+           AND ${notMuted('v')} AND ${reportCountable('v')}
        WITH bu, authEps, declaredAuthCount, collect(DISTINCT coalesce(v.type, v.vulnerability_type, v.name)) AS vulnTags
        WHERE size(authEps) > 0 OR size([x IN vulnTags WHERE x IS NOT NULL]) > 0
        OPTIONAL MATCH (bu)-[:HAS_ENDPOINT]->(anyEp:Endpoint)

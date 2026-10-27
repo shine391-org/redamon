@@ -30,17 +30,6 @@ export interface ReconSSEEvent {
   data: ReconLogEvent | { error: string } | { status: string; completedAt?: string; error?: string }
 }
 
-export const RECON_PHASES = [
-  'Domain Discovery',
-  'Port Scanning',
-  'HTTP Probing',
-  'Resource Enumeration',
-  'Vulnerability Scanning',
-  'MITRE Enrichment',
-] as const
-
-export type ReconPhase = typeof RECON_PHASES[number]
-
 // =============================================================================
 // GVM Vulnerability Scan Types
 // =============================================================================
@@ -59,9 +48,13 @@ export interface GvmState {
   container_id?: string | null
 }
 
+// Kept in step with GVM_PHASE_PATTERNS in container_manager.py, in order: the
+// drawer's "Phase N/M" takes M from here and N from the pattern's number.
+// recon-types.phases.test.ts compares the three phase lists below with the Python.
 export const GVM_PHASES = [
   'Loading Recon Data',
-  'Connecting to GVM',
+  'Waiting for GVM',
+  'Connected to GVM',
   'Scanning IPs',
   'Scanning Hostnames',
 ] as const
@@ -86,6 +79,7 @@ export interface GithubHuntState {
   container_id?: string | null
 }
 
+// Kept in step with GITHUB_HUNT_PHASE_PATTERNS in container_manager.py.
 export const GITHUB_HUNT_PHASES = [
   'Loading Settings',
   'Scanning Repositories',
@@ -236,44 +230,19 @@ export interface PartialReconParams {
  *  recon_orchestrator/batch_scope.py. */
 export const PARTIAL_RECON_OVERRIDE_KEYS = ['CVE_LOOKUP_ENABLED', 'MITRE_ENABLED', 'SECURITY_CHECK_ENABLED'] as const
 
-export const PARTIAL_RECON_SUPPORTED_TOOLS = new Set(['SubdomainDiscovery', 'Naabu', 'Masscan', 'Nmap', 'Tlsx', 'Httpx', 'Katana', 'OpenAPI', 'ZapAjaxSpider', 'Hakrawler', 'Jsluice', 'Gau', 'Kiterunner', 'ParamSpider', 'Arjun', 'Ffuf', 'EndpointAiClassifier', 'AiSurfaceRecon', 'JsRecon', 'SerializedScan', 'SupplyChainRecon', 'GraphqlScan', 'Nuclei', 'SubdomainTakeover', 'VhostSni', 'WebCachePoison', 'SecurityChecks', 'Shodan', 'Urlscan', 'Uncover', 'OsintEnrichment', 'OriginDiscovery'])
+export const PARTIAL_RECON_SUPPORTED_TOOLS = new Set(['SubdomainDiscovery', 'Naabu', 'Masscan', 'Nmap', 'Tlsx', 'Httpx', 'IpAttribution', 'Katana', 'OpenAPI', 'ZapAjaxSpider', 'Hakrawler', 'Jsluice', 'Gau', 'Kiterunner', 'ParamSpider', 'Arjun', 'Ffuf', 'EndpointAiClassifier', 'AiSurfaceRecon', 'JsRecon', 'SerializedScan', 'SupplyChainRecon', 'GraphqlScan', 'Nuclei', 'SubdomainTakeover', 'VhostSni', 'WebCachePoison', 'SecurityChecks', 'Shodan', 'Urlscan', 'Uncover', 'OsintEnrichment', 'OriginDiscovery'])
 
-export const PARTIAL_RECON_PHASE_MAP: Record<string, readonly string[]> = {
-  SubdomainDiscovery: ['Subdomain Discovery'],
-  Naabu: ['Port Scanning'],
-  Masscan: ['Port Scanning'],
-  Nmap: ['Nmap Service Detection'],
-  Tlsx: ['TLS Certificate Grab'],
-  Httpx: ['HTTP Probing'],
-  Katana: ['Resource Enumeration'],
-  OpenAPI: ['Resource Enumeration'],
-  ZapAjaxSpider: ['Resource Enumeration'],
-  Hakrawler: ['Resource Enumeration'],
-  Jsluice: ['Resource Enumeration'],
-  Gau: ['Resource Enumeration'],
-  Kiterunner: ['Resource Enumeration'],
-  ParamSpider: ['Resource Enumeration'],
-  Arjun: ['Resource Enumeration'],
-  Ffuf: ['Resource Enumeration'],
-  EndpointAiClassifier: ['Endpoint AI Classification'],
-  AiSurfaceRecon: ['AI Surface Recon'],
-  JsRecon: ['JS Recon'],
-  SerializedScan: ['Serialized Object Scan'],
-  SupplyChainRecon: ['Package Harvest', 'Offline OSV Verdict'],
-  GraphqlScan: ['Endpoint Discovery', 'Introspection Testing', 'Schema Analysis', 'Vulnerability Detection'],
-  Nuclei: ['Vulnerability Scanning'],
-  SubdomainTakeover: ['Subdomain Takeover Detection'],
-  VhostSni: ['VHost & SNI Enumeration'],
-  WebCachePoison: ['Cache Poisoning Detection'],
-  SecurityChecks: ['Security Checks'],
-  Shodan: ['Shodan Enrichment'],
-  Urlscan: ['URLScan Enrichment'],
-  Uncover: ['Uncover Expansion'],
-  OsintEnrichment: ['OSINT Enrichment'],
-  OriginDiscovery: ['Origin Discovery'],
-}
+/**
+ * A partial run's phase count. The orchestrator pins every partial-run log
+ * event to phase 1 (stream_partial_logs in container_manager.py): the phase
+ * NAME comes from the full pipeline's patterns, the number is always 1 of 1.
+ * recon-types.phases.test.ts checks the pin.
+ */
+export const PARTIAL_RECON_TOTAL_PHASES = 1
 
-// Backward-compatible default (SubdomainDiscovery phases)
-export const PARTIAL_RECON_PHASES = PARTIAL_RECON_PHASE_MAP['SubdomainDiscovery']
-
-export type PartialReconPhase = typeof PARTIAL_RECON_PHASES[number]
+/**
+ * The full pipeline's phase count: the last number PHASE_PATTERNS assigns
+ * (1-6, with an AI Surface Recon 4.5 between 4 and 5), as ReconState.total_phases
+ * says. recon-types.phases.test.ts checks it.
+ */
+export const RECON_TOTAL_PHASES = 6

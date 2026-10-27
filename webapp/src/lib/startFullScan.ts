@@ -15,6 +15,7 @@ import { describeScanWriters } from '@/lib/graphWriters'
 import { currentAuthorization, loadEngagement } from '@/lib/engagement'
 import { settingsFingerprint } from '@/lib/jobQueue'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
+import { classifyStartFailure } from '@/lib/scanStartOutcome'
 import { applyRetentionSafe } from '@/lib/scanRetention'
 import type { InvalidEntry } from '@/lib/domainBatch'
 import { scopeStartProblem } from '@/lib/scopeGroups'
@@ -68,6 +69,12 @@ export interface StartFullScanInput {
   trigger: ScanTrigger
   actorUserId?: string | null
   scheduleId?: string | null
+  /**
+   * Set by the headless callers (the queue, the scheduler), which retry a
+   * transient refusal: no failed ScanJob is recorded for one, or every
+   * attempt would leave a failed run in the history.
+   */
+  quietTransient?: boolean
 }
 
 export interface StartFullScanSuccess {
@@ -103,9 +110,11 @@ export interface StartFullScanFailure {
   /**
    * 'scope_invalid' when the saved scope holds entries the current rules refuse
    * (a public-suffix update can do that to a stored list). Permanent and 422,
-   * never 409: the queue requeues a 409 forever as "busy".
+   * never 409: the queue requeues a 409 forever as "busy". Otherwise the
+   * orchestrator's own code, e.g. 'spawn_failed' (the container could not be
+   * created; permanent).
    */
-  code?: 'scope_invalid'
+  code?: 'scope_invalid' | string
   invalidEntries?: InvalidEntry[]
 }
 
@@ -281,8 +290,18 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
     }
   }
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
+  // An orchestrator from before plan 12.9 answered a container it could not
+  // create with 200 and `status: error`. That is a refusal like any other:
+  // nothing runs, so no retention and no running ScanJob.
+  const accepted = response.ok ? await response.json().catch(() => ({})) : null
+  const spawnFailed = accepted && (accepted as { status?: unknown }).status === 'error'
+
+  if (!response.ok || spawnFailed) {
+    const errorData = spawnFailed
+      ? { detail: { detail: String((accepted as { error?: unknown }).error ?? 'The scan container could not be started'),
+          code: 'spawn_failed' } }
+      : await response.json().catch(() => ({}))
+    const status = spawnFailed ? 500 : response.status
     // Single source of truth for turning a structured governor detail into a safe
     // string + limit object (Scan Queue Phase 0.4). Never render the raw object.
     const norm = normalizeOrchestratorStartError(errorData, 'Failed to start recon')
@@ -293,8 +312,12 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
     const rolledBack = await rollbackPreparedVersions(projectId, prepared)
     const versionId = rolledBack ? prepared.frozenVersionId : prepared.currentVersion.id
 
-    // Record the attempt so the timeline shows why it did not run.
-    const job = await createScanJob({
+    // Record the attempt so the timeline shows why it did not run, unless the
+    // caller retries it: then it is recorded once, when the refusal is final.
+    const retried = input.quietTransient && classifyStartFailure(
+      status, { error: norm.error, code: norm.code, limit: norm.limit }, { orchestratorAnswered: true },
+    ).kind === 'transient'
+    const job = retried ? null : await createScanJob({
       projectId,
       versionId,
       trigger,
@@ -303,7 +326,7 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
       initiatedByUserId: input.actorUserId ?? null,
       roeTextSha256: engagement.documentTextSha256,
       scheduleId: input.scheduleId ?? null,
-      ramReason: isLimit ? String(norm.limit?.detail ?? norm.error) : null,
+      ramReason: isLimit ? String(norm.limit?.detail ?? norm.error) : (spawnFailed ? norm.error : null),
     }).catch(err => {
       console.error('[scanTimeline] could not record failed scan job:', err)
       return null
@@ -311,14 +334,15 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
 
     return {
       ok: false,
-      status: response.status,
+      status,
       error: norm.error,
       ...(isLimit ? { limit: norm.limit as Record<string, unknown> } : {}),
+      ...(norm.code ? { code: norm.code } : {}),
       scanJobId: job?.id ?? null,
     }
   }
 
-  const state = await response.json()
+  const state = accepted as Record<string, unknown>
 
   // The scan is accepted, so the version it minted is real and the timeline can
   // be trimmed to policy. Retention deletes the oldest unpinned versions, which

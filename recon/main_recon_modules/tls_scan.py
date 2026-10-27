@@ -427,6 +427,19 @@ def _attribute_cdn(combined_result: dict, by_target: dict) -> int:
     return filled
 
 
+def _cdn_attributions(combined_result: dict) -> dict:
+    """{ip: cdn} for the IPs whose CDN tag came from tlsx's certificate issuer.
+
+    In a full run the port graph write happens before tlsx, so the tag
+    _attribute_cdn puts on port_scan.by_ip would never reach IP.is_cdn; the tlsx
+    writer reads this map from the payload instead.
+    """
+    by_ip = ((combined_result.get("port_scan") or {}).get("by_ip")) or {}
+    return {ip: info["cdn"] for ip, info in by_ip.items()
+            if ip and isinstance(info, dict) and info.get("cdn")
+            and info.get("cdn_source") == "tls_certificate"}
+
+
 def _discovered_hostnames(by_target: dict) -> list:
     out = set()
     for cert in by_target.values():
@@ -437,6 +450,24 @@ def _discovered_hostnames(by_target: dict) -> list:
         if cn:
             out.add(_strip_wildcard(cn))
     return sorted(out)
+
+
+def _wildcard_dropped(combined_result: dict, names: list, settings: dict) -> set:
+    """The certificate names that answer only through their zone's wildcard
+    DNS (recon/helpers/wildcard_control.py). Both the full pipeline and partial
+    tlsx call run_tlsx_enrichment, so the check sits here: these names are
+    never merged as targets, and the tlsx writer links no Subdomain to them.
+    The roots are the ones that writer uses."""
+    roots = [r for r in (combined_result.get("domains") or [combined_result.get("domain")])
+             if isinstance(r, str) and r.strip()]
+    if not roots or not names:
+        return set()
+    from recon.helpers import wildcard_control
+    candidates = sorted({_strip_wildcard(n).rstrip(".") for n in names if n})
+    control = wildcard_control.filter_late_names(candidates, roots, settings, label="tlsx")
+    if control.zones:
+        combined_result.setdefault("wildcard_zones", {}).update(control.zones)
+    return set(control.dropped)
 
 
 def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
@@ -451,7 +482,7 @@ def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
         if not lines:
             _print("-", "no eligible TLS targets (all HTTP ports or filtered)")
             combined_result["tlsx"] = {
-                "by_target": {}, "discovered_hostnames": [],
+                "by_target": {}, "discovered_hostnames": [], "cdn_by_ip": {},
                 "summary": {"targets": 0, "with_cert": 0},
                 "scan_metadata": {"targets": 0, "skipped": "no eligible targets"},
             }
@@ -490,9 +521,14 @@ def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
         _attribute_cdn(combined_result, by_target)
 
         with_cert = sum(1 for c in by_target.values() if c.get("fingerprint_sha256") or c.get("subject_cn"))
+        discovered = _discovered_hostnames(by_target)
+        dropped = _wildcard_dropped(combined_result, discovered, settings)
         combined_result["tlsx"] = {
             "by_target": by_target,
-            "discovered_hostnames": _discovered_hostnames(by_target),
+            "discovered_hostnames": [n for n in discovered
+                                     if _strip_wildcard(n).rstrip(".") not in dropped],
+            "wildcard_dropped": sorted(dropped),
+            "cdn_by_ip": _cdn_attributions(combined_result),
             "summary": {
                 "targets": len(lines),
                 "responded": sum(1 for c in by_target.values() if c.get("probe_status")),
@@ -511,7 +547,8 @@ def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
         _print("!", f"tlsx failed: {e}")
         combined_result["metadata"].setdefault("phase_errors", {})["tlsx"] = str(e)
         combined_result.setdefault("tlsx", {"by_target": {}, "discovered_hostnames": [],
-                                            "summary": {}, "scan_metadata": {"error": str(e)}})
+                                            "cdn_by_ip": {}, "summary": {},
+                                            "scan_metadata": {"error": str(e)}})
     finally:
         try:
             import shutil

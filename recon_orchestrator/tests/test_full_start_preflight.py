@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 
 import api
-from models import ReconStartRequest
+from models import ReconStartRequest, ReconState, ReconStatus
 
 
 class _SpyManager:
@@ -21,7 +21,7 @@ class _SpyManager:
 
     async def start_recon(self, **kw):
         self.calls.append(kw)
-        return {"status": "starting"}
+        return ReconState(project_id="p1", status=ReconStatus.STARTING)
 
 
 @pytest.fixture

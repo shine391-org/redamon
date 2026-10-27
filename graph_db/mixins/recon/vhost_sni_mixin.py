@@ -33,6 +33,8 @@ Properties written on each Vulnerability:
     observed_size            body size returned with vhost lie applied
     size_delta               observed_size - baseline_size
     internal_pattern_match   matched internal-keyword (e.g. "admin"), or None
+    dns_known                public DNS points the hostname at this IP (only a
+                             routing inconsistency is reported for such a name)
     first_seen, last_seen    ISO timestamps
 
 Properties written on the Subdomain for an in-scope hidden vhost:
@@ -111,6 +113,7 @@ class VhostSniMixin:
                         "is_reverse_proxy": bool(ip_info.get("is_reverse_proxy")),
                         "is_permissive_frontend": bool(ip_info.get("is_permissive_frontend")),
                         "vhost_sni_suppressed_by_control": int(ip_info.get("suppressed_by_control") or 0),
+                        "vhost_sni_suppressed_dns_known": int(ip_info.get("suppressed_dns_known") or 0),
                         # Always written, 0 and [] included: `SET i += $props`
                         # keeps the old value of a key that is left out.
                         "vhost_sni_suppressed_as_noise": int(ip_info.get("suppressed_as_noise") or 0),
@@ -171,6 +174,7 @@ class VhostSniMixin:
                         "observed_size": finding.get("observed_size"),
                         "size_delta": finding.get("size_delta"),
                         "internal_pattern_match": finding.get("internal_pattern_match"),
+                        "dns_known": bool(finding.get("dns_known")),
                         "matched_at": _build_url(hostname, port, finding.get("scheme") or "https"),
                         "is_dast_finding": False,
                         "last_seen": detected_at,
@@ -197,9 +201,11 @@ class VhostSniMixin:
                     # graph, flagged has_dns_records=false until a resolver says
                     # otherwise. An out-of-scope name (a co-hosted third party)
                     # hangs off the IP that served it instead.
+                    # A name public DNS points at this IP is reported only for a
+                    # routing inconsistency, never as hidden.
                     sub_props = {
                         "vhost_tested": True,
-                        "vhost_hidden": True,
+                        "vhost_hidden": not finding.get("dns_known"),
                         "vhost_routing_layer": layer,
                         "vhost_status_code": finding.get("observed_status"),
                         "vhost_size_delta": finding.get("size_delta"),

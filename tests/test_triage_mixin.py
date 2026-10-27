@@ -351,6 +351,17 @@ class TestThePublishIsLayered(unittest.TestCase):
         self.assertIsInstance(row["base_factors"], str)
         self.assertIn('"C"', row["base_factors"])
 
+    def test_the_fullest_tier_inputs_are_stored_whole(self):
+        """A cut JSON string reads back as {}: proof and the gates would be
+        lost at the next verdict's rescore. Every key set at once must fit."""
+        import json
+        fullest = {"proven": False, "kev": False, "passive_unconfirmed": True,
+                   "public_client_key": True,
+                   "gates": {"reachable_now": False, "attributed": False,
+                             "controlled": False, "impactful": False}}
+        row = TriageMixin._clean_layer_row(_layer_row(tier_inputs=fullest))
+        self.assertEqual(json.loads(row["tier_inputs"]), fullest)
+
     def test_it_is_one_managed_transaction_that_locks_before_it_reads(self):
         client = FakeClient(records=[])
         client.publish_triage_layers(UID, PID, [_layer_row()], _combine_stub)
@@ -435,6 +446,59 @@ class TestThePublishIsLayered(unittest.TestCase):
         client.driver.session.return_value.execute_write = boom
         with self.assertRaises(TriageWriteBusy):
             client.publish_triage_layers(UID, PID, [_layer_row()], _combine_stub)
+
+
+class TestTheDispositionIsAFinalValue(unittest.TestCase):
+    """Plan 10.5: `triage_disposition` and `triage_blocker` come from combine
+    only, through the same two statements as every other final value."""
+
+    def test_both_are_triage_properties(self):
+        self.assertIn("triage_disposition", TRIAGE_PROPS)
+        self.assertIn("triage_blocker", TRIAGE_PROPS)
+
+    def test_the_enum_is_the_score_model_s(self):
+        from cypherfix_triage import score_model
+        from graph_db.mixins.recon.triage_mixin import VALID_DISPOSITION
+        self.assertEqual(VALID_DISPOSITION, score_model.DISPOSITIONS)
+
+    def test_the_rescore_and_the_publish_write_them_from_combine(self):
+        self.assertIn("n.triage_disposition    = $final.disposition", TriageMixin._FINAL_SET)
+        self.assertIn("n.triage_blocker        = $final.blocker", TriageMixin._FINAL_SET)
+        client = SeqClient([_lock_record()], [])
+        combine = lambda row, props, proven_now: {  # noqa: E731
+            "final": {**FINAL, "disposition": "candidate", "blocker": "shared edge"}, "review": None}
+        client.publish_triage_layers(UID, PID, [_layer_row()], combine)
+        self.assertIn("n.triage_disposition    = row.final.disposition", client.queries[-1])
+        self.assertIn("n.triage_blocker        = row.final.blocker", client.queries[-1])
+        final = client.params[-1]["rows"][0]["final"]
+        self.assertEqual((final["disposition"], final["blocker"]), ("candidate", "shared edge"))
+
+    def test_they_are_clamped_like_every_final(self):
+        clean = TriageMixin._clean_final
+        cases = (
+            ({"disposition": "reportable", "blocker": "leftover"}, ("reportable", None)),
+            ({"disposition": "candidate", "blocker": "x" * 500}, ("candidate", "x" * 200)),
+            ({"disposition": "published", "blocker": "shared edge"}, (None, None)),
+            ({"disposition": "candidate", "blocker": 7}, (None, None)),
+            ({"disposition": "candidate", "blocker": "  "}, (None, None)),
+            ({}, (None, None)),
+        )
+        for final, want in cases:
+            with self.subTest(final=final):
+                out = clean({**FINAL, **final})
+                self.assertEqual((out["disposition"], out["blocker"]), want)
+
+    def test_a_review_cannot_write_them(self):
+        review = {"triage_ai_verdict": "false_positive", "triage_ai_channel": "mcp",
+                  "triage_disposition": "excluded", "triage_blocker": "hidden by the page"}
+        written = TriageMixin._clean_review(review)
+        self.assertNotIn("triage_disposition", written)
+        self.assertNotIn("triage_blocker", written)
+
+    def test_the_board_row_carries_the_stored_answer(self):
+        for query in (TriageMixin._board_row(), TriageMixin._board_row(", 1 AS x")):
+            self.assertIn("n.triage_disposition               AS triage_disposition", query)
+            self.assertIn("n.triage_blocker                   AS triage_blocker", query)
 
 
 class TestAPersonsDecision(unittest.TestCase):
@@ -715,6 +779,22 @@ class TestTheBoardFilters(unittest.TestCase):
                        "AS review_state", "AS decided_via", "AS triage_ai_why",
                        "AS triage_verdict_token", "AS triage_tier_inputs"):
             self.assertIn(column, client.last)
+
+    def test_rows_carry_what_the_disposition_reads(self):
+        """
+        The board and MCP list_findings decide a row's disposition (plan 10)
+        from it. A public client key is "info" by its flag, or, on a node
+        written before the flag, by its pattern name; without these columns a
+        triaged browser key read as a candidate there and as info in the report.
+        Read-only: the row is the board's, no triage layer is written.
+        """
+        client = FakeClient(records=[])
+        client.list_triage_findings(UID, PID)
+        # The page, the row a verdict answers with, and the detail all project
+        # through _board_row.
+        for query in (client.last, TriageMixin._board_row(), TriageMixin._board_row(", 1 AS x")):
+            self.assertIn("coalesce(n.public_client_key, false) AS public_client_key", query)
+            self.assertIn("coalesce(n.secret_type, '')      AS secret_type", query)
 
     def test_a_finding_named_by_its_title_shows_that_title(self):
         """

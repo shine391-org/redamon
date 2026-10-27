@@ -7,6 +7,7 @@ pipeline, and merges the result back via update_graph_from_tlsx. Partial and
 full share one graph, so every write is a MERGE on the tenant triple.
 """
 
+import copy
 import json
 import os
 import sys
@@ -120,6 +121,10 @@ def run_tlsx(config: dict) -> None:
         print("[!][Partial Recon] Run Naabu/Nmap first, or provide IPs + ports manually.")
         sys.exit(1)
 
+    # The custom-port write below lands before the tlsx write, so it gets the
+    # port data as it stood before tlsx: tlsx tags IPs from certificate issuers
+    # in place, and an IP that already read as tagged would lose cdn_source 'tlsx'.
+    port_data = copy.deepcopy(recon_data) if user_ports else None
     result = run_tlsx_enrichment(recon_data, settings=settings)
 
     print("[*][Partial Recon] Updating graph database...")
@@ -134,7 +139,7 @@ def run_tlsx(config: dict) -> None:
             # Service enrichment).
             if user_ports:
                 graph_client.update_graph_from_port_scan(
-                    recon_data=result, user_id=user_id, project_id=project_id)
+                    recon_data=port_data, user_id=user_id, project_id=project_id)
             stats = graph_client.update_graph_from_tlsx(
                 recon_data=result, user_id=user_id, project_id=project_id)
             print(f"[+][Partial Recon] tlsx graph update: {json.dumps(stats, default=str)}")

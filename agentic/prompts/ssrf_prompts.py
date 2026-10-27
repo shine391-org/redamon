@@ -245,7 +245,7 @@ http://169.254.169.254/latest/dynamic/instance-identity/document
 Extraction sequence:
 1. List role: `GET /latest/meta-data/iam/security-credentials/`
 2. Get keys: `GET /latest/meta-data/iam/security-credentials/<role>` -> AccessKeyId, SecretAccessKey, Token
-3. Use the temporary credentials with `aws-cli` (via execute_code if needed) to enumerate scope.
+3. Use the temporary credentials with `boto3` (via execute_code) to enumerate scope.
 
 **AWS (IMDSv2)** requires a PUT-token. See Step 5 for the header-injection pivot."""
 

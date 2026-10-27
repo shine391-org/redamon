@@ -164,6 +164,12 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
     'Targets are loaded from the graph (BaseURLs from prior HTTP probing). ' +
     'You can also provide custom URLs below. ' +
     'Endpoint and BaseURL nodes are merged into the existing graph.',
+  IpAttribution:
+    'Re-tags every IP already in the graph as a shared edge (a CDN edge serving many companies), dedicated ' +
+    '(its default certificate covers a target domain) or unknown, from the CDN signals the graph holds and one ' +
+    'TLS handshake without SNI per IP with port 443 open (capped, paced at the engagement rate ceiling, off in stealth mode). ' +
+    'Graph targets only: it updates existing IP nodes and creates none. ' +
+    'Useful after a partial scan added IPs, or when the step was off during the original scan.',
   EndpointAiClassifier:
     'Re-runs the AI surface classifier over every Endpoint and Parameter already in the graph. ' +
     'Stamps Endpoint.ai_interface_type (llm-chat / llm-completion / llm-embedding / llm-tool-call / sse-stream / mcp / llm-graphql / non-llm), ' +
@@ -750,6 +756,7 @@ export function PartialReconModal({
     || (isSecurityChecks && !loadingInputs && (graphInputs?.existing_ips_count ?? 0) === 0 && (graphInputs?.existing_subdomains_count ?? 0) === 0 && (graphInputs?.existing_baseurls_count ?? 0) === 0)
     || (toolId === 'Shodan' && !loadingInputs && (graphInputs?.existing_ips_count ?? 0) === 0)
     || (toolId === 'OsintEnrichment' && !loadingInputs && (graphInputs?.existing_ips_count ?? 0) === 0)
+    || (toolId === 'IpAttribution' && !loadingInputs && (graphInputs?.existing_ips_count ?? 0) === 0)
   const hasJsUploads = toolId === 'JsRecon' && uploadedJsFiles.length > 0
   const hasNoCustomTargets = (!hasSubdomainInput || !customSubdomains.trim()) && (!hasIpInput || !customIps.trim()) && !customPorts.trim() && (!hasUrlInput || !customUrls.trim()) && !hasJsUploads
   const noTargetsToScan = hasUserInputs && !isGau && !isParamSpider && !includeGraphTargets && hasNoCustomTargets
@@ -763,6 +770,8 @@ export function PartialReconModal({
   const securityChecksNoUrls = isSecurityChecks && !includeGraphTargets && !customUrls.trim() && !customSubdomains.trim() && !customIps.trim()
   const shodanNoIps = isShodan && !includeGraphTargets && !customIps.trim()
   const osintNoIps = isOsintEnrichment && !includeGraphTargets && !customIps.trim()
+  // Graph targets only: the step tags existing IP nodes and creates none.
+  const ipAttributionNoIps = toolId === 'IpAttribution' && !loadingInputs && (graphInputs?.existing_ips_count ?? 0) === 0
   const originDiscoveryNoFronted = isOriginDiscovery && !loadingInputs && !customSubdomains.trim() && (!includeGraphTargets || (graphInputs?.fronted_count ?? 0) === 0)
 
   const inputCounts: string | null = (isNmap || isTlsx)
@@ -795,7 +804,7 @@ export function PartialReconModal({
     ? `(${graphInputs?.existing_ips_count ?? 0} IPs)`
     : toolId === 'Shodan'
     ? `(${graphInputs?.existing_ips_count ?? 0} IPs)`
-    : toolId === 'OsintEnrichment'
+    : toolId === 'OsintEnrichment' || toolId === 'IpAttribution'
     ? `(${graphInputs?.existing_ips_count ?? 0} IPs, ${graphInputs?.existing_subdomains_count ?? 0} subdomains)`
     : null
 
@@ -981,6 +990,8 @@ export function PartialReconModal({
               ? 'No IPs found in graph. Run Subdomain Discovery first to populate IPs, or provide custom IPs below.'
               : toolId === 'OsintEnrichment'
               ? 'No IPs found in graph. Run Subdomain Discovery first to populate IPs for OSINT enrichment.'
+              : toolId === 'IpAttribution'
+              ? 'No IPs found in graph. Run a scan first: IP attribution tags the IPs already in the graph.'
               : 'No IPs found in graph. Run Subdomain Discovery first to populate the graph, or provide custom targets below.'}
           </div>
         )}
@@ -1445,7 +1456,7 @@ export function PartialReconModal({
           <button
             type="button"
             onClick={handleRun}
-            disabled={!runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || originDiscoveryNoFronted || oldModelGraph}
+            disabled={!runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || ipAttributionNoIps || originDiscoveryNoFronted || oldModelGraph}
             style={{
               padding: '8px 16px', borderRadius: '6px', border: 'none',
               backgroundColor: '#3b82f6', color: '#fff',

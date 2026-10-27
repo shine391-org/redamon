@@ -96,3 +96,40 @@ describe('useReconStatus pause transition', () => {
     expect(result.current.state?.status).toBe('running')
   })
 })
+
+describe('useReconStatus resume refusal (plan 12.5)', () => {
+  // The orchestrator re-checks the RoE time window on resume: outside it the
+  // answer is 403 with the same message a refused start gets, and the scan
+  // stays paused. The page reads the message back to show it.
+  const REFUSAL = 'RoE time window: current time 21:00 UTC is outside allowed window (09:00-18:00)'
+
+  function stub(resume: Response) {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => (
+      url.endsWith('/resume') ? resume : jsonResponse(state('paused'))
+    )) as unknown as typeof fetch)
+  }
+
+  test('a refused resume resolves to null and keeps the refusal readable', async () => {
+    stub({ ok: false, status: 403, json: async () => ({ error: REFUSAL }) } as Response)
+    const { result } = renderHook(() => useReconStatus({ projectId: PROJECT_ID }))
+    await waitFor(() => expect(result.current.state?.status).toBe('paused'))
+
+    let answer: ReconState | null = state('running')
+    await act(async () => { answer = await result.current.resumeRecon() })
+    expect(answer).toBeNull()
+    expect(result.current.getLastResumeError()).toBe(REFUSAL)
+    expect(result.current.state?.status).toBe('paused')
+  })
+
+  test('a resume that goes through clears the last refusal', async () => {
+    stub({ ok: false, status: 403, json: async () => ({ error: REFUSAL }) } as Response)
+    const { result } = renderHook(() => useReconStatus({ projectId: PROJECT_ID }))
+    await waitFor(() => expect(result.current.state?.status).toBe('paused'))
+    await act(async () => { await result.current.resumeRecon() })
+
+    stub(jsonResponse(state('running')))
+    await act(async () => { await result.current.resumeRecon() })
+    expect(result.current.getLastResumeError()).toBeNull()
+    expect(result.current.state?.status).toBe('running')
+  })
+})

@@ -56,9 +56,12 @@ Access control is invisible without a comparison. For every test:
    or a DENIED control request (what the block looks like: exact status, body
    length, body hash, key headers).
 2. Send ONE mutated request that changes exactly one variable.
-3. **Diff** it against the baseline. A mutation that moves a denied control toward
-   success (403/401 -> 2xx/3xx, empty -> populated body, one user's data -> another
-   user's data) IS the finding. Reason from the diff, never from a single response.
+3. **Diff** it against the baseline. A mutation that moves a denied control to real
+   success (403/401 -> 2xx WITH the protected content, a 3xx whose `Location` is NOT
+   a login, landing or error route, empty -> populated body, one user's data ->
+   another user's data) IS the finding. A redirect to a login, landing or error
+   route is the protection working, not a bypass. Reason from the diff, never from
+   a single response.
 
 The strongest oracle is **two accounts** owning distinct objects (if credentials
 or self-registration exist): what User A may see vs what User A can reach of User

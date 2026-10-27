@@ -13,13 +13,17 @@ vi.mock('@/lib/access', () => ({ guardProject: vi.fn().mockResolvedValue(null) }
 let findingRows: Array<Record<string, unknown>> = []
 let chainRows: Array<Record<string, unknown>> = []
 let exploitRows: Array<Record<string, unknown>> = []
+let githubRows: Array<Record<string, unknown>> = []
+const queries: string[] = []
 
 vi.mock('@/app/api/graph/neo4j', () => ({
   getGraphSession: () => ({
     run: async (cypher: string) => {
+      queries.push(cypher)
       const rows = cypher.includes('v.cvss_score AS cvssScore') ? findingRows
         : cypher.includes('c.cvss AS cvss,') ? chainRows
-        : cypher.includes('ex.cvss_score AS cvssScore') ? exploitRows : []
+        : cypher.includes('ex.cvss_score AS cvssScore') ? exploitRows
+        : cypher.includes('AS sensitiveFiles') ? githubRows : []
       return { records: rows.map(row => ({ get: (k: string) => row[k] ?? null })) }
     },
     close: async () => {},
@@ -36,6 +40,8 @@ beforeEach(() => {
   findingRows = []
   chainRows = []
   exploitRows = []
+  githubRows = []
+  queries.length = 0
 })
 
 describe('CVSS stored as INTEGER', () => {
@@ -49,5 +55,18 @@ describe('CVSS stored as INTEGER', () => {
     expect(body.findings.map((f: { cvssScore: unknown }) => f.cvssScore)).toEqual([10, 9.8, null])
     expect(body.cveChains[0].cvss).toBe(9)
     expect(body.exploits[0].cvssScore).toBe(8)
+  })
+})
+
+describe('GitHub-hunt secrets (plan 05.2)', () => {
+  test('a public client key in a repository is counted apart, as the report counts it', async () => {
+    const { githubSecretCountsCypher } = await import('@/lib/secrets/githubSecretCounts')
+    githubRows = [{ repos: neo4j.int(2), secrets: neo4j.int(5), publicClientKeys: neo4j.int(3),
+                    sensitiveFiles: neo4j.int(1) }]
+
+    const body = await (await route.GET(request('p1'))).json()
+
+    expect(queries).toContain(githubSecretCountsCypher())
+    expect(body.githubSecrets).toEqual({ repos: 2, secrets: 5, publicClientKeys: 3, sensitiveFiles: 1 })
   })
 })

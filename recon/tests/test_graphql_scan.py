@@ -58,16 +58,22 @@ class TestGraphQLDiscovery:
                     'https://example.com': {'status_code': 200}
                 }
             },
+            # js_recon.endpoints, as recon/helpers/js_recon/endpoints.py writes it
+            # (plan 12.12: discovery used to read a `findings` key nothing writes).
             'js_recon': {
-                'findings': [
+                'endpoints': [
                     {
                         'type': 'graphql',
                         'path': '/api/graphql',
+                        'full_url': '/api/graphql',
+                        'source_js': 'https://example.com/static/app.js',
                         'method': 'POST'
                     },
                     {
                         'type': 'graphql_introspection',
                         'path': 'https://example.com/graphiql',
+                        'full_url': 'https://example.com/graphiql',
+                        'source_js': 'https://example.com/static/app.js',
                         'method': 'POST'
                     }
                 ]
@@ -89,19 +95,14 @@ class TestGraphQLDiscovery:
         combined_result = {
             'http_probe': {
                 'by_url': {
+                    # A top-level content_type, as http_probe's by_url carries it.
                     'https://example.com/api': {
                         'status_code': 200,
-                        'headers': {
-                            'content-type': 'application/graphql'
-                        },
-                        'body': 'GraphQL Playground'
+                        'content_type': 'application/graphql',
                     },
                     'https://example.com/normal': {
                         'status_code': 200,
-                        'headers': {
-                            'content-type': 'text/html'
-                        },
-                        'body': 'Normal page'
+                        'content_type': 'text/html',
                     }
                 }
             }

@@ -52,8 +52,8 @@ Pentesters with full authorization on an engagement where stealth is irrelevant.
   targetProfile: 'both',
   environment: 'either',
   parameters: {
-    // All scan modules enabled including js_recon (actively crawls and downloads JS files)
-    scanModules: ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan', 'js_recon'],
+    // All scan modules enabled; JS recon runs by jsReconEnabled, on the crawl's output
+    scanModules: ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan'],
 
     // Stealth OFF
     stealthMode: false,
@@ -100,6 +100,7 @@ Pentesters with full authorization on an engagement where stealth is irrelevant.
 
     // --- HTTP Probing: all probes maxed ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 3,

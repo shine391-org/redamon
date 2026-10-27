@@ -33,7 +33,7 @@ This workflow uses only tools already present in the agent's runtime. No new Kal
 - `execute_arjun` to brute-force hidden body parameters on each candidate endpoint
 - `execute_curl` to fire crafted JSON, form-encoded, multipart, and patch payloads with two distinct authentication contexts
 - `execute_code` to generate per-resource field dictionaries, build shape variants, drive batched diffing, and parse before/after responses
-- `kali_shell` for `jq`, `httpie`, and one-off CLI checks (response-body comparison, body re-encoding)
+- `kali_shell` for `jq`, `curl`, and one-off CLI checks (response-body comparison, body re-encoding)
 
 ## Workflow
 

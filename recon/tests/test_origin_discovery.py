@@ -22,7 +22,18 @@ import copy
 import unittest
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from recon.main_recon_modules import origin_discovery as od
+
+
+@pytest.fixture(autouse=True)
+def _no_live_tls(monkeypatch):
+    """A confirmed candidate gets a default-certificate TLS dial; no test here
+    may make it to a real public address."""
+    def _offline(*_a, **_k):
+        raise OSError("network disabled in unit tests")
+    monkeypatch.setattr(od, "_tls_handshake_cert", _offline)
 
 
 def _settings(**over):

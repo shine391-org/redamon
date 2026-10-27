@@ -543,7 +543,7 @@ def get_phase_tools(
         tool_filter: Optional whitelist of tool names. When set, the rendered output is
                      restricted to the intersection of phase-allowed tools and this set.
                      Used by fireteam members to render a "primary tools" view limited
-                     to their declared skills. None means no filtering (full phase view).
+                     to their declared `tools`. None means no filtering (full phase view).
 
     Returns:
         Concatenated tool descriptions appropriate for the phase, mode, and attack path.
@@ -576,7 +576,7 @@ def get_phase_tools(
     # Determine allowed tools for current phase (dynamic from TOOL_PHASE_MAP in DB)
     phase_allowed_unfiltered = get_allowed_tools_for_phase(phase)
     # Optional fireteam-member filter: render only the intersection with the
-    # member's declared skills, so the "primary tools" view stays focused.
+    # member's declared `tools`, so the "primary tools" view stays focused.
     # Phase-allowlisting still applies — filter is a SUBSET operation, never a
     # superset.
     if tool_filter is not None:
@@ -587,7 +587,7 @@ def get_phase_tools(
     # Kali shell library installation rules (prompt-based control).
     # IMPORTANT: check the UNFILTERED phase allowlist. A fireteam member may
     # render the "primary tools" view without kali_shell in its declared
-    # skills, but kali_shell still appears in the member's fallback toolbox
+    # `tools`, but kali_shell still appears in the member's fallback toolbox
     # and is callable. The install constraints must be communicated regardless
     # of which view we're rendering — otherwise the model may try `apt install`
     # via a fallback kali_shell call without seeing the warning.

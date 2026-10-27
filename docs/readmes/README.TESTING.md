@@ -66,6 +66,41 @@ copy that genuinely lacks an input is `REDAMON_TEST_ALLOW_MISSING=<section>[,<se
 (or `all`), which prints a `SKIPPED` line so the hole is visible in the log
 (`_test_missing_input` in `redamon.sh`).
 
+### The wiki checkout
+
+`redamon.wiki/` is a git submodule: `.gitmodules` declares it, and
+`tests/test_wiki_submodule.py` checks the declaration. A clone made without
+`--recurse-submodules` leaves it empty, and then every wiki-dependent test
+**fails** instead of skipping, because a skip there would pass while checking
+nothing. Those tests are `tests/test_docs_not_stale.py`,
+`tests/docs_cited_paths_test.sh`, the community-skill tests in `agentic/tests/`
+that read `Agent-Skills.md`, and the webapp's `apiReference`, `settingsReference`,
+`scopeCopy`, `onboarding` and `profiles` tests under `webapp/src/lib/`. Fill the
+checkout with `git submodule update --init redamon.wiki`, or opt out with
+`REDAMON_TEST_ALLOW_MISSING=wiki` (or `all`), which the gate forwards into every
+section's container: the wiki checks then skip with
+`SKIPPED: no wiki checkout, allowed by REDAMON_TEST_ALLOW_MISSING`, and
+`./redamon.sh test` prints a `SKIPPED the wiki checks` line. The rule lives in
+`tooling/scripts/wiki_checkout.py`, with its TypeScript twin in
+`webapp/src/lib/wikiCheckout.testUtils.ts`.
+
+### Drift guards
+
+Tests that fail when one copy of a fact moves and another does not. The full
+list, with what each one cannot see, is section 3 of
+[README.DRIFT_MAP.md](README.DRIFT_MAP.md); the ones you meet when you edit docs
+or generated files:
+
+| Guard | Fails when |
+|---|---|
+| `tests/test_docs_not_stale.py` | a doc's wiki link, anchor, image or count no longer holds, or an agent-facing guide names something deleted or tells you to hand-edit a generated file. Today's known drift is allowlisted in `tests/fixtures/docs_drift_{wiki,readmes,root}.json`, and an entry that stops failing must leave its file |
+| `tests/docs_cited_paths_test.sh` | a doc cites a repository path git does not track (`drift-audit.sh --docs`), against the allowlists in `tests/fixtures/docs_paths_drift_{wiki,readmes,root}.json` under the same rule |
+| `tests/drift_audit_test.sh` | `skills/skill-sync/assets/drift-audit.sh` stops reporting a dead link or a basename-only match |
+| `tests/test_registry_build_check.py` | the settings registry's generated files are stale (`recon_settings/build.py --check`) |
+| `tests/pre_commit_hook_test.sh` | `tooling/hooks/pre-commit` stops blocking a commit that leaves a generated artifact stale, or blocks one that does not touch a generator |
+| `tests/redamon_update_map_test.sh` | `./redamon.sh update` would not rebuild (or restart) an image whose `COPY` sources changed |
+| `tests/redamon_gate_unskippable_test.sh` | the gate could go green with a section's image or `webapp/node_modules` missing |
+
 ### The `shell` section
 
 Parts of RedAmon are bash, not Python: the proportional memory allocator, the
@@ -114,7 +149,7 @@ through `testing/e2e/scripts/stub-llm-server.mjs`, registered as an OpenAI-compa
 the run and removed at the end, and analyses `testing/e2e/fixtures/skiller-session.json`. Each
 spec skips itself when its files are missing.
 
-### Two oracles, and only one of them runs in CI
+### Two oracles, and only one of them runs in the gate
 
 Some unit-tier files mix hermetic checks with checks that need a live Neo4j and
 self-skip without one. The graph-schema suites are the example, and the split is

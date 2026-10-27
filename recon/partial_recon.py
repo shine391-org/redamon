@@ -34,6 +34,11 @@ from datetime import datetime
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# First, as in main.py: a stop during the imports or the settings load must
+# still sweep and exit (recon/helpers/shutdown.py).
+from recon.helpers import shutdown
+if __name__ == "__main__":
+    shutdown.install()
 
 from recon.project_settings import get_settings
 from recon.helpers.roe_scope import _is_roe_excluded
@@ -290,7 +295,15 @@ def _run_tool(tool_id: str, config: dict):
     return {root: STATUS_OK for root in roots}, True
 
 
+# The job's start stamp, kept where the stopper's sweep can read it. None until
+# the dispatch starts: a job stopped before then wrote nothing, so the sweep
+# skips itself.
+_STARTED_AT = None
+
+
 def main():
+    global _STARTED_AT
+    shutdown.set_sweep(lambda: _apply_node_filters(_STARTED_AT))
     config = load_config()
     tool_id = config.get("tool_id", "")
 
@@ -341,11 +354,13 @@ def main():
     # Taken BEFORE the dispatch: everything this job writes is stamped later, so
     # the end-of-job node-filter sweep reaches exactly what it wrote.
     from graph_db.mixins.base_mixin import run_timestamp
-    started_at = run_timestamp()
+    _STARTED_AT = run_timestamp()
     try:
         statuses, completed = _run_tool(tool_id, config)
     finally:
-        _apply_node_filters(started_at)
+        shutdown.sweep_once()
+        # A stopped job ends in the stopper (exit 143), not in the report below.
+        shutdown.park()
 
     # A partial run never prunes, so its coverage gaps protect nothing here; the
     # drain still says which empty results looked like a failure, and asks Jev
@@ -398,6 +413,9 @@ def _dispatch(tool_id: str, config: dict):
         return run_tlsx(config)
     elif tool_id == "Httpx":
         return run_httpx(config)
+    elif tool_id == "IpAttribution":
+        from recon.partial_recon_modules.ip_attribution import run_ip_attribution_partial
+        return run_ip_attribution_partial(config)
     elif tool_id == "Katana":
         return run_katana(config)
     elif tool_id == "Hakrawler":

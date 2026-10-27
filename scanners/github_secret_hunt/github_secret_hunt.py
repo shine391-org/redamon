@@ -77,7 +77,7 @@ SECRET_PATTERNS = {
     "Azure Storage Key": r"(?i)DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{88}",
     "Azure Connection String": r"(?i)(AccountKey|SharedAccessKey)=[A-Za-z0-9+/=]{40,}",
     "Azure SAS Token": r"(?i)[?&]sig=[A-Za-z0-9%]{40,}",
-    "Azure AD Client Secret": r"(?i)azure.*client.?secret.*['\"][a-zA-Z0-9~._-]{34,}['\"]",
+    "Azure AD Client Secret": r"(?i)(?:azure|msal|aad)[^\n]{0,120}?client.?secret[\"']?\s*[:=]\s*[\"'][a-zA-Z0-9~._-]{34,}[\"']",
 
     # ========== GOOGLE CLOUD ==========
     "GCP API Key": r"AIza[0-9A-Za-z\-_]{35}",
@@ -122,26 +122,26 @@ SECRET_PATTERNS = {
     "Stripe Publishable Key": r"pk_live_[0-9a-zA-Z]{24,}",
 
     # ========== PAYMENT PROCESSORS ==========
-    "PayPal Client ID": r"(?i)paypal.*client[_-]?id.*['\"][A-Za-z0-9-]{20,}['\"]",
+    "PayPal Client ID": r"(?i)paypal[^\n]{0,120}?client[_-]?id[^\n]{0,120}?['\"][A-Za-z0-9-]{20,}['\"]",
     "PayPal Braintree Token": r"access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}",
     "Square Access Token": r"sq0atp-[0-9A-Za-z\-_]{22}",
     "Square OAuth Secret": r"sq0csp-[0-9A-Za-z\-_]{43}",
     "Razorpay Key": r"rzp_(live|test)_[a-zA-Z0-9]{14}",
-    "Plaid Client ID": r"(?i)plaid.*client.?id.*['\"][a-f0-9]{24}['\"]",
-    "Plaid Secret Key": r"(?i)plaid.*secret.*['\"][a-f0-9]{30}['\"]",
-    "Plaid API Token": r"(?i)plaid.*(?:access|public).*token.*['\"][a-z0-9-]+['\"]",
+    "Plaid Client ID": r"(?i)plaid[^\n]{0,120}?client.?id[^\n]{0,120}?['\"][a-f0-9]{24}['\"]",
+    "Plaid Secret Key": r"(?i)plaid[^\n]{0,120}?secret[^\n]{0,120}?['\"][a-f0-9]{30}['\"]",
+    "Plaid API Token": r"(?i)plaid[^\n]{0,120}?(?:access|public)[^\n]{0,120}?token[^\n]{0,120}?['\"][a-z0-9-]+['\"]",
     "Flutterwave Secret Key": r"FLWSECK-[a-zA-Z0-9]{32}-X",
     "Flutterwave Public Key": r"FLWPUBK-[a-zA-Z0-9]{32}-X",
     "Flutterwave Encryption Key": r"FLWSECK_TEST-[a-zA-Z0-9]{12}",
-    "GoCardless API Token": r"(?i)gocardless.*['\"]live_[a-zA-Z0-9\-_]{40,}['\"]",
-    "Coinbase Access Token": r"(?i)coinbase.*['\"][a-zA-Z0-9]{64}['\"]",
+    "GoCardless API Token": r"(?i)gocardless[^\n]{0,120}?['\"]live_[a-zA-Z0-9\-_]{40,}['\"]",
+    "Coinbase Access Token": r"(?i)coinbase[^\n]{0,120}?['\"][a-zA-Z0-9]{64}['\"]",
 
     # ========== CRYPTO EXCHANGES ==========
-    "Kraken Access Token": r"(?i)kraken.*['\"][a-zA-Z0-9/+]{40,}['\"]",
-    "KuCoin Access Token": r"(?i)kucoin.*['\"][a-f0-9]{24}['\"]",
-    "KuCoin Secret Key": r"(?i)kucoin.*secret.*['\"][a-f0-9-]{36}['\"]",
-    "Bittrex Access Key": r"(?i)bittrex.*['\"][a-f0-9]{32}['\"]",
-    "Bittrex Secret Key": r"(?i)bittrex.*secret.*['\"][a-f0-9]{32}['\"]",
+    "Kraken Access Token": r"(?i)kraken[^\n]{0,120}?['\"][a-zA-Z0-9/+]{40,}['\"]",
+    "KuCoin Access Token": r"(?i)kucoin[^\n]{0,120}?['\"][a-f0-9]{24}['\"]",
+    "KuCoin Secret Key": r"(?i)kucoin[^\n]{0,120}?secret[^\n]{0,120}?['\"][a-f0-9-]{36}['\"]",
+    "Bittrex Access Key": r"(?i)bittrex[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
+    "Bittrex Secret Key": r"(?i)bittrex[^\n]{0,120}?secret[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
 
     # ========== AI / LLM PROVIDERS ==========
     "OpenAI API Key": r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}",
@@ -150,48 +150,48 @@ SECRET_PATTERNS = {
     "Anthropic Admin Key": r"sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA",
     "HuggingFace Access Token": r"hf_[a-zA-Z]{34}",
     "HuggingFace Org Token": r"api_org_[a-zA-Z0-9]{34}",
-    "Cohere API Token": r"(?i)cohere.*['\"][a-zA-Z0-9]{40}['\"]",
+    "Cohere API Token": r"(?i)cohere[^\n]{0,120}?['\"][a-zA-Z0-9]{40}['\"]",
     "Perplexity API Key": r"pplx-[a-f0-9]{48}",
     "Replicate API Token": r"r8_[a-zA-Z0-9]{40}",
-    "Google Gemini API Key": r"(?i)gemini.*['\"]AIza[0-9A-Za-z\-_]{35}['\"]",
-    "Mistral API Key": r"(?i)mistral.*['\"][a-zA-Z0-9]{32}['\"]",
+    "Google Gemini API Key": r"(?i)gemini[^\n]{0,120}?['\"]AIza[0-9A-Za-z\-_]{35}['\"]",
+    "Mistral API Key": r"(?i)mistral[^\n]{0,120}?['\"][a-zA-Z0-9]{32}['\"]",
     "Groq API Key": r"gsk_[a-zA-Z0-9]{52}",
-    "Together AI Key": r"(?i)together.*['\"][a-f0-9]{64}['\"]",
-    "Deepseek API Key": r"(?i)deepseek.*['\"]sk-[a-f0-9]{48}['\"]",
+    "Together AI Key": r"(?i)together[^\n]{0,120}?['\"][a-f0-9]{64}['\"]",
+    "Deepseek API Key": r"(?i)deepseek[^\n]{0,120}?['\"]sk-[a-f0-9]{48}['\"]",
 
     # ========== SOCIAL MEDIA & APIs ==========
-    "Twitter API Key": r"(?i)twitter.*api[_-]?key.*['\"][0-9a-zA-Z]{25}['\"]",
-    "Twitter API Secret": r"(?i)twitter.*api[_-]?secret.*['\"][0-9a-zA-Z]{50}['\"]",
-    "Twitter Access Token": r"(?i)twitter.*access[_-]?token.*['\"][0-9]+-[a-zA-Z0-9]{40,}['\"]",
+    "Twitter API Key": r"(?i)twitter[^\n]{0,120}?api[_-]?key[^\n]{0,120}?['\"][0-9a-zA-Z]{25}['\"]",
+    "Twitter API Secret": r"(?i)twitter[^\n]{0,120}?api[_-]?secret[^\n]{0,120}?['\"][0-9a-zA-Z]{50}['\"]",
+    "Twitter Access Token": r"(?i)twitter[^\n]{0,120}?access[_-]?token[^\n]{0,120}?['\"][0-9]+-[a-zA-Z0-9]{40,}['\"]",
     "Twitter Bearer Token": r"(?<![A-Za-z0-9+/=])AAAAAAAAAAAAAAAAAAAAAA[0-9A-Za-z%]{30,}(?![A-Za-z0-9+/=])",
     "Facebook Access Token": r"EAACEdEose0cBA[0-9A-Za-z]+",
     "Facebook Page Token": r"EAA[MC][a-zA-Z0-9]{100,}",
-    "Facebook Secret": r"(?i)facebook.*(?:secret|app.?secret).*['\"][a-f0-9]{32}['\"]",
-    "Facebook OAuth": r"(?i)facebook.*['\"][0-9]{13,17}['\"]",
-    "LinkedIn Client ID": r"(?i)linkedin.*client.?id.*['\"][a-z0-9]{12,}['\"]",
-    "LinkedIn Client Secret": r"(?i)linkedin.*client.?secret.*['\"][a-zA-Z0-9]{16}['\"]",
-    "Twitch API Token": r"(?i)twitch.*['\"][a-z0-9]{30}['\"]",
+    "Facebook Secret": r"(?i)facebook[^\n]{0,120}?(?:secret|app.?secret)[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
+    "Facebook OAuth": r"(?i)facebook[^\n]{0,120}?['\"][0-9]{13,17}['\"]",
+    "LinkedIn Client ID": r"(?i)linkedin[^\n]{0,120}?client.?id[^\n]{0,120}?['\"][a-z0-9]{12,}['\"]",
+    "LinkedIn Client Secret": r"(?i)linkedin[^\n]{0,120}?client.?secret[^\n]{0,120}?['\"][a-zA-Z0-9]{16}['\"]",
+    "Twitch API Token": r"(?i)twitch[^\n]{0,120}?['\"][a-z0-9]{30}['\"]",
 
     # ========== MESSAGING ==========
     "Twilio API Key": r"\bSK[0-9a-fA-F]{32}\b",
     "Twilio Account SID": r"\bAC[a-zA-Z0-9]{32}\b",
     "Twilio App SID": r"\bAP[a-zA-Z0-9_\-]{32}\b",
     "SendGrid API Key": r"SG\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9\-_]{43}",
-    "Mailgun API Key": r"key-[0-9a-zA-Z]{32}",
+    "Mailgun API Key": r"(?<![A-Za-z0-9])key-[0-9a-zA-Z]{32}",
     "Mailgun Public Key": r"pubkey-[a-f0-9]{32}",
-    "Mailgun Signing Key": r"(?i)mailgun.*signing.*['\"][a-f0-9]{32}-[a-f0-9]{8}-[a-f0-9]{8}['\"]",
+    "Mailgun Signing Key": r"(?i)mailgun[^\n]{0,120}?signing[^\n]{0,120}?['\"][a-f0-9]{32}-[a-f0-9]{8}-[a-f0-9]{8}['\"]",
     "Mailchimp API Key": r"[0-9a-f]{32}-us[0-9]{1,2}",
     "SendinBlue API Key": r"xkeysib-[a-f0-9]{64}-[a-zA-Z0-9]{16}",
     "Telegram Bot Token": r"[0-9]+:AA[0-9A-Za-z\-_]{33}",
-    "MessageBird API Token": r"(?i)messagebird.*['\"][a-zA-Z0-9]{25}['\"]",
-    "MessageBird Client ID": r"(?i)messagebird.*client.?id.*['\"][a-f0-9-]{36}['\"]",
-    "Mattermost Access Token": r"(?i)mattermost.*['\"][a-z0-9]{26}['\"]",
+    "MessageBird API Token": r"(?i)messagebird[^\n]{0,120}?['\"][a-zA-Z0-9]{25}['\"]",
+    "MessageBird Client ID": r"(?i)messagebird[^\n]{0,120}?client.?id[^\n]{0,120}?['\"][a-f0-9-]{36}['\"]",
+    "Mattermost Access Token": r"(?i)mattermost[^\n]{0,120}?['\"][a-z0-9]{26}['\"]",
     "Microsoft Teams Webhook": r"https://[a-z0-9]+\.webhook\.office\.com/webhookb2/[a-f0-9-]+",
 
     # ========== DISCORD ==========
     "Discord Bot Token": r"[MN][A-Za-z\d]{23,}\.[\w-]{4,7}\.[\w-]{27,}",
-    "Discord Client ID": r"(?i)discord.*client.?id.*['\"][0-9]{17,19}['\"]",
-    "Discord Client Secret": r"(?i)discord.*client.?secret.*['\"][a-zA-Z0-9_-]{32}['\"]",
+    "Discord Client ID": r"(?i)discord[^\n]{0,120}?client.?id[^\n]{0,120}?['\"][0-9]{17,19}['\"]",
+    "Discord Client Secret": r"(?i)discord[^\n]{0,120}?client.?secret[^\n]{0,120}?['\"][a-zA-Z0-9_-]{32}['\"]",
     "Discord Webhook": r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+",
 
     # ========== DATABASES ==========
@@ -202,10 +202,10 @@ SECRET_PATTERNS = {
     "CockroachDB URL": r"\bcockroachdb://[^\s'\"]+",
 
     # ========== CI/CD & DEVOPS ==========
-    "Heroku API Key": r"(?i)heroku.*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-    "Travis CI Token": r"(?i)travis.*['\"][a-zA-Z0-9]{20,}['\"]",
-    "CircleCI Token": r"(?i)circle.*token.*['\"][a-f0-9]{40}['\"]",
-    "DroneCI Access Token": r"(?i)drone.*['\"][a-zA-Z0-9]{32,}['\"]",
+    "Heroku API Key": r"(?i)heroku[^\n]{0,120}?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    "Travis CI Token": r"(?i)travis[^\n]{0,120}?['\"][a-zA-Z0-9]{20,}['\"]",
+    "CircleCI Token": r"(?i)circle[^\n]{0,120}?token[^\n]{0,120}?['\"][a-f0-9]{40}['\"]",
+    "DroneCI Access Token": r"(?i)drone[^\n]{0,120}?['\"][a-zA-Z0-9]{32,}['\"]",
     "NPM Token": r"(?i)//registry\.npmjs\.org/:_authToken=[0-9a-f-]{36}",
     "PyPI Token": r"pypi-AgEIcHlwaS5vcmc[A-Za-z0-9-_]{50,}",
     "Docker Hub Token": r"dckr_pat_[A-Za-z0-9_-]{27}",
@@ -216,7 +216,7 @@ SECRET_PATTERNS = {
     # ========== INFRASTRUCTURE / SECRET MANAGEMENT ==========
     "HashiCorp Vault Service Token": r"\bhvs\.[a-zA-Z0-9_-]{24,}\b",
     "HashiCorp Vault Batch Token": r"\bhvb\.[a-zA-Z0-9_-]{24,}\b",
-    "HashiCorp Terraform Token": r"(?i)terraform.*['\"][a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9_-]{60,}['\"]",
+    "HashiCorp Terraform Token": r"(?i)terraform[^\n]{0,120}?['\"][a-zA-Z0-9]{14}\.atlasv1\.[a-zA-Z0-9_-]{60,}['\"]",
     "Doppler API Token": r"dp\.pt\.[a-zA-Z0-9]{43}",
     "Pulumi Access Token": r"pul-[a-f0-9]{40}",
     "Infracost API Token": r"ico-[a-zA-Z0-9]{32}",
@@ -225,21 +225,21 @@ SECRET_PATTERNS = {
     "DigitalOcean Token": r"dop_v1_[a-f0-9]{64}",
     "DigitalOcean OAuth": r"doo_v1_[a-f0-9]{64}",
     "DigitalOcean Refresh Token": r"dor_v1_[a-f0-9]{64}",
-    "Cloudflare API Key": r"(?i)cloudflare.*['\"][a-z0-9]{37}['\"]",
-    "Cloudflare API Token": r"(?i)cloudflare.*['\"][A-Za-z0-9_-]{40}['\"]",
+    "Cloudflare API Key": r"(?i)cloudflare[^\n]{0,120}?['\"][a-z0-9]{37}['\"]",
+    "Cloudflare API Token": r"(?i)cloudflare[^\n]{0,120}?['\"][A-Za-z0-9_-]{40}['\"]",
     "Cloudflare Origin CA Key": r"v1\.0-[a-f0-9]{24}-[a-f0-9]{146}",
-    "Cloudflare Global API Key": r"(?i)cloudflare.*global.*['\"][a-f0-9]{37}['\"]",
+    "Cloudflare Global API Key": r"(?i)cloudflare[^\n]{0,120}?global[^\n]{0,120}?['\"][a-f0-9]{37}['\"]",
     "Netlify Access Token": r"nfp_[a-zA-Z0-9]{40}",
     "Fly.io Access Token": r"FlyV1\s+fm1r_[a-zA-Z0-9_-]{43}",
-    "Vercel Token": r"(?i)vercel.*['\"][a-zA-Z0-9]{24}['\"]",
+    "Vercel Token": r"(?i)vercel[^\n]{0,120}?['\"][a-zA-Z0-9]{24}['\"]",
     "Scalingo API Token": r"tk-us-[a-zA-Z0-9-_]{48}",
     "Render API Token": r"rnd_[a-zA-Z0-9]{32}",
 
     # ========== ALIBABA / YANDEX ==========
     "Alibaba Access Key ID": r"\bLTAI[a-zA-Z0-9]{20}\b",
-    "Alibaba Secret Key": r"(?i)alibaba.*['\"][a-z0-9]{30}['\"]",
-    "Yandex API Key": r"(?i)yandex.*['\"]AQVN[a-zA-Z0-9_\-]{35,38}['\"]",
-    "Yandex Access Token": r"(?i)yandex.*['\"]t1\.[A-Z0-9a-z_-]+={0,2}\.[A-Z0-9a-z_-]{86}={0,2}['\"]",
+    "Alibaba Secret Key": r"(?i)alibaba[^\n]{0,120}?['\"][a-z0-9]{30}['\"]",
+    "Yandex API Key": r"(?i)yandex[^\n]{0,120}?['\"]AQVN[a-zA-Z0-9_\-]{35,38}['\"]",
+    "Yandex Access Token": r"(?i)yandex[^\n]{0,120}?['\"]t1\.[A-Z0-9a-z_-]+={0,2}\.[A-Z0-9a-z_-]{86}={0,2}['\"]",
     "Yandex AWS Access Token": r"YC[a-zA-Z0-9_\-]{38}",
 
     # ========== E-COMMERCE ==========
@@ -247,15 +247,15 @@ SECRET_PATTERNS = {
     "Shopify Custom Access Token": r"shpca_[a-fA-F0-9]{32}",
     "Shopify Private App Token": r"shppa_[a-fA-F0-9]{32}",
     "Shopify Shared Secret": r"shpss_[a-fA-F0-9]{32}",
-    "Etsy Access Token": r"(?i)etsy.*['\"][a-z0-9]{24}['\"]",
-    "Squarespace Access Token": r"(?i)squarespace.*['\"][a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}['\"]",
+    "Etsy Access Token": r"(?i)etsy[^\n]{0,120}?['\"][a-z0-9]{24}['\"]",
+    "Squarespace Access Token": r"(?i)squarespace[^\n]{0,120}?['\"][a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}['\"]",
 
     # ========== OBSERVABILITY & MONITORING ==========
-    "Datadog API Key": r"(?i)datadog.*['\"][a-f0-9]{32}['\"]",
-    "Datadog App Key": r"(?i)datadog.*app.*key.*['\"][a-f0-9]{40}['\"]",
+    "Datadog API Key": r"(?i)datadog[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
+    "Datadog App Key": r"(?i)datadog[^\n]{0,120}?app[^\n]{0,120}?key[^\n]{0,120}?['\"][a-f0-9]{40}['\"]",
     "New Relic Insert Key": r"NRII-[A-Za-z0-9-_]{32}",
     "New Relic User API Key": r"NRAK-[A-Z0-9]{27}",
-    "New Relic User API ID": r"(?i)new.?relic.*['\"][0-9]{7}['\"]",
+    "New Relic User API ID": r"(?i)new.?relic[^\n]{0,120}?['\"][0-9]{7}['\"]",
     "New Relic Browser API Token": r"NRJS-[a-f0-9]{19}",
     "Grafana API Key": r"eyJrIjoi[a-zA-Z0-9+/=]{60,}",
     "Grafana Cloud Token": r"glc_[A-Za-z0-9+/]{32,}={0,2}",
@@ -264,74 +264,74 @@ SECRET_PATTERNS = {
     "Sentry Org Token": r"sntryo_[a-zA-Z0-9]{56,}",
     "Sentry DSN": r"https://[a-f0-9]{32}@[a-z0-9.-]+\.ingest\.sentry\.io/[0-9]+",
     "Dynatrace API Token": r"dt0c01\.[A-Z0-9]{24}\.[A-Z0-9]{64}",
-    "SumoLogic Access ID": r"(?i)sumo.*access.?id.*['\"]su[a-zA-Z0-9]{12}['\"]",
-    "SumoLogic Access Token": r"(?i)sumo.*access.?key.*['\"][a-zA-Z0-9]{64}['\"]",
+    "SumoLogic Access ID": r"(?i)sumo[^\n]{0,120}?access.?id[^\n]{0,120}?['\"]su[a-zA-Z0-9]{12}['\"]",
+    "SumoLogic Access Token": r"(?i)sumo[^\n]{0,120}?access.?key[^\n]{0,120}?['\"][a-zA-Z0-9]{64}['\"]",
 
     # ========== DEV TOOLS & PROJECT MANAGEMENT ==========
     "Atlassian API Token": r"ATATT3[A-Za-z0-9_\-=]{186}",
-    "Notion API Token": r"(?i)notion.*secret_[a-zA-Z0-9]{43}",
+    "Notion API Token": r"(?i)notion[^\n]{0,120}?secret_[a-zA-Z0-9]{43}",
     "Linear API Key": r"lin_api_[a-zA-Z0-9]{40}",
-    "Linear Client Secret": r"(?i)linear.*client.?secret.*['\"][a-f0-9]{32}['\"]",
-    "Asana Client ID": r"(?i)asana.*['\"][0-9]{16}['\"]",
-    "Asana Client Secret": r"(?i)asana.*secret.*['\"][a-z0-9]{32}['\"]",
+    "Linear Client Secret": r"(?i)linear[^\n]{0,120}?client.?secret[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
+    "Asana Client ID": r"(?i)asana[^\n]{0,120}?['\"][0-9]{16}['\"]",
+    "Asana Client Secret": r"(?i)asana[^\n]{0,120}?secret[^\n]{0,120}?['\"][a-z0-9]{32}['\"]",
     "Postman API Token": r"PMAK-[a-f0-9]{24}-[a-f0-9]{34}",
-    "Bitbucket Client ID": r"(?i)bitbucket.*client.?id.*['\"][a-zA-Z0-9]{32}['\"]",
-    "Bitbucket Client Secret": r"(?i)bitbucket.*client.?secret.*['\"][a-zA-Z0-9_\-]{64}['\"]",
-    "Snyk API Token": r"(?i)snyk.*['\"][a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}['\"]",
+    "Bitbucket Client ID": r"(?i)bitbucket[^\n]{0,120}?client.?id[^\n]{0,120}?['\"][a-zA-Z0-9]{32}['\"]",
+    "Bitbucket Client Secret": r"(?i)bitbucket[^\n]{0,120}?client.?secret[^\n]{0,120}?['\"][a-zA-Z0-9_\-]{64}['\"]",
+    "Snyk API Token": r"(?i)snyk[^\n]{0,120}?['\"][a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}['\"]",
     "SonarQube Token": r"sqa_[a-zA-Z0-9]{40}",
     "Sourcegraph Access Token": r"sgp_[a-f0-9]{40}",
-    "Codecov Access Token": r"codecov.*['\"][a-f0-9]{32}['\"]",
+    "Codecov Access Token": r"codecov[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
 
     # ========== AUTH PROVIDERS ==========
-    "Okta API Token": r"(?i)okta.*['\"][0-9a-zA-Z_-]{42}['\"]",
-    "Auth0 Client Secret": r"(?i)auth0.*client.?secret.*['\"][a-zA-Z0-9_-]{32,}['\"]",
-    "HubSpot API Key": r"(?i)hubspot.*['\"][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}['\"]",
-    "Postmark Server Token": r"(?i)postmark.*['\"][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}['\"]",
-    "Intercom API Key": r"(?i)intercom.*['\"][a-z0-9=_]{60}['\"]",
+    "Okta API Token": r"(?i)okta[^\n]{0,120}?['\"][0-9a-zA-Z_-]{42}['\"]",
+    "Auth0 Client Secret": r"(?i)auth0[^\n]{0,120}?client.?secret[^\n]{0,120}?['\"][a-zA-Z0-9_-]{32,}['\"]",
+    "HubSpot API Key": r"(?i)hubspot[^\n]{0,120}?['\"][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}['\"]",
+    "Postmark Server Token": r"(?i)postmark[^\n]{0,120}?['\"][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}['\"]",
+    "Intercom API Key": r"(?i)intercom[^\n]{0,120}?['\"][a-z0-9=_]{60}['\"]",
 
     # ========== INFRASTRUCTURE DISCOVERY ==========
     "Databricks API Token": r"dapi[a-h0-9]{32}",
     "Kubernetes Secret YAML": r"(?i)apiVersion:\s*v1\s*\nkind:\s*Secret",
     "Octopus Deploy API Key": r"API-[A-Z0-9]{25}",
     "OpenShift User Token": r"sha256~[a-zA-Z0-9_-]{43}",
-    "Harness API Key": r"(?i)harness.*pat\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{24}\.[a-zA-Z0-9]{20}",
+    "Harness API Key": r"(?i)harness[^\n]{0,120}?pat\.[a-zA-Z0-9]{22}\.[a-zA-Z0-9]{24}\.[a-zA-Z0-9]{20}",
 
     # ========== JS-SPECIFIC SERVICES ==========
-    "Algolia API Key": r"(?i)algolia.*['\"][a-f0-9]{32}['\"]",
-    "Algolia App ID": r"(?i)algolia.*app.?id.*['\"][A-Z0-9]{10}['\"]",
+    "Algolia API Key": r"(?i)algolia[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
+    "Algolia App ID": r"(?i)algolia[^\n]{0,120}?app.?id[^\n]{0,120}?['\"][A-Z0-9]{10}['\"]",
     "Mapbox Token": r"pk\.[a-zA-Z0-9]{60,}",
-    "Pusher Key": r"(?i)pusher.*key.*['\"][a-f0-9]{20}['\"]",
-    "Pusher Secret": r"(?i)pusher.*secret.*['\"][a-f0-9]{40}['\"]",
-    "Segment Write Key": r"(?i)segment.*write.?key.*['\"][a-zA-Z0-9]{32}['\"]",
-    "Amplitude API Key": r"(?i)amplitude.*api.?key.*['\"][a-f0-9]{32}['\"]",
+    "Pusher Key": r"(?i)pusher[^\n]{0,120}?key[^\n]{0,120}?['\"][a-f0-9]{20}['\"]",
+    "Pusher Secret": r"(?i)pusher[^\n]{0,120}?secret[^\n]{0,120}?['\"][a-f0-9]{40}['\"]",
+    "Segment Write Key": r"(?i)segment[^\n]{0,120}?write.?key[^\n]{0,120}?['\"][a-zA-Z0-9]{32}['\"]",
+    "Amplitude API Key": r"(?i)amplitude[^\n]{0,120}?api.?key[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
     "LaunchDarkly SDK Key": r"(?i)sdk-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
     "LaunchDarkly Access Token": r"(?i)api-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
-    "Contentful Token": r"(?i)contentful.*['\"][a-zA-Z0-9_-]{43}['\"]",
-    "Supabase Key": r"(?i)supabase.*(?:anon|service).*key.*eyJ[A-Za-z0-9-_]+",
+    "Contentful Token": r"(?i)contentful[^\n]{0,120}?['\"][a-zA-Z0-9_-]{43}['\"]",
+    "Supabase Key": r"(?i)supabase[^\n]{0,120}?(?:anon|service)[^\n]{0,120}?key[^\n]{0,120}?eyJ[A-Za-z0-9-_]+",
     "PlanetScale Token": r"pscale_tkn_[a-zA-Z0-9_-]{43}",
     "PlanetScale OAuth Token": r"pscale_otkn_[a-zA-Z0-9_-]{43}",
     "PlanetScale Password": r"pscale_pw_[a-zA-Z0-9_-]{43}",
     "Next.js Env Leak": r"__NEXT_DATA__.{0,5000}(?:apiKey|secret|token|password)",
 
     # ========== MISC SAAS ==========
-    "Dropbox API Token": r"(?i)dropbox.*['\"]sl\.[a-zA-Z0-9\-_]{130,}['\"]",
+    "Dropbox API Token": r"(?i)dropbox[^\n]{0,120}?['\"]sl\.[a-zA-Z0-9\-_]{130,}['\"]",
     "Dropbox Short-lived Token": r"\bsl\.[A-Za-z0-9\-_]{130,}\b",
-    "Freshbooks Access Token": r"(?i)freshbooks.*['\"][a-f0-9]{64}['\"]",
-    "Zendesk Secret Key": r"(?i)zendesk.*['\"][a-zA-Z0-9]{40}['\"]",
+    "Freshbooks Access Token": r"(?i)freshbooks[^\n]{0,120}?['\"][a-f0-9]{64}['\"]",
+    "Zendesk Secret Key": r"(?i)zendesk[^\n]{0,120}?['\"][a-zA-Z0-9]{40}['\"]",
     "Typeform API Token": r"tfp_[a-zA-Z0-9_-]{40,}",
-    "Beamer API Token": r"(?i)beamer.*b_[a-zA-Z0-9=_-]{44}",
+    "Beamer API Token": r"(?i)beamer[^\n]{0,120}?b_[a-zA-Z0-9=_-]{44}",
     "ReadMe API Token": r"rdme_[a-z0-9]{70}",
-    "Fastly API Token": r"(?i)fastly.*['\"][a-zA-Z0-9_-]{32}['\"]",
-    "Lob API Key": r"(?i)lob.*(?:live|test)_[a-f0-9]{35}",
-    "Lob Pub API Key": r"(?i)lob.*(?:live|test)_pub_[a-f0-9]{31}",
+    "Fastly API Token": r"(?i)fastly[^\n]{0,120}?['\"][a-zA-Z0-9_-]{32}['\"]",
+    "Lob API Key": r"(?i)lob[^\n]{0,120}?(?:live|test)_[a-f0-9]{35}",
+    "Lob Pub API Key": r"(?i)lob[^\n]{0,120}?(?:live|test)_pub_[a-f0-9]{31}",
     "Shippo API Token": r"shippo_(?:live|test)_[a-f0-9]{40}",
     "Duffel API Token": r"duffel_(?:live|test)_[a-zA-Z0-9_-]{43}",
     "EasyPost API Token": r"EZAK[a-f0-9]{54}",
     "EasyPost Test Token": r"EZTK[a-f0-9]{54}",
-    "Finicity API Token": r"(?i)finicity.*['\"][a-f0-9]{32}['\"]",
+    "Finicity API Token": r"(?i)finicity[^\n]{0,120}?['\"][a-f0-9]{32}['\"]",
     "Frame.io API Token": r"fio-u-[a-zA-Z0-9\-_=]{64}",
-    "Gitter Access Token": r"(?i)gitter.*['\"][a-f0-9]{40}['\"]",
-    "Airtable API Key": r"(?i)airtable.*['\"][a-z0-9]{17}['\"]",
+    "Gitter Access Token": r"(?i)gitter[^\n]{0,120}?['\"][a-f0-9]{40}['\"]",
+    "Airtable API Key": r"(?i)airtable[^\n]{0,120}?['\"][a-z0-9]{17}['\"]",
     "Airtable PAT": r"\bpat[a-zA-Z0-9]{14}\.[a-f0-9]{64}\b",
     "Adobe Client Secret": r"\bp8e-[a-zA-Z0-9]{32}\b",
 
@@ -358,18 +358,18 @@ SECRET_PATTERNS = {
     "Clerk Publishable Key": r"pk_live_[a-zA-Z0-9]{27,}",
     "Clerk Test Secret Key": r"sk_test_[a-zA-Z0-9]{27,}",
     "Neon DB Connection String": r"\bpostgresql://[^\s'\"]*@[^\s'\"]*\.neon\.tech/[^\s'\"]+",
-    "Upstash Redis REST Token": r"(?i)upstash.*['\"]AX[a-zA-Z0-9_-]{36,}['\"]",
+    "Upstash Redis REST Token": r"(?i)upstash[^\n]{0,120}?['\"]AX[a-zA-Z0-9_-]{36,}['\"]",
     "Resend API Key": r"re_[a-zA-Z0-9]{20,}",
     "Convex Deploy Key": r"(?:prod|dev):[a-z0-9]+:[a-zA-Z0-9_-]{40,}",
-    "Turso DB Token": r"(?i)turso.*eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+",
+    "Turso DB Token": r"(?i)turso[^\n]{0,120}?eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+",
     "Trigger.dev API Key": r"tr_(?:dev|prod|test)_[a-zA-Z0-9]{24,}",
     "Axiom API Token": r"xaat-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
     "Axiom Ingest Token": r"xait-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
     "Pinecone API Key": r"pcsk_[a-zA-Z0-9_]{50,}",
-    "Pinecone Legacy API Key": r"(?i)pinecone.*['\"][a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}['\"]",
-    "Weaviate API Key": r"(?i)weaviate.*['\"][a-zA-Z0-9]{40,}['\"]",
+    "Pinecone Legacy API Key": r"(?i)pinecone[^\n]{0,120}?['\"][a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}['\"]",
+    "Weaviate API Key": r"(?i)weaviate[^\n]{0,120}?['\"][a-zA-Z0-9]{40,}['\"]",
     "Cloudinary URL": r"cloudinary://[0-9]+:[a-zA-Z0-9_-]+@[a-zA-Z0-9_-]+",
-    "Cloudinary API Secret": r"(?i)cloudinary.*(?:api_?secret|secret).*['\"][a-zA-Z0-9_-]{27}['\"]",
+    "Cloudinary API Secret": r"(?i)cloudinary[^\n]{0,120}?(?:api_?secret|secret)[^\n]{0,120}?['\"][a-zA-Z0-9_-]{27}['\"]",
     "WorkOS API Key": r"sk_(?:live|test)_[a-zA-Z0-9]{30,}",
     "Liveblocks Secret Key": r"sk_(?:prod|dev)_[a-zA-Z0-9_-]{30,}",
     "Sanity Project Token": r"sk[a-zA-Z0-9]{8,}\.(?:production|dataset)\.[a-zA-Z0-9]+",
@@ -396,6 +396,17 @@ SECRET_PATTERNS = {
     "Azure Blob Storage": r"https?://([a-zA-Z0-9]+)\.blob\.core\.windows\.net",
     "IP Address (Private)": r"(?:^|[^0-9])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3})(?:[^0-9]|$)",
 }
+
+def redact_sample(text: str) -> str:
+    """The stored form of a matched value: its first and last characters, as
+    js_recon's `redacted_value` (recon/helpers/js_recon/patterns.py `redact`).
+    Idempotent, so the graph writer can apply it again to an older artifact."""
+    if len(text) > 12:
+        return text[:6] + '...' + text[-4:]
+    if len(text) > 4:
+        return text[:3] + '...'
+    return '***'
+
 
 # Pre-compile all patterns at module load time for performance
 COMPILED_SECRET_PATTERNS = {}
@@ -758,11 +769,17 @@ class GitHubSecretHunter:
                           repository_public: Optional[bool] = None):
         """Scan file content for secrets using regex patterns."""
         for secret_type, compiled_re in COMPILED_SECRET_PATTERNS.items():
-            matches = compiled_re.findall(content)
+            # The whole match, as js_recon stores it: `findall` returns a
+            # pattern's capturing group, which for the generic ones is the
+            # keyword ("password"), not the value.
+            matches = [m.group(0) for m in compiled_re.finditer(content)]
             if matches:
                 self._add_finding(
                     "SECRET", repo_name, path, secret_type,
-                    {"matches": len(matches), "sample": str(matches[0])[:100]},
+                    # `value` stays in the on-disk artifact only (stdout prints
+                    # it [REDACTED]); the graph gets the redacted `sample`.
+                    {"matches": len(matches), "sample": redact_sample(matches[0]),
+                     "value": matches[0][:100]},
                     repository_public=repository_public,
                 )
 

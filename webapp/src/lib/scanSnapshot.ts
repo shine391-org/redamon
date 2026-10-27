@@ -24,6 +24,14 @@ import { getGraphSession } from '@/app/api/graph/neo4j'
 import { serializeGraphProperties } from '@/lib/graphSerialize'
 import { MUTED_LABEL } from '@/lib/graphMute'
 import { getNodeName, type FormattedGraphData, type Neo4jNode } from '@/app/api/graph/format'
+import {
+  NOT_A_REFERENCE_NODE,
+  PROJECT_RELATIONSHIPS_CYPHER,
+  REFERENCE_LABELS_PARAM,
+  referenceLinkOf,
+  splitCapturedRelationships,
+  type ReferenceLink,
+} from '@/lib/graphReferenceLinks'
 
 /** Agent-run (session) labels that are never part of a recon version. */
 export const SESSION_LABELS = [
@@ -50,6 +58,8 @@ export interface SnapshotRelationship {
 export interface SnapshotPayload {
   nodes: SnapshotNode[]
   relationships: SnapshotRelationship[]
+  /** Edges to the global CVE / MitreData / Capec nodes; absent in snapshots stored before them. */
+  referenceLinks?: ReferenceLink[]
 }
 
 export interface CapturedSnapshot extends SnapshotPayload {
@@ -148,8 +158,9 @@ export async function tryWithSnapshotSlot<T>(fn: () => Promise<T>): Promise<TryS
  *
  * Same node + relationship queries the project exporter uses, plus the session
  * label exclusion. A relationship is kept only when BOTH endpoints are in the
- * captured node set, so chain→recon edges (and edges to global, project-less
- * enrichment nodes) drop out exactly as they do on export.
+ * captured node set, so chain→recon edges drop out exactly as they do on export.
+ * An edge to a global CVE / MitreData / Capec node is kept as a link record
+ * (graphReferenceLinks.ts); the node itself never is.
  *
  * The caller must guarantee no scan / partial recon / activation is writing the
  * graph (Sections 3.3 and 4A.3 enforce this via the activation lock), otherwise
@@ -162,9 +173,10 @@ export async function captureGraphSnapshot(projectId: string): Promise<CapturedS
       const nodesResult = await session.run(
         `MATCH (n) WHERE n.project_id = $pid
            AND NONE(l IN labels(n) WHERE l IN $sessionLabels)
+           AND ${NOT_A_REFERENCE_NODE}
          RETURN labels(n) as labels, properties(n) as props, elementId(n) as eid,
                 toString(id(n)) as nid`,
-        { pid: projectId, sessionLabels: [...SESSION_LABELS] }
+        { pid: projectId, sessionLabels: [...SESSION_LABELS], ...REFERENCE_LABELS_PARAM }
       )
 
       const elementIdToExportId = new Map<string, string>()
@@ -187,29 +199,14 @@ export async function captureGraphSnapshot(projectId: string): Promise<CapturedS
         }
       })
 
-      const relsResult = await session.run(
-        `MATCH (a)-[r]->(b)
-         WHERE a.project_id = $pid OR b.project_id = $pid
-         RETURN elementId(a) as startId, elementId(b) as endId,
-                type(r) as relType, properties(r) as relProps`,
-        { pid: projectId }
-      )
-
-      const relationships: SnapshotRelationship[] = relsResult.records
-        .filter(record =>
-          elementIdToExportId.has(record.get('startId') as string) &&
-          elementIdToExportId.has(record.get('endId') as string)
-        )
-        .map(record => ({
-          startExportId: elementIdToExportId.get(record.get('startId') as string)!,
-          endExportId: elementIdToExportId.get(record.get('endId') as string)!,
-          type: record.get('relType') as string,
-          properties: serializeGraphProperties((record.get('relProps') as Record<string, unknown>) || {}),
-        }))
+      const relsResult = await session.run(PROJECT_RELATIONSHIPS_CYPHER, { pid: projectId })
+      const { relationships, referenceLinks } = splitCapturedRelationships(
+        relsResult.records, elementIdToExportId, serializeGraphProperties)
 
       return {
         nodes,
         relationships,
+        referenceLinks,
         nodeCount: nodes.length,
         linkCount: relationships.length,
         summary,
@@ -225,6 +222,7 @@ export function serializeSnapshot(payload: SnapshotPayload): Buffer {
   return gzipSync(Buffer.from(JSON.stringify({
     nodes: payload.nodes,
     relationships: payload.relationships,
+    ...(payload.referenceLinks?.length ? { referenceLinks: payload.referenceLinks } : {}),
   })))
 }
 
@@ -233,6 +231,9 @@ export function deserializeSnapshot(buf: Buffer | Uint8Array): SnapshotPayload {
   return {
     nodes: Array.isArray(parsed?.nodes) ? parsed.nodes : [],
     relationships: Array.isArray(parsed?.relationships) ? parsed.relationships : [],
+    ...(Array.isArray(parsed?.referenceLinks)
+      ? { referenceLinks: parsed.referenceLinks.map(referenceLinkOf).filter(Boolean) as ReferenceLink[] }
+      : {}),
   }
 }
 

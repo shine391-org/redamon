@@ -41,7 +41,8 @@ Use \`Full Pipeline - Maximum\` if you want supply-chain findings as one signal 
   targetProfile: 'domain',
   environment: 'external',
   parameters: {
-    scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'js_recon'],
+    scanModules: ['domain_discovery', 'http_probe', 'resource_enum'],
+    ipAttributionEnabled: true,
 
     // -- The point of this preset --
     supplyChainReconEnabled: true,

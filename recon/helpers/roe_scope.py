@@ -1,10 +1,11 @@
 """
 RedAmon - Rules of Engagement scope helpers
 ============================================
-Excluded-host matching for the RoE governor. Extracted from ``recon.main`` so
-active scanners (e.g. origin_discovery) can enforce the excluded-hosts list
-without importing ``recon.main`` (which pulls the whole pipeline). ``recon.main``
-re-exports these names, so ``from main import _is_roe_excluded`` still resolves.
+Excluded-host matching and the time window for the RoE governor. Extracted
+from ``recon.main`` so active scanners (e.g. origin_discovery, AI Surface Recon)
+can enforce them without importing ``recon.main``, which would re-run the
+pipeline's top level as a second module. ``recon.main`` re-exports these names,
+so ``from main import _is_roe_excluded`` still resolves.
 
 It imports no other recon module: the auth profile and the OpenAPI scope build
 on its normalizers.
@@ -84,3 +85,40 @@ def _filter_roe_excluded(hosts: list, settings: dict, label: str = "host") -> li
     if removed:
         print(f"[RoE] Excluded {removed} {label}(s) per Rules of Engagement")
     return filtered
+
+
+def _check_roe_time_window(settings: dict, _now=None) -> tuple[bool, str]:
+    """Check if current time is within the RoE-allowed window.
+
+    Returns (allowed, reason_message). Always returns (True, "") if
+    RoE or its time window is disabled. Pass _now for testing.
+    """
+    if not settings.get('ROE_ENABLED') or not settings.get('ROE_TIME_WINDOW_ENABLED'):
+        return True, ""
+
+    from datetime import datetime as _dt
+    import zoneinfo as _zi
+
+    tz_name = settings.get('ROE_TIME_WINDOW_TIMEZONE', 'UTC')
+    try:
+        tz = _zi.ZoneInfo(tz_name)
+    except Exception:
+        print(f"[RoE] Unknown timezone '{tz_name}', falling back to UTC")
+        tz = _zi.ZoneInfo('UTC')
+
+    now = _now or _dt.now(tz)
+
+    # Check day of week
+    allowed_days = [d.lower() for d in settings.get('ROE_TIME_WINDOW_DAYS', [])]
+    current_day = now.strftime('%A').lower()
+    if current_day not in allowed_days:
+        return False, f"Current day ({current_day}) is not in allowed days: {', '.join(allowed_days)} ({tz_name})"
+
+    # Check time range
+    start = settings.get('ROE_TIME_WINDOW_START_TIME', '09:00')
+    end = settings.get('ROE_TIME_WINDOW_END_TIME', '18:00')
+    current_time = now.strftime('%H:%M')
+    if current_time < start or current_time >= end:
+        return False, f"Current time ({current_time} {tz_name}) is outside allowed window ({start}\u2013{end})"
+
+    return True, ""

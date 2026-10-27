@@ -452,7 +452,7 @@ full value survives at reasonable RAM and only throttles hard when memory is gen
   - **Background jobs** (`job_runner._governed_max_jobs`, `MAX_BACKGROUND_JOBS` default 16):
     byte-budgeted on `background_job_envelope_bytes`. Count-and-insert is atomic under the
     registry lock.
-- **MCP terminal sessions** (`mcp/servers/terminal_server`): the existing
+- **MCP terminal sessions** (`mcp/servers/terminal_server.py`): the existing
   `TERMINAL_MAX_SESSIONS` (default 5) is further reduced under pressure by the byte-budget.
 
 These agent caps are graceful-degradation, not the host-OOM guarantee, the agent and kali

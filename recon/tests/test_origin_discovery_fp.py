@@ -13,10 +13,22 @@ Candidate IPs are public resolver addresses: documentation ranges
 
 from __future__ import annotations
 
+import socket
+import ssl
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from recon.main_recon_modules import origin_discovery as od
+
+
+@pytest.fixture(autouse=True)
+def _no_live_tls(monkeypatch):
+    """No test here may open a real TLS connection to a public address."""
+    def _offline(*_a, **_k):
+        raise OSError("network disabled in unit tests")
+    monkeypatch.setattr(od, "_tls_handshake_cert", _offline, raising=False)
 
 
 def _settings(**over):
@@ -186,6 +198,153 @@ class TestSeverityFollowsConfidence(unittest.TestCase):
 
     def test_threshold_match_is_medium(self):
         self.assertEqual(self._confirmed(64.0)["severity"], "medium")
+
+
+
+BRAND_CERT = {"serial": "1", "cn": "www.example.com", "sans": {"www.example.com", "example.com"}}
+EDGE_CERT = {"serial": "2", "cn": "edge.cdn-provider.test", "sans": {"*.cdn-provider.test"}}
+
+
+class _Handshake:
+    """Stands in for the TLS dial; records (ip, sni, port) of every handshake."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = []
+
+    def __call__(self, host_or_ip, sni, port, timeout):
+        self.calls.append((host_or_ip, sni, port))
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+def _match(score=92.5, port=443):
+    return {"matched_ip": "8.8.8.8", "port": port, "method": "host-header",
+            "confidence_score": score, "html_similarity": 95.0, "cert_match": 100.0,
+            "header_match": 100.0, "status_code": 200, "url": f"https://8.8.8.8:{port}"}
+
+
+def _confirm(answer, match=None, **settings):
+    """Run _process_host on one candidate whose score is already decided."""
+    ctx = od._RunCtx(_settings(**settings))
+    entry = {"favicon_hash": None, "cdn_name": "cloudflare", "edge_ip": "104.16.1.1", "resolved_ips": set()}
+    hs = _Handshake(answer)
+    with patch.object(od, "_gather_candidates", return_value={"8.8.8.8": "dns"}), \
+         patch.object(od, "_fetch", return_value=APP), \
+         patch.object(od, "_score_candidate", return_value=match or _match()), \
+         patch.object(od, "_tls_handshake_cert", hs):
+        confirmed, _ = od._process_host("www.example.com", entry, ctx)
+    return confirmed[0], hs
+
+
+class TestDefaultCertificateTellsOriginFromEdge(unittest.TestCase):
+    """A shared edge outside the CDN list, asked with the brand's Host/SNI, serves
+    the brand's page and certificate, which scores like the origin. The
+    certificate the IP presents to a client that names no host tells them apart."""
+
+    def test_a_default_certificate_of_the_brand_keeps_high(self):
+        f, hs = _confirm(BRAND_CERT)
+        self.assertEqual(f["severity"], "high")
+        self.assertEqual(f["confidence_score"], 92.5)
+        self.assertIn("default certificate belongs to the target", f["evidence"])
+        self.assertEqual(hs.calls, [("8.8.8.8", None, 443)])
+
+    def test_a_generic_default_certificate_caps_the_finding_at_medium(self):
+        f, _ = _confirm(EDGE_CERT)
+        self.assertEqual(f["severity"], "medium")
+        self.assertLess(f["confidence_score"], 80)
+        self.assertIn("default certificate does not belong to the target", f["evidence"])
+
+    def test_a_wildcard_for_the_brand_counts_as_the_brand(self):
+        f, _ = _confirm({"serial": "3", "cn": None, "sans": {"*.example.com"}})
+        self.assertEqual(f["severity"], "high")
+
+    def test_a_lookalike_name_is_not_the_brand(self):
+        f, _ = _confirm({"serial": "4", "cn": "example.com.cdn-provider.test", "sans": set()})
+        self.assertEqual(f["severity"], "medium")
+
+    def test_a_timed_out_fetch_is_no_evidence_either_way(self):
+        f, _ = _confirm(socket.timeout("timed out"))
+        self.assertEqual(f["severity"], "high")
+        self.assertEqual(f["confidence_score"], 92.5)
+        self.assertIn("default certificate: not checked (timeout)", f["evidence"])
+
+    def test_a_closed_port_and_a_tls_error_are_not_evidence_either(self):
+        for exc, reason in ((ConnectionRefusedError(111, "refused"), "port 443 closed"),
+                            (ssl.SSLError(1, "handshake failure"), "TLS error")):
+            with self.subTest(reason=reason):
+                f, _ = _confirm(exc)
+                self.assertEqual(f["severity"], "high")
+                self.assertIn(f"default certificate: not checked ({reason})", f["evidence"])
+
+    def test_a_match_on_a_tls_port_is_checked_on_that_port(self):
+        _, hs = _confirm(BRAND_CERT, match=_match(port=8443))
+        self.assertEqual(hs.calls, [("8.8.8.8", None, 8443)])
+
+    def test_a_match_on_plain_http_is_checked_on_443(self):
+        _, hs = _confirm(BRAND_CERT, match=_match(port=8080))
+        self.assertEqual(hs.calls, [("8.8.8.8", None, 443)])
+
+    def test_the_empty_body_certificate_path_is_capped_too(self):
+        # The fronted host serves no HTML: a certificate match alone confirms,
+        # at 100. A generic default certificate must still cap it.
+        ctx = od._RunCtx(_settings())
+        entry = {"favicon_hash": None, "cdn_name": "cloudflare", "edge_ip": "104.16.1.1", "resolved_ips": set()}
+        empty = {"text": "", "status": 200, "headers": {}, "cookies": ""}
+
+        def fetch(url, host_header, ctx, allow_redirects=False):
+            return empty if url.startswith("https://www.example.com") else APP
+
+        with patch.object(od, "_gather_candidates", return_value={"8.8.8.8": "dns"}), \
+             patch.object(od, "_fetch", side_effect=fetch), \
+             patch.object(od, "_port_open", side_effect=lambda ip, port, t: port == 443), \
+             patch.object(od, "_compare_certs", return_value=1.0), \
+             patch.object(od, "_tls_handshake_cert", _Handshake(EDGE_CERT)):
+            confirmed, _ = od._process_host("www.example.com", entry, ctx)
+        self.assertEqual(confirmed[0]["severity"], "medium")
+        self.assertLess(confirmed[0]["confidence_score"], 80)
+
+
+class TestDefaultCertificateEngagementLimits(unittest.TestCase):
+    def _check(self, ip="8.8.8.8", answer=BRAND_CERT, **settings):
+        ctx = od._RunCtx(_settings(**settings))
+        ctx.rate = MagicMock()
+        hs = _Handshake(answer)
+        with patch.object(od, "_tls_handshake_cert", hs):
+            result = od._default_cert_check("www.example.com", ip, 443, ctx)
+        return result, hs, ctx
+
+    def test_an_roe_excluded_ip_gets_no_handshake(self):
+        (status, detail), hs, _ = self._check(ROE_ENABLED=True, ROE_EXCLUDED_HOSTS=["8.8.8.8"])
+        self.assertEqual(hs.calls, [])
+        self.assertEqual(status, "not_checked")
+        self.assertIn("rules of engagement", detail)
+
+    def test_a_non_routable_ip_gets_no_handshake(self):
+        for ip in ("10.0.0.5", "169.254.169.254", "127.0.0.1"):
+            with self.subTest(ip=ip):
+                (status, _), hs, _ = self._check(ip=ip)
+                self.assertEqual(hs.calls, [])
+                self.assertEqual(status, "not_checked")
+
+    def test_the_handshake_waits_on_the_modules_rate_limit(self):
+        _, hs, ctx = self._check()
+        ctx.rate.wait.assert_called_once()
+        self.assertEqual(len(hs.calls), 1)
+
+    def test_a_host_marked_unreachable_gets_no_handshake(self):
+        from recon.helpers import circuit_breaker as cb
+        with patch.object(cb.host_health, "allow", return_value=False):
+            (status, detail), hs, _ = self._check()
+        self.assertEqual(hs.calls, [])
+        self.assertEqual((status, detail), ("not_checked", "host marked unreachable"))
+
+    def test_a_failed_handshake_counts_against_the_host(self):
+        from recon.helpers import circuit_breaker as cb
+        with patch.object(cb.host_health, "record_failure") as failed:
+            self._check(answer=ConnectionRefusedError(111, "refused"))
+        failed.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -74,6 +74,7 @@ Bug bounty hunters triaging a new target. You want to know if there are quick wi
 
     // --- httpx: essential probes only, fast ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 10,
     httpxRetries: 2,

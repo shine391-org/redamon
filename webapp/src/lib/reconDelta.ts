@@ -12,6 +12,7 @@
 import type { FormattedGraphData, FormattedNode } from '@/app/api/graph/format'
 import { TRIAGE_PROPERTIES } from '@/lib/triage/properties'
 import { type CoverageGap, gapInScope, skippedHostInScope } from '@/lib/scanCoverage'
+import { COVERAGE_STAMP_PROPERTIES } from '@/lib/coverageStamps'
 
 /**
  * Identity properties per node label, most-specific first. A node matches across
@@ -106,6 +107,9 @@ export const VOLATILE_PROPERTIES = new Set([
   'deser_jev_format_confidence',
   'deser_jev_exploitability',
   'deser_jev_source',
+  // Per-host coverage stamps on BaseURL: every run restamps every host it
+  // looked at, and a cut that moves between runs is the scan, not the target.
+  ...COVERAGE_STAMP_PROPERTIES,
 ])
 
 function stableString(value: unknown): string {

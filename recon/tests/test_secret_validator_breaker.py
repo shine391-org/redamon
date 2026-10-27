@@ -31,7 +31,7 @@ def test_three_timeouts_stop_the_service_and_the_shape_is_kept():
                            side_effect=requests.Timeout("slow")) as get:
         for _ in range(3):
             r = validators.validate_github(_github())
-            assert r == {"valid": False, "scope": "", "info": "", "error": "timeout"}
+            assert r == {"valid": False, "state": "unknown", "scope": "", "info": "", "error": "timeout"}
         skipped = validators.validate_github(_github())
     assert get.call_count == 3
     assert skipped["valid"] is False

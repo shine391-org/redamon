@@ -4,10 +4,14 @@ Writes, all tenant-scoped on {natural_key, user_id, project_id}:
   - Certificate           MERGEd on cert_key (Phase 0.2 shared key)
   - (IP)-[:HAS_CERTIFICATE]->(Certificate)   the documented non-HTTP TLS anchor
   - (Certificate)-[:COVERS_HOST]->(Subdomain) per in-scope SAN entry, so SAN
-        data is traversable instead of a dead list property
+        data is traversable instead of a dead list property; a SAN listed in
+        the payload's wildcard_dropped (it answers only through its zone's
+        wildcard DNS) gets none
   - Service enrichment: advisory TLS props on the EXISTING Service node
         (never a rename -- name is part of the Service MERGE key, so writing a
         different one orphans the node)
+  - IP CDN tag: is_cdn, cdn_name and cdn_source on the EXISTING IP node for each
+        IP whose certificate issuer named a CDN (payload key cdn_by_ip)
 
 Certificate properties: cert_key, subject_cn, subject_dn, subject_org, san,
 issuer_cn, issuer_dn, issuer, issuer_org, serial, fingerprint_sha256,
@@ -109,12 +113,14 @@ class TlsxMixin:
     def update_graph_from_tlsx(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         stats = {
             "certificates_created": 0, "relationships_created": 0,
-            "services_enriched": 0, "covers_host_edges": 0, "errors": [],
+            "services_enriched": 0, "covers_host_edges": 0, "ips_cdn_tagged": 0,
+            "errors": [],
         }
         tlsx_data = recon_data.get("tlsx") or {}
         by_target = tlsx_data.get("by_target") or {}
         if not by_target:
             return stats
+        cdn_by_ip = tlsx_data.get("cdn_by_ip") or {}
 
         # The run's SCAN roots, not attach_roots: a SAN only gets a COVERS_HOST
         # Subdomain here, never a Domain link, so in a full batch a sibling
@@ -141,6 +147,9 @@ class TlsxMixin:
             return True
 
         mismatched_by_cert = _mismatched_by_cert(by_target)
+        # Names that answer only through their zone's wildcard DNS: the
+        # certificate keeps them in its san list, but no Subdomain stands for them.
+        wildcard_dropped = {str(n).strip().lower() for n in tlsx_data.get("wildcard_dropped") or []}
 
         with self.driver.session() as session:
             for key, entry in by_target.items():
@@ -266,7 +275,7 @@ class TlsxMixin:
                     # --- COVERS_HOST for each in-scope SAN --------------------
                     for san_name in entry.get("san") or []:
                         name = (san_name or "").strip().lower().lstrip("*.")
-                        if not name or not _in_scope(name):
+                        if not name or not _in_scope(name) or name in wildcard_dropped:
                             continue
                         try:
                             session.run(
@@ -284,8 +293,35 @@ class TlsxMixin:
                 except Exception as e:
                     stats["errors"].append(f"tlsx cert {key}: {e}")
 
+            # --- IP CDN tag ---------------------------------------------------
+            # The port write ran before tlsx in a full run, so this is the only
+            # write that carries the certificate issuer's CDN. It only ever adds
+            # the tag: is_cdn is never set false over another tool's true, and
+            # the IP keeps the source of whichever tool tagged it first.
+            for ip, cdn_name in cdn_by_ip.items():
+                if not ip or not cdn_name:
+                    continue
+                try:
+                    res = session.run(
+                        """
+                        MATCH (i:IP {address: $ip, user_id: $uid, project_id: $pid})
+                        WITH i, coalesce(i.is_cdn, false) AS already_tagged
+                        SET i.cdn_source = CASE WHEN already_tagged THEN i.cdn_source ELSE 'tlsx' END,
+                            i.cdn_name = coalesce(i.cdn_name, $name),
+                            i.is_cdn = true
+                        RETURN count(i) AS matched
+                        """,
+                        ip=ip, name=str(cdn_name), uid=user_id, pid=project_id,
+                    )
+                    row = res.single()
+                    if row and row["matched"]:
+                        stats["ips_cdn_tagged"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"tlsx cdn tag {ip}: {e}")
+
         print(f"[*][graph-db] tlsx: {stats['certificates_created']} cert(s), "
-              f"{stats['services_enriched']} service(s), {stats['covers_host_edges']} COVERS_HOST edge(s)")
+              f"{stats['services_enriched']} service(s), {stats['covers_host_edges']} COVERS_HOST edge(s), "
+              f"{stats['ips_cdn_tagged']} IP(s) tagged CDN")
         # A swallowed write is how H7 stayed hidden: every Service enrichment
         # failed on a Neo4j type error while the counts above read as a clean
         # run. Surface the first few rather than burying them in the return.

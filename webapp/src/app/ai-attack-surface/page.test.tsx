@@ -27,6 +27,12 @@ const hookState = {
 }
 vi.mock('@/hooks/useAiAttackSurface', () => ({ useAiAttackSurface: () => hookState }))
 
+// The backend's judge model (drift-map #16). The name is test data: the page must
+// show whatever the orchestrator reports, never a model of its own.
+const BACKEND_JUDGE = 'judge-under-test:7b'
+const judgeState = vi.hoisted(() => ({ current: { status: 'ready', model: 'judge-under-test:7b' } as Record<string, unknown> }))
+vi.mock('@/hooks/useLocalJudgeModel', () => ({ useLocalJudgeModel: () => judgeState.current }))
+
 // Mock useAlertModal. The real hook throws unless <AlertProvider> is in the
 // tree (it is mounted in app/layout.tsx in production, which these render tests
 // bypass). vi.hoisted runs before the vi.mock factory so the refs are stable.
@@ -56,6 +62,7 @@ beforeEach(() => {
   hookState.findings = []
   hookState.run = null
   hookState.logs = []
+  judgeState.current = { status: 'ready', model: BACKEND_JUDGE }
 })
 
 describe('AI Attack Surface page', () => {
@@ -247,5 +254,61 @@ describe('AI Attack Surface — garak probe selection grid', () => {
     fireEvent.click(screen.getByText('Clear'))
     const launchBtn = (screen.getByText('Launch garak').closest('button')) as HTMLButtonElement
     expect(launchBtn.disabled).toBe(true)
+  })
+})
+
+describe('AI Attack Surface — the judge model is the backend\'s (drift-map #16)', () => {
+  beforeEach(() => {
+    (hookState.launch as ReturnType<typeof vi.fn>).mockClear()
+    hookState.targets = [{ baseUrl: 'http://h:8000', path: '/v1/chat/completions', method: 'POST', interfaceType: 'llm-chat' }]
+  })
+
+  const judgeInput = () =>
+    screen.getByText('Judge').querySelector('input') as HTMLInputElement
+
+  const openGarakReady = () => {
+    render(<AiAttackSurfacePage />)
+    fireEvent.click(screen.getAllByText('Configure & launch')[0])
+    fireEvent.click(screen.getByText('http://h:8000/v1/chat/completions'))
+    fireEvent.click(screen.getByText(/I confirm this is an authorized/))
+  }
+
+  test('the field starts at the orchestrator\'s model and the launch sends it', () => {
+    openGarakReady()
+    expect(judgeInput().value).toBe(BACKEND_JUDGE)
+    fireEvent.click(screen.getByText('Launch garak'))
+    const arg = (hookState.launch as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(arg.bounds.judge_model).toBe(BACKEND_JUDGE)
+  })
+
+  test('an operator\'s own model wins over the backend\'s', () => {
+    openGarakReady()
+    fireEvent.change(judgeInput(), { target: { value: 'my-judge:14b' } })
+    fireEvent.click(screen.getByText('Launch garak'))
+    const arg = (hookState.launch as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(arg.bounds.judge_model).toBe('my-judge:14b')
+  })
+
+  test('while it loads the field is empty and disabled, and nothing can launch', () => {
+    judgeState.current = { status: 'loading' }
+    openGarakReady()
+    const input = judgeInput()
+    expect(input.value).toBe('')
+    expect(input.disabled).toBe(true)
+    expect(input.placeholder).toBe('Loading…')
+    const launchBtn = screen.getByText('Launch garak').closest('button') as HTMLButtonElement
+    expect(launchBtn.disabled).toBe(true)
+  })
+
+  test('with the orchestrator down the field is empty, says so, and stays editable', () => {
+    judgeState.current = { status: 'unavailable' }
+    openGarakReady()
+    const input = judgeInput()
+    expect(input.value).toBe('')
+    expect(input.disabled).toBe(false)
+    expect(input.placeholder).toBe('Local LLM unavailable')
+    fireEvent.click(screen.getByText('Launch garak'))
+    const arg = (hookState.launch as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(arg.bounds.judge_model).toBe('')
   })
 })

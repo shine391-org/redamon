@@ -12,6 +12,7 @@
 import { describe, test, expect } from 'vitest'
 import { reconPresetSchema, RECON_PARAMETER_CATALOG } from '../recon-preset-schema'
 import { PRESET_EXCLUDED_FIELDS, extractPresetSettings } from '../project-preset-utils'
+import { RECON_PRESETS } from './index'
 
 // Active-recon presets that explicitly enable VHost/SNI.
 // Decision per preset is grounded in the preset's stated goal — see
@@ -35,6 +36,7 @@ const PRESETS_WITH_VHOSTSNI_ENABLED = [
   'graphql-recon',          // GraphQL endpoints often live on internal vhosts
   'parameter-injection',    // synergistic — finds more endpoints to fuzz
   'secret-hunter',          // admin panels (hidden vhosts) often leak secrets
+  'ai-surface-recon',       // on with the preset's active vuln/security block
 ] as const
 
 // Presets that EXPLICITLY disable VHost/SNI (stealth or passive-only identity).
@@ -43,6 +45,9 @@ const PRESETS_EXPLICIT_DISABLE = [
   'osint-investigator',     // "no active scanning"
   'stealth-recon',          // 2300+ probes = catastrophically slow and noisy
   'large-network',          // per-IP serial × thousands of IPs = days
+  'internal-network',       // "impractical per-IP serial loop across a subnet"
+  'supply-chain-audit',     // not needed to answer the dependency question; no extra traffic
+  'web-cache-poisoning',    // host enumeration does not help prove a cache bug on known URLs
 ] as const
 
 // Presets that leave VHost/SNI at the default (false) — out-of-scope by intent.
@@ -189,78 +194,45 @@ describe('PRESET_EXCLUDED_FIELDS', () => {
 // 4. Active presets enable VHost/SNI; passive/stealth don't
 // ===========================================================================
 describe('Recon preset content -- vhost_sni enablement', () => {
-  // Use eager dynamic imports so vitest discovers them
-  const presetModules: Record<string, () => Promise<{ default?: unknown } & Record<string, unknown>>> = {
-    // Explicitly enabled
-    'subdomain-takeover': () => import('./presets/subdomain-takeover'),
-    'bug-bounty-deep': () => import('./presets/bug-bounty-deep'),
-    'full-active-scan': () => import('./presets/full-active-scan'),
-    'full-maximum-scan': () => import('./presets/full-maximum-scan'),
-    'web-app-pentester': () => import('./presets/web-app-pentester'),
-    'red-team-operator': () => import('./presets/red-team-operator'),
-    'cloud-exposure': () => import('./presets/cloud-exposure'),
-    'infrastructure-mapper': () => import('./presets/infrastructure-mapper'),
-    'api-security': () => import('./presets/api-security'),
-    'bug-bounty-quick': () => import('./presets/bug-bounty-quick'),
-    'compliance-audit': () => import('./presets/compliance-audit'),
-    'cve-hunter': () => import('./presets/cve-hunter'),
-    'directory-discovery': () => import('./presets/directory-discovery'),
-    'graphql-recon': () => import('./presets/graphql-recon'),
-    'parameter-injection': () => import('./presets/parameter-injection'),
-    'secret-hunter': () => import('./presets/secret-hunter'),
-    // Explicitly disabled
-    'full-passive-scan': () => import('./presets/full-passive-scan'),
-    'osint-investigator': () => import('./presets/osint-investigator'),
-    'large-network': () => import('./presets/large-network'),
-    'stealth-recon': () => import('./presets/stealth-recon'),
-    // Leave default
-    'dns-email-security': () => import('./presets/dns-email-security'),
-    'secret-miner': () => import('./presets/secret-miner'),
-  }
+  // The preset list comes from the registry, so a new preset fails here until
+  // it is given a decision above (the wiki promises a preset without one fails
+  // the unit gate).
+  const byId = new Map(RECON_PRESETS.map(p => [p.id, p]))
+  const params = (id: string) => byId.get(id)!.parameters as Record<string, unknown>
+  const decided: readonly string[] = [
+    ...PRESETS_WITH_VHOSTSNI_ENABLED, ...PRESETS_EXPLICIT_DISABLE, ...PRESETS_LEAVE_DEFAULT,
+  ]
 
-  // Helper -- return the first object value found in a module (a preset
-  // file exports one named const).
-  function findPresetExport(mod: Record<string, unknown>): Record<string, unknown> | null {
-    for (const [, value] of Object.entries(mod)) {
-      if (value && typeof value === 'object' && 'parameters' in (value as Record<string, unknown>)) {
-        return value as Record<string, unknown>
-      }
-    }
-    return null
-  }
+  test('every registered preset has exactly one vhostSni decision', () => {
+    const undecided = RECON_PRESETS.map(p => p.id).filter(id => !decided.includes(id))
+    expect(undecided, 'add each to one of the three lists above').toEqual([])
+    expect(decided.filter((id, i) => decided.indexOf(id) !== i)).toEqual([])
+  })
+
+  test('every decision names a registered preset', () => {
+    expect(decided.filter(id => !byId.has(id))).toEqual([])
+  })
 
   for (const id of PRESETS_WITH_VHOSTSNI_ENABLED) {
-    test(`${id} enables vhostSni`, async () => {
-      const mod = await presetModules[id]()
-      const preset = findPresetExport(mod)
-      expect(preset, `${id}: no preset export found`).not.toBeNull()
-      const params = preset!.parameters as Record<string, unknown>
-      expect(params.vhostSniEnabled, `${id} should enable vhostSni`).toBe(true)
+    test(`${id} enables vhostSni`, () => {
+      expect(params(id).vhostSniEnabled, `${id} should enable vhostSni`).toBe(true)
     })
   }
 
   for (const id of PRESETS_EXPLICIT_DISABLE) {
-    test(`${id} EXPLICITLY disables vhostSni (preset identity)`, async () => {
-      const mod = await presetModules[id]()
-      const preset = findPresetExport(mod)
-      expect(preset, `${id}: no preset export found`).not.toBeNull()
-      const params = preset!.parameters as Record<string, unknown>
+    test(`${id} EXPLICITLY disables vhostSni (preset identity)`, () => {
       // Must be explicit false — these presets define themselves by being safe
       // for hostile/passive contexts. Relying on the schema default would let
       // a future default-flip silently break the contract.
-      expect(params.vhostSniEnabled, `${id} must explicitly set vhostSniEnabled: false`).toBe(false)
+      expect(params(id).vhostSniEnabled, `${id} must explicitly set vhostSniEnabled: false`).toBe(false)
     })
   }
 
   for (const id of PRESETS_LEAVE_DEFAULT) {
-    test(`${id} leaves vhostSni at default (out-of-scope by intent)`, async () => {
-      const mod = await presetModules[id]()
-      const preset = findPresetExport(mod)
-      if (!preset) return
-      const params = preset.parameters as Record<string, unknown>
+    test(`${id} leaves vhostSni at default (out-of-scope by intent)`, () => {
       // Must NOT set vhostSniEnabled — the preset's narrow focus makes it
       // irrelevant. Any opinion on enable/disable would be noise.
-      expect(params.vhostSniEnabled).toBeUndefined()
+      expect(params(id).vhostSniEnabled).toBeUndefined()
     })
   }
 })

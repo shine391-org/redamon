@@ -3,7 +3,8 @@
 merge_discovered_hostnames resolves each SAN-derived name to drop internal
 pivots. It ran twice per pipeline and the second call re-resolved the first's
 names; now a per-run cache means each name is resolved once, and when the shared
-DNS resolver is already down the getaddrinfo is skipped entirely.
+DNS resolver is already down the getaddrinfo is skipped and the name is not
+injected (it cannot be checked).
 """
 from __future__ import annotations
 
@@ -38,7 +39,10 @@ def test_a_down_resolver_skips_getaddrinfo():
         dr.resolver_breaker.note_transient()
     assert dr.resolver_breaker.is_open()
     with mock.patch("socket.getaddrinfo") as gai:
-        # In scope, unresolved: kept without resolving.
-        assert th._resolves_to_routable("late.example.test") is True
+        # Unchecked, so not injected (plan 12.10): kept unresolved, a name that
+        # points at a private address would reach httpx and Nuclei, which
+        # resolve it themselves. It is recorded as a skipped host instead.
+        assert th._resolves_to_routable("late.example.test") is False
         gai.assert_not_called()
+    assert "late.example.test" in cb.coverage_report().skipped_hostnames()
     dr.resolver_breaker.reset()

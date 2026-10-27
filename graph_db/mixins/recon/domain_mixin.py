@@ -8,7 +8,7 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 from graph_db.cpe_resolver import _is_ip_address
-from graph_db.mixins.recon.scope import org_for_scan_root
+from graph_db.mixins.recon.scope import home_domain, org_for_scan_root, project_orgs
 
 # The first clause of every read-modify-write on an org Domain (GDB-11). Several
 # scan roots share one org Domain and up to twelve partial recons run at once,
@@ -385,7 +385,9 @@ class DomainMixin:
                                     )
                                     stats["ips_created"] += 1
 
-                                    # Create relationship: Subdomain -[:RESOLVES_TO]-> IP
+                                    # Create relationship: Subdomain -[:RESOLVES_TO]-> IP.
+                                    # DNS resolved it, so an edge Shodan's reverse DNS
+                                    # created first (source 'shodan_rdns') is forward DNS now.
                                     record_type = "A" if ip_version == "ipv4" else "AAAA"
                                     session.run(
                                         """
@@ -393,6 +395,7 @@ class DomainMixin:
                                         MATCH (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                         MERGE (s)-[r:RESOLVES_TO]->(i)
                                         SET r.record_type = coalesce(r.record_type, $record_type)
+                                        REMOVE r.source
                                         """,
                                         subdomain=subdomain, ip=ip_addr, record_type=record_type,
                                         user_id=user_id, project_id=project_id
@@ -449,7 +452,56 @@ class DomainMixin:
             if stats["errors"]:
                 print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
 
+        try:
+            stats["wildcard_zones_stamped"] = self.update_graph_wildcard_zones(
+                recon_data, user_id, project_id)
+        except Exception as e:
+            stats["errors"].append(f"Wildcard zone stamp failed: {e}")
         return stats
+
+    def update_graph_wildcard_zones(self, recon_data: dict, user_id: str, project_id: str) -> int:
+        """Stamp is_wildcard_zone and wildcard_ips on each zone the wildcard
+        control checked; return how many nodes were stamped.
+
+        ``recon_data["wildcard_zones"]``: {zone: {"is_wildcard", "ips"}}, only
+        zones with a definite answer. An org zone is its Domain; any deeper
+        zone (a scan root below its org, a parent many names sat under) is the
+        Subdomain of that name. MATCH only: a zone with no node yet is stamped
+        by the next run that writes one, and a Domain is never created here.
+        """
+        zones = (recon_data or {}).get("wildcard_zones")
+        if not isinstance(zones, dict) or not zones:
+            return 0
+        orgs = {o.strip().lower() for o in project_orgs(recon_data) if o}
+        home = home_domain(recon_data)
+        if home:
+            orgs.add(home.strip().lower())
+        stamped = 0
+        with self.driver.session() as session:
+            for zone, info in zones.items():
+                zone = str(zone or "").strip().rstrip(".").lower()
+                if not zone or not isinstance(info, dict):
+                    continue
+                params = {
+                    "zone": zone, "user_id": user_id, "project_id": project_id,
+                    "is_wildcard": bool(info.get("is_wildcard")),
+                    "ips": [ip for ip in info.get("ips") or [] if isinstance(ip, str) and ip],
+                }
+                if zone in orgs:
+                    query = """
+                        MATCH (d:Domain {name: $zone, user_id: $user_id, project_id: $project_id})
+                        SET d.is_wildcard_zone = $is_wildcard, d.wildcard_ips = $ips
+                        RETURN count(d) AS n
+                    """
+                else:
+                    query = """
+                        MATCH (s:Subdomain {name: $zone, user_id: $user_id, project_id: $project_id})
+                        SET s.is_wildcard_zone = $is_wildcard, s.wildcard_ips = $ips
+                        RETURN count(s) AS n
+                    """
+                record = session.run(query, **params).single()
+                stamped += record["n"] if record else 0
+        return stamped
 
     def update_graph_from_ip_recon(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         """
@@ -567,18 +619,23 @@ class DomainMixin:
 
                     for ip in all_ips:
                         # Get WHOIS info for this IP if available
-                        whois_info = ip_whois.get(ip, {})
+                        whois_info = ip_whois.get(ip) or {}
 
                         ip_props = {
                             "address": ip,
                             "user_id": user_id,
                             "project_id": project_id,
-                            "version": "v6" if ":" in ip else "v4",
+                            "version": "ipv6" if ":" in ip else "ipv4",
                             "ip_mode": True,
                         }
-                        if whois_info:
-                            ip_props["organization"] = whois_info.get("org", "")
-                            ip_props["country"] = whois_info.get("country", "")
+                        # A blank whois field is left unset: "" reads as present
+                        # to every IS NOT NULL / coalesce() reader. Nothing to
+                        # REMOVE: a full run clears IP nodes before this first
+                        # writer, and a REMOVE could erase an OSINT country.
+                        if whois_info.get("org"):
+                            ip_props["organization"] = whois_info["org"]
+                        if whois_info.get("country"):
+                            ip_props["country"] = whois_info["country"]
 
                         session.run(
                             """
@@ -595,7 +652,8 @@ class DomainMixin:
                             """
                             MATCH (s:Subdomain {name: $sub, user_id: $uid, project_id: $pid})
                             MATCH (i:IP {address: $ip, user_id: $uid, project_id: $pid})
-                            MERGE (s)-[:RESOLVES_TO]->(i)
+                            MERGE (s)-[r:RESOLVES_TO]->(i)
+                            REMOVE r.source
                             """,
                             sub=subdomain_name, ip=ip, uid=user_id, pid=project_id
                         )

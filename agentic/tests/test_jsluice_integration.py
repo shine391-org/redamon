@@ -469,13 +469,9 @@ class TestJsluiceRoECategory(unittest.TestCase):
 
     def test_jsluice_not_in_roe_categories(self):
         """jsluice is passive -- should not be in any CATEGORY_TOOL_MAP list."""
-        plan_node_path = os.path.join(
-            _agentic_dir, 'orchestrator_helpers', 'nodes', 'execute_plan_node.py'
-        )
-        with open(plan_node_path) as f:
-            source = f.read()
-        self.assertNotIn("'execute_jsluice'", source)
-        self.assertNotIn('"execute_jsluice"', source)
+        from orchestrator_helpers.roe_gate import CATEGORY_TOOL_MAP
+        for category, tools in CATEGORY_TOOL_MAP.items():
+            self.assertNotIn('execute_jsluice', tools, category)
 
 
 # ===========================================================================

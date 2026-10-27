@@ -175,10 +175,28 @@ class TestStableNodeIds(unittest.TestCase):
         props = next(p["props"] for _, p in session.queries
                      if "props" in p and p["props"].get("secret_type") == "AWS Key")
         self.assertEqual(props["matches"], 3)
-        self.assertEqual(props["sample"], "AKIAX")
+        # Never a raw value on the node, whatever artifact it came from (05.9).
+        self.assertEqual(props["sample"], "AKI...")
         self.assertEqual(props["user_id"], "u1")
         self.assertEqual(props["project_id"], "p1")
         self.assertEqual(props["path"], "src/.env")
+
+    def test_the_sample_on_the_node_is_always_redacted(self):
+        raw = "AKIA" + "Q7R2M9X4K1T8B3V6"
+        for sample, stored in ((raw, raw[:6] + "..." + raw[-4:]),         # an artifact from before
+                               (raw[:6] + "..." + raw[-4:], raw[:6] + "..." + raw[-4:])):  # today's
+            with self.subTest(sample=sample):
+                session = FakeSession()
+                Client(session).update_graph_from_github_hunt({
+                    "target": "acme", "statistics": {},
+                    "findings": [{"type": "SECRET", "repository": "acme/app", "path": "a.py",
+                                  "secret_type": "AWS Access Key ID",
+                                  "details": {"matches": 1, "sample": sample, "value": raw}}],
+                }, "u1", "p1")
+                props = next(p["props"] for _, p in session.queries
+                             if "props" in p and p["props"].get("secret_type") == "AWS Access Key ID")
+                self.assertEqual(props["sample"], stored)
+                self.assertNotIn(raw, str(props))
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ class JsReconTimeoutTest(unittest.TestCase):
             return ([], {'low_entropy': 0, 'base64_blob': 0, 'binary_context': 0,
                          'repetitive': 0, 'url_whitelist': 0})
 
-        def fast_sourcemaps(js_files, settings, scan_func):
+        def fast_sourcemaps(js_files, settings, **kwargs):
             return []
 
         def fast_deps(js_files, settings):

@@ -182,6 +182,17 @@ def check(cat: dict, declared_props, normalizers: dict, *, registry_keys=None,
                 continue
             if ftype == "ordinal" and fdef.get("scale") not in ordinals:
                 errors.append(f"{where}: {fw} names unknown scale {fdef.get('scale')!r}")
+            aliases = fdef.get("aliases")
+            if aliases is not None:
+                values = set(fdef.get("values") or [])
+                if ftype != "enum" or not isinstance(aliases, dict):
+                    errors.append(f"{where}: {fw} aliases are a map on an enum field")
+                else:
+                    for alias, targets in aliases.items():
+                        if alias not in values or not isinstance(targets, list) or not targets \
+                                or not set(targets) <= values:
+                            errors.append(f"{where}: {fw} alias {alias!r} must map a listed "
+                                          "value to listed values")
             normalizer = fdef.get("normalizer")
             if normalizer:
                 if normalizer not in normalizers:

@@ -29,6 +29,7 @@ import { usePendingNodeQuery } from './hooks/usePendingNodeQuery'
 
 // External hooks
 import { useAgentWebSocket } from '@/hooks/useAgentWebSocket'
+import type { ConnectedPayload } from '@/lib/websocket-types'
 import { useConversations } from '@/hooks/useConversations'
 import { useChatPersistence } from '@/hooks/useChatPersistence'
 
@@ -98,6 +99,8 @@ export function AIAssistantDrawer({
     groupedChatItems,
     resetChatState,
   } = useChatState()
+  const isLoadingRef = useRef(isLoading)
+  isLoadingRef.current = isLoading
 
   const {
     awaitingApproval, setAwaitingApproval,
@@ -203,6 +206,7 @@ export function AIAssistantDrawer({
     setIterationCount,
     setIsLoading,
     setIsStopped,
+    setIsStopping,
     setTodoList,
     isRestoringConversation,
     shouldAutoScroll,
@@ -269,12 +273,22 @@ export function AIAssistantDrawer({
     projectId,
     sessionId,
     graphViewCypher,
-    enabled: isOpen,
+    // A run keeps the socket open with the drawer closed: closing it dropped
+    // every event of the run until the drawer reopened.
+    enabled: isOpen || isLoading,
+    runActive: isLoading,
     onMessage: handleWebSocketMessage,
-    // On (re)connect, if we just restored a still-running session, re-read it
-    // now that the backend has flushed its persist queue so the timeline is
-    // complete (fixes the empty/partial chat that trickles in over seconds).
-    onConnect: useCallback(() => { resyncActiveConversation(sessionId) }, [resyncActiveConversation, sessionId]),
+    // On every (re)connect, reconcile with the server: re-read the timeline
+    // (the backend flushed its persist queue first) whenever a run is or was
+    // believed to be going, and take the spinner state from the server's live
+    // agent_running instead of trusting events that may have been lost.
+    onConnect: useCallback((payload: ConnectedPayload) => {
+      resyncActiveConversation(sessionId, {
+        agentRunning: payload?.agent_running,
+        clientRunning: isLoadingRef.current,
+        isRunActive: () => isLoadingRef.current,
+      })
+    }, [resyncActiveConversation, sessionId]),
   })
 
   // ─── Send handlers ────────────────────────────────────────────────────────

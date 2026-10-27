@@ -7,8 +7,8 @@ default outside its own bound would refuse EVERY apply, so this is where a
 default moved in project_settings.py without its bound (or the reverse) is
 caught. The recon half is recon/tests/test_defaults_within_registry_bounds.py.
 
-The real endpoint is called, so its own naming (agentXxx, the unprefixed HYDRA_
-and FIRETEAM_ families) is what is checked, not a copy of it.
+The real endpoint is called, so its own naming (the column names in
+AGENT_SETTING_COLUMNS) is what is checked, not a copy of it.
 """
 from __future__ import annotations
 

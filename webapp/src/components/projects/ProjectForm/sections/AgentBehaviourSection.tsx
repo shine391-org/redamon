@@ -37,6 +37,14 @@ const FORBIDDEN_CATEGORIES = (field('roeForbiddenCategories')?.values ?? []).map
 /** The agent's real tool names. A near-miss never matches the gate. */
 const FORBIDDEN_TOOLS = field('roeForbiddenTools')?.values ?? []
 
+/**
+ * The agent's runtime default, `FIRETEAM_TIMEOUT_SEC` in
+ * agentic/project_settings.py. The form shows it for a project without a value
+ * and writes it back when an entry is not a number, so a different number here
+ * would silently change the ceiling of a project the user never touched.
+ */
+export const FIRETEAM_TIMEOUT_SEC_DEFAULT = 7200
+
 interface AgentBehaviourSectionProps {
   data: FormData
   updateField: <K extends keyof FormData>(field: K, value: FormData[K]) => void
@@ -266,7 +274,7 @@ export function AgentBehaviourSection({ data, updateField, detectedHostIp }: Age
             const maxConcurrent = (data as any).fireteamMaxConcurrent ?? 5
             const maxMembers = (data as any).fireteamMaxMembers ?? 5
             const memberMaxIter = (data as any).fireteamMemberMaxIterations ?? 10
-            const timeoutSec = (data as any).fireteamTimeoutSec ?? 3600
+            const timeoutSec = (data as any).fireteamTimeoutSec ?? FIRETEAM_TIMEOUT_SEC_DEFAULT
             const propensity = (data as any).fireteamPropensity ?? 3
             const allowedPhasesRaw = (data as any).fireteamAllowedPhases ?? ['informational', 'exploitation', 'post_exploitation']
             const allowedPhases: string[] = Array.isArray(allowedPhasesRaw)
@@ -383,7 +391,7 @@ export function AgentBehaviourSection({ data, updateField, detectedHostIp }: Age
                           }}
                           onBlur={(e) => {
                             const n = parseInt(e.target.value)
-                            const v = Number.isFinite(n) ? Math.max(60, Math.min(7200, n)) : 1800
+                            const v = Number.isFinite(n) ? Math.max(60, Math.min(7200, n)) : FIRETEAM_TIMEOUT_SEC_DEFAULT
                             updateField('fireteamTimeoutSec' as any, v as any)
                           }}
                         />

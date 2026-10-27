@@ -119,6 +119,27 @@ def present(props: dict, source=None):
     return _text(props.get(source)) is not None if source else False
 
 
+#: Keys that are public by design. score_model.PUBLIC_CLIENT_KEY_TYPES, which
+#: this standalone module cannot import; a test pins the two equal.
+PUBLIC_CLIENT_KEY_TYPES = frozenset({
+    "gcp api key", "gcpkey", "firebase api key", "segment write key",
+    "amplitude api key", "new relic browser api token", "sentry dsn",
+    "stripe publishable key", "google recaptcha key", "mapbox token",
+    "algolia app id", "algolia search key", "intercom app id", "pusher key",
+    "clerk publishable key", "mailgun public key", "flutterwave public key",
+    "supabase anon key", "supabase publishable key",
+})
+
+
+def public_client_key(props: dict, _source=None):
+    """The flag js_recon writes, or, on a node written before it, a pattern
+    name every reader calls public."""
+    if props.get("public_client_key") is True:
+        return True
+    secret_type = _text(props.get("secret_type"))
+    return bool(secret_type) and secret_type.lower() in PUBLIC_CLIENT_KEY_TYPES
+
+
 _CVE_INPUTS = ("cves", "cve_ids", "cve_id", "aliases", "id")
 
 NORMALIZERS = {
@@ -131,6 +152,7 @@ NORMALIZERS = {
     "port_from_url": (port_from_url, None),
     "advisory_prefix": (advisory_prefix, None),
     "present": (present, None),
+    "public_client_key": (public_client_key, ("public_client_key", "secret_type")),
 }
 
 

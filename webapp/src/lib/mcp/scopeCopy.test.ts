@@ -8,6 +8,7 @@
  * @vitest-environment node
  */
 import { existsSync, readFileSync } from 'fs'
+import { wikiCheckoutPresent } from '@/lib/wikiCheckout.testUtils'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, test, expect, beforeAll, vi } from 'vitest'
@@ -215,12 +216,8 @@ describe('wiki anchors resolve', () => {
     process.env.MCP_DOCS_WIKI_DIR ||
     fileURLToPath(new URL('../../../../redamon.wiki/', import.meta.url))
 
-  /**
-   * A real checkout, not merely the directory: the main repo records the wiki as
-   * a submodule pointer, so a fresh clone leaves redamon.wiki/ EMPTY and every
-   * anchor would read as broken.
-   */
-  const hasWiki = () => existsSync(path.join(WIKI_DIR, 'Home.md'))
+  /** A real wiki checkout; an empty one fails unless allowed (wikiCheckout.testUtils.ts). */
+  const hasWiki = () => wikiCheckoutPresent(WIKI_DIR)
 
   /** GitHub's heading -> anchor rule: lowercase, drop punctuation, spaces to -. */
   const slug = (heading: string) =>

@@ -2,7 +2,7 @@
 
 ## Complete Technical Documentation
 
-> **Module:** `recon/resource_enum.py`
+> **Module:** `recon/main_recon_modules/resource_enum.py`
 > **Purpose:** Endpoint discovery, classification, and parameter extraction
 > **Author:** RedAmon Security Suite
 
@@ -186,8 +186,23 @@ All parameters are configured via the webapp project settings (stored in Postgre
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `KATANA_EXCLUDE_PATTERNS` | `list` | See below | URL patterns to exclude |
+| `KATANA_EXCLUDE_PATTERNS` | `list` | See below | URL patterns to exclude from the crawl's URL list and the Endpoints. Not from JS recon: see below |
 | `KATANA_CUSTOM_HEADERS` | `list` | `[]` | Custom HTTP headers |
+
+**The exclude list does not hide JS from js_recon.** The defaults hold `/static/`,
+`/_next/static`, `.chunk.js`, `.bundle.js`, `/dist/`, `/build/` and `.min.js`, which
+is where React, Next.js and webpack apps keep their own code, and js_recon cannot
+browse: it analyzes only the JS URLs it is handed. So Katana and Hakrawler collect
+every in-scope JS URL (the shared detector, `recon/helpers/js_recon/urls.py`) after
+the scope check and **before** the exclude check, and return it apart from their
+URL list (`meta["js_urls"]`). resource_enum returns the union as
+`resource_enum["js_urls"]`, and jsluice reads it too. `discovered_urls`,
+`by_base_url` and therefore the Endpoint nodes keep honouring the excludes: a JS
+file is never an Endpoint.
+
+`resource_enum["archived_urls"]` lists the URLs only a web archive reported (GAU,
+URLScan, ParamSpider) and no live tool saw; js_recon leaves their JS out when
+`JS_RECON_INCLUDE_ARCHIVED_JS` is off.
 
 **Default Exclude Patterns:**
 
@@ -923,6 +938,15 @@ risk gauge or the posture score; the overview reports them as
       "https://example.com/search?q=test"
     ],
 
+    "js_urls": [
+      "https://example.com/_next/static/chunks/pages/_app-91c.js",
+      "https://example.com/static/js/main.4f3a.js"
+    ],
+
+    "archived_urls": [
+      "https://example.com/old-admin/config.php"
+    ],
+
     "by_base_url": {
       "https://example.com": {
         "base_url": "https://example.com",
@@ -1237,7 +1261,7 @@ python3 recon/main.py
 ### Standalone Enrichment
 
 ```python
-from resource_enum import run_resource_enum
+from recon.main_recon_modules.resource_enum import run_resource_enum
 from pathlib import Path
 import json
 
@@ -1253,7 +1277,7 @@ enriched = run_resource_enum(recon_data, output_file=Path("output/recon_example.
 
 ```bash
 # Enrich an existing recon file
-python3 recon/resource_enum.py output/recon_example.com.json
+python3 recon/main_recon_modules/resource_enum.py output/recon_example.com.json
 ```
 
 ### Using Results in vuln_scan

@@ -36,7 +36,40 @@ def _nmap_service_on(services: list, ip_addr: str, port_number):
     return None
 
 
+#: The `source` of a Port a passive provider reported from its own crawl. A
+#: Port an active scan found carries no source (naabu, masscan) or `nmap`.
+PASSIVE_PORT_SOURCES = ("shodan", "internetdb", "censys", "fofa", "netlas", "zoomeye",
+                        "criminalip", "uncover")
+
+
 class PortMixin:
+    def active_open_ports(self, user_id: str, project_id: str, ips) -> dict:
+        """{ip: {port, ...}}: the open ports an active scan found on these IPs.
+
+        `passive_only = false` is an active writer's mark; a Port written before
+        that mark existed counts as active unless a passive provider created it.
+        """
+        ips = sorted({ip for ip in ips or () if ip})
+        if not ips:
+            return {}
+        passive = ", ".join(f"'{s}'" for s in PASSIVE_PORT_SOURCES)
+        out: dict = {}
+        with self.driver.session() as session:
+            for record in session.run(
+                f"""
+                MATCH (i:IP {{user_id: $uid, project_id: $pid}})-[:HAS_PORT]->(p:Port)
+                WHERE i.address IN $ips
+                  AND toLower(coalesce(p.state, 'open')) = 'open'
+                  AND (p.passive_only = false
+                       OR (p.passive_only IS NULL
+                           AND NOT toLower(coalesce(p.source, '')) IN [{passive}]))
+                RETURN i.address AS ip, collect(DISTINCT p.number) AS ports
+                """,
+                uid=user_id, pid=project_id, ips=ips,
+            ):
+                out[record["ip"]] = {int(n) for n in record["ports"] or [] if n is not None}
+        return out
+
     def update_graph_from_port_scan(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         """
         Update the Neo4j graph database with port scan data.
@@ -145,6 +178,7 @@ class PortMixin:
                             """
                             MERGE (p:Port {number: $port_number, protocol: $protocol, ip_address: $ip_addr, user_id: $user_id, project_id: $project_id})
                             SET p.state = 'open',
+                                p.passive_only = false,
                                 p.updated_at = datetime()
                             """,
                             port_number=port_number, protocol=protocol, ip_addr=ip_addr,
@@ -337,6 +371,7 @@ class PortMixin:
                         MERGE (p:Port {number: $port_number, protocol: $protocol, ip_address: $ip_addr, user_id: $user_id, project_id: $project_id})
                         ON CREATE SET p.source = 'nmap'
                         SET p.state = 'open',
+                            p.passive_only = false,
                             p.updated_at = datetime()
                         MERGE (i)-[:HAS_PORT]->(p)
                         """,

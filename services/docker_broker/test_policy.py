@@ -59,7 +59,9 @@ allow("bind via Mounts type=bind under prefix", {"Image": NAABU,
 # Supply-chain feature (plan Phase 0.5): the DIRTY analyzer image + the offline
 # OSV DB volume are allowlisted; a look-alike image is not.
 allow("supply-chain analyzer image", {"Image": "redamon-supply-chain-analyzer:latest"})
-allow("supply-chain clean scanner image", {"Image": "redamon-supply-chain:latest"})
+# The CLEAN scanner is started by the orchestrator on the real socket, never
+# through the broker, so the broker refuses it.
+deny("supply-chain clean scanner image", {"Image": "redamon-supply-chain:latest"}, "allowlist")
 allow("offline OSV DB volume (ro)", {"Image": "redamon-supply-chain-analyzer:latest",
       "HostConfig": {"Mounts": [{"Type": "volume", "Source": "redamon-osv-db", "Target": "/osv-db", "ReadOnly": True}]}})
 

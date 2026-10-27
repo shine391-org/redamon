@@ -30,7 +30,7 @@ const SUMMARY_KEYS = new Set([
   'scored', 'reviewed', 'cache_hits', 'not_reviewed', 'skipped_changed',
   'false_positives', 'groups', 'llm_calls', 'duration_ms',
   'remediations_created', 'remediations_updated', 'remediations_deleted',
-  'remediations_skipped', 'nodes_written', 'llm_available',
+  'remediations_skipped', 'remediations_repointed', 'nodes_written', 'llm_available',
   'reviews_kept', 'external_reviews', 'reviews_adopted', 'review_budget',
   'publish_failed',
 ])

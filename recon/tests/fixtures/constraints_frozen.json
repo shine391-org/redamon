@@ -43,5 +43,9 @@
   "CREATE CONSTRAINT chain_decision_id IF NOT EXISTS FOR (d:ChainDecision) REQUIRE d.decision_id IS UNIQUE",
   "CREATE CONSTRAINT chain_failure_id IF NOT EXISTS FOR (fl:ChainFailure) REQUIRE fl.failure_id IS UNIQUE",
   "CREATE CONSTRAINT kb_chunk_id IF NOT EXISTS FOR (c:KBChunk) REQUIRE c.chunk_id IS UNIQUE",
-  "CREATE CONSTRAINT userinput_tenant_unique IF NOT EXISTS FOR (ui:UserInput) REQUIRE (ui.id, ui.user_id, ui.project_id) IS UNIQUE"
+  "CREATE CONSTRAINT userinput_tenant_unique IF NOT EXISTS FOR (ui:UserInput) REQUIRE (ui.id, ui.user_id, ui.project_id) IS UNIQUE",
+  "CREATE CONSTRAINT aduser_tenant_unique IF NOT EXISTS FOR (adu:ADUser) REQUIRE (adu.object_identifier, adu.user_id, adu.project_id) IS UNIQUE",
+  "CREATE CONSTRAINT adgroup_tenant_unique IF NOT EXISTS FOR (adg:ADGroup) REQUIRE (adg.object_identifier, adg.user_id, adg.project_id) IS UNIQUE",
+  "CREATE CONSTRAINT adcomputer_tenant_unique IF NOT EXISTS FOR (adc:ADComputer) REQUIRE (adc.object_identifier, adc.user_id, adc.project_id) IS UNIQUE",
+  "CREATE CONSTRAINT credential_tenant_unique IF NOT EXISTS FOR (cred:Credential) REQUIRE (cred.kind, cred.username, cred.domain, cred.value, cred.user_id, cred.project_id) IS UNIQUE"
 ]

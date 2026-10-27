@@ -27,6 +27,12 @@ export interface OrchestratorLimit {
 export interface NormalizedStartError {
   error: string
   limit?: OrchestratorLimit
+  /**
+   * The orchestrator's own reason code, when its detail names one:
+   * `spawn_failed` (the container could not be created) or `not_configured`.
+   * The queue reads both as permanent (scanStartOutcome.ts).
+   */
+  code?: string
 }
 
 export function normalizeOrchestratorStartError(
@@ -53,9 +59,11 @@ export function normalizeOrchestratorStartError(
     }
     // Unknown object shape: prefer its own `detail` string, else the fallback.
     // Critically, NEVER return the object itself as `error`.
+    const code = (detail as { code?: unknown }).code
     return {
       error: (typeof d.detail === 'string' ? d.detail : null) || fallback,
       limit: d,
+      ...(typeof code === 'string' ? { code } : {}),
     }
   }
 

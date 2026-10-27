@@ -10,6 +10,7 @@ import { SETTINGS_KEYS_HREF } from '@/lib/settingsLinks'
 import { CredentialShortcut } from '@/components/settings/CredentialShortcut'
 import { useCredentialKeys, type CredentialKeysApi } from '@/hooks/useCredentialKeys'
 import { SCAN_TARGET_FOLDERS } from '@/lib/trufflehogSources'
+import { copyText } from '@/lib/copyText'
 import {
   TRUFFLEHOG_DETECTOR_COUNT,
   filterDetectors,
@@ -613,12 +614,13 @@ function DetectorPicker({
 
   const copyAll = async () => {
     try {
-      await navigator.clipboard.writeText(shown.join(','))
+      await copyText(shown.join(','))
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
     } catch {
-      // Clipboard is permission-gated and absent over plain http; the names are
-      // selectable text either way, so a failure needs no error of its own.
+      // copyText already falls back for plain http, so this only fires when no
+      // copy path works; the names are selectable text either way, so a failure
+      // needs no error of its own.
     }
   }
 

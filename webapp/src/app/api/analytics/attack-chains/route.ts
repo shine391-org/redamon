@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -184,7 +185,7 @@ export async function GET(request: NextRequest) {
     // Q11: ExploitGvm list
     const gvmResult = await session.run(
       `MATCH (ex:ExploitGvm {project_id: $pid})
-       WHERE ${notMuted('ex')}
+       WHERE ${notMuted('ex')} AND ${reportCountable('ex')}
        OPTIONAL MATCH (ex)-[:EXPLOITED_CVE]->(c:CVE)
        WITH ex, collect(c.id) AS cveIds
        RETURN ex.name AS name, ex.target_ip AS targetIp, ex.target_port AS targetPort,
@@ -244,7 +245,7 @@ export async function GET(request: NextRequest) {
        RETURN target, tool, findingType, severity
        UNION ALL
        MATCH (ex:ExploitGvm {project_id: $pid})
-       WHERE ${notMuted('ex')}
+       WHERE ${notMuted('ex')} AND ${reportCountable('ex')}
        RETURN COALESCE(ex.target_ip, 'unknown') AS target,
               'openvas' AS tool,
               'exploit_success' AS findingType,

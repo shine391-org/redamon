@@ -1,5 +1,6 @@
 """Initialize node — handles new vs continuing objectives and attack chain creation."""
 
+import asyncio
 import logging
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -16,9 +17,13 @@ from state import (
 import orchestrator_helpers.chain_graph_writer as chain_graph
 from orchestrator_helpers.config import get_config_values
 from orchestrator_helpers.phase import classify_attack_path, determine_phase_for_new_objective
+from neo4j_read_pool import run_neo4j_read
 from project_settings import get_setting
 
 logger = logging.getLogger(__name__)
+
+# Seconds a session's first turn waits for the optional prior-chain context.
+PRIOR_CHAINS_WAIT_S = 15.0
 
 
 def _build_guardrail_block(user_id, project_id, session_id, target_desc, reason) -> dict:
@@ -507,9 +512,16 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
     # Load prior chain context on first invocation (empty trace)
     if not state.get("execution_trace"):
         try:
-            prior_chains = chain_graph.query_prior_chains(
-                neo4j_uri, neo4j_user, neo4j_password,
-                user_id, project_id, session_id,
+            # Off the event loop and bounded: this read runs before the first
+            # think turn, and a slow Neo4j here froze every session on the agent.
+            # The context is optional, so a slow read is skipped, not awaited.
+            prior_chains = await asyncio.wait_for(
+                run_neo4j_read(
+                    chain_graph.query_prior_chains,
+                    neo4j_uri, neo4j_user, neo4j_password,
+                    user_id, project_id, session_id,
+                ),
+                timeout=PRIOR_CHAINS_WAIT_S,
             )
             if prior_chains:
                 updates["_prior_chain_context"] = format_prior_chains(prior_chains)

@@ -185,7 +185,9 @@ export function ScanQueuePanel({ projectId }: { projectId: string | null }) {
                     className={`${styles.iconBtn} ${styles.textBtn}`}
                     disabled={busyId === j.id}
                     onClick={() => act(j.id, 'reconfirm')}
-                    title="Re-confirm with the current project settings"
+                    title={'Run it again. A job is held when the project settings changed after it was ' +
+                      'queued (it then runs with the current settings), or when its start got no ' +
+                      'answer (check first that the scan did not start).'}
                   >
                     Re-confirm
                   </button>

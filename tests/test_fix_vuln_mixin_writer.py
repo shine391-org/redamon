@@ -334,8 +334,19 @@ class TestWafReliabilityFields(unittest.TestCase):
         [props] = _security_findings([{
             "type": "waf_bypass", "severity": "medium", "name": "n", "description": "d",
             "url": "https://198.51.100.10", "matched_ip": "198.51.100.10"}]).vuln_props()
-        for key in ("detection_method", "waf_confidence", "waf_type", "ai_reasoning", "service"):
+        for key in ("detection_method", "waf_confidence", "waf_type", "ai_reasoning", "service",
+                    "control_check"):
             self.assertNotIn(key, props)
+
+    def test_the_catch_all_control_verdict_is_kept(self):
+        """Plan 10's "Controlled" gate reads control_check off the finding."""
+        [props] = _security_findings([{
+            "type": "ip_api_exposed", "severity": "high", "name": "n", "description": "d",
+            "url": "http://198.51.100.10/api/v1", "matched_ip": "198.51.100.10",
+            "evidence": "API endpoint returned 200 with application/json; control_check: passed",
+            "control_check": "passed"}]).vuln_props()
+        self.assertEqual(props["control_check"], "passed")
+        self.assertIn("control_check: passed", props["evidence"])
 
 
 # --------------------------------------------------------------------------- #

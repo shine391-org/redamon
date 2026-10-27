@@ -188,6 +188,127 @@ class TestReconFpWritersGraphLive(unittest.TestCase):
         self.assertEqual((banner["detection_method"], banner["verified"]), ("passive_verified", True))
         self.assertEqual((banner["product"], banner["cvss_score"], banner["severity"]), ("nginx", 7.7, "high"))
 
+    def test_the_port_recheck_round_trips(self):
+        payload = _shodan_payload()
+        cve = payload["shodan"]["cves"][0]
+        cve["port_confirmed"] = False
+        self.client.update_graph_from_shodan(payload, self.user, self.pid)
+        self.assertIs(self._vuln(BANNER_CVE)["port_confirmed"], False)
+        # Partial recon could not say: the stored verdict stays.
+        cve.pop("port_confirmed")
+        self.client.update_graph_from_shodan(payload, self.user, self.pid)
+        self.assertIs(self._vuln(BANNER_CVE)["port_confirmed"], False)
+        # A full run whose scan did not look at the port: unknown, the old verdict goes.
+        cve["port_confirmed"] = None
+        self.client.update_graph_from_shodan(payload, self.user, self.pid)
+        self.assertNotIn("port_confirmed", self._vuln(BANNER_CVE))
+
+    def test_a_port_only_shodan_saw_is_passive_until_a_scan_finds_it(self):
+        def port():
+            return self._one("MATCH (p:Port {number: 443, ip_address: $ip, project_id: $pid}) "
+                             "RETURN p.passive_only AS passive, p.source AS source", ip=IP)
+
+        self.client.update_graph_from_shodan(_shodan_payload(), self.user, self.pid)
+        self.assertEqual((port()["passive"], port()["source"]), (True, "shodan"))
+        self.assertEqual(self.client.active_open_ports(self.user, self.pid, {IP}), {})
+        self.client.update_graph_from_port_scan({"domain": "fp-itest.test", "port_scan": {
+            "by_ip": {IP: {"ports": [443]}},
+            "by_host": {"www.fp-itest.test": {"ip": IP, "port_details": [
+                {"port": 443, "protocol": "tcp", "service": "https"}]}}}}, self.user, self.pid)
+        self.assertIs(port()["passive"], False)
+        self.assertEqual(self.client.active_open_ports(self.user, self.pid, {IP}), {IP: {443}})
+        # Shodan seeing it again does not make it passive again.
+        self.client.update_graph_from_shodan(_shodan_payload(), self.user, self.pid)
+        self.assertIs(port()["passive"], False)
+
+    def test_passive_enrichers_leave_an_actively_found_port_active(self):
+        self.client.update_graph_from_port_scan({"domain": "fp-itest.test", "port_scan": {
+            "by_ip": {IP: {"ports": [22]}},
+            "by_host": {"www.fp-itest.test": {"ip": IP, "port_details": [
+                {"port": 22, "protocol": "tcp", "service": "ssh"}]}}}}, self.user, self.pid)
+        base = {"domain": "fp-itest.test", "domains": ["fp-itest.test"]}
+        self.client.update_graph_from_censys({**base, "censys": {"hosts": [
+            {"ip": IP, "services": [{"port": 22}]}]}}, self.user, self.pid)
+        for tool in ("fofa", "netlas", "zoomeye"):
+            getattr(self.client, f"update_graph_from_{tool}")(
+                {**base, tool: {"results": [{"ip": IP, "port": 22}]}}, self.user, self.pid)
+        self.client.update_graph_from_criminalip({**base, "criminalip": {"ip_reports": [
+            {"ip": IP, "ports": [{"port": 22}]}]}}, self.user, self.pid)
+        port = self._one("MATCH (p:Port {number: 22, ip_address: $ip, project_id: $pid}) "
+                         "RETURN p.source AS source, p.passive_only AS passive, count(*) AS n", ip=IP)
+        self.assertEqual((port["source"], port["passive"], port["n"]), (None, False, 1))
+        self.assertEqual(self.client.active_open_ports(self.user, self.pid, {IP}), {IP: {22}})
+
+    def test_the_priority_board_reads_reach_per_port(self):
+        from cypherfix_triage import fact_queries, score_model
+        self.client.update_graph_from_shodan(_shodan_payload(), self.user, self.pid)
+        self.client.update_graph_from_port_scan({"domain": "fp-itest.test", "port_scan": {
+            "by_ip": {IP: {"ports": [22]}},
+            "by_host": {"www.fp-itest.test": {"ip": IP, "port_details": [
+                {"port": 22, "protocol": "tcp", "service": "ssh"}]}}}}, self.user, self.pid)
+        query = next(q["query"] for q in fact_queries.PROJECT_FACT_QUERIES if q["name"] == "port_hosts")
+        with self.client.driver.session() as s:
+            facts = fact_queries.build_project_facts(
+                {"port_hosts": [dict(r) for r in s.run(query, userId=self.user, projectId=self.pid)]})
+        self.assertEqual((facts.port_status[(IP, 22)], facts.port_status[(IP, 443)]),
+                         ("active", "passive"))
+        finding = [q for q in fact_queries.FINDING_QUERIES if q["name"] == "vulnerabilities"][0]["query"]
+        with self.client.driver.session() as s:
+            rows = {r["id"]: fact_queries.normalise_finding_row(dict(r))
+                    for r in s.run(finding, userId=self.user, projectId=self.pid)}
+        banner = rows[f"shodan-{BANNER_CVE}-{IP}"]
+        reach = score_model.reach(banner, facts, score_model.parse_cvss_vector(None))
+        self.assertEqual(reach.value, 0.7, "the host's active port 22 says nothing about 443")
+
+    def test_netlas_writes_one_finding_per_ip_and_port_under_the_ip(self):
+        from cypherfix_triage import fact_queries
+        other = "198.51.100.41"
+        rows = [{"ip": ip, "port": 22, "protocol": "ssh",
+                 "cve_list": [{"id": "CVE-2018-15473", "base_score": 5.3, "severity": "medium"}]}
+                for ip in (IP, other)]
+        payload = {"domain": "fp-itest.test", "domains": ["fp-itest.test"], "netlas": {"results": rows}}
+        self.client.update_graph_from_netlas(payload, self.user, self.pid)
+        # A parent edge from the old shape, left by an earlier release.
+        with self.client.driver.session() as s:
+            s.run("MATCH (svc:Service {port_number: 22, ip_address: $ip, project_id: $pid}), "
+                  "(v:Vulnerability {id: $vid, project_id: $pid}) MERGE (svc)-[:HAS_VULNERABILITY]->(v)",
+                  ip=IP, pid=self.pid, vid=f"netlas-CVE-2018-15473-{IP}-22")
+        self.client.update_graph_from_netlas(payload, self.user, self.pid)
+        nodes = self._one(
+            "MATCH (v:Vulnerability {project_id: $pid, source: 'netlas'}) "
+            "RETURN collect(v.id) AS ids, "
+            "       sum(COUNT { (:Service)-[:HAS_VULNERABILITY]->(v) }) AS service_parents, "
+            "       sum(COUNT { (:IP)-[:HAS_VULNERABILITY]->(v) }) AS ip_parents, "
+            "       sum(COUNT { (v)-[:INCLUDES_CVE]->(:CVE {id: 'CVE-2018-15473'}) }) AS cve_edges")
+        self.assertEqual(sorted(nodes["ids"]), sorted(f"netlas-CVE-2018-15473-{ip}-22" for ip in (IP, other)))
+        self.assertEqual((nodes["service_parents"], nodes["ip_parents"], nodes["cve_edges"]), (0, 2, 2))
+        query = [q for q in fact_queries.FINDING_QUERIES if q["name"] == "vulnerabilities"][0]["query"]
+        with self.client.driver.session() as s:
+            hosts = {r["id"]: r["triage_host"] for r in s.run(query, userId=self.user, projectId=self.pid)}
+        self.assertEqual(hosts[f"netlas-CVE-2018-15473-{IP}-22"], IP)
+
+    def test_criminalip_refreshes_its_score_under_the_boards_name(self):
+        def payload(score):
+            return {"domain": "fp-itest.test", "criminalip": {"ip_reports": [{
+                "ip": IP, "ports": [],
+                "vulnerabilities": [{"cve_id": "CVE-2021-44228", "cvssv3_score": score}]}]}}
+
+        vid = f"criminalip-CVE-2021-44228-{IP}"
+        with self.client.driver.session() as s:
+            # A row as the old writer left it: the score under `cvss`, set once.
+            s.run("CREATE (:Vulnerability {id: $id, user_id: $u, project_id: $pid, "
+                  "source: 'criminalip', name: 'CVE-2021-44228', cvss: 5.0})",
+                  id=vid, u=self.user, pid=self.pid)
+        self.client.update_graph_from_criminalip(payload(9.8), self.user, self.pid)
+        node = self._one("MATCH (v:Vulnerability {id: $id, project_id: $pid}) RETURN properties(v) AS p",
+                         id=vid)["p"]
+        self.assertEqual((node["cvss_score"], node["source"], node["target_ip"]), (9.8, "criminalip", IP))
+        self.assertNotIn("cvss", node)
+        self.client.update_graph_from_criminalip(payload(7.5), self.user, self.pid)
+        node = self._one("MATCH (v:Vulnerability {id: $id, project_id: $pid}) RETURN properties(v) AS p",
+                         id=vid)["p"]
+        self.assertEqual(node["cvss_score"], 7.5)
+
     def test_the_priority_board_reads_the_grade(self):
         from cypherfix_triage import fact_queries, score_model
         self.client.update_graph_from_shodan(_shodan_payload(), self.user, self.pid)

@@ -13,7 +13,6 @@ Features:
   - Passive CVEs: Extract known CVEs from Shodan host data
 """
 import os
-import re
 import threading
 import time
 import logging
@@ -45,9 +44,10 @@ class _RateLimiter:
 
 try:
     from recon.main_recon_modules.ip_filter import (
-        collect_cdn_ips, filter_ips_for_enrichment, in_published_cdn_range)
+        collect_cdn_ips, filter_ips_for_enrichment, in_published_cdn_range, is_shared_edge_org)
 except ImportError:
-    from ip_filter import collect_cdn_ips, filter_ips_for_enrichment, in_published_cdn_range
+    from ip_filter import (
+        collect_cdn_ips, filter_ips_for_enrichment, in_published_cdn_range, is_shared_edge_org)
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +190,8 @@ def _shodan_get(endpoint: str, api_key: str, params: dict | None = None, key_rot
     breaker = _shodan_breaker(_shodan_endpoint(endpoint))
     res = _shodan_call(endpoint, cb.KeyPool(key_rotator, api_key, label="Shodan"), params,
                        admitted=admitted)
+    if res.answered:
+        cb.run_cache("shodan_answered").put(endpoint, True)
     if res.ok:
         return res.data
     if res.outcome is cb.Outcome.FATAL or (res.outcome is cb.Outcome.SKIPPED and breaker.is_fatal):
@@ -231,12 +233,29 @@ def _internetdb_get(ip: str) -> dict | None:
     return None
 
 
-def _lookup_single_ip(ip: str, use_internetdb: bool, api_key: str, key_rotator, rate_limiter: _RateLimiter) -> dict | None:
+def _shodan_answered(endpoint: str, data) -> bool:
+    """The Shodan API answered `endpoint` this run: data, or a genuine "no data"."""
+    from recon.helpers import circuit_breaker as cb
+    return data is not None or cb.run_cache("shodan_answered").get(endpoint)[0]
+
+
+def _internetdb_answered(ip: str, data) -> bool:
+    """InternetDB answered for `ip` this run (its run cache holds answers only)."""
+    from recon.helpers import circuit_breaker as cb
+    return data is not None or cb.run_cache("internetdb").get(ip)[0]
+
+
+def _lookup_single_ip(ip: str, use_internetdb: bool, api_key: str, key_rotator,
+                      rate_limiter: _RateLimiter, answered: set | None = None) -> dict | None:
     """Lookup a single IP via Shodan API or InternetDB. Thread-safe.
 
     Takes the InternetDB branch itself once the host API is refused or
-    paused, so no IP is lost to a fallback that happens elsewhere.
+    paused, so no IP is lost to a fallback that happens elsewhere. An IP that
+    got an answer, "no data" included, is added to `answered`: the prune
+    keeps the CVEs of the others.
     """
+    if answered is None:
+        answered = set()
     if not use_internetdb:
         from recon.helpers.circuit_breaker import Outcome
         host_breaker = _shodan_breaker("host")
@@ -253,6 +272,8 @@ def _lookup_single_ip(ip: str, use_internetdb: bool, api_key: str, key_rotator, 
                 data = None
                 use_internetdb = True
             if not use_internetdb:
+                if _shodan_answered(f"/shodan/host/{ip}", data):
+                    answered.add(ip)
                 if data:
                     host_entry = {
                         "ip": ip,
@@ -288,6 +309,8 @@ def _lookup_single_ip(ip: str, use_internetdb: bool, api_key: str, key_rotator, 
     # InternetDB path
     rate_limiter.wait()
     idb = _internetdb_get(ip)
+    if _internetdb_answered(ip, idb):
+        answered.add(ip)
     if idb:
         host_entry = {
             "ip": ip,
@@ -310,7 +333,8 @@ def _lookup_single_ip(ip: str, use_internetdb: bool, api_key: str, key_rotator, 
     return None
 
 
-def _run_host_lookup(ips: list[str], api_key: str, key_rotator=None, max_workers: int = 5) -> list[dict]:
+def _run_host_lookup(ips: list[str], api_key: str, key_rotator=None, max_workers: int = 5,
+                     answered: set | None = None) -> list[dict]:
     """Fetch Shodan host data for each IP using parallel workers.
 
     Tries the full /shodan/host/{ip} API first. Once that is refused (401,
@@ -320,8 +344,10 @@ def _run_host_lookup(ips: list[str], api_key: str, key_rotator=None, max_workers
     and tags -- no banners or geo data.
 
     The first IP is looked up alone, so a refused key costs one call rather
-    than one per worker.
+    than one per worker. Every IP that got an answer goes into `answered`.
     """
+    if answered is None:
+        answered = set()
     hosts = []
     use_internetdb = not api_key  # No key -> go straight to InternetDB
 
@@ -334,7 +360,7 @@ def _run_host_lookup(ips: list[str], api_key: str, key_rotator=None, max_workers
     if not ips:
         return hosts
 
-    first = _lookup_single_ip(ips[0], use_internetdb, api_key, key_rotator, rate_limiter)
+    first = _lookup_single_ip(ips[0], use_internetdb, api_key, key_rotator, rate_limiter, answered)
     if first:
         hosts.append(first)
     rest = ips[1:]
@@ -345,14 +371,16 @@ def _run_host_lookup(ips: list[str], api_key: str, key_rotator=None, max_workers
     workers = min(max_workers, len(rest))
     if workers <= 1:
         for ip in rest:
-            result = _lookup_single_ip(ip, use_internetdb, api_key, key_rotator, rate_limiter)
+            result = _lookup_single_ip(ip, use_internetdb, api_key, key_rotator, rate_limiter,
+                                       answered)
             if result:
                 hosts.append(result)
         return hosts
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_lookup_single_ip, ip, use_internetdb, api_key, key_rotator, rate_limiter): ip
+            executor.submit(_lookup_single_ip, ip, use_internetdb, api_key, key_rotator,
+                            rate_limiter, answered): ip
             for ip in rest
         }
         for future in as_completed(futures):
@@ -481,27 +509,16 @@ def _service_vulns(raw) -> list[dict]:
     return out
 
 
-# Providers whose IPs front many unrelated tenants. A CVE Shodan correlates to
-# such an IP describes whatever answered there for whichever customer, not the
-# target; our own CDN ranges know only Cloudflare, so Shodan's attribution is
-# used as well. Only providers that sell no servers are named: Akamai (which
-# now runs Linode), G-Core and StackPath also rent VMs, so their edges are
-# recognised by Shodan's `cdn` tag instead of the org name.
-_SHARED_EDGE_ORG = re.compile(
-    r"\b(?:cloudflare|fastly|vercel|netlify|incapsula|imperva|sucuri"
-    r"|edgecast|edgio|limelight|bunnyway|bunny\.net|cdn77|cloudfront)\b",
-    re.IGNORECASE,
-)
-
-
 def _is_shared_edge_host(host: dict) -> bool:
     """True when Shodan itself tags the IP as a CDN, or attributes it to a
-    shared edge provider."""
+    shared edge provider. A CVE Shodan correlates to such an IP describes
+    whatever answered there for whichever customer, not the target; Akamai,
+    G-Core and StackPath also rent VMs, so their edges are recognised by the
+    `cdn` tag rather than the org name (see is_shared_edge_org)."""
     tags = {str(t).lower() for t in (host.get("tags") or [])}
     if "cdn" in tags:
         return True
-    org = " ".join(str(host.get(k) or "") for k in ("org", "isp"))
-    return bool(_SHARED_EDGE_ORG.search(org))
+    return is_shared_edge_org(" ".join(str(host.get(k) or "") for k in ("org", "isp")))
 
 
 _GRADE_RANK = {"passive_catalog": 0, "passive_version_match": 1, "passive_verified": 2}
@@ -536,7 +553,9 @@ def _passive_cve_entry(cve_id: str, ip: str, source: str, svc: Optional[dict] = 
     }
 
 
-def _extract_passive_cves(hosts: list[dict], ips: list[str], api_key: str, key_rotator=None, max_workers: int = 5) -> list[dict]:
+def _extract_passive_cves(hosts: list[dict], ips: list[str], api_key: str, key_rotator=None,
+                          max_workers: int = 5, covered: set | None = None,
+                          host_answered: set | None = None) -> list[dict]:
     """Extract CVEs from host lookup data.
 
     If host data exists (from host lookup, which may be InternetDB data),
@@ -546,7 +565,13 @@ def _extract_passive_cves(hosts: list[dict], ips: list[str], api_key: str, key_r
     A banner's own CVEs carry its port, product and version; the IP-level
     list fills in the rest as catalog matches. A shared CDN/edge IP yields
     none: its banners belong to the provider and its other tenants.
+
+    `covered` receives every IP whose CVEs this run re-checked: the IPs the
+    host lookup got an answer for (`host_answered`), or those InternetDB
+    answered here. A "no data" answer counts; a failure does not.
     """
+    if covered is None:
+        covered = set()
     cves: list[dict] = []
     seen_cve_ip: set[tuple[str, str]] = set()
     skipped_edge = 0
@@ -554,6 +579,8 @@ def _extract_passive_cves(hosts: list[dict], ips: list[str], api_key: str, key_r
     # If host lookup already ran, extract from existing data (works for both
     # Shodan API and InternetDB sources since both populate 'vulns')
     if hosts:
+        covered.update(host_answered or ())
+        covered.update(h["ip"] for h in hosts)
         for host in hosts:
             ip = host["ip"]
             if _is_shared_edge_host(host):
@@ -587,6 +614,8 @@ def _extract_passive_cves(hosts: list[dict], ips: list[str], api_key: str, key_r
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for ip, idb in executor.map(_query_cves, ips):
+                if _internetdb_answered(ip, idb):
+                    covered.add(ip)
                 if idb:
                     if _is_shared_edge_host(idb):
                         skipped_edge += 1
@@ -647,8 +676,8 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
     print(f"\n[PHASE] Shodan OSINT Enrichment")
     print("-" * 40)
 
-    ips = _extract_ips_from_recon(combined_result)
-    ips = filter_ips_for_enrichment(ips, combined_result, "Shodan")
+    all_ips = _extract_ips_from_recon(combined_result)
+    ips = filter_ips_for_enrichment(all_ips, combined_result, "Shodan")
     domain = combined_result.get("domain", "")
     is_ip_mode = combined_result.get("metadata", {}).get("ip_mode", False)
 
@@ -662,12 +691,17 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
     }
     from recon.helpers import circuit_breaker as cb
     shodan_scope = cb.scope(("shodan", "internetdb"), label="Shodan", unit="call(s)")
+    host_answered: set[str] = set()
+    cve_checked: set[str] = set()
+    failed = False
 
     try:
         # 1. Host Lookup (falls back to InternetDB on 403)
         if do_host and ips:
             print(f"[*][Shodan] Running host lookup on {len(ips)} IPs...")
-            shodan_data["hosts"] = _run_host_lookup(ips, api_key, key_rotator=key_rotator, max_workers=shodan_workers)
+            shodan_data["hosts"] = _run_host_lookup(ips, api_key, key_rotator=key_rotator,
+                                                    max_workers=shodan_workers,
+                                                    answered=host_answered)
             print(f"[+][Shodan] Host lookup complete: {len(shodan_data['hosts'])} hosts enriched")
 
         # 2. Reverse DNS (falls back to InternetDB hostnames on 403)
@@ -692,7 +726,8 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
         if do_cves and ips:
             print(f"[*][Shodan] Extracting passive CVEs...")
             shodan_data["cves"] = _extract_passive_cves(
-                shodan_data["hosts"], ips, api_key, key_rotator=key_rotator, max_workers=shodan_workers
+                shodan_data["hosts"], ips, api_key, key_rotator=key_rotator,
+                max_workers=shodan_workers, covered=cve_checked, host_answered=host_answered,
             )
             print(f"[+][Shodan] Passive CVEs complete: {len(shodan_data['cves'])} CVEs found")
 
@@ -700,13 +735,19 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
         # Only reaches here for 401 (invalid key) — 403 is handled per-function
         print(f"[!][Shodan] API key error: {e}")
         print(f"[!][Shodan] Aborting enrichment — pipeline continues")
+        failed = True
 
     except Exception as e:
         logger.error(f"Shodan enrichment failed: {type(e).__name__}")
         print(f"[!][Shodan] Enrichment error: {type(e).__name__}")
         print(f"[!][Shodan] Pipeline continues without Shodan data")
+        failed = True
 
     shodan_scope.finish("shodan_enrich", payload=shodan_data)
+    if do_cves:
+        from recon.helpers.passive_cve_coverage import note_cve_coverage
+        note_cve_coverage("shodan", "shodan_enrich", ips, cve_checked,
+                          no_input=not all_ips, failed=failed)
     combined_result["shodan"] = shodan_data
     return combined_result
 
@@ -741,6 +782,48 @@ def drop_cdn_ips(shodan_data: dict, combined_result: dict) -> int:
     if "cves" in shodan_data:
         shodan_data["cves"] = [c for c in cves if c.get("ip") not in dropped]
     return len(dropped)
+
+
+def drop_shared_edge_cves(shodan_data: dict, edge_ips) -> int:
+    """Drop the CVEs on the IPs IP attribution tagged shared_edge. Returns how many.
+
+    A shared edge's CVEs describe the provider and its other tenants, not the
+    target. Only the CVEs go: in a full run the hosts, ports and names were
+    written at GROUP 3, before the tag existed.
+    """
+    edge_ips = set(edge_ips or ())
+    cves = shodan_data.get("cves") or []
+    if not edge_ips or not cves:
+        return 0
+    kept = [c for c in cves if c.get("ip") not in edge_ips]
+    shodan_data["cves"] = kept
+    return len(cves) - len(kept)
+
+
+def reachcheck_cves(shodan_data: dict, covers, *, clear_unknown: bool = True) -> dict:
+    """Set each CVE's `port_confirmed` from `covers(ip, port)`. No traffic.
+
+    True: this run's port scan found the port open; False: it looked at the
+    port and did not; None: it did not look, so nothing is known. With
+    `clear_unknown` an unknown is written as None, which removes an older
+    value: a full run is the authority on its own scan. Partial recon has no
+    scan and passes False, so it only ever confirms. A UDP banner is unknown:
+    the port scans are TCP. Returns how many of each.
+    """
+    transport = {
+        (h.get("ip"), svc.get("port")): str(svc.get("transport") or "tcp").lower()
+        for h in shodan_data.get("hosts") or [] for svc in h.get("services") or []
+    }
+    counts = {"open": 0, "closed": 0, "unknown": 0}
+    for cve in shodan_data.get("cves") or []:
+        ip, port = cve.get("ip"), cve.get("port")
+        state = None
+        if ip and isinstance(port, int) and transport.get((ip, port), "tcp") == "tcp":
+            state = covers(ip, port)
+        counts["open" if state is True else "closed" if state is False else "unknown"] += 1
+        if state is not None or clear_unknown:
+            cve["port_confirmed"] = state
+    return counts
 
 
 def run_shodan_enrichment_isolated(combined_result: dict, settings: dict[str, Any]) -> dict:

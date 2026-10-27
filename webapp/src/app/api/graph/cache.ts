@@ -33,8 +33,19 @@ const TTL = 10_000 // 10 seconds
 let totalElements = 0
 
 /**
+ * What a finding's disposition reads from the Priority Board. A triage run or a
+ * verdict changes these and nothing structural, so without them a revalidation
+ * got a 304 and the node drawer kept the disposition from before the run.
+ */
+const TRIAGE_ETAG_PROPS = [
+  'triage_tier_rule', 'triage_state', 'triage_status', 'triage_source',
+  'triage_disposition', 'triage_blocker',
+] as const
+
+/**
  * Generate a fast ETag from graph data.
- * XOR-hashes all node IDs for O(n) structural fingerprint.
+ * XOR-hashes all node IDs, plus each finding's triage result, for an O(n)
+ * fingerprint. Other property changes keep the ETag.
  */
 function generateEtag(nodes: any[], links: any[]): string {
   // Fast numeric hash: XOR all node ID chars with position mixing
@@ -43,6 +54,17 @@ function generateEtag(nodes: any[], links: any[]): string {
     const id = nodes[i].id as string
     for (let j = 0; j < id.length; j++) {
       hash = ((hash << 5) - hash + id.charCodeAt(j)) | 0
+    }
+    const props = nodes[i].properties
+    if (props) {
+      for (let k = 0; k < TRIAGE_ETAG_PROPS.length; k++) {
+        const value = props[TRIAGE_ETAG_PROPS[k]]
+        if (typeof value !== 'string') continue
+        hash = ((hash << 5) - hash + (k + 1) * 7919) | 0
+        for (let j = 0; j < value.length; j++) {
+          hash = ((hash << 5) - hash + value.charCodeAt(j)) | 0
+        }
+      }
     }
     hash = (hash ^ (i * 2654435761)) | 0 // mix with position
   }

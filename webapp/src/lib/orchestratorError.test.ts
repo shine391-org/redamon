@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, test, expect } from 'vitest'
 import { normalizeOrchestratorStartError } from './orchestratorError'
 
 /**
@@ -89,5 +89,24 @@ describe('normalizeOrchestratorStartError', () => {
       const r = normalizeOrchestratorStartError(input, 'fb')
       expect(typeof r.error, `error must be string for input ${JSON.stringify(input)}`).toBe('string')
     }
+  })
+})
+
+describe('the orchestrator reason code (plan 12.6, 12.9)', () => {
+  test('a detail object naming a code carries it, with its message as the error', () => {
+    const n = normalizeOrchestratorStartError(
+      { detail: { detail: 'The scan container could not be started: no image', code: 'spawn_failed' } },
+      'Failed to start recon',
+    )
+    expect(n.error).toBe('The scan container could not be started: no image')
+    expect(n.code).toBe('spawn_failed')
+  })
+
+  test('a plain string detail has no code', () => {
+    expect(normalizeOrchestratorStartError({ detail: 'nope' }, 'f').code).toBeUndefined()
+  })
+
+  test('a non-string code is ignored', () => {
+    expect(normalizeOrchestratorStartError({ detail: { detail: 'x', code: 7 } }, 'f').code).toBeUndefined()
   })
 })

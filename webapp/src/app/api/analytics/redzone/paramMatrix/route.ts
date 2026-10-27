@@ -3,6 +3,7 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -27,7 +28,7 @@ export async function GET(request: NextRequest) {
        OPTIONAL MATCH (bu:BaseURL)-[:HAS_ENDPOINT]->(ep)
        OPTIONAL MATCH (sd:Subdomain)-[:HAS_BASE_URL]->(bu)
        OPTIONAL MATCH (v:Vulnerability)-[:AFFECTS_PARAMETER]->(p)
-         WHERE ${notMuted('v')}
+         WHERE ${notMuted('v')} AND ${reportCountable('v')}
        WITH p, ep, bu, sd, collect(DISTINCT v) AS vulns
        WHERE p.is_injectable = true OR size(vulns) > 0
        UNWIND (CASE WHEN size(vulns) = 0 THEN [null] ELSE vulns END) AS v

@@ -67,7 +67,8 @@ class _Spy:
         self.urls.append(url)
 
         class _R:
-            status_code = 200
+            # A real server 404s the catch-all control's made-up path.
+            status_code = 404 if "/rdm-" in url else 200
         return _R()
 
 
@@ -89,6 +90,7 @@ class ProbeSkipsSSRF(unittest.TestCase):
         self.assertEqual(by_url[METADATA]["validation_status"], "unvalidated")
         self.assertEqual(by_url[METADATA]["validation_error"], "ssrf_blocked")
         self.assertNotIn(METADATA, spy.urls)
+        self.assertFalse([u for u in spy.urls if "169.254.169.254" in u])   # nor its control
         # Public: probed normally.
         self.assertIn(PUBLIC, spy.urls)
         self.assertEqual(by_url[PUBLIC]["validation_status"], "hittable")

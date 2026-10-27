@@ -1,10 +1,14 @@
 'use client'
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { AlertTriangle, ArrowLeft, Bot, Check, Copy, Trash2 } from 'lucide-react'
 import { Drawer, ExternalLink, useToast } from '@/components/ui'
 import { trufflehogDisplayFields } from '@/lib/trufflehogDisplay'
+import { COVERAGE_STAMP_PROPERTIES, coverageLines, recordedCoverageModules } from '@/lib/coverageStamps'
 import { copyText } from '@/lib/copyText'
+import { muteableLabel } from '@/lib/muteTarget'
+import { dispositionText, readDisposition } from '@/lib/triage/disposition'
+import { OWNERSHIP_PROPERTIES, ownershipLine } from '@/lib/ipOwnership'
 import { GraphData, GraphNode } from '../../types'
 import { badgeColors, buildNodeContext, getNodeColor, getNodeUrl, nodeLabel } from '../../utils'
 import { domainScopeRoots, scanRootBadge } from '../../utils/scopeRootsForNode'
@@ -106,7 +110,19 @@ export function NodeDrawer({
     setShowDeleteConfirm(false)
   }
 
-  const hiddenKeys = ['project_id', 'user_id']
+  // Whether a missing stamp reads "not scanned" or "coverage not recorded" is a
+  // project-wide question: did the module stamp ANY host.
+  const recordedModules = useMemo(() => recordedCoverageModules(graphData?.nodes), [graphData])
+  const coverage = displayNode?.type === 'BaseURL'
+    ? coverageLines(displayNode.properties ?? {}, recordedModules)
+    : []
+
+  const isIp = displayNode?.type === 'IP'
+  const hiddenKeys: string[] = [
+    'project_id', 'user_id',
+    ...(coverage.length ? COVERAGE_STAMP_PROPERTIES : []),
+    ...(isIp ? OWNERSHIP_PROPERTIES : []),
+  ]
   const sortedProperties = displayNode
     ? Object.entries(displayNode.properties || {})
         .filter(([key]) => !hiddenKeys.includes(key))
@@ -120,6 +136,11 @@ export function NodeDrawer({
           return 0
         })
     : []
+
+  // Findings only: an asset or a reference node is never "reportable".
+  const disposition = displayNode && muteableLabel([displayNode.type])
+    ? readDisposition(displayNode.properties)
+    : null
 
   const trufflehogFields = displayNode?.type === 'MultiscannerFinding'
     ? trufflehogDisplayFields((displayNode.properties ?? {}) as Record<string, unknown>)
@@ -259,6 +280,20 @@ export function NodeDrawer({
                 })()}
               </span>
             </div>
+            {isIp && (
+              <div className={styles.propertyRow} data-testid="drawer-ownership">
+                <span className={styles.propertyKey}>Ownership</span>
+                <span className={`${styles.propertyValue} ${styles.proseValue}`}>
+                  {ownershipLine(displayNode.properties)}
+                </span>
+              </div>
+            )}
+            {disposition && (
+              <div className={styles.propertyRow} data-testid="drawer-disposition">
+                <span className={styles.propertyKey}>Disposition</span>
+                <span className={styles.propertyValue}>{dispositionText(disposition)}</span>
+              </div>
+            )}
             {(() => {
               const roots = domainScopeRoots(displayNode, scopeGroups)
               return roots && (
@@ -289,6 +324,21 @@ export function NodeDrawer({
                 <div key={label} className={styles.propertyRow}>
                   <span className={styles.propertyKey}>{label}</span>
                   <span className={styles.propertyValue}>{value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {coverage.length > 0 && (
+            <div className={styles.section} data-testid="coverage-section">
+              <h3 className={styles.sectionTitleProperties}>Coverage</h3>
+              {coverage.map(line => (
+                <div key={line.module} className={styles.propertyRow} data-state={line.state}>
+                  <span className={styles.propertyKey}>{line.label}</span>
+                  <span className={`${styles.coverageValue} ${styles[`coverage_${line.state}`] ?? ''}`}>
+                    {line.text}
+                    {line.at && <span className={styles.coverageAt}> · run started {line.at}</span>}
+                  </span>
                 </div>
               ))}
             </div>

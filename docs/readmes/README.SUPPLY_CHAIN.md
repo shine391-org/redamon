@@ -16,9 +16,9 @@ of RedAmon.
 - [The offline OSV database](#the-offline-osv-database)
 - [The shared engine (`supply_chain_common`)](#the-shared-engine-supply_chain_common)
 - [Security posture: the DIRTY / CLEAN split](#security-posture-the-dirty--clean-split)
-- [Layer L3 - Agent tools](#layer-l3--agent-tools)
-- [Layer L1 - Standalone scan (Other Scans)](#layer-l1--standalone-scan-other-scans)
-- [Layer L2 - Recon pipeline module](#layer-l2--recon-pipeline-module)
+- [Layer L3 - Agent tools](#layer-l3---agent-tools)
+- [Layer L1 - Standalone scan (Other Scans)](#layer-l1---standalone-scan-other-scans)
+- [Layer L2 - Recon pipeline module](#layer-l2---recon-pipeline-module)
 - [Graph model](#graph-model)
 - [The Supply-Chain SCA table](#the-supply-chain-sca-table)
 - [Container topology](#container-topology)
@@ -111,7 +111,7 @@ flowchart TB
 
 Kali holds **no Docker socket**: it is the least-trusted, target-facing worker, so
 the one L3 tool that spawns a container (`execute_guarddog`) goes through the
-orchestrator instead. See [Layer L3](#layer-l3--agent-tools).
+orchestrator instead. See [Layer L3](#layer-l3---agent-tools).
 
 The **shared engine** (`scanners/supply_chain_common/`) is a pure-Python package of runners
 and parsers mounted read-only into every CLEAN/DIRTY container the same way
@@ -436,7 +436,7 @@ flowchart LR
 |---|---|
 | **DIRTY sandbox** `cap_drop=ALL`, `read_only` rootfs + tmpfs, non-root, mem/pids/cpu caps, **no secrets** | `run_supply_chain_analyzer` (modeled on `codefix_sandbox`) |
 | **Network isolation** - OSV path zero-egress; GuardDog registry-egress opt-in, fails closed | dedicated `redamon-supply-chain-net` bridge |
-| **NO-INSTALL invariant** - never run `npm/pip/... install` on a target manifest (lifecycle scripts = RCE); static parse only | CI grep test over supply-chain source |
+| **NO-INSTALL invariant** - never run `npm/pip/... install` on a target manifest (lifecycle scripts = RCE); static parse only | a grep over supply-chain source in the unit gate (`tests/test_supply_chain_security.py`, `TestNoInstallInvariant`) |
 | **Name sanitization** (S6/S7) - charset allowlist before any subprocess/filename | `sanitize_name` |
 | **DIRTY->CLEAN boundary** (S5) - schema-validate the artifact | `validate_artifact` |
 | **SSRF guard** (S4) - L2 makes no new fetches; it parses data JS-recon already downloaded | `harvest.py` (no `requests.get`) |
@@ -644,7 +644,12 @@ synthesized into a CycloneDX SBOM, and scanned offline. The result is stored on
 
 **Pipeline placement** (`recon/main.py`): GROUP 5.5, gated on
 `SUPPLY_CHAIN_RECON_ENABLED`, after `run_js_recon` so its `source_maps` +
-`technologies` are available. Settings live in `recon/project_settings.py`
+`technologies` are available. Both pipelines call it through
+`_maybe_run_supply_chain` (domain mode in `run_domain_recon`, IP mode in
+`run_ip_recon`), before GROUP 6 and outside its `skip_active_scans` gate: it
+sends nothing to the target, so it runs even when the active scans are skipped.
+Its findings are not recon prune sources (`NON_RECON_LABELS`), so a crash only
+records a phase error. Settings live in `recon/project_settings.py`
 (`SUPPLY_CHAIN_RECON_ENABLED`, `_ECOSYSTEMS`, `_DEEP_ANALYSIS_ENABLED`).
 
 **Partial recon** (`recon/partial_recon_modules/supply_chain.py`, tool id

@@ -458,7 +458,7 @@ def run_nmap(config: dict) -> None:
     """
     import ipaddress as _ipaddress
     from recon.main_recon_modules.nmap_scan import run_nmap_scan
-    from recon.main import merge_nmap_into_port_scan
+    from recon.helpers.nmap_merge import merge_nmap_into_port_scan
 
     roots = scope_roots(config)
     user_inputs = config.get("user_inputs", [])

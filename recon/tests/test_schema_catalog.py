@@ -158,6 +158,45 @@ def test_the_schema_sections_are_no_longer_hardcoded_in_the_prompt():
     assert not stray, f"node blocks are back in the prompt: {stray}"
 
 
+SEEDER = PROJECT_ROOT / "tooling" / "scripts" / "seed_schema_catalog.py"
+
+
+def _run_seeder_check(root: Path):
+    import subprocess
+
+    return subprocess.run(
+        [sys.executable, str(root / "tooling" / "scripts" / SEEDER.name), "--check"],
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_the_committed_catalog_is_what_the_seeder_generates():
+    """The generator check: the catalog is regenerated from schema_sections.md
+    and compared with the committed file (a hand edit, or a seed edit without
+    a re-seed, fails here)."""
+    result = _run_seeder_check(PROJECT_ROOT)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_seeder_check_fails_on_a_hand_edited_catalog(tmp_path):
+    """--check once compared the seed with itself and always exited 0."""
+    import shutil
+
+    for rel in ("tooling/scripts/seed_schema_catalog.py",
+                "tooling/scripts/parse_label_block.py",
+                "graph_db/schema_sections.md", "graph_db/schema_catalog.py"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT_ROOT / rel, tmp_path / rel)
+    assert _run_seeder_check(tmp_path).returncode == 0, "the copy is not self-consistent"
+
+    copy = tmp_path / "graph_db" / "schema_catalog.py"
+    copy.write_text(copy.read_text(encoding="utf-8").replace(
+        "Subdomain", "Subdomian", 1), encoding="utf-8")
+    result = _run_seeder_check(tmp_path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "schema_catalog.py" in result.stderr
+
+
 # ---------------------------------------------------------------------------
 # 2. Completeness: code declares the labels, the catalog must explain them
 # ---------------------------------------------------------------------------
@@ -171,9 +210,6 @@ INTENTIONALLY_UNDOCUMENTED = {
     "Muted",
     # Knowledge-base RAG chunks. Not attack surface, never a recon answer.
     "KBChunk",
-    # Its uniqueness constraint is explicitly dropped in schema.py; it survives
-    # as an index only, so it is not a stable queryable entity.
-    "Exploit",
 }
 
 # Real documentation debt. EMPTY, and the test below keeps it that way: a label

@@ -70,3 +70,46 @@ describe('dispatchStart on a third-party engagement that is not startable', () =
     expect(h.orchestratorFetch).not.toHaveBeenCalled()
   })
 })
+
+describe('dispatchStart tells the queue what the start really did (plan 12.6)', () => {
+  test('a full recon forwards startOutcome, snapshotFailed and the body code', async () => {
+    const { startFullScan } = await import('@/lib/startFullScan')
+    const full = vi.mocked(startFullScan)
+    full.mockResolvedValueOnce({
+      ok: false, status: 503, startOutcome: 'unknown', error: 'no answer', scanJobId: 'sj1',
+    })
+    expect(await dispatchStart('full_recon', 'p1')).toMatchObject({
+      ok: false, status: 503, startOutcome: 'unknown', scanJobId: 'sj1',
+    })
+    full.mockResolvedValueOnce({ ok: false, status: 500, error: 'freeze failed', snapshotFailed: true })
+    expect(await dispatchStart('full_recon', 'p1')).toMatchObject({ snapshotFailed: true })
+    full.mockResolvedValueOnce({ ok: false, status: 500, error: 'no image', code: 'spawn_failed' })
+    expect(await dispatchStart('full_recon', 'p1')).toMatchObject({ code: 'spawn_failed' })
+  })
+
+  test('the queue starts full recons headless, so a transient refusal records no ScanJob', async () => {
+    const { startFullScan } = await import('@/lib/startFullScan')
+    const full = vi.mocked(startFullScan)
+    full.mockResolvedValueOnce({ ok: false, status: 503, error: 'x' })
+    await dispatchStart('full_recon', 'p1')
+    expect(full).toHaveBeenLastCalledWith(expect.objectContaining({ quietTransient: true }))
+  })
+
+  test('a non-full start whose orchestrator call throws has an unknown outcome', async () => {
+    h.legacy.mockResolvedValue([])
+    h.orchestratorFetch.mockRejectedValue(new Error('The operation was aborted due to timeout'))
+    const r = await dispatchStart('partial_recon', 'p1', { payload: { tool_id: 'Tlsx' } })
+    expect(r).toMatchObject({ ok: false, status: 503, startOutcome: 'unknown' })
+    expect(classifyStartFailure(r.status, { error: r.error, startOutcome: r.startOutcome },
+      { orchestratorAnswered: false }).kind).toBe('unknown')
+  })
+
+  test('a non-full refusal forwards the orchestrator body code', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500,
+      json: async () => ({ detail: { detail: 'Failed to start: image missing', code: 'spawn_failed' } }),
+    })
+    const r = await dispatchStart('github_hunt', 'p1')
+    expect(r).toMatchObject({ ok: false, status: 500, code: 'spawn_failed', error: 'Failed to start: image missing' })
+  })
+})

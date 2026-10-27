@@ -16,6 +16,7 @@ import {
 import { Menu, MenuItem, Tooltip, useAlertModal, WikiInfoButton } from '@/components/ui'
 import { useDirtyState } from '@/hooks/useDirtyState'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
+import { copyText } from '@/lib/copyText'
 import {
   MCP_SCOPES,
   MCP_DEFAULT_EXPIRY_DAYS,
@@ -424,7 +425,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
 
   const copy = async (text: string, which: 'token' | 'snippet') => {
     try {
-      await navigator.clipboard.writeText(text)
+      await copyText(text)
       setCopied(which)
       setTimeout(() => setCopied(null), 2000)
     } catch {

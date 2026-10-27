@@ -8,6 +8,7 @@ import logging
 import httpx
 
 from state import AgentState
+from orchestrator_helpers import roe_gate
 from orchestrator_helpers.json_utils import json_dumps_safe
 from orchestrator_helpers.config import get_identifiers
 from tools import set_tenant_context, set_phase_context, set_graph_view_context
@@ -113,68 +114,17 @@ async def execute_tool_node(
     if graph_view_cyphers:
         set_graph_view_context(graph_view_cyphers.get(session_id))
 
-    # RoE enforcement: tool restrictions are handled via agentToolPhaseMap
-    # (is_tool_allowed_in_phase already blocks tools with empty/missing phases).
-    # Here we only enforce the severity phase cap.
     from project_settings import get_setting
-    if get_setting('ROE_ENABLED', False):
-        # Severity phase cap
-        PHASE_ORDER = {'informational': 0, 'exploitation': 1, 'post_exploitation': 2}
-        max_phase = get_setting('ROE_MAX_SEVERITY_PHASE', 'post_exploitation')
-        if PHASE_ORDER.get(phase, 0) > PHASE_ORDER.get(max_phase, 2):
-            msg = f"RoE BLOCKED: Current phase '{phase}' exceeds maximum allowed phase '{max_phase}'."
-            logger.warning(f"[{user_id}/{project_id}/{session_id}] {msg}")
-            step_data["tool_output"] = msg
-            step_data["success"] = False
-            step_data["error_message"] = msg
-            return {
-                "_current_step": step_data,
-                "_tool_result": {"success": False, "error": msg},
-            }
-
-    # Recon-budget gate (Fix C): the agent must not grind reconnaissance forever.
-    # Once informational recon exceeds its iteration budget, refuse the
-    # discovery/scanning tool family so the agent is forced to COMMIT — switch to
-    # the vulnerability class the live evidence already implies and move to
-    # exploitation. Non-discovery tools (curl/kali_shell/code, fs_*, switch_skill,
-    # transition_phase, complete, ask_user) stay available so exploitation and the
-    # required control actions are never blocked.
-    if get_setting('RECON_BUDGET_GATE_ENABLED', True) and phase == "informational":
-        recon_budget = get_setting('RECON_MAX_INFORMATIONAL_ITERS', 15)
-        discovery_tools = set(get_setting('RECON_DISCOVERY_TOOLS', [
-            'web_search', 'execute_httpx', 'execute_ffuf', 'execute_nuclei',
-            'execute_katana', 'execute_gau', 'execute_arjun', 'execute_wpscan',
-            'execute_nmap', 'execute_subfinder', 'execute_dnsx', 'execute_naabu',
-            'execute_whatweb', 'query_graph',
-        ]))
-        # graph_schema and graph_summary are DELIBERATELY absent from that list,
-        # and must stay absent. An agent that has spent its recon budget still
-        # needs to orient before it commits, and neither returns target data or
-        # emits a single packet: one is a static code-derived document, the
-        # other a count per label. Gating them would block the very step this
-        # budget exists to force.
-
-        if iteration >= recon_budget and tool_name in discovery_tools:
-            msg = (
-                f"RECON BUDGET EXCEEDED ({iteration} informational iterations; limit "
-                f"{recon_budget}). Discovery/scanning tools are DISABLED in the "
-                f"informational phase past this budget — you already have enough surface "
-                f"data. STOP scanning and COMMIT now: (1) emit action='switch_skill' to "
-                f"the vulnerability class the live evidence implies (path_traversal for a "
-                f"file/include parameter, sql_injection for a query parameter, xss for "
-                f"reflected input, ssrf for a URL fetcher, rce for a template/command "
-                f"sink, brute_force_credential_guess for a login), then (2) emit "
-                f"action='transition_phase' to exploitation and exploit what you can "
-                f"already see. Blocked tool: {tool_name}."
-            )
-            logger.warning(f"[{user_id}/{project_id}/{session_id}] recon-budget gate blocked '{tool_name}' at iter {iteration}")
-            step_data["tool_output"] = msg
-            step_data["success"] = False
-            step_data["error_message"] = "recon budget exceeded"
-            return {
-                "_current_step": step_data,
-                "_tool_result": {"success": False, "error": msg},
-            }
+    refusal = roe_gate.check_tool_call(tool_name, tool_args, phase, iteration)
+    if refusal:
+        logger.warning(f"[{user_id}/{project_id}/{session_id}] refused '{tool_name}' at iter {iteration}: {refusal.error}")
+        step_data["tool_output"] = refusal.message
+        step_data["success"] = False
+        step_data["error_message"] = refusal.error
+        return {
+            "_current_step": step_data,
+            "_tool_result": {"success": False, "error": refusal.message},
+        }
 
     extra_updates = {}
 

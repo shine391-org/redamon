@@ -1,6 +1,6 @@
 import React from 'react'
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { AlertProvider, ToastProvider } from '@/components/ui'
 import { NodeDrawer } from './NodeDrawer'
 import type { GraphData, GraphNode } from '../../types'
@@ -147,6 +147,54 @@ describe('NodeDrawer header actions', () => {
   })
 })
 
+describe('NodeDrawer coverage section (BaseURL)', () => {
+  const baseUrl = (properties: Record<string, unknown>, id = 'b1'): GraphNode => ({
+    id, type: 'BaseURL', name: 'https://app.example.com', properties: { url: 'https://app.example.com', ...properties },
+  })
+  const project = (...nodes: GraphNode[]): GraphData => ({ projectId: 'p', nodes, links: [] })
+  const coverage = () => screen.getByTestId('coverage-section')
+
+  it('renders one line per module, and the raw stamp keys only there', () => {
+    const node = baseUrl({ js_recon_status: 'complete', js_recon_inputs: 12, js_recon_outputs: 0 })
+    const other = baseUrl({ nuclei_status: 'complete', nuclei_inputs: 2, nuclei_outputs: 0 }, 'b2')
+    renderDrawer({ node, graphData: project(node, other) })
+    expect(coverage()).toHaveTextContent('JS analysis')
+    expect(coverage()).toHaveTextContent('complete, 12 files, 0 findings')
+    expect(coverage()).toHaveTextContent('not scanned by this module')
+    expect(screen.queryByText('js_recon_status')).toBeNull()
+    expect(screen.queryByText('js_recon_inputs')).toBeNull()
+    expect(screen.getByText('url')).toBeInTheDocument()
+  })
+
+  it('says "coverage not recorded" where the project carries no stamp at all', () => {
+    const node = baseUrl({})
+    renderDrawer({ node, graphData: project(node) })
+    const lines = within(coverage()).getAllByText('coverage not recorded')
+    expect(lines).toHaveLength(2)
+    expect(screen.queryByText('not scanned by this module')).toBeNull()
+  })
+
+  it('shows a partial stamp with its reason and a failed one with its cause', () => {
+    const node = baseUrl({
+      js_recon_status: 'partial', js_recon_inputs: 2, js_recon_outputs: 1, js_recon_reason: 'file cap',
+      nuclei_status: 'failed', nuclei_inputs: 0, nuclei_outputs: 0, nuclei_reason: 'runtime cap',
+    })
+    renderDrawer({ node, graphData: project(node) })
+    expect(coverage()).toHaveTextContent('partial (file cap), 2 files, 1 finding')
+    expect(coverage()).toHaveTextContent('failed (runtime cap)')
+  })
+
+  it('reads "coverage not recorded" when there is no graph to compare against (a past version)', () => {
+    renderDrawer({ node: baseUrl({}), graphData: null })
+    expect(within(coverage()).getAllByText('coverage not recorded')).toHaveLength(2)
+  })
+
+  it('is absent on any other node type', () => {
+    renderDrawer({ node: { ...tech, properties: { js_recon_status: 'complete' } } })
+    expect(screen.queryByTestId('coverage-section')).toBeNull()
+  })
+})
+
 describe('NodeDrawer ask-agent modal', () => {
   it('starts a session with the typed request, the node context and its label', () => {
     const onStart = vi.fn()
@@ -190,5 +238,82 @@ describe('NodeDrawer ask-agent modal', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(onStart).not.toHaveBeenCalled()
     expect(screen.queryByLabelText('What should the agent do?')).toBeNull()
+  })
+})
+
+describe('NodeDrawer disposition line (plan 10.2b)', () => {
+  const finding = (properties: GraphNode['properties']): GraphNode => ({
+    id: '7', type: 'Vulnerability', name: 'Exposed panel', properties,
+  })
+
+  it('a finding node says whether it can go in a report, and what blocks it', () => {
+    renderDrawer({ node: finding({ severity: 'high', triage_tier_rule: 'credible, with impact worth planning for' }) })
+    const row = screen.getByTestId('drawer-disposition')
+    expect(row).toHaveTextContent('Disposition')
+    expect(row).toHaveTextContent('Candidate, blocked by credible, with impact worth planning for')
+  })
+
+  it('a finding never triaged says so', () => {
+    renderDrawer({ node: finding({ severity: 'high' }) })
+    expect(screen.getByTestId('drawer-disposition')).toHaveTextContent('Candidate, not triaged yet')
+  })
+
+  it('a node a v3.10 run rescored shows the blocker the run stored (plan 10.5)', () => {
+    renderDrawer({ node: finding({ severity: 'high', triage_tier_rule: 'credible, with impact worth planning for',
+      triage_disposition: 'candidate', triage_blocker: 'unknown: attributed' }) })
+    expect(screen.getByTestId('drawer-disposition')).toHaveTextContent('Candidate, blocked by unknown: attributed')
+  })
+
+  it('proof makes it reportable, a person\'s False positive excludes it', () => {
+    renderDrawer({ node: finding({ triage_tier_rule: 'proven' }) })
+    expect(screen.getByTestId('drawer-disposition')).toHaveTextContent('Reportable')
+    cleanup()
+    renderDrawer({ node: finding({ triage_status: 'likely_noise', triage_source: 'human' }) })
+    expect(screen.getByTestId('drawer-disposition')).toHaveTextContent('Excluded')
+  })
+
+  it('a node that is not a finding has no disposition', () => {
+    renderDrawer()
+    expect(screen.queryByTestId('drawer-disposition')).toBeNull()
+  })
+
+  it('a finding whose properties could not be read shows no line, never a default', () => {
+    renderDrawer({ node: { id: '8', type: 'Secret', name: 'k', properties: undefined as never } })
+    expect(screen.queryByTestId('drawer-disposition')).toBeNull()
+  })
+})
+
+describe('NodeDrawer ownership line (plan 11.4)', () => {
+  const ip = (properties: Record<string, unknown>): GraphNode =>
+    ({ id: '9', type: 'IP', name: '198.51.100.20', properties })
+
+  it('an IP says whose it is, and why', () => {
+    renderDrawer({ node: ip({
+      ownership: 'shared_edge', cdn_name: 'cloudflare',
+      ownership_reasons: ['default certificate covers no target domain', 'in a published CDN edge range'],
+    }) })
+    const row = screen.getByTestId('drawer-ownership')
+    expect(row).toHaveTextContent('Ownership')
+    expect(row).toHaveTextContent(
+      'Shared edge (Cloudflare): default certificate covers no target domain; in a published CDN edge range')
+  })
+
+  it('an IP no run attributed yet says not checked yet', () => {
+    renderDrawer({ node: ip({ address: '198.51.100.20' }) })
+    expect(screen.getByTestId('drawer-ownership')).toHaveTextContent('not checked yet')
+  })
+
+  it('the raw keys leave the property list, the other IP properties stay', () => {
+    renderDrawer({ node: ip({ ownership: 'dedicated', ownership_reasons: ['default certificate covers example.com'],
+      current_dns_names: 2 }) })
+    const props = screen.getByRole('heading', { name: 'Properties' }).parentElement!
+    expect(within(props).queryByText('ownership')).toBeNull()
+    expect(within(props).queryByText('ownership_reasons')).toBeNull()
+    expect(within(props).getByText('current_dns_names')).toBeInTheDocument()
+  })
+
+  it('a node that is not an IP has no ownership line', () => {
+    renderDrawer()
+    expect(screen.queryByTestId('drawer-ownership')).toBeNull()
   })
 })

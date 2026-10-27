@@ -71,6 +71,14 @@ class TestEvidenceText:
                "matched_text": "AbCdEfGh1234567890", "evidence": 'apiKey("AbCdEfGh1234567890")'}
         assert "AbCdEfGh1234567890" not in C.evidence_text(row)
 
+    def test_a_secret_context_is_scrubbed_like_other_free_text(self):
+        # The source text around a js_recon match carries the value itself.
+        row = {"key": "s2", "label": "Secret", "source": "js_recon",
+               "matched_text": "AbCdEfGh1234567890",
+               "context": 'cfg = {token: "AbCdEfGh1234567890", region: "eu"}'}
+        assert "AbCdEfGh1234567890" not in C.redact_row(row)["context"]
+        assert "AbCdEfGh1234567890" not in C.evidence_text(row)
+
     def test_gvm_description_is_evidence(self):
         row = {"key": "g1", "label": "Vulnerability", "source": "gvm",
                "description": "Installed version: 2.4.1 detected"}

@@ -102,6 +102,7 @@ Use \`API Security Audit\` if you also need heavy REST endpoint discovery via Ki
 
     // --- httpx: aggressive tech + response capture for GraphQL detection ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

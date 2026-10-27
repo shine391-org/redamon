@@ -196,7 +196,7 @@ wrap the source in `php://filter/convert.base64-encode/...`, and prefer an
   - SVG (in-band): `<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/hostname">]>`
     then reference `&xxe;` inside a `<text>` element; useful when the app
     rasterizes or echoes the SVG.
-  - OOXML (DOCX / XLSX / PPTX): unzip with `kali_shell` (`7z x`), inject the
+  - OOXML (DOCX / XLSX / PPTX): unzip with `kali_shell` (`unzip`), inject the
     external-DTD OOB payload into `word/document.xml` or `xl/workbook.xml`, then
     rezip and upload. Use the Step 6 OOB or Step 5 error technique to read data.
 

@@ -106,6 +106,7 @@ import {
 import { MUTEABLE_FINDING_LABELS } from '@/lib/mcp/findingLabels'
 import { listGraphViews, runGraphView } from '@/lib/mcp/viewTools'
 import { FINDING_SECTIONS, listFindings, listMuted } from '@/lib/mcp/findingTools'
+import { DISPOSITIONS } from '@/lib/triage/disposition'
 import { compareScanVersions, listScanVersions } from '@/lib/mcp/versionTools'
 import { startRecon, stopRecon, updateReconSettings } from '@/lib/mcp/writeTools'
 import {
@@ -399,10 +400,17 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
       title: 'Summarise the attack-surface graph',
       description:
         'What this project ACTUALLY contains: a count per node type, the relationships present, ' +
-        'the current scan version, and whether the live graph is settled.\n\n' +
-        'Read this before concluding that something is absent. If a node type is missing ' +
-        'entirely, that surface was never scanned - which is a very different answer from "it ' +
-        'was scanned and is clean". Counts only, never sample values.\n\n' +
+        'the current scan version, whether the live graph is settled, and a `coverage` block: per ' +
+        'module (js_recon, nuclei), how many web hosts (BaseURL) it analyzed `complete`, `partial`, ' +
+        'found `no_input` on or `failed` on, and how many live hosts it never looked at ' +
+        '(`not_scanned`). `recorded: false` means the project predates coverage records.\n\n' +
+        'Read this before concluding that something is absent. A node type missing from the counts ' +
+        'means one of three things: never scanned, scanned and clean, or every such finding ' +
+        'suppressed (suppressed findings are not counted). Check `coverage` and the suppressed ' +
+        'findings before calling anything clean. Counts only, never sample values.\n\n' +
+        'When the settled graph holds far fewer nodes than a saved version, or none after a ' +
+        'completed full scan, `warning` is "graph_data_missing" and `graphDataMissing` says what ' +
+        'was expected: the data was lost, so the graph\'s contents are UNKNOWN, not empty.\n\n' +
         `${GRAPH_TOOL_USAGE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -494,6 +502,18 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'that review still describes the evidence. get_finding_triage says why a finding ranks ' +
         'where it does. `decidedBy`, `reviewedVia` and `reviewCurrent` filter in the graph, so ' +
         'their `total` is exact.\n\n' +
+        '`disposition` answers "can this go in a report?", as the RedAmon report counts it. ' +
+        'Report ONLY `reportable` findings (proven by an exploit or a validator, or confirmed by ' +
+        'a person). Treat `candidate` as "verify first": its `blocker` says what is missing: the ' +
+        'first report gate the run found failing (`not reachable now`, `shared edge`, `failed ' +
+        'its control check`, `no impact shown`) or could not tell (`unknown: <gate>`); an AI ' +
+        'review that called it a likely false positive, which is NOT a person\'s verdict; or, ' +
+        'on a finding no current run has rescored, its tier rule or `not triaged yet`. ' +
+        '`shared edge` means a CDN edge may be what answered, never that the target does not ' +
+        'own the finding. `info` has no impact even if ' +
+        'real; `excluded` was judged a false positive by a person, or resolved. The ' +
+        '`disposition`, `severity` and `section` filters apply to the highest-ranked window this ' +
+        'tool reads; `totalIsPartial` says when that window was full.\n\n' +
         'With the separate mute permission, hide noise you have independent evidence for with ' +
         'mute_findings (it takes either id).\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
@@ -506,6 +526,8 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         severity: z.string().optional().describe('critical | high | medium | low | info.'),
         section: z.enum(FINDING_SECTIONS as [string, ...string[]]).optional()
           .describe('Narrow to one board section.'),
+        disposition: z.enum(DISPOSITIONS).optional()
+          .describe('Narrow to one disposition: reportable | candidate | info | excluded.'),
         decidedBy: z.enum(['person', 'review', 'rules']).optional()
           .describe('Only findings whose final score this layer set.'),
         reviewedVia: z.enum(['builtin', 'mcp', 'none']).optional()
@@ -521,7 +543,7 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
       'list_findings',
       a => listFindings(ctx, a.projectId, {
         limit: a.limit, offset: a.offset, severity: a.severity,
-        section: a.section, includeQuotes: a.includeQuotes,
+        section: a.section, disposition: a.disposition, includeQuotes: a.includeQuotes,
         decidedBy: a.decidedBy, reviewedVia: a.reviewedVia, reviewCurrent: a.reviewCurrent,
       }),
       a => a.projectId
@@ -883,9 +905,14 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'Use it to orient before asking anything specific - it costs one query where the same ' +
         'picture assembled from natural-language questions costs many and is easy to get subtly ' +
         'wrong.\n\n' +
-        'Counts exclude suppressed findings and findings a later scan stopped reporting, so they ' +
-        'agree with graph_summary. A category at zero can mean that surface was never scanned; ' +
+        'Counts exclude suppressed findings and findings a later scan stopped reporting, as ' +
+        'graph_summary does. A category at zero can mean that surface was never scanned; ' +
         'graph_summary and get_project_activity are how you tell those apart.\n\n' +
+        'Finding counts also leave out what a person judged a false positive on the Priority ' +
+        'Board and what the board resolved (fixed, gone, inactive), as the client report does; ' +
+        'for vulnerabilities those are counted separately, as judgedFalsePositiveVulnerabilities ' +
+        'and resolvedVulnerabilities. A finding only an AI review flagged as a false positive is ' +
+        'still counted; aiFlaggedVulnerabilities says how many.\n\n' +
         'Endpoints and parameters known only from an API specification are counted apart, as ' +
         'declaredEndpoints and declaredParameters: documented, not observed.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
@@ -908,7 +935,8 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'guessed from a severity label.\n\n' +
         '`cisaKev` means an exploit record for that CVE exists in THIS project\'s graph, not that ' +
         'the CVE appears on a public exploited list. `reachedBy` counts how many web origins, ' +
-        'services and ports run the technology: it is exposure, not severity.\n\n' +
+        'services and ports run the technology: it is exposure, not severity. An exploit record ' +
+        'a person judged a false positive, or the Priority Board resolved, does not count.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -926,7 +954,8 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'technology and version, how many CVEs affect it, the worst CVSS among them, how many ' +
         'known exploits exist, and how many web origins, services and ports run it.\n\n' +
         'The top row is usually the highest-leverage single fix, which is a different question ' +
-        'from "what is the worst finding" and often has a different answer.\n\n' +
+        'from "what is the worst finding" and often has a different answer. An exploit record a ' +
+        'person judged a false positive, or the Priority Board resolved, is not counted.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -995,8 +1024,10 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'mode.\n\n' +
         'Three things to know. A queued job can wait minutes or hours - poll it with ' +
         'get_project_activity, never by queueing again. A job that becomes "needs_review" is ' +
-        'PARKED because the project settings changed after it was queued, and only a person can ' +
-        'release it; no tool here can. And a queued job OUTLIVES this token: revoking the token ' +
+        'PARKED, because the project settings changed after it was queued or because its start ' +
+        'got no answer (the scan may have started), and only a person can release it; no tool ' +
+        'here can. A start that fails on a passing orchestrator error is retried with backoff. ' +
+        'And a queued job OUTLIVES this token: revoking the token ' +
         'does not cancel it, only cancel_queued_scan does.\n\n' +
         'One full recon can be queued per project at a time.',
       annotations: {
@@ -1571,8 +1602,12 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
     {
       title: 'Stop a running recon scan',
       description:
-        'Stop the full recon scan running for this project. If the orchestrator cannot be ' +
-        'reached this reports that the outcome is unknown rather than claiming it stopped.',
+        'Stop the full recon scan running for this project. The stop is asynchronous: it answers ' +
+        'with status "stopping" at once, the scan\'s tool containers end at once, and the scan ' +
+        'then lands its queued graph writes and applies the project\'s mute rules within a grace ' +
+        '(45 s by default) before get_recon_status reads idle. A new start is refused until then. ' +
+        'If the orchestrator cannot be reached this reports that the outcome is unknown rather ' +
+        'than claiming it stopped.',
       // Aborting a scan is not an additive update, which is what the spec means
       // by destructiveHint: false.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -1960,7 +1995,9 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'back to the default, a wordlist path outside this project\'s directory is dropped. An ' +
         'agent that only read the first would believe a rejected value was accepted.\n\n' +
         'It also names every enabled tool whose PHASE is not in scanModules. Those are the ' +
-        'silent no-ops: the scan succeeds, that tool never runs, and no result field says why.\n\n' +
+        'silent no-ops: the scan succeeds, that tool never runs, and no result field says why. ' +
+        'JS recon is no phase: it is named when jsReconEnabled is on with neither resource_enum ' +
+        'nor http_probe to feed it, and its options when jsReconEnabled is off.\n\n' +
         '`aiHooks` gives, for each recon hook that can run on Jev, its kind, the engine the row ' +
         'asks for and the one that will run. An `engine` hook asks for llm or jev; an `enable` ' +
         'hook (Jev-only) asks for off or jev. Every hook is off when ' +

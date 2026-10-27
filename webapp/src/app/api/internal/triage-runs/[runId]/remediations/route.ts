@@ -16,6 +16,8 @@
  *
  * | existing row                                   | what happens                    |
  * |------------------------------------------------|---------------------------------|
+ * | none, but an orphaned row shares >= half its    | that row is re-pointed to the   |
+ * |   findings (a regrouping, import or restore)    |   new key, then the rules below |
  * | none                                            | create                          |
  * | pending, unprotected, unchanged since we read   | update in place, same id        |
  * | protected (session / branch / PR / not pending) | only the counts and rank refresh|
@@ -46,6 +48,39 @@ function isProtected(row: {
 }
 
 const SEVERITIES = new Set(['critical', 'high', 'medium', 'low', 'info'])
+
+interface ExistingRow {
+  id: string; groupKey: string | null; status: string; agentSessionId: string
+  fixBranch: string; prUrl: string; updatedAt: Date; findingIds: string[]
+}
+
+/**
+ * The row an incoming group with no row of its own should take over: one this
+ * run produced no key for (so nothing else claims it), not already taken, that
+ * shares at least half of the group's findings. Largest overlap first; a tie
+ * goes to the protected row (somebody's work), then the most recently updated.
+ * Without this a regrouping split a dismissed or in-progress fix from a fresh
+ * duplicate pending row.
+ */
+function repointCandidate(
+  findingIds: string[], existing: ExistingRow[], incomingKeys: Set<string>, taken: Set<string>,
+): ExistingRow | undefined {
+  if (findingIds.length === 0) return undefined
+  const wanted = new Set(findingIds)
+  let best: { row: ExistingRow; overlap: number } | undefined
+  for (const row of existing) {
+    if (taken.has(row.id) || (row.groupKey && incomingKeys.has(row.groupKey))) continue
+    const overlap = new Set((row.findingIds ?? []).filter((id) => wanted.has(id))).size
+    if (overlap === 0 || overlap * 2 < wanted.size) continue
+    const better = !best
+      || overlap > best.overlap
+      || (overlap === best.overlap && isProtected(row) && !isProtected(best.row))
+      || (overlap === best.overlap && isProtected(row) === isProtected(best.row)
+          && row.updatedAt.getTime() > best.row.updatedAt.getTime())
+    if (better) best = { row, overlap }
+  }
+  return best?.row
+}
 
 function str(value: unknown, max: number, fallback = ''): string {
   return typeof value === 'string' ? value.slice(0, max) : fallback
@@ -146,25 +181,36 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       Boolean(r) && typeof r === 'object' && !Array.isArray(r))
     .filter((r) => typeof r.groupKey === 'string' && r.groupKey)
 
-  const stats = { created: 0, updated: 0, deleted: 0, skipped: 0, flagged: 0 }
+  const stats = { created: 0, updated: 0, deleted: 0, skipped: 0, flagged: 0, repointed: 0 }
 
   await prisma.$transaction(async (tx) => {
     const existing = await tx.remediation.findMany({
       where: { projectId },
       select: {
         id: true, groupKey: true, status: true, agentSessionId: true,
-        fixBranch: true, prUrl: true, updatedAt: true,
+        fixBranch: true, prUrl: true, updatedAt: true, findingIds: true,
       },
     })
     const byKey = new Map(
       existing.filter((r) => r.groupKey).map((r) => [r.groupKey as string, r])
     )
     const incomingKeys = new Set(rows.map((r) => r.groupKey as string))
+    const repointed = new Set<string>()
 
     for (const rem of rows) {
       const key = rem.groupKey as string
-      const current = byKey.get(key)
       const facts = factsOf(rem, runId)
+      let current = byKey.get(key)
+
+      if (!current) {
+        const candidate = repointCandidate(facts.findingIds, existing, incomingKeys, repointed)
+        if (candidate) {
+          await tx.remediation.update({ where: { id: candidate.id }, data: { groupKey: key } })
+          repointed.add(candidate.id)
+          stats.repointed += 1
+          current = candidate
+        }
+      }
 
       if (!current) {
         await tx.remediation.create({
@@ -206,6 +252,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     // Rows this run produced no group for: the findings behind them are gone.
     for (const row of existing) {
       if (row.groupKey && incomingKeys.has(row.groupKey)) continue
+      if (repointed.has(row.id)) continue
       if (isProtected(row)) {
         // Dismissed, resolved, in progress, or owned by a CodeFix session:
         // never recreated and never deleted. Its live count is now zero.

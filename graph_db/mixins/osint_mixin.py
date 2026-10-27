@@ -75,6 +75,32 @@ def _shodan_cve_props(cve_entry: dict) -> dict:
     return {k: v for k, v in props.items() if v is not None}
 
 
+#: The passive CVE sources whose id ends in the IP (`shodan-<cve>-<ip>`,
+#: `criminalip-<cve>-<ip>`). Kept in step with PASSIVE_CVE_SOURCES in
+#: recon/helpers/finding_sources.py, which this package cannot import.
+_IP_KEYED_PASSIVE_SOURCES = ("shodan_api", "internetdb", "shodan", "shodan_host_lookup",
+                             "criminalip")
+
+_PASSIVE_CVE_ID = re.compile(r"^(?:shodan|criminalip)-CVE-\d{4}-\d+-(.+)$", re.IGNORECASE)
+
+
+def _ip_from_passive_cve_id(vid) -> str | None:
+    """The IP a Shodan or CriminalIP CVE's id names, or None."""
+    match = _PASSIVE_CVE_ID.match(str(vid or ""))
+    if not match:
+        return None
+    candidate = match.group(1)
+    return candidate if _is_ip_address(candidate) else None
+
+
+_CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+
+def netlas_vuln_id(cve_id: str, ip: str, port) -> str:
+    """A Netlas finding's id: one per CVE, IP and port."""
+    return f"netlas-{cve_id}-{ip}-{port}"
+
+
 def _split_url(url: str) -> tuple[str, str]:
     """(base_url, path), where base_url is scheme://netloc and path defaults to
     '/'. Query and fragment are dropped.
@@ -170,7 +196,8 @@ class OsintMixin:
                             """
                             MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                            user_id: $user_id, project_id: $project_id})
-                            ON CREATE SET p.state = 'open', p.source = 'shodan', p.updated_at = datetime()
+                            ON CREATE SET p.state = 'open', p.source = 'shodan', p.passive_only = true,
+                                          p.updated_at = datetime()
                             ON MATCH SET p.updated_at = datetime()
                             MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                             SET i.updated_at = datetime()
@@ -267,7 +294,8 @@ class OsintMixin:
                                 """
                                 MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET p.state = 'open', p.source = 'shodan', p.updated_at = datetime()
+                                ON CREATE SET p.state = 'open', p.source = 'shodan', p.passive_only = true,
+                                          p.updated_at = datetime()
                                 ON MATCH SET p.updated_at = datetime()
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
@@ -285,6 +313,10 @@ class OsintMixin:
                     stats["errors"].append(f"Failed to enrich IP {ip}: {e}")
 
             # ── 2. Reverse DNS → Subdomain or ExternalDomain nodes ──
+            # A PTR answer is not forward DNS: the edge it creates carries
+            # source 'shodan_rdns' (and a domain-DNS record's 'shodan_dns'), so
+            # readers that mean "resolves now" skip it. ON CREATE only: an edge
+            # DNS wrote first stays forward DNS.
             for ip, hostnames in shodan_data.get("reverse_dns", {}).items():
                 for hostname in hostnames:
                     if not hostname:
@@ -301,7 +333,7 @@ class OsintMixin:
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
                                 MERGE (s)-[r:RESOLVES_TO]->(i)
-                                ON CREATE SET r.timestamp = datetime()
+                                ON CREATE SET r.timestamp = datetime(), r.source = 'shodan_rdns'
                                 SET r.last_seen_at = datetime(),
                                     r.record_type = coalesce(r.record_type,
                                         CASE WHEN $ip CONTAINS ':' THEN 'AAAA' ELSE 'A' END)
@@ -426,7 +458,7 @@ class OsintMixin:
                             MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                             SET i.updated_at = datetime()
                             MERGE (s)-[r:RESOLVES_TO]->(i)
-                            ON CREATE SET r.timestamp = datetime()
+                            ON CREATE SET r.timestamp = datetime(), r.source = 'shodan_dns'
                             SET r.last_seen_at = datetime(),
                                 r.record_type = coalesce(r.record_type, $type)
                             """,
@@ -457,6 +489,9 @@ class OsintMixin:
                     props = _shodan_cve_props(cve_entry)
                     method = props.pop("detection_method")
                     verified = props.pop("verified")
+                    # A full run's port scan decides port_confirmed, an unknown
+                    # (None) included; an entry with no verdict at all (partial
+                    # recon could not say) leaves the stored one alone.
                     session.run(
                         """
                         MERGE (v:Vulnerability {id: $vuln_id, user_id: $user_id,
@@ -464,13 +499,17 @@ class OsintMixin:
                         ON CREATE SET v.source = $source
                         SET v += $props, v.updated_at = datetime(),
                             v.verified = coalesce(v.verified, false) OR $verified
+                        FOREACH (_ IN CASE WHEN $set_port_confirmed THEN [1] ELSE [] END |
+                          SET v.port_confirmed = $port_confirmed)
                         WITH v, {passive_catalog: 0, passive_version_match: 1, passive_verified: 2} AS rank
                         SET v.detection_method = CASE
                             WHEN coalesce(rank[v.detection_method], -1) > rank[$method]
                             THEN v.detection_method ELSE $method END
                         """,
                         vuln_id=vuln_id, source=cve_source, props=props, method=method,
-                        verified=verified, user_id=user_id, project_id=project_id
+                        verified=verified, user_id=user_id, project_id=project_id,
+                        set_port_confirmed="port_confirmed" in cve_entry,
+                        port_confirmed=cve_entry.get("port_confirmed"),
                     )
                     stats["vulnerabilities_created"] += 1
 
@@ -527,6 +566,43 @@ class OsintMixin:
                 print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
 
         return stats
+
+    def backfill_passive_cve_hosts(self, user_id: str, project_id: str) -> int:
+        """Give older Shodan and CriminalIP CVEs the `target_ip` their id names.
+
+        The recon prune keeps an IP the run could not look up by matching a
+        finding's host fields, and `target_ip` is the only one these carry.
+        Shodan stores it since its evidence grading, CriminalIP since its CVEs
+        are pruned at all; a row written before would otherwise be deleted
+        when its IP was the one not re-checked. Run before the prune. Never
+        writes `updated_at`; idempotent.
+        """
+        with self.driver.session() as session:
+            rows = []
+            for record in session.run(
+                """
+                MATCH (v:Vulnerability {user_id: $uid, project_id: $pid})
+                WHERE v.target_ip IS NULL AND v.source IN $sources
+                RETURN v.id AS id
+                """,
+                uid=user_id, pid=project_id, sources=list(_IP_KEYED_PASSIVE_SOURCES),
+            ):
+                ip = _ip_from_passive_cve_id(record["id"])
+                if ip:
+                    rows.append({"id": record["id"], "ip": ip})
+            if not rows:
+                return 0
+            session.run(
+                """
+                UNWIND $rows AS r
+                MATCH (v:Vulnerability {id: r.id, user_id: $uid, project_id: $pid})
+                WHERE v.target_ip IS NULL
+                SET v.target_ip = r.ip
+                """,
+                rows=rows, uid=user_id, pid=project_id,
+            )
+        print(f"[*][graph-db] Backfilled target_ip on {len(rows)} older passive CVE(s)")
+        return len(rows)
 
 
     def update_graph_from_urlscan_discovery(self, recon_data: dict, user_id: str, project_id: str) -> dict:
@@ -1005,8 +1081,8 @@ class OsintMixin:
                                     """
                                     MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                    user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                    SET p.source = 'censys', p.updated_at = datetime()
+                                    ON CREATE SET p.state = 'open', p.source = 'censys'
+                                    SET p.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (i)-[:HAS_PORT]->(p)
@@ -1214,8 +1290,8 @@ class OsintMixin:
                                 """
                                 MERGE (p:Port {number: $port, protocol: 'tcp', ip_address: $ip,
                                                user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                SET p.source = 'fofa', p.updated_at = datetime()
+                                ON CREATE SET p.state = 'open', p.source = 'fofa'
+                                SET p.updated_at = datetime()
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
                                 MERGE (i)-[:HAS_PORT]->(p)
@@ -1719,7 +1795,8 @@ class OsintMixin:
     def update_graph_from_netlas(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         stats = {
             "ips_enriched": 0, "ports_merged": 0, "services_merged": 0,
-            "vulnerabilities_merged": 0, "relationships_created": 0, "errors": [],
+            "vulnerabilities_merged": 0, "relationships_created": 0,
+            "historical_skipped": 0, "errors": [],
         }
         try:
             rows = (recon_data.get("netlas") or {}).get("results") or []
@@ -1732,6 +1809,10 @@ class OsintMixin:
                             continue
                         ip = row.get("ip")
                         if not ip:
+                            continue
+                        attribution = row.get("attribution")
+                        if attribution == "historical":
+                            stats["historical_skipped"] += 1
                             continue
                         try:
                             # --- IP node enrichment ---
@@ -1778,8 +1859,8 @@ class OsintMixin:
                                 """
                                 MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                SET p.source = 'netlas', p.updated_at = datetime()
+                                ON CREATE SET p.state = 'open', p.source = 'netlas'
+                                SET p.updated_at = datetime()
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
                                 MERGE (i)-[:HAS_PORT]->(p)
@@ -1822,49 +1903,24 @@ class OsintMixin:
                                 stats["services_merged"] += 1
                                 stats["relationships_created"] += 1
 
-                                # --- CVE Vulnerability nodes ---
-                                for cve in (row.get("cve_list") or []):
-                                    if not isinstance(cve, dict):
-                                        continue
-                                    cve_id = cve.get("id") or ""
-                                    if not cve_id:
-                                        continue
-                                    try:
-                                        vuln_props: dict = {
-                                            "source": "netlas",
-                                            "name": cve_id,
-                                        }
-                                        severity = cve.get("severity") or ""
-                                        if severity:
-                                            vuln_props["severity"] = severity
-                                        base_score = cve.get("base_score")
-                                        if base_score is not None:
-                                            try:
-                                                vuln_props["cvss_score"] = float(base_score)
-                                            except (TypeError, ValueError):
-                                                pass
-                                        vuln_props["has_exploit"] = bool(cve.get("has_exploit", False))
-                                        session.run(
-                                            """
-                                            MERGE (v:Vulnerability {id: $cve_id,
-                                                                     user_id: $user_id,
-                                                                     project_id: $project_id})
-                                            ON CREATE SET v.created_at = datetime()
-                                            SET v += $props, v.updated_at = datetime()
-                                            WITH v
-                                            MATCH (svc:Service {name: $svc_name, port_number: $port,
-                                                                ip_address: $ip,
-                                                                user_id: $user_id,
-                                                                project_id: $project_id})
-                                            MERGE (svc)-[:HAS_VULNERABILITY]->(v)
-                                            """,
-                                            cve_id=cve_id, user_id=user_id, project_id=project_id,
-                                            props=vuln_props, svc_name=prot_name, port=pnum, ip=ip,
-                                        )
-                                        stats["vulnerabilities_merged"] += 1
-                                        stats["relationships_created"] += 1
-                                    except Exception as e:
-                                        stats["errors"].append(f"Netlas CVE {cve_id} on {ip}:{pnum}: {e}")
+                            # --- CVE Vulnerability nodes ---
+                            # A shared edge's CVEs describe the provider and its
+                            # other tenants, not the target.
+                            if attribution == "shared_edge":
+                                continue
+                            for cve in (row.get("cve_list") or []):
+                                if not isinstance(cve, dict):
+                                    continue
+                                cve_id = str(cve.get("id") or "").strip().upper()
+                                if not _CVE_ID.match(cve_id):
+                                    continue
+                                try:
+                                    self._write_netlas_cve(session, cve, cve_id, ip, pnum,
+                                                           user_id, project_id)
+                                    stats["vulnerabilities_merged"] += 1
+                                    stats["relationships_created"] += 2
+                                except Exception as e:
+                                    stats["errors"].append(f"Netlas CVE {cve_id} on {ip}:{pnum}: {e}")
 
                         except Exception as e:
                             stats["errors"].append(f"Netlas row {ip}: {e}")
@@ -1872,6 +1928,59 @@ class OsintMixin:
             stats["errors"].append(f"update_graph_from_netlas: {e}")
         print(f"[graph-db] update_graph_from_netlas complete: {stats}")
         return stats
+
+    @staticmethod
+    def _write_netlas_cve(session, cve: dict, cve_id: str, ip: str, port: int,
+                          user_id: str, project_id: str) -> None:
+        """One Netlas CVE on one IP and port, the IP its only parent.
+
+        Shodan's shape: the board reads a finding's host from its parent, and a
+        Service parent read the protocol ("ssh") as the host. `cve_ids` and the
+        CVE reference edge carry the KEV and EPSS intel to it. The id was the
+        bare CVE once, one node per CVE per project however many IPs carried
+        it; tooling/scripts/netlas_finding_rekey.py moves those.
+        """
+        props: dict = {
+            "name": cve_id, "cves": [cve_id], "cve_ids": [cve_id],
+            "target_ip": ip, "target_port": port,
+            "has_exploit": bool(cve.get("has_exploit", False)),
+        }
+        severity = str(cve.get("severity") or "").lower()
+        if severity:
+            props["severity"] = severity
+        try:
+            if cve.get("base_score") is not None:
+                props["cvss_score"] = float(cve["base_score"])
+        except (TypeError, ValueError):
+            pass
+        session.run(
+            """
+            MERGE (v:Vulnerability {id: $vuln_id, user_id: $user_id, project_id: $project_id})
+            ON CREATE SET v.source = 'netlas', v.created_at = datetime()
+            SET v += $props, v.updated_at = datetime()
+            WITH v
+            OPTIONAL MATCH (:Service)-[stale:HAS_VULNERABILITY]->(v)
+            DELETE stale
+            WITH DISTINCT v
+            MATCH (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
+            MERGE (i)-[:HAS_VULNERABILITY]->(v)
+            """,
+            vuln_id=netlas_vuln_id(cve_id, ip, port), props=props, ip=ip,
+            user_id=user_id, project_id=project_id,
+        )
+        session.run(
+            """
+            // Global reference node: no tenant stamp.
+            MERGE (c:CVE {id: $cve_id})
+            ON CREATE SET c.source = 'netlas'
+            SET c.updated_at = datetime()
+            WITH c
+            MATCH (v:Vulnerability {id: $vuln_id, user_id: $user_id, project_id: $project_id})
+            MERGE (v)-[:INCLUDES_CVE]->(c)
+            """,
+            cve_id=cve_id, vuln_id=netlas_vuln_id(cve_id, ip, port),
+            user_id=user_id, project_id=project_id,
+        )
 
     def update_graph_from_virustotal(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         stats = {"domains_updated": 0, "ips_enriched": 0, "errors": []}
@@ -2052,8 +2161,8 @@ class OsintMixin:
                                     """
                                     MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                    user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                    SET p.source = 'zoomeye', p.updated_at = datetime()
+                                    ON CREATE SET p.state = 'open', p.source = 'zoomeye'
+                                    SET p.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (i)-[:HAS_PORT]->(p)
@@ -2271,8 +2380,8 @@ class OsintMixin:
                                     """
                                     MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                    user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                    SET p.source = 'criminalip', p.updated_at = datetime()
+                                    ON CREATE SET p.state = 'open', p.source = 'criminalip'
+                                    SET p.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (i)-[:HAS_PORT]->(p)
@@ -2323,12 +2432,18 @@ class OsintMixin:
                                         MERGE (v:Vulnerability {id: $vuln_id,
                                                                 user_id: $user_id,
                                                                 project_id: $project_id})
-                                        ON CREATE SET v.source = 'criminalip', v.name = $cve_id,
-                                                      v.cves = [$cve_id], v.cvss = $cvss,
-                                                      v.user_id = $user_id, v.project_id = $project_id,
-                                                      v.updated_at = datetime()
+                                        ON CREATE SET v.source = 'criminalip'
+                                        // Every run: the prune deletes what a run did
+                                        // not touch, and keeps an IP it could not look
+                                        // up by target_ip. The board reads the score
+                                        // as cvss_score; rows that hold it as `cvss`
+                                        // converge here.
+                                        SET v.name = $cve_id, v.cves = [$cve_id],
+                                            v.cvss_score = $cvss,
+                                            v.updated_at = datetime(), v.target_ip = $ip
+                                        REMOVE v.cvss
                                         """,
-                                        vuln_id=vuln_id, cve_id=cve_id, cvss=cvss,
+                                        vuln_id=vuln_id, cve_id=cve_id, cvss=cvss, ip=ip,
                                         user_id=user_id, project_id=project_id,
                                     )
                                     stats["vulnerabilities_created"] += 1

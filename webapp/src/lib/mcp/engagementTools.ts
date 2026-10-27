@@ -675,6 +675,39 @@ async function resolveAiHooks(row: Record<string, unknown>, ownerUserId: string)
 }
 
 /**
+ * Why an enabled tool will not run, or null when it will.
+ *
+ * The registry files JS recon's settings under a 'js_recon' phase, but that is
+ * no scanModules phase: the pipeline runs JS recon on jsReconEnabled alone,
+ * after resource_enum, on the JS URLs resource_enum and http_probe found (or
+ * on uploaded files), and its options do nothing while it is off. jsluice,
+ * filed there too, runs inside resource_enum.
+ */
+function noOpReason(
+  t: { field: string; tool: string; phase: string },
+  row: Record<string, unknown>,
+  scanModules: string[],
+): string | null {
+  if (t.phase === 'standalone') return null
+  if (t.phase !== 'js_recon') {
+    return scanModules.includes(t.phase) ? null : `enabled, but '${t.phase}' is not in scanModules, so it will not run`
+  }
+  if (t.tool === 'jsluice') {
+    return scanModules.includes('resource_enum')
+      ? null : "enabled, but jsluice runs inside resource_enum, which is not in scanModules"
+  }
+  if (t.field !== 'jsReconEnabled' && row.jsReconEnabled !== true) {
+    return 'enabled, but jsReconEnabled is off, so JS recon does not run'
+  }
+  const uploads = Array.isArray(row.jsReconUploadedFiles) && row.jsReconUploadedFiles.length > 0
+  if (row.jsReconEnabled === true && !uploads
+      && !scanModules.includes('resource_enum') && !scanModules.includes('http_probe')) {
+    return 'enabled, but neither resource_enum nor http_probe is in scanModules, so JS recon has no JS file to analyze'
+  }
+  return null
+}
+
+/**
  * Read-only proof that the configured pipeline fits the engagement.
  *
  * Without it "the pipeline respects the scope" is an assertion. With it, it is a
@@ -776,13 +809,10 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
   // A module whose phase is not in scanModules will not run whatever its own
   // flag says. That two-level model is the mistake this surface's docs lead
   // with, and reporting it here turns it into something a caller can see.
-  const silentNoOps = enabledTools
-    .filter(t => t.phase !== 'standalone' && !scanModules.includes(t.phase))
-    .map(t => ({
-      field: t.field,
-      phase: t.phase,
-      why: `enabled, but '${t.phase}' is not in scanModules, so it will not run`,
-    }))
+  const silentNoOps = enabledTools.flatMap(t => {
+    const why = noOpReason(t, row, scanModules)
+    return why === null ? [] : [{ field: t.field, phase: t.phase, why }]
+  })
 
   const exceeds = rates.filter(r => ceiling !== null && r.resolved > ceiling)
 

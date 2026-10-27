@@ -64,6 +64,9 @@ class FakeGraph:
     def verify_connection(self):
         return self.reachable
 
+    def backfill_passive_cve_hosts(self, user_id, project_id):
+        return 0
+
     def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
         self.prunes.append({"sources": list(sources), "since": since, "keep_hosts": tuple(keep_hosts)})
         return {"pruned": 0, "stale": 0, "revived": 0}

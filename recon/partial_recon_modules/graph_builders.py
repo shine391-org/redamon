@@ -27,6 +27,13 @@ def declared_only_unsafe(alias: str = "e") -> str:
     return DECLARED_ONLY_UNSAFE.format(a=alias)
 
 
+#: True for a RESOLVES_TO edge `r` that is forward DNS. Shodan's reverse-DNS
+#: and domain-DNS answers write the same edge with source 'shodan_rdns' /
+#: 'shodan_dns'; a partial run reading them would take a PTR record for the
+#: name's current address. An edge with no source (DNS, or older) counts.
+FORWARD_DNS = "NOT coalesce(r.source, '') STARTS WITH 'shodan_'"
+
+
 #: A BaseURL is a thin service-identity node: httpx writes the response data
 #: (status, content type, CDN flags) onto the Endpoint it probed, never onto the
 #: BaseURL. Reading `b.status_code` therefore always saw null, so every partial
@@ -280,8 +287,8 @@ def _apex_rows(session, user_id: str, project_id: str, apex_roots: list, returns
     by_lower = {r.lower(): r for r in apex_roots}
     rows = session.run(
         """
-        MATCH (s:Subdomain {user_id: $uid, project_id: $pid})-[:RESOLVES_TO]->(i:IP)
-        WHERE toLower(s.name) IN $apex_roots
+        MATCH (s:Subdomain {user_id: $uid, project_id: $pid})-[r:RESOLVES_TO]->(i:IP)
+        WHERE toLower(s.name) IN $apex_roots AND """ + FORWARD_DNS + """
         """ + returns.replace("{ROOT}", "s.name AS root"),
         apex_roots=list(by_lower), uid=user_id, pid=project_id,
     )
@@ -484,6 +491,50 @@ def graph_target_hosts(user_id: str, project_id: str, domains, domain_groups,
     return sorted(hosts)
 
 
+def _recon_data_ips(recon_data: dict) -> list:
+    ips = set(((recon_data.get("port_scan") or {}).get("by_ip")) or {})
+    dns = recon_data.get("dns") or {}
+    for entry in [dns.get("domain") or {}, *((dns.get("subdomains") or {}).values())]:
+        ip_lists = (entry or {}).get("ips") or {}
+        ips.update(ip_lists.get("ipv4") or [])
+        ips.update(ip_lists.get("ipv6") or [])
+    return sorted(ip for ip in ips if ip)
+
+
+def attach_graph_ownership(recon_data: dict, user_id: str, project_id: str) -> None:
+    """Load the IP attribution tag (IP.ownership) of the run's IPs from the graph.
+
+    A partial run does not re-run IP attribution, so the consumers that read
+    its tag (vhost/SNI, origin discovery, the Shodan and Netlas CVE writers)
+    read the last one written, in the shape the full run leaves in memory. An
+    IP with no tag is absent, and the consumers fall back to their own CDN
+    checks. Never raises: on any failure nothing is loaded.
+    """
+    ips = _recon_data_ips(recon_data)
+    if not ips:
+        return
+    try:
+        from graph_db import Neo4jClient
+        with Neo4jClient() as graph_client:
+            if not graph_client.verify_connection():
+                return
+            with graph_client.driver.session() as session:
+                rows = session.run(
+                    """
+                    MATCH (i:IP {user_id: $uid, project_id: $pid})
+                    WHERE i.address IN $ips AND i.ownership IS NOT NULL
+                    RETURN i.address AS ip, i.ownership AS ownership
+                    """,
+                    ips=ips, uid=user_id, pid=project_id,
+                )
+                by_ip = {r["ip"]: {"ownership": r["ownership"]} for r in rows if r["ip"]}
+    except Exception as e:  # noqa: BLE001 - no tag only means the CDN fallbacks apply
+        print(f"[!][Partial Recon] Could not read the IP attribution tags: {type(e).__name__}")
+        return
+    if by_ip:
+        recon_data["ip_attribution"] = {"by_ip": by_ip, "source": "graph"}
+
+
 def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
                                  include_root_domain: bool = False,
                                  domain_groups: list = None) -> dict:
@@ -549,8 +600,8 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                      -[:RESOLVES_TO]->(i:IP)
-                WHERE toLower(d.name) IN $domains
+                      -[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS subdomain, i.address AS address, i.version AS version
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
@@ -608,14 +659,25 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
 
     all_ports_set = set()
 
-    def _add_host(host: str, ip_addr: str, port_numbers: list, port_details: list) -> None:
-        """Record one host -> IP -> ports row in by_ip, by_host and ip_to_hostnames."""
+    def _add_host(host: str, ip_addr: str, port_numbers: list, port_details: list,
+                  record=None) -> None:
+        """Record one host -> IP -> ports row in by_ip, by_host and ip_to_hostnames.
+
+        The IP's CDN tag rides along: a partial run writes this data back through
+        update_graph_from_port_scan, which sets IP.is_cdn from it, so an entry
+        without the tag would reset every tagged IP to false.
+        """
+        get = getattr(record, "get", None)
+        is_cdn = bool(get("is_cdn")) if get else False
+        cdn = (get("cdn_name") if get else None) or None
         if ip_addr not in recon_data["port_scan"]["by_ip"]:
             recon_data["port_scan"]["by_ip"][ip_addr] = {
                 "ip": ip_addr,
                 "hostnames": [host],
                 "ports": list(port_numbers),
                 "port_details": list(port_details),
+                "is_cdn": is_cdn,
+                "cdn": cdn,
             }
         else:
             existing = recon_data["port_scan"]["by_ip"][ip_addr]
@@ -634,6 +696,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 "ip": ip_addr,
                 "ports": list(port_numbers),
                 "port_details": list(port_details),
+                "is_cdn": is_cdn,
+                "cdn": cdn,
             }
         else:
             existing = recon_data["port_scan"]["by_host"][host]
@@ -680,6 +744,7 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                     session, user_id, project_id, apex_roots,
                     "OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)\n"
                     "RETURN {ROOT}, i.address AS ip, i.version AS version, "
+                    "i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, "
                     "collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports")
             for record in apex_records:
                 root = record["root"]
@@ -694,16 +759,17 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                     if ip_addr not in ips:
                         ips.append(ip_addr)
                 port_numbers, port_details = _ports(record["ports"])
-                _add_host(root, ip_addr, port_numbers, port_details)
+                _add_host(root, ip_addr, port_numbers, port_details, record)
 
             # Subdomain -> IP -> Port relationships
             result = session.run(
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
-                      -[:HAS_SUBDOMAIN]->(s:Subdomain)-[:RESOLVES_TO]->(i:IP)
-                WHERE toLower(d.name) IN $domains
+                      -[:HAS_SUBDOMAIN]->(s:Subdomain)-[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)
                 RETURN d.name AS root, s.name AS subdomain, i.address AS ip, i.version AS version,
+                       i.is_cdn AS is_cdn, i.cdn_name AS cdn_name,
                        collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
@@ -718,7 +784,7 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 if ip_addr not in sub_ips[bucket]:
                     sub_ips[bucket].append(ip_addr)
                 port_numbers, port_details = _ports(record["ports"])
-                _add_host(subdomain, ip_addr, port_numbers, port_details)
+                _add_host(subdomain, ip_addr, port_numbers, port_details, record)
 
     recon_data["port_scan"]["all_ports"] = sorted(all_ports_set)
     return recon_data
@@ -800,8 +866,8 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                      -[:RESOLVES_TO]->(i:IP)
-                WHERE toLower(d.name) IN $domains
+                      -[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS subdomain, i.address AS address, i.version AS version
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
@@ -959,8 +1025,8 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                      -[:RESOLVES_TO]->(i:IP)
-                WHERE toLower(d.name) IN $domains
+                      -[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS subdomain, i.address AS address, i.version AS version,
                        i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, i.asn AS asn
                 """,
@@ -1123,13 +1189,17 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
     """
     Build recon_data for GraphQL security scanning.
 
-    Populates the three sections discover_graphql_endpoints() reads:
-      - http_probe.by_url        (from BaseURL nodes -- headers, status_code)
-      - resource_enum.endpoints  ({base_url: [{path, method}]} -- from Endpoint nodes)
-      - resource_enum.parameters ({base_url: [{name}]}         -- from Parameter nodes)
-      - js_recon.findings        ([{type, path, method}]       -- GraphQL-tagged JsReconFindings)
-    Plus metadata.roe so filter_by_roe() still works. `settings` is the run's
-    preloaded settings (partial_settings); only a direct caller omits it.
+    Populates the sections discover_graphql_endpoints() reads, in the shapes
+    the full pipeline's writers produce, so one discovery serves both:
+      - http_probe.by_url          ({url: {status_code, content_type}} -- BaseURL nodes)
+      - resource_enum.by_base_url  ({base: {endpoints: {path: {path, methods,
+                                     parameters: {query, body, path}}}}} -- Endpoint
+                                     nodes and their Parameter nodes)
+      - js_recon.endpoints         ([{type, path, full_url, source_js}] -- the
+                                     GraphQL Endpoint nodes JS Recon wrote)
+    Plus metadata.roe, the fallback discovery reads when the settings carry no
+    RoE. `settings` is the run's preloaded settings (partial_settings); only a
+    direct caller omits it.
 
     BaseURLs, Endpoints and Parameters are read project-wide; with
     domain_groups, those on a host under a Domain this run does not cover, or a
@@ -1146,8 +1216,8 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
         "domain": roots[0] if roots else "",
         "domains": roots,
         "http_probe": {"by_url": {}},
-        "resource_enum": {"endpoints": {}, "parameters": {}, "discovered_urls": []},
-        "js_recon": {"findings": []},
+        "resource_enum": {"by_base_url": {}, "discovered_urls": []},
+        "js_recon": {"endpoints": []},
         "metadata": {
             "roe": {
                 "ROE_ENABLED": settings.get("ROE_ENABLED", False),
@@ -1190,63 +1260,57 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
                     "headers": {},
                 }
 
-            # 2) Endpoints grouped by BaseURL -> resource_enum.endpoints
+            # 2) Endpoints and their parameters -> resource_enum.by_base_url
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
                 WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
-                RETURN b.url AS base_url,
-                       collect(DISTINCT {path: e.path, method: coalesce(e.method, 'GET')}) AS endpoints
+                OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
+                RETURN b.url AS base_url, e.path AS path,
+                       coalesce(e.method, 'GET') AS method,
+                       [n IN collect(DISTINCT p.name) WHERE n IS NOT NULL] AS parameters
                 """,
                 uid=user_id, pid=project_id,
             )
+            by_base = recon_data["resource_enum"]["by_base_url"]
             for record in result:
                 base = record["base_url"]
-                if base and keep(url_host(base)):
-                    recon_data["resource_enum"]["endpoints"][base] = list(record["endpoints"] or [])
+                if not base or not keep(url_host(base)):
+                    continue
+                endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
+                entry = endpoints.setdefault(record["path"], {
+                    "path": record["path"], "methods": [],
+                    "parameters": {"query": [], "body": [], "path": []},
+                })
+                if record["method"] not in entry["methods"]:
+                    entry["methods"].append(record["method"])
+                known = {p["name"] for p in entry["parameters"]["query"]}
+                entry["parameters"]["query"].extend(
+                    {"name": name} for name in record["parameters"] or [] if name not in known)
 
-            # 3) Parameters grouped by BaseURL -> resource_enum.parameters
+            # 3) The GraphQL endpoints JS Recon found -> js_recon.endpoints.
+            # js_recon_mixin writes them as Endpoint nodes with endpoint_type;
+            # a JsReconFinding never carries them.
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
-                      -[:HAS_PARAMETER]->(p:Parameter)
-                WHERE p.name IS NOT NULL
-                RETURN b.url AS base_url,
-                       collect(DISTINCT {name: p.name}) AS parameters
+                WHERE e.endpoint_type IN ['graphql', 'graphql_introspection']
+                RETURN b.url AS base_url, e.path AS path, e.endpoint_type AS type,
+                       coalesce(e.full_url, '') AS full_url
                 """,
                 uid=user_id, pid=project_id,
             )
             for record in result:
                 base = record["base_url"]
-                if base and keep(url_host(base)):
-                    recon_data["resource_enum"]["parameters"][base] = list(record["parameters"] or [])
-
-            # 4) GraphQL-tagged JsReconFindings -> js_recon.findings
-            result = session.run(
-                """
-                MATCH (jr:JsReconFinding {user_id: $uid, project_id: $pid})
-                WHERE (jr.finding_type IN ['graphql', 'graphql_introspection']
-                   OR (jr.finding_type = 'rest' AND toLower(coalesce(jr.path, '')) CONTAINS 'graphql'))
-                  // An operator's mute keeps a finding out of the target list. A
-                  // node-filter RULE mute does not: it hides noise from display,
-                  // and full recon scans its in-memory results either way.
-                  AND NOT (jr:Muted AND NOT coalesce(jr.muted_by, '') STARTS WITH 'rule:')
-                RETURN jr.finding_type AS type,
-                       jr.path AS path,
-                       coalesce(jr.method, 'POST') AS method
-                """,
-                uid=user_id, pid=project_id,
-            )
-            for record in result:
-                path = record["path"]
-                if not path:
+                if not base or not record["path"] or not keep(url_host(base)):
                     continue
-                recon_data["js_recon"]["findings"].append({
-                    "type": record["type"] or "rest",
-                    "path": path,
-                    "method": record["method"] or "POST",
+                recon_data["js_recon"]["endpoints"].append({
+                    "type": record["type"],
+                    "path": record["path"],
+                    "full_url": record["full_url"],
+                    "source_js": base,
                 })
 
     return recon_data

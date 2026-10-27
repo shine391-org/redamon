@@ -116,7 +116,9 @@ const PHASE_NOTES: Record<string, string> = {
   http_probe: 'HTTP probing and technology fingerprinting of the hosts found so far.',
   resource_enum: 'Crawling, directory fuzzing, parameter and API discovery.',
   vuln_scan: 'Nuclei templates, takeover checks and the CVE / MITRE enrichment that hangs off them.',
-  js_recon: 'JavaScript retrieval and analysis, including source maps and secret extraction.',
+  js_recon: 'Not a phase: accepted for older projects and ignored. JavaScript analysis (source maps, ' +
+    'secrets, endpoints) runs on jsReconEnabled alone, after resource_enum, on the JS files ' +
+    'resource_enum and http_probe found.',
 }
 
 const NOTES = [
@@ -127,6 +129,9 @@ const NOTES = [
     'the pipeline logs "skipping port scan phase" and continues. The scan runs, nothing is port ' +
     'scanned, and no result field says why. Enable the phase AND at least one tool in it.',
   'A phase that is not in scanModules does not run whatever its tools are set to.',
+  'JS recon is the one exception: it is no scanModules phase. jsReconEnabled alone switches it ' +
+    'on, and it analyzes the JS files resource_enum and http_probe found, so keep one of them in ' +
+    'scanModules. jsluice runs inside resource_enum.',
   'Sections listed as standalone scanners are not pipeline phases and are not gated by ' +
     'scanModules at all; they are separate jobs.',
   'These are the fields THIS surface may write. A key absent from them is refused BY NAME, ' +

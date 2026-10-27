@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parents[2]
 # A pinned copy of recon_orchestrator/container_manager.py PHASE_PATTERNS.
 # test_pinned_phase_patterns_match_the_orchestrator keeps it honest.
 PINNED_PHASE_PATTERNS = [
-    r"\[Phase 1\]|\[PHASE 1\]|Phase 1:|WHOIS Lookup|domain.*discovery|Domain Reconnaissance",
+    r"\[Phase 1\]|\[PHASE 1\]|Phase 1:|domain.*discovery|Domain Reconnaissance",
     r"\[Phase 2\]|\[PHASE 2\]|Phase 2:|NAABU PORT SCANNER|port.*scan",
     r"\[Phase 3\]|\[PHASE 3\]|Phase 3:|HTTPX HTTP PROBER|http.*prob",
     r"\[Phase 4\]|\[PHASE 4\]|Phase 4:|Resource Enumeration|Katana.*GAU|resource.*enum",
@@ -890,3 +890,20 @@ class TestAccumulator:
             cb.note_degraded("otx_enrich", entries=[{"source": "otx:general", "reason": "r", "skipped": 5}])
         (gap,) = cb.coverage_report().gaps
         assert gap["skipped"] == 10 and gap["source"] == "otx:general"
+
+    def test_aliases_are_cut_with_their_source_under_one_gap(self):
+        # One provider stamps its findings with several source values.
+        cb.note_degraded("shodan_enrich", sources=["shodan"], aliases=["internetdb", "shodan_api"],
+                         reason="the lookup failed")
+        report = cb.coverage_report()
+        assert report.degraded_sources == frozenset({"shodan", "internetdb", "shodan_api"})
+        assert [g["source"] for g in report.gaps] == ["shodan"]
+
+    def test_host_aliases_keep_the_same_hosts_under_one_gap(self):
+        cb.note_degraded("shodan_enrich", hosts=["198.51.100.4"], host_source="shodan",
+                         aliases=["internetdb"], source_only_hosts=True)
+        report = cb.coverage_report()
+        assert report.keep_hostnames("shodan") == ("198.51.100.4",)
+        assert report.keep_hostnames("internetdb") == ("198.51.100.4",)
+        assert report.keep_hostnames("nuclei") == ()
+        assert [g["source"] for g in report.gaps] == ["shodan"]

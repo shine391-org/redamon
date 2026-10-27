@@ -461,6 +461,143 @@ describe('graph_summary', () => {
     okSummary(3)
     expect(JSON.stringify(await graphSummary(ctx(), 'p1'))).not.toMatch(/muted/i)
   })
+
+  describe('a lost graph reads as lost, not as never scanned (plan 09.4)', () => {
+    beforeEach(() => h.findScanJob.mockResolvedValue(null))
+    const census = (nodes: { label: string; count: number }[]) =>
+      h.fetch.mockImplementation(async (_url: unknown, init: { body: string }) => {
+        const body = JSON.parse(init.body) as { op?: string }
+        if (body.op === 'summary') return { ok: true, json: async () => ({ nodes, relationships: [] }) }
+        return { ok: true, json: async () => ({ records: [{ stale: 0 }] }) }
+      })
+    const versions = (current: number | null, latestSaved: { seq: number; nodeCount: number } | null) =>
+      h.findVersion.mockImplementation(async (args: { where: Record<string, unknown> }) =>
+        args.where.isCurrent
+          ? { id: 'v4', seq: 4, label: 'Scan 4', createdAt: new Date(), nodeCount: current }
+          : latestSaved)
+
+    test('a saved version held nodes and the live census is empty: graph_data_missing', async () => {
+      census([])
+      versions(null, { seq: 3, nodeCount: 5000 })
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.liveGraphState).toBe('stable')
+      expect(r.warning).toBe('graph_data_missing')
+      expect(r.graphDataMissing).toMatchObject({ liveNodes: 0, expectedNodes: 5000, basis: 'scan_version', versionSeq: 3 })
+      expect(r.graphDataMissing?.detail).toMatch(/UNKNOWN/)
+    })
+
+    test('a census below a tenth of the version it should hold also warns', async () => {
+      census([{ label: 'Domain', count: 1 }, { label: 'IP', count: 300 }])
+      versions(5000, null)
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.warning).toBe('graph_data_missing')
+      expect(r.graphDataMissing).toMatchObject({ liveNodes: 301, expectedNodes: 5000, versionSeq: 4 })
+    })
+
+    test('a census at or above a tenth does not', async () => {
+      census([{ label: 'IP', count: 600 }])
+      versions(5000, null)
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.warning).toBeUndefined()
+      expect(r).not.toHaveProperty('graphDataMissing')
+    })
+
+    test('no node count anywhere and no completed scan: an empty graph is just empty', async () => {
+      census([])
+      versions(null, null)
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.warning).toBeUndefined()
+    })
+
+    test('an empty graph after a completed full scan warns even with no saved version', async () => {
+      census([])
+      versions(null, null)
+      h.findScanJob.mockResolvedValue({ finishedAt: new Date('2026-10-24T10:00:00Z') })
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.warning).toBe('graph_data_missing')
+      expect(r.graphDataMissing).toMatchObject({ liveNodes: 0, expectedNodes: null, basis: 'completed_scan' })
+      const where = h.findScanJob.mock.calls[0][0].where
+      expect(where).toMatchObject({ projectId: 'p1', kind: 'full_recon', status: 'completed' })
+    })
+
+    test('while something rewrites the graph, the state warning stands and nothing is called lost', async () => {
+      census([])
+      versions(null, { seq: 3, nodeCount: 5000 })
+      h.activeScans.mockReturnValue([scanRow()])
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.liveGraphState).toBe('scan_running')
+      expect(r.warning).toMatch(/not settled/i)
+      expect(r).not.toHaveProperty('graphDataMissing')
+    })
+
+    test('a history that cannot be read never fails the tool and never invents a warning', async () => {
+      census([])
+      h.findVersion.mockImplementation(async (args: { where: Record<string, unknown> }) => {
+        if (args.where.isCurrent) return { id: 'v4', seq: 4, label: 'Scan 4', createdAt: new Date(), nodeCount: null }
+        throw new Error('db down')
+      })
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.nodes).toEqual([])
+      expect(r.warning).toBeUndefined()
+    })
+
+    test('the version node count is used, not returned', async () => {
+      census([{ label: 'IP', count: 12 }])
+      versions(20, null)
+      expect((await graphSummary(ctx(), 'p1')).scanVersion).not.toHaveProperty('nodeCount')
+    })
+  })
+
+  describe('the coverage block (plan 09.2)', () => {
+    const withCoverage = (coverage: unknown) =>
+      h.fetch.mockImplementation(async (_url: unknown, init: { body: string }) => {
+        const body = JSON.parse(init.body) as { op?: string }
+        if (body.op === 'summary') {
+          return {
+            ok: true,
+            json: async () => ({ nodes: [{ label: 'BaseURL', count: 6 }], relationships: [], coverage }),
+          }
+        }
+        return { ok: true, json: async () => ({ records: [{ stale: 0 }] }) }
+      })
+
+    test('per module, the hosts in each state and the live ones never looked at', async () => {
+      withCoverage({
+        js_recon: { recorded: true, complete: 3, partial: 1, no_input: 1, failed: 0, not_scanned: 1 },
+        nuclei: { recorded: false },
+      })
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.coverage).toEqual({
+        js_recon: { recorded: true, complete: 3, partial: 1, no_input: 1, failed: 0, not_scanned: 1 },
+        nuclei: { recorded: false },
+      })
+    })
+
+    test('it costs no round trip of its own: it rides the summary op', async () => {
+      withCoverage({ js_recon: { recorded: false }, nuclei: { recorded: false } })
+      await graphSummary(ctx(), 'p1')
+      const ops = h.fetch.mock.calls.map(c => JSON.parse(c[1].body).op)
+      expect(ops).toEqual(['summary', 'cypher'])
+    })
+
+    test('an agent that sent no block (older image, or the count failed) omits the key, never zeros', async () => {
+      okSummary(0)
+      expect(await graphSummary(ctx(), 'p1')).not.toHaveProperty('coverage')
+    })
+
+    test('only the known modules and counts pass through', async () => {
+      withCoverage({
+        js_recon: { recorded: true, complete: '2', partial: 0, no_input: 0, failed: 0, not_scanned: 0, url: 'x' },
+        nuclei: { recorded: false },
+        evil: { recorded: true, complete: 1 },
+      })
+      const r = await graphSummary(ctx(), 'p1')
+      expect(r.coverage).toEqual({
+        js_recon: { recorded: true, complete: 2, partial: 0, no_input: 0, failed: 0, not_scanned: 0 },
+        nuclei: { recorded: false },
+      })
+    })
+  })
 })
 
 // =============================================================================

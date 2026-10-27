@@ -17,6 +17,7 @@ import { MasscanSection } from '../sections/MasscanSection'
 import { NmapSection } from '../sections/NmapSection'
 import { TlsxSection } from '../sections/TlsxSection'
 import { HttpxSection } from '../sections/HttpxSection'
+import { IpAttributionSection } from '../sections/IpAttributionSection'
 import { KatanaSection } from '../sections/KatanaSection'
 import { OpenApiSection } from '../sections/OpenApiSection'
 import { ZapAjaxSpiderSection } from '../sections/ZapAjaxSpiderSection'
@@ -109,6 +110,7 @@ export function WorkflowNodeModal({
       case 'Nmap':              return <NmapSection {...baseProps} />
       case 'Tlsx':              return <TlsxSection {...baseProps} />
       case 'Httpx':             return <HttpxSection {...baseProps} />
+      case 'IpAttribution':     return <IpAttributionSection {...baseProps} />
       case 'Katana':            return <KatanaSection {...baseProps} />
       case 'OpenAPI':           return <OpenApiSection {...baseProps} projectId={mode === 'edit' ? projectId : undefined} />
       case 'ZapAjaxSpider':     return <ZapAjaxSpiderSection {...baseProps} />

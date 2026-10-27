@@ -4,8 +4,8 @@ Persists the EvoGraph — attack chain nodes (AttackChain, ChainStep,
 ChainFinding, ChainDecision, ChainFailure) and bridge relationships
 to the recon graph.
 
-All write operations are fire-and-forget: they run in a background thread
-so the agent loop is never blocked.  Errors are logged but never crash
+Writes run on one dedicated writer thread (see _get_writer_pool) so the agent
+loop is never blocked and never waits on Neo4j longer than STEP_WRITE_WAIT_S.  Errors are logged but never crash
 the orchestrator.
 
 Replaces and absorbs the former exploit_writer.py.
@@ -13,56 +13,191 @@ Replaces and absorbs the former exploit_writer.py.
 
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Query
 from neo4j.exceptions import ServiceUnavailable, SessionExpired
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Driver singleton with health check
+# Driver, writer thread and bounds
 # ---------------------------------------------------------------------------
+#
+# Every chain write runs on ONE dedicated writer thread, never on asyncio's
+# default executor. That executor is shared with every Bedrock LLM call (sync
+# boto3 under run_in_executor) and with the DNS lookup behind every new outbound
+# connection (asyncio getaddrinfo), so writes that stalled on an overloaded
+# Neo4j used to fill it and starve the LLM and every new tool connection: the
+# agent then sat idle at ~0% CPU with tool cards stuck "Running". One thread
+# also keeps writes in submission order, so a step's findings never race ahead
+# of the ChainStep they MATCH.
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Server-side timeout of every chain transaction. Neo4j sets none by default
+# (db.transaction.timeout=0), so a write blocked on a lock could hold the writer
+# thread until the database restarted.
+CHAIN_TX_TIMEOUT_S = _env_float("CHAIN_GRAPH_TX_TIMEOUT", 30.0)
+# How long the agent loop waits for an awaited ChainStep write before moving on.
+# The write itself is not cancelled: it stays queued and lands when Neo4j
+# recovers, but the turn no longer waits on it.
+STEP_WRITE_WAIT_S = _env_float("CHAIN_GRAPH_STEP_WRITE_WAIT", 20.0)
+# Fire-and-forget writes queued beyond this are dropped (dead-lettered) instead
+# of growing without bound while Neo4j is down.
+MAX_PENDING_WRITES = 500
 
 _driver = None
 _driver_lock = threading.Lock()
 
+_writer_pool: Optional[ThreadPoolExecutor] = None
+_writer_pool_lock = threading.Lock()
+_pending_writes = 0
+_pending_lock = threading.Lock()
+# Set when an awaited write times out, cleared once the writer has drained.
+# While set, later awaited writes queue without waiting: otherwise every step,
+# and every tool of a plan wave, would pay the full STEP_WRITE_WAIT_S again
+# behind the same stuck write.
+_writer_stalled = False
+
 
 def _get_driver(uri: str, user: str, password: str):
-    """Get or create a singleton Neo4j driver with connectivity check.
+    """Get or create the singleton Neo4j driver.
 
-    If the cached driver's connection has gone stale (e.g. Neo4j restarted),
-    it is discarded and a fresh driver is created.
+    No per-call connectivity check: the driver re-validates pooled connections
+    idle longer than liveness_check_timeout, and _run_with_retry discards the
+    driver after a connectivity error, which covers a Neo4j restart.
     """
     global _driver
+    driver = _driver
+    if driver is not None:
+        return driver
     with _driver_lock:
-        if _driver is not None:
-            try:
-                _driver.verify_connectivity()
-            except Exception:
-                logger.warning("Neo4j driver connectivity check failed; recreating driver")
-                try:
-                    _driver.close()
-                except Exception:
-                    pass
-                _driver = None
-
         if _driver is None:
-            _driver = GraphDatabase.driver(uri, auth=(user, password))
+            _driver = GraphDatabase.driver(
+                uri,
+                auth=(user, password),
+                connection_timeout=10.0,
+                connection_acquisition_timeout=30.0,
+                liveness_check_timeout=30.0,
+            )
         return _driver
+
+
+def _discard_driver():
+    """Drop the cached driver so the next write builds a fresh one."""
+    global _driver
+    with _driver_lock:
+        driver, _driver = _driver, None
+    if driver is not None:
+        try:
+            driver.close()
+        except Exception:
+            pass
 
 
 def close_driver():
     """Close the Neo4j driver (call on shutdown)."""
-    global _driver
-    with _driver_lock:
-        if _driver is not None:
-            _driver.close()
-            _driver = None
+    _discard_driver()
+
+
+class _BoundedSession:
+    """Session proxy that gives every run() a server-side transaction timeout."""
+
+    def __init__(self, session):
+        self._session = session
+
+    def run(self, query, parameters=None, **kwargs):
+        if isinstance(query, str):
+            query = Query(query, timeout=CHAIN_TX_TIMEOUT_S or None)
+        return self._session.run(query, parameters, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+@contextmanager
+def _session(driver):
+    with driver.session() as session:
+        yield _BoundedSession(session)
+
+
+def _get_writer_pool() -> ThreadPoolExecutor:
+    global _writer_pool
+    with _writer_pool_lock:
+        if _writer_pool is None:
+            _writer_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="chain-graph-writer"
+            )
+        return _writer_pool
+
+
+def pending_writes() -> int:
+    """Writes queued or running on the writer thread (diagnostics + tests)."""
+    return _pending_writes
+
+
+def _submit(fn) -> Optional[Future]:
+    """Queue fn on the writer thread; None when the backlog is full."""
+    global _pending_writes
+    with _pending_lock:
+        if _pending_writes >= MAX_PENDING_WRITES:
+            return None
+        _pending_writes += 1
+
+    def _done(_fut):
+        global _pending_writes, _writer_stalled
+        with _pending_lock:
+            _pending_writes -= 1
+            if _pending_writes == 0:
+                _writer_stalled = False
+
+    future = _get_writer_pool().submit(fn)
+    future.add_done_callback(_done)
+    return future
+
+
+async def run_bounded_write(fn, *, wait_s: Optional[float] = None, label: str = "") -> Optional[bool]:
+    """Run one AWAITED chain write on the writer thread, waiting at most wait_s.
+
+    Returns True when fn finished in time; False when it is still queued (it
+    stays queued, shielded, and lands later in submission order, so a later
+    write may still reference it); None when it was dropped because the backlog
+    is full, so it will never exist. A stalled Neo4j costs the agent turn at
+    most wait_s, once, instead of the whole run. Exceptions raised by fn
+    propagate.
+    """
+    global _writer_stalled
+    wait = STEP_WRITE_WAIT_S if wait_s is None else wait_s
+    future = _submit(fn)
+    if future is None:
+        _increment_failed_writes()
+        logger.warning("Chain graph write dropped (%s): writer backlog full", label or "awaited")
+        return None
+    if _writer_stalled and _pending_writes > 1:
+        return False
+    try:
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), wait or None)
+        return True
+    except asyncio.TimeoutError:
+        _writer_stalled = True
+        logger.warning(
+            "Chain graph write still pending after %.0fs (%s); continuing without it "
+            "(%d writes queued)", wait, label or "awaited", _pending_writes,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -88,12 +223,15 @@ def _run_with_retry(func, args, kwargs, max_retries, retry_delay, sync):
             return  # Success
         except (ServiceUnavailable, SessionExpired, OSError) as exc:
             last_exc = exc
+            # A connectivity failure may mean Neo4j restarted under a pooled
+            # driver; rebuild it rather than retrying through the same one.
+            _discard_driver()
             if attempt < max_retries:
                 logger.debug("Chain graph write transient error (attempt %d/%d): %s",
                              attempt + 1, max_retries + 1, exc)
                 time.sleep(retry_delay)
         except Exception as exc:
-            # Non-transient (Cypher syntax, constraint violation) — no point retrying
+            # Non-transient (Cypher syntax, constraint violation, tx timeout) — no point retrying
             last_exc = exc
             break
 
@@ -107,20 +245,16 @@ def _run_with_retry(func, args, kwargs, max_retries, retry_delay, sync):
 
 
 def _fire_and_forget(func, *args, max_retries: int = 1, retry_delay: float = 0.5, **kwargs):
-    """Schedule *func* in a background thread; retry on transient errors, then dead-letter."""
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        _run_with_retry(func, args, kwargs, max_retries, retry_delay, sync=True)
-        return
-
-    async def _run():
-        await loop.run_in_executor(
-            None,
-            lambda: _run_with_retry(func, args, kwargs, max_retries, retry_delay, sync=False),
+    """Queue *func* on the writer thread; retry on transient errors, then dead-letter."""
+    future = _submit(
+        lambda: _run_with_retry(func, args, kwargs, max_retries, retry_delay, sync=False)
+    )
+    if future is None:
+        _increment_failed_writes()
+        logger.warning(
+            "Chain graph write dropped [%s]: %d writes already queued (Neo4j stalled?)",
+            getattr(func, "__name__", str(func)), MAX_PENDING_WRITES,
         )
-
-    asyncio.ensure_future(_run())
 
 
 def _uid() -> str:
@@ -307,7 +441,7 @@ def _write_attack_chain(
     FOREACH (_ IN CASE WHEN d IS NOT NULL THEN [1] ELSE [] END |
         MERGE (ac)-[:CHAIN_TARGETS]->(d))
     """
-    with driver.session() as session:
+    with _session(driver) as session:
         session.run(cypher, {
             "chain_id": chain_id,
             "user_id": user_id,
@@ -438,6 +572,8 @@ def sync_record_step(
             fireteam_id=fireteam_id,
         )
     except Exception as exc:
+        if isinstance(exc, (ServiceUnavailable, SessionExpired, OSError)):
+            _discard_driver()
         logger.error("Chain graph step write failed (sync): %s", exc)
 
 
@@ -498,7 +634,7 @@ def _write_step(
         "fireteam_id": fireteam_id,
     }
 
-    with driver.session() as session:
+    with _session(driver) as session:
         session.run(cypher, params)
 
         # Only the first step links to AttackChain (no prev = first step)
@@ -590,7 +726,7 @@ def fire_resolve_step_bridges(
 def _write_bridges(uri, user, password, step_id, extracted_info, user_id, project_id):
     """Open a Neo4j session and delegate to the existing bridge resolver."""
     driver = _get_driver(uri, user, password)
-    with driver.session() as session:
+    with _session(driver) as session:
         _resolve_step_bridges(session, step_id, extracted_info or {}, user_id, project_id)
 
 
@@ -783,7 +919,7 @@ def _write_finding(
         "fireteam_id": fireteam_id,
     }
 
-    with driver.session() as session:
+    with _session(driver) as session:
         result = session.run(cypher, params)
         if result.single() is None:
             logger.warning("ChainStep %s not found — skipping finding %s", step_id, title[:60])
@@ -1066,7 +1202,7 @@ def _write_failure(
     MATCH (s:ChainStep {step_id: $step_id})
     MERGE (s)-[:FAILED_WITH]->(fl)
     """
-    with driver.session() as session:
+    with _session(driver) as session:
         session.run(cypher, {
             "failure_id": failure_id,
             "chain_id": chain_id,
@@ -1165,7 +1301,7 @@ def _write_decision(
         "iteration": iteration,
     }
 
-    with driver.session() as session:
+    with _session(driver) as session:
         session.run(cypher, params)
         # Link to the step that triggered this decision
         if step_id:
@@ -1289,7 +1425,7 @@ def _write_exploit_success(
     if password_found:
         props["password"] = password_found
 
-    with driver.session() as session:
+    with _session(driver) as session:
         # Guard: skip if an exploit_success finding already exists for this step
         dup_check = session.run(
             """
@@ -1444,7 +1580,7 @@ def _write_chain_status(
         ac.phases_reached   = $phases_reached,
         ac.updated_at       = datetime()
     """
-    with driver.session() as session:
+    with _session(driver) as session:
         session.run(cypher, {
             "chain_id": chain_id,
             "status": status or "completed",
@@ -1486,7 +1622,7 @@ def _write_chain_attack_path(uri, user, password, *, chain_id, attack_path_type)
     SET ac.attack_path_type = $attack_path_type,
         ac.updated_at       = datetime()
     """
-    with driver.session() as session:
+    with _session(driver) as session:
         session.run(cypher, {
             "chain_id": chain_id,
             "attack_path_type": attack_path_type or "",
@@ -1543,7 +1679,7 @@ def query_prior_chains(
         ORDER BY ac.created_at DESC
         LIMIT $limit
         """
-        with driver.session() as session:
+        with _session(driver) as session:
             result = session.run(cypher, {
                 "user_id": user_id,
                 "project_id": project_id,

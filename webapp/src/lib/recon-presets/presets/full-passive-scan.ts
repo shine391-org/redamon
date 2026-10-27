@@ -107,6 +107,9 @@ Red team operators in the pre-engagement phase, OSINT analysts building target p
 
     // --- DISABLE httpx (sends HTTP requests to target) ---
     httpxEnabled: false,
+    // IP attribution stays on with no TLS handshake: it only reads the CDN signals already collected
+    ipAttributionEnabled: true,
+    ipAttributionTlsMaxProbes: 0,
 
     // --- DISABLE Wappalyzer (needs HTTP responses) ---
     wappalyzerEnabled: false,

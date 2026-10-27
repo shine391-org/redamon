@@ -27,6 +27,8 @@ import urllib.request
 from pathlib import Path
 
 _AGENTIC_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_AGENTIC_DIR.parent / "tooling" / "scripts"))
+from wiki_checkout import SKIP_REASON, wiki_checkout_present  # noqa: E402
 sys.path.insert(0, str(_AGENTIC_DIR))
 
 SKILL_ID = "insecure_file_uploads"
@@ -462,8 +464,8 @@ class TestRegression(unittest.TestCase):
 
     def test_wiki_table_includes_new_skill(self):
         wiki = _AGENTIC_DIR.parent / "redamon.wiki" / "Agent-Skills.md"
-        if not wiki.exists():
-            self.skipTest("redamon.wiki not present in this checkout")
+        if not wiki_checkout_present(wiki.parent):
+            self.skipTest(SKIP_REASON)
         text = wiki.read_text(encoding="utf-8")
         self.assertIn("insecure_file_uploads.md", text,
                       "Wiki Community Skills table does not list the new skill")

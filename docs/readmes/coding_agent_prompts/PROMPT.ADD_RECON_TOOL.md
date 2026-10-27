@@ -28,9 +28,9 @@ Integrate **[TOOL_NAME]** into the RedAmon recon pipeline.
    - If Python library: study the package docs and return types.
 
 3. **Choose integration pattern** — Based on the research above, match to the existing codebase patterns:
-   - **Docker-in-Docker** (Naabu, httpx, Katana, Nuclei, GAU): `subprocess.run(['docker', 'run', '--rm', ...])` — see `recon/port_scan.py`, `recon/resource_enum.py`
-   - **Direct subprocess** (Knockpy): `subprocess.run(['toolname', ...])` — see `recon/domain_recon.py`
-   - **API/HTTP calls** (crt.sh, HackerTarget, URLScan, Shodan): `requests.get(...)` — see `recon/domain_recon.py`, `recon/urlscan_enrich.py`, `recon/shodan_enrich.py`
+   - **Docker-in-Docker** (Naabu, httpx, Katana, Nuclei, GAU): `subprocess.run(['docker', 'run', '--rm', ...])` — see `recon/main_recon_modules/port_scan.py` and the helpers under `recon/helpers/resource_enum/` (e.g. `gau_helpers.py`)
+   - **Direct subprocess** (Knockpy): `subprocess.run(['toolname', ...])` — see `recon/main_recon_modules/domain_recon.py`
+   - **API/HTTP calls** (crt.sh, HackerTarget, URLScan, Shodan): `requests.get(...)` — see `recon/main_recon_modules/domain_recon.py`, `recon/main_recon_modules/urlscan_enrich.py`, `recon/main_recon_modules/shodan_enrich.py`
 
    If the tool has an official Docker image, prefer Docker-in-Docker. If it's a simple API, use HTTP calls. Only use direct subprocess if the tool is a pip package already in the container.
 
@@ -118,20 +118,20 @@ Integrate **[TOOL_NAME]** into the RedAmon recon pipeline.
 
    **Rules for placing a new tool:**
    - If it's a passive OSINT enrichment (queries third-party APIs, no traffic to target): add to **GROUP 3b** -- register it in the `_osint_tools` dict and provide a `run_X_enrichment_isolated()` wrapper (deep-copies `combined_result` so threads don't conflict).
-   - If it's a new subdomain discovery source: add to **GROUP 1** inside `discover_subdomains()` in `recon/domain_recon.py` (internally parallel).
+   - If it's a new subdomain discovery source: add to **GROUP 1** inside `discover_subdomains()` in `recon/main_recon_modules/domain_recon.py` (internally parallel).
    - If it's a new port scanner or active host enrichment: add to **GROUP 3**.
    - If it's a new URL discovery / crawling tool: add to the parallel phase of **GROUP 5** (the `ThreadPoolExecutor(max_workers=4)` block).
    - If it's a new post-crawl analysis tool (needs crawled URLs): add to the sequential phase of **GROUP 5** after the parallel block.
-   - Any tool added to a parallel fan-out group **must** use the `_isolated` wrapper pattern: `run_X_isolated(combined_result, settings)` that deep-copies the input, runs the tool on the copy, and returns only the tool's result dict. See `recon/censys_enrich.py` or `recon/shodan_enrich.py` for the pattern.
+   - Any tool added to a parallel fan-out group **must** use the `_isolated` wrapper pattern: `run_X_isolated(combined_result, settings)` that deep-copies the input, runs the tool on the copy, and returns only the tool's result dict. See `recon/main_recon_modules/censys_enrich.py` or `recon/main_recon_modules/shodan_enrich.py` for the pattern.
    - **Never parallelize across dependency boundaries** -- if the tool needs port scan results, it cannot run in GROUP 3; if it needs live URLs, it cannot run before GROUP 4.
 
 ### Phase 2: Implementation checklist
 
-- [ ] Tool runner function in the appropriate `recon/*.py` file following the **enrichment module contract**:
+- [ ] Tool runner function in the appropriate `recon/main_recon_modules/*.py` file following the **enrichment module contract**:
   - Main function `run_X_enrichment(combined_result: dict, settings: dict) -> dict` — mutates `combined_result` in place by writing to `combined_result["toolname"]` and returns it
   - The top-level key **must match** the tool identifier used everywhere else in the pipeline (e.g. `combined_result["virustotal"]`, `combined_result["censys"]`) — never abbreviate or vary the name
   - Isolated wrapper `run_X_enrichment_isolated(combined_result: dict, settings: dict) -> dict` — shallow-copies `combined_result`, calls the main runner on the copy, returns only the tool's payload dict (e.g. `snapshot.get("toolname", {})`). This is the **actual call path** used by GROUP 3b fan-out in `recon/main.py` and by all unit tests — it must be present
-  - If the tool uses API keys: follow the `_effective_key(api_key, key_rotator)` pattern. Copy this helper verbatim from an existing module (e.g. `censys_enrich.py`). Add a `TOOL_KEY_ROTATOR` settings key alongside `TOOL_API_KEY` so key rotation is supported from day one
+  - If the tool uses API keys: follow the `_effective_key(api_key, key_rotator)` pattern. Copy this helper verbatim from an existing module (e.g. `virustotal_enrich.py`). Add a `TOOL_KEY_ROTATOR` settings key alongside `TOOL_API_KEY` so key rotation is supported from day one
 - [ ] Settings keys in `recon/project_settings.py` (`DEFAULT_SETTINGS` + `fetch_project_settings()` mapping)
 - [ ] Prisma schema fields in `webapp/prisma/schema.prisma`
 - [ ] Run `docker compose exec webapp npx prisma db push` (never use `prisma migrate`)
@@ -142,7 +142,7 @@ Integrate **[TOOL_NAME]** into the RedAmon recon pipeline.
   - A field with a closed vocabulary needs `values:`, not `validator: free_text`. That is what makes the form render a select and the write refuse an unknown value, instead of accepting it and having the runtime silently replace it.
   - `form_section` is joined from the tool's entry, so the field lands beside the rest of that tool's settings automatically. Override it on the field only when the input genuinely lives elsewhere — and then the override records where it IS, not where it ought to be.
   - The build reads `Prisma.ProjectScalarFieldEnum` from the **generated client**, not `schema.prisma`, so it stays green until the client is regenerated (`docker compose build webapp`, or `prisma generate`). A green local run right after editing the schema does **not** mean you are done.
-- [ ] **If the tool writes a *finding* node** (something a person can mute), add its label to `MUTEABLE_FINDING_LABELS` in `webapp/src/lib/mcp/findingLabels.ts`, keeping it in sync with `MUTEABLE_LABELS` in `graph_db/mixins/recon/triage_mixin.py` and `MUTEABLE` in `webapp/src/lib/muteEnforcement.test.ts`. **Nothing fails if you skip this.** The label is simply absent from `list_findings`, `list_muted_findings` and the stale count in `graph_summary`, so an external agent is told a clean bill of health for findings that exist. On a security surface a silent false negative is worse than an error, which is why this one is called out despite having no test behind it.
+- [ ] **If the tool writes a *finding* node** (something a person can mute), add its label to `MUTEABLE_LABELS` in `graph_db/mixins/recon/triage_mixin.py` and to every copy that mirrors it, among them `MUTEABLE_FINDING_LABELS` in `webapp/src/lib/mcp/findingLabels.ts` and `MUTEABLE` in `webapp/src/lib/muteEnforcement.test.ts`; `tests/test_finding_labels_mirrors.py` names each copy and fails until all of them equal the source. At runtime a missing copy raises nothing: the label is simply absent from that path (from `list_findings`, `list_muted_findings` and the stale count in `graph_summary`, for the MCP copy), so an external agent is told a clean bill of health for findings that exist.
 - [ ] **If the tool writes findings with a new `source` value**, register the source twice:
   1. Add it to `RECON_FINDING_SOURCES` in `recon/helpers/finding_sources.py`. **Nothing fails if you skip this**: the end-of-run prune never removes the tool's stale findings, and the Mute Rules sweep never mutes them, because both are scoped to that tuple (see "How a Run Ends" in `README.RECON.md`). A source stamped only on asset nodes (BaseURL, Endpoint) goes in too.
   2. Claim it in `graph_db/node_filters/catalog.yaml`: in the `sources` and `select` of the kind its findings belong to (a new kind needs `fields` for what an operator would filter on), or under `asset_sources` or `unfiltered_sources` with the reason. Then run `python3 graph_db/node_filters/build.py`, which rewrites `graph_db/node_filters/catalog.json` and `webapp/src/lib/nodeFilters/catalog.json`. The unit gate runs `build.py --check` and fails on a source no kind claims, on a field naming a property the schema does not declare, and on a stale copy. Rebuild the agent afterwards: it runs the Mute Rules preview and apply from its baked copy of `graph_db`.
@@ -151,25 +151,23 @@ Integrate **[TOOL_NAME]** into the RedAmon recon pipeline.
 - [ ] Temp files in `/tmp/redamon/`, cleaned up in `finally` block
 - [ ] Frontend section component in `webapp/src/components/projects/ProjectForm/sections/`
 - [ ] Section imported and rendered in `ProjectForm.tsx` under the correct tab
-- [ ] Section exported from `sections/index.ts`
 - [ ] `SECTION_INPUT_MAP` and `SECTION_NODE_MAP` updated in `nodeMapping.ts` — list ALL data node types the tool consumes (inputs) and produces (outputs). These drive the workflow graph edges automatically.
 - [ ] **Workflow view** (`webapp/src/components/projects/ProjectForm/WorkflowView/`):
   1. Add entry to `WORKFLOW_TOOLS` in `workflowDefinition.ts` with correct `id` (must match `nodeMapping.ts` key), `label`, `enabledField` (camelCase Prisma field), `group` (pipeline phase number), and `badge` (`'active'`, `'passive'`, or `'both'`)
   2. If tool produces **new data node types** not already in `TRANSITIONAL_DATA_NODES`: add them to `TRANSITIONAL_DATA_NODES` and `DATA_NODE_CATEGORIES` in `workflowDefinition.ts`, and add placement to `getDataPlacement()` in `workflowLayout.ts` (choose `band: 'upper'` for nodes consumed by later tools, `band: 'lower'` for terminal outputs/enrichments; `row: 0` closest to tools, higher rows farther)
   3. Add a `case 'ToolId':` to the `switch(toolId)` in `WorkflowNodeModal.tsx` that renders the tool's section component (import it at the top of the file). Use `baseProps` for sections that only need `{ data, updateField }`, or `extendedProps` for sections that also need `{ projectId, mode }`
   4. No changes needed in `useWorkflowGraph.ts` or `workflowLayout.ts` (unless adding new data node types) — they read from the definition files automatically
-- [ ] `/defaults` endpoint updated in `recon_orchestrator/api.py`
+- [ ] Nothing to add to the `/defaults` endpoint (`recon_orchestrator/api.py`): it emits `DEFAULT_SETTINGS` under the column names the registry records
 - [ ] Graph DB: add or extend the appropriate `update_graph_from_*()` method in the correct mixin — `graph_db/mixins/osint_mixin.py` for OSINT enrichment tools, `graph_db/mixins/recon_mixin.py` for core recon phases. Do NOT edit `graph_db/neo4j_client.py` directly — it is a thin orchestrator that only imports the mixins.
 - [ ] **Graph completeness**: Cross-check every field stored in the enrichment output dict (`combined_result["toolname"]`) against the `update_graph_from_*()` method — every collected field must be written to a node property or relationship. Silently dropping a field (collecting it in the enrichment module but never reading it in the graph method) is a data loss bug. If a field doesn't fit any existing node, either map it to the closest existing property or document explicitly why it is intentionally omitted.
 - [ ] **Graph node reuse**: Before creating new node labels, check if the tool's output can be mapped to **existing** node types in `graph_db/schema_sections.md`. For example, discovered hostnames should go into `Subdomain`, not a new label. Only introduce new node labels if the data genuinely doesn't fit any existing type.
 - [ ] **Schema sync (mandatory for every tool)**: If the tool writes **any** data to Neo4j — new node labels, new relationships, or new properties on existing nodes — declare it. This applies even when adding properties to existing node types (e.g., new enrichment flags on `IP`, new fields on `Service`):
   1. `graph_db/schema_sections.md` — **THE declaration, and the only one.** Add the label, its properties (name, type, meaning) and its relationships here, then re-seed: `python3 tooling/scripts/seed_schema_catalog.py`. A new label with a uniqueness key also needs an entry in `graph_db/schema_keys.py`, from which `schema.py` renders its `CREATE CONSTRAINT`.
      **Do NOT copy any of it into `agentic/prompts/base.py` or `docs/readmes/GRAPH.SCHEMA.md`.** The prompt splices the catalog in at its `__GRAPH_SCHEMA__` marker, and GRAPH.SCHEMA.md deliberately lists no labels. Those two used to hold their own copies, which is precisely how 12 labels, 164 properties and 8 relationship types ended up undocumented: forgetting one copy failed silently — no error, just an agent that could never query the new data.
-     Four tests fail if you skip this, two of them without needing a database: `recon/tests/test_graph_writes_documented.py` (code-level, runs in CI) and `recon/tests/test_schema_catalog.py` (live graph, skips without one).
+     The unit gate (`./redamon.sh test unit`) fails if you skip this: `recon/tests/test_graph_writes_documented.py` reads the code, and `recon/tests/test_schema_catalog.py` checks the catalog against the code (its live-graph checks need a running Neo4j).
   2. `webapp/src/app/graph/config/colors.ts` — add entry to `NODE_COLORS` dict with an appropriate color for the new node type (read existing color families as reference)
   3. `webapp/src/app/graph/config/colors.ts` — add entry to `NODE_SIZES` if the new node type needs a non-default size
-  4. `webapp/src/app/graph/components/DataTable/DataTableToolbar.tsx` — add the new node type to the type filter dropdown so users can filter by it
-  5. `webapp/src/app/graph/components/PageBottomBar/PageBottomBar.tsx` — add the new node type to the legend if applicable
+  4. Nothing for the type filters: the filter chips in `webapp/src/app/graph/components/PageBottomBar/PageBottomBar.tsx` and the Node Inspector's type menu (`NodeDetailsTable.tsx`) list the types the loaded graph holds, coloured from `NODE_COLORS`
 - [ ] **Report data layer** (`webapp/src/lib/report/reportData.ts`):
   1. Add a TypeScript interface for the tool's findings (e.g., `MyToolRecord`) with all fields queried from Neo4j
   2. Add a new section to the `ReportData` interface (e.g., `myTool: { totalFindings: number; bySeverity: ...; findings: MyToolRecord[] }`)
@@ -188,7 +186,7 @@ Integrate **[TOOL_NAME]** into the RedAmon recon pipeline.
   Update `webapp/src/lib/apiKeysTemplate.ts`: add new key to `ALLOWED_KEY_FIELDS`. If the key supports rotation, add one entry to `ROTATION_TOOLS` in `webapp/src/lib/rotationTools.ts` (tool name = the `toolName` your `_build_rotator` call reads): the settings page, the settings PUT and the template all read that list. Update test counts in `webapp/src/lib/apiKeysTemplate.test.ts` to match.
 - [ ] **API usage report**: register a usage probe for the new key in `webapp/src/lib/apiUsage/registry.ts` (a `providers/<id>.ts` + `<id>.test.ts` built from the provider's free account/usage endpoint, sending the key the way your module does), or list the field in `NOT_PROBED` with the reason. `registry.drift.test.ts` fails until the field is covered.
 - [ ] If tool is active (sends traffic to target): add overrides in `apply_stealth_overrides()` in `recon/project_settings.py`
-- [ ] If tool is involved in subdomain enumeration: results may include out-of-scope subdomains (e.g., related but not under the target root domain). These must be split into in-scope `subdomains` vs `external_domains` — follow the existing pattern in `recon/domain_recon.py` where discovered subdomains are checked against the target domain and out-of-scope entries are collected separately as external domains
+- [ ] If tool is involved in subdomain enumeration: results may include out-of-scope subdomains (e.g., related but not under the target root domain). These must be split into in-scope `subdomains` vs `external_domains` — follow the existing pattern in `recon/main_recon_modules/domain_recon.py` where discovered subdomains are checked against the target domain and out-of-scope entries are collected separately as external domains
 - [ ] **Logging format**: All `print()` log lines MUST follow the standard `[symbol][ToolName] message` format used throughout the recon pipeline. The symbol prefix indicates the log level/type:
    - `[*][ToolName]` — informational / progress (e.g., `[*][Naabu] Starting scan...`)
    - `[+][ToolName]` — success / positive result (e.g., `[+][Subfinder] Found 42 subdomains`)
@@ -197,7 +195,7 @@ Integrate **[TOOL_NAME]** into the RedAmon recon pipeline.
    - `[✓][ToolName]` — completed / verified (e.g., `[✓][Naabu] Image already available`)
    - `[⚡]` — special mode indicator (e.g., `[⚡] BRUTEFORCE MODE`)
 
-   See `recon/domain_recon.py`, `recon/port_scan.py`, `recon/whois_recon.py` for reference. Never use bare `print()` without the `[symbol][ToolName]` prefix.
+   See `recon/main_recon_modules/domain_recon.py`, `recon/main_recon_modules/port_scan.py`, `recon/main_recon_modules/whois_recon.py` for reference. Never use bare `print()` without the `[symbol][ToolName]` prefix.
 - [ ] **Recon Presets** (`webapp/src/lib/recon-presets/presets/*.ts`):
   Hardcoded parameter presets exist in `webapp/src/lib/recon-presets/presets/`. Each preset is a partial dictionary of camelCase project settings that override defaults when a user selects it. When adding a new tool:
   1. Review EVERY preset file in the `presets/` folder

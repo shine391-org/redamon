@@ -47,7 +47,7 @@ class TestPublishedPrefixesBeforeThePortScan:
     def test_shodan_never_looks_up_a_published_cdn_ip(self, no_network, monkeypatch):
         looked_up = []
 
-        def fake_lookup(ips, api_key, key_rotator=None, max_workers=5):
+        def fake_lookup(ips, api_key, key_rotator=None, max_workers=5, answered=None):
             looked_up.extend(ips)
             return []
 

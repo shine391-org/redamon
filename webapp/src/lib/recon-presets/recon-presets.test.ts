@@ -31,6 +31,10 @@ import { PARAMETER_INJECTION } from './presets/parameter-injection'
 import { DNS_EMAIL_SECURITY } from './presets/dns-email-security'
 import { LARGE_NETWORK } from './presets/large-network'
 import type { ReconPreset } from './types'
+import { RECON_PARAMETER_CATALOG, reconPresetSchema } from '../recon-preset-schema'
+import { applyPresetSettings } from '../project-preset-utils'
+import { field } from '../reconSettings/registry'
+import { validateValue } from '../reconSettings/validators'
 
 // ============================================================
 // Registry
@@ -102,7 +106,7 @@ describe('JS Secret Miner preset', () => {
     expect(modules).toContain('domain_discovery')
     expect(modules).toContain('http_probe')
     expect(modules).toContain('resource_enum')
-    expect(modules).toContain('js_recon')
+    expect(modules).not.toContain('js_recon')
     expect(modules).not.toContain('port_scan')
     expect(modules).not.toContain('vuln_scan')
   })
@@ -192,15 +196,16 @@ describe('Full Pipeline - Active Only preset', () => {
     expect(preset!.id).toBe('full-active-scan')
   })
 
-  test('includes all 6 scan modules including js_recon', () => {
+  test('includes all 5 scan modules (JS recon is its own switch, not a module)', () => {
     const modules = FULL_ACTIVE_SCAN.parameters.scanModules!
     expect(modules).toContain('domain_discovery')
     expect(modules).toContain('port_scan')
     expect(modules).toContain('http_probe')
     expect(modules).toContain('resource_enum')
     expect(modules).toContain('vuln_scan')
-    expect(modules).toContain('js_recon')
-    expect(modules).toHaveLength(6)
+    expect(modules).not.toContain('js_recon')
+    expect(modules).toHaveLength(5)
+    expect(FULL_ACTIVE_SCAN.parameters.jsReconEnabled).toBe(true)
   })
 
   // --- Stealth explicitly OFF ---
@@ -822,15 +827,15 @@ describe('Full Pipeline - Maximum preset', () => {
     expect(getPresetById('full-maximum-scan')).toBeDefined()
   })
 
-  test('includes all 6 scan modules', () => {
+  test('includes all 5 scan modules', () => {
     const modules = FULL_MAXIMUM_SCAN.parameters.scanModules!
     expect(modules).toContain('domain_discovery')
     expect(modules).toContain('port_scan')
     expect(modules).toContain('http_probe')
     expect(modules).toContain('resource_enum')
     expect(modules).toContain('vuln_scan')
-    expect(modules).toContain('js_recon')
-    expect(modules).toHaveLength(6)
+    expect(modules).not.toContain('js_recon')
+    expect(modules).toHaveLength(5)
   })
 
   // --- CORE INVARIANT: every tool must be enabled ---
@@ -1194,15 +1199,16 @@ describe('Bug Bounty - Deep Dive preset', () => {
     expect(getPresetById('bug-bounty-deep')).toBeDefined()
   })
 
-  test('includes 5 modules with js_recon but no port_scan', () => {
+  test('includes 4 modules but no port_scan, and runs JS recon by its own switch', () => {
     const modules = BUG_BOUNTY_DEEP.parameters.scanModules!
     expect(modules).toContain('domain_discovery')
     expect(modules).toContain('http_probe')
     expect(modules).toContain('resource_enum')
     expect(modules).toContain('vuln_scan')
-    expect(modules).toContain('js_recon')
+    expect(modules).not.toContain('js_recon')
     expect(modules).not.toContain('port_scan')
-    expect(modules).toHaveLength(5)
+    expect(modules).toHaveLength(4)
+    expect(BUG_BOUNTY_DEEP.parameters.jsReconEnabled).toBe(true)
   })
 
   // --- Deeper than Quick, more conservative than Full Active ---
@@ -2836,9 +2842,10 @@ describe('Secret & Credential Hunter preset', () => {
     expect(preset!.name).toBe('Secret & Credential Hunter')
   })
 
-  test('scanModules includes js_recon', () => {
+  test('scanModules leaves js_recon to its own switch', () => {
     const modules = SECRET_HUNTER.parameters.scanModules!
-    expect(modules).toContain('js_recon')
+    expect(modules).not.toContain('js_recon')
+    expect(SECRET_HUNTER.parameters.jsReconEnabled).toBe(true)
     expect(modules).toContain('domain_discovery')
     expect(modules).toContain('http_probe')
     expect(modules).toContain('resource_enum')
@@ -3488,7 +3495,7 @@ describe('Preset system integrity', () => {
   })
 
   test('every preset with scanModules sets a valid array', () => {
-    const validModules = ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan', 'js_recon']
+    const validModules = ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan']
     for (const preset of RECON_PRESETS) {
       const modules = preset.parameters.scanModules
       if (modules) {
@@ -3987,5 +3994,50 @@ describe('Internal Network & Active Directory preset', () => {
     for (const header of ['### Pipeline Goal', '### Who is this for?', '### What it enables', '### What it disables']) {
       expect(preset.fullDescription).toContain(header)
     }
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// Plan 06.7: js_recon is not a scan module. The pipeline gates JS recon on
+// jsReconEnabled alone (it reads the crawler's and http_probe's output), so a
+// "js_recon" entry in scanModules did nothing.
+// ---------------------------------------------------------------------------
+
+describe('js_recon is not a scan module', () => {
+  test('no built-in preset lists js_recon in scanModules', () => {
+    const listing = RECON_PRESETS.filter(p => (p.parameters.scanModules ?? []).includes('js_recon')).map(p => p.id)
+    expect(listing).toEqual([])
+  })
+
+  test('the six presets that ran JS recon still do, by its switch, with crawler or http_probe input', () => {
+    for (const id of ['bug-bounty-deep', 'full-active-scan', 'full-maximum-scan', 'secret-hunter',
+                      'secret-miner', 'supply-chain-audit']) {
+      const p = getPresetById(id)!.parameters
+      expect(p.jsReconEnabled, id).toBe(true)
+      const modules = p.scanModules ?? []
+      expect(modules.includes('resource_enum') || modules.includes('http_probe'), id).toBe(true)
+    }
+  })
+
+  test('the preset catalog the LLM reads does not offer js_recon as a module', () => {
+    const line = RECON_PARAMETER_CATALOG.split('\n').find(l => l.startsWith('- scanModules:'))!
+    expect(line).not.toContain('"js_recon"')
+    expect(RECON_PARAMETER_CATALOG).toMatch(/jsReconEnabled/)
+  })
+
+  const OLD = ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan', 'js_recon']
+
+  test('an old preset that still lists js_recon validates and loads unchanged', () => {
+    const parsed = reconPresetSchema.safeParse({ scanModules: OLD, jsReconEnabled: true })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data!.scanModules).toEqual(OLD)
+    const next = applyPresetSettings({ name: 'p' }, { scanModules: OLD, jsReconEnabled: true }, {})
+    expect(next.scanModules).toEqual(OLD)
+    expect(next.jsReconEnabled).toBe(true)
+  })
+
+  test('an old project that still lists js_recon passes the save validator', () => {
+    expect(validateValue('scanModules', field('scanModules')!, OLD)).toBeNull()
   })
 })

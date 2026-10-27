@@ -11,7 +11,39 @@
  *
  * `nextRunAt` is advanced whatever the outcome, so a scan that cannot start does
  * not pin the schedule to a due state and hot-loop the worker.
+ *
+ * A live agent session holds the run, as it holds a queued full recon at
+ * dispatch: the scan would clear the graph the agent is working on. The check
+ * runs BEFORE startFullScan (which would freeze a version first) and fails
+ * closed on an unverified session; the occurrence becomes a queue row, never
+ * a second one while a full recon is already queued or running.
  */
+
+/** A full recon of this project already waiting or running in the queue. */
+async function openFullReconJob(projectId: string) {
+  return prisma.jobQueue.findFirst({
+    where: { projectId, kind: 'full_recon', status: { in: ['queued', 'dispatching', 'running', 'needs_review'] } },
+    select: { id: true, status: true },
+  })
+}
+
+/** Queue the occurrence unless a full recon is already queued or running. */
+async function enqueueOccurrence(schedule: { id: string; projectId: string; userId: string }, mode: string) {
+  const open = await openFullReconJob(schedule.projectId)
+  if (open) return { ok: true, id: open.id as string | undefined, alreadyQueued: true }
+  const enq = await enqueueJob({
+    projectId: schedule.projectId,
+    userId: schedule.userId,
+    kind: 'full_recon',
+    payload: { mode },
+    priority: 0, // scheduled
+    scheduleId: schedule.id,
+  }).catch(err => {
+    console.error('[scanScheduler] could not enqueue deferred scheduled run:', err)
+    return { ok: false, status: 500, error: String(err), id: undefined as string | undefined }
+  })
+  return { ok: enq.ok, id: enq.id, alreadyQueued: false }
+}
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
@@ -21,6 +53,7 @@ import { parseScanMode, createScanJob } from '@/lib/scanTimeline'
 import { classifyStartFailure } from '@/lib/scanStartOutcome'
 import { enqueueJob } from '@/lib/enqueueJob'
 import { writeAudit } from '@/lib/audit'
+import { checkAgentSessions, describeAgentSessionState } from '@/lib/agentSessions'
 
 export const runtime = 'nodejs'
 
@@ -44,21 +77,12 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     const mode = parseScanMode(schedule.scanMode) ?? 'new'
     const now = new Date()
-
-    const result = await startFullScan({
-      projectId: schedule.projectId,
-      mode,
-      trigger: 'scheduled',
-      actorUserId: schedule.userId,
-      scheduleId: schedule.id,
-    })
-
     // A one-off schedule is spent after it fires; recurring ones roll forward.
     // `enabled` is never written back for a recurring one: the value read above
     // predates the start, and a pause made meanwhile (a rescope that widened the
     // batch, or a person) must survive it.
     const nextRunAt = computeNextRun(schedule, now)
-    await prisma.scanSchedule.update({
+    const advance = () => prisma.scanSchedule.update({
       where: { id: scheduleId },
       data: {
         lastRunAt: now,
@@ -67,37 +91,77 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       },
     })
 
+    const agent = describeAgentSessionState(await checkAgentSessions(schedule.projectId))
+    if (agent) {
+      await advance()
+      const enq = await enqueueOccurrence(schedule, mode)
+      console.info(
+        `[scanScheduler] schedule ${scheduleId} held: ${agent}; ` +
+        `${enq.alreadyQueued ? 'a full recon is already queued' : 'enqueued'} as ${enq.id ?? 'none'}`
+      )
+      return NextResponse.json(
+        {
+          ok: false, queued: enq.ok, jobId: enq.id ?? null, blockedCode: 'agent_running',
+          error: `${agent} for this project; a full recon would wipe its graph`,
+          ...(enq.alreadyQueued ? { alreadyQueued: true } : {}),
+          nextRunAt,
+        },
+        { status: 200 },
+      )
+    }
+
+    const result = await startFullScan({
+      projectId: schedule.projectId,
+      mode,
+      trigger: 'scheduled',
+      actorUserId: schedule.userId,
+      scheduleId: schedule.id,
+      // A transient refusal becomes a queue row below, so no failed run for it.
+      quietTransient: true,
+    })
+
+    await advance()
+
     if (!result.ok) {
       const cls = classifyStartFailure(result.status, {
         error: result.error,
         limit: result.limit as { limitType?: string } | undefined,
         activationInProgress: result.activationInProgress,
         busy: result.busy,
-      })
+        snapshotFailed: result.snapshotFailed,
+        startOutcome: result.startOutcome,
+        code: result.code,
+      }, { orchestratorAnswered: result.startOutcome !== 'unknown' })
 
-      // Phase 4: a TEMPORARY refusal (RAM/hard limit, activation, or the graph is
-      // busy) must NOT burn the occurrence. Advancing nextRunAt above is correct
+      // The orchestrator did not answer: a scan may be running. Queueing the
+      // occurrence could start a second one, so it is not enqueued; the failed
+      // ScanJob startFullScan wrote ("start outcome unknown") is the record.
+      if (cls.kind === 'unknown') {
+        console.warn(`[scanScheduler] schedule ${scheduleId}: ${result.error}`)
+        return NextResponse.json(
+          { ok: false, startOutcome: 'unknown', error: result.error, scanJobId: result.scanJobId ?? null, nextRunAt },
+          { status: 200 },
+        )
+      }
+
+      // Phase 4: a TEMPORARY refusal (RAM/hard limit, activation, the graph is
+      // busy, or a transient error the orchestrator answered) must NOT burn the
+      // occurrence. Advancing nextRunAt above is correct
       // precisely because the occurrence becomes a durable queue row here, which
       // the dispatcher runs when resources free up. This replaces the old
       // defer-and-retry-every-tick path.
       if (cls.temporary) {
-        const enq = await enqueueJob({
-          projectId: schedule.projectId,
-          userId: schedule.userId,
-          kind: 'full_recon',
-          payload: { mode },
-          priority: 0, // scheduled
-          scheduleId: schedule.id,
-        }).catch(err => {
-          console.error('[scanScheduler] could not enqueue deferred scheduled run:', err)
-          return { ok: false, status: 500, error: String(err), id: undefined as string | undefined }
-        })
+        const enq = await enqueueOccurrence(schedule, mode)
         console.info(
           `[scanScheduler] schedule ${scheduleId} refused (${cls.blockedCode || 'temporary'}); ` +
-          `enqueued as ${enq.id ?? 'none'}`
+          `${enq.alreadyQueued ? 'a full recon is already queued' : 'enqueued'} as ${enq.id ?? 'none'}`
         )
         return NextResponse.json(
-          { ok: false, queued: enq.ok, jobId: enq.id ?? null, blockedCode: cls.blockedCode, error: result.error, nextRunAt },
+          {
+            ok: false, queued: enq.ok, jobId: enq.id ?? null, blockedCode: cls.blockedCode, error: result.error,
+            ...(enq.alreadyQueued ? { alreadyQueued: true } : {}),
+            nextRunAt,
+          },
           { status: 200 },
         )
       }

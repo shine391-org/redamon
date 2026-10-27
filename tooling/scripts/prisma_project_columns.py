@@ -79,7 +79,7 @@ class Column:
             inner = raw[1:-1].strip()
             if not inner:
                 return []
-            parts = [p.strip() for p in inner.split(",")]
+            parts = _split_list_items(inner)
             # A list default is typed by the column, not by the literal: Int[]
             # carries numbers and String[] carries strings.
             if self.type in ("Int", "BigInt"):
@@ -97,6 +97,29 @@ class Column:
             pass
         # cuid(), now(), autoincrement(), dbgenerated(...): a function, not a value.
         return None
+
+
+def _split_list_items(inner: str) -> list[str]:
+    """Split a list literal on the commas outside its string literals.
+
+    A String[] default such as an HTTP header list carries commas inside its
+    items ("Accept: text/html,application/xhtml+xml").
+    """
+    parts, item, quoted, escaped = [], [], False, False
+    for ch in inner:
+        if escaped:
+            escaped = False
+        elif ch == "\\" and quoted:
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif ch == "," and not quoted:
+            parts.append("".join(item).strip())
+            item = []
+            continue
+        item.append(ch)
+    parts.append("".join(item).strip())
+    return parts
 
 
 @dataclass

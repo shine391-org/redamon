@@ -11,6 +11,11 @@ database, so unlike the live oracle it actually runs in CI.
 It found five undocumented relationship types on its first run (HAS_IP,
 DISCOVERED_FROM and the three ChainFinding FINDING_AFFECTS_* edges), plus a real
 bug that had nothing to do with documentation: see the phantom test below.
+
+The webapp's Cypher (webapp/src, tests excluded) is scanned too: its routes are
+the live implementation of several graph reads, and a TS port once kept a
+phantom the Python twin had fixed (drift-map #6). Every member of an
+alternation `[:A|B]` counts, not only the first.
 """
 from __future__ import annotations
 
@@ -18,6 +23,8 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CATALOG_PY = PROJECT_ROOT / "graph_db" / "schema_catalog.py"
@@ -33,10 +40,21 @@ SKIP_FILES = {
 }
 
 SEARCH_ROOTS = ("graph_db", "recon", "scanners", "recon_orchestrator", "agentic")
+WEBAPP_SRC = PROJECT_ROOT / "webapp" / "src"
 
 #: Placeholders that are not relationship types: `-[:REL]` in a worked example,
 #: `-[:STEP_*]` in a docstring describing a family of edges.
 NOT_A_TYPE = {"REL", "STEP_", "RUNS"}
+
+#: Read on purpose although nothing writes them. Each entry needs its reason.
+INTENTIONAL_PHANTOMS = {
+    # The pre-unification spelling of HAS_BASE_URL. Readers match both until
+    # tooling/scripts/triage_graph_migrate.py has rewritten every database.
+    "HAS_BASEURL": "legacy alias of HAS_BASE_URL (drift-map 4.7)",
+}
+
+#: `-[r:A|B|:C*1..3]`: the type list after the colon, every member of it.
+REL_TYPES = re.compile(r"-\[\w*:(\w+(?:\s*\|\s*:?\w+)*)")
 
 
 def _load(path: Path, name: str):
@@ -50,7 +68,7 @@ def _load(path: Path, name: str):
 catalog = _load(CATALOG_PY, "schema_catalog")
 
 
-def _source_files() -> list[Path]:
+def _python_files() -> list[Path]:
     out = []
     for root in SEARCH_ROOTS:
         d = PROJECT_ROOT / root
@@ -59,9 +77,30 @@ def _source_files() -> list[Path]:
         out += [
             f
             for f in d.rglob("*.py")
-            if "test" not in str(f) and f.name not in SKIP_FILES
+            if "test" not in str(f.relative_to(PROJECT_ROOT)) and f.name not in SKIP_FILES
         ]
     return out
+
+
+def _webapp_files() -> list[Path]:
+    """webapp/src TS/TSX, without its tests and mocks (their Cypher is fixtures).
+
+    Excluded by test naming rather than by "test" in the path, which would also
+    drop a route under a directory such as `latest/`.
+    """
+    if not WEBAPP_SRC.exists():
+        return []
+    return [
+        f
+        for ext in ("*.ts", "*.tsx")
+        for f in WEBAPP_SRC.rglob(ext)
+        if not re.search(r"\.(test|spec)\.tsx?$", f.name)
+        and not {"__tests__", "__mocks__", "node_modules"} & set(f.parts)
+    ]
+
+
+def _source_files() -> list[Path]:
+    return _python_files() + _webapp_files()
 
 
 def _scan() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -76,11 +115,12 @@ def _scan() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     for f in _source_files():
         rel = f.relative_to(PROJECT_ROOT)
         for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").split("\n"), 1):
-            for t in re.findall(r"-\[\w*:(\w+)", line):
-                if t in NOT_A_TYPE:
-                    continue
-                bucket = written if re.search(r"\b(MERGE|CREATE)\b", line) else read
-                bucket.setdefault(t, []).append(f"{rel}:{i}")
+            for group in REL_TYPES.findall(line):
+                for t in re.split(r"\s*\|\s*:?", group):
+                    if t in NOT_A_TYPE:
+                        continue
+                    bucket = written if re.search(r"\b(MERGE|CREATE)\b", line) else read
+                    bucket.setdefault(t, []).append(f"{rel}:{i}")
     return written, read
 
 
@@ -110,11 +150,61 @@ def test_no_query_reads_a_relationship_nothing_ever_writes():
     empty-result warning - just a number that was always zero.
     """
     written, read = _scan()
-    phantom = {t: v for t, v in read.items() if t not in written}
+    phantom = {
+        t: v for t, v in read.items()
+        if t not in written and t not in INTENTIONAL_PHANTOMS
+    }
     assert not phantom, (
         "relationship type(s) are READ by a query but written NOWHERE, so those "
         "patterns can never match:\n"
         + "\n".join(f"  {t}  ({', '.join(v[:2])})" for t, v in sorted(phantom.items()))
+    )
+
+
+def test_every_intentional_phantom_is_still_read_and_still_unwritten():
+    """An allowlist entry that no longer applies hides the next real phantom
+    of the same name."""
+    written, read = _scan()
+    stale = sorted(t for t in INTENTIONAL_PHANTOMS if t in written or t not in read)
+    assert not stale, f"INTENTIONAL_PHANTOMS entries no longer needed: {stale}"
+
+
+def test_every_member_of_an_alternation_is_read():
+    """`[:A|B]` used to yield A only, which is how a phantom second member
+    stayed invisible."""
+    line = "MATCH (s)-[:HAS_BASE_URL|HAS_BASEURL]->(b) OPTIONAL MATCH (a)<-[r:X | :Y*1..2]-(c)"
+    found = [t for g in REL_TYPES.findall(line) for t in re.split(r"\s*\|\s*:?", g)]
+    assert found == ["HAS_BASE_URL", "HAS_BASEURL", "X", "Y"]
+
+
+def test_the_graph_view_clusters_only_edges_something_writes():
+    """STRUCTURAL_EDGE_TYPES is a string list, not Cypher, so the scan above
+    cannot see it; an entry nothing writes (POWERED_BY was one) is dead."""
+    cluster = WEBAPP_SRC / "app" / "graph" / "utils" / "clusterNodes.ts"
+    if not cluster.exists():
+        pytest.skip("webapp/ is not in this checkout")
+    block = re.search(r"STRUCTURAL_EDGE_TYPES = new Set\(\[(.*?)\]\)",
+                      cluster.read_text(encoding="utf-8"), re.S)
+    assert block, "STRUCTURAL_EDGE_TYPES not found in clusterNodes.ts"
+    types = re.findall(r"'([A-Z_]+)'", block.group(1))
+    assert len(types) > 10
+    written, _ = _scan()
+    dead = sorted(t for t in types if t not in written and t not in INTENTIONAL_PHANTOMS)
+    assert not dead, f"STRUCTURAL_EDGE_TYPES names edges nothing writes: {dead}"
+
+
+def test_the_scan_reads_the_webapp_cypher():
+    """The webapp routes carry graph reads of their own; a scan that silently
+    found none of them would pass the phantom test vacuously."""
+    if not (PROJECT_ROOT / "webapp").exists():
+        pytest.skip("webapp/ is not in this checkout")
+    files = _webapp_files()
+    assert any(f.name == "route.ts" and "graph-inputs" in str(f) for f in files)
+    _, read = _scan()
+    webapp_reads = {t for t, v in read.items() if any(x.startswith("webapp") for x in v)}
+    assert len(webapp_reads) > 20, (
+        f"only {len(webapp_reads)} relationship types read in webapp/src; the "
+        "webapp file filter is probably wrong"
     )
 
 
@@ -128,7 +218,7 @@ def _properties_written() -> dict[str, set[str]]:
     one covers the dynamic writers.
     """
     out: dict[str, set[str]] = {}
-    for f in _source_files():
+    for f in _python_files():
         src = f.read_text(encoding="utf-8", errors="replace")
         blocks = re.findall(r'"""(.*?)"""', src, re.S) + re.findall(r'"([^"\n]{30,})"', src)
         for q in blocks:

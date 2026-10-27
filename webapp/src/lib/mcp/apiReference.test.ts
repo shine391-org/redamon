@@ -18,6 +18,7 @@
  * @vitest-environment node
  */
 import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { wikiCheckoutPresent } from '@/lib/wikiCheckout.testUtils'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -50,13 +51,8 @@ const WIKI_DIR = process.env.MCP_DOCS_WIKI_DIR
   || fileURLToPath(new URL('../../../../redamon.wiki/', import.meta.url))
 const WRITE = process.env.MCP_DOCS_WRITE === '1'
 
-/**
- * A real wiki checkout, not merely the directory. The main repo records the wiki
- * as a submodule pointer with no .gitmodules, so a fresh clone creates
- * redamon.wiki/ EMPTY: checking the directory alone compared an empty page
- * against the render and failed on every fresh clone.
- */
-const hasWikiCheckout = () => existsSync(path.join(WIKI_DIR, 'Home.md'))
+/** A real wiki checkout; an empty one fails unless allowed (wikiCheckout.testUtils.ts). */
+const hasWikiCheckout = () => wikiCheckoutPresent(WIKI_DIR)
 
 /**
  * Arguments that make a conditional scope apply, merged over the example call.

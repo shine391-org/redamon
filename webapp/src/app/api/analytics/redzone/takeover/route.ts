@@ -3,6 +3,7 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -22,7 +23,7 @@ export async function GET(request: NextRequest) {
     // Vulnerabilities with source = takeover_scan (subjack + nuclei + baddns dedup output)
     const result = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid, source: 'takeover_scan'})
-       WHERE ${notMuted('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (parent)-[:HAS_VULNERABILITY]->(v)
        RETURN toString(id(v))       AS nodeId,
               v.id                   AS id,

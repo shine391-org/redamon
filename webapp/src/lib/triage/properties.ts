@@ -55,6 +55,8 @@ export const TRIAGE_PROPERTIES = [
   'triage_factors',
   'triage_state',
   'triage_decided_by',
+  'triage_disposition',
+  'triage_blocker',
   'triage_rescored_at',
 ] as const
 

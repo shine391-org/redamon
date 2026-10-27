@@ -39,6 +39,16 @@ JSON_PATH = HERE / "registry.json"
 WEBAPP_JSON_PATH = REPO_ROOT / "webapp" / "src" / "lib" / "reconSettings" / "registry.json"
 ROE_PROMPT_PATH = HERE / "roe_parse_prompt.py"
 DIGEST_TS_PATH = REPO_ROOT / "webapp" / "src" / "lib" / "reconSettings" / "registryDigest.generated.ts"
+NODE_MAPPING_TS = REPO_ROOT / "webapp" / "src" / "components" / "projects" / "ProjectForm" / "nodeMapping.ts"
+
+#: Registry tools whose partial-recon section in SECTION_NODE_MAP has another name.
+SECTION_ALIASES = {
+    "gvm": "GvmScan",
+    "graphql": "GraphqlScan",
+    "openapi_recon": "OpenAPI",
+    "takeover": "SubdomainTakeover",
+    "zap": "ZapAjaxSpider",
+}
 
 sys.path.insert(0, str(REPO_ROOT / "tooling" / "scripts"))
 
@@ -198,7 +208,8 @@ def build(document: dict | None = None) -> dict:
         entry["has_default"] = col.default_raw is not None
         out_fields[name] = {k: entry[k] for k in sorted(entry)}
 
-    tools = {name: {k: v for k, v in sorted(tool.items())} for name, tool in sorted(doc["tools"].items())}
+    tools = {name: {k: v for k, v in sorted(_with_produces(name, tool).items())}
+             for name, tool in sorted(doc["tools"].items())}
     runtime = {name: {k: v for k, v in sorted(r.items())} for name, r in sorted(doc["runtime_only"].items())}
 
     return {
@@ -207,6 +218,44 @@ def build(document: dict | None = None) -> dict:
         "runtime_only": runtime,
         "tools": tools,
     }
+
+
+def _section_node_map() -> dict[str, list[str]]:
+    """SECTION_NODE_MAP in nodeMapping.ts: the node labels each partial-recon
+    section writes, as the workflow view draws them."""
+    import re
+
+    text = NODE_MAPPING_TS.read_text(encoding="utf-8")
+    body = re.search(r"export const SECTION_NODE_MAP[^=]*=\s*\{(.*?)\n\}", text, re.S)
+    if not body:
+        raise RegistryError(f"SECTION_NODE_MAP not found in {NODE_MAPPING_TS.relative_to(REPO_ROOT)}")
+    return {m.group(1): re.findall(r"'([^']+)'", m.group(2))
+            for m in re.finditer(r"^\s*(\w+):\s*\[([^\]]*)\]", body.group(1), re.M)}
+
+
+_SECTIONS: dict[str, list[str]] | None = None
+
+
+def _with_produces(name: str, tool: dict) -> dict:
+    """A tool's `produces` is its section's SECTION_NODE_MAP entry, derived at
+    build time so it cannot drift from the view; a tool that runs inside another
+    section (dns, crtsh) has none of its own."""
+    global _SECTIONS
+    if "produces" in tool:
+        raise RegistryError(
+            f"tools.{name}.produces is derived from SECTION_NODE_MAP "
+            f"({NODE_MAPPING_TS.relative_to(REPO_ROOT)}); remove it from registry.yaml")
+    if _SECTIONS is None:
+        _SECTIONS = _section_node_map()
+    unknown = sorted(a for a in SECTION_ALIASES.values() if a not in _SECTIONS)
+    if unknown:
+        raise RegistryError(f"SECTION_ALIASES names sections SECTION_NODE_MAP lacks: {unknown}")
+    norm = name.replace("_", "").lower().rstrip("s")
+    section = SECTION_ALIASES.get(name) or next(
+        (key for key in _SECTIONS if key.lower().rstrip("s") == norm), None)
+    if section is None:
+        return dict(tool)
+    return {**tool, "produces": _SECTIONS[section]}
 
 
 HEADER = (

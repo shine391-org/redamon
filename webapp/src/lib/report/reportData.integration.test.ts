@@ -21,7 +21,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'vitest'
 import neo4j, { type Driver, type Session } from 'neo4j-driver'
-import { queryGraphOverview } from './reportData'
+import { queryGraphOverview, querySecrets, queryVulnerabilities } from './reportData'
 
 const URI = process.env.NEO4J_URI || 'bolt://localhost:7687'
 const USER = process.env.NEO4J_USER || 'neo4j'
@@ -121,5 +121,86 @@ describe('the suppressed-findings line', () => {
       rules: overview.suppressedByRules,
       total: overview.suppressedCount,
     }).toEqual({ people: 5, multi: 3, agents: 1, rules: 2, total: 8 })
+  })
+})
+
+describe('the board verdict in the report counts', () => {
+  const PID_JUDGED = `REPORT_JUDGED_${Math.random().toString(36).slice(2, 10)}`
+
+  afterAll(async () => {
+    if (alive && session) await session.run('MATCH (n {project_id: $pid}) DETACH DELETE n', { pid: PID_JUDGED })
+  })
+
+  test('a person excludes, a rule resolves, an AI review only flags', async (ctx) => {
+    if (!alive || !session) ctx.skip()
+    await session!.run(
+      `UNWIND $rows AS row
+       CREATE (n:Vulnerability {id: row.id, user_id: $uid, project_id: $pid, severity: 'high',
+                                name: row.id, source: 'nuclei'})
+       SET n += row.props`,
+      {
+        uid: UID, pid: PID_JUDGED,
+        rows: [
+          { id: 'plain', props: {} },
+          { id: 'person-fp', props: { triage_status: 'likely_noise', triage_source: 'human',
+                                      triage_state: 'false_positive', triage_decided_by: 'person' } },
+          { id: 'inactive', props: { triage_state: 'inactive', triage_decided_by: 'rules' } },
+          { id: 'ai-fp', props: { triage_state: 'false_positive', triage_decided_by: 'review' } },
+        ],
+      },
+    )
+    // A person's False positive that is ALSO muted: counted only as suppressed.
+    await session!.run(
+      `CREATE (:Vulnerability:Muted {id: 'muted-fp', user_id: $uid, project_id: $pid, severity: 'high',
+                                     muted: true, muted_by: $uid, triage_status: 'likely_noise',
+                                     triage_source: 'human', triage_state: 'false_positive'})`,
+      { uid: UID, pid: PID_JUDGED },
+    )
+    await session!.run(
+      `CREATE (:Secret {id: 's-person', user_id: $uid, project_id: $pid, severity: 'high',
+                        triage_status: 'likely_noise', triage_source: 'human'}),
+              (:Secret {id: 's-open', user_id: $uid, project_id: $pid, severity: 'high'})`,
+      { uid: UID, pid: PID_JUDGED },
+    )
+
+    const vulns = await queryVulnerabilities(session, PID_JUDGED)
+    const high = vulns.severityDistribution.find((d: { severity: string }) => d.severity === 'high')?.count
+    expect(high).toBe(2)
+    expect(vulns.findings.map((f: { name: string }) => f.name).sort()).toEqual(['ai-fp', 'plain'])
+
+    const secrets = await querySecrets(session, PID_JUDGED)
+    expect(secrets.total).toBe(1)
+
+    const overview = await queryGraphOverview(session, PID_JUDGED)
+    expect(overview.judged).toEqual({ personFalsePositive: 2, resolved: 1, aiFlagged: 1 })
+    expect(overview.suppressedByPeople).toBe(1)
+  })
+})
+
+describe('keys that are public by design, on a real graph (plan 05.2)', () => {
+  const PID_PUBLIC = `REPORT_PUBLIC_${Math.random().toString(36).slice(2, 10)}`
+
+  afterAll(async () => {
+    if (alive && session) await session.run('MATCH (n {project_id: $pid}) DETACH DELETE n', { pid: PID_PUBLIC })
+  })
+
+  test('flagged, legacy-named and secret keys are counted where the readers say', async (ctx) => {
+    if (!alive || !session) ctx.skip()
+    await session!.run(
+      `CREATE (:Secret {id: 'flagged', user_id: $uid, project_id: $pid, severity: 'info',
+                        secret_type: 'GCP API Key', public_client_key: true, source: 'js_recon'}),
+              (:Secret {id: 'legacy', user_id: $uid, project_id: $pid, severity: 'critical',
+                        secret_type: 'Sentry DSN', source: 'js_recon'}),
+              (:Secret {id: 'real', user_id: $uid, project_id: $pid, severity: 'critical',
+                        secret_type: 'Stripe Secret Key', public_client_key: false, source: 'js_recon'})`,
+      { uid: UID, pid: PID_PUBLIC },
+    )
+    const secrets = await querySecrets(session, PID_PUBLIC)
+    expect(secrets.total).toBe(1)
+    expect(secrets.bySeverity).toEqual([{ severity: 'critical', count: 1 }])
+    expect(secrets.findings.map((f: { secretType: string }) => f.secretType)).toEqual(['Stripe Secret Key'])
+    expect(secrets.publicClientKeys?.total).toBe(2)
+    expect(secrets.publicClientKeys?.byType.map((t: { secretType: string }) => t.secretType).sort())
+      .toEqual(['GCP API Key', 'Sentry DSN'])
   })
 })

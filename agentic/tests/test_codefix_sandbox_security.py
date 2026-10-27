@@ -336,6 +336,16 @@ class GitHubRepoHardening(unittest.TestCase):
 # ===========================================================================
 # 4. CONTAINER MANAGER SANDBOX
 # ===========================================================================
+class _AnyMember(type):
+    """A stub models class whose members resolve: container_manager builds
+    sets of ReconStatus / PartialReconStatus members at import."""
+
+    def __getattr__(cls, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return f"{cls.__name__}.{name}"
+
+
 def _install_orchestrator_stubs():
     # fake docker package
     docker = types.ModuleType("docker")
@@ -365,7 +375,7 @@ def _install_orchestrator_stubs():
               "SupplyChainState", "SupplyChainStatus", "SupplyChainLogEvent",
               "PartialReconState", "PartialReconStatus", "AiAttackSurfaceState",
               "AiAttackSurfaceStatus", "AiAttackSurfaceLogEvent"):
-        setattr(fake_models, n, type(n, (), {}))
+        setattr(fake_models, n, _AnyMember(n, (), {}))
     sys.modules["models"] = fake_models
     return NotFound, APIError
 

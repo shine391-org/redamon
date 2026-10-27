@@ -9,9 +9,9 @@
  *
  * @vitest-environment node
  */
-import { describe, test, expect, beforeEach, vi } from 'vitest'
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
 import { NextRequest } from 'next/server'
-import { settingsFingerprint } from '@/lib/jobQueue'
+import { settingsFingerprint, nextBackoff } from '@/lib/jobQueue'
 
 const h = vi.hoisted(() => ({
   isInternal: vi.fn(),
@@ -287,6 +287,124 @@ describe('dispatch route happy + failure paths', () => {
     const body = await (await dispatch(post('http://x/api/internal/job-queue/j1/dispatch'), sp('j1'))).json()
     expect(body.failed).toBe(true)
     expect(h.jqUpdateMany.mock.calls.at(-1)![0].data.status).toBe('failed')
+  })
+})
+
+describe('dispatch route: transient, unknown and thrown starts (plan 12.6)', () => {
+  const NOW = new Date('2026-10-26T12:00:00Z')
+  const dispatchOnce = async () =>
+    (await dispatch(post('http://x/api/internal/job-queue/j1/dispatch'), sp('j1'))).json()
+  const lastWrite = () => h.jqUpdateMany.mock.calls.at(-1)![0]
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(NOW)
+  })
+  afterEach(() => { vi.useRealTimers() })
+
+  test('an answered 503 is requeued, spending one attempt, after the first backoff', async () => {
+    h.dispatchStart.mockResolvedValue({
+      ok: false, status: 503,
+      error: 'Cannot verify scan scope: the webapp is unreachable (URLError). Refusing to start.',
+    })
+    const body = await dispatchOnce()
+    expect(body).toMatchObject({ blocked: 'transient', temporary: true })
+    expect(lastWrite().where).toMatchObject({ id: 'j1', status: 'dispatching' })
+    expect(lastWrite().data).toMatchObject({ status: 'queued', attempts: 1, blockedCode: 'transient' })
+    expect(lastWrite().data.notBefore).toEqual(new Date(NOW.getTime() + nextBackoff(1)))
+  })
+
+  test('the transient branch gives up at maxAttempts', async () => {
+    h.jqFindUnique.mockResolvedValue(baseRow({ attempts: 19, maxAttempts: 20 }))
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 500, error: 'boom' })
+    const body = await dispatchOnce()
+    expect(body.failed).toBe(true)
+    expect(lastWrite().data).toMatchObject({ status: 'failed', attempts: 20 })
+    expect(lastWrite().data.error).toMatch(/gave up after 20 attempts/)
+  })
+
+  test('a failed spawn is permanent on its first attempt', async () => {
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 500, error: 'image not found', code: 'spawn_failed' })
+    expect((await dispatchOnce()).failed).toBe(true)
+    expect(lastWrite().data).toMatchObject({ status: 'failed', attempts: 1 })
+  })
+
+  test('a 403 (outside the RoE window) still fails at once', async () => {
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 403, error: 'RoE time window' })
+    expect((await dispatchOnce()).failed).toBe(true)
+    expect(lastWrite().data.status).toBe('failed')
+  })
+
+  test('unknown full_recon with the orchestrator running a scan it started after the claim -> running', async () => {
+    h.dispatchStart.mockResolvedValue({
+      ok: false, status: 503, startOutcome: 'unknown', error: 'no answer', scanJobId: 'sj9',
+    })
+    h.orchFetch.mockResolvedValue({
+      ok: true, json: async () => ({ status: 'running', started_at: new Date(NOW.getTime() + 1000).toISOString() }),
+    })
+    const body = await dispatchOnce()
+    expect(body).toMatchObject({ ok: true, adopted: true })
+    expect(h.orchFetch.mock.calls[0][0]).toMatch(/\/recon\/p1\/status$/)
+    expect(lastWrite().data).toMatchObject({ status: 'running', scanJobId: 'sj9' })
+    expect(h.sjUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'sj9' }),
+      data: expect.objectContaining({ status: 'running' }),
+    }))
+  })
+
+  test('unknown full_recon and the orchestrator idle -> requeued as transient', async () => {
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 503, startOutcome: 'unknown', error: 'no answer' })
+    h.orchFetch.mockResolvedValue({ ok: true, json: async () => ({ status: 'idle' }) })
+    const body = await dispatchOnce()
+    expect(body.blocked).toBe('transient')
+    expect(lastWrite().data).toMatchObject({ status: 'queued', attempts: 1, blockedCode: 'transient' })
+  })
+
+  test('unknown full_recon with a scan that started before the claim is not ours -> requeued', async () => {
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 503, startOutcome: 'unknown', error: 'no answer' })
+    h.orchFetch.mockResolvedValue({
+      ok: true, json: async () => ({ status: 'running', started_at: '2026-10-26T11:00:00Z' }),
+    })
+    expect((await dispatchOnce()).blocked).toBe('transient')
+    expect(lastWrite().data.status).toBe('queued')
+  })
+
+  test('unknown full_recon with the status unreadable -> needs_review', async () => {
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 503, startOutcome: 'unknown', error: 'no answer' })
+    h.orchFetch.mockRejectedValue(new Error('ECONNREFUSED'))
+    const body = await dispatchOnce()
+    expect(body.needsReview).toBe(true)
+    expect(lastWrite().data).toMatchObject({ status: 'needs_review', blockedCode: 'start_unknown' })
+  })
+
+  test('unknown outcome of another kind -> needs_review naming the doubt, with its ScanJob id', async () => {
+    h.jqFindUnique.mockResolvedValue(baseRow({
+      kind: 'gvm', settingsHash: settingsFingerprint('gvm', PROJECT as unknown as Record<string, unknown>),
+    }))
+    h.dispatchStart.mockResolvedValue({ ok: false, status: 503, startOutcome: 'unknown', error: 'no answer', scanJobId: 'sj7' })
+    const body = await dispatchOnce()
+    expect(body.needsReview).toBe(true)
+    expect(lastWrite().data).toMatchObject({
+      status: 'needs_review', blockedCode: 'start_unknown', scanJobId: 'sj7',
+      blockedReason: 'the orchestrator did not answer; check whether the scan started',
+    })
+    expect(h.orchFetch).not.toHaveBeenCalled()
+  })
+
+  test('a thrown error spends an attempt and backs off instead of retrying every tick', async () => {
+    h.dispatchStart.mockRejectedValue(new Error('prepareVersions blew up'))
+    const res = await dispatch(post('http://x/api/internal/job-queue/j1/dispatch'), sp('j1'))
+    expect(res.status).toBe(500)
+    expect(lastWrite().where).toMatchObject({ id: 'j1', status: 'dispatching' })
+    expect(lastWrite().data).toMatchObject({ status: 'queued', attempts: 1 })
+    expect(lastWrite().data.notBefore).toEqual(new Date(NOW.getTime() + nextBackoff(1)))
+  })
+
+  test('a thrown error at maxAttempts fails the job', async () => {
+    h.jqFindUnique.mockResolvedValue(baseRow({ attempts: 19, maxAttempts: 20 }))
+    h.dispatchStart.mockRejectedValue(new Error('boom'))
+    await dispatch(post('http://x/api/internal/job-queue/j1/dispatch'), sp('j1'))
+    expect(lastWrite().data).toMatchObject({ status: 'failed', attempts: 20 })
   })
 })
 

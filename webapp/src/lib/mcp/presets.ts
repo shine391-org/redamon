@@ -1,6 +1,6 @@
 /**
- * Prefilled MCP server templates - 10 publicly-available, security-relevant
- * MCP servers chosen for RedAmon's pentest workflow.
+ * Prefilled MCP server templates: publicly-available, security-relevant MCP
+ * servers chosen for RedAmon's pentest workflow.
  *
  * Each preset fills `id, name, description, transport, url/command/args,
  * default_phases, auth structure, env structure` - but leaves `token` and

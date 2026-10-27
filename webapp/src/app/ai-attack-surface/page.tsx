@@ -6,6 +6,7 @@ import { AlertTriangle, ArrowLeft, KeyRound, Loader2, Lock, Play, Plus, SlidersH
 import { useProject } from '@/providers/ProjectProvider'
 import { useAiAttackSurface } from '@/hooks/useAiAttackSurface'
 import { useScanStartFailure } from '@/hooks/useScanStartFailure'
+import { useLocalJudgeModel } from '@/hooks/useLocalJudgeModel'
 import {
   ALL_CARDS, ATTACK_CHIPS, resolveAuth, splitUrl,
   type AuthMode, type ChipKey, type CustomTarget, type ToolCard,
@@ -47,7 +48,11 @@ export default function AiAttackSurfacePage() {
   )
   const [trials, setTrials] = useState(1)
   const [asrThreshold, setAsrThreshold] = useState(0.3)
-  const [judgeModel, setJudgeModel] = useState('qwen2.5:0.5b')
+  // The backend's judge model until the operator types another one. Empty while
+  // it loads or when the orchestrator cannot say: an empty judge runs no-judge.
+  const judge = useLocalJudgeModel(projectId)
+  const [judgeOverride, setJudgeOverride] = useState<string | null>(null)
+  const judgeModel = judgeOverride ?? (judge.status === 'ready' ? judge.model : '')
   const [maxTurns, setMaxTurns] = useState(4)
   const [seed, setSeed] = useState(0)
   // Concurrent requests per tool (garak --parallel_attempts / promptfoo eval
@@ -189,7 +194,9 @@ export default function AiAttackSurfacePage() {
 
   const totalTargets = selectedTargets.size + customTargets.length
   const running = s.run?.status === 'running' || s.run?.status === 'starting'
+  // Not while the judge model loads: the run would start without a judge.
   const canLaunch = totalTargets > 0 && selectedProbes.size > 0 && roeConfirmed && !s.launching && !running
+    && judge.status !== 'loading'
 
   return (
     <div className={styles.page}>
@@ -412,7 +419,12 @@ export default function AiAttackSurfacePage() {
               <label>ASR ≥<input type="number" min={0} max={1} step={0.05} value={asrThreshold}
                      onChange={(e) => setAsrThreshold(parseFloat(e.target.value) || 0)} /></label>
               <label>Judge<input type="text" value={judgeModel}
-                     onChange={(e) => setJudgeModel(e.target.value)} /></label>
+                     disabled={judge.status === 'loading'}
+                     placeholder={judge.status === 'loading' ? 'Loading…' : judge.status === 'unavailable' ? 'Local LLM unavailable' : undefined}
+                     title={judge.status === 'unavailable'
+                       ? 'The orchestrator did not report its judge model. Type one, or leave it empty to run without a judge.'
+                       : 'Local Ollama judge model (the orchestrator\'s LOCAL_LLM_MODEL)'}
+                     onChange={(e) => setJudgeOverride(e.target.value)} /></label>
               {openCard.style === 'multi-turn' && (
                 <label>Max turns<input type="number" min={1} value={maxTurns}
                        onChange={(e) => setMaxTurns(parseInt(e.target.value) || 1)} /></label>

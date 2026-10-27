@@ -51,8 +51,8 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
   targetProfile: 'domain',
   environment: 'external',
   parameters: {
-    // Modules: all except port_scan (web-focused) and js_recon handled via tool toggle
-    scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'vuln_scan', 'js_recon'],
+    // Modules: all except port_scan (web-focused); JS recon runs by jsReconEnabled
+    scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'vuln_scan'],
 
     // No stealth
     stealthMode: false,
@@ -86,6 +86,7 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 
     // --- httpx: all probes enabled for full fingerprinting ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

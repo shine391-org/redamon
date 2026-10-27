@@ -243,7 +243,7 @@ class TestValidationStatus(unittest.TestCase):
             ]), "u1", "p1")
         by_location = {f["location"]: f["validation_status"] for f in c.findings()}
         self.assertEqual(by_location["x1"], "validated")
-        self.assertEqual(by_location["x2"], "unvalidated")
+        self.assertEqual(by_location["x2"], "rejected")
         self.assertEqual(by_location["x3"], "verify_error")
 
     def test_finding_kind_is_carried(self):

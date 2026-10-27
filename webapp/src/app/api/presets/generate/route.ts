@@ -5,6 +5,7 @@ import { reconPresetSchema, extractJson, RECON_PARAMETER_CATALOG } from '@/lib/r
 import { assertSafeLlmBaseUrl, BaseUrlValidationError } from '@/lib/llm-url-guard'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
 import { isChatProvider } from '@/lib/llmProviderKinds'
+import { builtinSendsTemperature, customSendsTemperature, rejectsTemperature } from '@/lib/llmTemperature'
 
 // ---------------------------------------------------------------------------
 // POST /api/presets/generate
@@ -106,8 +107,38 @@ interface OpenAICompatOptions {
   extraHeaders?: Record<string, string>
   timeout?: number
   temperature?: number
+  /** False for a model that rejects `temperature`: the field is then left out. */
+  sendTemperature: boolean
   maxTokens?: number
   sslVerify?: boolean
+}
+
+/**
+ * POST a chat request and return the parsed reply.
+ *
+ * A 400 that names `temperature` is retried once without it: the lists in
+ * llmTemperature.ts only know today's model families, and this is the same
+ * self-heal the agent's llm_retry.py applies to a model they miss.
+ */
+async function postChat(
+  provider: string,
+  url: string,
+  init: RequestInit & { dispatcher?: unknown },
+  payload: Record<string, unknown>,
+  temperature: number | undefined,
+): Promise<unknown> {
+  const send = (withTemperature: boolean) => fetch(url, {
+    ...init,
+    body: JSON.stringify(withTemperature ? { ...payload, temperature } : payload),
+  })
+  let res = await send(temperature !== undefined)
+  if (!res.ok && temperature !== undefined) {
+    const text = await res.text().catch(() => '')
+    if (!rejectsTemperature(res.status, text)) throw providerError(provider, res.status, text)
+    res = await send(false)
+  }
+  if (!res.ok) throw providerError(provider, res.status, await res.text().catch(() => ''))
+  return res.json()
 }
 
 /**
@@ -130,17 +161,16 @@ async function callOpenAICompatible(opts: OpenAICompatOptions): Promise<string> 
       'Authorization': `Bearer ${opts.apiKey}`,
       ...opts.extraHeaders,
     },
-    body: JSON.stringify({
-      model: opts.modelId,
-      messages: [
-        { role: 'system', content: opts.systemPrompt },
-        { role: 'user', content: opts.userPrompt },
-      ],
-      temperature: opts.temperature ?? 0.3,
-      max_tokens: opts.maxTokens ?? 4096,
-      response_format: { type: 'json_object' },
-    }),
     signal: controller.signal,
+  }
+  const payload = {
+    model: opts.modelId,
+    messages: [
+      { role: 'system', content: opts.systemPrompt },
+      { role: 'user', content: opts.userPrompt },
+    ],
+    max_tokens: opts.maxTokens ?? 4096,
+    response_format: { type: 'json_object' },
   }
 
   // SSL bypass for internal endpoints with self-signed certs (mirrors
@@ -151,11 +181,10 @@ async function callOpenAICompatible(opts: OpenAICompatOptions): Promise<string> 
   }
 
   try {
-    const res = await fetch(`${opts.baseUrl}/chat/completions`, init)
-
-    if (!res.ok) throw await providerError('LLM', res)
-
-    const data = await res.json()
+    const data = await postChat(
+      'LLM', `${opts.baseUrl}/chat/completions`, init, payload,
+      opts.sendTemperature ? (opts.temperature ?? 0.3) : undefined,
+    ) as { choices?: { message?: { content?: string } }[] }
     return data.choices?.[0]?.message?.content ?? ''
   } finally {
     clearTimeout(timer)
@@ -167,13 +196,14 @@ async function callOpenAICompatible(opts: OpenAICompatOptions): Promise<string> 
  * is JSON, its short error type or code. Never the body's text: a 401 body can
  * quote part of the key it refused.
  */
-async function providerError(provider: string, res: Response): Promise<Error> {
-  const body: unknown = await res.json().catch(() => null)
+function providerError(provider: string, status: number, text: string): Error {
+  let body: unknown = null
+  try { body = JSON.parse(text) } catch { /* not JSON: the status alone is logged */ }
   const error = body && typeof body === 'object' ? (body as { error?: unknown }).error : null
   const fields = error && typeof error === 'object' ? error as { type?: unknown; code?: unknown } : {}
   const kind = [fields.type, fields.code].find(
     (v): v is string => typeof v === 'string' && /^[A-Za-z0-9_.-]{1,60}$/.test(v))
-  return new Error(`${provider} API returned ${res.status}: ${kind ?? 'no error code'}`)
+  return new Error(`${provider} API returned ${status}: ${kind ?? 'no error code'}`)
 }
 
 /**
@@ -192,27 +222,22 @@ async function callAnthropic(
   const timer = setTimeout(() => controller.abort(), (timeout || 120) * 1000)
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const data = await postChat('Anthropic', 'https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model: modelId,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-        max_tokens: maxTokens ?? 4096,
-        temperature: temperature ?? 0.3,
-      }),
       signal: controller.signal,
-    })
-
-    if (!res.ok) throw await providerError('Anthropic', res)
-
-    const data = await res.json()
-    const textBlock = data.content?.find((b: { type: string }) => b.type === 'text')
+    }, {
+      model: modelId,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+      max_tokens: maxTokens ?? 4096,
+    }, builtinSendsTemperature('anthropic', modelId) ? (temperature ?? 0.3) : undefined,
+    ) as { content?: { type: string; text?: string }[] }
+    const textBlock = data.content?.find((b) => b.type === 'text')
     return textBlock?.text ?? ''
   } finally {
     clearTimeout(timer)
@@ -302,6 +327,7 @@ export async function POST(request: NextRequest) {
         extraHeaders,
         timeout: provider.timeout,
         temperature: provider.temperature,
+        sendTemperature: customSendsTemperature(provider.providerType, apiModel),
         maxTokens: provider.maxTokens,
         sslVerify: provider.sslVerify,
       })
@@ -354,6 +380,7 @@ export async function POST(request: NextRequest) {
           extraHeaders,
           timeout: provider.timeout,
           temperature: provider.temperature,
+          sendTemperature: builtinSendsTemperature(providerType, modelId),
           maxTokens: provider.maxTokens,
           sslVerify: provider.sslVerify,
         })

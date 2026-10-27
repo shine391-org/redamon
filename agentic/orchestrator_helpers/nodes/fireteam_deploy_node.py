@@ -63,15 +63,18 @@ def _mk_member_id(idx: int) -> str:
 
 def _validate_mutex_groups(plan_members: list) -> Optional[str]:
     """Return None if OK, or a diagnostic string if two members claim the same
-    singleton tool group (e.g. two members both using metasploit)."""
+    singleton tool group (e.g. two members both declaring metasploit_console).
+
+    A member claims a group when its `tools` names one of the group's tools
+    (the canonical TOOL_REGISTRY names the member spec requires) or the group
+    itself.
+    """
     for group, group_tools in TOOL_MUTEX_GROUPS.items():
+        claim_names = {group.lower()} | {t.lower() for t in group_tools}
         claimers = []
         for m in plan_members:
-            # A member "claims" a group if any of its declared tools overlaps the
-            # group name, or if the group's tools are referenced by its tools list.
-            member_tools = [s.lower() for s in (m.get("tools") or [])]
-            tool_keywords = {t.split("_", 1)[-1] for t in group_tools}
-            if group.lower() in member_tools or any(k in member_tools for k in tool_keywords):
+            member_tools = {str(t).strip().lower() for t in (m.get("tools") or [])}
+            if member_tools & claim_names:
                 claimers.append(m.get("name") or "(unnamed)")
         if len(claimers) > 1:
             return f"Multiple members claim mutex group '{group}': {claimers}"

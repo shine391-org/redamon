@@ -68,7 +68,24 @@ logs/
 .env.*
 !.env.example
 
+# ---------- Shadows of baked packages ----------
+# agentic/Dockerfile bakes services/knowledge_base/ at /app/knowledge_base/ and
+# then runs `COPY agentic/ ./`, so anything here would overwrite it. An empty
+# kb_config.yaml here replaced the real KB config, and a root-owned local copy
+# outlives its removal from git (tests/test_agent_image_no_shadowed_copy.py).
+agentic/knowledge_base/
+
 # ---------- Runtime-installed data ----------
 # run_amass copies the image's own baked list here on first use; shipping it
 # back into the build context would add it to the image a second time.
 recon/wordlists/jhaddix-all.txt
+
+# Local migration: runtime data and private backups stay out of image contexts.
+.local/
+backups/
+agentic/agent-workspace/
+agentic/logs/
+recon/output/
+mcp/output/
+scanners/*/output/
+services/knowledge_base/data/

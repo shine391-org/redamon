@@ -798,9 +798,8 @@ def test_binary_check_not_found():
 # Settings layer consistency tests
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
 def test_settings_defaults_match_prisma_defaults():
-    """All DEFAULT_SETTINGS keys for Arjun should have matching Prisma fields."""
+    """Every Arjun DEFAULT_SETTINGS value equals the Prisma @default of its column."""
     from recon.project_settings import DEFAULT_SETTINGS
 
     arjun_keys = {k for k in DEFAULT_SETTINGS if k.startswith('ARJUN_')}
@@ -811,19 +810,15 @@ def test_settings_defaults_match_prisma_defaults():
     }
     assert arjun_keys == expected, f"Missing or extra keys: {arjun_keys ^ expected}"
 
-    # Verify default values match what we expect
-    assert DEFAULT_SETTINGS['ARJUN_ENABLED'] is False
-    assert DEFAULT_SETTINGS['ARJUN_THREADS'] == 2
-    assert DEFAULT_SETTINGS['ARJUN_TIMEOUT'] == 15
-    assert DEFAULT_SETTINGS['ARJUN_SCAN_TIMEOUT'] == 600
-    assert DEFAULT_SETTINGS['ARJUN_METHODS'] == ['GET']
-    assert DEFAULT_SETTINGS['ARJUN_MAX_ENDPOINTS'] == 50
-    assert DEFAULT_SETTINGS['ARJUN_CHUNK_SIZE'] == 500
-    assert DEFAULT_SETTINGS['ARJUN_RATE_LIMIT'] == 0
-    assert DEFAULT_SETTINGS['ARJUN_STABLE'] is False
-    assert DEFAULT_SETTINGS['ARJUN_PASSIVE'] is False
-    assert DEFAULT_SETTINGS['ARJUN_DISABLE_REDIRECTS'] is False
-    assert DEFAULT_SETTINGS['ARJUN_CUSTOM_HEADERS'] == []
+    # The registry's default is the Prisma @default (registry.prisma.test.ts).
+    registry = Path(__file__).resolve().parents[2] / 'recon_settings' / 'registry.json'
+    fields = json.loads(registry.read_text(encoding='utf-8'))['fields']
+    prisma = {spec['runtime_key']: spec.get('default') for spec in fields.values()
+              if spec.get('runtime_key') in arjun_keys}
+    assert set(prisma) == arjun_keys, f"keys with no column: {arjun_keys - set(prisma)}"
+    for key in sorted(arjun_keys):
+        assert DEFAULT_SETTINGS[key] == prisma[key], \
+            f"{key}: Python {DEFAULT_SETTINGS[key]!r} != Prisma {prisma[key]!r}"
 
     print("PASS: test_settings_defaults_match_prisma_defaults")
 

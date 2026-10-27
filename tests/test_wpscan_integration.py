@@ -255,10 +255,10 @@ class TestStealthRules(unittest.TestCase):
 
 
 class TestRoECategoryMap(unittest.TestCase):
-    """Verify execute_plan_node.py RoE mapping."""
+    """Verify the RoE category map in roe_gate.py."""
 
     def setUp(self):
-        path = os.path.join(BASE_DIR, 'agentic', 'orchestrator_helpers', 'nodes', 'execute_plan_node.py')
+        path = os.path.join(BASE_DIR, 'agentic', 'orchestrator_helpers', 'roe_gate.py')
         with open(path) as f:
             self.content = f.read()
 

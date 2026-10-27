@@ -54,7 +54,6 @@ def client(monkeypatch):
     module = MagicMock()
     module.Neo4jClient.return_value = client
     monkeypatch.setitem(sys.modules, "graph_db", module)
-    monkeypatch.setitem(sys.modules, "recon.main", MagicMock())
     monkeypatch.setattr(port_scanning, "_build_port_scan_data_from_graph", _graph_recon)
     return client
 

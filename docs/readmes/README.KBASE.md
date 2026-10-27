@@ -59,7 +59,7 @@ graph TB
         SB[Source Boosts]
         RR[Cross-Encoder Rerank<br/>bge-reranker-base]
         MMR[MMR Diversity Filter]
-        SC[Sufficiency Check<br/>score >= 0.35?]
+        SC[Sufficiency Check<br/>score >= threshold?]
         TV[Tavily Fallback]
         RES[Results to Agent]
 
@@ -187,7 +187,7 @@ The pipeline uses a two-layer caching system to avoid redundant work:
 
 **Layer 1 -- File-level cache** (tarball sources only): Each downloaded file is hashed. On the next run, only files with changed hashes are re-parsed. Stored in `data/cache/<source>/.file_hashes.json`.
 
-**Layer 2 -- Chunk content-hash filter**: After chunking, each chunk's content is SHA-256 hashed. If a chunk's hash matches the previous run's manifest (`data/cache/.manifest.json`), it is skipped entirely -- no re-embedding, no re-upserting. This catches cases where files changed but the extracted chunks did not.
+**Layer 2 -- Chunk content-hash filter**: After chunking, each chunk's content is SHA-256 hashed. If a chunk's hash matches the previous run's manifest (`services/knowledge_base/data/cache/.manifest.json`, gitignored runtime data), it is skipped entirely -- no re-embedding, no re-upserting. This catches cases where files changed but the extracted chunks did not.
 
 ### NVD-specific behavior
 
@@ -234,7 +234,7 @@ flowchart TD
     end
 
     subgraph "Stage 6: Sufficiency Check"
-        CHECK["top_result.score >= 0.35?"]
+        CHECK["top_result.score >= threshold?"]
         YES["Return KB results"]
         NO["Fallback to Tavily<br/>merge if partial KB results"]
         CHECK -->|yes| YES
@@ -255,7 +255,7 @@ flowchart TD
 - **Source boosts** are multiplicative on the RRF score (pre-rerank) and on the sigmoid-transformed reranker score (post-rerank).
 - **Cross-encoder** returns raw logits (can be negative). Sigmoid is applied before boosting to ensure correct directionality.
 - **MMR** uses a lightweight similarity proxy (no stored vectors): `0.4 * same_source + 0.6 * title_jaccard`. Lambda=0.65 slightly favors relevance over diversity.
-- **Sufficiency threshold** defaults to 0.35. Below this, Tavily is queried as a fallback.
+- **Sufficiency threshold** is the project's `KB_SCORE_THRESHOLD`, else `retrieval.score_threshold`: 0.80 in the shipped `kb_config.yaml` (0.35 is the code default for a config without the key). Below it, Tavily is queried as a fallback.
 
 ---
 
@@ -300,7 +300,7 @@ flowchart TD
 ### Initialization Sequence
 
 1. `AgentOrchestrator.initialize()` calls `_setup_knowledge_base()`
-2. Feature gate: checks `KB_ENABLED` env var (default `true`). If `false`, returns `None`
+2. Feature gate: checks the `KB_ENABLED` env var. `redamon.sh` sets it from the `.kbase-enabled` flag file, and compose defaults it to `false`. If `false`, returns `None`
 3. Dynamic import of KB modules (graceful degradation if dependencies missing)
 4. Creates `Embedder` (model from `KB_EMBEDDING_MODEL` env var or config)
 5. Creates `FAISSIndexer` pointed at `KB_PATH` (default `/app/knowledge_base/data`)
@@ -315,7 +315,7 @@ The `web_search` tool implements a three-tier fallback:
 
 | Condition | Behavior |
 |---|---|
-| KB score >= threshold (0.35) | Return KB results only, skip Tavily |
+| KB score >= threshold | Return KB results only, skip Tavily |
 | KB score < threshold | Query Tavily, merge KB partial results with Tavily results |
 | KB fails, Tavily succeeds | Return Tavily results only |
 | Tavily fails, KB has partial results | Return KB results with "(Tavily unavailable)" header |
@@ -417,7 +417,7 @@ flowchart BT
 Located at `services/knowledge_base/kb_config.yaml`. Mounted read-only into the agent container.
 
 ```yaml
-KB_ENABLED: true
+KB_ENABLED: false                  # not read at runtime: the agent's KB_ENABLED env var decides
 
 embedder:
   model: "intfloat/e5-large-v2"   # 1024 dimensions, 512 token cap
@@ -439,7 +439,7 @@ fulltext:
 retrieval:
   top_k: 5
   overfetch_factor: 6              # candidate_pool = top_k * factor
-  score_threshold: 0.35            # below this, fall back to Tavily
+  score_threshold: 0.80            # below this, fall back to Tavily
   rrf_k: 60                        # RRF smoothing constant
 
 mmr:
@@ -460,6 +460,7 @@ ingestion:
   nvd_lookback_days: 90
   nvd_min_cvss: 7.0
   profiles:
+    cpu-lite: [tool_docs, gtfobins, lolbas]
     lite: [tool_docs, gtfobins, lolbas, owasp, exploitdb]
     standard: [tool_docs, gtfobins, lolbas, owasp, exploitdb, nvd]
     full: [tool_docs, gtfobins, lolbas, owasp, exploitdb, nvd, nuclei]
@@ -469,7 +470,7 @@ ingestion:
 
 | Variable | Config Path | Default |
 |---|---|---|
-| `KB_ENABLED` | top-level | `true` |
+| `KB_ENABLED` | none: the agent reads it, and `redamon.sh` sets it from `.kbase-enabled` | `false` |
 | `KB_EMBEDDING_MODEL` | `embedder.model` | `intfloat/e5-large-v2` |
 | `KB_RERANK_ENABLED` | `reranker.enabled` | `true` |
 | `KB_RERANKER_MODEL` | `reranker.model` | `BAAI/bge-reranker-base` |
@@ -817,7 +818,7 @@ There are **four ways** ingestion can start. Each ultimately calls the same Pyth
 flowchart TD
     subgraph "Entry Point 1: redamon.sh install / up / restart"
         CMD1["./redamon.sh install<br/>./redamon.sh up<br/>./redamon.sh restart"]
-        CHK1["is_kb_enabled()?<br/>reads KB_ENABLED env or<br/>kb_config.yaml"]
+        CHK1["is_kb_enabled()?<br/>.kbase-enabled flag file"]
         BOOT["_kb_bootstrap lite<br/>non-fatal on failure"]
         MAKE1["make kb-build-lite<br/>MODE=docker"]
         EXEC1["docker exec redamon-agent<br/>python -m knowledge_base<br/>.curation.data_ingestion<br/>--profile lite"]
@@ -903,19 +904,19 @@ flowchart TD
 
 | Step | What runs | Where | Code location |
 |---|---|---|---|
-| User runs `./redamon.sh install` | Starts containers, then calls `_kb_bootstrap lite` | Host shell | `redamon.sh:364-374` |
-| `_kb_bootstrap` calls `make kb-build-lite` | Runs `docker exec` into agent container | Host -> container | `Makefile:132-140` |
-| `data_ingestion.main()` starts | Parses CLI args, acquires lock | Agent container | `data_ingestion.py:580-640` |
-| `Embedder()` created | Loads `intfloat/e5-large-v2` model (pre-cached in image) | Agent container | `embedder.py:60-70` |
-| `FAISSIndexer()` created | Points at `/app/knowledge_base/data`, loads existing index if present | Agent container | `faiss_indexer.py:80-95` |
-| `Neo4jLoader()` created | Connects to `bolt://neo4j:7687`, creates schema | Agent container -> Neo4j | `neo4j_loader.py:82-100` |
+| User runs `./redamon.sh install` | Starts containers, then calls `_kb_bootstrap` with the profile `_kb_choose_profile` picks (`lite` or `cpu-lite`) | Host shell | `redamon.sh`: `cmd_install` |
+| `_kb_bootstrap` calls `make kb-build-<profile>` | Runs `docker exec` into agent container | Host -> container | `services/knowledge_base/Makefile`: `kb-build-lite` |
+| `data_ingestion.main()` starts | Parses CLI args; `run_ingestion` acquires the lock | Agent container | `data_ingestion.py`: `main`, `run_ingestion` |
+| Embedder created | `create_embedder` loads `intfloat/e5-large-v2` (pre-cached in image) or the API embedder | Agent container | `embedder.py`: `create_embedder`, `Embedder` |
+| `FAISSIndexer()` created | Points at `/app/knowledge_base/data`, loads existing index if present | Agent container | `faiss_indexer.py`: `FAISSIndexer` |
+| `Neo4jLoader()` created | Connects to `bolt://neo4j:7687`, creates schema | Agent container -> Neo4j | `neo4j_loader.py`: `Neo4jLoader` |
 | `client.fetch()` per source | Downloads tarball/CSV/API data via `safe_get()` | Agent container -> internet | `*_client.py` |
 | `client.to_chunks()` | Parses raw data into chunk dicts with `chunk_id`, `content`, `title` | Agent container (CPU) | `*_client.py` |
-| `_filter_unchanged()` | SHA-256 content hashes vs `.manifest.json`, drops unchanged | Agent container (CPU) | `data_ingestion.py:430-490` |
-| `embedder.embed_documents_batch()` | Runs sentence-transformer model on chunk texts, batch_size=64 | Agent container (CPU) | `embedder.py:130-160` |
-| `faiss_indexer.add()` | Adds vectors + chunk_ids to in-memory FAISS index | Agent container (RAM) | `faiss_indexer.py:105-125` |
-| `neo4j_loader.upsert_chunks()` | MERGE by chunk_id, dual-label (`:KBChunk:SourceChunk`) | Agent -> Neo4j | `neo4j_loader.py:130-175` |
-| `faiss_indexer.save()` | Atomic write `index.faiss` + `chunk_ids.json` + manifest | Agent container (disk) | `faiss_indexer.py:130-175` |
+| `_filter_unchanged()` | SHA-256 content hashes vs `.manifest.json`, drops unchanged | Agent container (CPU) | `data_ingestion.py`: `_filter_unchanged` |
+| `embedder.embed_documents_batch()` | Runs sentence-transformer model on chunk texts, batch_size=64 | Agent container (CPU) | `embedder.py`: `embed_documents_batch` |
+| `faiss_indexer.add()` | Adds vectors + chunk_ids to in-memory FAISS index | Agent container (RAM) | `faiss_indexer.py`: `add` |
+| `neo4j_loader.upsert_chunks()` | MERGE by chunk_id, dual-label (`:KBChunk:SourceChunk`) | Agent -> Neo4j | `neo4j_loader.py`: `upsert_chunks` |
+| `faiss_indexer.save()` | Atomic write `index.faiss` + `chunk_ids.json` + manifest | Agent container (disk) | `faiss_indexer.py`: `save` |
 
 ---
 
@@ -937,8 +938,8 @@ flowchart TD
     end
 
     subgraph "WebSearchToolManager"
-        WSM["web_search tool closure<br/>tools.py"]
-        CHK["KB attached?"]
+        WSM["web_search tool closure<br/>WebSearchToolManager.get_tool()"]
+        CHK["KB attached and on?"]
         SRCS["Resolve sources<br/>include/exclude from args<br/>or project KB_ENABLED_SOURCES"]
         CLAMP["Clamp top_k to 1-20"]
     end
@@ -956,7 +957,7 @@ flowchart TD
     end
 
     subgraph "Sufficiency Decision"
-        SUFF["top_result.score >= 0.35?"]
+        SUFF["top_result.score >= threshold?"]
         KB_OK["Format KB results<br/>sanitize content<br/>wrap in UNTRUSTED frame"]
         TAVILY["Call Tavily API<br/>search_depth=advanced"]
         MERGE["Merge KB partial +<br/>Tavily results"]
@@ -990,9 +991,9 @@ flowchart TD
     RERANK --> MMR_Q
     MMR_Q --> SUFF
 
-    SUFF -->|">= 0.35"| KB_OK
+    SUFF -->|">= threshold"| KB_OK
     KB_OK --> RESULT
-    SUFF -->|"< 0.35"| TAVILY
+    SUFF -->|"< threshold"| TAVILY
     TAVILY -->|success + KB partial| MERGE
     MERGE --> RESULT
     TAVILY -->|fail + KB partial| KB_ONLY
@@ -1007,25 +1008,25 @@ flowchart TD
 
 | # | Step | Component | Code location | Latency |
 |---|---|---|---|---|
-| 1 | User sends chat message | Webapp | `webapp/src/app/api/chat/` | -- |
-| 2 | Webapp forwards to agent API | Agent HTTP | `orchestrator.py` | ~ms |
+| 1 | User sends chat message over the browser's WebSocket to the agent | Webapp | `webapp/src/hooks/agentWsUrl.ts` (`/ws/agent`) | -- |
+| 2 | The agent's WebSocket handler passes it to the orchestrator | Agent | `websocket_api.py` -> `orchestrator.py` | ~ms |
 | 3 | LLM decides to call `web_search` | LLM inference | (external API) | ~1-3s |
-| 4 | Tool invocation enters `WebSearchToolManager` | Agent | `tools.py:570-580` | -- |
-| 5 | Check if KB is attached | Agent | `tools.py:588` | -- |
-| 6 | Resolve `include_sources` from args or project settings | Agent | `tools.py:578-582` | -- |
-| 7 | Clamp `top_k` to [1, 20] | Agent | `tools.py:587` | -- |
-| 8 | `kb.query()` starts | KB Orchestrator | `kb_orchestrator.py:90` | -- |
-| 9 | Embed query with `e5-large-v2` (prepend `"query: "`) | Embedder | `embedder.py:100-110` | ~30ms |
-| 10 | FAISS inner-product search on normalized vectors | FAISSIndexer | `faiss_indexer.py:110-130` | ~5ms |
-| 11 | Neo4j Lucene fulltext search on `content` + `title` | Neo4jLoader | `neo4j_loader.py:285-330` | ~5ms |
-| 12 | RRF fusion merges vector + keyword ranked lists | KB Orchestrator | `kb_orchestrator.py:240-270` | <1ms |
-| 13 | Neo4j metadata fetch + source/CVSS/severity filter | Neo4jLoader | `neo4j_loader.py:230-280` | ~5ms |
-| 14 | Multiply scores by source boost factors | KB Orchestrator | `kb_orchestrator.py:145-155` | <1ms |
-| 15 | Cross-encoder rerank (top 30, sigmoid, re-boost) | Reranker | `reranker.py:130-190` | ~200ms |
-| 16 | MMR diversity selection (top_k from pool) | KB Orchestrator | `kb_orchestrator.py:280-340` | <1ms |
-| 17 | Sufficiency check: `results[0].score >= 0.35` | KB Orchestrator | `kb_orchestrator.py:230-235` | -- |
-| 18a | **If sufficient**: sanitize, frame, return KB results | Agent | `tools.py:600-640` | -- |
-| 18b | **If insufficient**: call Tavily, merge with partials | Agent | `tools.py:606-626` | ~1-2s |
+| 4 | Tool invocation enters the `web_search` closure built by `WebSearchToolManager.get_tool()` | Agent | `agentic/tools.py`: `WebSearchToolManager.get_tool` | -- |
+| 5 | Check the KB is attached and not turned off for the project (`KB_ENABLED`) | Agent | `agentic/tools.py`: `web_search` (`kb and kb_on`) | -- |
+| 6 | Resolve `include_sources` from args, else the project's `KB_ENABLED_SOURCES` | Agent | `agentic/tools.py`: `web_search` (`effective_include`) | -- |
+| 7 | Clamp a caller-given `top_k` to [1, 20]; without one, `KB_TOP_K` or `retrieval.top_k` | Agent | `agentic/tools.py`: `web_search` | -- |
+| 8 | `kb.query()` starts | KB Orchestrator | `kb_orchestrator.py`: `PentestKnowledgeBase.query` | -- |
+| 9 | Embed query with `e5-large-v2` (prepend `"query: "`) | Embedder | `embedder.py`: `Embedder.embed_query` | ~30ms |
+| 10 | FAISS inner-product search on normalized vectors | FAISSIndexer | `faiss_indexer.py`: `FAISSIndexer.search` | ~5ms |
+| 11 | Neo4j Lucene fulltext search on `content` + `title` | Neo4jLoader | `neo4j_loader.py`: `Neo4jLoader.fulltext_search` | ~5ms |
+| 12 | RRF fusion merges vector + keyword ranked lists | KB Orchestrator | `kb_orchestrator.py`: `PentestKnowledgeBase._rrf_score_map` | <1ms |
+| 13 | Neo4j metadata fetch + source/CVSS/severity filter | Neo4jLoader | `neo4j_loader.py`: `Neo4jLoader.filter_chunks` | ~5ms |
+| 14 | Drop `exclude_sources`, multiply scores by source boost factors | KB Orchestrator | `kb_orchestrator.py`: `PentestKnowledgeBase.query` | <1ms |
+| 15 | Cross-encoder rerank (top 30, sigmoid, re-boost) | Reranker | `reranker.py`: `CrossEncoderReranker.rerank` (sigmoid and re-boost in `PentestKnowledgeBase.query`) | ~200ms |
+| 16 | MMR diversity selection (top_k from pool) | KB Orchestrator | `kb_orchestrator.py`: `PentestKnowledgeBase._mmr_rerank` | <1ms |
+| 17 | Sufficiency check: `results[0].score >= threshold` (`KB_SCORE_THRESHOLD`, else `retrieval.score_threshold`) | KB Orchestrator | `kb_orchestrator.py`: `PentestKnowledgeBase.is_sufficient` | -- |
+| 18a | **If sufficient**: sanitize, frame, return KB results | Agent | `agentic/tools.py`: `_format_kb_results` | -- |
+| 18b | **If insufficient**: call Tavily, merge with partials | Agent | `agentic/tools.py`: `_tavily_search`, `_merge_results` | ~1-2s |
 | 19 | Tool result injected into LLM context | Agent | `orchestrator.py` | -- |
 
 ### When does the LLM call web_search?

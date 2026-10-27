@@ -159,3 +159,19 @@ describe('useDownloadMarkdown header', () => {
     expect(idx('**Wall time:**')).toBeLessThan(idx('**Tokens:**'))
   })
 })
+
+describe('useDownloadMarkdown tool status tags', () => {
+  const toolCard = (extra: any): ChatItem => ({
+    type: 'tool_execution', id: `tool-${Math.random()}`, timestamp: new Date(1_000),
+    tool_name: 'tradecraft_lookup', tool_args: {}, status: 'running', output_chunks: ['PoC not found'], ...extra,
+  } as unknown as ChatItem)
+
+  test('a returned tool awaiting analysis exports as ANALYZING, a cut-off one as INTERRUPTED', async () => {
+    await run([toolCard({ finished: true })])
+    expect(captured).toContain('[ANALYZING]')
+    await run([toolCard({ status: 'error', interrupted: true })])
+    expect(captured).toContain('[INTERRUPTED]')
+    await run([toolCard({})])
+    expect(captured).toContain('[RUNNING]')
+  })
+})

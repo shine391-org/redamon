@@ -30,6 +30,7 @@ export enum MessageType {
   THINKING_CHUNK = 'thinking_chunk',
   TOOL_START = 'tool_start',
   TOOL_OUTPUT_CHUNK = 'tool_output_chunk',
+  TOOL_FINISHED = 'tool_finished',
   TOOL_COMPLETE = 'tool_complete',
   PHASE_UPDATE = 'phase_update',
   TODO_UPDATE = 'todo_update',
@@ -68,6 +69,27 @@ export enum MessageType {
   LATS_START = 'lats_start',
   LATS_TREE_UPDATE = 'lats_tree_update',
   LATS_COMPLETE = 'lats_complete',
+
+  // Background-job lifecycle (job_spawn / job_cancel), fanned out by
+  // agentic/ws_job_emitter.py to every connection of the job's project.
+  JOB_UPDATE = 'job_update',
+}
+
+/**
+ * Server messages the webapp receives and deliberately does nothing with, each
+ * with the reason. Every other server message must have a handler:
+ * websocket-types.parity.test.ts fails a value that has neither, so a message
+ * the agent adds is a decision instead of a silent drop.
+ */
+export const IGNORED_SERVER_MESSAGES: Readonly<Partial<Record<MessageType, string>>> = {
+  [MessageType.JOB_UPDATE]:
+    'No webapp view lists agent background jobs; the agent reads a job through job_status / job_wait, whose output the drawer shows as a tool result.',
+  [MessageType.THINKING_CHUNK]:
+    'The drawer renders the complete thought from THINKING, not the streamed partials.',
+  [MessageType.EXECUTION_STEP]:
+    'The drawer builds its timeline from the tool and thinking events; the step record is not displayed.',
+  [MessageType.SKILL_INJECT_ACK]:
+    'The drawer shows an injected chat skill when it sends it; the queue position in the ack is not displayed.',
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +372,10 @@ export interface ConnectedPayload {
   protocol_version?: number
   /** Server-advertised feature flags (e.g. "fireteam", "plan_tools"). */
   features?: string[]
+  /** Whether this session's run is still going on the server. Events emitted
+   *  while the socket was down are lost, so every (re)connect uses this to
+   *  keep or clear the spinner. Absent from agents older than this field. */
+  agent_running?: boolean
 }
 
 export interface ThinkingPayload {
@@ -370,6 +396,8 @@ export interface ToolStartPayload {
   tool_name: string
   tool_args: Record<string, any>
   wave_id?: string
+  /** Stable per-step id, repeated on this tool's chunk/finished/complete. */
+  step_id?: string
 }
 
 export interface ToolOutputChunkPayload {
@@ -377,6 +405,15 @@ export interface ToolOutputChunkPayload {
   chunk: string
   is_final: boolean
   wave_id?: string
+  step_id?: string
+}
+
+/** The tool itself returned; its tool_complete follows after the next think turn. */
+export interface ToolFinishedPayload {
+  tool_name: string
+  success: boolean
+  duration_ms?: number
+  step_id?: string
 }
 
 export interface ToolCompletePayload {
@@ -388,6 +425,7 @@ export interface ToolCompletePayload {
   wave_id?: string
   step_index?: number
   duration_ms?: number
+  step_id?: string
 }
 
 export interface PlanStartPayload {
@@ -407,7 +445,7 @@ export interface PlanCompletePayload {
 export interface PhaseUpdatePayload {
   current_phase: string
   iteration_count: number
-  attack_path_type?: string  // "cve_exploit" | "sql_injection" | "xss" | "ssrf" | "rce" | "path_traversal" | "access_control" | "xxe" | "crypto_attack" | "http_request_smuggling" | "brute_force_credential_guess" | "phishing_social_engineering" | "denial_of_service" | "user_skill:<id>" | "<term>-unclassified"
+  attack_path_type?: string  // a KNOWN_ATTACK_PATHS id (agentic/state.py), "user_skill:<id>" or "<term>-unclassified"
 }
 
 export interface TodoItem {

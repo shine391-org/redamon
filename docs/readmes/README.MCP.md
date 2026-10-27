@@ -8,7 +8,7 @@ This document describes the **five system MCP servers** that ship inside the kal
 > and drive recon as one user — is a separate feature, **MCP Server**.
 > See [README.MCP.SERVER.md](README.MCP.SERVER.md).
 
-> **Adding your own MCP servers via the UI** (Shodan, GitHub, Censys, your own internal MCPs, ...) is a separate user-facing feature called **MCP Tool Plugins**. Open Global Settings → MCP Tool Plugins tab. 39 prefilled presets are available for one-click setup. Plugins added there auto-appear in every project's Tool Matrix and in the agent's system prompt within ~1 second of save — no rebuild, no migration. See the **[MCP Tool Plugins wiki page](https://github.com/samugit83/redamon/wiki/MCP-Tool-Plugins)** for the full operator manual covering form fields, the live discovery flow, the validation rules, and the storage / security model.
+> **Adding your own MCP servers via the UI** (Shodan, GitHub, Censys, your own internal MCPs, ...) is a separate user-facing feature called **MCP Tool Plugins**. Open Global Settings → MCP Tool Plugins tab. Prefilled presets (`MCP_PRESETS` in `webapp/src/lib/mcp/presets.ts`) are available for one-click setup. Plugins added there auto-appear in every project's Tool Matrix and in the agent's system prompt within ~1 second of save — no rebuild, no migration. See the **[MCP Tool Plugins wiki page](https://github.com/samugit83/redamon/wiki/MCP-Tool-Plugins)** for the full operator manual covering form fields, the live discovery flow, the validation rules, and the storage / security model.
 
 > **Not the same as Plugins.** RedAmon [Plugins](README.PLUGINS.md) are optional features an admin installs from the signed plugin catalog on the Plugins page; MCP Tool Plugins are MCP servers connected to the agent from Global Settings.
 
@@ -487,7 +487,8 @@ default:
   stack at all, set `MCP_AUTH_TOKEN` in `.env` (or just run `redamon.sh`).
 
 This closes the unauthenticated-RCE surface tracked as STRIDE **S10 / E1 / I9**
-in `_local/internal/stride/README.TM.STRIDE.md`.
+in the maintainers' threat model; the public control catalog is
+[README.SECURITY_POSTURE.md](README.SECURITY_POSTURE.md).
 
 ## Troubleshooting
 

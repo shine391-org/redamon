@@ -31,14 +31,21 @@ from urllib.parse import urlsplit
 
 #: Confirmed live by the owning API. The only status that means "act now".
 VALIDATED = "validated"
-#: Verification ran and the API said the credential is not live.
-UNVALIDATED = "unvalidated"
+#: Verification ran and the API said the credential is not live. The same word
+#: js_recon writes for a provider's refusal, which the Priority Board reads as
+#: inactive.
+REJECTED = "rejected"
 #: The verify call itself errored — NOT proof the credential is dead.
 VERIFY_ERROR = "verify_error"
 #: Verification was switched off for the whole scan. Never checked.
 UNVERIFIED = "unverified"
 
-VALIDATION_STATUSES = (VALIDATED, UNVALIDATED, VERIFY_ERROR, UNVERIFIED)
+VALIDATION_STATUSES = (VALIDATED, REJECTED, VERIFY_ERROR, UNVERIFIED)
+
+#: What nodes written before REJECTED hold for it. js_recon means "no
+#: validator" by the same word, so readers take it as rejected for a
+#: MultiscannerFinding only.
+UNVALIDATED = "unvalidated"
 
 
 def validation_status(result: dict, verification_enabled: bool = True) -> str:
@@ -54,7 +61,7 @@ def validation_status(result: dict, verification_enabled: bool = True) -> str:
         return VALIDATED
     if result.get("VerificationError"):
         return VERIFY_ERROR
-    return UNVALIDATED
+    return REJECTED
 
 
 # ---------------------------------------------------------------------------

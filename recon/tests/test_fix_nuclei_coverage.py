@@ -100,6 +100,13 @@ class TestNucleiUnavailable:
         data = vs.run_vuln_scan_isolated(_recon(), _settings())
         assert data == {"vuln_scan": {"security_checks": SECURITY_RESULT["security_checks"]}}
 
+    def test_the_isolated_wrapper_returns_the_cve_lookup_too(self, pipeline, monkeypatch):
+        monkeypatch.setattr(vs, "is_docker_running", lambda: False)
+        data = vs.run_vuln_scan_isolated(_recon(), _settings(CVE_LOOKUP_ENABLED=True))
+        assert pipeline["cve"] == 1
+        assert data["technology_cves"] == {"summary": {"total_cves": 0}}
+        assert data["vuln_scan"]["security_checks"] == SECURITY_RESULT["security_checks"]
+
     def test_a_healthy_scan_degrades_nothing(self, pipeline):
         out = vs.run_vuln_scan(_recon(), settings=_settings())
         assert [p["label"] for p in pipeline["passes"]] == ["DETECTION"]

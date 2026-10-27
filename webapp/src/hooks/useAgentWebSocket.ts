@@ -16,8 +16,25 @@ import {
   type QueryPayload,
   type ApprovalPayload,
   type AnswerPayload,
+  type ConnectedPayload,
   isServerMessage,
 } from '@/lib/websocket-types'
+
+/** Client -> server messages that must reach the agent even when the socket is
+ *  down at the moment of the click: they wait in an outbox and go out right
+ *  after the next CONNECTED. Dropping them silently left Stop doing nothing. */
+const OUTBOX_TYPES = new Set<MessageType>([
+  MessageType.STOP,
+  MessageType.TOOL_STOP,
+  MessageType.GUIDANCE,
+  MessageType.SKILL_INJECT,
+])
+const OUTBOX_MAX = 20
+
+export const PING_INTERVAL_MS = 30_000
+/** No PONG for this long means the socket is dead even though the browser
+ *  still reports it open (half-open TCP): reconnect instead of waiting. */
+export const PONG_TIMEOUT_MS = 75_000
 
 // =============================================================================
 // HOOK CONFIGURATION
@@ -29,9 +46,12 @@ interface UseAgentWebSocketConfig {
   sessionId: string
   graphViewCypher?: string
   enabled?: boolean
+  /** A run is in progress: a graph-view change then waits for it to end
+   *  instead of reconnecting, which would drop live events mid-run. */
+  runActive?: boolean
   onMessage?: (message: ServerMessage) => void
   onError?: (error: Error) => void
-  onConnect?: () => void
+  onConnect?: (payload: ConnectedPayload) => void
   onDisconnect?: () => void
   maxReconnectAttempts?: number
   reconnectInterval?: number
@@ -66,6 +86,7 @@ export function useAgentWebSocket({
   sessionId,
   graphViewCypher,
   enabled = true,
+  runActive = false,
   onMessage,
   onError,
   onConnect,
@@ -85,6 +106,19 @@ export function useAgentWebSocket({
   // Set when the ticket mint came back empty, so the agent's 1008 rejection can
   // name the actual cause instead of a generic auth error.
   const ticketMissingRef = useRef(false)
+  // Each queued message remembers its session: a Stop clicked while
+  // disconnected must never reach another session the page switched to.
+  const outboxRef = useRef<{ sessionKey: string; message: ClientMessage }[]>([])
+  const sessionKey = `${userId}:${projectId}:${sessionId}`
+  const sessionKeyRef = useRef(sessionKey)
+  sessionKeyRef.current = sessionKey
+  const lastPongAtRef = useRef(0)
+  const connectRef = useRef<() => void>(() => {})
+  // Read at init time, so a view change does not have to rebuild sendInit.
+  const graphViewCypherRef = useRef(graphViewCypher)
+  graphViewCypherRef.current = graphViewCypher
+  // The view the live connection was opened with (see the view effect below).
+  const appliedViewRef = useRef(graphViewCypher)
 
   // Get WebSocket URL - auto-detect from browser location so it works on any
   // machine. The chat socket authenticates via the init frame (not a URL ticket).
@@ -92,15 +126,25 @@ export function useAgentWebSocket({
 
   // Send a message to the server
   const sendMessage = useCallback(<T = any>(type: MessageType, payload: T) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+    const message: ClientMessage<T> = { type, payload }
+    const ready = wsRef.current && wsRef.current.readyState === WebSocket.OPEN
+      && (isAuthenticatedRef.current || type === MessageType.INIT)
+    if (!ready) {
+      if (OUTBOX_TYPES.has(type) && outboxRef.current.length < OUTBOX_MAX) {
+        outboxRef.current.push({ sessionKey: sessionKeyRef.current, message })
+      }
       return
     }
-
-    const message: ClientMessage<T> = { type, payload }
-    const messageStr = JSON.stringify(message)
-
-    wsRef.current.send(messageStr)
+    wsRef.current!.send(JSON.stringify(message))
   }, [])
+
+  const flushOutbox = useCallback(() => {
+    const queued = outboxRef.current
+    outboxRef.current = []
+    for (const { sessionKey: key, message } of queued) {
+      if (key === sessionKeyRef.current) sendMessage(message.type, message.payload)
+    }
+  }, [sendMessage])
 
   // Send initialization message.
   // STRIDE S6: fetch a short-lived ticket (JWT cookie sent automatically) and
@@ -131,11 +175,12 @@ export function useAgentWebSocket({
       project_id: projectId,
       session_id: sessionId,
       ...(ticket && { ticket }),
-      ...(graphViewCypher && { graph_view_cypher: graphViewCypher }),
+      ...(graphViewCypherRef.current && { graph_view_cypher: graphViewCypherRef.current }),
     }
+    appliedViewRef.current = graphViewCypherRef.current
 
     sendMessage(MessageType.INIT, initPayload)
-  }, [userId, projectId, sessionId, graphViewCypher, sendMessage])
+  }, [userId, projectId, sessionId, sendMessage])
 
   // Public API: Send query
   const sendQuery = useCallback((question: string) => {
@@ -195,19 +240,16 @@ export function useAgentWebSocket({
 
   // Public API: Send guidance (steer agent while it's working)
   const sendGuidance = useCallback((message: string) => {
-    if (!isAuthenticatedRef.current) return
     sendMessage(MessageType.GUIDANCE, { message })
   }, [sendMessage])
 
   // Public API: Send skill injection (push Chat Skill content into guidance queue)
   const sendSkillInject = useCallback((payload: { skill_id: string; skill_name: string; content: string }) => {
-    if (!isAuthenticatedRef.current) return
     sendMessage(MessageType.SKILL_INJECT, payload)
   }, [sendMessage])
 
   // Public API: Stop agent execution
   const sendStop = useCallback(() => {
-    if (!isAuthenticatedRef.current) return
     sendMessage(MessageType.STOP, {})
   }, [sendMessage])
 
@@ -221,7 +263,6 @@ export function useAgentWebSocket({
   // but scoped to one tool_execution card). Backend cancels just that tool
   // task; the tool completes with success=false and the agent flow proceeds.
   const sendToolStop = useCallback((tool_name: string, wave_id?: string, step_index?: number) => {
-    if (!isAuthenticatedRef.current) return
     const payload: { tool_name: string; wave_id?: string; step_index?: number } = { tool_name }
     if (wave_id) payload.wave_id = wave_id
     if (step_index !== undefined && step_index !== null) payload.step_index = step_index
@@ -234,11 +275,18 @@ export function useAgentWebSocket({
       clearInterval(pingIntervalRef.current)
     }
 
+    lastPongAtRef.current = Date.now()
     pingIntervalRef.current = setInterval(() => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        sendMessage(MessageType.PING, {})
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+      if (Date.now() - lastPongAtRef.current > PONG_TIMEOUT_MS) {
+        // The agent stopped answering on this socket: a half-open connection
+        // never fires onclose, so the page would sit on a stale timeline.
+        setStatus(ConnectionStatus.RECONNECTING)
+        connectRef.current()
+        return
       }
-    }, 30000) // Ping every 30 seconds
+      sendMessage(MessageType.PING, {})
+    }, PING_INTERVAL_MS)
   }, [sendMessage])
 
   // Stop ping interval
@@ -268,11 +316,13 @@ export function useAgentWebSocket({
         setReconnectAttempt(0)
         setError(null)
         startPingInterval()
-        onConnect?.()
+        flushOutbox()
+        onConnect?.(message.payload as ConnectedPayload)
       }
 
       // Handle PONG message
       if (message.type === MessageType.PONG) {
+        lastPongAtRef.current = Date.now()
         return // Don't forward pong to message handler
       }
 
@@ -281,7 +331,7 @@ export function useAgentWebSocket({
 
     } catch (err) {
     }
-  }, [onMessage, onConnect, startPingInterval])
+  }, [onMessage, onConnect, startPingInterval, flushOutbox])
 
   // Handle WebSocket errors
   const handleError = useCallback((event: Event) => {
@@ -377,6 +427,7 @@ export function useAgentWebSocket({
       onError?.(connectionError)
     }
   }, [getWebSocketUrl, sendInit, handleMessage, handleError, handleClose, onError])
+  connectRef.current = connect
 
   // Public API: Disconnect
   const disconnect = useCallback(() => {
@@ -435,7 +486,15 @@ export function useAgentWebSocket({
         wsRef.current.close()
       }
     }
-  }, [enabled, userId, projectId, sessionId, graphViewCypher]) // Reconnect if session or graph view changes
+  }, [enabled, userId, projectId, sessionId]) // Reconnect if the session changes
+
+  // The graph view is sent in INIT, so a new view needs a new connection, but
+  // not in the middle of a run: that reconnect drops the live stream exactly
+  // when it matters. A change made during a run applies once the run ends.
+  useEffect(() => {
+    if (!enabled || runActive || appliedViewRef.current === graphViewCypher) return
+    connectRef.current()
+  }, [enabled, runActive, graphViewCypher])
 
   return {
     status,

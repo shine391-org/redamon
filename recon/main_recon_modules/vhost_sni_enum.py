@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Iterable, NamedTuple, Optional
 
 from recon.helpers.roe_scope import _is_roe_excluded
+from recon.helpers.catchall import canonical_bytes, replace_hostnames as _replace_hostnames
 
 
 # Marker that separates the response body from curl's --write-out metadata in
@@ -200,6 +201,21 @@ def run_vhost_sni_enrichment(
     from recon.helpers import circuit_breaker as _cb
     vhost_scope = _cb.scope((), label="VhostSni", unit="port(s)")
     candidate_scope = _build_candidate_scope(combined_result, settings)
+
+    # A shared CDN edge answers almost any name with some customer's site or
+    # its own catch-all, so a wordlist there finds the CDN, not the target.
+    # Its graph names (and the custom lines) are still tried. Only edges are
+    # skipped: a Kubernetes ingress or a shared reverse proxy is exactly where
+    # real hidden apps live.
+    edge_ips = _shared_edge_ips(combined_result, ip_port_map) if use_default_wordlist else set()
+    wordlist_skipped = sorted(edge_ips)
+    if wordlist_skipped:
+        print(f"[-][VhostSni] Default wordlist skipped on {len(wordlist_skipped)} shared CDN edge IP(s)")
+        _cb.note_degraded("vhost_sni", entries=[{
+            "source": "vhost_sni_wordlist", "reason": "shared CDN edge",
+            "skipped": len(wordlist_skipped),
+        }])
+
     print(f"[*][VhostSni] Probing {len(ip_port_map)} IP target(s) with concurrency={concurrency}")
     for ip, ports in ip_port_map.items():
         try:
@@ -207,7 +223,7 @@ def run_vhost_sni_enrichment(
                 ip=ip,
                 ports=ports,
                 apex_domain=apex,
-                default_prefixes=default_prefixes if use_default_wordlist else [],
+                default_prefixes=default_prefixes if use_default_wordlist and ip not in edge_ips else [],
                 custom_lines=custom_lines,
                 graph_candidates=_collect_graph_candidates(combined_result, ip) if use_graph_candidates else [],
                 test_l7=test_l7,
@@ -217,6 +233,7 @@ def run_vhost_sni_enrichment(
                 size_tolerance=size_tolerance,
                 max_candidates=max_candidates_per_ip,
                 scope=candidate_scope,
+                dns_known=_dns_known_names(combined_result, ip),
             )
         except Exception as e:
             print(f"[!][VhostSni] IP {ip} probing failed: {e}")
@@ -242,7 +259,9 @@ def run_vhost_sni_enrichment(
 
             findings_flat.append(_build_finding_record(anomaly, ip, ip_result))
 
-            if inject_discovered:
+            # http_probe already has a DNS-known name; injecting it would only
+            # re-label a public site as discovered by this module.
+            if inject_discovered and not anomaly.get("dns_known"):
                 base_url = _build_baseurl(anomaly["hostname"], anomaly["port"], anomaly.get("scheme", "https"))
                 if base_url:
                     discovered_baseurls.add(base_url)
@@ -267,6 +286,7 @@ def run_vhost_sni_enrichment(
             "scan_timestamp": now_iso,
             "wordlist_default_used": use_default_wordlist,
             "wordlist_default_count": len(default_prefixes),
+            "wordlist_skipped_edge_ips": wordlist_skipped,
             "wordlist_custom_count": len(custom_lines),
             "graph_candidates_used": use_graph_candidates,
             "test_l7": test_l7,
@@ -355,8 +375,15 @@ def _probe_single_ip(
     size_tolerance: int,
     max_candidates: int,
     scope: Optional["_CandidateScope"] = None,
+    dns_known: Iterable[str] = (),
 ) -> dict:
-    """Run baseline + L7/L4 anomaly probes for one IP across all its ports."""
+    """Run baseline + L7/L4 anomaly probes for one IP across all its ports.
+
+    ``dns_known`` names resolve to this IP in public DNS: they are probed, but
+    only a routing inconsistency (L7 and L4 serving different pages) on one of
+    them is kept, since a site anyone can resolve is not a hidden vhost.
+    """
+    dns_known = {h.strip().lower().rstrip(".") for h in dns_known if isinstance(h, str)}
 
     candidates, out_of_scope_skipped = _scoped_candidates(
         apex_domain, default_prefixes, custom_lines, graph_candidates, scope)
@@ -373,6 +400,7 @@ def _probe_single_ip(
     is_permissive_frontend = False
     suppressed_by_control_total = 0
     suppressed_unstable_total = 0
+    suppressed_dns_known: set[str] = set()
     suppressed_as_noise: list[str] = []
     dead_ports: list[str] = []
 
@@ -499,6 +527,8 @@ def _probe_single_ip(
                 "port": port,
                 "scheme": scheme,
                 "layer": layer,
+                "layers_differ": layer == "both" and not _same_response(l7_res, l4_res, size_tolerance),
+                "dns_known": hostname in dns_known,
                 "baseline_status": baseline["status"],
                 "baseline_size": baseline["size"],
                 "observed_status": obs["status"],
@@ -527,6 +557,10 @@ def _probe_single_ip(
             )
         suppressed_by_control_total += port_suppressed_by_control
 
+        # Set aside before the re-probe (no traffic for a name that cannot be
+        # reported) and again after it, since a re-probe can reduce a routing
+        # inconsistency to one layer.
+        kept = _set_aside_dns_known(kept, suppressed_dns_known)
         if port_key in dead_ports:
             unstable = 0  # the port stopped answering: a second probe would only time out
         else:
@@ -535,6 +569,7 @@ def _probe_single_ip(
                 scheme=scheme, ip=ip, port=port, timeout=timeout, concurrency=concurrency,
                 baseline=baseline, size_tolerance=size_tolerance,
             )
+        kept = _set_aside_dns_known(kept, suppressed_dns_known)
         if unstable:
             print(
                 f"[*][VhostSni] IP {ip}:{port} ({scheme}) dropped {unstable} "
@@ -542,6 +577,10 @@ def _probe_single_ip(
             )
         suppressed_unstable_total += unstable
         anomalies.extend(kept)
+
+    if suppressed_dns_known:
+        print(f"[*][VhostSni] IP {ip}: {len(suppressed_dns_known)} name(s) public DNS already "
+              f"points here served their own site -- not reported as hidden")
 
     # Build the per-IP summary
     primary_baseline = next(iter(baselines.values()), None)
@@ -559,6 +598,7 @@ def _probe_single_ip(
         "is_permissive_frontend": is_permissive_frontend,
         "suppressed_by_control": suppressed_by_control_total,
         "suppressed_unstable": suppressed_unstable_total,
+        "suppressed_dns_known": len(suppressed_dns_known),
         "out_of_scope_skipped": out_of_scope_skipped,
         # A permissive frontend's anomalies are discarded as noise, not written
         # as findings; the count and a bounded sample keep that discard visible.
@@ -703,32 +743,6 @@ def _curl_probe(
             "title": _canonical_title(body, probed) if has_meta else None}
 
 
-# Per-request values that make one provider template hash differently on every
-# request: UUIDs, timestamps, Cloudflare Ray IDs and other hex request ids,
-# Akamai references, Fastly cache-node names, epoch numbers, and long
-# base64/ULID nonces. These rules only feed the "is this the same page as the
-# unknown-host page" comparison, never what is stored or shown, so erring
-# toward normalising is safe: a real hidden app differs in far more than ids.
-_VOLATILE_RULES: tuple[tuple[re.Pattern, bytes], ...] = (
-    (re.compile(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I), b"{UUID}"),
-    (re.compile(rb"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}| UTC)?"), b"{TS}"),
-    (re.compile(rb"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT"), b"{TS}"),
-    (re.compile(rb"reference(?:\s|&#32;)*(?:#|&#35;)\s*[0-9a-z.&#;]+", re.I), b"reference #{REF}"),
-    # Akamai's reference also appears bare, in its errors.edgesuite.net link,
-    # with plain or entity-encoded dots: 18.6bd3c917.1696512345.1a2b3c4d
-    (re.compile(rb"\b\d{1,3}(?:\.|&#46;)[0-9a-f]{6,10}(?:\.|&#46;)\d{9,10}(?:\.|&#46;)[0-9a-f]{4,10}\b", re.I), b"{AKREF}"),
-    # Azure Front Door's "Ref A/B/C" lines (edge node names, timestamps).
-    (re.compile(rb"\bRef [ABC]:\s*[^<\n]*"), b"Ref {REF}"),
-    # Upper-case alphanumeric request ids (S3's 16-character RequestId).
-    (re.compile(rb"\b(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{16,}\b"), b"{ID}"),
-    (re.compile(rb"\bcache-[a-z0-9-]+-[A-Z]{3}\b"), b"{EDGE}"),
-    # No `/` in a token: two different redirect paths must stay different.
-    (re.compile(rb"(?<![\w+=-])(?=[\w+=-]*\d)[\w+=-]{20,}"), b"{TOKEN}"),
-    (re.compile(rb"\b(?=[0-9a-f]*\d)[0-9a-f]{12,}(?:-[A-Z]{3})?\b", re.I), b"{HEX}"),
-    (re.compile(rb"\b\d{9,}\b"), b"{NUM}"),
-)
-
-
 _TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 
@@ -739,14 +753,6 @@ def _canonical_title(body: bytes, hostnames: list[str]) -> Optional[str]:
         return None
     title = _replace_hostnames(m.group(1), hostnames)
     return b" ".join(title.split()).decode("utf-8", "replace")[:200]
-
-
-def _replace_hostnames(data: bytes, hostnames: list[str]) -> bytes:
-    """Replace each probed hostname (plain or with HTML-entity dots) by {HOST}."""
-    for host in sorted({h.lower() for h in hostnames if h}, key=len, reverse=True):
-        for variant in (host, host.replace(".", "&#46;")):
-            data = re.sub(re.escape(variant.encode("ascii", "ignore")), b"{HOST}", data, flags=re.I)
-    return data
 
 
 def _canonical_fingerprint(
@@ -763,18 +769,12 @@ def _canonical_fingerprint(
     name (Fastly) or carries a fresh Ray ID (Cloudflare); the raw bytes then
     differ per probe while this fingerprint does not.
     """
-    def canon(data: bytes) -> bytes:
-        data = _replace_hostnames(data.replace(b"\r\n", b"\n"), hostnames)
-        for pattern, replacement in _VOLATILE_RULES:
-            data = pattern.sub(replacement, data)
-        return data
-
     mime = content_type.split(";", 1)[0].strip().lower()
     parts = [
         str(status).encode("ascii"),
-        canon(redirect_url.encode("utf-8", "ignore")),
+        canonical_bytes(redirect_url.encode("utf-8", "ignore"), hostnames),
         mime.encode("ascii", "ignore"),
-        canon(body),
+        canonical_bytes(body, hostnames),
     ]
     return hashlib.sha1(b"\x00".join(parts)).hexdigest()
 
@@ -961,13 +961,25 @@ def _drop_unstable(
         else:
             (layer,) = fired - bad
             obs = (first_results.get(a["hostname"]) or {})[layer]
-            a = dict(a, layer=layer, observed_status=obs["status"], observed_size=obs["size"],
-                     observed_fingerprint=obs.get("canon_hash") or "")
+            a = dict(a, layer=layer, layers_differ=False, observed_status=obs["status"],
+                     observed_size=obs["size"], observed_fingerprint=obs.get("canon_hash") or "")
             if baseline is not None:
                 a["size_delta"] = obs["size"] - baseline["size"]
                 a["severity"] = _classify_severity(a["hostname"], layer, baseline, obs, None, None, size_tolerance)
             kept.append(a)
     return kept, dropped
+
+
+def _set_aside_dns_known(anomalies: list[dict], set_aside: set) -> list[dict]:
+    """Drop the anomalies on DNS-known names that are not a routing
+    inconsistency, adding their hostnames to ``set_aside``."""
+    kept = []
+    for a in anomalies:
+        if a.get("dns_known") and not a.get("layers_differ"):
+            set_aside.add(a["hostname"])
+        else:
+            kept.append(a)
+    return kept
 
 
 def _detect_noisy_frontend(
@@ -1169,24 +1181,56 @@ def _is_valid_hostname(hostname: str) -> bool:
     return all(allowed.match(label) for label in hostname.split("."))
 
 
+def _resolves_here(dns_entry, ip: str) -> bool:
+    ip_set = (dns_entry or {}).get("ips") if isinstance(dns_entry, dict) else None
+    if not isinstance(ip_set, dict):
+        return False
+    return ip in (ip_set.get("ipv4") or []) or ip in (ip_set.get("ipv6") or [])
+
+
+def _dns_subdomains_on(combined_result: dict, ip: str) -> set[str]:
+    """Subdomains whose A/AAAA in this run's dns block include ``ip``."""
+    subs = ((combined_result.get("dns") or {}).get("subdomains")) or {}
+    return {name.strip().lower().rstrip(".") for name, info in subs.items()
+            if isinstance(name, str) and _resolves_here(info, ip)}
+
+
+def _dns_known_names(combined_result: dict, ip: str) -> set[str]:
+    """Names public DNS points at ``ip`` this run: its subdomains, the apex, and
+    the names httpx resolved to it.
+
+    Anyone can resolve them, so a site served for one of them is not hidden,
+    however much it differs from the raw-IP answer. On a shared CDN or proxy IP
+    every customer's site does differ, so without this each DNS-known name was
+    reported as a hidden vhost.
+
+    The httpx part matters for names found after the DNS phase (certificate
+    SANs, JS): they join the dns block with no addresses, and http_probe's
+    ``ip`` for a hostname URL is the address its own lookup returned.
+    """
+    names = _dns_subdomains_on(combined_result, ip)
+    apex = _detect_apex_domain(combined_result)
+    if apex and _resolves_here((combined_result.get("dns") or {}).get("domain"), ip):
+        names.add(apex)
+    by_url = ((combined_result.get("http_probe") or {}).get("by_url")) or {}
+    for info in by_url.values():
+        if not isinstance(info, dict) or info.get("ip") != ip:
+            continue
+        host = str(info.get("host") or "").strip().lower().rstrip(".")
+        if host and not _looks_like_ip(host):
+            names.add(host)
+    return names
+
+
 def _collect_graph_candidates(combined_result: dict, ip: str) -> list[str]:
     """
     Pull every hostname from the recon data that resolves to (or sits on) this
     IP. Sources: dns map, http_probe.by_host, urlscan/external domains, TLS
     SAN list captured by httpx.
     """
-    out: set[str] = set()
-
     # 1. DNS resolved subdomains pointing at this IP
+    out: set[str] = set(_dns_subdomains_on(combined_result, ip))
     dns = combined_result.get("dns") or {}
-    for sub_name, sub_info in (dns.get("subdomains") or {}).items():
-        if not isinstance(sub_info, dict):
-            continue
-        ip_set = (sub_info.get("ips") or {})
-        ipv4 = ip_set.get("ipv4") if isinstance(ip_set, dict) else None
-        ipv6 = ip_set.get("ipv6") if isinstance(ip_set, dict) else None
-        if (ipv4 and ip in ipv4) or (ipv6 and ip in ipv6):
-            out.add(sub_name.strip().lower())
 
     # 2. http_probe.by_host (alive hosts httpx already resolved)
     http_probe = combined_result.get("http_probe") or {}
@@ -1226,13 +1270,10 @@ def _collect_graph_candidates(combined_result: dict, ip: str) -> list[str]:
             if isinstance(cn, str) and cn.strip():
                 out.add(cn.strip().lower().rstrip("."))
 
-    # 6. Reverse DNS PTR records on this IP
-    ip_recon = combined_result.get("ip_recon") or {}
-    ptr = (ip_recon.get(ip) or {}).get("reverse_dns")
-    if isinstance(ptr, str) and ptr.strip():
-        out.add(ptr.strip().lower().rstrip("."))
+    # IP mode's PTR names need no source of their own: main records each one in
+    # the dns block with its address, so source 1 reads it (as a DNS-known name).
 
-    # 8. tlsx SAN list, matched on the scanned IP. Covers non-HTTP TLS ports and
+    # 6. tlsx SAN list, matched on the scanned IP. Covers non-HTTP TLS ports and
     # bare IPs httpx never dialled; empty when tlsx is off (harmless).
     tlsx = combined_result.get("tlsx") or {}
     for _key, entry in (tlsx.get("by_target") or {}).items():
@@ -1331,6 +1372,26 @@ def _collect_ip_targets(combined_result: dict) -> dict[str, list[dict]]:
         ip_to_ports[ip] = unique
 
     return ip_to_ports
+
+
+def _shared_edge_ips(combined_result: dict, ips: Iterable[str]) -> set[str]:
+    """The target IPs IP attribution tagged shared_edge.
+
+    An IP with no tag (the step was off, or a graph written before it) falls
+    back to the CDN checks: flagged by naabu, httpx or tlsx with an edge-only
+    CDN name, or inside a CDN's published edge prefix. Plain cloud-hosting
+    labels (aws, azure, gcp) do not count; those IPs serve the application
+    itself.
+    """
+    from recon.helpers.cdn_ranges import collect_reliable_edge_ips, edge_cdn_for_ip
+    ips = set(ips)
+    by_ip = ((combined_result.get("ip_attribution") or {}).get("by_ip")) or {}
+    tags = {ip: by_ip[ip].get("ownership") for ip in ips
+            if isinstance(by_ip.get(ip), dict) and by_ip[ip].get("ownership")}
+    untagged = ips - set(tags)
+    fallback = ((collect_reliable_edge_ips(combined_result) & untagged)
+                | {ip for ip in untagged if edge_cdn_for_ip(ip)})
+    return {ip for ip, tag in tags.items() if tag == "shared_edge"} | fallback
 
 
 def _scheme_for_port(port: int) -> str:
@@ -1436,8 +1497,14 @@ def _build_finding_record(anomaly: dict, ip: str, ip_result: dict) -> dict:
     layer = anomaly["layer"]
     severity = anomaly["severity"]
     internal_kw = anomaly.get("internal_pattern_match")
+    # Only a split between the layers is a routing inconsistency; when both
+    # reach the same page it is a hidden vhost seen twice. An anomaly built
+    # without the flag is "high" exactly when its layers differ.
+    layers_differ = anomaly.get("layers_differ")
+    if layers_differ is None:
+        layers_differ = layer == "both" and severity == "high"
 
-    if layer == "both":
+    if layer == "both" and layers_differ:
         vuln_type = "host_header_bypass"
         vuln_name = f"Routing Inconsistency (L7 vs L4): {hostname}"
         description = (
@@ -1453,6 +1520,14 @@ def _build_finding_record(anomaly: dict, ip: str, ip_result: dict) -> dict:
             f"The TLS reverse proxy on {ip}:{port} routes the SNI {hostname} to a backend "
             f"that does not respond to a bare IP request. This indicates an ingress controller "
             f"(NGINX, Traefik, k8s, Cloudflare) is fronting a hidden application."
+        )
+    elif layer == "both":
+        vuln_type = "hidden_vhost"
+        vuln_name = f"Hidden Virtual Host: {hostname}"
+        description = (
+            f"Setting Host: {hostname}, or the TLS SNI {hostname}, on {ip}:{port} returns the "
+            f"same page on both layers, and it differs from the baseline IP request. This "
+            f"typically reveals a vhost not exposed via DNS."
         )
     else:  # L7
         vuln_type = "hidden_vhost"
@@ -1489,6 +1564,7 @@ def _build_finding_record(anomaly: dict, ip: str, ip_result: dict) -> dict:
         "observed_size": anomaly["observed_size"],
         "size_delta": anomaly["size_delta"],
         "internal_pattern_match": internal_kw,
+        "dns_known": bool(anomaly.get("dns_known")),
         "description": description,
         "discovered_at": datetime.now(timezone.utc).isoformat(),
     }

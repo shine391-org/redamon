@@ -44,7 +44,8 @@ DISK_PARTIAL_BUILD_GB=15
 #
 # recon/ is bind mounted rw into the spawned recon container, and two of its
 # TRACKED data directories are re-downloaded there on a cache miss:
-#   * mitre_db          - add_mitre.py, CVE/CAPEC/CWE, 15 files, 24h TTL
+#   * mitre_db          - add_mitre.py, the 4 CAPEC/CWE resources, 24h TTL (the
+#                         CVE year files are downloaded too, but untracked)
 #   * wappalyzer_cache  - http_probe.py, technologies.json, 24h TTL
 # Both drift whenever their upstream publishes. Directories are listed rather
 # than files so a new sibling is covered automatically; entries may be either
@@ -334,7 +335,7 @@ _disk_reserve_gb() {
 # a clear message, instead of failing mysteriously later. Returns 1 to abort.
 # Override with REDAMON_SKIP_RAM_GATE=1 or REDAMON_MIN_RAM_MB=<mb>.
 preflight_ram_gate() {
-    [[ "${REDAMON_SKIP_RAM_GATE:-}" == "1" ]] && return 0
+    [[ "$(_env_knob REDAMON_SKIP_RAM_GATE)" == "1" ]] && return 0
     detect_build_resources
     local required_mb baseline_mb headroom_mb
     if [[ -n "${REDAMON_MIN_RAM_MB:-}" ]]; then
@@ -608,6 +609,15 @@ _env_knob() {
         END { gsub(/^[[:space:]]+|[[:space:]]+$/, "", val); print val }
     ' "$env_file"
 }
+
+# The .env.example keys only this script reads, through _env_knob on the host.
+# Compose forwards every other key; tests/test_env_example_keys.py fails on a key
+# that is in neither, because that is a documented knob that does nothing.
+HOST_ONLY_ENV_KEYS=(
+    OS_RESERVE_PCT SERVICES_PCT BURST_FACTOR BURST_SWAP_MIN_PCT BLAST_PCT
+    REDAMON_WEIGHT_WEBAPP REDAMON_WEIGHT_NEO4J REDAMON_WEIGHT_AGENT
+    REDAMON_SKIP_RAM_GATE REDAMON_ENABLE_ZRAM
+)
 
 # An integer percentage knob, with a default and a sane range.
 _pct_env() {
@@ -1097,7 +1107,7 @@ export_resource_caps() {
 # host only; a NO-OP on macOS/Windows (Docker Desktop's VM manages its own swap)
 # and when REDAMON_ENABLE_ZRAM != 1. Best-effort: never fatal, never interactive.
 setup_zram() {
-    [[ "${REDAMON_ENABLE_ZRAM:-}" == "1" ]] || return 0
+    [[ "$(_env_knob REDAMON_ENABLE_ZRAM)" == "1" ]] || return 0
 
     # Docker Desktop / WSL2 / mac: cannot add zram to the host VM from here.
     case "$(uname -s 2>/dev/null || echo unknown)" in
@@ -2753,6 +2763,15 @@ remove_spawned_containers() {
     fi
 }
 
+# The third-party tool images recon/entrypoint.sh pre-pulls (its IMAGES array),
+# one per line, read from that file so the list removed here is the list pulled.
+_recon_tool_images() {
+    local img
+    while IFS= read -r img; do
+        if [[ -n "$img" && "$img" != redamon-* ]]; then printf '%s\n' "$img"; fi
+    done < <(sed -n '/^IMAGES=(/,/^)/s/^[[:space:]]*"\([^"]*\)".*/\1/p' "$SCRIPT_DIR/recon/entrypoint.sh")
+}
+
 remove_redamon_images() {
     # Remove locally-built redamon images
     docker images --format '{{.Repository}}:{{.Tag}}' \
@@ -2764,27 +2783,13 @@ remove_redamon_images() {
         | grep 'registry.community.greenbone.net' \
         | xargs -r docker rmi 2>/dev/null || true
 
-    # Remove ProjectDiscovery + recon tool images (pulled at runtime by entrypoint)
-    local runtime_images=(
-        "projectdiscovery/naabu"
-        "projectdiscovery/httpx"
-        "projectdiscovery/katana"
-        "projectdiscovery/nuclei"
-        "projectdiscovery/subfinder"
-        "projectdiscovery/dnsx"
-        "projectdiscovery/uncover"
-        "sxcurity/gau"
-        "caffix/amass"
-        "frost19k/puredns"
-        "jauderho/hakrawler"
-        "trufflesecurity/trufflehog"
-        # On-demand local LLM (Ollama) for the AI Attack Surface judge/attacker —
-        # pulled at runtime by the orchestrator, not built.
-        "$LOCAL_LLM_IMAGE"
-    )
-    for img in "${runtime_images[@]}"; do
+    # Remove the recon tool images (pulled at runtime by recon/entrypoint.sh) and
+    # the on-demand local LLM (Ollama) the orchestrator pulls for the AI Attack
+    # Surface judge/attacker.
+    local img
+    while IFS= read -r img; do
         docker rmi "$img" 2>/dev/null || true
-    done
+    done < <(_recon_tool_images; printf '%s\n' "$LOCAL_LLM_IMAGE")
 }
 
 pull_gvm_images() {
@@ -3425,7 +3430,7 @@ cmd_install() {
     # switch is on (it is not compose-managed, so `up`/restart won't bring it back).
     ensure_capture_proxy_running
 
-    # Bootstrap the Knowledge Base if enabled (reads KB_ENABLED from kb_config.yaml).
+    # Bootstrap the Knowledge Base if enabled (the .kbase-enabled flag file).
     # Install always runs a fresh bootstrap -- first-time setup populates FAISS +
     # Neo4j from committed caches. Graceful failure: if bootstrap fails
     # (network, missing deps, etc.) the agent still starts with an empty KB
@@ -3479,8 +3484,10 @@ _map_core_changes() {
         restart_only+=(recon-orchestrator)
     fi
 
-    # kali-sandbox: rebuild only if Dockerfile/entrypoint changed, else restart
-    if echo "$changed_files" | grep -q "^mcp/kali-sandbox/\(Dockerfile\|entrypoint\)"; then
+    # kali-sandbox: its image bakes everything under mcp/kali-sandbox/ (pip
+    # constraints, the adkc helpers, the motd) and mcp/requirements.txt; any other
+    # mcp/ path is mounted over the baked copy, so a restart picks it up.
+    if echo "$changed_files" | grep -qE "^(mcp/kali-sandbox/|mcp/requirements\.txt$)"; then
         rebuild_core+=(kali-sandbox)
     elif echo "$changed_files" | grep -q "^mcp/"; then
         restart_only+=(kali-sandbox)
@@ -3520,17 +3527,105 @@ _map_core_changes() {
     fi
 }
 
-# graph_db/ is COPY-baked into these tool images. The orchestrator mounts the live
-# copy over it at spawn, except where it cannot resolve the host path (Docker
-# Desktop / WSL2, issue #169), and there the baked copy runs. Appends to the
-# CALLER's `rebuild_tools`; runs outside _map_core_changes so a release that also
-# changes docker-compose.yml (which skips that map) still rebuilds them.
+# graph_db/ is COPY-baked into these tool images (their Dockerfiles COPY it; the
+# supply-chain images only bind-mount it). The orchestrator mounts the live copy
+# over it at spawn, except where it cannot resolve the host path (Docker Desktop /
+# WSL2, issue #169), and there the baked copy runs. Appends to the CALLER's
+# `rebuild_tools`; called by _map_tool_changes, which runs even when
+# docker-compose.yml changed (that skips _map_core_changes).
 _map_baked_graph_db() {
     echo "$1" | grep -q "^graph_db/" || return 0
     local img
-    for img in recon vuln-scanner github-secret-hunter supply-chain supply-chain-analyzer; do
+    for img in recon vuln-scanner github-secret-hunter; do
         [[ " ${rebuild_tools[*]-} " == *" $img "* ]] || rebuild_tools+=("$img")
     done
+}
+
+# changed file -> tool-profile image map for `update`. Appends to the CALLER's
+# `rebuild_tools` and sets the CALLER's `rebuild_capture` / `rebuild_plugins`.
+_map_tool_changes() {
+    local changed_files="$1"
+    # Tool-profile images build ONLY from their own source dirs — a docker-compose.yml
+    # change never alters their content. So rebuild a tool image ONLY when its source
+    # actually changed, even under rebuild_all. This avoids spuriously rebuilding heavy
+    # / fragile tool images (e.g. ai-attack-surface, whose pyrit deps need a Rust
+    # toolchain on arm64) on an unrelated compose change.
+    # The recon image also COPYs recon_settings/ (the registry bounds and caps), and
+    # a scan whose host recon_settings path does not resolve runs the baked copy.
+    if echo "$changed_files" | grep -qE "^(recon|recon_settings)/"; then
+        rebuild_tools+=(recon)
+    fi
+    # wcvs: the Web Cache Vulnerability Scanner image (web cache poisoning module),
+    # run docker-in-docker by the recon container. Build-only; rebuild when its
+    # Dockerfile (or pinned WCVS_REF) changes.
+    if echo "$changed_files" | grep -q "^scanners/wcvs/"; then
+        rebuild_tools+=(wcvs)
+    fi
+    if echo "$changed_files" | grep -q "^scanners/gvm_scan/"; then
+        rebuild_tools+=(vuln-scanner)
+    fi
+    if echo "$changed_files" | grep -q "^scanners/github_secret_hunt/"; then
+        rebuild_tools+=(github-secret-hunter)
+    fi
+    if echo "$changed_files" | grep -q "^scanners/trufflehog_scan/"; then
+        rebuild_tools+=(trufflehog-scanner)
+    fi
+    if echo "$changed_files" | grep -q "^scanners/baddns_scan/"; then
+        rebuild_tools+=(baddns-scanner)
+    fi
+    # ai-attack-surface: heavy build-only image (Node + promptfoo + per-tool venvs).
+    # The adapter .py files are volume-mounted into the scan container at spawn
+    # (hot-reload, no rebuild); ONLY the baked-in toolchain — the Dockerfile or any
+    # requirements file — needs a rebuild.
+    if echo "$changed_files" | grep -qE "^scanners/ai_attack_surface_scan/(Dockerfile|.*requirements)"; then
+        rebuild_tools+=(ai-attack-surface)
+    fi
+    # codefix-sandbox: the isolated CodeFix build sandbox (T6/E10). Build-only
+    # image; rebuild when anything in its build context changes.
+    if echo "$changed_files" | grep -q "^scanners/codefix_sandbox/"; then
+        rebuild_tools+=(codefix-sandbox)
+    fi
+    # supply-chain (L1 CLEAN scanner): the .py source is volume-mounted into the
+    # spawned scan container (hot-reload), so rebuild the image ONLY when the
+    # baked layer changes -- the Dockerfile (osv-scanner binary) or requirements.
+    # Matches recon-orchestrator's precise rule. On the FIRST update onto this
+    # release these files are new, so the image is built; thereafter a pure .py
+    # change hot-reloads at spawn with no rebuild.
+    if echo "$changed_files" | grep -qE "^scanners/supply_chain_scan/(Dockerfile|requirements)"; then
+        rebuild_tools+=(supply-chain)
+    fi
+    # supply-chain-analyzer (DIRTY analyzer): entrypoint.py is BAKED (COPY), not
+    # mounted, so rebuild on ANY change to the analyzer dir (entrypoint or Dockerfile).
+    if echo "$changed_files" | grep -q "^scanners/supply_chain_analyzer/"; then
+        rebuild_tools+=(supply-chain-analyzer)
+    fi
+    _map_baked_graph_db "$changed_files"
+    # capture-proxy / traffic-ingest (HTTP Traffic Capture): both share the
+    # redamon-capture-proxy:latest image, built from scanners/capture_proxy/. It is in the
+    # "capture" profile — never started by `up`, but SPAWNED on demand by the
+    # orchestrator, which just runs the image (no on-demand build; scanners/capture_proxy/ is
+    # not mounted into the orchestrator). So `update` MUST rebuild it here or the
+    # proxy would keep serving stale capture/ingest/redaction/egress code. Handled
+    # separately from rebuild_tools because it needs its own profile flag to build.
+    if echo "$changed_files" | grep -q "^scanners/capture_proxy/"; then
+        rebuild_capture=true
+    fi
+    # The proxy image also COPYs two files OUT of recon_orchestrator/ at build
+    # time (hard_guardrail.py, ip_denylist.py — the shared hostname and
+    # resolved-IP denylists). Those live outside scanners/capture_proxy/, so a
+    # change to either would otherwise leave the proxy enforcing a stale guard
+    # while the orchestrator enforced the new one. tests/redamon_update_map_test.sh
+    # checks every COPY source of every built image against these rules.
+    if echo "$changed_files" | grep -qE "^recon_orchestrator/(hard_guardrail|ip_denylist)\.py$"; then
+        rebuild_capture=true
+    fi
+    # The plugin runner image: rebuilt when its sources or a compose file it depends on
+    # changed (cmd_update also builds it when missing). Never in rebuild_core or
+    # restart_only: plugins_converge alone starts the runner and the gateway, and
+    # recreates both after this rebuild.
+    if echo "$changed_files" | grep -qE "^(docker-compose(\.plugins)?\.yml$|services/plugin_runner/)"; then
+        rebuild_plugins=true
+    fi
 }
 
 # The webapp reaches the plugin services only through the overlay's network and volume,
@@ -3682,86 +3777,9 @@ cmd_update() {
         _map_core_changes "$changed_files"
     fi
 
-    # Tool-profile images build ONLY from their own source dirs — a docker-compose.yml
-    # change never alters their content. So rebuild a tool image ONLY when its source
-    # actually changed, even under rebuild_all. This avoids spuriously rebuilding heavy
-    # / fragile tool images (e.g. ai-attack-surface, whose pyrit deps need a Rust
-    # toolchain on arm64) on an unrelated compose change.
-    if echo "$changed_files" | grep -q "^recon/"; then
-        rebuild_tools+=(recon)
-    fi
-    # wcvs: the Web Cache Vulnerability Scanner image (web cache poisoning module),
-    # run docker-in-docker by the recon container. Build-only; rebuild when its
-    # Dockerfile (or pinned WCVS_REF) changes.
-    if echo "$changed_files" | grep -q "^scanners/wcvs/"; then
-        rebuild_tools+=(wcvs)
-    fi
-    if echo "$changed_files" | grep -q "^scanners/gvm_scan/"; then
-        rebuild_tools+=(vuln-scanner)
-    fi
-    if echo "$changed_files" | grep -q "^scanners/github_secret_hunt/"; then
-        rebuild_tools+=(github-secret-hunter)
-    fi
-    if echo "$changed_files" | grep -q "^scanners/trufflehog_scan/"; then
-        rebuild_tools+=(trufflehog-scanner)
-    fi
-    if echo "$changed_files" | grep -q "^scanners/baddns_scan/"; then
-        rebuild_tools+=(baddns-scanner)
-    fi
-    # ai-attack-surface: heavy build-only image (Node + promptfoo + per-tool venvs).
-    # The adapter .py files are volume-mounted into the scan container at spawn
-    # (hot-reload, no rebuild); ONLY the baked-in toolchain — the Dockerfile or any
-    # requirements file — needs a rebuild.
-    if echo "$changed_files" | grep -qE "^scanners/ai_attack_surface_scan/(Dockerfile|.*requirements)"; then
-        rebuild_tools+=(ai-attack-surface)
-    fi
-    # codefix-sandbox: the isolated CodeFix build sandbox (T6/E10). Build-only
-    # image; rebuild when anything in its build context changes.
-    if echo "$changed_files" | grep -q "^scanners/codefix_sandbox/"; then
-        rebuild_tools+=(codefix-sandbox)
-    fi
-    # supply-chain (L1 CLEAN scanner): the .py source is volume-mounted into the
-    # spawned scan container (hot-reload), so rebuild the image ONLY when the
-    # baked layer changes -- the Dockerfile (osv-scanner binary) or requirements.
-    # Matches recon-orchestrator's precise rule. On the FIRST update onto this
-    # release these files are new, so the image is built; thereafter a pure .py
-    # change hot-reloads at spawn with no rebuild.
-    if echo "$changed_files" | grep -qE "^scanners/supply_chain_scan/(Dockerfile|requirements)"; then
-        rebuild_tools+=(supply-chain)
-    fi
-    # supply-chain-analyzer (DIRTY analyzer): entrypoint.py is BAKED (COPY), not
-    # mounted, so rebuild on ANY change to the analyzer dir (entrypoint or Dockerfile).
-    if echo "$changed_files" | grep -q "^scanners/supply_chain_analyzer/"; then
-        rebuild_tools+=(supply-chain-analyzer)
-    fi
-    _map_baked_graph_db "$changed_files"
-    # capture-proxy / traffic-ingest (HTTP Traffic Capture): both share the
-    # redamon-capture-proxy:latest image, built from scanners/capture_proxy/. It is in the
-    # "capture" profile — never started by `up`, but SPAWNED on demand by the
-    # orchestrator, which just runs the image (no on-demand build; scanners/capture_proxy/ is
-    # not mounted into the orchestrator). So `update` MUST rebuild it here or the
-    # proxy would keep serving stale capture/ingest/redaction/egress code. Handled
-    # separately from rebuild_tools because it needs its own profile flag to build.
-    local rebuild_capture=false
-    if echo "$changed_files" | grep -q "^scanners/capture_proxy/"; then
-        rebuild_capture=true
-    fi
-    # The proxy image also COPYs two files OUT of recon_orchestrator/ at build
-    # time (hard_guardrail.py, ip_denylist.py — the shared hostname and
-    # resolved-IP denylists). Those live outside scanners/capture_proxy/, so a
-    # change to either would otherwise leave the proxy enforcing a stale guard
-    # while the orchestrator enforced the new one. Keep this list in step with
-    # the COPY lines in scanners/capture_proxy/Dockerfile.
-    if echo "$changed_files" | grep -qE "^recon_orchestrator/(hard_guardrail|ip_denylist)\.py$"; then
-        rebuild_capture=true
-    fi
-    # The plugin runner image: rebuilt when its sources or a compose file it depends on
-    # changed, built when missing. Never in rebuild_core or restart_only: plugins_converge
-    # alone starts the runner and the gateway, and recreates both after this rebuild.
-    local rebuild_plugins=false
-    if echo "$changed_files" | grep -qE "^(docker-compose(\.plugins)?\.yml$|services/plugin_runner/)"; then
-        rebuild_plugins=true
-    elif ! docker image inspect "$PLUGINS_RUNNER_IMAGE" >/dev/null 2>&1; then
+    local rebuild_capture=false rebuild_plugins=false
+    _map_tool_changes "$changed_files"
+    if [[ "$rebuild_plugins" != "true" ]] && ! docker image inspect "$PLUGINS_RUNNER_IMAGE" >/dev/null 2>&1; then
         rebuild_plugins=true
     fi
 
@@ -5024,6 +5042,8 @@ _test_run_section() {
         -e COVERAGE_FILE=/tmp/redamon.coverage \
         -e HOME=/tmp \
         -e REDAMON_TEST_PARALLEL="${REDAMON_TEST_PARALLEL:-8}" \
+        `# the wiki-dependent tests read it to decide whether an empty wiki may skip` \
+        -e REDAMON_TEST_ALLOW_MISSING="${REDAMON_TEST_ALLOW_MISSING:-}" \
         `# recon_orchestrator/api.py resolves host paths at import; satisfy the` \
         `# *_PATH lookups so its tests import outside docker-compose (harmless elsewhere).` \
         -e RECON_PATH=/repo/recon \
@@ -5046,6 +5066,16 @@ cmd_test() {
         *) error "Unknown test tier: $tier (use unit|integration|live|all|coverage)"; return 2 ;;
     esac
     local failed=0 spec
+    # redamon.wiki is a submodule: an empty checkout fails every wiki-dependent
+    # test (Python and vitest) unless REDAMON_TEST_ALLOW_MISSING names `wiki`.
+    if [[ ! -f "$SCRIPT_DIR/redamon.wiki/Home.md" ]]; then
+        if _test_section_may_skip wiki; then
+            error "SKIPPED the wiki checks (redamon.wiki is empty) — allowed by REDAMON_TEST_ALLOW_MISSING"
+        else
+            error "redamon.wiki is empty, so the wiki-dependent tests will fail."
+            error "  Fix: git submodule update --init redamon.wiki   (or REDAMON_TEST_ALLOW_MISSING=wiki)"
+        fi
+    fi
     for spec in "${_TEST_SECTIONS[@]}"; do
         IFS='|' read -r name image workdir pypath testpaths covpkg exclude <<< "$spec"
         if ! _test_run_section "$name" "$image" "$workdir" "$pypath" "$testpaths" "$covpkg" "$exclude" "$tier"; then

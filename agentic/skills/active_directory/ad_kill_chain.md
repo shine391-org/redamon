@@ -88,12 +88,12 @@ Crack in tiers (fast to broad):
 # AS-REP — hashcat mode 18200
 kali_shell: hashcat -m 18200 /tmp/adkc/asrep.hash \
             /tmp/adkc/company.txt /usr/share/wordlists/rockyou.txt \
-            -r /usr/share/hashcat/rules/best64.rule --force --potfile-path /tmp/adkc/hc.pot
+            -r /usr/share/hashcat/rules/best66.rule --force --potfile-path /tmp/adkc/hc.pot
 
 # Kerberoast — hashcat mode 13100
 kali_shell: hashcat -m 13100 /tmp/adkc/kerberoast.hash \
             /tmp/adkc/company.txt /usr/share/wordlists/rockyou.txt \
-            -r /usr/share/hashcat/rules/best64.rule --force --potfile-path /tmp/adkc/hc.pot
+            -r /usr/share/hashcat/rules/best66.rule --force --potfile-path /tmp/adkc/hc.pot
 
 # Show what cracked
 kali_shell: hashcat -m 18200 /tmp/adkc/asrep.hash  --show --potfile-path /tmp/adkc/hc.pot

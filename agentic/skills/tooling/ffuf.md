@@ -23,8 +23,7 @@ Upstream: https://github.com/ffuf/ffuf
 /usr/share/seclists/Discovery/Web-Content/common.txt              4750 entries (start here)
 /usr/share/seclists/Discovery/Web-Content/big.txt                 20481 entries
 /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt  29999 entries
-/usr/share/seclists/Discovery/Web-Content/raft-large-files.txt    37k entries
-/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt
+/usr/share/dnsrecon/dnsrecon/data/subdomains-top1mil.txt         114606 entries (vhost / subdomain)
 ```
 
 ## Canonical shape
@@ -81,7 +80,7 @@ execute_ffuf args: "-w /usr/share/seclists/Discovery/Web-Content/raft-medium-dir
 ### Vhost fuzzing (filter the empty-host baseline)
 
 ```
-execute_ffuf args: "-w /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt -u https://target.tld -H 'Host: FUZZ.target.tld' -fs 0 -ac -t 30 -noninteractive -of json -o /tmp/ffuf_vhost.json"
+execute_ffuf args: "-w /usr/share/dnsrecon/dnsrecon/data/subdomains-top1mil.txt -u https://target.tld -H 'Host: FUZZ.target.tld' -fs 0 -ac -t 30 -noninteractive -of json -o /tmp/ffuf_vhost.json"
 ```
 
 ### Parameter value fuzzing

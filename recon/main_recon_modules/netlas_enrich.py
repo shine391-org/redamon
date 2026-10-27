@@ -16,9 +16,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 try:
-    from recon.main_recon_modules.ip_filter import filter_ips_for_enrichment
+    from recon.main_recon_modules.ip_filter import (
+        collect_cdn_ips, filter_ips_for_enrichment, in_published_cdn_range, is_shared_edge_org)
 except ImportError:
-    from ip_filter import filter_ips_for_enrichment
+    from ip_filter import (
+        collect_cdn_ips, filter_ips_for_enrichment, in_published_cdn_range, is_shared_edge_org)
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +208,48 @@ def _parse_netlas_body(body: dict | None) -> tuple[list[dict], int]:
     return results, int(total)
 
 
+def _attribute_rows(rows: list[dict], dns_ips, combined_result: dict) -> None:
+    """Tag the rows that must not become a finding.
+
+    Netlas answers from its index, history included: domain mode asks for
+    every response it ever stored for the name. A row for an IP this run's
+    DNS does not give is `historical` and stays out of the graph entirely: the
+    IP may be another tenant's machine now, and an IP node would put it in
+    later scans' targets. A row for a CDN or shared edge IP is `shared_edge`:
+    its ports are the provider's, and its CVEs describe the provider and its
+    other tenants, so it gets no CVE finding. In a partial run that includes
+    the IPs the graph's IP attribution tag names (the full run applies the tag
+    later, with retag_shared_edge).
+    """
+    from recon.main_recon_modules.ip_attribution import shared_edge_ips
+    current = set(dns_ips)
+    cdn = collect_cdn_ips(combined_result) | shared_edge_ips(combined_result)
+    for row in rows:
+        ip = row.get("ip")
+        if ip not in current:
+            row["attribution"] = "historical"
+        elif (ip in cdn or in_published_cdn_range(ip)
+              or is_shared_edge_org(f"{row.get('isp') or ''} {row.get('asn_name') or ''}")):
+            row["attribution"] = "shared_edge"
+
+
+def retag_shared_edge(netlas_data: dict, edge_ips) -> int:
+    """Mark the rows of the IPs IP attribution tagged shared_edge. Returns how many.
+
+    In a full run Netlas answers before http_probe, so _attribute_rows could
+    not see the tag; the pipeline holds the write back and applies it here. A
+    `historical` row stays historical: it never reaches the graph at all.
+    """
+    edge_ips = set(edge_ips or ())
+    marked = 0
+    for row in netlas_data.get("results") or []:
+        if (isinstance(row, dict) and row.get("ip") in edge_ips
+                and row.get("attribution") not in ("historical", "shared_edge")):
+            row["attribution"] = "shared_edge"
+            marked += 1
+    return marked
+
+
 def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> dict:
     """
     Run Netlas Responses enrichment for domain or per-IP host queries.
@@ -246,8 +290,8 @@ def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
 
     domain = combined_result.get("domain", "") or ""
     is_ip_mode = combined_result.get("metadata", {}).get("ip_mode", False)
-    ips = _extract_ips_from_recon(combined_result)
-    ips = filter_ips_for_enrichment(ips, combined_result, "Netlas")
+    all_ips = _extract_ips_from_recon(combined_result)
+    ips = filter_ips_for_enrichment(all_ips, combined_result, "Netlas")
 
     print(f"[*][Netlas] Starting OSINT enrichment")
 
@@ -256,21 +300,32 @@ def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
     total_hint = 0
     netlas_scope = cb.scope("netlas", label="Netlas", unit="query(ies)")
     breaker = _netlas_breaker()
+    # IPs whose every Netlas row this run saw; the prune keeps the others' CVEs.
+    checked: set[str] = set()
+    reached = False
+    failed = False
 
     try:
         if is_ip_mode:
             print(f"[+][Netlas] IP mode — querying host: for {len(ips)} IP(s)")
 
             def _enrich_single_ip_netlas(ip, rate_limiter):
+                nonlocal reached
                 # Before the wait: the limiter reserves a slot before sleeping.
                 if not breaker.allow():
                     return ip, [], 0
                 rate_limiter.wait()
                 q = f"host:{ip}"
                 res = _netlas_responses_get(q, keys, max_results, admitted=True)
+                if res.answered:
+                    reached = True
+                if res.answered and not res.ok:
+                    checked.add(ip)
                 if not res.ok:
                     return ip, [], 0
                 rows, t = _parse_netlas_body(res.data)
+                if t <= len(rows):
+                    checked.add(ip)
                 return ip, rows, t
 
             max_workers = settings.get('NETLAS_WORKERS', 5)
@@ -289,6 +344,9 @@ def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
             # Preserve original IP ordering
             ip_order = {ip: i for i, ip in enumerate(ips)}
             all_rows.sort(key=lambda r: ip_order.get(r.get("ip", ""), 0))
+            # The row cap is across every IP: one that lost a row to it was not
+            # fully re-checked.
+            checked -= {r.get("ip") for r in all_rows[max_results:]}
         else:
             if not domain:
                 print("[!][Netlas] No domain in scope — skipping")
@@ -299,6 +357,11 @@ def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
                 if res.ok:
                     rows, total_hint = _parse_netlas_body(res.data)
                     all_rows = rows[:max_results]
+                # One query answers for every IP of the domain; a cut answer
+                # re-checked none of them for sure.
+                reached = res.answered
+                if res.answered and total_hint <= len(all_rows):
+                    checked.update(ips)
                 time.sleep(1)
 
         netlas_data["results"] = all_rows[:max_results]
@@ -311,8 +374,17 @@ def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
         print(f"[!][Netlas] Pipeline continues with partial or empty Netlas data")
         netlas_data["results"] = all_rows[:max_results]
         netlas_data["total"] = total_hint if total_hint else len(netlas_data["results"])
+        failed = True
 
+    _attribute_rows(netlas_data["results"], all_ips, combined_result)
+    historical = sum(1 for r in netlas_data["results"] if r.get("attribution") == "historical")
+    if historical:
+        print(f"[*][Netlas] {historical} row(s) for IPs this run's DNS does not give are "
+              f"kept as history, not written to the graph")
     netlas_scope.finish("netlas_enrich", payload=netlas_data)
+    from recon.helpers.passive_cve_coverage import note_cve_coverage
+    note_cve_coverage("netlas", "netlas_enrich", ips, checked, reached=reached,
+                      no_input=not all_ips or (not is_ip_mode and not domain), failed=failed)
     combined_result["netlas"] = netlas_data
     return combined_result
 

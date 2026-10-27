@@ -48,7 +48,7 @@ export function buildTrufflehogCommon(project: Record<string, unknown>): Record<
   const str = (v: unknown, d = '') => (typeof v === 'string' ? v : d)
   return {
     // Verification off means NOTHING was checked; the scanner marks every
-    // finding `unverified` rather than `unvalidated` because of this flag.
+    // finding `unverified` rather than `rejected` because of this flag.
     skipVerification: project.trufflehogNoVerification === true,
     resultTypes: str(project.trufflehogResultTypes, 'verified,unverified,unknown')
       .split(',').map(s => s.trim()).filter(Boolean),

@@ -10,6 +10,7 @@
  */
 import type { ProjectTargetFields } from './partialReconScope'
 import { authScopePatterns, resolveScopeGroups } from './scopeGroups'
+import { isRoeExcluded } from './roeScope'
 
 export interface OpenApiSourceStatus {
   hash: string
@@ -131,14 +132,6 @@ function normalizeHost(value: string): string {
   return host.trim().replace(/\.+$/, '').toLowerCase()
 }
 
-/** recon's _normalize_scope_entry: `*.domain` and CIDRs keep their shape. */
-function normalizeScopeEntry(value: string): string {
-  const entry = value.trim()
-  if (entry.startsWith('*.')) return `*.${normalizeHost(entry.slice(2))}`
-  if (entry.includes('/') && !entry.includes('://')) return entry.toLowerCase()
-  return normalizeHost(entry)
-}
-
 /**
  * The hosts one legacy group record admits, as recon's OpenAPI scope builds them
  * (scope_payload in recon/helpers/openapi/discovery.py): each listed prefix as
@@ -164,21 +157,6 @@ function hostInScope(host: string, entries: readonly string[]): boolean {
     if (entry.startsWith('*.')) return host.endsWith(entry.slice(1))
     if (entry.includes('/')) return inIpv4Target(host, entry) === true
     return host === entry
-  })
-}
-
-/**
- * recon's _is_roe_excluded: an exact host or IP; a domain, with its subdomains;
- * `*.domain`, its subdomains only; or a CIDR.
- */
-function roeExcluded(host: string, excluded: unknown): boolean {
-  const isIp = ipv4ToInt(host) !== null
-  return strings(excluded).some(value => {
-    const entry = normalizeScopeEntry(value)
-    if (!entry) return false
-    if (entry.startsWith('*.')) return host.endsWith(entry.slice(1))
-    if (entry.includes('/') || isIp) return isIp && inIpv4Target(host, entry) === true
-    return host === entry || host.endsWith(`.${entry}`)
   })
 }
 
@@ -238,5 +216,5 @@ export function documentInProjectScope(url: string, project: DocumentScopeFields
     if (!entries.length) return null
     if (!hostInScope(host, entries)) return false
   }
-  return !roeExcluded(host, project.roeExcludedHosts)
+  return !isRoeExcluded(host, strings(project.roeExcludedHosts))
 }

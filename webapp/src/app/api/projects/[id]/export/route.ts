@@ -5,11 +5,11 @@ import { existsSync, createReadStream, readdirSync } from 'fs'
 import path from 'path'
 import archiver from 'archiver'
 import { Readable } from 'stream'
-import { randomUUID } from 'crypto'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
-import { serializeGraphProperties } from '@/lib/graphSerialize'
 import { projectPresetForRead } from '@/lib/reconPresets/server'
 import { PROJECT_EXPORT_EXCLUDED, PROJECT_EXPORT_EXCLUDED_REASON } from '@/lib/projectExport/pluginExclusion'
+import { exportProjectGraph, type ExportedGraph } from '@/lib/projectExport/graph'
+import { REFERENCE_LINKS_BUNDLE_PATH } from '@/lib/graphReferenceLinks'
 import { exportRevision, REVISIONS_BUNDLE_PATH } from '@/lib/roe/revisionBundle'
 
 const RECON_OUTPUT_PATH = process.env.RECON_OUTPUT_PATH || '/data/recon-output'
@@ -19,10 +19,6 @@ const GITHUB_HUNT_OUTPUT_PATH = process.env.GITHUB_HUNT_OUTPUT_PATH || '/data/gi
 interface RouteParams {
   params: Promise<{ id: string }>
 }
-
-// Shared with lib/scanSnapshot.ts so exports and Scan Timeline snapshots are the
-// same restore-fidelity format (a snapshot must be re-importable into Neo4j).
-const serializeProperties = serializeGraphProperties
 
 export async function GET(_request: NextRequest, { params }: RouteParams) {
   try {
@@ -122,60 +118,22 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       select: { name: true, description: true, mode: true, rules: true },
     })
 
-    // 3. Export Neo4j data
-    let neo4jNodes: Array<{ labels: string[]; properties: Record<string, unknown>; _exportId: string }> = []
-    let neo4jRelationships: Array<{ startExportId: string; endExportId: string; type: string; properties: Record<string, unknown> }> = []
-
+    // 3. Export Neo4j data: the project's nodes and relationships, and its
+    // edges to the global CVE / MitreData / Capec nodes as link records (never
+    // the nodes themselves, which every tenant shares).
     const session = getGraphSession()
+    let graph: ExportedGraph
     try {
-      // Export all nodes for this project
-      const nodesResult = await session.run(
-        `MATCH (n) WHERE n.project_id = $pid
-         RETURN labels(n) as labels, properties(n) as props, elementId(n) as eid`,
-        { pid: id }
-      )
-
-      const elementIdToExportId = new Map<string, string>()
-
-      neo4jNodes = nodesResult.records.map(record => {
-        const eid = record.get('eid') as string
-        const exportId = randomUUID()
-        elementIdToExportId.set(eid, exportId)
-        return {
-          labels: record.get('labels') as string[],
-          properties: serializeProperties(record.get('props') as Record<string, unknown>),
-          _exportId: exportId,
-        }
-      })
-
-      // Export all relationships where at least one end has this project_id
-      const relsResult = await session.run(
-        `MATCH (a)-[r]->(b)
-         WHERE a.project_id = $pid OR b.project_id = $pid
-         RETURN elementId(a) as startId, elementId(b) as endId,
-                type(r) as relType, properties(r) as relProps`,
-        { pid: id }
-      )
-
-      neo4jRelationships = relsResult.records
-        .filter(record => {
-          const startId = record.get('startId') as string
-          const endId = record.get('endId') as string
-          return elementIdToExportId.has(startId) && elementIdToExportId.has(endId)
-        })
-        .map(record => ({
-          startExportId: elementIdToExportId.get(record.get('startId') as string)!,
-          endExportId: elementIdToExportId.get(record.get('endId') as string)!,
-          type: record.get('relType') as string,
-          properties: serializeProperties((record.get('relProps') as Record<string, unknown>) || {}),
-        }))
+      graph = await exportProjectGraph(session, id)
     } finally {
       await session.close()
     }
+    const { nodes: neo4jNodes, relationships: neo4jRelationships, referenceLinks } = graph
 
-    // 4. Build manifest
+    // 4. Build manifest. 1.1.0 added neo4j/reference_links.json; an older
+    // bundle without it imports as before.
     const manifest = {
-      version: '1.0.0',
+      version: '1.1.0',
       exportDate: new Date().toISOString(),
       projectName: project.name,
       targetDomain: project.targetDomain,
@@ -192,6 +150,7 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
         reports: reports.length,
         neo4jNodes: neo4jNodes.length,
         neo4jRelationships: neo4jRelationships.length,
+        neo4jReferenceLinks: referenceLinks.length,
         userPresets: userPresets.length,
         muteRulesPresets: muteRulesPresets.length,
         scanVersions: scanVersions.length,
@@ -319,6 +278,7 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
 
     archive.append(Buffer.from(JSON.stringify(neo4jNodes, null, 2)), { name: 'neo4j/nodes.json' })
     archive.append(Buffer.from(JSON.stringify(neo4jRelationships, null, 2)), { name: 'neo4j/relationships.json' })
+    archive.append(Buffer.from(JSON.stringify(referenceLinks, null, 2)), { name: REFERENCE_LINKS_BUNDLE_PATH })
 
     if (nodeFilter) {
       archive.append(Buffer.from(JSON.stringify(nodeFilter, null, 2)), { name: 'node-filters/node-filters.json' })

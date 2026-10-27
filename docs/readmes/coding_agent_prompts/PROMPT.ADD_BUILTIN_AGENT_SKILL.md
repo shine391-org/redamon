@@ -102,7 +102,7 @@ Add a tunable ONLY when the answer is yes to at least one of the following, AND 
 
 **Disqualifier (do NOT make it a tunable):** the agent can decide this at runtime from observed target behaviour. Concretely: which payload to try first, whether to escalate to a noisier technique, retry counts, timing variance for oracle detection, which order to enumerate parameters in, how many parallel curls to fire. These belong in the prompt as guidance ("start with the simplest payload; escalate only if filtered"), not in settings.
 
-The competitor benchmark in [internal/SKILL_TO_ADD.md](../../../_local/internal/SKILL_TO_ADD.md) is also a useful sanity-check: count the per-skill knobs the upstream prompt actually parameterizes. Strix prompts have ~0-2 user-facing variables; Shannon has ~5-10 because of the deliverable-CLI plumbing we strip. Aim for 2-5 RedAmon tunables; over 6 usually means something belongs in code as the agent's default.
+A useful sanity-check: count the per-skill knobs an upstream prompt actually parameterizes. Strix prompts have ~0-2 user-facing variables; Shannon has ~5-10 because of the deliverable-CLI plumbing we strip. Aim for 2-5 RedAmon tunables; over 6 usually means something belongs in code as the agent's default.
 
 ### The three dynamic-prompt patterns (and when to use each)
 
@@ -412,7 +412,7 @@ Add an entry to the `BUILT_IN_SKILLS` array at lines 36-73. Pick an icon from `l
 
 Add the same key to `DEFAULT_CONFIG.builtIn` at lines 80-90 (must match Phase 6 exactly).
 
-If the skill has tunable settings that need their own sub-section UI (like `SqliSection.tsx`, `DosSection.tsx`, `HydraSection.tsx`, `PhishingSection.tsx`), create a new sibling component and conditionally render it inside the main `AttackSkillsSection` where the other sub-sections are rendered (around lines 225-236 in the file). If your skill only has simple boolean/number settings, skip this.
+If the skill has tunable settings that need their own sub-section UI (like `SqliSection.tsx`, `DosSection.tsx`, `BruteForceSection.tsx` (which exports `HydraSection`), `PhishingSection.tsx`), create a new sibling component and conditionally render it inside the main `AttackSkillsSection` where the other sub-sections are rendered (search the file for `<SqliSection`). If your skill only has simple boolean/number settings, skip this.
 
 **8.2** Edit [webapp/src/app/graph/components/AIAssistantDrawer/phaseConfig.ts](../../../webapp/src/app/graph/components/AIAssistantDrawer/phaseConfig.ts).
 

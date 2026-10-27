@@ -56,5 +56,25 @@ class TestLiveProofMirrorsIsProven(unittest.TestCase):
             facts))
 
 
+class TestAgentConfidenceMirrorsTheModel(unittest.TestCase):
+    THRESHOLD = (f"coalesce(toInteger(cf.confidence), {sm.AGENT_CONFIDENCE_DEFAULT}) "
+                 f">= {sm.PROOF_MIN_AGENT_CONFIDENCE}")
+
+    def test_the_threshold_and_default_are_the_same(self):
+        self.assertEqual(triage_mixin._PROOF_MIN_CONFIDENCE, sm.PROOF_MIN_AGENT_CONFIDENCE)
+        self.assertEqual(triage_mixin._PROOF_DEFAULT_CONFIDENCE, sm.AGENT_CONFIDENCE_DEFAULT)
+
+    def test_live_proof_reads_the_agent_s_confidence(self):
+        self.assertIn(self.THRESHOLD, " ".join(triage_mixin._LIVE_PROOF.split()))
+
+    def test_the_proof_types_the_detail_shows_use_the_same_bar(self):
+        # A confirmation that does not count as proof must not be listed as one.
+        source = open(triage_mixin.__file__).read()
+        listed = re.search(r"\[\(cf:ChainFinding\)-\[:CONFIRMS\]->\(n\)(.*?)\| cf\.finding_type\]",
+                           source, re.S)
+        self.assertIsNotNone(listed)
+        self.assertIn("_PROOF_CONFIDENCE", listed.group(1))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -90,3 +90,36 @@ def test_nothing_to_scan_still_exits_1(run):
     with pytest.raises(SystemExit) as ei:
         run({"domains": ROOTS, "domain": "alpha.test", "include_graph_targets": False})
     assert ei.value.code == 1
+
+
+def test_the_custom_port_write_does_not_pre_empt_tlsx_s_cdn_tag(monkeypatch):
+    """With custom ports the partial run writes port data before the tlsx
+    data. That write must carry the IP as it stood before tlsx's attribution;
+    otherwise the IP already reads as tagged when the tlsx writer runs, and the
+    tag loses its cdn_source 'tlsx'."""
+    client = MagicMock()
+    client.verify_connection.return_value = True
+    client.update_graph_from_tlsx.return_value = {}
+    client.__enter__ = MagicMock(return_value=client)
+    client.__exit__ = MagicMock(return_value=False)
+    fake_graph_db = MagicMock()
+    fake_graph_db.Neo4jClient.return_value = client
+    monkeypatch.setattr(tlsx_scanning, "_build_port_scan_data_from_graph", MagicMock(side_effect=_graph_recon))
+
+    def attribute(rd, settings=None):
+        info = rd["port_scan"]["by_ip"]["10.0.2.1"]
+        info.update(cdn="cloudflare", is_cdn=True, cdn_source="tls_certificate")
+        rd["tlsx"] = {"by_target": {}, "cdn_by_ip": {"10.0.2.1": "cloudflare"}}
+        return rd
+
+    with patch.dict(sys.modules, {"graph_db": fake_graph_db}), \
+         patch("recon.main_recon_modules.tls_scan.run_tlsx_enrichment", side_effect=attribute):
+        tlsx_scanning.run_tlsx({"_settings": {}, "domains": ROOTS, "domain": "alpha.test",
+                                "domain_groups": GROUPS, "user_targets": {"ports": [8443]}})
+
+    port_data = client.update_graph_from_port_scan.call_args.kwargs["recon_data"]
+    ip = port_data["port_scan"]["by_ip"]["10.0.2.1"]
+    assert not ip.get("is_cdn") and ip.get("cdn_source") is None
+    assert 8443 in ip["ports"]
+    tlsx_data = client.update_graph_from_tlsx.call_args.kwargs["recon_data"]
+    assert tlsx_data["tlsx"]["cdn_by_ip"] == {"10.0.2.1": "cloudflare"}

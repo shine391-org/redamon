@@ -51,6 +51,14 @@ export interface ToolExecutionItem {
   actionable_findings?: string[]
   recommended_next_steps?: string[]
   step_index?: number  // Disambiguates same-name tools within a wave
+  /** Backend ExecutionStep id; pairs this card with its later events. */
+  step_id?: string
+  /** The tool returned (tool_finished) and the agent is analysing its output;
+   *  status stays 'running' until tool_complete carries the analysis. */
+  finished?: boolean
+  finishedSuccess?: boolean
+  /** The run ended (stop, crash, lost events) before this tool returned. */
+  interrupted?: boolean
 }
 
 export interface PlanWaveItem {

@@ -83,9 +83,12 @@ function describeJob(row: {
 const JOB_NOTES = [
   'A queued job runs when the host has room, which can be minutes or hours. Poll it with ' +
     'get_project_activity or get_recon_status rather than re-queueing.',
-  'A job whose status becomes "needs_review" is PARKED and will not run: the project settings ' +
-    'changed after it was queued, so it waits for a person to re-confirm it in the app. Nothing ' +
-    'on this surface can re-confirm one.',
+  'A job whose status becomes "needs_review" is PARKED and will not run until a person ' +
+    're-confirms it in the app: either the project settings changed after it was queued ' +
+    '(blockedCode settings_changed), or its start got no answer from the orchestrator, so the ' +
+    'scan may or may not have started (start_unknown). Nothing on this surface can re-confirm one.',
+  'A start that fails on a passing error (the orchestrator answered 500 or 503) is retried with ' +
+    'a growing backoff, for about 7.5 hours before the job is marked failed.',
   'A queued job OUTLIVES the token that created it. Revoking this token does not cancel it; ' +
     'cancel_queued_scan does.',
   'When it dispatches it behaves exactly like start_recon in "new" mode: the current graph is ' +
@@ -128,8 +131,8 @@ export async function queueRecon(ctx: McpContext, projectId: string) {
       `A full recon is already queued for this project (job ${sameKind.id}, status ` +
       `"${sameKind.status}"). Queueing a second would run the same scan twice. ` +
       (sameKind.status === 'needs_review'
-        ? 'That job is parked awaiting a person: the project settings changed after it was ' +
-          'queued, and nothing on this surface can re-confirm it.'
+        ? 'That job is parked awaiting a person (the project settings changed after it was ' +
+          'queued, or its start got no answer), and nothing on this surface can re-confirm it.'
         : 'Wait for it, or cancel it first.'),
       'already_queued'
     )

@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { clearProjectGraph, restoreGraph } from '@/lib/graphRestore'
+import { REFERENCE_LINKS_BUNDLE_PATH } from '@/lib/graphReferenceLinks'
 import { requireEffectiveUser } from '@/lib/access'
 import JSZip from 'jszip'
 import { randomUUID } from 'crypto'
@@ -357,6 +358,10 @@ export async function POST(request: NextRequest) {
       reports: 0,
       neo4jNodes: 0,
       neo4jRelationships: 0,
+      // Links to the global CVE / MitreData / Capec nodes re-made, and skipped
+      // (the node is not in this database, or the record failed validation).
+      neo4jReferenceLinks: 0,
+      neo4jReferenceLinksSkipped: 0,
       artifacts: 0,
     }
 
@@ -747,12 +752,16 @@ export async function POST(request: NextRequest) {
     // Import Neo4j data
     const nodesFile = zip.file('neo4j/nodes.json')
     const relsFile = zip.file('neo4j/relationships.json')
+    // Absent from bundles exported before manifest 1.1.0. Each record is
+    // validated by the restore, which only ever MATCHes a reference node.
+    const linksFile = zip.file(REFERENCE_LINKS_BUNDLE_PATH)
 
     if (nodesFile) {
       const nodes: ExportedNode[] = JSON.parse(await nodesFile.async('text'))
       const relationships: ExportedRelationship[] = relsFile
         ? JSON.parse(await relsFile.async('text'))
         : []
+      const referenceLinks: unknown = linksFile ? JSON.parse(await linksFile.async('text')) : null
 
       if (nodes.length > 0) {
         const session = getGraphSession()
@@ -778,9 +787,14 @@ export async function POST(request: NextRequest) {
           const restored = await restoreGraph(session, nodes, relationships, {
             projectId: newProject.id,
             userId,
+            ...(Array.isArray(referenceLinks) ? { referenceLinks } : {}),
           })
           stats.neo4jNodes = restored.nodes
           stats.neo4jRelationships = restored.relationships
+          if (restored.referenceLinks) {
+            stats.neo4jReferenceLinks = restored.referenceLinks.restored
+            stats.neo4jReferenceLinksSkipped = restored.referenceLinks.skipped
+          }
         } finally {
           await session.close()
         }

@@ -157,13 +157,15 @@ def run_dispatcher_tick(container_manager) -> dict:
             continue
 
         # Not dispatched. A capacity-bound block (RAM / hard cap / disk) means every
-        # later job is also capacity-bound, so stop. Any OTHER outcome (busy, agent,
-        # needs_review, permanent failure) is per-project/per-job, so try other
-        # projects - but mark THIS project handled so a sibling of it cannot trip the
-        # head-of-line RAM break below and starve everyone (Finding 2).
+        # later job is also capacity-bound, so stop; so does a transient refusal (an
+        # orchestrator-wide 5xx), which would otherwise spend one attempt of every
+        # candidate in a single tick. Any OTHER outcome (busy, agent, needs_review,
+        # permanent failure) is per-project/per-job, so try other projects - but mark
+        # THIS project handled so a sibling of it cannot trip the head-of-line RAM
+        # break below and starve everyone (Finding 2).
         summary["deferred"] += 1
         blocked = res.get("blocked")
-        if blocked in ("ram", "hard", "disk"):
+        if blocked in ("ram", "hard", "disk", "transient"):
             break
         dispatched_projects.add(pid)
 

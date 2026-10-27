@@ -16,6 +16,8 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from recon.helpers.js_recon.urls import accept_js_response, is_js_url
+
 
 # Scan-target health (recon/helpers/circuit_breaker.py HostHealth). jsluice's
 # downloader was sequential urllib at 10s each, so one dead host stalled the
@@ -594,13 +596,7 @@ def merge_jsluice_into_by_base_url(
 
 
 def _is_js_url(url: str) -> bool:
-    """Check if a URL points to a JavaScript file."""
-    try:
-        parsed = urlparse(url)
-        path = parsed.path.lower().split('?')[0]
-        return path.endswith('.js') or path.endswith('.mjs')
-    except Exception:
-        return False
+    return is_js_url(url)
 
 
 def _download_js_files(
@@ -645,15 +641,15 @@ def _download_js_files(
                 print(f"[-][jsluice] Skipping {url}: HTTP {response.status}")
                 return None
 
-            # Verify response is actually JavaScript, not an HTML error page
-            content_type = response.headers.get('Content-Type', '').lower()
-            if 'html' in content_type and 'javascript' not in content_type:
-                print(f"[-][jsluice] Skipping {url}: Content-Type is {content_type} (not JS)")
-                return None
-
             content = response.read()
 
             if len(content) > 10 * 1024 * 1024:
+                return None
+
+            content_type = response.headers.get('Content-Type', '')
+            accepted, why = accept_js_response(url, content_type, content)
+            if not accepted:
+                print(f"[-][jsluice] Skipping {url}: not a JS file ({why}, Content-Type {content_type or 'none'})")
                 return None
 
             filepath = str(work_dir / f"js_{i}.js")

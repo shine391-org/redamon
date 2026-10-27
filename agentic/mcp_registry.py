@@ -139,15 +139,23 @@ def _builtin_tool_names() -> Set[str]:
     """Lazy import of TOOL_REGISTRY to avoid circular imports."""
     global _BUILTIN_NAME_CACHE
     if _BUILTIN_NAME_CACHE is None:
+        names: Set[str] = set()
         try:
             from prompts.tool_registry import TOOL_REGISTRY, _mcp_injected_keys  # type: ignore
             # tradecraft_lookup is a built-in that now lives in the per-session
             # tradecraft overlay (not the global dict), so add it explicitly.
-            _BUILTIN_NAME_CACHE = (
-                (set(TOOL_REGISTRY.keys()) - set(_mcp_injected_keys)) | {"tradecraft_lookup"}
-            )
+            names = (set(TOOL_REGISTRY.keys()) - set(_mcp_injected_keys)) | {"tradecraft_lookup"}
         except Exception:
-            _BUILTIN_NAME_CACHE = set()
+            pass
+        try:
+            # Every tool a system MCP server exposes is reserved too, including one
+            # the registry does not advertise (execute_masscan): a user server must
+            # not shadow a live system tool.
+            from tools import SYSTEM_MCP_TOOL_NAMES  # type: ignore
+            names |= set(SYSTEM_MCP_TOOL_NAMES)
+        except Exception:
+            pass
+        _BUILTIN_NAME_CACHE = names
     return _BUILTIN_NAME_CACHE
 
 

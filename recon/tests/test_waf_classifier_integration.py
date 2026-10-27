@@ -206,6 +206,9 @@ def test_has_cdn_markers_none_response():
 # ============================================================================
 # check_waf_bypass cascade -- AI off (regression: existing behavior)
 # ============================================================================
+# These drive the static / AI cascade with two responses, so the payload
+# differential that runs first (and has its own tests in test_waf_bypass.py)
+# is stubbed out: left in, it consumes the two responses itself.
 
 def test_check_waf_bypass_ai_off_static_path_unchanged():
     """Regression: when AI is disabled, the original static logic path
@@ -214,7 +217,9 @@ def test_check_waf_bypass_ai_off_static_path_unchanged():
     sub_resp = _mock_response(status_code=200, headers={"Server": "cloudflare"}, body=b"<html>cf</html>")
     ip_resp = _mock_response(status_code=200, headers={"Server": "nginx"}, body=b"<html>origin</html>")
     with mock.patch('recon.helpers.security_checks.requests.get',
-                    side_effect=[sub_resp, ip_resp]):
+                    side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None):
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
     assert result is not None
     assert result["type"] == "waf_bypass"
@@ -230,7 +235,9 @@ def test_check_waf_bypass_ai_off_no_waf_no_finding():
     sub_resp = _mock_response(status_code=200, headers={"Server": "nginx"}, body=b"<html>" + b"x" * 5000 + b"</html>")
     ip_resp = _mock_response(status_code=403, headers={"Server": "nginx"}, body=b"forbidden")
     with mock.patch('recon.helpers.security_checks.requests.get',
-                    side_effect=[sub_resp, ip_resp]):
+                    side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None):
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
     assert result is None
     print("PASS: test_check_waf_bypass_ai_off_no_waf_no_finding")
@@ -248,6 +255,7 @@ def test_check_waf_bypass_static_positive_skips_ai():
     ip_resp = _mock_response(status_code=200, headers={"Server": "nginx"}, body=b"origin")
     with mock.patch('recon.helpers.security_checks.requests.get',
                     side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
          mock.patch.object(sc, '_classify_waf_ai') as ai_mock:
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
     assert result is not None
@@ -275,6 +283,7 @@ def test_check_waf_bypass_ai_detects_waf_on_hostname_only():
 
     with mock.patch('recon.helpers.security_checks.requests.get',
                     side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
          mock.patch.object(sc, '_classify_waf_ai', side_effect=fake_classify):
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
 
@@ -301,6 +310,7 @@ def test_check_waf_bypass_ai_detects_waf_on_both_no_finding():
 
     with mock.patch('recon.helpers.security_checks.requests.get',
                     side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
          mock.patch.object(sc, '_classify_waf_ai', side_effect=fake_classify):
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
 
@@ -322,6 +332,7 @@ def test_check_waf_bypass_ai_low_confidence_no_finding():
 
     with mock.patch('recon.helpers.security_checks.requests.get',
                     side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
          mock.patch.object(sc, '_classify_waf_ai', side_effect=fake_classify):
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
 
@@ -347,6 +358,7 @@ def test_check_waf_bypass_ai_unavailable_falls_back():
     ip_resp = _mock_response(status_code=403, headers={"Server": "nginx"}, body=b"403")
     with mock.patch('recon.helpers.security_checks.requests.get',
                     side_effect=[sub_resp, ip_resp]), \
+         mock.patch.object(sc, '_waf_payload_differential', return_value=None), \
          mock.patch.object(sc, '_classify_waf_ai', return_value=None):
         result = sc.check_waf_bypass("api.target.com", "1.2.3.4")
     # No static WAF and AI unavailable -> we fall through to the

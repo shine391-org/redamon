@@ -2,7 +2,7 @@
 
 ## Complete Technical Documentation
 
-> **Module:** `recon/httpx_scan.py`  
+> **Module:** `recon/main_recon_modules/http_probe.py`  
 > **Purpose:** HTTP probing, technology detection, and non-HTTP service detection  
 > **Author:** RedAmon Security Suite
 
@@ -12,7 +12,7 @@
 
 1. [Overview](#overview)
 2. [Features](#features)
-3. [Installation](#installation)
+3. [Requirements](#requirements)
 4. [Configuration Parameters](#configuration-parameters)
 5. [Banner Grabbing](#banner-grabbing)
 6. [Architecture & Flow](#architecture--flow)
@@ -24,11 +24,11 @@
 
 ## Overview
 
-The `httpx_scan.py` module integrates ProjectDiscovery's httpx toolkit into RedAmon's reconnaissance pipeline. httpx is a multi-purpose HTTP toolkit designed for probing, technology detection, and web service analysis.
+The `http_probe.py` module integrates ProjectDiscovery's httpx toolkit into RedAmon's reconnaissance pipeline. httpx is a multi-purpose HTTP toolkit designed for probing, technology detection, and web service analysis.
 
-**This module also includes integrated banner grabbing** for non-HTTP services (SSH, FTP, SMTP, MySQL, etc.) to provide complete service detection across all open ports.
+**This module also includes integrated banner grabbing** for non-HTTP services (SSH, FTP, SMTP, MySQL, etc.) and a Wappalyzer pass over the captured pages, to provide complete service detection across all open ports.
 
-**⚠️ Important:** httpx runs exclusively via Docker. No native installation is supported.
+**⚠️ Important:** httpx runs exclusively via Docker, as a sibling container the recon container starts with `docker run`. No native installation is supported.
 
 ### Why httpx + Banner Grabbing?
 
@@ -44,19 +44,19 @@ The `httpx_scan.py` module integrates ProjectDiscovery's httpx toolkit into RedA
 ### How It Works
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Naabu Results  │────▶│  httpx_scan.py   │────▶│  Enriched JSON  │
-│  (open ports,   │     │                  │     │  with live URLs,│
-│   hostnames)    │     │  1. Build URLs   │     │  technologies,  │
-└─────────────────┘     │  2. HTTP probe   │     │  TLS info,      │
-        │               │  3. Tech detect  │     │  banners, etc.  │
-        │               │  4. Banner grab  │     └─────────────────┘
-        │               │  5. Parse JSON   │
-        ▼               └──────────────────┘
-┌─────────────────┐
-│  DNS Data       │  (Fallback if no Naabu)
-│  (hostnames)    │
-└─────────────────┘
+┌──────────────────┐     ┌─────────────────────────┐     ┌──────────────────┐
+│  port_scan       │────▶│  http_probe.py          │────▶│  http_probe key  │
+│  (Naabu+Masscan  │     │                         │     │  live URLs,      │
+│   open ports)    │     │  1. Build URLs          │     │  technologies,   │
+└──────────────────┘     │  2. httpx probe         │     │  TLS info,       │
+        │                │  3. Parse + scope filter│     │  redirects       │
+        │                │  4. AI surface signals  │     └──────────────────┘
+        │                │  5. Wappalyzer          │     ┌──────────────────┐
+        ▼                │  6. Banner grab         │────▶│  banner_grab key │
+┌──────────────────┐     └─────────────────────────┘     └──────────────────┘
+│  DNS Data        │  (Fallback if the port scan found no open port)
+│  (hostnames)     │
+└──────────────────┘
 ```
 
 ---
@@ -66,40 +66,32 @@ The `httpx_scan.py` module integrates ProjectDiscovery's httpx toolkit into RedA
 | Feature | Description |
 |---------|-------------|
 | **HTTP Probing** | Identifies live HTTP/HTTPS endpoints |
-| **Technology Detection** | Wappalyzer-based tech fingerprinting |
+| **Technology Detection** | httpx `-td` plus a Wappalyzer pass over the captured HTML |
 | **TLS Analysis** | Certificate info, cipher suites, JARM |
 | **CDN Detection** | Identifies CDN providers |
 | **ASN Lookup** | Autonomous System Number detection |
 | **Response Analysis** | Status codes, headers, body hashing |
+| **Redirect Chain** | First status, every hop's status and the final URL per probed URL |
+| **Scope Filter** | Drops results outside the target scope; an off-scope redirect becomes an external domain |
+| **AI Surface Signals** | Flags AI frameworks and frontends from headers, favicon, title and body |
 | **Favicon Hashing** | Fingerprint via favicon hash |
 | **Banner Grabbing** | Service detection for non-HTTP ports (SSH, FTP, SMTP, etc.) |
+| **Runtime Budget** | A probe that outlives its computed budget is stopped and keeps what it found |
 | **Docker Execution** | No local installation required |
 
 ---
 
-## Installation
+## Requirements
 
-### Requirements
+Nothing to install by hand: the recon container reaches the host's Docker daemon
+and, on first use, `pull_httpx_docker_image()` pulls the httpx image.
+`run_http_probe()` checks `docker` is on the path and `docker info` answers,
+and skips the probe otherwise. `python-Wappalyzer` is installed in the recon
+image (`recon/requirements.txt`).
 
-- **Docker** installed and running
-
-### Setup
-
-```bash
-# Make sure Docker is running
-sudo systemctl start docker
-
-# Run the scan - image will be pulled automatically
-python3 recon/main.py
-```
-
-### Verify Docker is Ready
+To pre-pull the image:
 
 ```bash
-# Check Docker is running
-docker info
-
-# Optionally pre-pull the image
 docker pull projectdiscovery/httpx:latest
 ```
 
@@ -107,7 +99,9 @@ docker pull projectdiscovery/httpx:latest
 
 ## Configuration Parameters
 
-All parameters are configured via the webapp project settings (stored in PostgreSQL) or as defaults in `project_settings.py`. This section provides **detailed explanations** including performance impact for each option.
+All parameters are set in the webapp project settings (stored in PostgreSQL) and reach the module as the runtime keys below; `recon/project_settings.py` holds the fallback defaults. Each field's meaning and bounds are in the settings registry (`recon_settings/registry.yaml`). This section provides **detailed explanations** including performance impact for each option.
+
+At scan start the engagement ceiling caps `HTTPX_RATE_LIMIT`, the memory governor can lower `HTTPX_THREADS` and `BANNER_GRAB_THREADS`, and stealth mode sets `HTTPX_RATE_LIMIT = 2` and `HTTPX_THREADS = 1` and turns off `HTTPX_PROBE_FAVICON`, `HTTPX_PROBE_JARM` and `BANNER_GRAB_ENABLED`.
 
 ---
 
@@ -115,25 +109,31 @@ All parameters are configured via the webapp project settings (stored in Postgre
 
 | Parameter | Type | Default | httpx Flag | Description |
 |-----------|------|---------|------------|-------------|
-| `HTTPX_DOCKER_IMAGE` | `str` | `"projectdiscovery/httpx:latest"` | - | Docker image to use. Only change for custom builds or specific versions. |
+| `HTTPX_ENABLED` | `bool` | `True` | - | Run the probe. The phase runs only when `http_probe` is in the project's scan modules. |
+| `HTTPX_DOCKER_IMAGE` | `str` | `"projectdiscovery/httpx:latest"` | - | Docker image to use; a value outside the shipped allowlist is pinned back to the default at scan start. |
 | `HTTPX_THREADS` | `int` | `50` | `-t` | Number of concurrent HTTP requests. Higher = faster but uses more CPU/memory. |
 | `HTTPX_TIMEOUT` | `int` | `10` | `-timeout` | Seconds to wait for each HTTP response before giving up. |
 | `HTTPX_RETRIES` | `int` | `2` | `-retries` | Number of retry attempts for failed/timeout requests. |
-| `HTTPX_RATE_LIMIT` | `int` | `150` | `-rl` | Maximum requests per second. Set to `0` for unlimited. Lower = more stealthy. |
+| `HTTPX_RATE_LIMIT` | `int` | `50` | `-rl` | Maximum requests per second. Lower = more stealthy. |
 
 **Thread Tuning Guide:**
 
-| Threads | Use Case | CPU Usage | Memory |
-|---------|----------|-----------|--------|
-| 10-25 | Stealth scanning, limited bandwidth | Low | ~100MB |
-| 50 | **Default** - balanced performance | Medium | ~200MB |
-| 100-200 | Fast scanning, good hardware | High | ~500MB |
-| 300+ | Maximum speed, powerful servers only | Very High | 1GB+ |
+| Threads | Use Case |
+|---------|----------|
+| 10-25 | Stealth scanning, limited bandwidth |
+| 50 | **Default** - balanced performance |
+| 100-200 | Fast scanning, good hardware |
 
 **Timeout Considerations:**
 - `5s` - Fast networks, modern servers
 - `10s` - **Default** - handles most scenarios
 - `15-30s` - Slow servers, high latency networks
+
+**Run budget.** The whole probe is stopped after `httpx_budget()` seconds:
+`ceil(URLs / HTTPX_THREADS) * HTTPX_TIMEOUT * (HTTPX_RETRIES + 1) + 60`. A
+stopped probe keeps the results it already wrote, records
+`scan_metadata.stopped_at_budget: true`, and leaves http_probe out of the
+finding prune for that run.
 
 ---
 
@@ -141,7 +141,7 @@ All parameters are configured via the webapp project settings (stored in Postgre
 
 | Parameter | Type | Default | httpx Flag | Description |
 |-----------|------|---------|------------|-------------|
-| `HTTPX_FOLLOW_REDIRECTS` | `bool` | `True` | `-fr` | Follow HTTP 301/302/307/308 redirects. Essential for modern web apps. |
+| `HTTPX_FOLLOW_REDIRECTS` | `bool` | `True` | `-fr` | Follow HTTP 301/302/307/308 redirects. Essential for modern web apps. With session headers attached, `-fhr` (same host only) is used instead, so the session never follows a redirect to another host. |
 | `HTTPX_MAX_REDIRECTS` | `int` | `10` | `-maxr` | Maximum redirect chain length. Prevents infinite redirect loops. |
 
 **Why Follow Redirects?**
@@ -149,6 +149,36 @@ All parameters are configured via the webapp project settings (stored in Postgre
 - www → non-www redirects are common
 - Login pages often redirect after authentication
 - Without following, you might miss the actual content
+
+**What is stored for a redirect.** httpx reports the URL it was *asked* for
+(`url`) and the last hop (`final_url`), but the status, title, technologies,
+server, favicon and body hash it prints describe the **last** page. So
+`status_code` on the Endpoint is the last hop's, and each probed URL also keeps:
+
+| Field (on the probed Endpoint) | Meaning |
+|---|---|
+| `first_status_code` | The first answer, before any redirect: `chain_status_codes[0]`, or `status_code` when nothing redirected. Rank on this, not on `status_code`: a host that answers `302` to a login page is not a `200` page. |
+| `redirect_chain_codes` | The status of each hop, first to last (`[302, 200]`); one entry when nothing redirected. |
+| `final_url` | Where the answer came from; equals `url` when nothing redirected. |
+| `redirected_off_host` | The last hop is on another host. |
+
+**An in-scope host that redirects off scope.** The scope filter checks the
+requested host *and* the last hop's host. When `old.example.com` (in scope)
+redirects to a third-party IdP (not in scope), the entry is kept (the host is
+live and redirects away) but none of the foreign page's fingerprint is: no
+title, technologies, server, favicon, body hash, content type, word/line
+counts, headers, body or TLS certificate (Go reports the final connection's).
+JARM, the IP, CNAME, ASN and CDN are measured on the requested host and stay.
+The foreign host becomes an external-domain entry (`source:
+"http_probe_redirect"`, `redirect_from_url` = the in-scope URL), which
+`run_http_probe` returns as `http_probe.external_domains` and the pipeline writes
+as an `ExternalDomain`. When neither host is in scope the entry is dropped and
+counted in `summary.filtered_out_of_scope`. `HTTPX_FOLLOW_REDIRECTS` stays on by
+default: with the chain stored, nothing needs the pre-redirect page itself.
+
+**What "in scope" means** (`is_host_in_scope()`): a subdomain of a scan root
+(the root itself only when it is a target); for an EXACT scope group or a
+filtered run, exactly the listed hosts; any IP otherwise.
 
 ---
 
@@ -163,7 +193,7 @@ These options extract basic HTTP response information with **minimal performance
 | `HTTPX_PROBE_CONTENT_TYPE` | `bool` | `True` | `-ct` | MIME type (`text/html`, `application/json`, etc.) | ✅ **None** |
 | `HTTPX_PROBE_TITLE` | `bool` | `True` | `-title` | HTML `<title>` tag content | ✅ **Minimal** |
 | `HTTPX_PROBE_SERVER` | `bool` | `True` | `-server` | Server header value (nginx, Apache, IIS, etc.) | ✅ **None** |
-| `HTTPX_PROBE_RESPONSE_TIME` | `bool` | `True` | `-rt` | Time to first byte in milliseconds | ✅ **None** |
+| `HTTPX_PROBE_RESPONSE_TIME` | `bool` | `True` | `-rt` | Response time | ✅ **None** |
 | `HTTPX_PROBE_WORD_COUNT` | `bool` | `True` | `-wc` | Number of words in response body | ✅ **Minimal** |
 | `HTTPX_PROBE_LINE_COUNT` | `bool` | `True` | `-lc` | Number of lines in response body | ✅ **Minimal** |
 
@@ -238,28 +268,41 @@ These options extract basic HTTP response information with **minimal performance
 - Cipher suite in use
 
 **TLS_GRAB extracts (additional):**
-- Certificate subject (CN, O, OU)
-- Certificate issuer (CA)
+- Certificate subject (CN, DN, organisation) and issuer (DN, CN, organisation)
 - Validity period (not_before, not_after)
 - Subject Alternative Names (all domains on cert)
-- Serial number
+- Serial number and SHA-256 fingerprint
+- The verdicts httpx's tlsx library reports: expired, self-signed, hostname mismatch, wildcard
 
-**Example TLS Output:**
+**Example TLS Output** (`by_url[...].tls`):
 ```json
 {
   "tls": {
-    "version": "TLS 1.3",
+    "version": "tls13",
     "cipher": "TLS_AES_256_GCM_SHA384",
     "certificate": {
       "subject_cn": "*.example.com",
-      "issuer": "Let's Encrypt Authority X3",
+      "subject_dn": "CN=*.example.com",
+      "subject_org": null,
+      "issuer": "CN=R3, O=Let's Encrypt, C=US",
+      "issuer_dn": "CN=R3, O=Let's Encrypt, C=US",
+      "issuer_cn": "R3",
+      "issuer_org": ["Let's Encrypt"],
+      "serial": "03:1A:...",
       "not_before": "2024-01-01T00:00:00Z",
       "not_after": "2024-04-01T00:00:00Z",
-      "san": ["example.com", "*.example.com", "www.example.com"]
+      "san": ["example.com", "*.example.com", "www.example.com"],
+      "fingerprint_sha256": "9f86d081884c7d65...",
+      "expired": false,
+      "self_signed": false,
+      "mismatched": false,
+      "wildcard": true
     }
   }
 }
 ```
+
+The certificate fields feed the TLS-hygiene security checks (see [README.VULN_SCAN.md](README.VULN_SCAN.md)), and the SANs are offered back to the pipeline as new hostnames after GROUP 4 (`collect_certificate_sans`, when `TLSX_INJECT_HOSTNAMES` is on).
 
 ⚠️ **Performance Note:** `TLS_GRAB` requires a full TLS handshake and certificate parsing. Disable for faster scans.
 
@@ -282,7 +325,7 @@ These options extract basic HTTP response information with **minimal performance
 **Use Cases:**
 - Identify Cobalt Strike C2 servers (known hashes)
 - Find admin panels (phpMyAdmin, cPanel)
-- Detect specific applications
+- Detect specific applications (RedAmon matches AI frontends by favicon, see [AI surface signals](#10-ai-surface-signals))
 - Cross-reference with Shodan favicon database
 
 **Example:**
@@ -295,7 +338,7 @@ These options extract basic HTTP response information with **minimal performance
 #### JARM Fingerprinting
 
 **What It Is:**
-- JARM = JA3 + RDP fingerprint for servers
+- An active TLS server fingerprint (Salesforce's JARM)
 - Creates unique fingerprint based on TLS server configuration
 - Requires **10 separate TLS handshakes** per target
 
@@ -305,7 +348,6 @@ Each JARM fingerprint requires:
 - 10 different TLS ClientHello messages
 - 10 separate connections
 - Parsing 10 ServerHello responses
-- Total: ~5-10 seconds per target
 ```
 
 **Use Cases:**
@@ -318,12 +360,20 @@ Each JARM fingerprint requires:
 
 #### Body Hash
 
-**Options:** `"md5"`, `"sha256"`, `"sha512"`, `""` (disabled)
+**Options:** `"md5"`, `"sha256"`, `"sha512"`, `""` (disabled). Stored as `body_hash`.
 
 **Use Cases:**
 - Detect identical pages across different URLs
 - Find mirror sites
 - Identify default/template pages
+
+**Shared pages (`shared_body_cluster`).** After every http_probe graph write,
+full or partial, the http mixin groups the project's root Endpoints (path `/`) by
+`body_sha256`. When 3 or more distinct BaseURLs serve the same body with status
+200 or 403, each of those Endpoints gets `shared_body_cluster` = that count: one
+gateway deny, parking or default page, not each host's own content. The mark is
+recomputed over the whole project each time and removed from an Endpoint whose
+host no longer serves the shared page.
 
 ---
 
@@ -331,22 +381,17 @@ Each JARM fingerprint requires:
 
 | Parameter | Type | Default | httpx Flag | What It Does | Speed Impact |
 |-----------|------|---------|------------|--------------|--------------|
-| `HTTPX_INCLUDE_RESPONSE` | `bool` | `True` | `-irr` | Include full HTTP response (headers + body) | ⚠️ **SLOW** + Large Output |
+| `HTTPX_INCLUDE_RESPONSE` | `bool` | `True` | `-irr` | Include full HTTP response (headers + body) | ⚠️ **SLOW** |
 | `HTTPX_INCLUDE_RESPONSE_HEADERS` | `bool` | `True` | `-irh` | Include only response headers | ⚡ **Medium** |
 
-**Output Size Comparison:**
-
-| Setting | Typical Size per URL |
-|---------|---------------------|
-| Headers only | 1-5 KB |
-| Headers + Body | 50-500 KB |
-| Full response | 100+ KB |
+**The body is used, then dropped.** `run_http_probe()` hands the captured bodies
+to the Wappalyzer pass, the AI body fingerprints, HTTP traffic capture (when
+`CAPTURE_PROXY_ENABLED` is on) and the Jev page-type labels, then removes `body`
+from every `by_url` entry before storing the result. Headers stay.
 
 **When to Enable Full Response:**
-- ✅ Detailed analysis of response content
-- ✅ Looking for sensitive data exposure
-- ✅ Custom pattern matching needed
-- ❌ Large-scale scanning (creates huge files)
+- ✅ Wappalyzer and AI body fingerprints need it
+- ✅ Traffic capture stores the transactions
 - ❌ Speed is priority
 
 ---
@@ -355,10 +400,10 @@ Each JARM fingerprint requires:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `HTTPX_PATHS` | `list` | `[]` | Additional paths to probe beyond root |
-| `HTTPX_CUSTOM_HEADERS` | `list` | `[]` | Custom HTTP headers to send |
-| `HTTPX_MATCH_CODES` | `list` | `[]` | Only keep responses with these status codes |
-| `HTTPX_FILTER_CODES` | `list` | `[]` | Exclude responses with these status codes |
+| `HTTPX_PATHS` | `list` | `[]` | Additional paths to probe beyond root (`-path`, joined with commas) |
+| `HTTPX_CUSTOM_HEADERS` | `list` | browser-like headers | HTTP headers to send (`-H` each); the default is a desktop Chrome `User-Agent` with the `Accept*`, `Sec-Fetch-*` and related headers a browser sends |
+| `HTTPX_MATCH_CODES` | `list` | `[]` | Only keep responses with these status codes (`-mc`) |
+| `HTTPX_FILTER_CODES` | `list` | `[]` | Exclude responses with these status codes (`-fc`) |
 
 #### Path Probing
 
@@ -386,6 +431,11 @@ HTTPX_CUSTOM_HEADERS = [
 ]
 ```
 
+**Authenticated sessions.** When the project has an authenticated-session
+profile, its headers are added to these (`merge_auth_headers_ex`), checked
+against the hosts this run actually probes: httpx sends one header set to the
+whole target file, so a probe with any out-of-scope host gets no session.
+
 #### Status Code Filtering
 
 ```python
@@ -398,6 +448,25 @@ HTTPX_FILTER_CODES = ["404", "403", "500", "502", "503"]
 
 ---
 
+### 10. AI Surface Signals
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `HTTP_PROBE_AI_HEADER_SCAN_ENABLED` | `bool` | `True` | Match response header names against the AI header catalogue (vLLM, TGI, LangChain, ...) |
+| `HTTP_PROBE_AI_FAVICON_HASH_ENABLED` | `bool` | `True` | Match the favicon hash against known AI frontends |
+| `HTTP_PROBE_AI_TITLE_DETECTION_ENABLED` | `bool` | `True` | Match the page title against AI frontends |
+| `HTTP_PROBE_AI_WAPPALYZER_ENABLED` | `bool` | `True` | Match the response body (up to 512 KB) against AI body fingerprints |
+| `HTTPX_JEV_PAGE_TYPE` | `bool` | `False` | With `AI_IN_PIPELINE` on, label each page (login wall, parked domain, default install, placeholder, error page, app) with TypeSafe AI Jev |
+
+The catalogues live in `recon/helpers/ai_signal_catalog.py`. A match sets
+`is_ai_framework_detected`, `ai_framework_name`, `ai_framework_category` and,
+for a frontend, `ai_frontend_product_guess` on the `by_url` entry; the summary
+counts the matches (`ai_header_matches`, `ai_favicon_matches`,
+`ai_title_matches`, `ai_wappalyzer_matches`). The page-type pass writes
+`page_class`, `page_class_confidence` and `page_class_source`.
+
+---
+
 ### Speed Profiles
 
 #### 🏎️ Fast Mode (Reconnaissance)
@@ -406,17 +475,16 @@ HTTPX_FILTER_CODES = ["404", "403", "500", "502", "503"]
 HTTPX_THREADS = 100
 HTTPX_TIMEOUT = 5
 HTTPX_RETRIES = 0
-HTTPX_RATE_LIMIT = 0
+HTTPX_RATE_LIMIT = 300
 
 HTTPX_PROBE_JARM = False           # DISABLE - very slow
 HTTPX_PROBE_TLS_GRAB = False       # DISABLE - slow
 HTTPX_PROBE_FAVICON = False        # DISABLE - extra request
 HTTPX_PROBE_HASH = ""              # DISABLE
-HTTPX_INCLUDE_RESPONSE = False     # DISABLE - large output
+HTTPX_INCLUDE_RESPONSE = False     # DISABLE - no Wappalyzer or AI body pass
 ```
-**Expected:** ~5-10 seconds for 10 URLs
 
-#### ⚖️ Balanced Mode (Default)
+#### ⚖️ Balanced Mode
 ```python
 # Good balance of speed and information
 HTTPX_THREADS = 50
@@ -427,9 +495,8 @@ HTTPX_RATE_LIMIT = 150
 HTTPX_PROBE_JARM = False           # DISABLE for balance
 HTTPX_PROBE_TLS_GRAB = True
 HTTPX_PROBE_FAVICON = True
-HTTPX_INCLUDE_RESPONSE = False
+HTTPX_INCLUDE_RESPONSE = True
 ```
-**Expected:** ~20-40 seconds for 10 URLs
 
 #### 🔬 Deep Analysis Mode
 ```python
@@ -445,18 +512,19 @@ HTTPX_PROBE_FAVICON = True
 HTTPX_PROBE_HASH = "sha256"
 HTTPX_INCLUDE_RESPONSE = True      # Full response capture
 ```
-**Expected:** ~2-5 minutes for 10 URLs
+
+The defaults match the deep profile, except for 50 threads and a 10-second timeout.
 
 ---
 
 ## Banner Grabbing
 
-Banner grabbing is **integrated into httpx_scan.py** and runs automatically after HTTP probing. It detects service versions on non-HTTP ports that httpx cannot probe.
+Banner grabbing is **integrated into http_probe.py** (`run_banner_grab()`) and runs after HTTP probing, when `BANNER_GRAB_ENABLED` is on and port-scan data exists. It detects service versions on non-HTTP ports that httpx cannot probe.
 
 ### Configuration
 
 ```python
-# Banner Grabbing Configuration (project_settings.py)
+# Banner Grabbing Configuration (project settings, runtime keys)
 
 # Enable/disable banner grabbing for non-HTTP ports
 BANNER_GRAB_ENABLED = True
@@ -468,8 +536,26 @@ BANNER_GRAB_TIMEOUT = 5
 BANNER_GRAB_THREADS = 20
 
 # Maximum banner length to store (characters)
-BANNER_GRAB_MAX_LENGTH = 500
+BANNER_GRAB_MAX_LENGTH = 1000
 ```
+
+### How It Works
+
+For every open port in `port_scan.by_host` that is not in
+`BANNER_GRAB_SKIP_PORTS` (every port in `HTTP_PORTS` and `HTTPS_PORTS`, plus
+9090 and 8800, which httpx already probes), `grab_banner_for_target()` connects
+to the host's IP, reads what the service sends first, sends the port's probe if
+nothing came, and retries over TLS on 993, 995, 465, 636 and 990.
+`identify_service()` matches the banner against `SERVICE_PATTERNS`.
+
+FTP and SMTP both greet with `220`, so their patterns are anchored at the start
+of the banner and the product decides (`vsFTPd`, `ProFTPD`, ... vs `Postfix`,
+`Exim 4.94.2`, `Sendmail`, `Microsoft ESMTP`, any `ESMTP`). A bare `220` that
+names no product is decided by the port: 25, 465, 587 and 2525 are SMTP, 21 and
+990 FTP, and any other port is FTP only when the banner says FTP, else
+`unknown`. Do not define `HTTP_PORTS` a second time for the skip set: a second
+definition once shadowed the first, and 443, 8443, 9090 and 8800 were
+banner-grabbed.
 
 ### Supported Services
 
@@ -477,23 +563,26 @@ BANNER_GRAB_MAX_LENGTH = 500
 |---------|---------|------------------|
 | SSH | 22 | Banner: `SSH-2.0-OpenSSH_8.2p1` |
 | FTP | 21 | Banner: `220 vsFTPd 3.0.3` |
-| SMTP | 25, 465, 587 | Banner: `220 mail.example.com ESMTP Postfix` |
+| SMTP | 25, 465, 587, 2525 | `EHLO` response: `220 mail.example.com ESMTP Postfix` |
 | POP3 | 110, 995 | Banner: `+OK Dovecot ready` |
 | IMAP | 143, 993 | Banner: `* OK Dovecot IMAP` |
-| MySQL | 3306 | Connection handshake |
+| MySQL / MariaDB | 3306 | Connection handshake |
 | PostgreSQL | 5432 | Cancel request response |
 | Redis | 6379 | `INFO` command response |
+| MongoDB | 27017 | Banner or error text |
 | VNC | 5900 | RFB protocol banner |
-| Memcached | 11211 | `VERSION` command |
+| Memcached | 11211 | `version` command |
 | Telnet | 23 | Login prompt |
 
 ### Skipped Ports (Handled by httpx)
 
-HTTP ports are automatically skipped since httpx provides better detection:
+Ports in `HTTP_PORTS` are skipped:
 
 ```
-80, 443, 8080, 8443, 8000, 8888, 8008, 3000, 5000, 9000, 9090, 8800
+80, 8080, 8000, 8888, 8008, 3000, 5000, 9000
 ```
+
+`http_probe.py` assigns `HTTP_PORTS` twice; the second assignment, shared with the URL builders, is the one in effect, so 443 and 8443 are banner-grabbed as well.
 
 ### Output Structure
 
@@ -514,7 +603,7 @@ HTTP ports are automatically skipped since httpx provides better detection:
             "port": 22,
             "banner": "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5",
             "service": "ssh",
-            "version": "OpenSSH 8.2p1",
+            "version": "OpenSSH_8.2p1",
             "confidence": "high"
           },
           "21": {
@@ -528,12 +617,14 @@ HTTP ports are automatically skipped since httpx provides better detection:
       }
     },
     "services_found": {
-      "ssh": [{"host": "example.com", "port": 22, "version": "OpenSSH 8.2p1"}],
+      "ssh": [{"host": "example.com", "port": 22, "version": "OpenSSH_8.2p1"}],
       "ftp": [{"host": "example.com", "port": 21, "version": "vsFTPd 3.0.3"}]
     }
   }
 }
 ```
+
+The banner and version are also copied onto the matching `port_scan.by_host[...].port_details` entries, and the CVE lookup reads `services_found` versions.
 
 ### Limitations
 
@@ -544,13 +635,13 @@ HTTP ports are automatically skipped since httpx provides better detection:
 | Custom services | Unknown port/protocol combinations |
 | Firewall blocking | May timeout on filtered ports |
 
-For comprehensive service detection (1000+ services), consider using nmap with `-sV` flag separately.
+For comprehensive service detection, the pipeline also runs Nmap service detection (`-sV`) in GROUP 3.5 when `NMAP_ENABLED` is on.
 
 ---
 
 ## Wappalyzer Technology Enhancement
 
-Wappalyzer enhancement is **integrated into httpx_scan.py** and runs automatically after httpx parsing. It uses existing HTML from httpx (no additional HTTP requests) to detect 1000+ technologies, including CMS plugins, analytics tools, security tools, and frameworks that httpx might miss.
+Wappalyzer enhancement is **integrated into http_probe.py** (`enhance_with_wappalyzer()`) and runs automatically after httpx parsing. It uses the HTML and headers httpx already captured (no additional HTTP requests to the target) to detect technologies httpx's own detection might miss, including CMS plugins, analytics tools, security tools, and frameworks.
 
 ### How It Works
 
@@ -558,22 +649,30 @@ Wappalyzer enhancement is **integrated into httpx_scan.py** and runs automatical
 ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │  httpx Output    │────▶│  Wappalyzer      │────▶│  Enhanced JSON   │
 │  (HTML bodies,   │     │  Enhancement     │     │  with additional │
-│   technologies)   │     │                  │     │  technologies    │
-└──────────────────┘     │  1. Parse HTML   │     └──────────────────┘
-                          │  2. Match 1000+  │
-                          │     patterns     │
-                          │  3. Detect       │
-                          │     plugins,     │
-                          │     analytics    │
-                          │  4. Merge with   │
+│   headers)       │     │                  │     │  technologies    │
+└──────────────────┘     │  1. Load the DB  │     └──────────────────┘
+                          │  2. Analyze each │
+                          │     captured page│
+                          │  3. Drop matches │
+                          │     below min    │
+                          │     confidence   │
+                          │  4. Merge new    │
+                          │     techs into   │
                           │     httpx techs  │
                           └──────────────────┘
 ```
 
+**The fingerprint database.** `download_wappalyzer_database()` fetches the
+`wappalyzer@WAPPALYZER_NPM_VERSION` package's `categories.json` and
+`technologies/*.json` from unpkg, normalizes them for python-Wappalyzer and
+caches the result in `recon/main_recon_modules/data/wappalyzer_cache/` for
+`WAPPALYZER_CACHE_TTL_HOURS`. When the download fails it uses the cached copy,
+then python-Wappalyzer's bundled (older) database.
+
 ### Configuration
 
 ```python
-# Wappalyzer Configuration (project_settings.py)
+# Wappalyzer Configuration (project settings, runtime keys)
 
 # Enable/disable Wappalyzer technology enhancement
 WAPPALYZER_ENABLED = True
@@ -582,20 +681,18 @@ WAPPALYZER_ENABLED = True
 # Lower = more detections but potentially more false positives
 WAPPALYZER_MIN_CONFIDENCE = 50
 
-# Analyze only URLs with HTML body (recommended: True)
-# When False, attempts to analyze URLs without body (limited detection)
+# Analyze only URLs with HTML body (URLs without a captured body are skipped either way)
 WAPPALYZER_REQUIRE_HTML = True
+
+# Fetch the newer fingerprint database (False = the bundled one)
+WAPPALYZER_AUTO_UPDATE = True
+WAPPALYZER_CACHE_TTL_HOURS = 24
+WAPPALYZER_NPM_VERSION = "6.10.56"
 ```
 
 ### Installation
 
-Wappalyzer requires the `python-Wappalyzer` library:
-
-```bash
-pip install python-Wappalyzer
-```
-
-**Note:** If Wappalyzer is not installed, the enhancement will be skipped with a warning message.
+`python-Wappalyzer` is installed in the recon image (`recon/requirements.txt`). If the import fails, the enhancement is skipped with a warning message.
 
 ### What Wappalyzer Detects
 
@@ -610,121 +707,67 @@ pip install python-Wappalyzer
 | **Database Tools** | phpMyAdmin, Adminer | Database exposure risks |
 | **Version Information** | WordPress 6.0, jQuery 3.6.0 | Version-based CVE lookup |
 
-### Comparison: httpx vs Wappalyzer
-
-| Feature | httpx Built-in | Wappalyzer Enhancement |
-|---------|---------------|------------------------|
-| **Pattern Database** | ~50-100 patterns | **1000+ patterns** |
-| **CMS Plugins** | ❌ Limited | ✅ **Excellent** |
-| **Analytics Tools** | ❌ Few | ✅ **Comprehensive** |
-| **Security Tools** | ⚠️ Basic | ✅ **Detailed** |
-| **Version Detection** | ⚠️ Basic | ✅ **Enhanced with confidence** |
-| **Category Classification** | ❌ None | ✅ **Full categorization** |
-| **Confidence Scores** | ❌ None | ✅ **Per-technology** |
-
 ### Output Structure
 
-Wappalyzer results are added under the `wappalyzer` key within the `httpx` section:
+Wappalyzer results are added under the `wappalyzer` key within the `http_probe` section, and every technology httpx did not report is appended to that URL's `technologies` as `Name:version` (or `Name`):
 
 ```json
 {
-  "httpx": {
+  "http_probe": {
     "by_url": {
       "https://example.com": {
-        "technologies": ["Nginx:1.19.0", "PHP:5.6.40", "WordPress:6.0", "jQuery:3.6.0", "Yoast SEO"]
+        "technologies": ["Nginx:1.19.0", "PHP:5.6.40", "WordPress:6.0", "jQuery:3.6.0", "Yoast SEO:20.0"]
       }
     },
     "wappalyzer": {
       "scan_metadata": {
         "scan_timestamp": "2025-12-31T12:34:56.789012",
+        "min_confidence": 50,
         "urls_analyzed": 1,
-        "new_technologies_found": 3,
-        "plugins_detected": 1,
-        "analytics_detected": 1,
-        "security_tools_detected": 1
+        "new_technologies_found": 2
       },
       "by_url": {
         "https://example.com": [
           {
             "name": "jQuery",
             "version": "3.6.0",
-            "categories": ["JavaScript frameworks"],
+            "categories": ["JavaScript libraries"],
+            "versions_all": ["3.6.0"],
             "confidence": 100
           },
           {
             "name": "Yoast SEO",
             "version": "20.0",
-            "categories": ["CMS"],
-            "confidence": 95
-          },
-          {
-            "name": "Google Analytics",
-            "version": null,
-            "categories": ["Analytics"],
+            "categories": ["SEO"],
+            "versions_all": ["20.0"],
             "confidence": 100
           }
         ]
       },
       "new_technologies": {
-        "jQuery:3.6.0": ["https://example.com"],
-        "Yoast SEO": ["https://example.com"],
-        "Google Analytics": ["https://example.com"]
+        "jQuery": ["https://example.com"],
+        "Yoast SEO": ["https://example.com"]
       },
       "all_technologies": {
-        "WordPress": {
-          "name": "WordPress",
-          "versions_found": ["6.0"],
-          "categories": ["CMS"],
-          "urls": ["https://example.com"]
-        },
         "jQuery": {
           "name": "jQuery",
           "versions_found": ["3.6.0"],
-          "categories": ["JavaScript frameworks"],
-          "urls": ["https://example.com"]
+          "categories": ["JavaScript libraries"],
+          "urls": ["https://example.com"],
+          "confidence": 100
         }
       },
-      "plugins": [
-        {
-          "name": "Yoast SEO",
-          "version": "20.0",
-          "url": "https://example.com"
-        }
-      ],
-      "analytics": [
-        {
-          "name": "Google Analytics",
-          "url": "https://example.com"
-        }
-      ],
-      "security_tools": [
-        {
-          "name": "Cloudflare",
-          "url": "https://example.com"
-        }
-      ],
-      "frameworks": [
-        {
-          "name": "jQuery",
-          "version": "3.6.0",
-          "url": "https://example.com"
-        }
-      ],
       "summary": {
         "urls_analyzed": 1,
-        "total_technologies": 5,
-        "new_technologies": 3,
-        "httpx_missed": ["jQuery:3.6.0", "Yoast SEO", "Google Analytics"],
-        "plugins_count": 1,
-        "analytics_count": 1,
-        "security_tools_count": 1,
-        "frameworks_count": 1
+        "total_technologies": 4,
+        "new_technologies": 2,
+        "httpx_missed": ["jQuery", "Yoast SEO"]
       }
     },
     "summary": {
       "technology_count": 5,
-      "unique_technologies": ["Nginx:1.19.0", "PHP:5.6.40", "WordPress:6.0", "jQuery:3.6.0", "Yoast SEO"],
-      "wappalyzer_additions": 3
+      "unique_technologies": ["Nginx:1.19.0", "PHP:5.6.40", "WordPress:6.0", "jQuery:3.6.0", "Yoast SEO:20.0"],
+      "wappalyzer_additions": 2
     }
   }
 }
@@ -732,7 +775,7 @@ Wappalyzer results are added under the `wappalyzer` key within the `httpx` secti
 
 ### Benefits for CVE Lookup
 
-Wappalyzer enhancement significantly improves CVE lookup results:
+Wappalyzer enhancement improves CVE lookup results:
 
 1. **More Technologies Detected:** More technologies = more CVEs found
 2. **Version Information:** Better version detection enables accurate CVE matching
@@ -740,26 +783,18 @@ Wappalyzer enhancement significantly improves CVE lookup results:
 4. **Framework CVEs:** JavaScript frameworks (jQuery, React) have known vulnerabilities
 
 **Example:**
-- **httpx only:** Detects `WordPress:6.0` → 5 CVEs found
-- **httpx + Wappalyzer:** Detects `WordPress:6.0`, `jQuery:3.6.0`, `Yoast SEO:20.0` → 15 CVEs found
+- **httpx only:** Detects `WordPress:6.0`
+- **httpx + Wappalyzer:** Detects `WordPress:6.0`, `jQuery:3.6.0`, `Yoast SEO:20.0`, and each versioned one is looked up
 
 ### Performance Impact
 
-| URLs | Wappalyzer Time | Total Scan Time |
-|------|----------------|-----------------|
-| 1 URL | ~1-2 seconds | +1-2 seconds |
-| 10 URLs | ~5-10 seconds | +5-10 seconds |
-| 100 URLs | ~30-60 seconds | +30-60 seconds |
-
-**Note:** Wappalyzer uses existing HTML from httpx, so there are **no additional HTTP requests**. The time is purely for HTML parsing and pattern matching.
+Wappalyzer uses the HTML httpx already captured, so it sends **no additional requests to the target**. The time is HTML parsing and pattern matching, plus the database download when the cache is stale.
 
 ### Troubleshooting
 
-#### "Wappalyzer not installed"
+#### "Wappalyzer not installed - skipping enhancement"
 
-```bash
-pip install python-Wappalyzer
-```
+The recon image ships `python-Wappalyzer`; this message means the image was built without it. Rebuild the recon image.
 
 #### "No new technologies found"
 
@@ -789,7 +824,7 @@ This is normal - the enhancement continues for other URLs.
 
 ### Integration with CVE Lookup
 
-Wappalyzer-detected technologies are automatically included in CVE lookup:
+Wappalyzer-detected technologies are automatically included in CVE lookup, because the lookup reads `http_probe.by_url[...].technologies`:
 
 ```json
 {
@@ -807,59 +842,73 @@ Wappalyzer-detected technologies are automatically included in CVE lookup:
 
 ## Architecture & Flow
 
-> **Pipeline context:** HTTP probing runs in **GROUP 4** of the parallelized recon pipeline, sequentially after GROUP 3 (Shodan + Port Scan). It depends on port scan results to build probe targets. While the module itself runs sequentially in the pipeline, httpx internally uses parallel threads for probing multiple targets.
+> **Pipeline context:** HTTP probing runs in **GROUP 4** of the recon pipeline (`recon/main.py`), after GROUP 3 (Shodan + port scan), GROUP 3.5 (Nmap) and GROUP 3.6 (tlsx), when `http_probe` is in the scan modules and `HTTPX_ENABLED` is on. It depends on the merged `port_scan` to build probe targets. The module runs sequentially in the pipeline; httpx uses parallel threads internally. After it, `update_graph_from_http_probe` writes the graph in the background, certificate SANs are offered back as hostnames, and when no live URL was found the active scans (resource enumeration, vulnerability scanning) are skipped.
 
-### Execution Flow
+### Execution Flow (`run_http_probe`)
 
 ```
-1. INITIALIZATION
-   └── Check Docker availability
-   └── Pull httpx image if needed
+1. PRECHECKS
+   └── is_docker_installed() / is_docker_running()
+   └── pull_httpx_docker_image() pulls the image if it is missing
 
 2. TARGET BUILDING
-   └── Priority 1: Build URLs from Naabu port data
-   └── Priority 2: Build URLs from DNS data (fallback)
-   └── Determine HTTP/HTTPS based on port numbers
+   └── port_scan present → build_targets_from_naabu()
+       (falls back to build_targets_from_dns() when it yields no URL)
+   └── no port_scan → build_targets_from_dns()
+   └── apply_custom_port_scope(): with NAABU_CUSTOM_PORTS set, drop every
+       URL on another port
 
 3. PROBE EXECUTION
-   └── Create targets file with URLs
-   └── Build httpx Docker command
-   └── Execute with JSON Lines output
-   └── Monitor progress
+   └── targets.txt in a per-run dir /tmp/redamon/.httpx_temp_<id>
+   └── build_httpx_command() → docker run ... -json, session headers
+       checked against the hosts in targets.txt
+   └── Stop at httpx_budget(); parse whatever was written
 
-4. RESULT PROCESSING
-   └── Parse JSONL output line by line
-   └── Extract technologies per URL
-   └── Aggregate data by host
-   └── Track unique technologies and servers
+4. RESULT PROCESSING  (parse_httpx_output)
+   └── Parse the JSON Lines output line by line
+   └── Scope filter (requested host and final host); off-scope redirects
+       become external_domains
+   └── Redirect chain, TLS certificate, fingerprints, headers
+   └── AI surface signals (_annotate_ai_http_signals)
+   └── Aggregate by host; track technologies and servers; summary
 
-5. DATA ENRICHMENT
-   └── Add "httpx" section to recon_data
-   └── Save incrementally to JSON file
-   └── Generate summary statistics
+5. ENRICHMENT
+   └── enhance_with_wappalyzer()
+   └── capture_httpx_transactions() (traffic capture, when enabled)
+   └── Jev page-type labels (AI_IN_PIPELINE and HTTPX_JEV_PAGE_TYPE)
+   └── Drop the bodies
+
+6. RESULT
+   └── recon_data["http_probe"] = {...}
+   └── run_banner_grab() → recon_data["banner_grab"]
+   └── Written to output_file when one is passed
+   └── The temp dir is removed
 ```
 
-### URL Building from Naabu
+### URL Building from the Port Scan
+
+`build_targets_from_naabu()` reads `port_scan.by_host[...].port_details` (Naabu and Masscan merged):
 
 ```python
-# Port-based protocol detection
-https_ports = {443, 8443, 4443, 9443}
-http_ports = {80, 8080, 8000, 8888}
-
-# Example transformations:
-# Port 443 -> https://example.com
-# Port 80 -> http://example.com
-# Port 8443 -> https://example.com:8443
-# Port 8080 -> http://example.com:8080
-# Unknown port -> try both http:// and https://
+# A port's service name decides first, then the port number
+# 443, or service containing "https"/"ssl"/"tls" -> https://host[:port]
+# 80, or service containing "http"               -> http://host[:port]
+HTTPS_PORTS = {443, 8443, 4443, 9443, 8843}      # -> https://host:port
+HTTP_PORTS  = {80, 8080, 8000, 8888, 8008, 3000, 5000, 9000}  # -> http://host:port
+# Any other port -> try both http:// and https://
 ```
+
+`build_targets_from_dns()` (the fallback) probes each resolved host (the root only when it is a target): with `NAABU_CUSTOM_PORTS` set, exactly those ports; otherwise ports 80 and 443 plus 8080, 8000, 8888, 3000, 5000, 9000 over HTTP and 8443, 4443, 9443 over HTTPS. In IP mode a mock hostname is replaced by its IP.
 
 ### Docker Command Structure
 
+What `build_httpx_command()` produces with the default settings:
+
 ```bash
-docker run --rm -i \
-  -v /targets:/targets:ro \
-  -v /output:/output \
+docker run --rm --net=host \
+  --name redamon-httpx-<id> \
+  -v /tmp/redamon/.httpx_temp_<id>:/targets:ro \
+  -v /tmp/redamon/.httpx_temp_<id>:/output \
   projectdiscovery/httpx:latest \
   -l /targets/targets.txt \
   -o /output/httpx_output.json \
@@ -869,8 +918,8 @@ docker run --rm -i \
   -t 50 \                    # Threads
   -timeout 10 \
   -retries 2 \
-  -rl 150 \                  # Rate limit
-  -fr \                      # Follow redirects
+  -rl 50 \                   # Rate limit
+  -fr \                      # Follow redirects (-fhr with session headers)
   -maxr 10 \                 # Max redirects
   -sc \                      # Status code
   -cl \                      # Content length
@@ -891,8 +940,11 @@ docker run --rm -i \
   -irr \                     # Include response (headers + body)
   -irh \                     # Include headers only
   -asn \                     # ASN info
-  -cdn                       # CDN detection
+  -cdn \                     # CDN detection
+  -H "User-Agent: ..." ...   # One -H per HTTPX_CUSTOM_HEADERS entry
 ```
+
+`-path`, `-mc` and `-fc` are added when `HTTPX_PATHS`, `HTTPX_MATCH_CODES` and `HTTPX_FILTER_CODES` are set. `--net=host` lets httpx reach loopback and local-lab targets; the name lets the budget watchdog `docker kill` the container.
 
 ---
 
@@ -902,22 +954,26 @@ docker run --rm -i \
 
 ```json
 {
-  "httpx": {
+  "http_probe": {
     "scan_metadata": {
       "scan_timestamp": "2024-01-15T12:00:00.000000",
       "scan_duration_seconds": 120.5,
       "docker_image": "projectdiscovery/httpx:latest",
       "threads": 50,
       "timeout": 10,
-      "rate_limit": 150,
+      "rate_limit": 50,
       "follow_redirects": true,
       "tech_detection": true,
       "tls_probing": true,
       "response_included": true,
       "proxy_used": false,
-      "total_urls_probed": 150
+      "total_urls_probed": 150,
+      "stopped_at_budget": false,
+      "root_domain_filter": "example.com",
+      "filtered_mode": false,
+      "allowed_hosts_filter": null
     },
-    
+
     "by_url": {
       "https://example.com": {
         "url": "https://example.com",
@@ -930,7 +986,7 @@ docker run --rm -i \
         "response_time_ms": 245,
         "word_count": 1234,
         "line_count": 89,
-        "technologies": ["nginx", "PHP", "WordPress"],
+        "technologies": ["Nginx:1.18.0", "PHP", "WordPress"],
         "ip": "93.184.216.34",
         "cname": null,
         "cdn": null,
@@ -940,51 +996,51 @@ docker run --rm -i \
           "as_name": "Edgecast Inc.",
           "as_country": "US"
         },
-        "tls": {
-          "version": "TLS 1.3",
-          "cipher": "TLS_AES_256_GCM_SHA384",
-          "certificate": {
-            "subject_cn": "example.com",
-            "issuer": "Let's Encrypt Authority X3",
-            "not_before": "2024-01-01T00:00:00Z",
-            "not_after": "2024-04-01T00:00:00Z",
-            "san": ["example.com", "www.example.com"]
-          }
-        },
+        "final_url": "https://example.com",
+        "first_status_code": 200,
+        "redirect_chain_codes": [200],
+        "redirected_off_host": false,
+        "tls": { "...": "see SSL/TLS Information" },
         "favicon_hash": "116323821",
         "jarm": "29d29d15d29d29d00029d29d29d29d...",
-        "body_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "body_hash": {"body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                      "header_sha256": "..."},
         "headers": {
-          "Content-Type": "text/html; charset=UTF-8",
-          "X-Powered-By": "PHP/7.4.3"
-        },
-        "body": "<!DOCTYPE html>..."
+          "content_type": "text/html; charset=UTF-8",
+          "x_powered_by": "PHP/7.4.3"
+        }
       }
     },
-    
+
+    "external_domains": [
+      {"domain": "idp.example.net", "source": "http_probe_redirect",
+       "url": "https://idp.example.net/saml/login", "redirect_from_url": "http://old.example.com",
+       "status_code": 200, "title": "SAML Login", "server": "nginx"}
+    ],
+
     "by_host": {
       "example.com": {
         "hostname": "example.com",
         "urls": ["http://example.com", "https://example.com"],
         "live_urls": ["https://example.com"],
-        "technologies": ["nginx", "PHP", "WordPress"],
+        "technologies": ["Nginx:1.18.0", "PHP", "WordPress"],
         "servers": ["nginx/1.18.0"],
         "status_codes": [200, 301]
       }
     },
-    
+
     "technologies_found": {
-      "nginx": ["https://example.com", "https://api.example.com"],
+      "Nginx:1.18.0": ["https://example.com", "https://api.example.com"],
       "PHP": ["https://example.com"],
       "WordPress": ["https://example.com"],
       "React": ["https://app.example.com"]
     },
-    
+
     "servers_found": {
       "nginx/1.18.0": ["https://example.com"],
       "Apache/2.4.41": ["https://legacy.example.com"]
     },
-    
+
     "summary": {
       "total_urls_probed": 150,
       "live_urls": 45,
@@ -994,47 +1050,56 @@ docker run --rm -i \
         "301": 8,
         "404": 2
       },
-      "unique_technologies": ["nginx", "PHP", "WordPress", "React"],
+      "unique_technologies": ["Nginx:1.18.0", "PHP", "WordPress", "React"],
       "technology_count": 4,
       "unique_servers": ["nginx/1.18.0", "Apache/2.4.41"],
       "server_count": 2,
-      "cdn_hosts": 3
-    }
+      "cdn_hosts": 3,
+      "filtered_out_of_scope": 2,
+      "ai_header_matches": 0,
+      "ai_favicon_matches": 0,
+      "ai_title_matches": 0,
+      "ai_wappalyzer_matches": 0,
+      "wappalyzer_additions": 0
+    },
+
+    "wappalyzer": { "...": "see Wappalyzer Technology Enhancement" }
   }
 }
 ```
+
+- Most values are passed through as httpx writes them: `body_hash` is httpx's `hash` object (the graph stores its `body_sha256` and `header_sha256`), and header names arrive with underscores (`x_powered_by`).
+- A URL counts as live when it answered with a status below 500.
+- `summary.total_urls_probed` counts the parsed results; `scan_metadata.total_urls_probed` the URLs sent.
+- `body` is not stored (see [Response Content Inclusion](#8-response-content-inclusion)).
+- `update_graph_from_http_probe` (`graph_db/mixins/recon/http_mixin.py`) writes the result to the graph.
 
 ---
 
 ## Usage Examples
 
-### Basic Usage (via main.py)
+### Basic Usage (full pipeline)
 
-```python
-# Include "http_probe" in SCAN_MODULES in project settings
-SCAN_MODULES = ["initial_recon", "naabu", "httpx", "nuclei"]
+The probe runs when the project's scan modules include `http_probe` (they do by default) and `HTTPX_ENABLED` is on. Start a recon scan from the webapp; the orchestrator spawns the recon container, which runs `recon/main.py` with the project's settings.
 
-# Run the full pipeline
-python3 recon/main.py
-```
+### Partial Recon
+
+`recon/partial_recon_modules/http_probing.py` (`run_httpx`) re-runs `run_http_probe()` on demand against the graph's hosts and ports and any targets the user typed in. It turns off the custom-port guard (`HTTPX_ENFORCE_CUSTOM_PORT_SCOPE = False`), since it scopes the ports itself.
 
 ### Standalone Enrichment
 
 ```python
-from httpx_scan import enrich_recon_file
+from recon.main_recon_modules.http_probe import enrich_recon_file
 from pathlib import Path
 
 enriched = enrich_recon_file(Path("output/recon_example.com.json"))
 ```
 
-### Command Line
-
-```bash
-# Enrich an existing recon file
-python3 recon/httpx_scan.py output/recon_example.com.json
-```
+`enrich_recon_file()` loads the settings with `get_settings()`, runs `run_http_probe()` and writes the result back to the same file.
 
 ### Configuration Profiles
+
+Values to enter in the project settings (shown as runtime keys):
 
 **Quick Probe (Fast):**
 ```python
@@ -1042,7 +1107,7 @@ HTTPX_THREADS = 100
 HTTPX_RATE_LIMIT = 300
 HTTPX_TIMEOUT = 5
 HTTPX_PROBE_TECH_DETECT = True
-HTTPX_INCLUDE_RESPONSE = False  # Smaller output
+HTTPX_INCLUDE_RESPONSE = False  # Skips Wappalyzer and the AI body pass
 ```
 
 **Comprehensive Analysis:**
@@ -1084,22 +1149,17 @@ HTTPX_INCLUDE_RESPONSE_HEADERS = True
 
 ### Common Issues
 
-#### "Docker not found"
+#### "[!][httpx] Docker is not installed" / "Docker daemon is not running"
 
-```bash
-# Install Docker
-sudo apt install docker.io
-
-# Start Docker daemon
-sudo systemctl start docker
-```
+httpx runs through the host's Docker daemon. Check that Docker is running on the host (`docker info`) and that the recon container can reach it.
 
 #### "No live URLs found"
 
 Possible causes:
 1. Hosts are down
 2. Firewall blocking requests
-3. Wrong ports probed
+3. Wrong ports probed (with `NAABU_CUSTOM_PORTS` set, only those ports are probed)
+4. Results filtered as out of scope (see `summary.filtered_out_of_scope`)
 
 Solutions:
 ```python
@@ -1108,10 +1168,13 @@ HTTPX_TIMEOUT = 20
 
 # Increase retries
 HTTPX_RETRIES = 3
-
-# Try without Naabu (probe default ports)
-SCAN_MODULES = ["initial_recon", "httpx"]
 ```
+
+With no live URL, the pipeline skips resource enumeration and vulnerability scanning (`metadata.active_scans_skipped`).
+
+#### "Probe hit its ...s budget"
+
+The probe outlived `httpx_budget()` and was stopped; downstream phases run on what it found. Raise `HTTPX_THREADS`, or lower `HTTPX_RETRIES`, or probe fewer URLs.
 
 #### Scan too slow
 
@@ -1130,8 +1193,7 @@ HTTPX_INCLUDE_RESPONSE = False
 #### Too much output data
 
 ```python
-# Disable response body inclusion
-HTTPX_INCLUDE_RESPONSE = False
+# Disable response headers
 HTTPX_INCLUDE_RESPONSE_HEADERS = False
 
 # Filter status codes
@@ -1158,10 +1220,11 @@ docker run --rm \
 
 | Risk | Mitigation |
 |------|------------|
-| Rate limiting/bans | Reduce `HTTPX_RATE_LIMIT` |
+| Rate limiting/bans | Reduce `HTTPX_RATE_LIMIT`, or set the engagement ceiling (`ROE_GLOBAL_MAX_RPS`) |
 | WAF blocking | Use custom User-Agent, reduce rate |
-| Detection | Reduce threads |
+| Detection | Reduce threads, or use stealth mode |
 | Fingerprinting | Your requests are identifiable |
+| Session leakage | Session headers go only to probes whose hosts are all in scope, and redirects stay on the same host |
 
 ### Safe Defaults
 
@@ -1182,7 +1245,8 @@ HTTPX_CUSTOM_HEADERS = [
 |---------|---------|
 | Docker | Container runtime for httpx |
 | `projectdiscovery/httpx:latest` | httpx Docker image (auto-pulled) |
-| Python 3.8+ | Script runtime |
+| `python-Wappalyzer` | Wappalyzer pass (in `recon/requirements.txt`) |
+| Python 3.11 | The recon image's runtime |
 
 ---
 
@@ -1193,8 +1257,3 @@ HTTPX_CUSTOM_HEADERS = [
 - [Wappalyzer](https://www.wappalyzer.com/) - Technology detection rules
 - [JARM Fingerprinting](https://github.com/salesforce/jarm)
 - [ProjectDiscovery Blog](https://blog.projectdiscovery.io/)
-
----
-
-*Documentation generated for RedAmon v1.0 - httpx HTTP Prober Module*
-

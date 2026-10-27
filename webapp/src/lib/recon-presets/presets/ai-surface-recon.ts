@@ -60,6 +60,7 @@ Every AI signal is a property annotation on existing graph nodes (Endpoint, Tech
 
     // --- HTTP probing ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxProbeTechDetect: true,
     httpxProbeFavicon: true,
     httpxProbeTlsInfo: true,

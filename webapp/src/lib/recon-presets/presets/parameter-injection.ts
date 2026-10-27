@@ -71,6 +71,7 @@ Pentesters and bug bounty hunters focused on injection vulnerabilities. Ideal fo
 
     // --- httpx: standard probing with tech detect ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

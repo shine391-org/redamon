@@ -157,7 +157,7 @@ describe('resolveTrufflehogStart', () => {
 describe('buildTrufflehogCommon', () => {
   test('skip-verification is carried through as its own switch', () => {
     // The scanner needs it separately from the result filter: with verification
-    // off, every finding is `unverified` (never checked), not `unvalidated`.
+    // off, every finding is `unverified` (never checked), not `rejected`.
     expect(buildTrufflehogCommon({ ...PROJECT, trufflehogNoVerification: true }).skipVerification)
       .toBe(true)
   })

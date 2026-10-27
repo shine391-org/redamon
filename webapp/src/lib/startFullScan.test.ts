@@ -613,3 +613,57 @@ describe('the run records which RoE document it started under', () => {
     expect(h.createJob.mock.calls[0][0].roeTextSha256).toBeNull()
   })
 })
+
+describe('a failed container spawn is a refusal, not an accepted start (plan 12.9)', () => {
+  test('an older orchestrator answering 2xx with status error rolls back and records a failed run', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: true, json: async () => ({ project_id: 'p1', status: 'error', error: 'No such image: redamon-recon:latest' }),
+    })
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 500, code: 'spawn_failed' })
+    if (res.ok) throw new Error('unreachable')
+    expect(res.error).toMatch(/No such image/)
+    expect(h.rollback).toHaveBeenCalledOnce()
+    expect(h.retention).not.toHaveBeenCalled()
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', versionId: 'v2' }))
+    expect(h.createJob).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+  })
+
+  test('the orchestrator\'s 500 spawn_failed carries its code through', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500,
+      json: async () => ({ detail: { detail: 'Failed to start: image missing', code: 'spawn_failed' } }),
+    })
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 500, code: 'spawn_failed', error: 'Failed to start: image missing' })
+    if (res.ok) throw new Error('unreachable')
+    expect(classifyStartFailure(res.status, res, { orchestratorAnswered: true }).temporary).toBe(false)
+  })
+})
+
+describe('a headless caller records no failed run for a transient refusal (plan 12.6)', () => {
+  const answered503 = () => h.orchestratorFetch.mockResolvedValue({
+    ok: false, status: 503,
+    json: async () => ({ detail: 'Cannot verify scan scope: the webapp is unreachable (URLError). Refusing to start.' }),
+  })
+
+  test('quietTransient skips the failed ScanJob, still rolls back', async () => {
+    answered503()
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', quietTransient: true })
+    expect(res).toMatchObject({ ok: false, status: 503 })
+    expect(h.createJob).not.toHaveBeenCalled()
+    expect(h.rollback).toHaveBeenCalledOnce()
+  })
+
+  test('a manual start still records it', async () => {
+    answered503()
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }))
+  })
+
+  test('quietTransient still records a permanent refusal', async () => {
+    h.orchestratorFetch.mockResolvedValue({ ok: false, status: 403, json: async () => ({ detail: 'RoE window' }) })
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', quietTransient: true })
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }))
+  })
+})

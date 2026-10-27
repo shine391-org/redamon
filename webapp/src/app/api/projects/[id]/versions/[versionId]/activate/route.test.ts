@@ -35,6 +35,7 @@ const h = vi.hoisted(() => ({
   transaction: vi.fn(),
   closeSession: vi.fn(),
   nodeFilterWriter: vi.fn(),
+  sweep: vi.fn(),
 }))
 
 vi.mock('@/lib/access', () => ({
@@ -71,6 +72,7 @@ vi.mock('@/lib/scanSnapshot', async orig => ({
 vi.mock('@/lib/graphRestore', () => ({
   clearProjectGraph: (...a: unknown[]) => h.clearGraph(...a),
   restoreGraph: (...a: unknown[]) => h.restore(...a),
+  sweepOrphanReferenceNodes: (...a: unknown[]) => h.sweep(...a),
 }))
 vi.mock('@/app/api/graph/neo4j', () => ({
   getGraphSession: () => ({ run: vi.fn(), close: h.closeSession }),
@@ -234,7 +236,25 @@ describe('the swap', () => {
 
   test('the clear preserves agent session nodes (F1)', async () => {
     await POST(req(), params('p1', 'v1'))
-    expect(h.clearGraph).toHaveBeenCalledWith(expect.anything(), 'p1', SESSION_LABELS)
+    expect(h.clearGraph).toHaveBeenCalledWith(expect.anything(), 'p1', SESSION_LABELS, { sweep: false })
+  })
+
+  test('the version links back to the CVE catalogue, and the orphan sweep waits for the restore (plan 09.5)', async () => {
+    // Swept between the clear and the restore, a CVE only this project linked
+    // would be gone before the restore could link it back.
+    const links = [{ startExportId: 'n1', endExportId: null, type: 'HAS_KNOWN_CVE',
+      refLabel: 'CVE', refKey: 'CVE-2021-23017', properties: {} }]
+    h.load.mockResolvedValue({ nodes: [{ labels: ['IP'], properties: {}, _exportId: 'n1' }],
+      relationships: [], referenceLinks: links })
+    const order: string[] = []
+    h.clearGraph.mockImplementation(async () => { order.push('clear') })
+    h.restore.mockImplementation(async () => { order.push('restore'); return { nodes: 1, relationships: 0 } })
+    h.sweep.mockImplementation(async () => { order.push('sweep') })
+
+    const res = await POST(req(), params('p1', 'v1'))
+    expect(res.status).toBe(200)
+    expect(order).toEqual(['clear', 'restore', 'sweep'])
+    expect(h.restore.mock.calls[0][3]).toEqual({ projectId: 'p1', referenceLinks: links })
   })
 
   test('the restore keeps the project id (no re-owning) and the cache is invalidated', async () => {

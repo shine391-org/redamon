@@ -166,6 +166,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'HTTP_PROBE_AI_TITLE_DETECTION_ENABLED': True,
     'HTTP_PROBE_AI_WAPPALYZER_ENABLED': True,
 
+    # IP attribution: shared_edge / dedicated / unknown per IP, after http_probe.
+    # The cap bounds its one active check, a TLS handshake without SNI to :443.
+    'IP_ATTRIBUTION_ENABLED': True,
+    'IP_ATTRIBUTION_TLS_MAX_PROBES': 500,
+
     # Wappalyzer
     'WAPPALYZER_ENABLED': True,
     'WAPPALYZER_MIN_CONFIDENCE': 50,
@@ -1562,6 +1567,9 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['HTTP_PROBE_AI_TITLE_DETECTION_ENABLED'] = project.get('httpProbeAiTitleDetectionEnabled', DEFAULT_SETTINGS['HTTP_PROBE_AI_TITLE_DETECTION_ENABLED'])
     settings['HTTP_PROBE_AI_WAPPALYZER_ENABLED'] = project.get('httpProbeAiWappalyzerEnabled', DEFAULT_SETTINGS['HTTP_PROBE_AI_WAPPALYZER_ENABLED'])
 
+    settings['IP_ATTRIBUTION_ENABLED'] = project.get('ipAttributionEnabled', DEFAULT_SETTINGS['IP_ATTRIBUTION_ENABLED'])
+    settings['IP_ATTRIBUTION_TLS_MAX_PROBES'] = project.get('ipAttributionTlsMaxProbes', DEFAULT_SETTINGS['IP_ATTRIBUTION_TLS_MAX_PROBES'])
+
     # Wappalyzer
     settings['WAPPALYZER_ENABLED'] = project.get('wappalyzerEnabled', DEFAULT_SETTINGS['WAPPALYZER_ENABLED'])
     settings['WAPPALYZER_MIN_CONFIDENCE'] = project.get('wappalyzerMinConfidence', DEFAULT_SETTINGS['WAPPALYZER_MIN_CONFIDENCE'])
@@ -2257,8 +2265,9 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
 # memory actually available when the scan starts. Ratio-scale concurrency knobs;
 # byte-budget the in-memory *_MAX_* accumulators. Emits [RESOURCE-CAP] log lines
 # (rendered red in the recon drawer) only when a value is actually reduced.
-# Applied AFTER stealth/RoE so those low-resource profiles win first, then the
-# governor tightens further under live memory pressure. Fail-open on any error.
+# Applied AFTER stealth and then the RoE cap (get_settings), so those
+# low-resource profiles win first, then the governor tightens further under
+# live memory pressure. Fail-open on any error.
 # =============================================================================
 
 # The two governor tables are REGISTRY QUERIES. Neither is derivable from a
@@ -2379,6 +2388,10 @@ def get_settings() -> dict[str, Any]:
     # idempotent.
     settings = apply_stealth_overrides(settings)
     settings = apply_ai_pipeline_overrides(settings)
+    # The RoE ceiling again, after stealth: the stealth profile `set`s some
+    # roe_capped rates (naabu 10, nuclei 5), which would otherwise overwrite the
+    # cap the fetch applied. It also covers CLI mode, which never fetches.
+    settings = apply_roe_rate_cap(settings)
     # Memory governor (Part 2): last, so it tightens whatever stealth/RoE left,
     # based on the RAM available at scan start.
     settings = apply_memory_governor(settings)
@@ -2441,8 +2454,9 @@ def apply_stealth_overrides(settings: dict[str, Any]) -> dict[str, Any]:
     exclude-tag list is a UNION of the operator's own excluded tags with the
     stealth set, and expressing a union as a value would discard their choice.
 
-    Applied BEFORE the RoE capper and the memory governor, so a low-resource
-    profile wins first and the later passes only tighten further.
+    Applied BEFORE get_settings' second RoE cap and the memory governor, so a
+    low-resource profile wins first and the later passes only tighten further:
+    a `set` above the engagement ceiling is lowered back to it.
     """
     if not settings.get('STEALTH_MODE', False):
         return settings

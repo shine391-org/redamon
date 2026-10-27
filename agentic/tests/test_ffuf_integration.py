@@ -449,20 +449,8 @@ class TestFfufRoECategory(unittest.TestCase):
 
     def test_ffuf_in_brute_force_category(self):
         """execute_ffuf should be in the brute_force RoE category."""
-        # Read the source file directly since the function is deeply nested
-        plan_node_path = os.path.join(
-            _agentic_dir, 'orchestrator_helpers', 'nodes', 'execute_plan_node.py'
-        )
-        with open(plan_node_path) as f:
-            source = f.read()
-        self.assertIn("'execute_ffuf'", source)
-        # Verify it's in the brute_force line
-        for line in source.split('\n'):
-            if 'brute_force' in line and 'CATEGORY_TOOL_MAP' not in line:
-                self.assertIn('execute_ffuf', line)
-                break
-        else:
-            self.fail("Could not find brute_force category line with execute_ffuf")
+        from orchestrator_helpers.roe_gate import CATEGORY_TOOL_MAP
+        self.assertIn('execute_ffuf', CATEGORY_TOOL_MAP['brute_force'])
 
 
 # ===========================================================================

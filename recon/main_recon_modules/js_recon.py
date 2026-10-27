@@ -25,18 +25,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 from typing import NamedTuple, Optional
 
+from recon.helpers import catchall
 from recon.helpers.roe_scope import _is_roe_excluded
 from recon.helpers.js_recon.patterns import (
     scan_js_content, scan_dev_comments, load_custom_patterns,
 )
 from recon.helpers.js_recon.validators import validate_secret
-from recon.helpers.js_recon.sourcemap import discover_and_analyze_sourcemaps
+from recon.helpers.js_recon.sourcemap import discover_and_analyze_sourcemaps, pseudo_file_base
 from recon.helpers.js_recon.dependency import detect_dependency_confusion
 from recon.helpers.js_recon.endpoints import extract_endpoints
 from recon.helpers.js_recon.framework import (
     detect_frameworks, detect_dom_sinks, detect_dev_comments,
     load_custom_frameworks,
 )
+from recon.helpers.js_recon.urls import accept_js_response, is_js_content_type, is_js_url
 from recon.helpers.ai_signal_catalog import match_ai_sdk
 
 try:
@@ -114,9 +116,6 @@ def _safe_redirect_get(url, *, timeout, headers, max_redirects=5):
     return None
 
 
-# File extensions to include as JS files
-_JS_EXTENSIONS = {'.js', '.mjs', '.jsx', '.ts', '.tsx'}
-
 # Framework JS paths that Katana typically excludes but contain app code
 _FRAMEWORK_JS_PATTERNS = [
     re.compile(r'/_next/static/chunks/'),
@@ -132,7 +131,7 @@ _SKIP_PATTERNS = [
     # jQuery itself (core, slim, migrate, UI), not its plugins: a plugin such as
     # jquery.prettyPhoto.js is where hash-reading DOM XSS has lived, and the sink
     # detector already rates library code by whether a source is in sight.
-    re.compile(r'/jquery(?:-ui|-migrate)?(?:[.-]\d+(?:\.\d+)*)?(?:\.slim)?(?:\.min)?\.js(?:[?#]|$)'),
+    re.compile(r'/jquery(?:-ui|-migrate)?(?:[.-]\d+(?:\.\d+)*)?(?:\.slim)?(?:\.min)?\.js(?:[?#_~\-]|$)'),
     re.compile(r'bootstrap\.min\.js'),
     re.compile(r'lodash\.min\.js'),
     re.compile(r'react\.production\.min\.js'),
@@ -417,19 +416,7 @@ def _endpoint_probe_headers(endpoint: dict, resolved_url: str, custom_header_lin
 
 
 def _is_js_url(url: str) -> bool:
-    """Check if a URL points to a JavaScript file."""
-    try:
-        path = urlparse(url).path.lower()
-        # Check extension
-        for ext in _JS_EXTENSIONS:
-            if path.endswith(ext):
-                return True
-        # Check common JS path patterns without extension
-        if '/js/' in path or '/javascript/' in path:
-            return True
-    except Exception:
-        pass
-    return False
+    return is_js_url(url)
 
 
 def _keep_work_dir(settings: dict) -> bool:
@@ -469,28 +456,115 @@ def _collect_js_urls(combined_result: dict, settings: dict) -> list:
     Collect JS file URLs from the recon pipeline output.
 
     Sources:
-    - resource_enum discovered_urls (filtered to .js)
+    - resource_enum js_urls: every in-scope JS URL the crawlers saw, before
+      their exclude list (which hides /static/ and /_next/static bundles)
+    - resource_enum discovered_urls (filtered to JS)
+    - http_probe URLs
     - GAU/Wayback archived URLs (if JS_RECON_INCLUDE_ARCHIVED_JS)
+
+    A Rules-of-Engagement exclusion is dropped whichever source named it.
     """
     js_urls = set()
 
-    # Primary source: all discovered URLs from resource_enum
     resource_enum = combined_result.get('resource_enum', {})
-    discovered_urls = resource_enum.get('discovered_urls', [])
+    discovered_urls = list(resource_enum.get('js_urls') or []) + list(resource_enum.get('discovered_urls') or [])
 
     for url in discovered_urls:
         if isinstance(url, str) and _is_js_url(url) and _should_include_url(url, settings):
             js_urls.add(url)
 
-    # Also check httpx probed URLs (the by_url dict keys are URLs)
+    # httpx probed URLs; one it saw answer with a JavaScript type counts
+    # whatever its name.
     http_probe = combined_result.get('http_probe', {})
     if isinstance(http_probe, dict):
-        for url in http_probe.get('by_url', {}).keys():
-            if isinstance(url, str) and _is_js_url(url) and _should_include_url(url, settings):
+        for url, info in (http_probe.get('by_url') or {}).items():
+            served_js = isinstance(info, dict) and is_js_content_type(info.get('content_type'))
+            if isinstance(url, str) and (served_js or _is_js_url(url)) and _should_include_url(url, settings):
                 js_urls.add(url)
 
+    settings = settings or {}
+    # archived_urls holds what only a web archive reported; http_probe's own
+    # answer for a URL means the live site still serves it.
+    if not settings.get('JS_RECON_INCLUDE_ARCHIVED_JS', True):
+        archived = set(resource_enum.get('archived_urls') or [])
+        probed = set((http_probe.get('by_url') or {}) if isinstance(http_probe, dict) else ())
+        dropped = {u for u in js_urls if u in archived and u not in probed}
+        if dropped:
+            print(f"[-][JsRecon] Left out {len(dropped)} JS URL(s) seen only in web archives "
+                  f"(JS_RECON_INCLUDE_ARCHIVED_JS off)")
+            js_urls -= dropped
+
+    excluded = settings.get('ROE_EXCLUDED_HOSTS') if settings.get('ROE_ENABLED') else None
+    excluded = [e for e in (excluded or []) if isinstance(e, str) and e.strip()]
+    if excluded:
+        kept = {u for u in js_urls if not _is_roe_excluded(_host_of(u), excluded)}
+        if len(kept) < len(js_urls):
+            print(f"[-][JsRecon] Dropped {len(js_urls) - len(kept)} JS URL(s) on RoE-excluded hosts")
+        js_urls = kept
+
     print(f"[*][JsRecon] Collected {len(js_urls)} JS URLs from pipeline")
-    return list(js_urls)
+    return sorted(js_urls)
+
+
+def _default_max_files() -> int:
+    from recon.project_settings import DEFAULT_SETTINGS
+    return int(DEFAULT_SETTINGS['JS_RECON_MAX_FILES'])
+
+
+# Which of a host's files to fetch first when the budget cannot cover them all.
+# Library and bundler-runtime files are public code; the app's own entry
+# points and page chunks are where its endpoints and keys live.
+_VENDOR_JS_HINT = re.compile(
+    r'(?:^|[/._~-])(?:vendors?|framework|polyfills?|runtime|webpack|react(?:-dom)?|jquery'
+    r'|lodash|moment|core-js|libs?)(?:[/._~-]|$)|/node_modules/', re.IGNORECASE)
+_FIRST_PARTY_JS_HINT = re.compile(r'(?:^|/)(?:main|app|index|_app)(?:[._~-]|$)|/pages/|/chunks/',
+                                  re.IGNORECASE)
+
+
+def _js_fetch_rank(url: str) -> tuple:
+    path = urlparse(url).path
+    if _VENDOR_JS_HINT.search(path):
+        rank = 2
+    elif _FIRST_PARTY_JS_HINT.search(path):
+        rank = 0
+    else:
+        rank = 1
+    return rank, url
+
+
+def _select_js_urls(js_urls: list, max_files: int) -> tuple:
+    """``(selected, by_host)``: at most ``max_files`` URLs, taken round-robin
+    by host so one large site cannot take the whole budget, in a fixed order
+    (hosts sorted; within a host, first-party bundles first, vendor files
+    last). ``by_host`` maps each ``host:port`` to its candidates / selected /
+    cut counts."""
+    from recon.helpers import circuit_breaker as cb
+    queues: dict = {}
+    for url in sorted(set(u for u in js_urls if isinstance(u, str))):
+        queues.setdefault(cb.host_key(url) or url, []).append(url)
+    for files in queues.values():
+        files.sort(key=_js_fetch_rank)
+
+    budget = max(0, int(max_files))
+    selected = []
+    taken = {host: 0 for host in queues}
+    hosts = sorted(queues)
+    while len(selected) < budget:
+        progressed = False
+        for host in hosts:
+            if len(selected) >= budget:
+                break
+            if taken[host] < len(queues[host]):
+                selected.append(queues[host][taken[host]])
+                taken[host] += 1
+                progressed = True
+        if not progressed:
+            break
+    by_host = {
+        host: {'candidates': len(files), 'selected': taken[host], 'cut': len(files) - taken[host]}
+        for host, files in queues.items()
+    }
+    return selected, by_host
 
 
 def _load_uploaded_files(settings: dict, project_id: str) -> list:
@@ -547,21 +621,27 @@ def _download_js_files(
     max_files: int,
     concurrency: int,
     timeout: int,
+    unreachable: Optional[list] = None,
 ) -> list:
     """
     Download JS files to local temp directory.
 
-    Returns list of dicts with: url, filepath, content, headers, size
+    Returns list of dicts with: url, filepath, content, headers, size.
+    `unreachable` collects the URLs never fetched: a host already known down,
+    or a request that raised.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
     urls_to_fetch = js_urls[:max_files]
+    if unreachable is None:
+        unreachable = []
 
     print(f"[*][JsRecon] Downloading {len(urls_to_fetch)} JS files (max {max_files})...")
 
     def fetch_one(idx_url):
         idx, url = idx_url
         if _js_skip(url):
+            unreachable.append(url)
             return None
         try:
             # STRIDE I14: JS URLs are target-derived; validate every redirect hop
@@ -587,6 +667,10 @@ def _download_js_files(
             content = resp.text
             if not content or len(content) > _MAX_JS_FILE_SIZE:
                 return None
+            accepted, why = accept_js_response(url, resp.headers.get('Content-Type'), content)
+            if not accepted:
+                print(f"[-][JsRecon] {url} -- not a JS file ({why})")
+                return None
 
             filepath = work_dir / f"js_{idx}.js"
             filepath.write_text(content, encoding='utf-8')
@@ -600,6 +684,7 @@ def _download_js_files(
             }
         except Exception as e:
             _js_failed(url, e)
+            unreachable.append(url)
             print(f"[!][JsRecon] {url} -- {type(e).__name__}: {e}")
             return None
 
@@ -639,6 +724,9 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
         'dev_references': [],
         'ai_sdk_findings': [],
     }
+    # Files an analyzer produced nothing for, so the prune keeps their hosts'
+    # findings. A list: workers still running after a timeout may append.
+    unanalyzed: list = []
 
     # Load custom extensions
     custom_patterns = None
@@ -658,9 +746,39 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
     # form calls shutdown(wait=True) which blocks until all worker threads
     # finish naturally, defeating the per-future timeout.
     analysis_budget = settings.get('JS_RECON_TIMEOUT', 900)
-    deadline = time.monotonic() + analysis_budget
+    started = time.monotonic()
+    deadline = started + analysis_budget
     executor = ThreadPoolExecutor(max_workers=4)
     try:
+        # Stage 1: discover and fetch the source maps. A map's first-party
+        # sources come back as pseudo-files, which every analyzer in stage 2
+        # reads like a downloaded file, so a key or an endpoint in the original
+        # code becomes a finding of its own.
+        served_files = js_files
+        pseudo_files = []
+        if settings.get('JS_RECON_SOURCE_MAPS', True):
+            recovered, not_checked = [], []
+            future = executor.submit(
+                discover_and_analyze_sourcemaps, served_files, settings,
+                pseudo_files=recovered, skipped=not_checked,
+                deadline=started + analysis_budget * _SOURCE_MAP_BUDGET_SHARE,
+            )
+            try:
+                results['source_maps'] = future.result(timeout=max(1.0, deadline - time.monotonic()))
+                pseudo_files, cut = _cap_pseudo_files(recovered)
+                unanalyzed.extend(f['url'] for f in cut)
+            except Exception as e:
+                unanalyzed.extend(f.get('url') for f in served_files)
+                print(f"[!][JsRecon] Analyzer 'sourcemaps' failed: {type(e).__name__}: {e}")
+            if not_checked:
+                print(f"[!][JsRecon] Source-map budget spent: {len(not_checked)} JS file(s) not checked for a map")
+                unanalyzed.extend(not_checked)
+            if pseudo_files:
+                print(f"[*][JsRecon] {len(pseudo_files)} first-party source(s) recovered from source maps")
+        js_files = served_files + pseudo_files
+        results['_source_map_files'] = len(pseudo_files)
+
+        # Stage 2: every analyzer on the downloaded files and the pseudo-files.
         futures = {}
 
         # 1. Pattern scanning (secrets, emails, IPs, UUIDs)
@@ -679,16 +797,10 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
                         for k, v in file_filtered.items():
                             total_filtered[k] = total_filtered.get(k, 0) + v
                     except Exception as e:
+                        unanalyzed.append(js_file.get('url'))
                         print(f"[!][JsRecon] Pattern scan failed for {js_file.get('url', '?')}: {e}")
                 return all_findings, total_filtered
             futures['patterns'] = executor.submit(run_patterns)
-
-        # 2. Source map discovery
-        if settings.get('JS_RECON_SOURCE_MAPS', True):
-            scan_func = lambda content, url: scan_js_content(content, url, min_confidence=min_confidence)[0]
-            futures['sourcemaps'] = executor.submit(
-                discover_and_analyze_sourcemaps, js_files, settings, scan_func
-            )
 
         # 3. Dependency confusion
         if settings.get('JS_RECON_DEPENDENCY_CHECK', True):
@@ -725,6 +837,7 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
                             detect_dev_comments(content, url)
                         )
                 except Exception as e:
+                    unanalyzed.append(js_file.get('url'))
                     print(f"[!][JsRecon] Framework analysis failed for {js_file.get('url', '?')}: {e}")
             return fw_results
         futures['framework'] = executor.submit(run_framework_analysis)
@@ -748,6 +861,7 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
                             finding['source_url'] = url
                             all_findings.append(finding)
                     except Exception as e:
+                        unanalyzed.append(js_file.get('url'))
                         print(f"[!][JsRecon] AI SDK scan failed for {js_file.get('url', '?')}: {e}")
                 return all_findings
             futures['ai_sdk'] = executor.submit(run_ai_sdk_detection)
@@ -810,14 +924,12 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
                         else:
                             results['secrets'].append(finding)
 
-                elif name == 'sourcemaps':
-                    results['source_maps'] = result
-
                 elif name == 'dependencies':
                     results['dependencies'] = result
 
                 elif name == 'endpoints':
                     results['endpoints'] = result
+                    results['_endpoint_extraction_files'] = len(js_files)
 
                 elif name == 'framework':
                     results['frameworks'] = result.get('frameworks', [])
@@ -828,6 +940,7 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
                     results['ai_sdk_findings'] = result
 
             except Exception as e:
+                unanalyzed.extend(f.get('url') for f in js_files)
                 print(f"[!][JsRecon] Analyzer '{name}' failed: {type(e).__name__}: {e}")
     finally:
         # cancel_futures drops tasks that have not started yet; tasks already
@@ -835,7 +948,64 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
         # shortly after this function returns so the threads die with it.
         executor.shutdown(wait=False, cancel_futures=True)
 
+    if pseudo_files:
+        results['frameworks'] = _one_framework_per_map(results['frameworks'], pseudo_files)
+    _count_source_map_secrets(results)
+    results['_unanalyzed_urls'] = unanalyzed
     return results
+
+
+# Stage 1 (source-map discovery) may use this share of JS_RECON_TIMEOUT, so a
+# site with thousands of scripts still leaves the analyzers their time.
+_SOURCE_MAP_BUDGET_SHARE = 0.5
+# All recovered sources together, in characters: the analyzers read each one
+# in full, and a monorepo's map can embed a whole codebase.
+_PSEUDO_FILES_MAX_TOTAL_CHARS = 50 * 1024 * 1024
+
+
+def _cap_pseudo_files(recovered: list) -> tuple:
+    """``(kept, cut)``: the pseudo-files in a fixed order, up to the total size cap."""
+    kept, cut, total = [], [], 0
+    for f in sorted(recovered, key=lambda f: f['url']):
+        if total + f['size'] > _PSEUDO_FILES_MAX_TOTAL_CHARS:
+            cut.append(f)
+            continue
+        kept.append(f)
+        total += f['size']
+    if cut:
+        print(f"[!][JsRecon] Source-map size cap: {len(cut)} recovered source(s) not analyzed")
+    return kept, cut
+
+
+def _one_framework_per_map(frameworks: list, pseudo_files: list) -> list:
+    """Original sources import their framework in nearly every file
+    (`next/router`, `@angular/core`), which a bundle does once. From a map's
+    sources a framework is kept once per map, and not at all when a served
+    file already showed it."""
+    map_of = {f['url']: f.get('map_url') for f in pseudo_files}
+    served = {fw.get('name') for fw in frameworks if fw.get('source_url') not in map_of}
+    kept, seen = [], set()
+    for fw in frameworks:
+        source_map = map_of.get(fw.get('source_url'))
+        if source_map is None:
+            kept.append(fw)
+            continue
+        key = (fw.get('name'), source_map)
+        if fw.get('name') in served or key in seen:
+            continue
+        seen.add(key)
+        kept.append(fw)
+    return kept
+
+
+def _count_source_map_secrets(results: dict) -> None:
+    """A map's secrets_in_source: the Secrets found in its own sources."""
+    secret_urls = [s.get('source_url') or '' for s in results.get('secrets') or []]
+    for source_map in results.get('source_maps') or []:
+        if not source_map.get('accessible'):
+            continue
+        prefix = pseudo_file_base(source_map.get('map_url', ''), source_map.get('js_url', '')) + '#'
+        source_map['secrets_in_source'] = sum(1 for u in secret_urls if u.startswith(prefix))
 
 
 def _validate_secrets(secrets: list, settings: dict) -> list:
@@ -872,47 +1042,66 @@ def _validate_secrets(secrets: list, settings: dict) -> list:
             )
 
             err = result.get('error')
+            state = result.get('state')
+            checked_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             if err == 'no_validator':
                 secret['validation'] = {'status': 'unvalidated'}
             elif err == 'incomplete_credentials':
                 secret['validation'] = {'status': 'incomplete', 'info': result.get('info', '')}
             elif err == 'format_only':
                 secret['validation'] = {'status': 'format_validated', 'info': result.get('info', '')}
-            elif err == 'format_invalid':
+            elif state == 'format_invalid':
                 secret['validation'] = {
-                    'status': 'invalid',
+                    'status': 'format_invalid',
                     'valid': False,
                     'info': result.get('info', ''),
                     'error': 'format_invalid',
                 }
-            elif result.get('valid'):
+            elif state == 'valid':
                 secret['validation'] = {
                     'status': 'validated',
                     'valid': True,
                     'scope': result.get('scope', ''),
                     'info': result.get('info', ''),
-                    'checked_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    'checked_at': checked_at,
                 }
             else:
+                # 'rejected' is the provider's verdict; anything else (a
+                # timeout, a 429 or 5xx, a breaker skip, a 403) is 'unknown',
+                # never a dead key.
                 secret['validation'] = {
-                    'status': 'invalid',
+                    'status': 'rejected' if state == 'rejected' else 'unknown',
                     'valid': False,
                     'info': result.get('info', ''),
                     'error': result.get('error', ''),
-                    'checked_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    'checked_at': checked_at,
                 }
         except Exception as e:
-            secret['validation'] = {'status': 'error', 'error': f'{type(e).__name__}: {e}'}
+            secret['validation'] = {'status': 'unknown', 'error': f'{type(e).__name__}: {e}'}
+
+    # One provider call per distinct key: the same key in a bundle and in the
+    # source map's original file is one credential.
+    same_key: dict = {}
+    for secret in secrets:
+        key = (secret.get('name'), secret.get('matched_text'), secret.get('validator_ref'),
+               secret.get('confidence'))
+        same_key.setdefault(key, []).append(secret)
+
+    def _validate_group(group: list) -> None:
+        _validate_one(group[0])
+        for other in group[1:]:
+            other['validation'] = dict(group[0].get('validation') or {})
 
     workers = max(1, min(settings.get('JS_RECON_CONCURRENCY', 10), 20))
     if secrets:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_validate_one, secrets))
+            list(ex.map(_validate_group, same_key.values()))
 
-    validated_count = sum(1 for s in secrets if s.get('validation', {}).get('status') == 'validated')
-    invalid_count = sum(1 for s in secrets if s.get('validation', {}).get('status') == 'invalid')
-    if validated_count or invalid_count:
-        print(f"[+][JsRecon] Key validation: {validated_count} live, {invalid_count} invalid")
+    def _count(status):
+        return sum(1 for s in secrets if s.get('validation', {}).get('status') == status)
+    live, rejected, unknown = _count('validated'), _count('rejected'), _count('unknown')
+    if live or rejected or unknown:
+        print(f"[+][JsRecon] Key validation: {live} live, {rejected} rejected, {unknown} could not be checked")
 
     return secrets
 
@@ -966,6 +1155,9 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
     # JS_RECON_CONCURRENCY used for downloads/secret validation.
     workers = _clamp_int(settings.get('JS_RECON_ENDPOINT_CONCURRENCY', 10), 10, 1, 20)
     requester = request_func or requests.request
+    # One cache per probe method: a HEAD or OPTIONS control says nothing
+    # about a GET hit.
+    controls = {m: catchall.ControlCache() for m in ('GET', 'HEAD', 'OPTIONS')}
 
     def _validate_one(endpoint: dict) -> None:
         candidate = endpoint.get('full_url') or endpoint.get('path') or ''
@@ -1029,15 +1221,45 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
             _js_failed(resolved_url, exc)
             endpoint['validation_status'] = 'not_hittable'
             endpoint['validation_error'] = 'timeout'
+            return
         except Exception as exc:
             _js_failed(resolved_url, exc)
             endpoint['validation_status'] = 'not_hittable'
             endpoint['validation_error'] = type(exc).__name__
+            return
+
+        if endpoint['validation_status'] != 'hittable':
+            return
+
+        def fetch_control(url):
+            try:
+                answer = requester(probe_method, url, timeout=timeout, headers=headers,
+                                   allow_redirects=False)
+            except Exception as exc:
+                _js_failed(url, exc)
+                raise
+            _js_alive(url)
+            return answer
+
+        # A server that answers every path alike (an SPA shell) makes any
+        # status "hittable": a path that cannot exist decides. A catch-all
+        # host is still alive (recorded above); only its endpoint is dropped.
+        verdict = catchall.control_probe(
+            fetch_control, resolved_url, response, url_guard=is_url_safe_to_probe,
+            cache=controls[probe_method], roe_excluded=scope.roe_excluded,
+            note_module='js_recon')
+        if verdict.catch_all:
+            endpoint['validation_status'] = 'catch_all'
 
     if endpoints:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             list(ex.map(_validate_one, endpoints))
 
+    sent = sum(cache.requests for cache in controls.values())
+    if sent:
+        caught = sum(1 for e in endpoints if e.get('validation_status') == 'catch_all')
+        print(f"[*][JsRecon] Catch-all control probes sent: {sent} ({caught} endpoint(s) answered "
+              f"like a made-up path)")
     return endpoints
 
 
@@ -1107,7 +1329,8 @@ def _build_summary(results: dict) -> dict:
     secrets = results.get('secrets', [])
     severity_counts = {}
     type_counts = {}
-    validated = {'live': 0, 'invalid': 0, 'unvalidated': 0, 'format_validated': 0, 'incomplete': 0}
+    validated = {'live': 0, 'rejected': 0, 'unknown': 0, 'format_invalid': 0,
+                 'format_validated': 0, 'incomplete': 0, 'unvalidated': 0, 'skipped': 0}
 
     for s in secrets:
         sev = s.get('severity', 'info')
@@ -1115,16 +1338,8 @@ def _build_summary(results: dict) -> dict:
         stype = s.get('name', 'unknown')
         type_counts[stype] = type_counts.get(stype, 0) + 1
         vstatus = s.get('validation', {}).get('status', 'unvalidated')
-        if vstatus == 'validated':
-            validated['live'] += 1
-        elif vstatus == 'invalid':
-            validated['invalid'] += 1
-        elif vstatus == 'format_validated':
-            validated['format_validated'] += 1
-        elif vstatus == 'incomplete':
-            validated['incomplete'] += 1
-        else:
-            validated['unvalidated'] += 1
+        key = 'live' if vstatus == 'validated' else vstatus
+        validated[key if key in validated else 'unvalidated'] += 1
 
     filtered_stats = results.get('_filtered_stats', {})
     endpoint_validation = {'hittable': 0, 'not_hittable': 0, 'unvalidated': 0}
@@ -1169,6 +1384,163 @@ def _count_by(items: list, key: str) -> dict:
         v = item.get(key, 'unknown')
         out[v] = out.get(v, 0) + 1
     return out
+
+
+def _has_live_urls(combined_result: dict) -> bool:
+    """http_probe got an answer from at least one URL: a status under 500, as
+    subdomain_takeover._collect_alive_urls counts a URL live."""
+    http_probe = combined_result.get('http_probe') or {}
+    for url, info in (http_probe.get('by_url') or {}).items():
+        if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
+            continue
+        status = info.get('status_code') if isinstance(info, dict) else None
+        if status is None or (isinstance(status, int) and status < 500):
+            return True
+    return any(isinstance(h, dict) and h.get('live_urls')
+               for h in (http_probe.get('by_host') or {}).values())
+
+
+def _note_unchecked(reason: str, urls=None) -> None:
+    """Tell the end-of-run prune what this run did not re-check. Never raises.
+
+    run_js_recon catches its own errors, so main's _note_phase_error never sees
+    them, and the prune reads "not reported this run" as "gone". With `urls`,
+    only their hosts keep their js_recon findings, so a capped run still prunes
+    the hosts it analyzed; with none, the whole source is kept.
+    """
+    try:
+        from recon.helpers import circuit_breaker as cb
+        if urls is None:
+            cb.note_degraded('js_recon', sources=['js_recon'], reason=reason)
+            return
+        hosts = {cb.host_key(u) for u in urls
+                 if isinstance(u, str) and u.startswith(('http://', 'https://'))}
+        hosts.discard('')
+        if hosts:
+            cb.note_degraded('js_recon', hosts=sorted(hosts), host_source='js_recon',
+                             source_only_hosts=True, reason=reason)
+    except Exception:  # noqa: BLE001 - coverage bookkeeping never fails the scan
+        pass
+
+
+# Below this many files an app can genuinely call no endpoint from its JS.
+_TOOL_MISS_MIN_FILES = 20
+
+
+def _note_endpoint_miss(files: int) -> None:
+    """Many files read and not one endpoint out: more likely the extractor
+    missing this app's call style than an app that calls nothing. Said in the
+    log and the report's Coverage Limitations; no prune effect."""
+    print(f"[!][JsRecon] Endpoint extraction found 0 endpoints in {files} files: the app's request "
+          f"style is probably one the extractor does not read (TOOL MISS)")
+    try:
+        from recon.helpers import circuit_breaker as cb
+        cb.note_degraded('js_recon', entries=[
+            {"source": "js_endpoint_extraction", "reason": f"0 endpoints from {files} files", "skipped": 0}])
+    except Exception:  # noqa: BLE001 - coverage bookkeeping never fails the scan
+        pass
+
+
+def _note_file_cap(skipped: int, max_files: int) -> None:
+    """The cut as a coverage note, so the report's Coverage Limitations block
+    names it. No prune effect: _note_unchecked keeps the cut hosts."""
+    try:
+        from recon.helpers import circuit_breaker as cb
+        print(f"[!][JsRecon] JS_RECON_MAX_FILES ({max_files}) cut {skipped} JS file(s)")
+        cb.note_degraded('js_recon', entries=[
+            {"source": "js_recon_file_cap", "reason": f"file cap ({max_files})", "skipped": skipped}])
+    except Exception:  # noqa: BLE001 - coverage bookkeeping never fails the scan
+        pass
+
+
+# Every list the graph writer turns into a finding node; endpoints are assets.
+_COVERAGE_FINDING_KEYS = (
+    'secrets', 'dependencies', 'source_maps', 'dom_sinks', 'dev_comments', 'frameworks',
+    'emails', 'ip_addresses', 'object_references', 'dev_references', 'cloud_assets',
+    'ai_sdk_findings',
+)
+
+
+def _considered_base_urls(combined_result: dict, settings: dict, js_urls) -> set:
+    """The web hosts this run looked at, as base_url_key: each one http_probe
+    got a live answer from (the _has_live_urls test), each one it was handed a
+    page on, and each one serving a JS candidate. A host the Rules of
+    Engagement exclude was never looked at."""
+    from recon.helpers.coverage_stamps import base_url_key
+    urls = list(js_urls or [])
+    http_probe = combined_result.get('http_probe') or {}
+    for url, info in ((http_probe.get('by_url') or {}) if isinstance(http_probe, dict) else {}).items():
+        status = info.get('status_code') if isinstance(info, dict) else None
+        if status is None or (isinstance(status, int) and status < 500):
+            urls.append(url)
+    resource_enum = combined_result.get('resource_enum') or {}
+    if isinstance(resource_enum, dict):
+        urls += list(resource_enum.get('discovered_urls') or []) + list(resource_enum.get('js_urls') or [])
+
+    settings = settings or {}
+    excluded = settings.get('ROE_EXCLUDED_HOSTS') if settings.get('ROE_ENABLED') else None
+    excluded = [e for e in (excluded or []) if isinstance(e, str) and e.strip()]
+    keys = set()
+    for url in urls:
+        if not isinstance(url, str) or (excluded and _is_roe_excluded(_host_of(url), excluded)):
+            continue
+        key = base_url_key(url)
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _js_coverage(combined_result: dict, settings: dict, at: str, *, js_urls=(), selected=(),
+                 downloaded=(), unreachable=(), unanalyzed=(), results=None, error=None) -> dict:
+    """``{"at", "hosts": {base_url_key: row}}``, one row per considered host.
+
+    A host with no JS candidate, or whose candidates all turned out not to be
+    JavaScript, is ``no_input``. One whose files were all lost to an
+    unreachable host or a failed analyzer is ``failed``; one that lost some,
+    or had files cut by JS_RECON_MAX_FILES, is ``partial``, with the reasons.
+    A fatal error fails every host, since none of its findings reached output.
+    """
+    from collections import Counter
+    from recon.helpers.coverage_stamps import base_url_key, coverage_row
+
+    def by_host(urls):
+        counts = Counter()
+        for url in urls:
+            key = base_url_key(url)
+            if key:
+                counts[key] += 1
+        return counts
+
+    candidates = by_host(set(js_urls))
+    chosen = by_host(selected)
+    read = by_host(f.get('url') for f in downloaded)
+    lost = by_host(unreachable)
+    dropped = by_host(u for u in unanalyzed if u)
+    found = by_host(
+        f.get('source_url') or f.get('js_url')
+        for key in _COVERAGE_FINDING_KEYS for f in (results or {}).get(key) or [] if isinstance(f, dict)
+    )
+
+    hosts = {}
+    for key in sorted(_considered_base_urls(combined_result, settings, js_urls)):
+        if error:
+            hosts[key] = coverage_row('failed', reason=error)
+            continue
+        reasons = [reason for reason, hit in (
+            ('file cap', candidates[key] > chosen[key]),
+            ('host unreachable', lost[key]),
+            ('analyzer failed or timed out', dropped[key]),
+        ) if hit]
+        if not candidates[key] or (not read[key] and not reasons):
+            status = 'no_input'
+        elif not reasons:
+            status = 'complete'
+        elif not read[key] and 'file cap' not in reasons:
+            status = 'failed'
+        else:
+            status = 'partial'
+        hosts[key] = coverage_row(status, read[key], found[key], ', '.join(reasons))
+    return {'at': at, 'hosts': hosts}
 
 
 def run_js_recon(combined_result: dict, settings: dict) -> dict:
@@ -1230,6 +1602,9 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         ],
     )
 
+    from recon.helpers.coverage_stamps import run_started_at
+    coverage_at = run_started_at()
+    js_urls, selected_urls, downloaded, unreachable = [], [], [], []
     try:
         # 1. Load uploaded JS files (manual uploads from UI)
         project_id = combined_result.get('metadata', {}).get('project_id', '')
@@ -1240,16 +1615,35 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         # 2. Collect JS URLs from pipeline
         js_urls = _collect_js_urls(combined_result, settings)
 
-        # 3. Download JS files from pipeline URLs
+        # 3. Download JS files from pipeline URLs, the budget shared by host
+        max_files = settings.get('JS_RECON_MAX_FILES') or _default_max_files()
+        selected_urls, by_host = _select_js_urls(js_urls, max_files)
+        file_budget = {
+            'max_files': max_files,
+            'candidates': len(set(js_urls)),
+            'selected': len(selected_urls),
+            'cut': len(set(js_urls)) - len(selected_urls),
+            'by_host': by_host,
+        }
         js_files = []
-        if js_urls:
+        if selected_urls:
             js_files = _download_js_files(
-                js_urls,
+                selected_urls,
                 work_dir,
-                max_files=settings.get('JS_RECON_MAX_FILES', 500),
+                max_files=max_files,
                 concurrency=settings.get('JS_RECON_CONCURRENCY', 10),
                 timeout=settings.get('JS_RECON_TIMEOUT', 900),
+                unreachable=unreachable,
             )
+        downloaded = list(js_files)
+        if file_budget['cut']:
+            chosen = set(selected_urls)
+            _note_unchecked("file cap", [u for u in js_urls if u not in chosen])
+            _note_file_cap(file_budget['cut'], max_files)
+        # Uploads do not count: they re-check none of the pipeline's files. A
+        # run with no live target at all had nothing to re-check, so no gap.
+        if not js_files and _has_live_urls(combined_result):
+            _note_unchecked("no JS input")
 
         # 4. Merge uploaded files with downloaded files
         js_files.extend(uploaded_files)
@@ -1257,7 +1651,11 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         if not js_files:
             print("[-][JsRecon] No JS files found (pipeline or uploaded)")
             combined_result['js_recon'] = {
-                'scan_metadata': {'mode': 'post_recon', 'js_files_analyzed': 0},
+                'scan_metadata': {
+                    'mode': 'post_recon', 'js_files_analyzed': 0, 'file_budget': file_budget,
+                    'coverage': _js_coverage(combined_result, settings, coverage_at, js_urls=js_urls,
+                                             selected=selected_urls, unreachable=unreachable),
+                },
                 'secrets': [], 'endpoints': [], 'summary': {},
             }
             return combined_result
@@ -1267,6 +1665,14 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
 
         # 3. Run all analysis modules
         results = _run_analysis(js_files, settings)
+        source_map_files = results.pop('_source_map_files', 0)
+        extracted_from = results.pop('_endpoint_extraction_files', 0)
+        endpoint_miss = extracted_from >= _TOOL_MISS_MIN_FILES and not results.get('endpoints')
+        if endpoint_miss:
+            _note_endpoint_miss(extracted_from)
+        unanalyzed = results.pop('_unanalyzed_urls', None)
+        if unanalyzed:
+            _note_unchecked("analyzer failed or timed out", unanalyzed)
         _downgrade_third_party_findings(results, combined_result)
 
         # 4. Log false-positive filter stats
@@ -1374,8 +1780,16 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
                 'scan_timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 'mode': 'post_recon',
                 'js_files_analyzed': len(js_files),
+                # First-party sources recovered from source maps, analyzed too.
+                'source_map_files_analyzed': source_map_files,
+                'endpoint_extraction_miss': endpoint_miss,
                 'js_files_total_size_bytes': total_size,
                 'duration_seconds': round(duration, 1),
+                'file_budget': file_budget,
+                'coverage': _js_coverage(
+                    combined_result, settings, coverage_at, js_urls=js_urls, selected=selected_urls,
+                    downloaded=downloaded, unreachable=unreachable, unanalyzed=unanalyzed or (),
+                    results=results),
             },
             # Where the downloaded JS lives. GROUP 5.5 (supply-chain recon)
             # hands this path to the DIRTY analyzer so retire.js can read the
@@ -1406,8 +1820,13 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         print(f"[!][JsRecon] Fatal error: {e}")
         import traceback
         traceback.print_exc()
+        _note_unchecked(f"fatal: {type(e).__name__}")
         combined_result.setdefault('js_recon', {
-            'scan_metadata': {'mode': 'post_recon', 'js_files_analyzed': 0, 'error': str(e)},
+            'scan_metadata': {
+                'mode': 'post_recon', 'js_files_analyzed': 0, 'error': str(e),
+                'coverage': _js_coverage(combined_result, settings, coverage_at, js_urls=js_urls,
+                                         error=f"fatal: {type(e).__name__}"),
+            },
             'secrets': [], 'endpoints': [], 'summary': {},
         })
     finally:

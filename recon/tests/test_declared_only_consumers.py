@@ -74,7 +74,7 @@ def _builder_queries(builder):
     # nuclei's partial run: parameterised URLs for DAST and the main pass.
     (graph_builders._build_vuln_scan_data_from_graph, ["WHERE p.position = 'query'"]),
     # cache poisoning and the GraphQL scanner (which takes the POST ones).
-    (graph_builders._build_graphql_data_from_graph, ["collect(DISTINCT {path: e.path"]),
+    (graph_builders._build_graphql_data_from_graph, ["OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)"]),
     (graph_builders._build_serialized_data_from_graph, ["collect(DISTINCT {name: p.name, sample_values"]),
 ])
 def test_graph_builders_leave_declared_only_non_get_endpoints_out(builder, markers):

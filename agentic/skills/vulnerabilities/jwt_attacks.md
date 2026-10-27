@@ -171,7 +171,7 @@ kali_shell: interactsh-client -v
 - Edge gateway adds `X-User-Id` from token claims; backend trusts the header even when token is forged or stripped. Probe by removing the token but keeping the header.
 - Async workers consume bearer tokens from queues and skip verification on replay. If you can re-enqueue a captured message, persistence is free.
 - Different services pin different `aud`. Token minted for `audience=billing` may be accepted by `audience=admin` if `aud` is unchecked.
-- gRPC and WebSocket consumers are common verification gaps. Replay the token over the same TLS session via `wscat`/`grpcurl`.
+- gRPC and WebSocket consumers are common verification gaps. Replay the token over the same TLS session from `execute_code` (`websockets` for WebSocket; `grpcio`, installed on demand, for gRPC).
 
 ## Refresh, session, storage
 

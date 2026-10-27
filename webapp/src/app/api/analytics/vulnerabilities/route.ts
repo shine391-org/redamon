@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted, agentCandidateConfirmedOrNA } from '@/lib/graphMute'
+import { queryJudgedFindings, reportCountable } from '@/lib/triage/reportable'
+import { inSeverityBreakdown, queryDispositionSummary } from '@/lib/triage/disposition'
+import { githubSecretCounts, githubSecretCountsCypher } from '@/lib/secrets/githubSecretCounts'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -18,10 +21,12 @@ export async function GET(request: NextRequest) {
 
   const session = getGraphSession()
   try {
-    // Q1: Vulnerability severity distribution
+    // Q1: Vulnerability severity distribution, as the report's: what scanners
+    // claimed about reportable and candidate findings.
     const sevResult = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid})
-       WHERE ${notMuted('v')} AND ${agentCandidateConfirmedOrNA('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')} AND ${agentCandidateConfirmedOrNA('v')}
+         AND ${inSeverityBreakdown('v')}
        RETURN v.severity AS severity, count(v) AS count`,
       { pid: projectId }
     )
@@ -33,7 +38,7 @@ export async function GET(request: NextRequest) {
     // Q2: Top vulnerability types
     const typesResult = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid})
-       WHERE ${notMuted('v')} AND ${agentCandidateConfirmedOrNA('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')} AND ${agentCandidateConfirmedOrNA('v')}
        RETURN v.name AS name, v.severity AS severity, v.source AS source, count(v) AS count
        ORDER BY count DESC LIMIT 20`,
       { pid: projectId }
@@ -49,7 +54,7 @@ export async function GET(request: NextRequest) {
     // Covers: HAS_VULNERABILITY (from IP/BaseURL/Subdomain/Domain), FOUND_AT (DAST→Endpoint)
     const findingsResult = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid})
-       WHERE ${notMuted('v')} AND ${agentCandidateConfirmedOrNA('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')} AND ${agentCandidateConfirmedOrNA('v')}
        OPTIONAL MATCH (parent)-[:HAS_VULNERABILITY]->(v)
        OPTIONAL MATCH (v)-[:FOUND_AT]->(ep:Endpoint)
        OPTIONAL MATCH (v)-[:AFFECTS_PARAMETER]->(param:Parameter)
@@ -151,7 +156,7 @@ export async function GET(request: NextRequest) {
     // Q7: Confirmed exploits (ExploitGvm)
     const exploitResult = await session.run(
       `MATCH (ex:ExploitGvm {project_id: $pid})
-       WHERE ${notMuted('ex')}
+       WHERE ${notMuted('ex')} AND ${reportCountable('ex')}
        OPTIONAL MATCH (ex)-[:EXPLOITED_CVE]->(c:CVE)
        RETURN ex.name AS name, ex.severity AS severity, ex.target_ip AS targetIp,
               ex.target_port AS targetPort, ex.cvss_score AS cvssScore,
@@ -171,25 +176,15 @@ export async function GET(request: NextRequest) {
       cveIds: r.get('cveIds') as string[],
     }))
 
-    // Q8: GitHub secrets summary
-    const ghResult = await session.run(
-      `OPTIONAL MATCH (d:Domain {project_id: $pid})-[:HAS_GITHUB_HUNT]->()-[:HAS_REPOSITORY]->(r:GithubRepository)
-       OPTIONAL MATCH (r)-[:HAS_PATH]->()-[:CONTAINS_SECRET]->(sec:GithubSecret)
-         WHERE ${notMuted('sec')}
-       OPTIONAL MATCH (r)-[:HAS_PATH]->()-[:CONTAINS_SENSITIVE_FILE]->(sf:GithubSensitiveFile)
-         WHERE ${notMuted('sf')}
-       RETURN count(DISTINCT r) AS repos, count(DISTINCT sec) AS secrets, count(DISTINCT sf) AS sensitiveFiles`,
-      { pid: projectId }
-    )
-    const ghRec = ghResult.records[0]
-    const githubSecrets = ghRec
-      ? { repos: toNum(ghRec.get('repos')), secrets: toNum(ghRec.get('secrets')), sensitiveFiles: toNum(ghRec.get('sensitiveFiles')) }
-      : { repos: 0, secrets: 0, sensitiveFiles: 0 }
+    // Q8: GitHub secrets summary, as the report counts it: a key that is
+    // public by design is counted apart, never as an exposed secret.
+    const ghResult = await session.run(githubSecretCountsCypher(), { pid: projectId })
+    const githubSecrets = githubSecretCounts(ghResult.records[0])
 
     // Q9: GVM remediation status
     const remResult = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid, source: 'gvm'})
-       WHERE ${notMuted('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')}
        RETURN CASE WHEN v.remediated = true THEN 'Remediated' ELSE 'Open' END AS status,
               count(v) AS count`,
       { pid: projectId }
@@ -199,7 +194,12 @@ export async function GET(request: NextRequest) {
       count: toNum(r.get('count')),
     }))
 
+    // Findings the board set aside, for the "not counted above" lines.
+    const judged = await queryJudgedFindings(session, projectId)
+    const disposition = await queryDispositionSummary(session, projectId)
+
     return NextResponse.json({
+      disposition,
       severityDistribution,
       vulnTypes,
       findings,
@@ -209,6 +209,7 @@ export async function GET(request: NextRequest) {
       exploits,
       githubSecrets,
       gvmRemediation,
+      judged,
     })
   } catch (error) {
     console.error('Analytics vulnerabilities error:', error)

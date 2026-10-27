@@ -65,23 +65,31 @@ class _Client:
 
 
 class TestTheSweepSitsInAFinally:
+    # The sweep is registered with recon/helpers/shutdown.py and run through
+    # sweep_once(), so a stop's stopper thread and the normal `finally` share
+    # one run of it (plan 12.3).
     def test_full_recon(self):
         main = _function(_source('recon/main.py'), 'main')
-        assert re.search(r'try:\s+return _run_pipeline\(\)\s+finally:\s+_apply_node_filters\(\)', main), main
+        assert '_shutdown.set_sweep(_apply_node_filters)' in main, main
+        assert re.search(r'try:\s+return _run_pipeline\(\)\s+finally:\s+'
+                         r'if not _shutdown\.stop_requested\(\):\s+'
+                         r'_graph_wait_all\(\)\s+_shutdown\.sweep_once\(\)', main), main
 
     def test_full_recon_sweeps_once_per_run_not_per_group(self):
         src = _source('recon/main.py')
-        calls = src.count('_apply_node_filters()') - src.count('def _apply_node_filters()')
-        assert calls == 1
-        assert '_apply_node_filters' not in _function(src, 'run_domain_group')
-        assert '_apply_node_filters' not in _function(src, 'run_domain_batch')
+        assert src.count('set_sweep(') == 1
+        assert src.count('sweep_once(') == 1
+        for fn in ('run_domain_group', 'run_domain_batch'):
+            body = _function(src, fn)
+            assert '_apply_node_filters' not in body and 'sweep_once' not in body, fn
 
     def test_partial_recon(self):
         src = _source('recon/partial_recon.py')
         main = _function(src, 'main')
-        assert re.search(r'started_at = run_timestamp\(\)\s+try:\s+'
+        assert 'shutdown.set_sweep(lambda: _apply_node_filters(_STARTED_AT))' in main, main
+        assert re.search(r'_STARTED_AT = run_timestamp\(\)\s+try:\s+'
                          r'statuses, completed = _run_tool\(tool_id, config\)\s+'
-                         r'finally:\s+_apply_node_filters\(started_at\)', main), main
+                         r'finally:\s+shutdown\.sweep_once\(\)', main), main
         # _run_tool is the only path to the tool, so the dispatch sits inside that try.
         assert '_dispatch(tool_id, config)' in _function(src, '_run_tool')
         assert '_dispatch(' not in main

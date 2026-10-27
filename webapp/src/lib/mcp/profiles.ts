@@ -482,7 +482,7 @@ export const PROFILE_ONBOARDING: Record<ProfileId, ProfileOnboarding> = {
       'An asset table, one row per asset, with its type, its parent and what is known about it. No ' +
       'findings. State the scan version and flag any layer that was never scanned.',
     gotchas: [
-      'Absence from the graph is not absence in reality. If a node type is missing from the census entirely, that surface was never scanned, and your inventory has a hole rather than a clean answer.',
+      'Absence from the graph is not absence in reality. A node type missing from the census means the surface that produces it was never scanned or produced nothing, and the census alone cannot say which: your inventory may have a hole rather than a clean answer. Say what you know was covered.',
       'Asset lists are long and every list tool caps what it returns. Page until you have it all, or say plainly that the answer is partial.',
     ],
   },
@@ -582,7 +582,7 @@ export const PROFILE_ONBOARDING: Record<ProfileId, ProfileOnboarding> = {
       'scanned" rather than collapsing the last two into zero.',
     gotchas: [
       'Never present a count from an unsettled graph as final. Re-read once it is settled, or label the figure provisional.',
-      'A zero means one of two very different things. Check the census: a node type that is absent entirely was never scanned.',
+      'A zero means one of three very different things: never scanned, scanned and clean, or everything suppressed. Check the census and its `coverage` block for what was actually scanned, and the suppressed count, before reporting a zero as clean.',
     ],
   },
 

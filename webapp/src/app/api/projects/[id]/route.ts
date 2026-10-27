@@ -587,9 +587,10 @@ async function stopPartialRecons(projectId: string): Promise<void> {
     const runs: Array<{ run_id?: unknown; status?: unknown }> = Array.isArray(data?.runs) ? data.runs : []
     await Promise.allSettled(
       runs
-        .filter(run => typeof run?.run_id === 'string' && (run.status === 'running' || run.status === 'starting'))
+        .filter(run => typeof run?.run_id === 'string'
+          && (run.status === 'running' || run.status === 'starting' || run.status === 'stopping'))
         .map(run => orchestratorFetch(
-          `${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial/${encodeURIComponent(run.run_id as string)}/stop`,
+          `${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial/${encodeURIComponent(run.run_id as string)}/stop?graceful=false`,
           { method: 'POST' },
         )),
     )
@@ -654,11 +655,15 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     // before removing the container, as a backstop for a scan killed mid-write.
     // The graph is cleared below, so here that write could only land after the
     // clear and leave the deleted project's nodes behind: ingest=false skips it.
-    const skipBackstop = new Set(['gvm', 'github-hunt'])
+    // A recon stop drains its queued writes for up to RECON_STOP_GRACE_S unless
+    // it is hard: graceful=false kills it and answers once it is gone.
+    const stopQuery: Record<string, string> = {
+      recon: '?graceful=false', gvm: '?ingest=false', 'github-hunt': '?ingest=false',
+    }
     await Promise.allSettled([
       ...['recon', 'gvm', 'github-hunt', 'supply-chain'].map(kind =>
         orchestratorFetch(
-          `${RECON_ORCHESTRATOR_URL}/${kind}/${id}/stop${skipBackstop.has(kind) ? '?ingest=false' : ''}`,
+          `${RECON_ORCHESTRATOR_URL}/${kind}/${id}/stop${stopQuery[kind] ?? ''}`,
           { method: 'POST' },
         ),
       ),

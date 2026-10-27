@@ -68,7 +68,7 @@ query IntrospectionFull {
 }
 ```
 
-Save the result and convert to SDL with `kali_shell graphql-inspector` (if installed) or a Python helper.
+Save the result and convert to SDL with a Python helper (`execute_code`).
 
 ### Introspection disabled
 

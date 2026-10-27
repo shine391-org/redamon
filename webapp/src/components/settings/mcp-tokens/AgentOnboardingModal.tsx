@@ -19,6 +19,7 @@ import {
 } from 'lucide-react'
 import { Modal, useAlertModal } from '@/components/ui'
 import { MCP_SCOPES, type McpScope } from '@/lib/mcpAuth'
+import { copyText } from '@/lib/copyText'
 import {
   PROFILE_LIST,
   PROFILES,
@@ -145,7 +146,7 @@ export default function AgentOnboardingModal({
   const copy = async () => {
     if (!files) return
     try {
-      await navigator.clipboard.writeText(files[active].content)
+      await copyText(files[active].content)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch {

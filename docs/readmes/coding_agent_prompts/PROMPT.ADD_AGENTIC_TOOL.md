@@ -176,7 +176,7 @@ A tool is "dangerous" if it actively modifies the target, sends attack traffic, 
 
 #### Step 5 — Determine RoE category mapping
 
-Read `agentic/orchestrator_helpers/nodes/execute_plan_node.py` — the `_check_roe_blocked()` function has a `CATEGORY_TOOL_MAP` dict that maps RoE categories to tools (brute_force, dos, social_engineering, exploitation). If the new tool fits any category, add it to the appropriate list so RoE category-based blocking works.
+Read `agentic/orchestrator_helpers/roe_gate.py`. Its `check_tool_call()` is the one pre-dispatch gate (the Rules of Engagement, then the recon budget) that every executor path asks: the single-tool node, the plan wave and every fireteam member. Its `CATEGORY_TOOL_MAP` maps RoE categories to tools (brute_force, dos, social_engineering, exploitation): if the new tool fits any category, add it to that list so category-based blocking works. If it is a discovery or scanning tool, also add it to `RECON_DISCOVERY_TOOLS`, the family the recon budget refuses once informational recon has used its iterations. Every name in both must be a `TOOL_REGISTRY` key; `agentic/tests/test_roe_gate.py` fails otherwise.
 
 #### Step 5b — Determine stealth mode constraints
 
@@ -299,14 +299,14 @@ The exact set of files depends on the integration type chosen in Phase 1.
 
 - [ ] **`agentic/prompts/tool_registry.py`** — Add entry to `TOOL_REGISTRY` dict with `purpose`, `when_to_use`, `args_format`, and `description`. Position matters: dict insertion order = tool priority. Read existing entries as reference.
 
-- [ ] **`webapp/src/lib/mcp/schema.ts`** — Add the tool name to `BUILTIN_RESERVED_TOOL_NAMES`. That set stops a user's **outbound MCP Tool Plugin** registering a tool with the same name and shadowing yours at dispatch. **Nothing catches this for you**: the set lives in TypeScript, `TOOL_REGISTRY` lives in Python, and no test compares them across the two languages — the existing test only spot-checks three names. A missed entry is silent until a user's plugin collides.
+- [ ] **`webapp/src/lib/mcp/schema.ts`** — Add the tool name to `BUILTIN_RESERVED_TOOL_NAMES`. That set stops a user's **outbound MCP Tool Plugin** registering a tool with the same name and shadowing yours at dispatch. The set lives in TypeScript and `TOOL_REGISTRY` in Python, so `agentic/tests/test_reserved_tool_names_parity.py` parses the TypeScript set and fails until it equals the names the agent reserves (`_builtin_tool_names()` in `agentic/mcp_registry.py`), in both directions.
 
 - [ ] **`agentic/project_settings.py`** — Up to 3 changes:
   1. Add tool to `TOOL_PHASE_MAP` in `DEFAULT_AGENT_SETTINGS` (~line 81-95)
   2. If dangerous: add to `DANGEROUS_TOOLS` frozenset (~line 19-23)
   3. If tool has configurable settings: add defaults to `DEFAULT_AGENT_SETTINGS` + mapping in `fetch_agent_settings()`
 
-- [ ] **`agentic/orchestrator_helpers/nodes/execute_plan_node.py`** — If tool fits an RoE category: add to `CATEGORY_TOOL_MAP` in `_check_roe_blocked()` (~line 30-35)
+- [ ] **`agentic/orchestrator_helpers/roe_gate.py`** — If the tool fits an RoE category: add it to `CATEGORY_TOOL_MAP`; if it is a discovery or scanning tool: add it to `RECON_DISCOVERY_TOOLS`. Every executor path already asks `check_tool_call()`, so no node changes
 
 - [ ] **`agentic/prompts/stealth_rules.py`** — If tool sends any traffic to a target: add a per-tool stealth constraint section under "Per-Tool Stealth Constraints". Specify what is ALLOWED and FORBIDDEN when stealth mode is active. Read existing tool sections as reference for format.
 
@@ -315,7 +315,7 @@ The exact set of files depends on the integration type chosen in Phase 1.
 - [ ] **Type B**: Add `@mcp.tool()` function to `mcp/servers/network_recon_server.py` (or whichever server fits). Read `execute_nmap` in `nmap_server.py` as the simplest reference. Include: rich docstring with examples (LLM reads this), `shlex.split` for arg parsing, `subprocess.run` with appropriate timeout, ANSI escape stripping, error handling.
 
 - [ ] **Type C**: Create `mcp/servers/[tool]_server.py`. Read `nmap_server.py` for simple tools or `metasploit_server.py` for stateful tools. Then:
-  - Register in `mcp/servers/run_servers.py` `SERVERS` dict with module name and port (next available: 8005+)
+  - Register in `mcp/servers/run_servers.py` `SERVERS` dict with module name and port (next available: 8006; 8000 and 8002-8005 are taken)
   - Add MCP server URL to `agentic/tools.py` `MCPToolsManager.get_tools()` server dict — read existing entries for the exact format
   - Add `MCP_[TOOL]_URL` env var to **BOTH** `docker-compose.yml` (root: `http://kali-sandbox:PORT/sse`) and `agentic/docker-compose.yml` (`http://host.docker.internal:PORT/sse`)
   - Expose port on kali-sandbox in root `docker-compose.yml`
@@ -412,7 +412,7 @@ If the tool has configurable parameters (like Hydra's threads, SQLMap's level/ri
 
 - [ ] **`webapp/prisma/schema.prisma`** — Add fields to `Project` model with `@default()` and `@map()`
 - [ ] **`agentic/project_settings.py`** — Add to `DEFAULT_AGENT_SETTINGS` + mapping in `fetch_agent_settings()` (camelCase → SCREAMING_SNAKE_CASE)
-- [ ] **Frontend section component** — Create `[Tool]Section.tsx` in `webapp/src/components/projects/ProjectForm/sections/` (read `BruteForceSection.tsx` or `SqliSection.tsx` as reference). Export from `sections/index.ts`.
+- [ ] **Frontend section component** — Create `[Tool]Section.tsx` in `webapp/src/components/projects/ProjectForm/sections/` (read `BruteForceSection.tsx` or `SqliSection.tsx` as reference). There is no sections index: `ProjectForm.tsx` imports each section from its own file.
 - [ ] **`webapp/src/components/projects/ProjectForm/ProjectForm.tsx`** — Import and render section in appropriate tab
 - [ ] Run `docker compose exec webapp npx prisma db push`
 - [ ] **`recon_settings/registry.yaml`** — Describe every new `Project` column, then run `python3 recon_settings/build.py`. The build FAILS on an undescribed column, so this layer announces itself.
@@ -459,8 +459,9 @@ If the tool is the PRIMARY tool for a new built-in attack skill (like Hydra is f
 | `agentic/tools.py` | **MCPToolsManager**, **PhaseAwareToolExecutor** (dispatch + phase enforcement), API tool managers, optional key injection | Type C (MCP URLs), Type D (manager + dispatch), Type B/C with optional API key (setter + elif branch) |
 | `agentic/orchestrator.py` | Orchestrator -- `_init_tools()`, `_apply_project_settings()` key hot-reload and injection | Type D (full manager lifecycle), Type B/C with optional API key (simple setter call) |
 | `agentic/prompts/base.py` | Dynamic prompt builders — **auto-reads TOOL_REGISTRY, no change needed** | Never |
-| `agentic/orchestrator_helpers/nodes/execute_tool_node.py` | Tool execution — progress streaming, session detection, RoE | If long-running or session-creating |
-| `agentic/orchestrator_helpers/nodes/execute_plan_node.py` | **Duplicate** of above for parallel plans + `CATEGORY_TOOL_MAP` for RoE | If long-running, session-creating, or RoE-categorized |
+| `agentic/orchestrator_helpers/nodes/execute_tool_node.py` | Tool execution — progress streaming, session detection | If long-running or session-creating |
+| `agentic/orchestrator_helpers/nodes/execute_plan_node.py` | **Duplicate** of above for parallel plans | If long-running or session-creating |
+| `agentic/orchestrator_helpers/roe_gate.py` | `check_tool_call()`, the RoE + recon-budget gate every executor path asks; `CATEGORY_TOOL_MAP`, `RECON_DISCOVERY_TOOLS` | If RoE-categorized or a discovery/scanning tool |
 | `agentic/orchestrator_helpers/nodes/tool_confirmation_nodes.py` | Dangerous tool confirmation — **auto-reads DANGEROUS_TOOLS** | Never |
 | `agentic/orchestrator_helpers/nodes/think_node.py` | ReAct reasoning — **auto-reads TOOL_PHASE_MAP + TOOL_REGISTRY** | Never |
 | `agentic/prompts/stealth_rules.py` | Per-tool stealth constraints (FORBIDDEN/RESTRICTED/allowed) | If tool sends traffic to target |
@@ -476,7 +477,6 @@ If the tool is the PRIMARY tool for a new built-in attack skill (like Hydra is f
 | `webapp/src/components/projects/ProjectForm/sections/ToolMatrixSection.tsx` | Tool × phase grid + API key warnings/modals | All types except A |
 | `webapp/src/components/projects/ProjectForm/sections/AttackSkillsSection.tsx` | Built-in attack skill toggles | If part of attack skill |
 | `webapp/src/components/projects/ProjectForm/ProjectForm.tsx` | Tab layout, section rendering | If adding settings section |
-| `webapp/src/components/projects/ProjectForm/sections/index.ts` | Section exports | If adding settings section |
 | `webapp/src/app/graph/components/AIAssistantDrawer/phaseConfig.ts` | `KNOWN_ATTACK_PATH_CONFIG` — chat UI badges | If part of new attack skill |
 | `webapp/src/app/graph/components/AIAssistantDrawer/hooks/useApiKeyModal.ts` | `API_KEY_INFO` + `fetchApiKeyStatus()` — missing key detection in chat drawer | If tool needs API keys |
 | `webapp/src/app/graph/components/AIAssistantDrawer/ToolExecutionCard.tsx` | `TOOL_KEY_LABEL` — human label on tool cards when key missing | If tool needs API keys |
@@ -499,7 +499,8 @@ Think Node (auto-reads TOOL_REGISTRY + TOOL_PHASE_MAP)
     ↓ decides: action=use_tool, tool_name="execute_[tool]"
     ↓
 Phase Check: is_tool_allowed_in_phase() → blocked if not in TOOL_PHASE_MAP
-RoE Check: _check_roe_blocked() → blocked if CATEGORY_TOOL_MAP forbids it
+RoE + recon budget: roe_gate.check_tool_call() → blocked if the RoE forbids the tool or its category
+    (CATEGORY_TOOL_MAP) or the phase, or if informational recon is past its budget (RECON_DISCOVERY_TOOLS)
 Dangerous Check: in DANGEROUS_TOOLS? → pause for user confirmation
     ↓
 Long-running check (hardcoded per tool) → execute_with_progress() or execute()

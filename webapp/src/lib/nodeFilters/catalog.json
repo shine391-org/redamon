@@ -1712,6 +1712,11 @@
             "passive_version_match",
             "passive_catalog"
           ]
+        },
+        "port_confirmed": {
+          "type": "bool",
+          "prop": "port_confirmed",
+          "label": "Port open on this scan (Shodan)"
         }
       },
       "overlaps": [
@@ -1731,6 +1736,15 @@
             },
             {
               "field": "has_exploit",
+              "op": "is_false"
+            }
+          ]
+        },
+        {
+          "name": "Shodan CVEs on a port the scan found closed",
+          "all": [
+            {
+              "field": "port_confirmed",
               "op": "is_false"
             }
           ]
@@ -1768,8 +1782,9 @@
         }
       ],
       "notes": [
-        "CriminalIP writes these nodes once and never refreshes them, and none of these providers is a recon finding source, so in this phase only applying to the current graph reaches them at all.",
-        "Netlas records a severity and a public exploit; Shodan records a severity only when its banner gave a CVSS score, plus the evidence grade (detection_method): a Shodan-verified banner, a banner's product and version, or the IP's catalog alone. CriminalIP carries the CVE alone."
+        "These providers are recon finding sources: the sweep after a scan applies the rules to their CVEs, and a full scan prunes the ones it no longer reports, except on an IP the provider could not be asked about.",
+        "Netlas records a severity and a public exploit; Shodan records a severity only when its banner gave a CVSS score, plus the evidence grade (detection_method): a Shodan-verified banner, a banner's product and version, or the IP's catalog alone. CriminalIP carries the CVE and its CVSS score.",
+        "port_confirmed says what this scan's port scan found on a Shodan CVE's port: true open, false looked at and not open. It is missing when the scan did not look at that port (a top-N port list, no port scan), so \"is false\" never mutes a CVE nobody re-checked."
       ]
     },
     "vuln.osv": {
@@ -2054,13 +2069,22 @@
           "label": "Validation",
           "values": [
             "validated",
-            "invalid",
+            "rejected",
+            "unknown",
+            "format_invalid",
             "unvalidated",
             "skipped",
             "incomplete",
             "format_validated",
+            "invalid",
             "error"
-          ]
+          ],
+          "aliases": {
+            "invalid": [
+              "rejected",
+              "format_invalid"
+            ]
+          }
         },
         "detection_method": {
           "type": "enum",
@@ -2069,6 +2093,11 @@
           "values": [
             "regex"
           ]
+        },
+        "public_client_key": {
+          "type": "bool",
+          "normalizer": "public_client_key",
+          "label": "Public by design"
         },
         "source_url": {
           "type": "url",
@@ -2095,7 +2124,9 @@
               "field": "validation_status",
               "op": "in",
               "value": [
-                "invalid"
+                "invalid",
+                "rejected",
+                "format_invalid"
               ]
             }
           ]

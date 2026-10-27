@@ -141,6 +141,11 @@ class McpCypherScopingTests(unittest.TestCase):
         self.assertIn("count(DISTINCT a6) AS parameters", q)
         self.assertTrue(q.startswith("OPTIONAL MATCH (a0:Subdomain)"))
         self.assertIn("b7.stale_since IS NULL", q)
+        # The Priority Board predicate is part of the where literal, so a mirror
+        # that dropped it would scope a query nobody ships.
+        self.assertIn("AND coalesce(b1.triage_source, '') = 'human')", q)
+        self.assertIn("AS judgedFalsePositiveVulnerabilities", q)
+        self.assertIn("ELSE 'counted' END = 'ai_flagged'", q)
         self.assertEqual(q.count("OPTIONAL MATCH"), q.count("WITH "))
 
     def test_the_typescript_source_is_actually_readable(self):

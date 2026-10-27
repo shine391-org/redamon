@@ -148,9 +148,14 @@ export function useMultiPartialReconStatus({
       }
 
       const data: PartialReconState = await response.json()
-      // Remove from list since backend deletes it on stop
-      setRuns(prev => prev.filter(r => r.run_id !== runId))
-      delete previousStatusesRef.current[runId]
+      if (data.status === 'stopping') {
+        // The run drains its graph writes and applies the mute rules first, so
+        // it stays listed as stopping until a poll finds it gone.
+        setRuns(prev => prev.map(r => (r.run_id === runId ? { ...r, ...data } : r)))
+      } else {
+        setRuns(prev => prev.filter(r => r.run_id !== runId))
+        delete previousStatusesRef.current[runId]
+      }
       return data
 
     } catch (err) {

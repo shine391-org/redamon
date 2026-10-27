@@ -30,6 +30,8 @@ from pathlib import Path
 
 _AGENTIC_DIR = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _AGENTIC_DIR.parent
+sys.path.insert(0, str(_REPO_ROOT / "tooling" / "scripts"))
+from wiki_checkout import SKIP_REASON, wiki_checkout_present  # noqa: E402
 _COMMUNITY_DIR = _AGENTIC_DIR / "community-skills"
 _SKILL_ID = "idor_bola_exploitation"
 _SKILL_PATH = _COMMUNITY_DIR / f"{_SKILL_ID}.md"
@@ -364,12 +366,12 @@ class TestReadmeIndex(unittest.TestCase):
 
 class TestWikiIndex(unittest.TestCase):
     """If the wiki exists locally, the community-skills table should
-    reference the new skill. Skip silently when the wiki submodule isn't
-    checked out (CI may not have it)."""
+    reference the new skill. An empty wiki checkout fails unless
+    REDAMON_TEST_ALLOW_MISSING names wiki."""
 
     def test_wiki_table_lists_idor_bola(self):
-        if not _WIKI_PATH.is_file():
-            self.skipTest("redamon.wiki not checked out locally")
+        if not wiki_checkout_present(_WIKI_PATH.parent):
+            self.skipTest(SKIP_REASON)
         wiki = _WIKI_PATH.read_text(encoding="utf-8")
         self.assertIn(f"{_SKILL_ID}.md", wiki,
                       "wiki community-skills table must reference the new file")

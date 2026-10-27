@@ -452,16 +452,9 @@ class TestKatanaRoECategory(unittest.TestCase):
 
     def test_katana_not_in_roe_categories(self):
         """execute_katana should NOT be in any RoE category (it's a crawler, not exploit/brute)."""
-        plan_node_path = os.path.join(
-            _agentic_dir, 'orchestrator_helpers', 'nodes', 'execute_plan_node.py'
-        )
-        with open(plan_node_path) as f:
-            source = f.read()
-        # Find CATEGORY_TOOL_MAP block
-        start = source.index('CATEGORY_TOOL_MAP')
-        end = source.index('}', start) + 1
-        category_block = source[start:end]
-        self.assertNotIn('execute_katana', category_block)
+        from orchestrator_helpers.roe_gate import CATEGORY_TOOL_MAP
+        for category, tools in CATEGORY_TOOL_MAP.items():
+            self.assertNotIn('execute_katana', tools, category)
 
 
 # ===========================================================================

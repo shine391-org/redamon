@@ -112,6 +112,7 @@ Network security teams and pentesters who need to map large external perimeters 
 
     // --- httpx: high throughput with full fingerprinting ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 75,
     httpxTimeout: 15,
     httpxRetries: 2,

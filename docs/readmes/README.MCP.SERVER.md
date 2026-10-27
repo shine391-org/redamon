@@ -24,7 +24,7 @@ set of recon tuning settings, and query the attack-surface graph.
 | `list_projects` | The token owner's projects. Nothing else is visible. | `recon:read` |
 | `get_recon_status` | Whether a scan is running, and its phase. | `recon:read` |
 | `get_recon_settings` | Every setting `update_recon_settings` can change, plus the (read-only) engagement scope and the `updatedAt` to pass back. Credentials are never returned. | `recon:read` |
-| `graph_summary` | Count per node type + relationships present. | `recon:read` |
+| `graph_summary` | Count per node type + relationships present; `coverage`, per stamping module (`js_recon`, `nuclei`), the BaseURLs `complete` / `partial` / `no_input` / `failed` and the live ones `not_scanned` (`{recorded: false}` before any stamp; absent, never zeros, when unreadable), computed inside the agent's same fixed `summary` op; and, on a settled graph far smaller than the project's history (under a tenth of the current or newest saved version's `nodeCount`, or empty after a completed full scan), `warning: "graph_data_missing"` with `graphDataMissing`. See `graphSummary` / `graphDataMissing` in `webapp/src/lib/mcp/tools.ts`. | `recon:read` |
 | `graph_schema` | What the graph *means*. No arguments, no data. | `recon:read` |
 | `query_graph` | Ask the graph a question in natural language. | `recon:read` (+ `graph:cypher` for raw Cypher) |
 | `kali_toolbox` | The Kali sandbox's installed toolset, by category. Reads code, not the container. | `recon:read` |
@@ -595,9 +595,9 @@ may write:
 
 | Disposition | Count | What it means |
 | --- | --- | --- |
-| `settable` | 650 | write at any time through `update_recon_settings` |
+| `settable` | 673 | write at any time through `update_recon_settings` |
 | `create_only` | 19 | the engagement scope: written once by `create_project`, refused by name afterwards |
-| `never` | 48 | not a pipeline parameter at all; refused with its class. 24 of these are the engagement RECORD |
+| `never` | 49 | not a pipeline parameter at all; refused with its class. 20 of these are the engagement RECORD (`engagement-record`); the record's uploaded RoE document and its parse are 5 more, `upload-managed` |
 
 There used to be a fourth, `tighten_only`, holding the Rules of Engagement under
 a write-time direction rule. It is deleted rather than migrated. The rule bought

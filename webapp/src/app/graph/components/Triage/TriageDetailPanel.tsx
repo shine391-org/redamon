@@ -20,6 +20,8 @@ import {
   personDecided, reviewChip, tierForScore, tierOf,
   type TriageFinding, type VerdictResult, type VerdictStatus,
 } from './triageLayers'
+import { DispositionLine } from './DispositionChip'
+import { readDisposition } from '@/lib/triage/disposition'
 import styles from './TriageDetailPanel.module.css'
 
 interface GroupMember {
@@ -285,10 +287,12 @@ function neverScored(row: TriageFinding): boolean {
 }
 
 function ResultSection({ row }: { row: TriageFinding }) {
+  const disposition = <DispositionLine result={readDisposition(row)} className={styles.disposition} />
   if (neverScored(row)) {
     return (
       <Section title="Result">
         <p className={styles.lead}>Not triaged yet.</p>
+        {disposition}
         <p className={styles.muted}>
           No run has scored it. Run triage to rank it; a decision you make now is kept.
         </p>
@@ -306,6 +310,7 @@ function ResultSection({ row }: { row: TriageFinding }) {
         <span className={`${styles.tierChip} ${styles[`tier${tier}`] ?? ''}`}>{TIER_LABELS[tier]}</span>
         <span className={styles.muted}>{row.triage_state || 'open'}</span>
       </div>
+      {disposition}
       {row.triage_tier_rule && <p className={styles.muted}>{row.triage_tier_rule}</p>}
       {base && (
         <p className={styles.baseLine} title={base.title}>

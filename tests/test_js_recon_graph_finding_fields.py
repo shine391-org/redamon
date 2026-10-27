@@ -101,7 +101,23 @@ class TestSourceMapFields(unittest.TestCase):
         self.assertFalse(props["accessible"])
         self.assertEqual(props["fetch_result"], "http_403")
         self.assertIn("answered http_403", props["detail"])
+        self.assertIsNone(props["control_check"])
         _assert_flat(self, props)
+
+    def test_a_reference_whose_control_failed_says_so(self):
+        """Plan 06.5: a control probe that errors is no evidence; the row stays, marked."""
+        def row(check):
+            return _written({"source_maps": [{
+                "id": "sm4", "finding_type": "source_map_reference", "severity": "info",
+                "js_url": "https://app.example.com/main.js", "map_url": "https://app.example.com/main.js.map",
+                "accessible": False, "fetch_result": "http_403", "control_check": check,
+                "discovery_method": "comment", "files_count": 0, "source_files": [], "secrets_in_source": 0,
+            }]})["source_map_reference"]
+
+        failed, passed = row("failed"), row("passed")
+        self.assertEqual((failed["control_check"], passed["control_check"]), ("failed", "passed"))
+        self.assertIn("control check could not run", failed["detail"])
+        self.assertNotIn("control check", passed["detail"])
 
 
 class TestInlineSourceMap(unittest.TestCase):

@@ -19,6 +19,9 @@ and on `192.88.99.50-79`. **Scan nothing else from this harness.**
 
 Every vhost returns `<h1>{host}</h1>` from a fixed map (never from the Host
 header), so httpx results are per host and no host-header reflection appears.
+web1 also serves `vhost-only.nwlab.test`, which no zone has: the one name the
+vhost/SNI scenario `VH` must report as a hidden vhost, while every name DNS
+points at web1 must not be (plan 07).
 
 ### `nwlab.test`: the "clean" org (A records → web1)
 
@@ -34,6 +37,9 @@ header), so httpx results are per host and no host-header reflection appears.
 | `js-only.v2.api` | A | found **only** in `/static/app.js` (JS-recon injection) |
 | `eu.corp`, `dev.eu.corp`, `staging.dev.eu.corp` | A | nested-wildcard collapse; brute-force depth limit |
 | `a.b.c.d` | A | a five-label EXACT host |
+| `wild` | A | scenario `WC`: the scan root of a DNS-wildcard zone |
+| `*.wild` | A (wildcard) → web1 | every name under `wild` answers, so a name that exists only through it proves nothing |
+| `real.wild` | A → **web2** (`192.88.99.61`) | the one name under `wild` with its own record and address: kept |
 | AXFR | refused | |
 
 ### `nwlab-two.test`: the "dirty" org (A records → web2)
@@ -52,11 +58,33 @@ whose systemd-resolved has DNSSEC off: see Lab limitations.
 
 - **web1** SANs: `api`, `v1.api`, `v2.api`, `admin.v1.api`, `internal.v1.api`, `www`, `shop`, `mail`, `secret` (all `.nwlab.test`). A `*.api` ENUMERATE group may inject only the four `*.api` names; an EXACT group injects nothing.
 - **web2** SANs: `nwlab-two.test`, `www`, `portal`, `api`, `v1.api`, `v2.api` (all `.nwlab-two.test`).
+- **wild** SANs: `wild`, `real.wild`, `admin.wild`, `dev.wild`, `vpn.wild`, `staging.wild` (all `.nwlab.test`). web1 serves it for `wild.nwlab.test` and every name under it, web2 for `real.wild.nwlab.test`. An existing lab gets it from the next `./setup.sh`, which only generates missing certificates; nginx will not start without it.
 
 ### Web content
 
 - `https://api.nwlab.test/` loads `/static/app.js`, which references `https://js-only.v2.api.nwlab.test/x` (inside `*.api`) and `https://cdn.nwlab.test/lib.js` (a sibling outside it).
 - `https://api.nwlab.test/openapi.json` and `https://www.nwlab.test/openapi.json` are two small OpenAPI 3 documents with distinct paths, for two partial OpenAPI runs on scan roots of the same org at the same time.
+
+### Scenario `WC`: wildcard DNS under a scan root (plan 08)
+
+RedAmon's own wildcard control probes each zone with random labels; when they
+resolve, a name whose addresses are all the wildcard's is dropped, and the zone
+node carries `is_wildcard_zone` and `wildcard_ips`. In production most such names
+come from brute force, but the lab has none (see Lab limitations), so the names
+arrive through the `wild` certificate's SANs, the merge every certificate name
+goes through: `admin`, `dev`, `vpn` and `staging.wild` are dropped, `real.wild`
+is kept, and `Subdomain(wild.nwlab.test)` is stamped `is_wildcard_zone = true`,
+`wildcard_ips = [192.88.99.60]`. A certificate name merged after httpx becomes a
+scan target (the run's `dns.subdomains`, crawled by resource enumeration), not a
+Subdomain node, unless tlsx or vhost/SNI writes it, and neither runs here; so the
+checks that tell kept from dropped read the run's recon JSON (`recon_json:` in
+`expected_results.yaml`). `WC-DNSOFF` runs the
+same hosts with DNS resolution off: no zone is checked and nothing reads as
+resolved. Without DNS httpx gets no target here, so no name reaches the control
+unchecked; the `wildcard_control` note for that case is unit-tested.
+The puredns half of plan 08 cannot run here either: discovery returns no lab
+name, so puredns always gets an empty list. It is unit-tested
+(`recon/tests/test_puredns.py`).
 
 ## Run it
 

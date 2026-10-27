@@ -307,3 +307,25 @@ class TestGraphClearHappensOncePerRun:
              mock.patch.object(recon_main, 'IP_MODE', False):
             assert recon_main.main() == 1
         clear.assert_not_called()
+
+
+class TestEachGroupRechecksTheResolver:
+    """Plan 12.10: a resolver latch tripped in group 1 used to stay shut for
+    every later group, refusing its ownership TXT lookup ("resolver down")
+    and resolving none of its hosts."""
+
+    def test_the_recheck_runs_before_the_ownership_lookup(self, recon_main, monkeypatch):
+        from recon.main_recon_modules import domain_recon as dr
+        order = []
+        monkeypatch.setattr(dr.resolver_breaker, "recheck", lambda: order.append("recheck") or True)
+        monkeypatch.setattr(recon_main, "VERIFY_DOMAIN_OWNERSHIP", True)
+
+        def ownership(group):
+            order.append("ownership")
+            return {"verified": False, "error": "", "record_names": ["_redamon-verify.b.com"],
+                    "expected_value": "x"}
+
+        monkeypatch.setattr(recon_main, "_group_ownership", ownership)
+        monkeypatch.setattr(recon_main, "_roe_refuses_root", lambda root: False)
+        assert recon_main.run_domain_group(_scope_group("b.com")) == 1
+        assert order == ["recheck", "ownership"]

@@ -474,6 +474,35 @@ class TestUpdateGraphFromCriminalip(unittest.TestCase):
         ]
         self.assertAlmostEqual(vuln_queries[0].kwargs["cvss"], 6.5)
 
+    # ── Plan 04.6: the score where the board reads it, refreshed every run ──
+
+    def _vuln_merge(self) -> str:
+        self._run()
+        return next(c.args[0] for c in self.session.run.call_args_list
+                    if c.args and "MERGE (v:Vulnerability" in c.args[0])
+
+    def _clauses(self, query):
+        """(ON CREATE SET clause, the rest) of the Vulnerability MERGE."""
+        import re
+        parts = re.search(r"ON CREATE SET(.*?)\n\s*(?://[^\n]*\n\s*)*SET\s(.*)", query, re.S)
+        self.assertIsNotNone(parts, query)
+        return parts.groups()
+
+    def test_the_score_is_written_where_the_board_reads_it(self):
+        on_create, every_run = self._clauses(self._vuln_merge())
+        self.assertIn("v.cvss_score = $cvss", every_run)
+        self.assertNotIn("v.cvss =", on_create + every_run)
+
+    def test_a_rerun_refreshes_the_finding_and_keeps_its_provenance(self):
+        on_create, every_run = self._clauses(self._vuln_merge())
+        for field in ("v.name = $cve_id", "v.cves = [$cve_id]", "v.updated_at = datetime()"):
+            self.assertIn(field, every_run)
+        self.assertIn("v.source = 'criminalip'", on_create)
+        self.assertNotIn("v.source", every_run)
+
+    def test_the_old_score_property_is_removed(self):
+        self.assertIn("REMOVE v.cvss", self._vuln_merge())
+
     # ── Multiple IPs ─────────────────────────────────────────────────────────
 
     def test_multiple_ip_reports_all_processed(self):

@@ -245,5 +245,51 @@ class TestTenantScoping(unittest.TestCase):
                     self.assertIn("project_id: $pid", query, query)
 
 
+
+class TestDnsKnownNameIsNotHidden(unittest.TestCase):
+    """A name public DNS already points at the IP is not a hidden vhost; only a
+    routing inconsistency on it is reported, and it never flags vhost_hidden."""
+
+    def _write(self, finding):
+        session = _Session(subdomains={"shop.example.com"}, ips={"192.0.2.20"}, domains={"example.com"})
+        _Client(session).update_graph_from_vhost_sni(_recon([finding]), "u", "p")
+        return session
+
+    def test_a_dns_known_finding_sets_vhost_hidden_false(self):
+        finding = dict(_finding("shop.example.com", ftype="host_header_bypass", layer="both"),
+                       dns_known=True)
+        session = self._write(finding)
+        sub = [p for q, p in session.calls if "MERGE (s:Subdomain" in q]
+        self.assertEqual(sub[0]["sprops"]["vhost_hidden"], False)
+
+    def test_the_vulnerability_records_that_dns_knew_the_name(self):
+        finding = dict(_finding("shop.example.com", ftype="host_header_bypass", layer="both"),
+                       dns_known=True)
+        session = self._write(finding)
+        vuln = [p for q, p in session.calls if "MERGE (v:Vulnerability" in q]
+        self.assertIs(vuln[0]["props"]["dns_known"], True)
+
+    def test_a_hidden_name_still_sets_vhost_hidden(self):
+        session = self._write(dict(_finding("intranet.example.com"), dns_known=False))
+        sub = [p for q, p in session.calls if "MERGE (s:Subdomain" in q]
+        self.assertEqual(sub[0]["sprops"]["vhost_hidden"], True)
+        vuln = [p for q, p in session.calls if "MERGE (v:Vulnerability" in q]
+        self.assertIs(vuln[0]["props"]["dns_known"], False)
+
+    def test_a_finding_from_an_older_scan_reads_as_hidden(self):
+        session = self._write(_finding("intranet.example.com"))
+        sub = [p for q, p in session.calls if "MERGE (s:Subdomain" in q]
+        self.assertEqual(sub[0]["sprops"]["vhost_hidden"], True)
+
+    def test_the_ip_records_how_many_dns_known_names_it_set_aside(self):
+        session = _Session(ips={"192.0.2.20"})
+        rec = _recon([])
+        rec["vhost_sni"]["by_ip"] = {"192.0.2.20": {"baseline": {"status": 404, "size": 10},
+                                                    "suppressed_dns_known": 3}}
+        _Client(session).update_graph_from_vhost_sni(rec, "u", "p")
+        ip_props = [p for q, p in session.calls if "SET i += $props" in q][0]["props"]
+        self.assertEqual(ip_props["vhost_sni_suppressed_dns_known"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

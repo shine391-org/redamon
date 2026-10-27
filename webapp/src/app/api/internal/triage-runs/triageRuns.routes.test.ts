@@ -345,6 +345,16 @@ describe('POST .../finish', () => {
     })
   })
 
+  test('the summary keeps how many fix items followed their findings', async () => {
+    await finish(post('/x', {
+      status: 'completed',
+      summary: { remediations_created: 1, remediations_updated: 4, remediations_repointed: 2 },
+    }), runParams())
+    expect(finishData().data.summary).toEqual({
+      remediations_created: 1, remediations_updated: 4, remediations_repointed: 2,
+    })
+  })
+
   test('a malformed body still records a terminal state', async () => {
     const bad = new NextRequest('http://x/finish', {
       method: 'POST',

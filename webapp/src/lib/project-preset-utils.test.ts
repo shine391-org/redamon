@@ -428,9 +428,15 @@ describe('applyPresetSettings', () => {
   })
 
   test('the backend default wins over the Prisma default', () => {
-    const next = applyPresetSettings({}, {}, { fireteamTimeoutSec: 7200 })
-    expect(next.fireteamTimeoutSec).toBe(7200)
-    expect(applyPresetSettings({}, {}, {}).fireteamTimeoutSec).toBe(3600)
+    // Read the Prisma default rather than naming it, and pick a backend value
+    // that differs from it, so the test keeps proving precedence when the two
+    // defaults are aligned.
+    const prismaDefault = field('fireteamTimeoutSec')?.default
+    expect(typeof prismaDefault).toBe('number')
+    const backend = (prismaDefault as number) + 60
+    const next = applyPresetSettings({}, {}, { fireteamTimeoutSec: backend })
+    expect(next.fireteamTimeoutSec).toBe(backend)
+    expect(applyPresetSettings({}, {}, {}).fireteamTimeoutSec).toBe(prismaDefault)
   })
 
   test('never touches an excluded field, even when a stale preset carries it', () => {

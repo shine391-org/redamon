@@ -1004,6 +1004,7 @@ Unauthorized vulnerability scanning may violate:
 redamon/
 ├── .env                              # Secrets (GVM_PASSWORD, NEO4J_PASSWORD, etc.)
 ├── docker-compose.yml                # Main stack (includes vuln-scanner build target)
+├── docs/readmes/README.GVM.md        # This documentation
 │
 ├── scanners/gvm_scan/
 │   ├── docker-compose.yml            # GVM infrastructure (gvmd, ospd-openvas, redis, pg-gvm)
@@ -1013,7 +1014,6 @@ redamon/
 │   ├── main.py                       # Entry point (reads PROJECT_ID from env)
 │   ├── gvm_scanner.py                # GVM API wrapper (reads connection settings from env)
 │   ├── requirements.txt              # Python dependencies
-│   ├── README.GVM.md                 # This documentation
 │   └── output/
 │       └── gvm_{projectId}.json      # Scan results per project
 │

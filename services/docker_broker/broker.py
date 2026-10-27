@@ -61,16 +61,16 @@ _DEFAULT_ALLOWED_IMAGES = [
     "caffix/amass:latest",
     "frost19k/puredns:latest",
     "sxcurity/gau:latest",
-    "sxcurity/gau:arm64",
     "jauderho/hakrawler:latest",
     "ghcr.io/zaproxy/zaproxy:stable",
     "dolevf/graphql-cop:1.14",
     "redamon-baddns:latest",
-    # Supply-chain feature (plan Phase 0.5/2): the DIRTY analyzer and the CLEAN
-    # standalone scanner. The analyzer may be spawned by a broker-socket caller
-    # (recon in L2), so it must be allowlisted or the spawn fails closed.
+    "redamon-wcvs:latest",
+    # Supply-chain feature (plan Phase 0.5/2): the DIRTY analyzer, spawned by a
+    # broker-socket caller (recon in L2), so it must be allowlisted or the spawn
+    # fails closed. The CLEAN scanner is started by the orchestrator on the real
+    # socket, so it is not on this list.
     "redamon-supply-chain-analyzer:latest",
-    "redamon-supply-chain:latest",
     "alpine",          # temp-file cleanup helper
     "alpine:latest",
 ]
@@ -401,6 +401,46 @@ def mark_owned(cfg: dict) -> dict:
     return cfg
 
 
+# The run a tool container belongs to, so the orchestrator can stop or pause one
+# run's tools and nobody else's. The broker cannot tell its callers apart (every
+# recon container shares one socket), so the recon container names its run in a
+# header its Docker CLI sends on every call (recon/entrypoint.sh writes it into
+# the CLI's config.json). Labels stay advisory: the orchestrator also requires
+# _OWNER_LABEL, and it talks to the real daemon directly.
+RUN_HEADER = "x-redamon-run"
+RUN_LABELS = ("redamon.run_kind", "redamon.project_id", "redamon.run_id")
+_RUN_KINDS = frozenset({"full_recon", "partial_recon"})
+_RUN_PART_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def parse_run_header(value) -> "tuple[str, str, str] | None":
+    """(kind, project_id, run_id) from `<kind>:<project>:<run>`, or None."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split(":")
+    if len(parts) != 3 or parts[0] not in _RUN_KINDS:
+        return None
+    if not all(_RUN_PART_RE.fullmatch(p) for p in parts[1:]):
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def stamp_run_labels(cfg: dict, header_value) -> dict:
+    """Label a create body with the run its header names. Run labels come only
+    from the header: a client-supplied one is overwritten, or dropped when the
+    header is absent or malformed. Mutates and returns cfg."""
+    labels = cfg.get("Labels")
+    if not isinstance(labels, dict):
+        labels = {}
+        cfg["Labels"] = labels
+    for name in RUN_LABELS:
+        labels.pop(name, None)
+    run = parse_run_header(header_value)
+    if run:
+        labels.update(zip(RUN_LABELS, run))
+    return cfg
+
+
 def _dechunk(body: bytes) -> bytes:
     """Decode HTTP/1.1 chunked transfer-encoding into the raw body."""
     out = b""
@@ -711,9 +751,11 @@ async def handle_client(client_reader, client_writer):
             # is corrected in the head rebuild below).
             inject_limits(cfg)
             mark_owned(cfg)
+            stamp_run_labels(cfg, headers.get(RUN_HEADER))
             body = json.dumps(cfg).encode("utf-8")
             body_modified = True
-            _log(f"ALLOW create image={cfg.get('Image')!r} mem={cfg.get('HostConfig', {}).get('Memory')}")
+            _log(f"ALLOW create image={cfg.get('Image')!r} mem={cfg.get('HostConfig', {}).get('Memory')} "
+                 f"run={cfg['Labels'].get('redamon.run_id', '-')}")
 
         # ---- validate docker pull (deny = no upstream contact) ----
         if method == "POST" and _IMAGES_CREATE_RE.match(path_only):

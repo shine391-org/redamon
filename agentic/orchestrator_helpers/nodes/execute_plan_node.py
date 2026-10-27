@@ -14,6 +14,7 @@ from uuid import uuid4
 import httpx
 
 from state import AgentState
+from orchestrator_helpers import roe_gate
 from orchestrator_helpers.config import get_identifiers
 from tools import set_tenant_context, set_phase_context, set_graph_view_context
 
@@ -24,9 +25,9 @@ def _validate_plan_mutex_groups(steps: list) -> str | None:
     """Return None if OK, or a diagnostic string if two plan steps invoke the
     same singleton tool group (e.g. two steps both calling metasploit_console).
 
-    Mirrors fireteam_deploy_node._validate_mutex_groups but scans tool_name
-    directly rather than declared skills — plan_tools steps carry the concrete
-    tool call, not a skill declaration.
+    Mirrors fireteam_deploy_node._validate_mutex_groups but scans each step's
+    tool_name rather than a member's declared `tools` list — plan_tools steps
+    carry the concrete tool call.
     """
     from project_settings import TOOL_MUTEX_GROUPS
 
@@ -37,45 +38,13 @@ def _validate_plan_mutex_groups(steps: list) -> str | None:
     return None
 
 
-def _check_roe_blocked(tool_name: str, phase: str) -> str | None:
-    """Check if a tool is blocked by Rules of Engagement. Returns error message or None."""
-    from project_settings import get_setting
-
-    if not get_setting('ROE_ENABLED', False):
-        return None
-
-    CATEGORY_TOOL_MAP = {
-        'brute_force': ['execute_hydra', 'execute_wpscan', 'execute_ffuf', 'proxy_fuzz'],
-        'dos': [],
-        'social_engineering': [],
-        'exploitation': ['metasploit_console', 'execute_hydra', 'proxy_replay', 'proxy_fuzz'],
-    }
-    forbidden = set(get_setting('ROE_FORBIDDEN_TOOLS', []))
-    for cat in get_setting('ROE_FORBIDDEN_CATEGORIES', []):
-        forbidden.update(CATEGORY_TOOL_MAP.get(cat, []))
-
-    if not get_setting('ROE_ALLOW_ACCOUNT_LOCKOUT', False):
-        forbidden.add('execute_hydra')
-    if not get_setting('ROE_ALLOW_DOS', False):
-        forbidden.update(CATEGORY_TOOL_MAP.get('dos', []))
-
-    if tool_name in forbidden:
-        return f"RoE BLOCKED: Tool '{tool_name}' is forbidden by the Rules of Engagement."
-
-    PHASE_ORDER = {'informational': 0, 'exploitation': 1, 'post_exploitation': 2}
-    max_phase = get_setting('ROE_MAX_SEVERITY_PHASE', 'post_exploitation')
-    if PHASE_ORDER.get(phase, 0) > PHASE_ORDER.get(max_phase, 2):
-        return f"RoE BLOCKED: Current phase '{phase}' exceeds maximum allowed phase '{max_phase}'."
-
-    return None
-
-
 async def _execute_single_step(
     step: dict,
     step_index: int,
     total_steps: int,
     *,
     phase: str,
+    iteration: int,
     wave_id: str,
     user_id: str,
     project_id: str,
@@ -96,22 +65,21 @@ async def _execute_single_step(
         step["error_message"] = "No tool name provided"
         return False
 
-    # RoE gate
-    roe_msg = _check_roe_blocked(tool_name, phase)
-    if roe_msg:
-        logger.warning(f"[{user_id}/{project_id}/{session_id}] {roe_msg}")
-        step["tool_output"] = roe_msg
+    refusal = roe_gate.check_tool_call(tool_name, tool_args, phase, iteration)
+    if refusal:
+        logger.warning(f"[{user_id}/{project_id}/{session_id}] refused '{tool_name}' at iter {iteration}: {refusal.error}")
+        step["tool_output"] = refusal.message
         step["success"] = False
-        step["error_message"] = roe_msg
+        step["error_message"] = refusal.error
         if streaming_cb:
             try:
                 await streaming_cb.on_tool_start(tool_name, tool_args, wave_id=wave_id, step_index=step_index)
                 await streaming_cb.on_tool_complete(
-                    tool_name, False, roe_msg, wave_id=wave_id, step_index=step_index,
+                    tool_name, False, refusal.message, wave_id=wave_id, step_index=step_index,
                     duration_ms=0,
                 )
             except Exception as e:
-                logger.warning(f"Error emitting RoE block events: {e}")
+                logger.warning(f"Error emitting refusal events: {e}")
         return False
 
     # Emit tool_start
@@ -416,6 +384,7 @@ async def execute_plan_node(
                 index,
                 len(steps),
                 phase=phase,
+                iteration=iteration,
                 wave_id=wave_id,
                 user_id=user_id,
                 project_id=project_id,

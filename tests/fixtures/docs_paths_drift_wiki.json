@@ -1,0 +1,20 @@
+{
+ "_comment": "Repo paths cited by a wiki page (redamon.wiki/) that do not exist at the path shown, found by skills/skill-sync/assets/drift-audit.sh --docs; read by tests/docs_cited_paths_test.sh. Remove an entry in the same commit as its fix. An item starting 'not a path:' is a token the audit cannot tell from a path; it stays until the prose changes.",
+ "entries": [
+  {
+   "file": "redamon.wiki/Building-a-Plugin.md",
+   "path": ".github/CODEOWNERS",
+   "item": "not a path: a file of the redamon-plugins repository"
+  },
+  {
+   "file": "redamon.wiki/JS-Reconnaissance.md",
+   "path": "src/config.ts",
+   "item": "not a path: a source file on the scanned target"
+  },
+  {
+   "file": "redamon.wiki/RedAmon-HackLab.md",
+   "path": "redamon.wiki/hacklab/community/",
+   "item": "not a path: the folder a contributor's first session file creates"
+  }
+ ]
+}

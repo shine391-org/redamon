@@ -138,7 +138,7 @@ class GvmState(BaseModel):
     status: GvmStatus
     current_phase: Optional[str] = None
     phase_number: Optional[Union[int, float]] = None
-    total_phases: int = 4
+    total_phases: int = 5
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None

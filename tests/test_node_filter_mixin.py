@@ -351,3 +351,21 @@ class TestFailsClosed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLegacyValidationAliasInAPreview(unittest.TestCase):
+    """The webapp's preview is this dry run (agentic/node_filter_runs.preview):
+    a saved rule on 'invalid' counts a node stored as 'rejected'."""
+
+    def test_a_saved_invalid_rule_previews_rejected_nodes(self):
+        rule = {"id": "v1nval", "name": "Keys that failed validation", "enabled": True,
+                "all": [{"field": "validation_status", "op": "in", "value": ["invalid"]}]}
+        nodes = []
+        for key, status in (("s1", "rejected"), ("s2", "invalid"), ("s3", "unknown")):
+            n = node(key, source="js_recon")
+            n["props"] = {"validation_status": status}
+            nodes.append(n)
+        g = FakeGraph(nodes)
+        stats = Client(g).sweep(config(rule, kind="secret"), kinds=["secret"], dry_run=True)
+        self.assertEqual(stats["kinds"]["secret"]["would_mute"], 2)
+        self.assertEqual(g.writes, [])

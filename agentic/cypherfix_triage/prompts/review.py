@@ -34,7 +34,7 @@ import re
 #: Stored with every built-in review (`triage_ai_prompt_version`). Bump whenever
 #: the wording below changes meaning: the built-in AI then re-reads its own
 #: reviews on the next run, while an external agent's review is left alone.
-REVIEW_PROMPT_VERSION = "review-v2"
+REVIEW_PROMPT_VERSION = "review-v3"
 
 #: The version every v3.1 review was written under. Only used to recognise one
 #: whose evidence has not changed, so the upgrade does not throw it away.
@@ -100,8 +100,10 @@ Rules you must follow:
    it to guessing.
 3. "false_positive" means the evidence shows the finding is not real: the
    response is an error page or the site's own HTML, the "secret" is a
-   documentation sample or a placeholder, the match is in a comment. It does not
-   mean "low severity" or "not worth fixing".
+   documentation sample or a placeholder, the match is in a comment, the
+   response is a login page, a redirect to login, a 401/403 auth wall, or the
+   same page the server returns for a random path. It does not mean "low
+   severity" or "not worth fixing".
 4. "real" means the evidence shows the thing the finding claims. Quote the part
    that shows it.
 5. impact_multiplier adjusts how BAD it would be, not how likely. Raise it when

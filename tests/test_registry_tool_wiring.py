@@ -128,15 +128,29 @@ def test_every_graph_label_has_a_producer():
         for spec in TOOLS.values()
         for label in (spec.get("produces") or [])
     }
-    # Labels written by something other than a recon tool. Named rather than
-    # skipped, so a NEW unproduced label still fails.
-    NOT_TOOL_PRODUCED = {
+    # `produces` is derived from the partial-recon sections (SECTION_NODE_MAP, see
+    # recon_settings/build.py), so a label written outside every section is named
+    # here with its writer, rather than skipped, so a NEW unproduced label still
+    # fails.
+    WRITTEN_OUTSIDE_A_SECTION = {
         # The graph's own structure and the operator's own inputs.
-        "UserInput",
+        "UserInput": "user_inputs.py",
         # Written by the graph read-path reconcile, not by a scanner.
-        "Traceroute",
+        "Traceroute": "the read-path reconcile",
+        # The scan root: ensure_root_domains creates it when a run starts and the
+        # sections only enrich it (SECTION_ENRICH_MAP).
+        "Domain": "graph_db/mixins/recon/domain_mixin.py",
+        # The agent's attack-chain record.
+        "AttackChain": "agentic/orchestrator_helpers/chain_graph_writer.py",
+        "ChainStep": "agentic/orchestrator_helpers/chain_graph_writer.py",
+        "ChainFinding": "agentic/orchestrator_helpers/chain_graph_writer.py",
+        "ChainDecision": "agentic/orchestrator_helpers/chain_graph_writer.py",
+        "ChainFailure": "agentic/orchestrator_helpers/chain_graph_writer.py",
+        # The TruffleHog ingest, which no partial-recon section runs.
+        "MultiscannerScan": "graph_db/mixins/secret_mixin.py",
+        "MultiscannerFinding": "graph_db/mixins/secret_mixin.py",
     }
-    orphans = sorted(set(LABELS) - produced - NOT_TOOL_PRODUCED)
+    orphans = sorted(set(LABELS) - produced - set(WRITTEN_OUTSIDE_A_SECTION))
     assert orphans == [], f"graph labels no tool claims to produce: {orphans}"
 
 

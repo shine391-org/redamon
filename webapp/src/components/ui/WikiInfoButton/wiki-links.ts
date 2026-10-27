@@ -47,6 +47,7 @@ export const TOOL_WIKI: Record<string, { page: string; anchor?: string }> = {
 
   // HTTP Probing
   Httpx:              { page: 'Project-Settings-Reference', anchor: 'http-prober-httpx' },
+  IpAttribution:      { page: 'Project-Settings-Reference', anchor: 'ip-attribution' },
 
   // Resource Enumeration
   Katana:             { page: 'Project-Settings-Reference', anchor: 'web-crawler-katana' },

@@ -345,7 +345,9 @@ class TestHappyPath(unittest.TestCase):
         self.assertEqual(v1["math_score"], v1["score"])
         self.assertEqual(v1["decided_by"], "rules")
         self.assertEqual(len(v1["evidence_hash"]), 40)
-        self.assertEqual(set(v1["tier_inputs"]), {"proven", "kev"})
+        self.assertEqual(set(v1["tier_inputs"]), {"proven", "kev", "gates"})
+        self.assertEqual(set(v1["tier_inputs"]["gates"]),
+                         {"reachable_now", "attributed", "controlled", "impactful"})
 
     def test_the_run_never_writes_a_decision(self):
         for row in self.h.written:
@@ -951,6 +953,43 @@ class TestStopAndBudget(unittest.TestCase):
         h.run(dict(NO_MODEL))
         self.assertEqual(h.client.authorize_args["trigger"], "mcp")
         self.assertEqual(h.client.authorize_args["token_id"], "tok1")
+
+
+class TestTheFixListStatsReachTheRunSummary(unittest.TestCase):
+    """The route re-points a fix item whose findings were regrouped; the run's
+    summary (what get_triage_status shows) must say how many followed."""
+
+    def test_repointed_is_carried_into_the_summary(self):
+        from unittest.mock import patch
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"created": 1, "updated": 3, "deleted": 0, "skipped": 2,
+                        "flagged": 0, "repointed": 2}
+
+        class Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return Response()
+
+        orch = TriageOrchestrator("u1", "p1", FakeCallback())
+        draft = RemediationDraft(computed=[{"groupKey": "secret:abc", "findingIds": ["s1"]}])
+        with patch("cypherfix_triage.orchestrator.httpx.AsyncClient", Client):
+            out = run(orch._save_remediations(draft, "run-1"))
+        self.assertEqual(out, {"remediations_created": 1, "remediations_updated": 3,
+                               "remediations_deleted": 0, "remediations_skipped": 2,
+                               "remediations_repointed": 2})
 
 
 if __name__ == "__main__":

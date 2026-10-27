@@ -146,3 +146,46 @@ describe('reconcileTimeline', () => {
     expect(out).toEqual([X, Y, Z])
   })
 })
+
+describe('reconcileTimeline - tool cards in a reconnect resync', () => {
+  const stepTool = (step_id: string, status: string, extra: any = {}): ChatItem =>
+    ({ type: 'tool_execution', id: `x-${step_id}-${status}`, tool_name: 'execute_code', tool_args: { c: 1 },
+       status, output_chunks: [], timestamp: new Date(), step_id, ...extra } as any)
+
+  test('cards pair by step_id, so two identical calls stay two cards', () => {
+    const auth = [stepTool('S1', 'success'), stepTool('S2', 'running')]
+    const current = [stepTool('S1', 'running'), stepTool('S2', 'running')]
+    const out = reconcileTimeline(auth, current)
+    expect(out).toHaveLength(2)
+    expect(out.map((i: any) => i.status)).toEqual(['success', 'running'])
+  })
+
+  test('a still-running DB card keeps the output and verdict the socket already showed', () => {
+    const auth = [stepTool('S1', 'running')]
+    const live = [stepTool('S1', 'running', { output_chunks: ['uid=0'], finished: true, finishedSuccess: true, duration: 1500 })]
+    const [card] = reconcileTimeline(auth, live) as any[]
+    expect(card.output_chunks).toEqual(['uid=0'])
+    expect(card.finished).toBe(true)
+    expect(card.duration).toBe(1500)
+  })
+
+  test('a completed DB card wins over the live running copy', () => {
+    const auth = [stepTool('S1', 'success', { output_chunks: ['final'] })]
+    const live = [stepTool('S1', 'running', { output_chunks: ['partial'] })]
+    const [card] = reconcileTimeline(auth, live) as any[]
+    expect(card.status).toBe('success')
+    expect(card.output_chunks).toEqual(['final'])
+  })
+})
+
+describe('reconcileTimeline - a card the socket closed after the DB read', () => {
+  test('a live success/error is never reverted by a staler "running" DB row', () => {
+    const auth = [{ type: 'tool_execution', id: 'db', tool_name: 'execute_code', tool_args: {}, status: 'running',
+      output_chunks: [], timestamp: new Date(), step_id: 'S1' } as any]
+    const live = [{ type: 'tool_execution', id: 'live', tool_name: 'execute_code', tool_args: {}, status: 'success',
+      output_chunks: ['out'], final_output: 'analysis', timestamp: new Date(), step_id: 'S1' } as any]
+    const [card] = reconcileTimeline(auth, live) as any[]
+    expect(card.status).toBe('success')
+    expect(card.final_output).toBe('analysis')
+  })
+})

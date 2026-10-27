@@ -45,9 +45,17 @@ def _install_stubs():
     sys.modules.setdefault("docker.models", models_mod)
     sys.modules.setdefault("docker.models.containers", containers)
 
-    # `from models import (...)` -> a module whose every attribute resolves.
+    # `from models import (...)` -> a module whose every attribute resolves,
+    # down to a class's members: container_manager builds sets of
+    # ReconStatus members at import.
+    class _AnyMember(type):
+        def __getattr__(cls, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return f"{cls.__name__}.{name}"
+
     models = types.ModuleType("models")
-    models.__getattr__ = lambda name: type(name, (), {})
+    models.__getattr__ = lambda name: _AnyMember(name, (), {})
     sys.modules.setdefault("models", models)
 
 

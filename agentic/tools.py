@@ -32,6 +32,7 @@ from graph_db.tenant_filter import (
 import workspace_fs
 import job_runner
 import output_offload
+from neo4j_read_pool import run_neo4j_read
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -510,6 +511,12 @@ class MCPToolsManager:
 # back with no clock on any of them. 0 or a negative value disables the bound.
 CYPHER_GENERATION_TIMEOUT_DEFAULT = 120.0
 
+# Server-side transaction timeout for the agent's own graph reads (query_graph,
+# graph_summary). An LLM-written Cartesian product otherwise runs until Neo4j is
+# restarted, pinning the database the graph screen and every scan share. Same
+# bound as /graph/exec (api.py _GRAPH_EXEC_DEFAULT_TIMEOUT_MS).
+GRAPH_QUERY_TX_TIMEOUT_S = 120.0
+
 
 def _cypher_generation_timeout() -> float:
     """Seconds allowed for one text-to-Cypher call; 0.0 means unbounded."""
@@ -779,7 +786,8 @@ Cypher Query:"""
             self.graph = Neo4jGraph(
                 url=self.uri,
                 username=self.user,
-                password=self.password
+                password=self.password,
+                timeout=GRAPH_QUERY_TX_TIMEOUT_S,
             )
 
             # Store reference to self for use in the tool closure
@@ -850,7 +858,11 @@ Cypher Query:"""
                         logger.info(f"[{user_id}/{project_id}] Filtered Cypher: {filtered_cypher}")
 
                         # Step 3: Execute the filtered query
-                        result = manager.graph.query(
+                        # Off the event loop (a slow query must not freeze every
+                        # other session served by this process) and off the
+                        # default executor the LLM calls and DNS lookups share.
+                        result = await run_neo4j_read(
+                            manager.graph.query,
                             filtered_cypher,
                             params={
                                 "tenant_user_id": user_id,
@@ -930,12 +942,14 @@ Cypher Query:"""
         return graph_schema
 
     def get_summary_tool(self) -> Optional[callable]:
-        """What this project ACTUALLY contains: a count per label.
+        """What this project ACTUALLY contains: a count per label, and which web
+        hosts each stamping module actually analyzed.
 
-        Exists because "no results" has two very different causes - the scan ran
-        and the project is clean, or that surface was never scanned - and an
-        agent that cannot tell them apart reports the second as the first, which
-        is a false negative in a security tool.
+        Exists because "no results" has three very different causes - the scan
+        ran and the project is clean, that surface was never scanned, or every
+        such finding is muted - and an agent that cannot tell them apart reports
+        the second or third as the first, which is a false negative in a
+        security tool.
 
         COUNTS ONLY, never sample values: sample values are live target data
         (hostnames, secrets, endpoints) and belong in a deliberate query, not in
@@ -947,11 +961,15 @@ Cypher Query:"""
         async def graph_summary() -> str:
             """
             Summarise what this project's attack-surface graph actually contains:
-            a count per node type and the relationships present.
+            a count per node type, the relationships present, and per module
+            (JS Recon, Nuclei) how many web hosts it analyzed completely,
+            partly, found nothing to analyze on, failed on, or never looked at.
 
-            Read this before concluding that something is ABSENT. If a node type
-            is missing entirely, that surface was never scanned - which is a very
-            different answer from "it was scanned and is clean".
+            Read this before concluding that something is ABSENT. A node type
+            missing from the counts means one of three things: never scanned,
+            scanned and clean, or every such finding muted by the operator
+            (muted findings are hidden from these counts). Check the coverage
+            lines before calling a host clean.
 
             Takes no arguments. Returns counts only, never sample values.
 
@@ -994,21 +1012,39 @@ Cypher Query:"""
             try:
                 if manager.graph is None:
                     manager.graph = Neo4jGraph(
-                        url=manager.uri, username=manager.user, password=manager.password
+                        url=manager.uri, username=manager.user, password=manager.password,
+                        timeout=GRAPH_QUERY_TX_TIMEOUT_S,
                     )
-                nodes = manager.graph.query(nodes_cypher, params=params)
-                rels = manager.graph.query(rels_cypher, params=params)
+                nodes = await run_neo4j_read(manager.graph.query, nodes_cypher, params=params)
+                rels = await run_neo4j_read(manager.graph.query, rels_cypher, params=params)
             except Exception as e:
                 logger.error(f"[{user_id}/{project_id}] graph_summary failed: {e}")
                 # A plain failure, NEVER an empty summary: an empty summary reads
                 # as "nothing has ever been scanned".
                 return "Error: could not read the graph summary."
+            # The coverage lines explain the counts; an unreadable one is said
+            # so, never shown as zero or as "not recorded". Imported here: many
+            # tests import this module with graph_db stubbed as a bare module.
+            try:
+                from graph_db.coverage_stamps import (
+                    COVERAGE_SUMMARY_CYPHER, coverage_summary, coverage_summary_lines,
+                )
+                coverage = coverage_summary_lines(coverage_summary(next(iter(
+                    await run_neo4j_read(manager.graph.query, COVERAGE_SUMMARY_CYPHER, params=params)
+                ), None)))
+            except Exception as e:
+                logger.warning(f"[{user_id}/{project_id}] graph_summary coverage unreadable: {e}")
+                coverage = ["  Coverage could not be read this time; the counts above are still exact."]
 
+            # The scan history lives behind the webapp's user-session routes,
+            # out of this tool's reach, so both causes are named.
             if not nodes:
                 return (
-                    "This project's graph is EMPTY: no nodes of any type. "
-                    "Nothing has been scanned yet, so an absent finding here "
-                    "means 'not looked for', not 'not present'."
+                    "This project's graph is EMPTY: no nodes of any type. Either nothing "
+                    "has been scanned yet, or the graph data was lost (a reset database "
+                    "or a failed restore); the project's scan history in the app tells "
+                    "which. Either way an absent finding here means 'not looked for' or "
+                    "'unknown', never 'not present'."
                 )
 
             lines = ["Node types in this project (count):"]
@@ -1018,6 +1054,12 @@ Cypher Query:"""
                 lines += [f"  {r['type']}: {r['count']}" for r in rels]
             else:
                 lines.append("No relationships between nodes yet.")
+            lines.append("Web hosts (BaseURL) per module, from its last run:")
+            lines += coverage
+            lines.append(
+                "A node type or finding missing here means never scanned, scanned and clean, "
+                "or all of it muted by the operator (muted findings are not counted). Only a "
+                "host a module completed is clean for that module.")
             return "\n".join(lines)
 
         return graph_summary
@@ -2066,6 +2108,115 @@ def _is_mcp_transport_error(exc: BaseException) -> bool:
     return False
 
 
+# =============================================================================
+# TOOL DEADLINES
+# =============================================================================
+
+# Wall-clock seconds the agent waits for ONE tool call before abandoning it.
+# Nothing else bounds a call: the kali MCP SSE stream carries a keep-alive
+# comment every 15s (sse-starlette's default ping), which resets httpx's read
+# timeout, so the per-server sse_read_timeout never fires while kali-sandbox is
+# up. A lost answer therefore hung the session forever (observed: an
+# execute_code card at 1837s for a script kali kills at 120s). Each value is the
+# tool's own server-side limit in mcp/servers/*.py plus a margin for MCP session
+# setup and queueing on the server, so no tool is cut short of the limit it
+# already enforces on itself.
+_TOOL_DEADLINE_MARGIN_S = 60
+TOOL_DEADLINES_S: Dict[str, float] = {
+    name: float(limit + _TOOL_DEADLINE_MARGIN_S)
+    for name, limit in {
+        "execute_curl": 60,
+        "execute_naabu": 300,
+        "execute_httpx": 300,
+        "execute_subfinder": 120,
+        "execute_gau": 300,
+        "kali_shell": 300,
+        "execute_code": 180,          # C/C++: 60s compile + 120s run
+        "proxy_brain": 180,
+        "execute_hydra": 1800,
+        "execute_jsluice": 120,
+        "execute_masscan": 600,
+        "execute_wpscan": 600,
+        "execute_amass": 1800,
+        "execute_katana": 1800,
+        "execute_arjun": 1200,
+        "execute_ffuf": 1200,
+        "cve_intel": 60,
+        "execute_osv_scanner": 60,
+        "execute_nmap": 600,
+        "execute_nuclei": 1800,
+        "execute_playwright": 60,
+        # MSF_RUN_TIMEOUT, plus up to 10 min queued behind the single console lock.
+        "metasploit_console": 2400,
+        # In-process tools: bounded by their own HTTP/LLM timeouts, which can
+        # chain (query_graph retries Cypher generation; tradecraft may run an
+        # LLM section picker before its fetch).
+        "query_graph": 540,
+        "graph_schema": 60,
+        "graph_summary": 120,
+        "tradecraft_lookup": 240,
+        "web_search": 120,
+        "shodan": 60,
+        "google_dork": 60,
+    }.items()
+}
+# Unknown tools (user MCP servers, agent-native tools) get the longest kali
+# limit plus the margin, so a working long-running tool is never cut short.
+TOOL_DEADLINE_DEFAULT_S = 1860.0
+
+
+def tool_deadline_seconds(tool_name: str) -> float:
+    """Seconds allowed for one call of `tool_name`; 0.0 means unbounded.
+
+    TOOL_DEADLINE_DEFAULT overrides the bound for tools without a table entry.
+    """
+    if tool_name in TOOL_DEADLINES_S:
+        return TOOL_DEADLINES_S[tool_name]
+    raw = os.environ.get("TOOL_DEADLINE_DEFAULT")
+    if raw is None or raw.strip() == "":
+        return TOOL_DEADLINE_DEFAULT_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Invalid TOOL_DEADLINE_DEFAULT={raw!r}, using {TOOL_DEADLINE_DEFAULT_S}s"
+        )
+        return TOOL_DEADLINE_DEFAULT_S
+
+
+class ToolDeadlineExceeded(Exception):
+    """A tool call produced no answer within its wall-clock deadline."""
+
+    def __init__(self, tool_name: str, seconds: float):
+        self.tool_name = tool_name
+        self.seconds = seconds
+        super().__init__(
+            f"Tool '{tool_name}' gave no answer within {int(seconds)}s and was "
+            f"abandoned: the result was lost in transit, or the tool or its host "
+            f"is stuck or overloaded. Do not assume the call ran or failed on the "
+            f"target: re-run it once if the result matters, otherwise continue "
+            f"with another step."
+        )
+
+
+async def _await_within_deadline(tool_name: str, awaitable) -> str:
+    """Await one tool call, raising ToolDeadlineExceeded when its clock runs out.
+
+    Uses asyncio.timeout's own expiry flag so a TimeoutError raised BY the tool
+    is passed through untouched rather than reported as a missed deadline.
+    """
+    deadline = tool_deadline_seconds(tool_name)
+    if not deadline:
+        return await awaitable
+    try:
+        async with asyncio.timeout(deadline) as clock:
+            return await awaitable
+    except TimeoutError:
+        if clock.expired():
+            raise ToolDeadlineExceeded(tool_name, deadline) from None
+        raise
+
+
 class PhaseAwareToolExecutor:
     """
     Executes tools with phase-awareness.
@@ -2596,7 +2747,7 @@ class PhaseAwareToolExecutor:
         seen_gen = self.mcp_manager.generation if is_mcp else 0
 
         try:
-            clean_output = await _invoke(tool)
+            clean_output = await _await_within_deadline(tool_name, _invoke(tool))
             clean_output = output_offload.maybe_offload(
                 current_project_id.get(),
                 tool_name,
@@ -2604,6 +2755,12 @@ class PhaseAwareToolExecutor:
                 override=output_override,
             )
             return {"success": True, "output": clean_output, "error": None}
+
+        except ToolDeadlineExceeded as exc:
+            # Not a dead transport: a reconnect + retry would only spend the
+            # same deadline a second time on a call that already got lost.
+            logger.error(f"Tool deadline exceeded: {tool_name} after {int(exc.seconds)}s")
+            return {"success": False, "output": None, "error": str(exc)}
 
         except Exception as exc:
             # Non-MCP tools or unrelated failures: original behaviour.
@@ -2646,7 +2803,7 @@ class PhaseAwareToolExecutor:
                 return {"success": False, "output": None, "error": str(exc)}
 
             try:
-                clean_output = await _invoke(retry_tool)
+                clean_output = await _await_within_deadline(tool_name, _invoke(retry_tool))
                 clean_output = output_offload.maybe_offload(
                     current_project_id.get(),
                     tool_name,

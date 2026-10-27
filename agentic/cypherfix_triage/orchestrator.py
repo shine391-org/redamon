@@ -1098,6 +1098,7 @@ class TriageOrchestrator:
             "remediations_updated": int(result.get("updated") or 0),
             "remediations_deleted": int(result.get("deleted") or 0),
             "remediations_skipped": int(result.get("skipped") or 0),
+            "remediations_repointed": int(result.get("repointed") or 0),
         }
 
     def _parse_findings(self, content) -> RemediationDraft:

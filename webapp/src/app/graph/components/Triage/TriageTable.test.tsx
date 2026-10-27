@@ -674,3 +674,137 @@ describe('the detail panel', () => {
     expect(screen.queryByRole('complementary', { name: 'Finding details' })).toBeNull()
   })
 })
+
+describe('disposition on the board (plan 10.2b)', () => {
+  const rows = [
+    { ...reviewed, id: 'd1', name: 'Proven SQL injection', triage_tier_rule: 'proven' },
+    { ...reviewed, id: 'd2', name: 'Outdated banner', triage_tier_rule: 'credible, with impact worth planning for' },
+    { ...reviewed, id: 'd3', label: 'Secret', name: 'Browser key', public_client_key: true,
+      secret_type: 'GCP API Key', triage_tier_rule: 'no rule placed this higher' },
+    { ...ranked, id: 'd4', name: 'Fresh finding', section: 1, severity: 'high', triage_run_id: '',
+      triage_priority_score: null, triage_tier: '', triage_tier_rule: '' },
+    { ...reviewed, id: 'd5', name: 'Debug page', section: 2, triage_state: 'false_positive',
+      triage_decided_by: 'review', triage_tier_rule: 'the AI review found it a false positive' },
+    { ...reviewed, id: 'd6', name: 'Old CVE', section: 3, triage_state: 'gone',
+      triage_tier_rule: 'credible, with impact worth planning for' },
+  ]
+  const chipOf = (name: string) => rowOf(name).querySelector('[data-disposition]') as HTMLElement | null
+
+  test('every row carries a chip, with its blocker as the tooltip', async () => {
+    serve({ findings: board(rows) })
+    render(<TriageTable projectId="p1" />)
+    await screen.findByRole('button', { name: 'Old CVE' })
+    const want: Array<[string, string, string]> = [
+      ['Proven SQL injection', 'reportable', 'Reportable: '],
+      ['Outdated banner', 'candidate', 'Candidate, blocked by credible, with impact worth planning for'],
+      ['Browser key', 'info', 'Info: '],
+      ['Fresh finding', 'candidate', 'Candidate, not triaged yet'],
+      ['Debug page', 'candidate', 'Candidate, blocked by AI review: likely false positive'],
+      ['Old CVE', 'excluded', 'Excluded: '],
+    ]
+    for (const [name, disposition, title] of want) {
+      const chip = chipOf(name)!
+      expect(chip.dataset.disposition, name).toBe(disposition)
+      expect(chip.title.startsWith(title), `${name}: ${chip.title}`).toBe(true)
+    }
+    // One table per section, each with the column.
+    expect(screen.getAllByRole('columnheader', { name: 'Disposition' })).toHaveLength(4)
+  })
+
+  test('excluded rows stay in their own sections', async () => {
+    serve({ findings: board(rows) })
+    render(<TriageTable projectId="p1" />)
+    await screen.findByRole('button', { name: 'Old CVE' })
+    expect(screen.getByRole('heading', { name: /^Resolved/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /^Likely false positive, check me/ })).toBeInTheDocument()
+  })
+
+  test('the filter counts each disposition, narrows the rows, and Any restores them', async () => {
+    serve({ findings: board(rows) })
+    render(<TriageTable projectId="p1" />)
+    await screen.findByRole('button', { name: 'Old CVE' })
+    const select = screen.getByRole('combobox', { name: 'Disposition' }) as HTMLSelectElement
+    const labels = [...select.options].map(o => o.textContent)
+    expect(labels).toEqual(['Disposition: any (6)', 'Reportable (1)', 'Candidate (3)', 'Info (1)', 'Excluded (1)'])
+
+    fireEvent.change(select, { target: { value: 'candidate' } })
+    const chips = [...document.querySelectorAll('tbody [data-disposition]')] as HTMLElement[]
+    expect(chips.map(c => c.dataset.disposition)).toEqual(['candidate', 'candidate', 'candidate'])
+    expect(screen.queryByRole('button', { name: 'Proven SQL injection' })).toBeNull()
+
+    fireEvent.change(select, { target: { value: '' } })
+    expect(document.querySelectorAll('tbody [data-disposition]')).toHaveLength(rows.length)
+  })
+
+  test('a filter that matches nothing says so', async () => {
+    serve({ findings: board(rows.slice(0, 2)) })
+    render(<TriageTable projectId="p1" />)
+    await screen.findByRole('button', { name: 'Outdated banner' })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Disposition' }), { target: { value: 'excluded' } })
+    expect(screen.getByText('No findings match this filter.')).toBeInTheDocument()
+  })
+
+  test('it combines with a tier chip', async () => {
+    serve({ findings: board(rows) })
+    render(<TriageTable projectId="p1" />)
+    await screen.findByRole('button', { name: 'Old CVE' })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Disposition' }), { target: { value: 'candidate' } })
+    fireEvent.click(screen.getByRole('button', { name: /^Plan \(/ }))
+    // Ranked T3 candidates only: the untriaged and the AI-flagged rows are not ranked.
+    expect([...document.querySelectorAll('tbody tr')].map(r => r.querySelector('button')?.textContent))
+      .toEqual(['Outdated banner'])
+  })
+
+  test('while the board loads, it shows its loader and no chip', async () => {
+    serve({ findings: () => new Promise<never>(() => {}) })
+    render(<TriageTable projectId="p1" />)
+    expect(await screen.findByText(/Loading findings/)).toBeInTheDocument()
+    expect(document.querySelector('[data-disposition]')).toBeNull()
+  })
+
+  test('the detail panel names the disposition above the tier rule', async () => {
+    const row = rows[1]
+    serve({
+      findings: board([row]),
+      finding: () => ({ body: detailOf(row) }),
+      evidence: () => ({ body: EVIDENCE }),
+    })
+    render(<TriageTable projectId="p1" />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Outdated banner' }))
+    const panel = screen.getByRole('complementary', { name: 'Finding details' })
+    const line = await within(panel).findByTestId('disposition-line')
+    expect(line).toHaveTextContent('Disposition: Candidate, blocked by credible, with impact worth planning for')
+    const rule = within(panel).getByText('credible, with impact worth planning for', { selector: 'p' })
+    expect(line.compareDocumentPosition(rule) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  test('the detail panel of an untriaged finding says "not triaged yet"', async () => {
+    const row = rows[3]
+    serve({
+      findings: board([row]),
+      finding: () => ({ body: detailOf(row) }),
+      evidence: () => ({ body: EVIDENCE }),
+    })
+    render(<TriageTable projectId="p1" />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Fresh finding' }))
+    const panel = screen.getByRole('complementary', { name: 'Finding details' })
+    expect(await within(panel).findByTestId('disposition-line'))
+      .toHaveTextContent('Disposition: Candidate, not triaged yet')
+  })
+
+  test('a row a v3.10 run rescored shows the blocker the run stored (plan 10.5)', async () => {
+    const row = { ...rows[1], triage_disposition: 'candidate', triage_blocker: 'shared edge' }
+    serve({
+      findings: board([row]),
+      finding: () => ({ body: detailOf(row) }),
+      evidence: () => ({ body: EVIDENCE }),
+    })
+    render(<TriageTable projectId="p1" />)
+    await screen.findByRole('button', { name: 'Outdated banner' })
+    expect(chipOf('Outdated banner')!.title.startsWith('Candidate, blocked by shared edge')).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Outdated banner' }))
+    const panel = screen.getByRole('complementary', { name: 'Finding details' })
+    expect(await within(panel).findByTestId('disposition-line'))
+      .toHaveTextContent('Disposition: Candidate, blocked by shared edge')
+  })
+})

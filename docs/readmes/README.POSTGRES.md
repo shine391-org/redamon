@@ -7,7 +7,7 @@ PostgreSQL database for storing RedAmon project configurations and user data. Us
 The PostgreSQL database stores:
 
 - **Users** - User accounts for project ownership
-- **Projects** - Target configurations with 169+ tunable parameters
+- **Projects** - Target configurations and their tunable parameters (each described in `recon_settings/registry.yaml`)
 
 This replaces the need for `params.py` configuration files, allowing project-specific settings to be managed through the webapp UI.
 
@@ -65,7 +65,7 @@ flowchart TB
 
 ### Projects Table
 
-The projects table contains 169+ configuration parameters grouped by category:
+The projects table holds the configuration parameters, each described in `recon_settings/registry.yaml`. The main groups:
 
 #### Target Configuration
 | Column | Default | Description |
@@ -219,7 +219,7 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict:
         'TARGET_DOMAIN': project['targetDomain'],
         'SUBDOMAIN_LIST': project['subdomainList'],
         'SCAN_MODULES': project['scanModules'],
-        # ... 169+ parameters mapped from camelCase to SCREAMING_SNAKE_CASE
+        # ... the other parameters, mapped from camelCase to SCREAMING_SNAKE_CASE
     }
 ```
 

@@ -7,7 +7,7 @@ langchain stubs into sys.modules, plain-dict state fixtures, AsyncMock executor.
 The highest-value / lowest-risk targets are the pure helpers, tested directly:
   * _detect_embedded_tool_error   (execute_tool_node)
   * _validate_plan_mutex_groups   (execute_plan_node)
-  * _check_roe_blocked            (execute_plan_node)
+  * roe_block_reason              (roe_gate, shared by both nodes)
 plus one happy-path invocation each of execute_tool_node / execute_plan_node with
 an AsyncMock tool_executor and streaming_callbacks={} (short-circuits the
 progress/httpx branches).
@@ -71,9 +71,9 @@ from orchestrator_helpers.nodes.execute_tool_node import (  # noqa: E402
 )
 from orchestrator_helpers.nodes.execute_plan_node import (  # noqa: E402
     _validate_plan_mutex_groups,
-    _check_roe_blocked,
     execute_plan_node,
 )
+from orchestrator_helpers.roe_gate import roe_block_reason  # noqa: E402
 
 
 def _make_config(user_id="u1", project_id="p1", session_id="s1"):
@@ -159,7 +159,7 @@ class TestValidatePlanMutexGroups(unittest.TestCase):
 
 
 # ===========================================================================
-# _check_roe_blocked  (pure)
+# roe_block_reason  (pure)
 # ===========================================================================
 class TestCheckRoeBlocked(unittest.TestCase):
     def setUp(self):
@@ -179,13 +179,13 @@ class TestCheckRoeBlocked(unittest.TestCase):
 
     def test_returns_none_when_roe_disabled(self):
         self._set(ROE_ENABLED=False)
-        self.assertIsNone(_check_roe_blocked("execute_hydra", "exploitation"))
+        self.assertIsNone(roe_block_reason("execute_hydra", "exploitation"))
 
     def test_forbidden_tool_blocked(self):
         self._set(ROE_ENABLED=True, ROE_FORBIDDEN_TOOLS=["execute_hydra"],
                   ROE_FORBIDDEN_CATEGORIES=[], ROE_ALLOW_ACCOUNT_LOCKOUT=True,
                   ROE_ALLOW_DOS=True, ROE_MAX_SEVERITY_PHASE="post_exploitation")
-        msg = _check_roe_blocked("execute_hydra", "informational")
+        msg = roe_block_reason("execute_hydra", "informational")
         self.assertIsNotNone(msg)
         self.assertIn("execute_hydra", msg)
 
@@ -194,13 +194,13 @@ class TestCheckRoeBlocked(unittest.TestCase):
         self._set(ROE_ENABLED=True, ROE_FORBIDDEN_TOOLS=[], ROE_FORBIDDEN_CATEGORIES=[],
                   ROE_ALLOW_ACCOUNT_LOCKOUT=False, ROE_ALLOW_DOS=True,
                   ROE_MAX_SEVERITY_PHASE="post_exploitation")
-        self.assertIsNotNone(_check_roe_blocked("execute_hydra", "informational"))
+        self.assertIsNotNone(roe_block_reason("execute_hydra", "informational"))
 
     def test_phase_cap_blocks_beyond_max_severity(self):
         self._set(ROE_ENABLED=True, ROE_FORBIDDEN_TOOLS=[], ROE_FORBIDDEN_CATEGORIES=[],
                   ROE_ALLOW_ACCOUNT_LOCKOUT=True, ROE_ALLOW_DOS=True,
                   ROE_MAX_SEVERITY_PHASE="informational")
-        msg = _check_roe_blocked("execute_httpx", "exploitation")
+        msg = roe_block_reason("execute_httpx", "exploitation")
         self.assertIsNotNone(msg)
         self.assertIn("exceeds maximum", msg)
 
@@ -208,7 +208,7 @@ class TestCheckRoeBlocked(unittest.TestCase):
         self._set(ROE_ENABLED=True, ROE_FORBIDDEN_TOOLS=[], ROE_FORBIDDEN_CATEGORIES=[],
                   ROE_ALLOW_ACCOUNT_LOCKOUT=True, ROE_ALLOW_DOS=True,
                   ROE_MAX_SEVERITY_PHASE="post_exploitation")
-        self.assertIsNone(_check_roe_blocked("execute_httpx", "informational"))
+        self.assertIsNone(roe_block_reason("execute_httpx", "informational"))
 
 
 # ===========================================================================

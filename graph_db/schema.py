@@ -6,11 +6,19 @@ fully idempotent — safe to run multiple times without side effects.
 """
 
 
-# Drop old global constraints that conflict with tenant-scoped ones
+# Constraints that kept their NAME when their key became tenant-scoped: they
+# were unique on the natural key alone, and schema_keys.py declares the same
+# name for (natural key, user_id, project_id). An unconditional DROP of these
+# would remove the LIVE constraint on every init_schema (every scan-container
+# spawn, every agent graph call) and rebuild it at once, a full re-index with a
+# window in which concurrent MERGEs have no uniqueness guard. So
+# drop_legacy_shaped_constraints drops one only while the database still holds
+# it with a key other than the declared one.
+LEGACY_SHAPED_CONSTRAINTS = ("subdomain_unique", "ip_unique", "baseurl_unique")
+
+# Dropped unconditionally, so no name here may be one schema_keys.py or the
+# index lists below still create (tests/test_schema_legacy_drops.py).
 DROP_LEGACY_CONSTRAINTS = [
-    "DROP CONSTRAINT subdomain_unique IF EXISTS",
-    "DROP CONSTRAINT ip_unique IF EXISTS",
-    "DROP CONSTRAINT baseurl_unique IF EXISTS",
     # Renamed with the Trufflehog -> Multiscanner labels. Dropped by their OLD
     # names, because a constraint is identified by NAME: recreating it under the
     # new name leaves this one behind, still guarding a label nothing writes.
@@ -70,8 +78,10 @@ DROP_LEGACY_CONSTRAINTS = [
     "DROP CONSTRAINT jsreconfinding_unique IF EXISTS",
     "DROP CONSTRAINT secret_unique IF EXISTS",
     "DROP CONSTRAINT userinput_unique IF EXISTS",
-    # K25: the `Exploit` label is constrained but nothing has ever written one.
+    # K25: the `Exploit` label is constrained and indexed but nothing has ever
+    # written one.
     "DROP CONSTRAINT exploit_unique IF EXISTS",
+    "DROP INDEX idx_exploit_tenant IF EXISTS",
     # K25: tenant indexes on the SHARED reference nodes. They have no tenant
     # keys (strip_reference_node_tenant removes any it finds), so these indexed
     # nothing but empty values and cost a write on every CVE upsert.
@@ -148,17 +158,22 @@ def build_constraints() -> list:
 
 
 def __getattr__(name):
-    """Defer CONSTRAINTS until first use (PEP 562).
+    """Defer CONSTRAINTS and GLOBAL_REFERENCE_LABELS until first use (PEP 562).
 
-    Building it at module level would run the schema_keys import during the
-    circular-import window described above. Every consumer reads it inside
-    init_schema or a test, long after the package has finished loading.
+    Building either at module level would run a sibling import during the
+    circular-import window described above, and in the tests that load this
+    file by path it would import the real package mid-setup. Every consumer
+    reads them inside init_schema, a test, or base_mixin's own import, after
+    this module has finished loading.
     """
     if name == "CONSTRAINTS":
         value = build_constraints()
-        globals()["CONSTRAINTS"] = value
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    elif name == "GLOBAL_REFERENCE_LABELS":
+        value = _global_reference_labels()
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
 
 # Tenant composite indexes (one per node type for efficient per-project queries)
 TENANT_INDEXES = [
@@ -173,12 +188,10 @@ TENANT_INDEXES = [
     "CREATE INDEX idx_endpoint_tenant IF NOT EXISTS FOR (e:Endpoint) ON (e.user_id, e.project_id)",
     "CREATE INDEX idx_parameter_tenant IF NOT EXISTS FOR (p:Parameter) ON (p.user_id, p.project_id)",
     "CREATE INDEX idx_vulnerability_tenant IF NOT EXISTS FOR (v:Vulnerability) ON (v.user_id, v.project_id)",
-    "CREATE INDEX idx_exploit_tenant IF NOT EXISTS FOR (e:Exploit) ON (e.user_id, e.project_id)",
     "CREATE INDEX idx_exploitgvm_tenant IF NOT EXISTS FOR (e:ExploitGvm) ON (e.user_id, e.project_id)",
     # GitHub Secret Hunt tenant indexes
     "CREATE INDEX idx_githubhunt_tenant IF NOT EXISTS FOR (gh:GithubHunt) ON (gh.user_id, gh.project_id)",
     "CREATE INDEX idx_githubrepo_tenant IF NOT EXISTS FOR (gr:GithubRepository) ON (gr.user_id, gr.project_id)",
-    "CREATE INDEX idx_sbomdoc_tenant IF NOT EXISTS FOR (d:SbomDocument) ON (d.user_id, d.project_id)",
     "CREATE INDEX idx_githubpath_tenant IF NOT EXISTS FOR (gp:GithubPath) ON (gp.user_id, gp.project_id)",
     "CREATE INDEX idx_githubsecret_tenant IF NOT EXISTS FOR (gs:GithubSecret) ON (gs.user_id, gs.project_id)",
     "CREATE INDEX idx_githubsensitivefile_tenant IF NOT EXISTS FOR (gsf:GithubSensitiveFile) ON (gsf.user_id, gsf.project_id)",
@@ -544,7 +557,17 @@ NON_RECON_SOURCES = (
 )
 
 REFERENCE_TENANT_STRIP_MARKER = "strip-reference-node-tenant-v1"
-GLOBAL_REFERENCE_LABELS = ("CVE", "MitreData", "Capec")
+
+
+def _global_reference_labels() -> tuple:
+    """The tenant filter's GLOBAL_REFERENCE_LABELS, as a sorted tuple.
+
+    Read from tenant_filter, never copied, so the labels this module strips and
+    the recon clears preserve are exactly the ones a query may leave unscoped.
+    Sorted because a frozenset iterates in per-process hash order, and the clears
+    build Cypher from this.
+    """
+    return tuple(sorted(_sibling("tenant_filter").GLOBAL_REFERENCE_LABELS))
 
 
 def strip_reference_node_tenant(session):
@@ -554,7 +577,7 @@ def strip_reference_node_tenant(session):
 
     ok = True
     total = 0
-    for label in GLOBAL_REFERENCE_LABELS:
+    for label in _global_reference_labels():
         try:
             stripped = _run_batched(
                 session,
@@ -683,6 +706,41 @@ def consolidate_resolves_to_identity(session):
               f"edge(s) across {stats['pairs']} Subdomain->IP pair(s)")
 
 
+def _live_constraint_shapes(session):
+    """{name: (labels, properties)} of every constraint, or None if unreadable."""
+    try:
+        return {
+            rec["name"]: (list(rec["labelsOrTypes"] or []),
+                          list(rec["properties"] or []))
+            for rec in session.run(
+                "SHOW CONSTRAINTS YIELD name, labelsOrTypes, properties")
+        }
+    except Exception:
+        return None
+
+
+def drop_legacy_shaped_constraints(session):
+    """Drop each LEGACY_SHAPED_CONSTRAINTS name whose live key is not the
+    declared one, so the CREATE that follows can install the declared key.
+
+    A constraint that already matches schema_keys.py is left alone. When the
+    constraints cannot be listed the drop runs anyway: rebuilding a correct
+    constraint costs a re-index, while keeping a global one makes the
+    same-name CREATE ... IF NOT EXISTS a silent no-op, and two projects then
+    collide on one node.
+    """
+    declared = {k["constraint"]: ([k["label"]], list(k["key_properties"]))
+                for k in _key_constraints()}
+    live = _live_constraint_shapes(session)
+    for name in LEGACY_SHAPED_CONSTRAINTS:
+        if live is not None and (name not in live or live[name] == declared.get(name)):
+            continue
+        try:
+            session.run(f"DROP CONSTRAINT {name} IF EXISTS")
+        except Exception:
+            pass
+
+
 def init_schema(session):
     """
     Initialize constraints and indexes for the graph schema.
@@ -698,6 +756,7 @@ def init_schema(session):
     consolidate_technology_identity(session)
     consolidate_resolves_to_identity(session)
 
+    drop_legacy_shaped_constraints(session)
     for stmt in DROP_LEGACY_CONSTRAINTS:
         try:
             session.run(stmt)

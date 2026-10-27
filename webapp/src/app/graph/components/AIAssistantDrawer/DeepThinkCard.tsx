@@ -8,6 +8,7 @@
 
 import { useState } from 'react'
 import { Lightbulb, ChevronDown, ChevronRight, Copy, Check } from 'lucide-react'
+import { copyText } from '@/lib/copyText'
 import styles from './DeepThinkCard.module.css'
 import type { DeepThinkItem } from './AgentTimeline'
 
@@ -22,7 +23,7 @@ export function DeepThinkCard({ item, isExpanded, onToggleExpand }: DeepThinkCar
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(item.analysis)
+      await copyText(item.analysis)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch {

@@ -16,6 +16,7 @@ import {
   IDENTITY_KEYS,
   VOLATILE_PROPERTIES,
 } from './reconDelta'
+import { COVERAGE_STAMP_PROPERTIES } from './coverageStamps'
 import type { FormattedGraphData, FormattedNode } from '@/app/api/graph/format'
 
 const node = (
@@ -171,6 +172,32 @@ describe('computeReconDelta', () => {
     const d = computeReconDelta(a, b)
     expect(d.totals).toMatchObject({ added: 0, removed: 0, changed: 0, stable: 1 })
     expect(VOLATILE_PROPERTIES.has('last_seen')).toBe(true)
+  })
+
+  test("an IP's ownership tag tracks target state, so a real change shows (plan 11.3)", () => {
+    // The lists are written sorted by recon, so the same state compares equal.
+    const props = { address: '198.51.100.20', ownership: 'unknown', current_dns_names: 1,
+      ownership_reasons: ['default certificate covers no target domain', 'no CDN or edge signal'],
+      default_cert_names: ['a.example.com', 'b.example.com'] }
+    for (const p of ['ownership', 'ownership_reasons', 'default_cert_names', 'current_dns_names']) {
+      expect(VOLATILE_PROPERTIES.has(p)).toBe(false)
+    }
+    const a = graph([node('1', 'IP', props)])
+    expect(computeReconDelta(a, graph([node('2', 'IP', { ...props })])).totals)
+      .toMatchObject({ changed: 0, stable: 1 })
+    const moved = graph([node('3', 'IP', { ...props, ownership: 'shared_edge', current_dns_names: 0 })])
+    expect(computeReconDelta(a, moved).totals).toMatchObject({ changed: 1 })
+  })
+
+  test('a BaseURL coverage stamp never registers as a change (plan 09.1)', () => {
+    // Every run restamps every host it looked at; the target did not change.
+    for (const p of COVERAGE_STAMP_PROPERTIES) expect(VOLATILE_PROPERTIES.has(p)).toBe(true)
+    const a = graph([node('1', 'BaseURL', { url: 'https://app.example.com', js_recon_status: 'complete',
+      js_recon_inputs: 4, js_recon_outputs: 0, js_recon_at: 'monday' })])
+    const b = graph([node('2', 'BaseURL', { url: 'https://app.example.com', js_recon_status: 'partial',
+      js_recon_inputs: 2, js_recon_outputs: 1, js_recon_reason: 'file cap', js_recon_at: 'tuesday',
+      nuclei_status: 'complete' })])
+    expect(computeReconDelta(a, b).totals).toMatchObject({ changed: 0, stable: 1 })
   })
 
   test("Jev's assessment of a serialized candidate never registers as a change", () => {

@@ -924,7 +924,8 @@ class TestTheCallersOfQueryCrtsh:
              mock.patch.object(dr, "run_subfinder", return_value={f"sf.{domain}"}), \
              mock.patch.object(dr, "run_amass", return_value=set()), \
              mock.patch.object(dr, "run_knockpy", return_value=set()), \
-             mock.patch.object(dr, "run_puredns_resolve", side_effect=lambda subs, d, s: subs):
+             mock.patch.object(dr, "run_puredns_resolve",
+                               side_effect=lambda subs, d, s: (subs, "filtered")):
             return dr.discover_subdomains(domain, resolve=False, save_output=False,
                                           settings={"CRTSH_ENABLED": True, **settings})
 

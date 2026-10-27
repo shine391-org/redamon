@@ -95,7 +95,7 @@ describe('Workflow graph edges stay consistent', () => {
     // A few tools are pure enrichment (annotate existing nodes without creating
     // new ones) and intentionally map to an empty output array — accept
     // undefined OR empty for those, otherwise require a non-empty entry.
-    const PURE_ENRICHMENT = new Set(['EndpointAiClassifier'])
+    const PURE_ENRICHMENT = new Set(['EndpointAiClassifier', 'IpAttribution'])
     for (const tool of WORKFLOW_TOOLS) {
       const outputs = SECTION_NODE_MAP[tool.id]
       if (outputs !== undefined && !PURE_ENRICHMENT.has(tool.id)) {

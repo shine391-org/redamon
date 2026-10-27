@@ -32,6 +32,12 @@ export interface DispatchStartResult {
   state?: unknown
   scanJobId?: string | null
   runId?: string
+  /** 'unknown' when the orchestrator call threw: the scan may or may not have started. */
+  startOutcome?: 'unknown'
+  /** The webapp could not freeze the graph, so nothing was started. */
+  snapshotFailed?: boolean
+  /** The orchestrator's (or startFullScan's) reason code, e.g. 'spawn_failed'. */
+  code?: string
 }
 
 export type StartScanPayload = Record<string, unknown>
@@ -96,7 +102,11 @@ export async function dispatchStart(
   if (kind === 'full_recon') {
     const mode = parseScanMode(payload.mode) ?? 'new'
     const trigger: ScanTrigger = 'scheduled'
-    const r = await startFullScan({ projectId, mode, trigger, actorUserId: opts.actorUserId ?? null })
+    // quietTransient: the queue retries a transient refusal, so the start path
+    // must not record a failed ScanJob for each attempt.
+    const r = await startFullScan({
+      projectId, mode, trigger, actorUserId: opts.actorUserId ?? null, quietTransient: true,
+    })
     if (r.ok) {
       return { ok: true, status: 200, state: r.state, scanJobId: r.scanJobId ?? null, runId: runId(r.state) }
     }
@@ -108,6 +118,9 @@ export async function dispatchStart(
       activationInProgress: r.activationInProgress,
       busy: r.busy,
       scanJobId: r.scanJobId ?? null,
+      ...(r.startOutcome ? { startOutcome: r.startOutcome } : {}),
+      ...(r.snapshotFailed ? { snapshotFailed: true } : {}),
+      ...(r.code ? { code: r.code } : {}),
     }
   }
 
@@ -240,20 +253,35 @@ export async function dispatchStart(
     return { ok: false, status: 400, error: `Unknown scan kind: ${kind}` }
   }
 
-  const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  let response: Response
+  try {
+    response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (err) {
+    // A thrown fetch (timeout, reset) is not a refusal: the orchestrator may
+    // have spawned the container anyway, and partial recon and AI attack allow
+    // parallel runs, so a blind retry could start a duplicate.
+    console.error(`[jobQueue] orchestrator start call for ${kind} on ${projectId} failed:`, err)
+    return {
+      ok: false,
+      status: 503,
+      startOutcome: 'unknown',
+      error: 'The orchestrator did not answer, so it is unknown whether the scan started.',
+    }
+  }
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}))
-    const { error, limit } = normalizeOrchestratorStartError(errorData, fallback)
+    const { error, limit, code } = normalizeOrchestratorStartError(errorData, fallback)
     return {
       ok: false,
       status: response.status,
       error,
       ...(limit ? { limit: limit as Record<string, unknown> } : {}),
+      ...(code ? { code } : {}),
     }
   }
 

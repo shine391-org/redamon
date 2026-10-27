@@ -16,7 +16,7 @@
 import { describe, test, expect } from 'vitest'
 import { SECTION_INPUT_MAP, SECTION_NODE_MAP, SECTION_ENRICH_MAP } from './nodeMapping'
 import { WORKFLOW_TOOLS } from './WorkflowView/workflowDefinition'
-import { PARTIAL_RECON_SUPPORTED_TOOLS, PARTIAL_RECON_PHASE_MAP } from '@/lib/recon-types'
+import { PARTIAL_RECON_SUPPORTED_TOOLS } from '@/lib/recon-types'
 
 const EXISTING_NODE_TYPES = new Set([
   'Domain', 'Subdomain', 'IP', 'Port', 'Service', 'DNSRecord', 'Certificate',
@@ -53,18 +53,6 @@ describe('partial recon registration', () => {
       PARTIAL_RECON_SUPPORTED_TOOLS.has('Tlsx'),
       'recon/partial_recon.py dispatches Tlsx, but the UI shows no way to start it',
     ).toBe(true)
-  })
-
-  test('Tlsx has a non-empty phase list for the progress readout', () => {
-    const phases = PARTIAL_RECON_PHASE_MAP['Tlsx']
-    expect(phases, 'missing phases fall back to a bare "Running"').toBeDefined()
-    expect(phases.length).toBeGreaterThan(0)
-  })
-
-  test('every partial-capable tool has a phase list', () => {
-    for (const id of PARTIAL_RECON_SUPPORTED_TOOLS) {
-      expect(PARTIAL_RECON_PHASE_MAP[id], `${id} has no phase list`).toBeDefined()
-    }
   })
 })
 

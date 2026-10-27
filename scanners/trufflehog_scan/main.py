@@ -59,7 +59,7 @@ def run_trufflehog_scan(job) -> dict:
     print("=" * 70)
     print(f"  Total findings:      {runner.stats['total_findings']}")
     print(f"  Live (validated):    {runner.stats['validated']}")
-    print(f"  Dead (unvalidated):  {runner.stats['unvalidated']}")
+    print(f"  Dead (rejected):     {runner.stats['rejected']}")
     print(f"  Verify errors:       {runner.stats['verify_error']}")
     print(f"  Never checked:       {runner.stats['unverified']}")
     print(f"  Assets scanned:      {runner.stats['assets_scanned']}")

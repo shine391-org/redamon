@@ -42,7 +42,7 @@ SECRET_VALUE_FIELDS = ("matched_text", "sample", "raw_secret", "secret_value")
 #: Free text that can carry an operator's credential or a target's token.
 TEXT_FIELDS = (
     "raw_request", "raw_response", "evidence", "description", "matched_at",
-    "name", "path", "location", "fuzzing_parameter",
+    "name", "path", "location", "fuzzing_parameter", "context",
 )
 
 HOST_FIELDS = ("triage_host", "host", "hostname", "target_hostname")

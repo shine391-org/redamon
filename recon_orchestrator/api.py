@@ -206,7 +206,7 @@ def _trusted_webapp_base() -> str:
     return os.environ.get("WEBAPP_API_URL", "http://webapp:3000").rstrip("/")
 
 
-def _fetch_project_for_preflight(project_id: str) -> dict:
+def _fetch_project_for_preflight(project_id: str, refusal: str = "Refusing to start.") -> dict:
     """Fetch the project settings the guardrail / RoE pre-flight needs.
 
     Fails CLOSED. Any fetch failure or non-200 raises 503 naming the
@@ -231,7 +231,7 @@ def _fetch_project_for_preflight(project_id: str) -> dict:
                     status_code=503,
                     detail=(
                         f"Cannot verify scan scope: the webapp project fetch "
-                        f"returned HTTP {resp.status}. Refusing to start."
+                        f"returned HTTP {resp.status}. {refusal}"
                     ),
                 )
             return json_mod.loads(resp.read().decode())
@@ -242,8 +242,23 @@ def _fetch_project_for_preflight(project_id: str) -> dict:
             status_code=503,
             detail=(
                 f"Cannot verify scan scope: the webapp is unreachable "
-                f"({type(e).__name__}). Refusing to start."
+                f"({type(e).__name__}). {refusal}"
             ),
+        )
+
+
+def _refuse_failed_spawn(state) -> None:
+    """A start whose container could not be created is a refusal: 500 with code
+    `spawn_failed`, never a 200 carrying `status: error`. The webapp would
+    otherwise run retention, keep the prepared version and record a running
+    ScanJob for a scan that never began. The queue treats the code as
+    permanent: a missing image or a refused mount fails every retry.
+    """
+    if state.status in (ReconStatus.ERROR, PartialReconStatus.ERROR):
+        raise HTTPException(
+            status_code=500,
+            detail={"detail": f"The scan container could not be started: {state.error}",
+                    "code": "spawn_failed"},
         )
 
 
@@ -1206,12 +1221,13 @@ async def start_recon(project_id: str, request: ReconStartRequest):
             custom_templates_path=CUSTOM_TEMPLATES_PATH,
             scan_mode=request.mode,
         )
-        return state
     except ValueError as e:
         raise _value_error_http(e)
     except Exception as e:
         logger.error(f"Error starting recon: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    _refuse_failed_spawn(state)
+    return state
 
 
 @app.get("/recon/{project_id}/status", response_model=ReconState)
@@ -1224,12 +1240,18 @@ async def get_recon_status(project_id: str):
 
 
 @app.post("/recon/{project_id}/stop", response_model=ReconState)
-async def stop_recon(project_id: str):
-    """Stop a running recon process"""
+async def stop_recon(project_id: str, graceful: bool = True):
+    """Stop a running recon process.
+
+    Answers `stopping` at once: the run lands its queued graph writes and
+    applies the mute rules within RECON_STOP_GRACE_S, then reads `idle`.
+    `?graceful=false` kills it at once and answers when it is gone; the project
+    delete passes it, so a draining run never writes into a deleted project.
+    """
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    state = await container_manager.stop_recon(project_id)
+    state = await container_manager.stop_recon(project_id, graceful=graceful)
     return state
 
 
@@ -1245,9 +1267,21 @@ async def pause_recon(project_id: str):
 
 @app.post("/recon/{project_id}/resume", response_model=ReconState)
 async def resume_recon(project_id: str):
-    """Resume a paused recon process"""
+    """Resume a paused recon process, inside the RoE time window only.
+
+    A scan paused before the window closed would otherwise carry on outside
+    it, where a new start is refused. The check fails closed like a start's
+    (503 when the webapp cannot be reached), and a refused resume leaves the
+    scan paused.
+    """
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
+
+    state = await container_manager.get_status(project_id)
+    if state.status != ReconStatus.PAUSED:
+        return state
+    project = _fetch_project_for_preflight(project_id, refusal="The scan stays paused.")
+    _check_roe_time_window(project)
 
     state = await container_manager.resume_recon(project_id)
     return state
@@ -1407,12 +1441,13 @@ async def start_partial_recon(project_id: str, request: PartialReconStartRequest
         logger.info(
             f"Partial recon run {state.run_id}: project {project_id}, "
             f"tool {request.tool_id}, roots {', '.join(roots)}")
-        return state
     except ValueError as e:
         raise _value_error_http(e)
     except Exception as e:
         logger.error(f"Error starting partial recon: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    _refuse_failed_spawn(state)
+    return state
 
 
 @app.get("/recon/{project_id}/partial/all", response_model=PartialReconListResponse)
@@ -1433,11 +1468,11 @@ async def get_partial_recon_status(project_id: str, run_id: str):
 
 
 @app.post("/recon/{project_id}/partial/{run_id}/stop", response_model=PartialReconState)
-async def stop_partial_recon(project_id: str, run_id: str):
-    """Stop a specific partial recon run"""
+async def stop_partial_recon(project_id: str, run_id: str, graceful: bool = True):
+    """Stop a specific partial recon run; `stopping` at once, as for /recon/{id}/stop."""
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    return await container_manager.stop_partial_recon(project_id, run_id)
+    return await container_manager.stop_partial_recon(project_id, run_id, graceful=graceful)
 
 
 @app.get("/recon/{project_id}/partial/{run_id}/logs")
@@ -1641,9 +1676,12 @@ async def start_ai_attack_surface(project_id: str, request: AiAttackSurfaceStart
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
     if not AI_ATTACK_SURFACE_PATH:
+        # A configuration error, not a passing outage: the queue must not
+        # retry it as transient, so it carries a code.
         raise HTTPException(
             status_code=503,
-            detail="AI Attack Surface source not mounted into the orchestrator",
+            detail={"detail": "AI Attack Surface source not mounted into the orchestrator",
+                     "code": "not_configured"},
         )
 
     run_config = {

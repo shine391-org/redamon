@@ -100,6 +100,9 @@ Red team operators performing authorized reconnaissance against targets with act
 
     // --- httpx: minimal probes, throttled ---
     httpxEnabled: true,
+    // IP attribution stays on with no TLS handshake: it only reads the CDN signals already collected
+    ipAttributionEnabled: true,
+    ipAttributionTlsMaxProbes: 0,
     httpxThreads: 1,
     httpxRateLimit: 2,
     httpxProbeStatusCode: true,

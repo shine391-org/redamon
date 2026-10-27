@@ -291,12 +291,32 @@ async def emit_streaming_events(state: dict, callback) -> None:
                 await callback.on_tool_output_chunk(
                     step.get("tool_name", "unknown"),
                     step["tool_output"],
-                    is_final=True
+                    is_final=True,
+                    step_id=step.get("step_id"),
                 )
                 callback._emitted_tool_output_ids.add(output_id)
 
-            # NOTE: tool_complete for current step will be emitted via _completed_step
-            # in the NEXT think iteration
+            # tool_complete for the current step is emitted via _completed_step
+            # in the NEXT think iteration, after the LLM has analysed the output.
+            # Say now that the tool itself returned (tool_output is None until
+            # execute_tool_node fills it, "" for an empty result), so the card
+            # stops counting at the real duration instead of looking hung for
+            # the whole next turn. Callbacks without the event skip it; the set
+            # check also skips auto-attribute mocks that would not be awaitable.
+            on_finished = getattr(callback, "on_tool_finished", None)
+            finished_ids = getattr(callback, "_emitted_tool_finished_ids", None)
+            if (on_finished is not None and isinstance(finished_ids, set)
+                    and step.get("tool_name") and step.get("tool_name") != "tool_rejection"
+                    and step.get("tool_output") is not None):
+                finished_id = f"tf|{step.get('step_id') or output_id}"
+                if finished_id not in finished_ids:
+                    await on_finished(
+                        step["tool_name"],
+                        bool(step.get("success")),
+                        duration_ms=step.get("duration_ms"),
+                        step_id=step.get("step_id"),
+                    )
+                    finished_ids.add(finished_id)
 
         # 4. Tool confirmation request — AFTER tool_complete and thinking
         #    Dedup via callback. Skip when tool_confirmation_response is already set

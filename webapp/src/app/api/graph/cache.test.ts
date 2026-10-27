@@ -96,3 +96,41 @@ describe('correctness', () => {
     expect(cacheStats()).toEqual({ entries: 0, elements: 0 })
   })
 })
+
+describe('the ETag', () => {
+  const graph = (props: Record<string, unknown>) => ({
+    nodes: [{ id: 'f1', type: 'Vulnerability', properties: { severity: 'high', ...props } }, { id: 'n2' }],
+    links: [] as { source: string; target: string }[],
+  })
+
+  test('the same graph gives the same ETag', () => {
+    expect(setCached('p', graph({ triage_tier_rule: 'proven' })))
+      .toBe(setCached('p', graph({ triage_tier_rule: 'proven' })))
+  })
+
+  // A triage run or a verdict adds no node and no link, so a structural ETag
+  // answered the browser's revalidation with a 304, and the node drawer kept
+  // showing the disposition from before the run, even after a reload.
+  test.each([
+    ['triage_tier_rule', 'proven'],
+    ['triage_state', 'gone'],
+    ['triage_status', 'confirmed'],
+    ['triage_source', 'human'],
+    // A rescore can move the stored blocker (a gate a new run measured) and
+    // leave the tier rule as it was.
+    ['triage_disposition', 'reportable'],
+    ['triage_blocker', 'shared edge'],
+  ])('a change to %s changes it', (key, value) => {
+    expect(setCached('p', graph({}))).not.toBe(setCached('p', graph({ [key]: value })))
+  })
+
+  test('two triage values cannot cancel out by swapping fields', () => {
+    expect(setCached('p', graph({ triage_status: 'confirmed', triage_source: 'human' })))
+      .not.toBe(setCached('p', graph({ triage_status: 'human', triage_source: 'confirmed' })))
+  })
+
+  test('any other property change keeps it, as before', () => {
+    expect(setCached('p', graph({ updated_at: '2026-10-01' })))
+      .toBe(setCached('p', graph({ updated_at: '2026-10-02' })))
+  })
+})

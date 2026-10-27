@@ -36,6 +36,7 @@ export const WORKFLOW_TOOLS: WorkflowToolDef[] = [
 
   // Group 4 - HTTP Probing
   { id: 'Httpx', label: 'Httpx', enabledField: 'httpxEnabled', group: 4, badge: 'active' },
+  { id: 'IpAttribution', label: 'IP Attribution', enabledField: 'ipAttributionEnabled', group: 4, badge: 'both' },
 
   // Group 5 - Resource Enumeration
   { id: 'Katana',      label: 'Katana',      enabledField: 'katanaEnabled',      group: 5, badge: 'active' },

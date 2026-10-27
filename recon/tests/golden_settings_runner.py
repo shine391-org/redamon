@@ -5,11 +5,11 @@ Shared by the golden-master test and the regeneration script, so the baseline
 and the assertion are produced by exactly the same code path. If they were two
 implementations, a bug in either would look like agreement.
 
-The full path is run, not just `fetch_project_settings`: stealth, then the RoE
-capper inside the fetch, then the AI-pipeline overrides, then the memory
-governor. Ordering is load-bearing and documented in `project_settings.py`, and
-a refactor that reorders the passes produces different effective settings with
-nothing failing.
+The full path is run through `get_settings` itself, not a copy of its pass
+order: the fetch (which caps once), stealth, the AI-pipeline overrides, the RoE
+cap again, then the memory governor. Ordering is load-bearing and documented in
+`project_settings.py`; a hand-copied order here once pinned stealth raising
+rates above the ceiling.
 
 The memory governor reads live host memory, so it is disabled here: a baseline
 that changes with the machine's free RAM would be a baseline nobody trusts. Its
@@ -54,11 +54,7 @@ def resolve(row: dict) -> dict:
         "REDAMON_MEM_GOVERNOR": "0",
     }
     with patch.dict(os.environ, env, clear=False), patch("requests.get", return_value=_FakeResponse(payload)):
-        settings = ps.fetch_project_settings("golden-project", "http://mocked")
-        if settings.get("STEALTH_MODE"):
-            settings = ps.apply_stealth_overrides(settings)
-        settings = ps.apply_ai_pipeline_overrides(settings)
-        settings = ps.apply_memory_governor(settings)
+        settings = ps.get_settings()
 
     # Key rotators and other callables are per-run objects with no stable
     # identity, so they are recorded by presence rather than by value.

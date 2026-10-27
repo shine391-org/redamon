@@ -327,7 +327,8 @@ assert_contains "status reports the frozen build variant" "$status_body" "TORCH_
 # update must rebuild BOTH images this feature touches.
 agent_map="$(rebuild_core=(); restart_only=(); _map_core_changes "agentic/requirements.txt"; echo "${rebuild_core[*]-}")"
 assert_contains "update rebuilds the agent on agentic/ changes"  "$agent_map" "agent"
-assert_contains "update rebuilds the scanner on its Dockerfile"  "$update_body" 'scanners/ai_attack_surface_scan/(Dockerfile'
+scanner_map="$(rebuild_tools=(); rebuild_capture=false; rebuild_plugins=false; _map_tool_changes "scanners/ai_attack_surface_scan/Dockerfile"; echo "${rebuild_tools[*]-}")"
+assert_contains "update rebuilds the scanner on its Dockerfile"  "$scanner_map" "ai-attack-surface"
 
 # =============================================================================
 printf '\n\033[1m== SUMMARY ==\033[0m\n'

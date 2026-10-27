@@ -7,8 +7,9 @@ import hashlib
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
+from graph_db.coverage_stamps import stamp_base_url_coverage
 from graph_db.cpe_resolver import _is_ip_address
-from graph_db.mixins.recon.scope import build_host_scope, home_domain, host_in_scope
+from graph_db.mixins.recon.scope import build_host_scope, home_domain, host_in_scope, scan_root_for_host
 
 # merge_discovered_hostnames (recon/helpers/target_helpers.py) tags each name it
 # admits into dns.subdomains with one of these, after its apex allow-list, RoE,
@@ -28,8 +29,9 @@ def _displayable_map_url(map_url: str) -> str:
 def _finding_type_props(data_key: str, finding: dict) -> dict:
     """The fields one finding kind carries beyond the shared title/detail/
     evidence, flattened to scalars and string lists (a property cannot hold a
-    map). A source map's own secret hits stay a count: they are pattern
-    matches inside the map's source text, not separate Secret nodes."""
+    map). A source map's first-party sources are analyzed as files of their
+    own (source_url ``<map_url>#<source>``), so a key in them is a Secret node
+    under that file; ``secrets_in_source`` counts those Secrets."""
     if data_key == "source_maps":
         map_url = _displayable_map_url(finding.get("map_url") or "")
         first_party = int(finding.get("first_party_files") or 0)
@@ -45,11 +47,14 @@ def _finding_type_props(data_key: str, finding: dict) -> dict:
             detail = (
                 f"Script references {map_url}, which answered "
                 f"{finding.get('fetch_result') or 'without a source map'}"
+                + (" (the missing-key control check could not run, so the refusal is unconfirmed)"
+                   if finding.get("control_check") == "failed" else "")
             )
         return {
             "map_url": map_url,
             "accessible": bool(finding.get("accessible")),
             "fetch_result": finding.get("fetch_result") or ("ok" if finding.get("accessible") else None),
+            "control_check": finding.get("control_check"),
             "discovery_method": finding.get("discovery_method"),
             "files_count": files,
             "first_party_files": first_party,
@@ -172,9 +177,16 @@ class JsReconMixin:
             if _is_uploaded(url):
                 return url.replace('upload://', '')
             try:
-                return urlparse(url).path.split('/')[-1] or url
+                parsed = urlparse(url)
+                name = parsed.path.split('/')[-1] or url
+                # A source recovered from a source map: <map>#<source path>.
+                return f"{name}#{parsed.fragment}" if parsed.fragment else name
             except Exception:
                 return url
+
+        def _linked(result) -> bool:
+            record = result.single() if result is not None else None
+            return bool(record) and int(record.get("linked", 0) or 0) > 0
 
         with self.driver.session() as session:
             # --- 0. Collect all unique source JS files and create file nodes ---
@@ -236,38 +248,57 @@ class JsReconMixin:
                     file_node_ids[source_url] = file_node_id
                     stats["file_nodes_created"] += 1
 
-                    # Link file node to BaseURL (pipeline) or Domain (uploaded)
+                    # Link file node to BaseURL (pipeline) or Domain (uploaded).
+                    # Counted only when the parent existed and the link was made.
                     if base_url:
-                        session.run(
+                        linked = _linked(session.run(
                             """
                             MATCH (bu:BaseURL {url: $base_url, user_id: $uid, project_id: $pid})
                             MATCH (jf:JsReconFinding {id: $fid, user_id: $uid, project_id: $pid})
-                            MERGE (bu)-[:HAS_JS_FILE]->(jf)
+                            MERGE (bu)-[r:HAS_JS_FILE]->(jf)
+                            RETURN count(r) AS linked
                             """,
                             base_url=base_url, uid=user_id, pid=project_id, fid=file_node_id
-                        )
+                        ))
+                        # No BaseURL: a host only the JS named, or a port http_probe
+                        # never probed. Its in-scope Subdomain is the parent; a
+                        # BaseURL is never created for a host nobody probed.
+                        host = (urlparse(base_url).hostname or "").lower()
+                        if not linked and host and scan_root_for_host(host, recon_data):
+                            linked = _linked(session.run(
+                                """
+                                MATCH (s:Subdomain {name: $host, user_id: $uid, project_id: $pid})
+                                MATCH (jf:JsReconFinding {id: $fid, user_id: $uid, project_id: $pid})
+                                MERGE (s)-[r:HAS_JS_FILE]->(jf)
+                                RETURN count(r) AS linked
+                                """,
+                                host=host, uid=user_id, pid=project_id, fid=file_node_id
+                            ))
                     else:
                         # Uploaded file or no base URL -- link to Domain
                         if domain_name:
-                            session.run(
+                            linked = _linked(session.run(
                                 """
                                 MATCH (d:Domain {name: $dname, user_id: $uid, project_id: $pid})
                                 MATCH (jf:JsReconFinding {id: $fid, user_id: $uid, project_id: $pid})
-                                MERGE (d)-[:HAS_JS_FILE]->(jf)
+                                MERGE (d)-[r:HAS_JS_FILE]->(jf)
+                                RETURN count(r) AS linked
                                 """,
                                 dname=domain_name, uid=user_id, pid=project_id, fid=file_node_id
-                            )
+                            ))
                         else:
-                            session.run(
+                            linked = _linked(session.run(
                                 """
                                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                                 WITH d LIMIT 1
                                 MATCH (jf:JsReconFinding {id: $fid, user_id: $uid, project_id: $pid})
-                                MERGE (d)-[:HAS_JS_FILE]->(jf)
+                                MERGE (d)-[r:HAS_JS_FILE]->(jf)
+                                RETURN count(r) AS linked
                                 """,
                                 uid=user_id, pid=project_id, fid=file_node_id
-                            )
-                    stats["relationships_created"] += 1
+                            ))
+                    if linked:
+                        stats["relationships_created"] += 1
 
                 except Exception as e:
                     stats["errors"].append(f"JS file node creation failed ({source_url}): {e}")
@@ -283,12 +314,12 @@ class JsReconMixin:
                     return False
                 result = session.run(
                     f"""
-                    MATCH (file:JsReconFinding {{id: $fid, finding_type: 'js_file'}})
-                    MATCH (n:{node_label} {{id: $nid}})
+                    MATCH (file:JsReconFinding {{id: $fid, finding_type: 'js_file', user_id: $uid, project_id: $pid}})
+                    MATCH (n:{node_label} {{id: $nid, user_id: $uid, project_id: $pid}})
                     MERGE (file)-[r:{rel_type}]->(n)
                     RETURN count(r) AS linked
                     """,
-                    fid=file_node_id, nid=node_id
+                    fid=file_node_id, nid=node_id, uid=user_id, pid=project_id
                 )
                 record = result.single()
                 linked = record.get("linked", 0) if record else 0
@@ -301,7 +332,7 @@ class JsReconMixin:
                     return False
                 result = session.run(
                     """
-                    MATCH (file:JsReconFinding {id: $fid, finding_type: 'js_file'})
+                    MATCH (file:JsReconFinding {id: $fid, finding_type: 'js_file', user_id: $uid, project_id: $pid})
                     MATCH (n:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $uid, project_id: $pid})
                     MERGE (file)-[r:HAS_ENDPOINT]->(n)
                     RETURN count(r) AS linked
@@ -713,10 +744,15 @@ class JsReconMixin:
                             s.validation_status = $validation_status,
                             s.matched_text = $matched_text,
                             s.validation_info = $validation_info,
+                            s.context = $context,
+                            s.public_client_key = $public_client_key,
                             s.discovered_at = $discovered_at,
                             s.updated_at = datetime()
                         """,
                         id=node_id, user_id=user_id, project_id=project_id,
+                        public_client_key=bool(secret.get("public_client_key")),
+                        # Already masked by the detector; the cap guards the node.
+                        context=(secret.get("context") or "")[:400],
                         secret_type=secret.get("name", "unknown"),
                         severity=secret.get("severity", "info"),
                         source_url=source_url,
@@ -744,13 +780,14 @@ class JsReconMixin:
             endpoint_scope = js_endpoint_scope(recon_data)
             for ep in js_recon_data.get("endpoints", []):
                 try:
-                    # Drop only endpoints a probe positively confirmed as dead.
-                    # 'hittable' (probe succeeded), 'unvalidated' (probing off,
-                    # unresolved upload-relative URL, or unsupported scheme), and
-                    # missing status are all ingested — only 'not_hittable' is
-                    # filtered out, so disabling endpoint probing keeps the prior
+                    # Drop only endpoints a probe positively judged: dead
+                    # ('not_hittable'), or answered exactly like a made-up path
+                    # on a catch-all host ('catch_all', an SPA shell). 'hittable',
+                    # 'unvalidated' (probing off, unresolved upload-relative URL,
+                    # or unsupported scheme) and a missing status are all
+                    # ingested, so disabling endpoint probing keeps the prior
                     # "ingest every extracted endpoint" behavior.
-                    if ep.get("validation_status") == "not_hittable":
+                    if ep.get("validation_status") in ("not_hittable", "catch_all"):
                         continue
 
                     path = ep.get("path", "")
@@ -797,11 +834,13 @@ class JsReconMixin:
                             e.resolved_url = $resolved_url,
                             e.validation_status = $validation_status,
                             e.endpoint_type = $ep_type,
+                            e.path_template = $path_template,
                             e._js_recon_created = true,
                             e.updated_at = datetime()
                         ON MATCH SET e.id = COALESCE(e.id, $id),
                             e.js_recon_source = true,
                             e.endpoint_type = COALESCE(e.endpoint_type, $ep_type),
+                            e.path_template = COALESCE(e.path_template, $path_template),
                             e.full_url = COALESCE(e.full_url, $full_url),
                             // K2: `status_code` is what the score model reads
                             // liveness from, and the HTTP probe owns it. JS
@@ -826,6 +865,8 @@ class JsReconMixin:
                         resolved_url=ep.get("resolved_url", ""),
                         validation_status=ep.get("validation_status"),
                         ep_type=ep.get("type", "rest"),
+                        # `parameterized` is this property being set.
+                        path_template=ep.get("path_template") if ep.get("parameterized") else None,
                     )
                     record = result.single()
                     if record and bool(record.get("created", False)):
@@ -960,6 +1001,16 @@ class JsReconMixin:
 
                 except Exception as e:
                     stats["errors"].append(f"AI SDK finding failed: {e}")
+
+            coverage = (js_recon_data.get("scan_metadata") or {}).get("coverage")
+            if coverage:
+                scope = js_endpoint_scope(recon_data)
+                try:
+                    stats["coverage_stamped"] = stamp_base_url_coverage(
+                        session, "js_recon", coverage, user_id, project_id,
+                        in_scope=lambda host: host_in_scope(host, scope))
+                except Exception as e:
+                    stats["errors"].append(f"JS Recon coverage stamp failed: {e}")
 
         print(f"[+][graph-db] JS Recon: {stats['file_nodes_created']} files, "
               f"{stats['findings_created']} findings, {stats['secrets_created']} secrets, "

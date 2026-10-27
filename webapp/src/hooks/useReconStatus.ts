@@ -38,6 +38,9 @@ interface UseReconStatusReturn {
   // Synchronously-readable detail of the most recent failed startRecon(), for a
   // tailored limit modal (read right after startRecon() resolves to null).
   getLastStartError: () => ReconStartError | null
+  // The same for the most recent failed resumeRecon(): a resume outside the RoE
+  // time window is refused (403) and the scan stays paused.
+  getLastResumeError: () => string | null
 }
 
 const DEFAULT_POLLING_INTERVAL = 5000 // 5 seconds when running
@@ -62,6 +65,7 @@ export function useReconStatus({
   // the request resolves -- a poll landing mid-freeze would revert the button.
   const transitionRef = useRef(false)
   const lastStartErrorRef = useRef<ReconStartError | null>(null)
+  const lastResumeErrorRef = useRef<string | null>(null)
 
   // Store callbacks in refs to avoid recreating fetchStatus
   const onStatusChangeRef = useRef(onStatusChange)
@@ -149,6 +153,7 @@ export function useReconStatus({
   }, [projectId])
 
   const getLastStartError = useCallback(() => lastStartErrorRef.current, [])
+  const getLastResumeError = useCallback(() => lastResumeErrorRef.current, [])
 
   const stopRecon = useCallback(async (): Promise<ReconState | null> => {
     if (!projectId) return null
@@ -218,6 +223,7 @@ export function useReconStatus({
     if (!projectId) return null
 
     setIsLoading(true)
+    lastResumeErrorRef.current = null
 
     try {
       const response = await fetch(`/api/recon/${projectId}/resume`, {
@@ -225,7 +231,7 @@ export function useReconStatus({
       })
 
       if (!response.ok) {
-        const data = await response.json()
+        const data = await response.json().catch(() => ({}))
         throw new Error(data.error || 'Failed to resume recon')
       }
 
@@ -235,6 +241,7 @@ export function useReconStatus({
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      lastResumeErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -289,6 +296,7 @@ export function useReconStatus({
     pauseRecon,
     resumeRecon,
     getLastStartError,
+    getLastResumeError,
   }
 }
 

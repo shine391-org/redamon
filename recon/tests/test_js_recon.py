@@ -15,6 +15,8 @@ import unittest
 import importlib.util
 from unittest import mock
 
+import requests
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
@@ -565,17 +567,19 @@ class TestLongLineWindowing(unittest.TestCase):
     # --- _window_line helper unit tests ---
 
     def test_window_short_line_single_segment(self):
-        self.assertEqual(patterns._window_line('abc', size=100, overlap=10), ['abc'])
+        self.assertEqual(patterns._window_line('abc', size=100, overlap=10), [(0, 'abc')])
 
     def test_window_covers_entire_line(self):
         line = ''.join(chr(65 + (i % 26)) for i in range(250_000))
         segs = patterns._window_line(line, size=100_000, overlap=5_000)
         self.assertGreater(len(segs), 1)
-        # Every index of the original line is covered by at least one window.
+        # Every index of the original line is covered by at least one window,
+        # and each window's offset is where its text sits in the line.
         step = 100_000 - 5_000
         covered = [False] * len(line)
-        for w, seg in enumerate(segs):
-            start = w * step
+        for w, (start, seg) in enumerate(segs):
+            self.assertEqual(start, w * step)
+            self.assertEqual(seg, line[start:start + 100_000])
             for i in range(start, min(start + 100_000, len(line))):
                 covered[i] = True
         self.assertTrue(all(covered))
@@ -688,14 +692,15 @@ class TestContextExtraction(unittest.TestCase):
         js = 'line1\nAKIA1234567890ABCDEF\nline3\nline4'
         findings = _scan(js)
         f = [x for x in findings if x['name'] == 'AWS Access Key ID'][0]
-        self.assertIn('AKIA1234567890ABCDEF', f['context'])
+        # The neighbour lines, with the key itself shown redacted, never raw.
+        self.assertEqual(f['context'], 'line1\nAKIA12...CDEF\nline3')
         self.assertEqual(f['line_number'], 2)
 
-    def test_context_max_500_chars(self):
+    def test_context_max_chars(self):
         js = 'A' * 200 + 'AKIA1234567890ABCDEF' + 'B' * 200
         findings = _scan(js)
         if findings:
-            self.assertLessEqual(len(findings[0]['context']), 500)
+            self.assertLessEqual(len(findings[0]['context']), patterns.CONTEXT_MAX_CHARS)
 
 
 # ============================================================
@@ -1154,6 +1159,9 @@ class TestEndpointValidationHelpers(unittest.TestCase):
         class Response:
             status_code = 200
 
+        class Missing:              # a real server 404s the catch-all control's made-up path
+            status_code = 404
+
         endpoints = [
             {'full_url': 'https://ns.adobe.com/personalization/dom-action', 'method': 'GET',
              'source_js': 'https://app.example.com/static/main.js'},
@@ -1173,13 +1181,18 @@ class TestEndpointValidationHelpers(unittest.TestCase):
                 endpoints,
                 {'JS_RECON_VALIDATE_ENDPOINTS': True, 'JS_RECON_ENDPOINT_CONCURRENCY': 1},
                 js_recon._ProbeScope(roots=('example.com',), hosts=frozenset({'app.example.com'})),
-                request_func=lambda method, url, **kwargs: probed.append(url) or Response(),
+                request_func=lambda method, url, **kwargs: probed.append(url) or (
+                    Missing() if '/rdm-' in url else Response()),
             )
 
-        self.assertEqual(sorted(probed), [
+        controls = [u for u in probed if '/rdm-' in u]
+        self.assertEqual(sorted(u for u in probed if u not in controls), [
             'https://api.example.com/v1/users',
             'https://app.example.com/admin',
         ])
+        # Each hittable endpoint also gets its catch-all control, on its own host.
+        self.assertEqual(sorted(u.rsplit('/', 1)[0] for u in controls),
+                         ['https://api.example.com/v1', 'https://app.example.com'])
         by_url = {e.get('full_url') or e['path']: e for e in validated}
         for third_party in ('https://ns.adobe.com/personalization/dom-action',
                             'https://picsum.photos/seed/mock-1/120/120',
@@ -1406,6 +1419,121 @@ class TestIntegration(unittest.TestCase):
         self.assertIsInstance(patterns.scan_dev_comments('x', 't.js'), list)
         self.assertIsInstance(framework.detect_frameworks('x', 't.js'), list)
         self.assertIsInstance(framework.detect_dom_sinks('x', 't.js'), list)
+
+
+
+# ---------------------------------------------------------------------------
+# Endpoint validation: a catch-all server answers every path, so a hittable
+# status says nothing. A control path that cannot exist decides (plan 03.6).
+# ---------------------------------------------------------------------------
+class _Answer:
+    def __init__(self, status, body="", headers=None):
+        self.status_code = status
+        self.content = body.encode()
+        self.text = body
+        self.headers = headers or {}
+
+
+SPA_SHELL = '<!doctype html><html><head><title>App</title></head><body><div id="root"></div></body></html>'
+
+
+class TestEndpointValidationCatchAll(unittest.TestCase):
+    def _validate(self, endpoints, answer, settings=None, scope=_EXAMPLE_SCOPE, guard=lambda u: True):
+        calls = []
+
+        def request_func(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return answer(method, url)
+        with mock.patch.object(js_recon, 'is_url_safe_to_probe', side_effect=guard):
+            out = js_recon._validate_extracted_endpoints(
+                endpoints, {'JS_RECON_VALIDATE_ENDPOINTS': True, **(settings or {})}, scope,
+                request_func=request_func)
+        return out, calls
+
+    def test_an_spa_shell_answering_every_path_is_catch_all(self):
+        endpoints = [{'full_url': 'https://app.example.com/api/read', 'method': 'GET'},
+                     {'full_url': 'https://app.example.com/api/list', 'method': 'GET'}]
+        out, calls = self._validate(endpoints, lambda m, u: _Answer(200, SPA_SHELL))
+        self.assertEqual([e['validation_status'] for e in out], ['catch_all', 'catch_all'])
+        controls = [u for _, u, _ in calls if '/rdm-' in u]
+        self.assertEqual(len(controls), 1)               # one control for the /api/ prefix
+        self.assertTrue(controls[0].startswith('https://app.example.com/api/rdm-'))
+
+    def test_a_real_endpoint_stays_hittable(self):
+        def answer(method, url):
+            if url.endswith('/api/v1'):
+                return _Answer(200, '{"service":"orders","version":"2.1"}')
+            return _Answer(404, '{"code":"NOT_FOUND"}')
+        out, _ = self._validate([{'full_url': 'https://api.example.com/api/v1', 'method': 'GET'}], answer)
+        self.assertEqual(out[0]['validation_status'], 'hittable')
+        self.assertEqual(out[0]['status_code'], 200)
+
+    def test_the_control_uses_the_probe_method_and_headers(self):
+        endpoints = [{'full_url': 'https://app.example.com/api/save', 'method': 'POST',
+                      'source_js': 'https://app.example.com/static/main.js'}]
+        out, calls = self._validate(endpoints, lambda m, u: _Answer(204),
+                                    settings={'JS_RECON_ENDPOINT_CUSTOM_HEADERS': ['Cookie: s=1']})
+        (m1, u1, k1), (m2, u2, k2) = calls
+        self.assertEqual((m1, m2), ('OPTIONS', 'OPTIONS'))
+        self.assertIn('/rdm-', u2)
+        self.assertEqual(k1, k2)
+        self.assertFalse(k2['allow_redirects'])
+        self.assertEqual(out[0]['validation_status'], 'catch_all')
+
+    def test_a_head_control_is_not_reused_for_a_get_hit(self):
+        endpoints = [{'full_url': 'https://app.example.com/api/a', 'method': 'HEAD'},
+                     {'full_url': 'https://app.example.com/api/b', 'method': 'GET'}]
+        _, calls = self._validate(endpoints, lambda m, u: _Answer(404 if '/rdm-' in u else 200))
+        self.assertEqual(sorted(m for m, u, _ in calls if '/rdm-' in u), ['GET', 'HEAD'])
+
+    def test_a_failed_control_keeps_the_endpoint_hittable(self):
+        def answer(method, url):
+            if '/rdm-' in url:
+                raise requests.ConnectionError('reset')
+            return _Answer(200, SPA_SHELL)
+        out, _ = self._validate([{'full_url': 'https://app.example.com/api/read', 'method': 'GET'}], answer)
+        self.assertEqual(out[0]['validation_status'], 'hittable')
+
+    def test_the_ssrf_guard_runs_on_the_control_too(self):
+        seen = []
+
+        def guard(url):
+            seen.append(url)
+            return '/rdm-' not in url        # refuse only the control
+        out, calls = self._validate([{'full_url': 'https://app.example.com/api/read', 'method': 'GET'}],
+                                    lambda m, u: _Answer(200, SPA_SHELL), guard=guard)
+        self.assertTrue(any('/rdm-' in u for u in seen))
+        self.assertFalse(any('/rdm-' in u for _, u, _ in calls))
+        self.assertEqual(out[0]['validation_status'], 'hittable')    # no conclusion: kept
+
+    def test_a_not_hittable_status_sends_no_control(self):
+        out, calls = self._validate([{'full_url': 'https://app.example.com/missing', 'method': 'GET'}],
+                                    lambda m, u: _Answer(404))
+        self.assertEqual(out[0]['validation_status'], 'not_hittable')
+        self.assertEqual(len(calls), 1)
+
+    def test_an_roe_excluded_host_is_never_probed_or_controlled(self):
+        scope = js_recon._ProbeScope(roots=('example.com',), roe_excluded=('admin.example.com',))
+        out, calls = self._validate([{'full_url': 'https://admin.example.com/api/x', 'method': 'GET'}],
+                                    lambda m, u: _Answer(200, SPA_SHELL), scope=scope)
+        self.assertEqual(calls, [])
+        self.assertEqual(out[0]['validation_error'], 'out_of_scope')
+
+    def test_validation_off_sends_nothing(self):
+        calls = []
+        out = js_recon._validate_extracted_endpoints(
+            [{'full_url': 'https://app.example.com/api/read', 'method': 'GET'}],
+            {'JS_RECON_VALIDATE_ENDPOINTS': False}, _EXAMPLE_SCOPE,
+            request_func=lambda *a, **k: calls.append(a) or _Answer(200))
+        self.assertEqual(calls, [])
+        self.assertEqual(out[0]['validation_status'], 'unvalidated')
+
+    def test_the_summary_counts_catch_all(self):
+        summary = js_recon._build_summary({'endpoints': [
+            {'validation_status': 'catch_all'}, {'validation_status': 'catch_all'},
+            {'validation_status': 'hittable'}]})
+        self.assertEqual(summary['endpoint_validation']['catch_all'], 2)
+        self.assertEqual(summary['endpoints_hittable'], 1)
 
 
 if __name__ == '__main__':

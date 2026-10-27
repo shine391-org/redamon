@@ -434,8 +434,7 @@ describe('/api/analytics/redzone/secrets', () => {
         { id: 'redis', secretType: 'Redis URL', asset: 'a', location: 'b' },
         { id: 'cloudinary', secretType: 'Cloudinary URL', asset: 'a', location: 'b' },
         { id: 'p12', secretType: 'PKCS12 File', asset: 'a', location: 'b' },
-        // Publishable by design — this one must STAY low, or the tier means
-        // nothing.
+        // Publishable by design: info, below every credential (plan 05.2).
         { id: 'recaptcha', secretType: 'Google reCAPTCHA Key', asset: 'a', location: 'b' },
         { id: 'bucket', secretType: 'S3 Bucket (virtual-hosted)', asset: 'a', location: 'b' },
       ] },
@@ -444,8 +443,58 @@ describe('/api/analytics/redzone/secrets', () => {
     const bySev = Object.fromEntries(body.rows.map((r: { id: string, severity: string }) => [r.id, r.severity]))
     expect(bySev).toEqual({
       ghcred: 'high', redis: 'high', cloudinary: 'high', p12: 'high',
-      recaptcha: 'low', bucket: 'low',
+      recaptcha: 'info', bucket: 'low',
     })
+  })
+
+  test('a key that is public by design is info and flagged, by flag or by name (plan 05.2)', async () => {
+    runReturnFor = [
+      { match: /MATCH \(s:Secret/, rows: [
+        { id: 'flagged', secretType: 'GCP API Key', severity: 'info', publicClientKey: true, origin: 'Secret' },
+        // Written before the flag existed: still stored critical.
+        { id: 'legacy', secretType: 'GCP API Key', severity: 'critical', publicClientKey: null, origin: 'Secret' },
+        { id: 'secret', secretType: 'Stripe Secret Key', severity: 'critical', publicClientKey: false, origin: 'Secret' },
+      ] },
+      { match: /MATCH \(gs:GithubSecret/, rows: [
+        { id: 'gh-pub', secretType: 'Stripe Publishable Key', asset: 'a', location: 'b' },
+      ] },
+    ]
+    const body = await (await secretsRoute.GET(makeRequest('p1'))).json()
+    const byId = Object.fromEntries(body.rows.map((r: { id: string }) => [r.id, r]))
+    expect([byId.flagged.severity, byId.flagged.publicClientKey]).toEqual(['info', true])
+    expect([byId.legacy.severity, byId.legacy.publicClientKey]).toEqual(['info', true])
+    expect([byId.secret.severity, byId.secret.publicClientKey]).toEqual(['critical', false])
+    expect([byId['gh-pub'].severity, byId['gh-pub'].publicClientKey]).toEqual(['info', true])
+    const c = runCalls.find(call => /MATCH \(s:Secret/.test(call.cypher))!.cypher
+    expect(c).toMatch(/s\.public_client_key\s+AS publicClientKey/)
+  })
+
+  test('a TruffleHog credential checked and dead sorts the same under either word (plan 05.8)', async () => {
+    runReturnFor = [
+      { match: /MATCH \(s:Secret/, rows: [] },
+      { match: /MultiscannerFinding/, rows: [
+        { id: 'never', secretType: 'AWS', validationStatus: 'unverified' },
+        { id: 'dead-new', secretType: 'AWS', validationStatus: 'rejected' },
+        { id: 'errored', secretType: 'AWS', validationStatus: 'verify_error' },
+        { id: 'dead-old', secretType: 'AWS', validationStatus: 'unvalidated' },
+      ] },
+    ]
+    const body = await (await secretsRoute.GET(makeRequest('p1'))).json()
+    expect(body.rows.map((r: { id: string }) => r.id)).toEqual(['errored', 'dead-new', 'dead-old', 'never'])
+  })
+
+  test('the explicit validation states sort as they read (plan 05.7)', async () => {
+    // No verdict ranks above a dead key; a legacy 'invalid' keeps its old place.
+    runReturnFor = [
+      { match: /MATCH \(s:Secret/, rows: [
+        { id: 'legacy', secretType: 'API Key', validationStatus: 'invalid', origin: 'Secret' },
+        { id: 'dead', secretType: 'API Key', validationStatus: 'rejected', origin: 'Secret' },
+        { id: 'nocheck', secretType: 'API Key', validationStatus: 'unknown', origin: 'Secret' },
+        { id: 'live', secretType: 'API Key', validationStatus: 'validated', origin: 'Secret' },
+      ] },
+    ]
+    const body = await (await secretsRoute.GET(makeRequest('p1'))).json()
+    expect(body.rows.map((r: { id: string }) => r.id)).toEqual(['live', 'nocheck', 'dead', 'legacy'])
   })
 
   test('a credential the agent USED outranks every scanner finding', async () => {

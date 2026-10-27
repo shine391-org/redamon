@@ -374,7 +374,24 @@ class TestFastlySharedEdge:
         f = out["findings"][0]
         assert f["layer"] == "both"
         assert f["severity"] == "medium"  # internal keyword, same page on L7 and L4
+        # Both layers reach the same app: a hidden vhost, not a routing split.
+        assert f["name"] == f"Hidden Virtual Host: admin.{APEX}"
+        assert f["type"] == "hidden_vhost"
         assert out["by_ip"][IP]["suppressed_by_control"] == len(WORDS) - 1
+
+    def test_l7_and_l4_reaching_different_apps_is_a_routing_inconsistency(self):
+        def responder(host, layer, attempt):
+            if host == f"admin.{APEX}" and layer == "L7":
+                return _proc(200, ADMIN_APP, ctype="application/json")
+            if host == f"admin.{APEX}" and layer == "L4":
+                return _proc(200, b'{"service":"billing","version":"1.0"}', ctype="application/json")
+            return self.responder(host, layer, attempt)
+
+        out, _ = _run(responder)
+        f = out["findings"][0]
+        assert f["layer"] == "both" and f["severity"] == "high"
+        assert f["name"] == f"Routing Inconsistency (L7 vs L4): admin.{APEX}"
+        assert f["type"] == "host_header_bypass"
 
 
 class TestCloudflareBlockPage:
@@ -563,14 +580,16 @@ class TestDeepReviewRegressions:
 # ===========================================================================
 class TestCandidateScope:
     def _graph_recon(self, **extra):
+        # The PTR name sits in the dns block with its address, as IP mode
+        # records it.
         return _recon(
             dns={"subdomains": {
                 f"login.{APEX}": {
                     "ips": {"ipv4": [IP], "ipv6": []},
                     "records": {"CNAME": ["example-tenant.idp-provider.test."]},
                 },
+                "edge-203-0-113-10.cdn-provider.test": {"ips": {"ipv4": [IP], "ipv6": []}},
             }},
-            ip_recon={IP: {"reverse_dns": "edge-203-0-113-10.cdn-provider.test"}},
             **extra,
         )
 
@@ -648,3 +667,239 @@ def test_controls_use_the_apex_so_a_zone_routed_cdn_is_calibrated():
     ctrl = [h for h in seen if h and h.startswith(vsm._CONTROL_LABEL_PREFIX)]
     assert any(re.fullmatch(rf"{vsm._CONTROL_LABEL_PREFIX}[0-9a-f]{{10}}-\d\.{re.escape(APEX)}", h) for h in ctrl)
     assert any(h.endswith(".invalid") for h in ctrl)
+
+
+# ===========================================================================
+# 7. A name public DNS already points at this IP is never a hidden vhost
+# ===========================================================================
+DNS_KNOWN = [f"www.{APEX}", f"shop.{APEX}", f"blog.{APEX}"]
+
+
+def _site(host: str) -> bytes:
+    return f"<html><head><title>{host.split('.')[0]} site</title></head><body>{host} home</body></html>".encode()
+
+
+class _OnlyHttps(FakeCurl):
+    """The DNS block gives every IP a default port 80; keep these cases to 443."""
+
+    def __call__(self, cmd, **kwargs):
+        if any(arg.startswith("http://") for arg in cmd):
+            self.calls.append((None, "dead"))
+            return _proc(0)
+        return super().__call__(cmd, **kwargs)
+
+
+def _shared_ip_recon(extra_dns=None):
+    subs = {h: {"ips": {"ipv4": [IP], "ipv6": []}} for h in DNS_KNOWN}
+    subs.update(extra_dns or {})
+    return _recon(dns={"subdomains": subs})
+
+
+def _shared_ip_responder(served: dict):
+    def responder(host, layer, attempt):
+        if layer == "baseline" or host not in served:
+            return _proc(404, b"<h1>no route</h1>")
+        return served[host](layer)
+    return responder
+
+
+def _run_https(responder, words, recon, **settings):
+    fake = _OnlyHttps(responder)
+    with patch.object(vsm, "_is_curl_available", return_value=True), \
+         patch("subprocess.run", side_effect=fake):
+        run_vhost_sni_enrichment(recon, settings=_settings(words, **settings))
+    return recon["vhost_sni"], fake
+
+
+def _same_page(host):
+    return lambda layer: _proc(200, _site(host))
+
+
+class TestDnsKnownNamesAreNotHidden:
+    def test_three_dns_known_sites_on_a_shared_ip_are_not_hidden(self):
+        served = {h: _same_page(h) for h in DNS_KNOWN}
+        out, fake = _run_https(_shared_ip_responder(served), [], _shared_ip_recon(),
+                               VHOST_SNI_USE_GRAPH_CANDIDATES=True)
+        assert out["findings"] == []
+        # Still probed: a routing check needs the request.
+        assert set(DNS_KNOWN) <= fake.probed_hosts()
+        assert out["by_ip"][IP]["suppressed_dns_known"] == 3
+
+    def test_a_name_with_no_dns_here_is_still_a_hidden_vhost(self):
+        served = {h: _same_page(h) for h in DNS_KNOWN + [f"intranet.{APEX}"]}
+        out, _ = _run_https(_shared_ip_responder(served), ["intranet"], _shared_ip_recon(),
+                            VHOST_SNI_USE_GRAPH_CANDIDATES=True)
+        assert [f["hostname"] for f in out["findings"]] == [f"intranet.{APEX}"]
+        assert out["findings"][0]["dns_known"] is False
+        assert out["findings"][0]["name"] == f"Hidden Virtual Host: intranet.{APEX}"
+
+    def test_a_name_whose_dns_points_elsewhere_is_still_reported(self):
+        elsewhere = f"legacy.{APEX}"
+        recon = _shared_ip_recon({elsewhere: {"ips": {"ipv4": ["198.51.100.7"], "ipv6": []}}})
+        served = {h: _same_page(h) for h in DNS_KNOWN + [elsewhere]}
+        out, _ = _run_https(_shared_ip_responder(served), [elsewhere], recon,
+                            VHOST_SNI_USE_GRAPH_CANDIDATES=True)
+        assert [f["hostname"] for f in out["findings"]] == [elsewhere]
+
+    def test_dns_known_names_are_never_injected_as_baseurls(self):
+        served = {h: _same_page(h) for h in DNS_KNOWN + [f"intranet.{APEX}"]}
+        recon = _shared_ip_recon()
+        out, _ = _run_https(_shared_ip_responder(served), ["intranet"], recon,
+                            VHOST_SNI_USE_GRAPH_CANDIDATES=True, VHOST_SNI_INJECT_DISCOVERED=True)
+        assert out["discovered_baseurls"] == [f"https://intranet.{APEX}"]
+        injected = set((recon.get("http_probe") or {}).get("by_url") or {})
+        assert injected == {f"https://intranet.{APEX}"}
+
+    def test_a_dns_known_name_whose_layers_disagree_is_a_routing_finding(self):
+        # Host header and SNI reach different backends: that is a routing
+        # inconsistency whatever DNS says, so it stays, flagged dns_known.
+        host = f"shop.{APEX}"
+
+        def split(layer):
+            if layer == "L7":
+                return _proc(200, _site(host))
+            return _proc(200, b"<html><head><title>internal admin</title></head><body>panel</body></html>")
+
+        served = {h: _same_page(h) for h in DNS_KNOWN}
+        served[host] = split
+        out, _ = _run_https(_shared_ip_responder(served), [], _shared_ip_recon(),
+                            VHOST_SNI_USE_GRAPH_CANDIDATES=True, VHOST_SNI_INJECT_DISCOVERED=True)
+        assert [f["hostname"] for f in out["findings"]] == [host]
+        f = out["findings"][0]
+        assert f["type"] == "host_header_bypass" and f["layer"] == "both"
+        assert f["dns_known"] is True
+        assert out["discovered_baseurls"] == []
+
+    def test_the_apex_resolving_here_is_dns_known(self):
+        recon = _recon(dns={"domain": {"ips": {"ipv4": [IP], "ipv6": []}}, "subdomains": {}})
+        out, _ = _run_https(_shared_ip_responder({APEX: _same_page(APEX)}), [APEX], recon)
+        assert out["findings"] == []
+        assert out["by_ip"][IP]["suppressed_dns_known"] == 1
+
+    def test_a_name_merged_without_addresses_counts_once_httpx_resolved_it_here(self):
+        # A certificate-SAN or JS name is merged into the dns block with no
+        # addresses; httpx resolves it later in the same run.
+        san = f"shop.{APEX}"
+        recon = _recon(
+            dns={"subdomains": {san: {"has_records": True, "source": "certificate_san"}}},
+            http_probe={"by_url": {f"https://{san}": {"url": f"https://{san}", "host": san, "ip": IP}}},
+        )
+        out, fake = _run_https(_shared_ip_responder({san: _same_page(san)}), [san], recon)
+        assert san in fake.probed_hosts()
+        assert out["findings"] == []
+        assert out["by_ip"][IP]["suppressed_dns_known"] == 1
+
+    def test_httpx_resolving_a_name_elsewhere_does_not_make_it_known_here(self):
+        name = f"legacy.{APEX}"
+        recon = _recon(http_probe={"by_url": {f"https://{name}": {"url": f"https://{name}", "host": name,
+                                                                  "ip": "198.51.100.7"}}})
+        out, _ = _run_https(_shared_ip_responder({name: _same_page(name)}), [name], recon)
+        assert [f["hostname"] for f in out["findings"]] == [name]
+
+    def test_dns_known_set_reads_the_current_resolution_only(self):
+        recon = {"domain": APEX, "dns": {
+            "domain": {"ips": {"ipv4": ["198.51.100.1"], "ipv6": []}},
+            "subdomains": {
+                f"www.{APEX}": {"ips": {"ipv4": [IP], "ipv6": []}},
+                f"v6.{APEX}": {"ips": {"ipv4": [], "ipv6": ["2001:db8::1"]}},
+                f"gone.{APEX}": {"ips": {"ipv4": [], "ipv6": []}, "has_records": False},
+            }}}
+        assert vsm._dns_known_names(recon, IP) == {f"www.{APEX}"}
+        assert vsm._dns_known_names(recon, "2001:db8::1") == {f"v6.{APEX}"}
+        assert vsm._dns_known_names(recon, "198.51.100.1") == {APEX}
+
+
+# ===========================================================================
+# 8. The default wordlist is not brute-forced against a shared CDN edge
+# ===========================================================================
+EDGE_WORDS = ["admin", "dev", "jenkins"]
+
+
+def _edge_recon(cdn="cloudflare", is_cdn=True):
+    r = _recon()
+    r["port_scan"]["by_ip"] = {IP: {"ip": IP, "is_cdn": is_cdn, "cdn": cdn}}
+    return r
+
+
+def _run_wordlist(recon, words=EDGE_WORDS, **settings):
+    def responder(host, layer, attempt):
+        return _proc(404, b"<h1>no route</h1>")
+
+    fake = FakeCurl(responder)
+    with patch.object(vsm, "_is_curl_available", return_value=True), \
+         patch.object(vsm, "_load_default_wordlist", return_value=list(words)), \
+         patch("subprocess.run", side_effect=fake):
+        run_vhost_sni_enrichment(recon, settings=_settings([], VHOST_SNI_USE_DEFAULT_WORDLIST=True,
+                                                           **settings))
+    return recon["vhost_sni"], fake
+
+
+def _wordlist_gaps():
+    from recon.helpers import circuit_breaker as cb
+    return [g for g in cb.coverage_report().gaps if g["source"] == "vhost_sni_wordlist"]
+
+
+class TestNoWordlistOnCdnEdges:
+    def test_an_edge_ip_gets_no_wordlist_name(self):
+        out, fake = _run_wordlist(_edge_recon())
+        assert not ({f"{w}.{APEX}" for w in EDGE_WORDS} & fake.probed_hosts())
+        assert out["scan_metadata"]["wordlist_skipped_edge_ips"] == [IP]
+
+    def test_a_non_edge_ip_still_gets_the_wordlist(self):
+        out, fake = _run_wordlist(_recon())
+        assert {f"{w}.{APEX}" for w in EDGE_WORDS} <= fake.probed_hosts()
+        assert out["scan_metadata"]["wordlist_skipped_edge_ips"] == []
+        assert _wordlist_gaps() == []
+
+    def test_plain_cloud_hosting_is_not_an_edge(self):
+        # httpx/naabu flag aws/azure/gcp as CDN too, but such an IP serves the
+        # application itself, often behind a Kubernetes ingress with real
+        # hidden vhosts: the wordlist must still run there.
+        _out, fake = _run_wordlist(_edge_recon(cdn="aws"))
+        assert {f"{w}.{APEX}" for w in EDGE_WORDS} <= fake.probed_hosts()
+
+    def test_graph_candidates_and_custom_lines_are_still_probed_on_an_edge(self):
+        recon = _edge_recon()
+        recon["http_probe"] = {"by_url": {f"https://{IP}": {
+            "host": IP, "tls": {"certificate": {"san": [f"staging.{APEX}"]}}}}}
+        _out, fake = _run_wordlist(recon, VHOST_SNI_USE_GRAPH_CANDIDATES=True,
+                                   VHOST_SNI_CUSTOM_WORDLIST="payments")
+        assert f"staging.{APEX}" in fake.probed_hosts()
+        assert f"payments.{APEX}" in fake.probed_hosts()
+        assert f"admin.{APEX}" not in fake.probed_hosts()
+
+    def test_the_skip_is_a_coverage_note_with_no_prune_effect(self):
+        from recon.helpers import circuit_breaker as cb
+        _run_wordlist(_edge_recon())
+        gaps = _wordlist_gaps()
+        assert len(gaps) == 1
+        assert gaps[0]["reason"] == "shared CDN edge" and gaps[0]["skipped"] == 1
+        assert re.fullmatch(r"[a-z0-9_]{1,64}", gaps[0]["source"])
+        assert re.fullmatch(r"[a-z0-9_]{1,64}", gaps[0]["module"])
+        report = cb.coverage_report()
+        assert "vhost_sni_wordlist" not in report.degraded_sources
+        assert "vhost_sni_enum" not in report.degraded_sources
+
+    def test_no_note_when_the_wordlist_is_off_anyway(self):
+        recon = _edge_recon()
+        fake = FakeCurl(lambda h, l, a: _proc(404, b"x"))
+        with patch.object(vsm, "_is_curl_available", return_value=True), \
+             patch("subprocess.run", side_effect=fake):
+            run_vhost_sni_enrichment(recon, settings=_settings(["admin"]))
+        assert _wordlist_gaps() == []
+        assert recon["vhost_sni"]["scan_metadata"]["wordlist_skipped_edge_ips"] == []
+
+
+# ===========================================================================
+# 9. IP mode: a PTR name is a DNS name of its IP, never a hidden vhost
+# ===========================================================================
+def test_ip_mode_ptr_name_serving_its_site_is_not_hidden():
+    ptr = "web-7.hosting-provider.test"
+    recon = _recon(dns={"subdomains": {ptr: {"ips": {"ipv4": [IP], "ipv6": []}}}})
+    recon["domain"] = "ip-targets.proj1"
+    recon["metadata"] = {"target": "ip-targets.proj1", "ip_mode": True}
+    out, fake = _run_https(_shared_ip_responder({ptr: _same_page(ptr)}), [], recon,
+                           VHOST_SNI_USE_GRAPH_CANDIDATES=True)
+    assert ptr in fake.probed_hosts()
+    assert out["findings"] == []
+    assert out["by_ip"][IP]["suppressed_dns_known"] == 1

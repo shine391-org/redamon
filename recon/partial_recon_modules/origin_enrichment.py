@@ -21,8 +21,10 @@ from recon.partial_recon_modules.helpers import (
     scope_roots,
 )
 from recon.partial_recon_modules.graph_builders import (
+    FORWARD_DNS,
     _GraphScope,
     _build_vuln_scan_data_from_graph,
+    attach_graph_ownership,
 )
 from recon.main_recon_modules.origin_discovery import _is_edge_cdn_label
 
@@ -35,6 +37,9 @@ def _inject_graph_fronted_hosts(by_url: dict, roots: list, user_id: str, project
     carries is_cdn / a favicon hash (where httpx records the CDN classification).
     A literal batch group contributes only the hosts it listed, as in the
     builders: a Subdomain another writer hung under it is not probed.
+
+    Forward DNS only: the IP read here is the host's edge, which a candidate is
+    dropped against, and a Shodan PTR edge names a former origin as often as not.
     """
     from graph_db import Neo4jClient
 
@@ -49,11 +54,11 @@ def _inject_graph_fronted_hosts(by_url: dict, roots: list, user_id: str, project
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
                 WHERE toLower(d.name) IN $domains
-                  AND (EXISTS { (s)-[:RESOLVES_TO]->(ci:IP) WHERE ci.is_cdn = true }
+                  AND (EXISTS { (s)-[r:RESOLVES_TO]->(ci:IP) WHERE ci.is_cdn = true AND """ + FORWARD_DNS + """ }
                    OR EXISTS { (s)-[:HAS_BASE_URL|HAS_BASEURL]->(:BaseURL)-[:HAS_ENDPOINT]->(ep:Endpoint)
                                WHERE ep.is_cdn = true OR ep.favicon_hash IS NOT NULL })
                 OPTIONAL MATCH (s)-[:HAS_BASE_URL|HAS_BASEURL]->(:BaseURL)-[:HAS_ENDPOINT]->(e:Endpoint)
-                OPTIONAL MATCH (s)-[:RESOLVES_TO]->(i:IP)
+                OPTIONAL MATCH (s)-[r:RESOLVES_TO]->(i:IP) WHERE """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS host,
                        head([x IN collect(DISTINCT e.favicon_hash) WHERE x IS NOT NULL]) AS favicon,
                        [x IN collect(DISTINCT e.cdn) WHERE x IS NOT NULL]
@@ -144,6 +149,8 @@ def run_origin_discovery(config: dict) -> None:
         }
 
     recon_data.setdefault("http_probe", {}).setdefault("by_url", {})
+    # A candidate the graph's IP attribution tagged shared_edge is never an origin.
+    attach_graph_ownership(recon_data, user_id, project_id)
 
     # The reused graph builder reconstructs http_probe.by_url from BaseURL nodes,
     # but is_cdn/favicon_hash live on the Endpoint node — so it never flags a host

@@ -179,6 +179,11 @@ def _compile_condition(cond, fdef: dict, now: datetime):
 
     if ftype == "enum":
         inside = op == "in"
+        # A value a writer stopped writing also stands for what replaced it, so
+        # a saved rule keeps matching with no migration (catalog `aliases`).
+        aliases = fdef.get("aliases") or {}
+        want = frozenset(want).union(*(
+            (str(t).lower() for t in aliases[v]) for v in aliases if v.lower() in want))
         return lambda p: not p[0] and (p[1] in want) is inside
 
     if ftype == "ip":

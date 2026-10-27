@@ -178,7 +178,10 @@ export function renderSettingsReference(): string {
   )
   out.push(
     '- **Two levels.** `scanModules` decides which PHASES run; a per-tool `*Enabled` flag ' +
-    'decides which tools run inside a phase. Setting one without the other is a silent no-op.'
+    'decides which tools run inside a phase. Setting one without the other is a silent no-op. ' +
+    'JS recon is the exception: it is no phase, `jsReconEnabled` alone switches it on, and it ' +
+    'analyzes the JS files `resource_enum` and `http_probe` found, so it needs one of those. ' +
+    'jsluice runs inside `resource_enum`.'
   )
   out.push(
     '- **One capability surface.** Every settable field has an input in the project form and ' +

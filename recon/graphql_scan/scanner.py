@@ -17,7 +17,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .discovery import discover_graphql_endpoints, filter_by_roe
+from .discovery import discover_graphql_endpoints, filter_by_roe, roe_settings_for
 from .introspection import (
     test_introspection, extract_operations, calculate_schema_hash,
     detect_sensitive_fields
@@ -139,9 +139,10 @@ def _run_graphql_scan(combined_result: dict, settings: dict) -> dict:
         combined_result['graphql_scan'] = graphql_results
         return combined_result
 
-    # Filter by RoE
-    roe_settings = combined_result.get('metadata', {}).get('roe', {})
-    in_scope_endpoints = filter_by_roe(discovered_endpoints, roe_settings)
+    # Filter by RoE: the run's own settings first. Full recon stamps no
+    # metadata.roe (only partial recon's graph builder does), so reading that
+    # alone applied no exclusion at all in a full scan.
+    in_scope_endpoints = filter_by_roe(discovered_endpoints, roe_settings_for(combined_result, settings))
     skipped_count = len(discovered_endpoints) - len(in_scope_endpoints)
 
     if skipped_count > 0:

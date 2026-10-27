@@ -2,7 +2,7 @@
 
 ## Complete Technical Documentation
 
-> **Modules:** `recon/masscan_scan.py`, `recon/port_scan.py`
+> **Modules:** `recon/main_recon_modules/masscan_scan.py`, `recon/main_recon_modules/port_scan.py`
 > **Purpose:** High-speed port scanning using Masscan and Naabu in parallel
 > **Author:** RedAmon Security Suite
 
@@ -12,7 +12,7 @@
 
 1. [Overview](#overview)
 2. [Features](#features)
-3. [Installation](#installation)
+3. [Requirements](#requirements)
 4. [Configuration Parameters](#configuration-parameters)
 5. [Architecture & Flow](#architecture--flow)
 6. [Output Data Structure](#output-data-structure)
@@ -23,9 +23,9 @@
 
 ## Overview
 
-The `naabu_scan.py` module integrates ProjectDiscovery's Naabu scanner into RedAmon's reconnaissance pipeline. Naabu is optimized for fast, reliable port scanning at scale.
+The `port_scan.py` module integrates ProjectDiscovery's Naabu scanner into RedAmon's reconnaissance pipeline. Naabu is optimized for fast, reliable port scanning at scale.
 
-**⚠️ Important:** Naabu runs exclusively via Docker. No native installation is supported.
+**⚠️ Important:** Naabu runs exclusively via Docker, as a sibling container the recon container starts with `docker run`. No native installation is supported.
 
 ### Why Naabu?
 
@@ -40,14 +40,16 @@ The `naabu_scan.py` module integrates ProjectDiscovery's Naabu scanner into RedA
 ### How It Works
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Recon Data     │────▶│  naabu_scan.py   │────▶│  Enriched JSON  │
-│  (hostnames,    │     │                  │     │  with ports,    │
-│   IPs from DNS) │     │  1. Extract IPs  │     │  services, CDN  │
-└─────────────────┘     │  2. Build targets│     └─────────────────┘
-                        │  3. Run Naabu    │
-                        │  4. Parse JSON   │
-                        └──────────────────┘
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│  Recon Data     │────▶│  port_scan.py        │────▶│  port_scan key  │
+│  (hostnames,    │     │                      │     │  with ports,    │
+│   IPs from DNS) │     │  1. Extract targets  │     │  services, CDN  │
+└─────────────────┘     │  2. Write targets    │     └─────────────────┘
+                        │  3. Run Naabu        │
+                        │     (SYN, CONNECT    │
+                        │      fallback)       │
+                        │  4. Parse JSON Lines │
+                        └──────────────────────┘
 ```
 
 ---
@@ -57,38 +59,30 @@ The `naabu_scan.py` module integrates ProjectDiscovery's Naabu scanner into RedA
 | Feature | Description |
 |---------|-------------|
 | **Fast Scanning** | SYN scan with configurable rate limiting |
+| **CONNECT Fallback** | A SYN scan that crashes, fails or finds no open port is retried once as a CONNECT scan |
 | **CDN Detection** | Identifies CDN-protected hosts (Cloudflare, Akamai, etc.) |
-| **Service Detection** | Maps common ports to service names |
+| **Service Detection** | Maps each open port to a service name (IANA registry) |
+| **AI Port Catalogue** | Tags ports of known AI runtimes, vector databases and frontends with `ai_service` |
 | **Docker Execution** | No local installation required |
 | **Passive Mode** | Query Shodan InternetDB instead of active scanning |
-| **Incremental Saving** | Results saved progressively |
 
 ---
 
-## Installation
+## Requirements
 
-### Requirements
+Nothing to install by hand: the recon container reaches the host's Docker daemon
+and, on first use, `pull_naabu_docker_image()` pulls the Naabu image. Masscan is
+a native binary built from source into the recon image (`recon/Dockerfile`).
 
-- **Docker** installed and running
-- **Root/sudo** for SYN scans (or use CONNECT mode)
+- **Docker** reachable from the recon container. `run_port_scan()` checks
+  `docker` is on the path and `docker info` answers, and skips the scan otherwise.
+- **Raw sockets** for SYN scans. Naabu runs with `--net=host`; when a SYN scan
+  cannot run, the module retries it as a CONNECT scan by itself. Masscan has no
+  such fallback and needs root or `CAP_NET_RAW`.
 
-### Setup
-
-```bash
-# Make sure Docker is running
-sudo systemctl start docker
-
-# Run the scan - image will be pulled automatically
-python3 recon/main.py
-```
-
-### Verify Docker is Ready
+To pre-pull the image:
 
 ```bash
-# Check Docker is running
-docker info
-
-# Optionally pre-pull the image
 docker pull projectdiscovery/naabu:latest
 ```
 
@@ -96,19 +90,30 @@ docker pull projectdiscovery/naabu:latest
 
 ## Configuration Parameters
 
-All parameters are configured via the webapp project settings (stored in PostgreSQL) or as defaults in `project_settings.py`:
+All parameters are set in the webapp project settings (stored in PostgreSQL) and reach the module as the runtime keys below; `recon/project_settings.py` holds the fallback defaults. Each field's meaning and bounds are in the settings registry (`recon_settings/registry.yaml`).
+
+Three things can change a value at scan start: the engagement ceiling (`apply_roe_rate_cap`) caps `NAABU_RATE_LIMIT` and `MASSCAN_RATE`, the memory governor can lower `NAABU_THREADS`, and stealth mode overrides several keys (see [Stealth Mode Behavior](#stealth-mode-behavior)).
+
+### Toggles
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `NAABU_ENABLED` | `bool` | `True` | Run Naabu inside the port-scan phase |
+| `PORT_SCAN_AI_PORT_CATALOG_ENABLED` | `bool` | `True` | Annotate Naabu's ports that match the AI port catalogue |
+
+The phase itself runs only when `port_scan` is in the project's scan modules (`SCAN_MODULES`).
 
 ### Docker Settings
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NAABU_DOCKER_IMAGE` | `str` | `"projectdiscovery/naabu:latest"` | Docker image to use |
+| `NAABU_DOCKER_IMAGE` | `str` | `"projectdiscovery/naabu:latest"` | Docker image to use; a value outside the shipped allowlist is pinned back to the default at scan start |
 
 ### Port Selection
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NAABU_TOP_PORTS` | `str` | `"1000"` | Number of top ports ("100", "1000", "full") |
+| `NAABU_TOP_PORTS` | `str` | `"1000"` | Number of top ports, passed to `-top-ports` ("100", "1000", "full") |
 | `NAABU_CUSTOM_PORTS` | `str` | `""` | Custom ports (overrides TOP_PORTS) |
 
 **Port Examples:**
@@ -126,8 +131,10 @@ NAABU_CUSTOM_PORTS = "1-65535"    # Full port range
 | `NAABU_SCAN_TYPE` | `str` | `"s"` | Scan type: "s" (SYN) or "c" (CONNECT) |
 
 **Scan Types:**
-- `"s"` (SYN) - Faster, more reliable, **requires root/sudo**
-- `"c"` (CONNECT) - No root needed, full TCP handshake
+- `"s"` (SYN) - Faster, more reliable, **requires raw sockets**
+- `"c"` (CONNECT) - No raw sockets needed, full TCP handshake
+
+With `"s"`, a run that crashes (SIGSEGV), fails with an error, or finds no open ports (a firewall may be dropping SYN probes) is retried once with `"c"`, and the result records `scan_metadata.scan_type_fallback: true`.
 
 **SYN Scan (Half-Open) - Default:**
 ```
@@ -163,13 +170,13 @@ NAABU_CUSTOM_PORTS = "1-65535"    # Full port range
 
 **Comparison:**
 
-| Aspect | SYN (`-s s`) | CONNECT (`-s c`) |
+| Aspect | SYN (`-scan-type s`) | CONNECT (`-scan-type c`) |
 |--------|--------------|------------------|
 | Packets sent | 2 (SYN, RST) | 6+ (full handshake) |
 | Speed | ⚡ Faster | 🐢 Slower |
 | Stealth | 🥷 Stealthier | 👀 Easily detected |
 | Application logging | ❌ Usually not | ✅ Logged |
-| Requires root | ✅ Yes | ❌ No |
+| Requires raw sockets | ✅ Yes | ❌ No |
 
 ### Performance Settings
 
@@ -178,7 +185,7 @@ NAABU_CUSTOM_PORTS = "1-65535"    # Full port range
 | `NAABU_RATE_LIMIT` | `int` | `1000` | Packets per second |
 | `NAABU_THREADS` | `int` | `25` | Concurrent threads |
 | `NAABU_TIMEOUT` | `int` | `10000` | Timeout per port (ms) |
-| `NAABU_RETRIES` | `int` | `3` | Retries for failed probes |
+| `NAABU_RETRIES` | `int` | `1` | Retries for failed probes |
 
 **Recommended Settings:**
 
@@ -193,11 +200,11 @@ NAABU_CUSTOM_PORTS = "1-65535"    # Full port range
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `NAABU_EXCLUDE_CDN` | `bool` | `True` | Skip non-standard ports on CDN hosts |
-| `NAABU_DISPLAY_CDN` | `bool` | `True` | Show CDN information in output |
-| `NAABU_SKIP_HOST_DISCOVERY` | `bool` | `True` | Assume all hosts are up |
-| `NAABU_VERIFY_PORTS` | `bool` | `True` | Extra TCP check to verify ports |
-| `NAABU_PASSIVE_MODE` | `bool` | `False` | Use Shodan InternetDB (no active scan) |
+| `NAABU_EXCLUDE_CDN` | `bool` | `False` | Skip non-standard ports on CDN hosts (`-exclude-cdn`) |
+| `NAABU_DISPLAY_CDN` | `bool` | `True` | Show CDN information in output (`-cdn`) |
+| `NAABU_SKIP_HOST_DISCOVERY` | `bool` | `True` | Assume all hosts are up (`-Pn`) |
+| `NAABU_VERIFY_PORTS` | `bool` | `True` | Extra TCP check to verify ports (`-verify`) |
+| `NAABU_PASSIVE_MODE` | `bool` | `False` | Use Shodan InternetDB, no active scan (`-passive`) |
 
 ---
 
@@ -230,14 +237,14 @@ With CDN Exclusion (NAABU_EXCLUDE_CDN = True):
 
 | Setting | Behavior |
 |---------|----------|
-| `True` (default) | Only scan 80/443 on CDN hosts, skip other ports |
-| `False` | Scan all ports (includes CDN infrastructure noise) |
+| `True` | Only scan 80/443 on CDN hosts, skip other ports |
+| `False` (default) | Scan all ports (includes CDN infrastructure noise) |
 
 ---
 
 #### `NAABU_DISPLAY_CDN` - CDN Detection Display
 
-Shows which CDN provider protects each host in the output.
+Shows which CDN provider protects each host in the output: `cdn` is Naabu's `cdn-name`, and `is_cdn` is true when Naabu reported a CDN at all.
 
 ```json
 {
@@ -253,6 +260,14 @@ Shows which CDN provider protects each host in the output.
 - Cloudflare, Akamai, Fastly, AWS CloudFront
 - Google Cloud CDN, Azure CDN, Incapsula
 - MaxCDN, KeyCDN, StackPath, and more
+
+Naabu's flag is one of several that reach `IP.is_cdn`: tlsx adds a CDN named
+by a certificate issuer, httpx its own `-cdn` result, and IP attribution a
+shared edge it recognised from a published prefix, a response header or an
+edge-only ASN (`cdn_source` names the tool when it was not naabu; none of them
+ever clears the flag). A cloud label (`aws`, `google`) is not a shared edge.
+The attribution itself is `IP.ownership` (see README.RECON.md, "IP
+attribution"): later modules read that tag rather than `is_cdn`.
 
 ---
 
@@ -379,66 +394,108 @@ When `NAABU_EXCLUDE_CDN = True`:
 - Reduces false positives from CDN edge servers
 - Still reports CDN detection in output
 
+### How an IP gets its CDN tag (`IP.is_cdn`, `cdn_name`, `cdn_source`)
+
+Three scanners can say an IP is a CDN edge, and all three reach the graph:
+
+| Source | When | Graph write |
+|---|---|---|
+| naabu `-cdn` | GROUP 3, port scan | `update_graph_from_port_scan` sets `is_cdn` / `cdn_name` from `port_scan.by_ip` and `port_scan.by_host` (no `cdn_source`) |
+| httpx `-cdn` | GROUP 4, per URL | on the `Endpoint` (`is_cdn`, `cdn`); readers that need an IP's tag also read `http_probe.by_url` |
+| tlsx certificate issuer | GROUP 3.6 | `_attribute_cdn` (`recon/main_recon_modules/tls_scan.py`) fills a **blank** tag on `port_scan.by_ip` from the issuer (Cloudflare, Akamai, Fastly, Sucuri, Incapsula/Imperva; never Amazon, since ACM certificates sit on real origins) and lists those IPs in the tlsx payload as `cdn_by_ip` |
+
+The port graph write runs **before** tlsx in a full run, so the tlsx graph writer
+(`update_graph_from_tlsx`) carries its own tag: for each IP in `cdn_by_ip` it
+sets `is_cdn = true`, fills a blank `cdn_name`, and stamps `cdn_source = 'tlsx'`
+unless another tool tagged the IP first. It MATCHes the tenant-scoped IP (never
+creates one) and never writes `is_cdn = false`.
+
+Partial runs rebuild `port_scan` from the graph (`_build_port_scan_data_from_graph`)
+and carry each IP's existing `is_cdn` / `cdn_name`, so the port write a partial
+tlsx, httpx or nmap run makes does not reset a tagged IP to false.
+
+**One CDN list.** `recon/helpers/cdn_ranges.py` is the single source every module
+reads for "is this a CDN edge?": edge prefixes for Cloudflare, Fastly, CloudFront,
+Azure Front Door, Imperva and Sucuri (static, `recon/helpers/cdn_edge_prefixes.py`,
+each list with its source and retrieval date; nothing is fetched at run time
+except the optional live Cloudflare list `is_cloudflare_ip` already used), the
+edge ASNs (Cloudflare, Fastly, Akamai, Imperva, Sucuri; never a generic cloud
+ASN), the certificate-issuer markers and the edge response-header signatures.
+Origin discovery, `ip_filter` (Shodan, Netlas, Uncover, the OSINT enrichers),
+security checks and vhost/SNI import it. Akamai has no prefix list: ARIN shows
+compute (`AKAMAI-COMPUTE`, Linode) reassignments inside its CDN blocks, so a
+prefix cannot tell an Akamai edge from a customer's server.
+
 ---
 
 ## Architecture & Flow
 
-> **Pipeline context:** Port scanning runs in **GROUP 3** of the parallelized recon pipeline, concurrently with Shodan enrichment via `ThreadPoolExecutor`. The `run_port_scan_isolated()` function accepts a read-only snapshot of recon data and returns only the port scan results, making it thread-safe for parallel execution.
+> **Pipeline context:** Port scanning runs in **GROUP 3** of the recon pipeline (`recon/main.py`), in one `ThreadPoolExecutor` with Shodan enrichment: `run_port_scan_isolated()` and `run_masscan_scan_isolated()` each run on a shallow copy of the combined result and return only their own payload (`port_scan`, `masscan_scan`). After the fan-in, `merge_port_scan_results()` folds `masscan_scan` into `port_scan`, the results are saved, and `update_graph_from_port_scan` writes them to the graph in the background. Nmap (GROUP 3.5) and tlsx (GROUP 3.6) then read the merged `port_scan`.
 
-### Execution Flow
+### Execution Flow (`run_port_scan`)
 
 ```
-1. INITIALIZATION
-   └── Check Docker availability
-   └── Pull Naabu image if needed
+1. PRECHECKS
+   └── NAABU_ENABLED off → return unchanged
+   └── is_docker_installed() / is_docker_running()
+   └── pull_naabu_docker_image() pulls the image if it is missing
 
-2. TARGET EXTRACTION
-   └── Parse recon_data JSON
-   └── Extract unique IPs from DNS records
-   └── Extract hostnames/subdomains
-   └── Build IP-to-hostname mapping
+2. TARGET EXTRACTION  (extract_targets_from_recon)
+   └── dns.domain: the scan root and its IPs, only when the root is a target
+       (recon_scope(...).include_root)
+   └── dns.subdomains: every subdomain with records, and its IPv4/IPv6 IPs
+   └── Build the IP-to-hostnames mapping
+   └── Target list = the hostnames followed by the IPs
 
 3. SCAN EXECUTION
-   └── Create targets file (hostnames preferred over IPs)
-   └── Build Naabu Docker command
-   └── Execute with JSON Lines output
-   └── Monitor progress
+   └── Write targets.txt in a per-run dir /tmp/redamon/.naabu_temp_<id>
+       (/tmp/redamon is the same path on the host, so no translation;
+        get_host_path() maps /app/recon/output via HOST_RECON_OUTPUT_PATH)
+   └── build_naabu_command() → docker run ... -json
+   └── Run with a 30-minute timeout
+   └── SYN run crashed, failed or found nothing → retry once as CONNECT
 
-4. RESULT PROCESSING
-   └── Parse JSONL output line by line
-   └── Group results by host and IP
-   └── Map ports to service names
-   └── Calculate statistics
+4. RESULT PROCESSING  (parse_naabu_output)
+   └── Parse the JSON Lines output line by line
+   └── Group results by host and by IP (a bare IP with no host is keyed by the IP)
+   └── Map ports to service names (get_service_name_friendly)
+   └── Annotate AI-catalogue ports (_annotate_ai_port_catalog)
+   └── Calculate summary statistics
 
-5. DATA ENRICHMENT
-   └── Add "naabu" section to recon_data
-   └── Save incrementally to JSON file
-   └── Generate summary statistics
+5. RESULT
+   └── recon_data["port_scan"] = {scan_metadata, by_host, by_ip, all_ports,
+                                  ip_to_hostnames, summary}
+   └── Written to output_file only when one is passed (the pipeline passes
+       none and saves after the fan-in)
+   └── The temp dir is removed
 ```
 
 ### Docker Command Structure
 
+What `build_naabu_command()` produces with the default settings:
+
 ```bash
 docker run --rm \
   --net=host \                              # Required for SYN scans
-  -v /targets:/targets:ro \
-  -v /output:/output \
+  -v /tmp/redamon/.naabu_temp_<id>:/targets:ro \
+  -v /tmp/redamon/.naabu_temp_<id>:/output \
   projectdiscovery/naabu:latest \
   -list /targets/targets.txt \
   -o /output/naabu_output.json \
   -json \
   -silent \
-  -top-ports 1000 \
+  -top-ports 1000 \                         # -p <ports> when NAABU_CUSTOM_PORTS is set
   -scan-type s \
   -rate 1000 \
   -c 25 \
   -timeout 10000 \
-  -retries 3 \
-  -cdn \                                    # Display CDN
-  # -sD not used (not yet implemented in naabu)
-  -Pn \                                     # Skip host discovery
-  -verify                                   # Verify ports
+  -retries 1 \
+  -cdn \                                    # NAABU_DISPLAY_CDN
+  -Pn \                                     # NAABU_SKIP_HOST_DISCOVERY
+  -verify                                   # NAABU_VERIFY_PORTS
 ```
+
+`-exclude-cdn` and `-passive` are added when `NAABU_EXCLUDE_CDN` and `NAABU_PASSIVE_MODE` are on.
 
 ---
 
@@ -448,25 +505,26 @@ docker run --rm \
 
 ```json
 {
-  "naabu": {
+  "port_scan": {
     "scan_metadata": {
       "scan_timestamp": "2024-01-15T12:00:00.000000",
       "scan_duration_seconds": 45.2,
       "docker_image": "projectdiscovery/naabu:latest",
       "scan_type": "syn",
+      "scan_type_fallback": false,
       "ports_config": "top-1000",
       "rate_limit": 1000,
       "passive_mode": false,
       "proxy_used": false,
       "total_targets": 15,
-      "cdn_exclusion": true
+      "cdn_exclusion": false
     },
-    
+
     "by_host": {
       "example.com": {
         "host": "example.com",
         "ip": "93.184.216.34",
-        "ports": [80, 443, 8080],
+        "ports": [80, 443, 11434],
         "port_details": [
           {
             "port": 80,
@@ -479,9 +537,14 @@ docker run --rm \
             "service": "https"
           },
           {
-            "port": 8080,
+            "port": 11434,
             "protocol": "tcp",
-            "service": "http-proxy"
+            "service": "ollama",
+            "ai_service": {
+              "name": "ollama",
+              "category": "ai-runtime",
+              "detected_by": "naabu-ai-port"
+            }
           }
         ],
         "cdn": null,
@@ -496,37 +559,44 @@ docker run --rm \
         "is_cdn": true
       }
     },
-    
+
     "by_ip": {
       "93.184.216.34": {
         "ip": "93.184.216.34",
         "hostnames": ["example.com", "www.example.com"],
-        "ports": [80, 443, 8080],
+        "ports": [80, 443, 11434],
         "cdn": null,
         "is_cdn": false
       }
     },
-    
-    "all_ports": [22, 80, 443, 3306, 8080],
-    
+
+    "all_ports": [22, 80, 443, 3306, 11434],
+
     "ip_to_hostnames": {
       "93.184.216.34": ["example.com", "www.example.com"]
     },
-    
+
     "summary": {
       "hosts_scanned": 15,
       "ips_scanned": 12,
       "hosts_with_open_ports": 10,
       "total_open_ports": 45,
-      "unique_ports": [22, 80, 443, 3306, 8080],
+      "unique_ports": [22, 80, 443, 3306, 11434],
       "unique_port_count": 5,
-      "cdn_hosts": 3
+      "cdn_hosts": 3,
+      "ai_ports_annotated": 1
     }
   }
 }
 ```
 
+- `scan_type` is the type that actually ran; `scan_type_fallback` is true when a SYN scan was retried as CONNECT.
+- `ai_service` appears only on ports the AI port catalogue (`recon/helpers/ai_signal_catalog.py`) knows. Ports the catalogue marks ambiguous (e.g. 8000, 8080) are not annotated here.
+- When Masscan also ran, `merge_port_scan_results()` adds its hosts, ports and hostnames, sets `scan_metadata.scanners` to `["naabu", "masscan"]`, and recomputes `summary` (without `ai_ports_annotated`). When only Masscan ran, its payload becomes `port_scan` as it is.
+
 ### Service Name Mapping
+
+`get_service_name_friendly()` (`recon/helpers/iana_services.py`) checks a short list of friendly overrides, then the IANA registry bundled as `recon/data/iana-services.csv`. Some common results:
 
 | Port | Service |
 |------|---------|
@@ -534,14 +604,14 @@ docker run --rm \
 | 22 | ssh |
 | 23 | telnet |
 | 25 | smtp |
-| 53 | dns |
+| 53 | domain |
 | 80 | http |
 | 110 | pop3 |
 | 143 | imap |
 | 443 | https |
 | 445 | microsoft-ds |
 | 3306 | mysql |
-| 3389 | ms-wbt-server |
+| 3389 | rdp |
 | 5432 | postgresql |
 | 6379 | redis |
 | 8080 | http-proxy |
@@ -552,33 +622,28 @@ docker run --rm \
 
 ## Usage Examples
 
-### Basic Usage (via main.py)
+### Basic Usage (full pipeline)
 
-```python
-# Include "port_scan" in SCAN_MODULES in project settings
-SCAN_MODULES = ["initial_recon", "naabu", "httpx", "nuclei"]
+The port-scan phase runs when the project's scan modules include `port_scan` (they do by default) and at least one of `NAABU_ENABLED` / `MASSCAN_ENABLED` is on. Start a recon scan from the webapp; the orchestrator spawns the recon container, which runs `recon/main.py` with the project's settings.
 
-# Run the full pipeline
-python3 recon/main.py
-```
+### Partial Recon
+
+`recon/partial_recon_modules/port_scanning.py` runs one scanner on demand (`run_naabu`, `run_masscan`) against the graph's IPs and subdomains and any targets the user typed in, and writes the result with `update_graph_from_port_scan`.
 
 ### Standalone Enrichment
 
 ```python
-from naabu_scan import enrich_recon_file
+from recon.main_recon_modules.port_scan import enrich_recon_file
 from pathlib import Path
 
 enriched = enrich_recon_file(Path("output/recon_example.com.json"))
 ```
 
-### Command Line
-
-```bash
-# Enrich an existing recon file
-python3 recon/naabu_scan.py output/recon_example.com.json
-```
+`enrich_recon_file()` loads the settings with `get_settings()` (the project's settings when `PROJECT_ID` and `WEBAPP_API_URL` are set, `DEFAULT_SETTINGS` otherwise), runs `run_port_scan()` and writes the result back to the same file.
 
 ### Configuration Profiles
+
+Values to enter in the project settings (shown as runtime keys):
 
 **Quick Scan (Fast):**
 ```python
@@ -618,26 +683,19 @@ NAABU_TIMEOUT = 5000
 
 ### Common Issues
 
-#### "Docker not found"
+#### "[!][Naabu] Docker is not installed" / "Docker daemon is not running"
 
-```bash
-# Install Docker
-sudo apt install docker.io  # Debian/Ubuntu
+Naabu runs through the host's Docker daemon. Check that Docker is running on the host (`docker info`) and that the recon container can reach it.
 
-# Start Docker daemon
-sudo systemctl start docker
-sudo systemctl enable docker
-```
+#### SYN scan fails or crashes
 
-#### "Permission denied" for SYN scan
+The module handles this by itself: it retries once with a CONNECT scan and logs `Retrying with CONNECT scan...`. `scan_metadata.scan_type_fallback` is then true. To skip the SYN attempt altogether:
 
-```bash
-# Option 1: Run with sudo
-sudo python3 recon/main.py
-
-# Option 2: Use CONNECT scan (no root needed)
+```python
 NAABU_SCAN_TYPE = "c"
 ```
+
+Masscan has no fallback: `Permission denied — masscan requires root or CAP_NET_RAW` means it could not open a raw socket.
 
 #### "No open ports found"
 
@@ -651,7 +709,7 @@ Solutions:
 # Reduce rate limit
 NAABU_RATE_LIMIT = 100
 
-# Disable CDN exclusion to see all ports
+# Make sure CDN exclusion is off to see all ports
 NAABU_EXCLUDE_CDN = False
 
 # Try passive mode
@@ -659,6 +717,8 @@ NAABU_PASSIVE_MODE = True
 ```
 
 #### Scan too slow
+
+A Naabu or Masscan run is stopped after 30 minutes.
 
 ```python
 # Increase performance
@@ -688,8 +748,8 @@ docker run --rm --net=host \
 
 | Risk | Mitigation |
 |------|------------|
-| Rate limiting/bans | Reduce `NAABU_RATE_LIMIT` |
-| IDS/IPS detection | Use CONNECT mode, lower rate |
+| Rate limiting/bans | Reduce `NAABU_RATE_LIMIT`, or set the engagement ceiling (`ROE_GLOBAL_MAX_RPS`) |
+| IDS/IPS detection | Use CONNECT mode, lower rate, or stealth mode |
 | CDN blocking | Use `NAABU_EXCLUDE_CDN = True` |
 | Detection | Reduce rate limit |
 
@@ -710,7 +770,8 @@ NAABU_EXCLUDE_CDN = True
 |---------|---------|
 | Docker | Container runtime for Naabu |
 | `projectdiscovery/naabu:latest` | Naabu Docker image (auto-pulled) |
-| Python 3.8+ | Script runtime |
+| `masscan` | Native binary built from source in `recon/Dockerfile` |
+| Python 3.11 | The recon image's runtime |
 
 ---
 
@@ -726,7 +787,7 @@ NAABU_EXCLUDE_CDN = True
 
 ## Overview
 
-The `masscan_scan.py` module integrates Robert David Graham's Masscan — the fastest Internet port scanner — into RedAmon's reconnaissance pipeline. Masscan runs as a native binary built from source inside the recon container (not Docker-in-Docker). Both Masscan and Naabu are enabled by default and run in parallel; results are merged and deduplicated automatically.
+The `masscan_scan.py` module integrates Robert David Graham's Masscan — the fastest Internet port scanner — into RedAmon's reconnaissance pipeline. Masscan runs as a native binary built from source inside the recon container (not Docker-in-Docker). Masscan is **off** by default (`MASSCAN_ENABLED = False`); when it is on, it runs in parallel with Naabu and the results are merged and deduplicated automatically.
 
 ### Masscan vs Naabu
 
@@ -736,9 +797,10 @@ The `masscan_scan.py` module integrates Robert David Graham's Masscan — the fa
 | **Best for** | Large CIDR ranges, bulk IP scanning | Hostname-based scanning, CDN detection |
 | **CDN Detection** | No | Built-in |
 | **Passive Mode** | No | Yes (Shodan InternetDB) |
+| **CONNECT fallback** | No (SYN only) | Yes |
 | **Execution** | Native binary | Docker container |
 | **Banner Grabbing** | Optional (`--banners`) | No |
-| **Output Format** | NDJSON (`-oD`) | JSON |
+| **Output Format** | NDJSON (`-oD`) | JSON Lines |
 
 ### How It Works
 
@@ -754,30 +816,38 @@ The `masscan_scan.py` module integrates Robert David Graham's Masscan — the fa
                                                   └─────────────────┘
 ```
 
+`run_masscan_scan()`:
+
+1. Skips when `MASSCAN_ENABLED` is off or `is_masscan_installed()` finds no binary.
+2. Picks the targets. In IP mode it takes `metadata.expanded_ips` (which may hold CIDRs) and `metadata.ip_to_hostname`, replacing each mock hostname (`10-0-0-1` for an IP with no PTR record, `_is_mock_hostname`) with the IP itself. Otherwise `resolve_targets_to_ips()` collects the IPs of the scan root (only when it is a target) and of every subdomain with records.
+3. Writes `targets.txt` in a temp dir, runs the command from `build_masscan_command()` with a 30-minute timeout, and parses the NDJSON with `parse_masscan_output()`: only `status` records with `open` count, `banner` records are skipped, and each port is filed under every hostname mapped to its IP (or under the IP when there is none).
+4. Stores the result as `recon_data["masscan_scan"]`, with the same `by_host` / `by_ip` / `all_ports` / `ip_to_hostnames` / `summary` shape as Naabu (CDN fields are always empty) and a `scan_metadata` of `scanner`, `scan_timestamp`, `scan_duration_seconds`, `scan_type` (`syn`), `ports_config`, `rate_limit`, `banners_enabled` and `total_targets`.
+
 **Pipeline integration:** Masscan runs in the same `ThreadPoolExecutor` as Naabu (GROUP 3 fan-out). After both complete, `merge_port_scan_results()` combines their output into the unified `port_scan` key, deduplicating by host+port. Downstream modules (httpx, Nuclei, graph DB) consume `port_scan` unchanged.
 
 ---
 
 ## Configuration Parameters
 
-All parameters are configured via the webapp project settings or as defaults in `project_settings.py`:
+All parameters are set in the webapp project settings; `recon/project_settings.py` holds the fallback defaults:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `MASSCAN_ENABLED` | `bool` | `True` | Enable/disable Masscan |
+| `MASSCAN_ENABLED` | `bool` | `False` | Enable/disable Masscan |
 | `MASSCAN_TOP_PORTS` | `str` | `"1000"` | Top N ports ("100", "1000", "full") |
 | `MASSCAN_CUSTOM_PORTS` | `str` | `""` | Custom ports (overrides TOP_PORTS) |
-| `MASSCAN_RATE` | `int` | `1000` | Packets per second |
+| `MASSCAN_RATE` | `int` | `1000` | Packets per second (capped by the engagement ceiling) |
 | `MASSCAN_BANNERS` | `bool` | `False` | Capture service banners |
 | `MASSCAN_WAIT` | `int` | `10` | Seconds to wait for late responses |
 | `MASSCAN_RETRIES` | `int` | `1` | Retry attempts |
-| `MASSCAN_EXCLUDE_TARGETS` | `str` | `""` | Comma-separated IPs/CIDRs to exclude |
+| `MASSCAN_EXCLUDE_TARGETS` | `str` | `""` | Comma-separated IPs/CIDRs to exclude (written to an `--excludefile`) |
+| `MASSCAN_AI_PORT_CATALOG_ENABLED` | `bool` | `True` | Annotate Masscan's ports that match the AI port catalogue (`detected_by: masscan-ai-port`) |
 
 **Port Examples:**
 ```python
 MASSCAN_TOP_PORTS = "100"              # Top 100 ports
 MASSCAN_TOP_PORTS = "1000"             # Top 1000 ports (default)
-MASSCAN_TOP_PORTS = "full"             # All 65535 ports
+MASSCAN_TOP_PORTS = "full"             # All ports (-p 0-65535)
 MASSCAN_CUSTOM_PORTS = "80,443,8080"   # Specific ports
 MASSCAN_CUSTOM_PORTS = "8080-8090"     # Port range
 ```
@@ -796,7 +866,16 @@ MASSCAN_CUSTOM_PORTS = "8080-8090"     # Port range
 
 ## Stealth Mode Behavior
 
-In stealth mode, Masscan is **disabled** (active SYN scanning generates significant network traffic). Naabu switches to passive mode (Shodan InternetDB queries).
+Stealth mode (`STEALTH_MODE`) applies the stealth values the settings registry declares. For port scanning:
+
+| Key | Stealth value |
+|-----|---------------|
+| `MASSCAN_ENABLED` | `False` (active SYN scanning generates significant traffic) |
+| `NAABU_PASSIVE_MODE` | `True` (Shodan InternetDB queries) |
+| `NAABU_SCAN_TYPE` | `"c"` |
+| `NAABU_RATE_LIMIT` | `10` |
+| `NAABU_THREADS` | `1` |
+| `NAABU_SKIP_HOST_DISCOVERY` | `True` |
 
 ---
 
@@ -804,8 +883,3 @@ In stealth mode, Masscan is **disabled** (active SYN scanning generates signific
 
 - [Masscan GitHub](https://github.com/robertdavidgraham/masscan)
 - [Masscan Usage Guide](https://github.com/robertdavidgraham/masscan#usage)
-
----
-
-*Documentation updated for RedAmon v3.1 - Port Scanning Module (Masscan + Naabu)*
-

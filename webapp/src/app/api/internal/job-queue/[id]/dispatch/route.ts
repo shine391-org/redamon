@@ -13,8 +13,13 @@
  *   5. no agent running when kind=full_recon (C-5): defer, blockedCode=agent_running.
  *   6. then the same start path the button uses (lib/startScan.ts, R2).
  *
- * A temporary start failure (RAM/hard/activation/409) returns the row to 'queued'
- * with a backoff; a permanent one fails it.
+ * A capacity wait (RAM/hard/activation/409) returns the row to 'queued' on a short
+ * recheck without spending an attempt. A transient refusal (an answered 5xx, a
+ * freeze failure) is retried with backoff, spending one; a permanent one fails it.
+ * A start whose outcome is unknown (the orchestrator did not answer) is never
+ * retried blindly: a full recon adopts the scan the orchestrator reports as just
+ * started, or requeues when nothing started; any other kind waits for a person
+ * (needs_review). A throw spends an attempt too, so it cannot retry every tick.
  */
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
@@ -24,8 +29,109 @@ import { currentFingerprintFor } from '@/lib/jobFingerprint'
 import { classifyStartFailure, isCapacityWait } from '@/lib/scanStartOutcome'
 import { dispatchStart, stopScan } from '@/lib/startScan'
 import { checkAgentSessions, describeAgentSessionState } from '@/lib/agentSessions'
+import { orchestratorFetch } from '@/lib/orchestrator'
 
 export const runtime = 'nodejs'
+
+const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
+const UNKNOWN_START_REASON = 'the orchestrator did not answer; check whether the scan started'
+const LIVE_RECON_STATUSES = new Set(['starting', 'running', 'paused'])
+
+type QueueRow = NonNullable<Awaited<ReturnType<typeof prisma.jobQueue.findUnique>>>
+
+/** The orchestrator's full-recon state for the project, or null when unreadable. */
+async function readReconStatus(projectId: string): Promise<{ status?: string; started_at?: string | null } | null> {
+  try {
+    const res = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/status`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+/** Back to 'queued' after a backoff, spending an attempt; 'failed' once they run out. */
+async function retryOrFail(row: QueueRow, blockedCode: string, reason: string) {
+  const attempts = row.attempts + 1
+  if (attempts < row.maxAttempts) {
+    await prisma.jobQueue.updateMany({
+      where: { id: row.id, status: 'dispatching' },
+      data: {
+        status: 'queued',
+        attempts,
+        blockedCode,
+        blockedReason: reason,
+        notBefore: new Date(Date.now() + nextBackoff(attempts)),
+      },
+    })
+    return NextResponse.json({ ok: false, blocked: blockedCode, temporary: true })
+  }
+  await prisma.jobQueue.updateMany({
+    where: { id: row.id, status: 'dispatching' },
+    data: {
+      status: 'failed',
+      attempts,
+      error: `gave up after ${attempts} attempts: ${reason}`,
+      blockedCode,
+      blockedReason: reason,
+      finishedAt: new Date(),
+    },
+  })
+  return NextResponse.json({ ok: false, failed: true, error: reason }, { status: 200 })
+}
+
+async function needsReviewUnknown(row: QueueRow, scanJobId: string | null) {
+  await prisma.jobQueue.updateMany({
+    where: { id: row.id, status: 'dispatching' },
+    data: {
+      status: 'needs_review',
+      blockedCode: 'start_unknown',
+      blockedReason: UNKNOWN_START_REASON,
+      scanJobId,
+    },
+  })
+  return NextResponse.json({ ok: false, needsReview: true, blocked: 'start_unknown' })
+}
+
+/**
+ * The orchestrator did not answer the start, so a scan may be running. A blind
+ * retry of a full recon would wait as busy and then start a SECOND one (another
+ * freeze, another graph wipe). A full recon runs one container per project, so
+ * its status settles it: a scan that started after this claim is this job's, and
+ * is adopted; nothing live means nothing started. Other kinds can run in
+ * parallel, so only a person can tell.
+ */
+async function resolveUnknownStart(row: QueueRow, scanJobId: string | null, claimedAt: Date) {
+  if (row.kind !== 'full_recon') return needsReviewUnknown(row, scanJobId)
+  const live = await readReconStatus(row.projectId)
+  if (!live) return needsReviewUnknown(row, scanJobId)
+
+  if (LIVE_RECON_STATUSES.has(String(live.status))) {
+    const started = live.started_at ? new Date(live.started_at) : null
+    if (!started || Number.isNaN(started.getTime())) return needsReviewUnknown(row, scanJobId)
+    if (started.getTime() < claimedAt.getTime()) {
+      return retryOrFail(row, 'transient', 'another full recon was already running when this job started')
+    }
+    const now = new Date()
+    await prisma.jobQueue.updateMany({
+      where: { id: row.id, status: 'dispatching' },
+      data: {
+        status: 'running', blockedCode: '', blockedReason: '', error: '',
+        scanJobId, dispatchedAt: now, startedAt: now,
+      },
+    })
+    // startFullScan recorded the attempt as failed ("start outcome unknown");
+    // the scan did start, and the reconcile closes this row like any other.
+    if (scanJobId) {
+      await prisma.scanJob.updateMany({
+        where: { id: scanJobId, status: 'failed' },
+        data: { status: 'running', finishedAt: null, ramReason: null },
+      })
+    }
+    return NextResponse.json({ ok: true, adopted: true, scanJobId })
+  }
+  return retryOrFail(row, 'transient', 'the orchestrator did not answer and no scan started')
+}
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -37,9 +143,10 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   }
 
   const { id } = await params
+  let row: QueueRow | null = null
 
   try {
-    const row = await prisma.jobQueue.findUnique({ where: { id } })
+    row = await prisma.jobQueue.findUnique({ where: { id } })
     if (!row) return NextResponse.json({ error: 'Not found' }, { status: 404 })
     if (row.status !== 'queued') {
       return NextResponse.json({ ok: false, skipped: row.status }, { status: 409 })
@@ -53,6 +160,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     if (claim.count === 0) {
       return NextResponse.json({ ok: false, skipped: 'already-claimed' }, { status: 409 })
     }
+    const claimedAt = new Date()
 
     // 3. One job per project (C-12): any OTHER row dispatching/running for this
     // project means we must wait. Revert our claim and defer with a reason.
@@ -161,13 +269,21 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ ok: true, runId: result.runId ?? '', scanJobId: result.scanJobId ?? null })
     }
 
-    // Failed to start. Temporary -> requeue; permanent -> fail.
+    // Failed to start. Unknown -> resolve; capacity -> recheck; transient ->
+    // backoff; permanent -> fail.
     const cls = classifyStartFailure(result.status, {
       error: result.error,
       limit: result.limit as { limitType?: string } | undefined,
       activationInProgress: result.activationInProgress,
       busy: result.busy,
-    })
+      snapshotFailed: result.snapshotFailed,
+      startOutcome: result.startOutcome,
+      code: result.code,
+    }, { orchestratorAnswered: result.startOutcome !== 'unknown' })
+
+    if (cls.kind === 'unknown') {
+      return await resolveUnknownStart(row, result.scanJobId ?? null, claimedAt)
+    }
 
     // A capacity wait (no memory / concurrency slot / project busy / activation in
     // flight) is not a defect: the job is simply waiting its turn. Requeue on a
@@ -188,30 +304,17 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ ok: false, blocked: cls.blockedCode, temporary: true })
     }
 
-    // A non-capacity temporary (an unexpected transient error) DOES spend the
+    // A transient refusal (an answered 5xx, a freeze failure) DOES spend the
     // attempt budget and eventually fails, so a job that keeps erroring for a real
     // reason cannot retry forever.
-    const attempts = row.attempts + 1
-    if (cls.temporary && attempts < row.maxAttempts) {
-      await prisma.jobQueue.updateMany({
-        where: { id, status: 'dispatching' },
-        data: {
-          status: 'queued',
-          attempts,
-          blockedCode: cls.blockedCode,
-          blockedReason: cls.reason,
-          notBefore: new Date(Date.now() + nextBackoff(attempts)),
-        },
-      })
-      return NextResponse.json({ ok: false, blocked: cls.blockedCode, temporary: true })
-    }
+    if (cls.temporary) return await retryOrFail(row, cls.blockedCode, cls.reason)
 
     await prisma.jobQueue.updateMany({
       where: { id, status: 'dispatching' },
       data: {
         status: 'failed',
-        attempts,
-        error: cls.temporary ? `gave up after ${attempts} attempts: ${cls.reason}` : cls.reason,
+        attempts: row.attempts + 1,
+        error: cls.reason,
         blockedCode: cls.blockedCode,
         blockedReason: cls.reason,
         finishedAt: new Date(),
@@ -220,13 +323,17 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json({ ok: false, failed: true, error: cls.reason }, { status: 200 })
   } catch (error) {
     console.error('[jobQueue] dispatch failed:', error)
-    // Best-effort: never leave a row stuck in 'dispatching' on an unexpected throw.
-    await prisma.jobQueue
-      .updateMany({ where: { id, status: 'dispatching' }, data: { status: 'queued' } })
-      .catch(() => {})
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    // Never leave a row stuck in 'dispatching', and never retry it on the next
+    // tick for free: a throw that repeats (a version freeze erroring every time)
+    // would otherwise run for ever. It spends an attempt and backs off.
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    if (row) {
+      await retryOrFail(row, 'transient', message).catch(() => {})
+    } else {
+      await prisma.jobQueue
+        .updateMany({ where: { id, status: 'dispatching' }, data: { status: 'queued' } })
+        .catch(() => {})
+    }
+    return NextResponse.json({ error: message }, { status: 500 })
   }
 }

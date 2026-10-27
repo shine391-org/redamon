@@ -1388,7 +1388,8 @@ def _norm_host(value: Any) -> str:
 
 def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[str] = (),
                   host_source: str = "", nuclei_truncated: bool = False, reason: str = "",
-                  entries: Iterable[dict] = (), source_only_hosts: bool = False) -> None:
+                  entries: Iterable[dict] = (), source_only_hosts: bool = False,
+                  aliases: Iterable[str] = ()) -> None:
     """Record, for the run, what ``module`` could not check. Never raises.
 
     ``sources``: finding sources cut as a whole - the prune leaves every one of
@@ -1396,9 +1397,12 @@ def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[s
     only, recorded under ``host_source``. By default an unreachable host is cut
     for every source, since no tool could re-check it; ``source_only_hosts``
     cuts them for ``host_source`` alone, for a host that answered the other
-    tools while this one gave up on it (an nmap host timeout). ``entries``:
-    breaker report entries of a module that writes no findings; recorded as
-    gaps, no prune effect.
+    tools while this one gave up on it (an nmap host timeout). ``aliases``:
+    the other source values the same provider stamps (Shodan writes
+    `shodan_api` or `internetdb`), cut exactly as ``sources`` or
+    ``host_source`` are but listed under their one gap, so the coverage
+    record names the provider once. ``entries``: breaker report entries of a
+    module that writes no findings; recorded as gaps, no prune effect.
     A fault here marks the accumulator broken, which makes the prune fail closed.
     """
     try:
@@ -1408,6 +1412,7 @@ def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[s
             "hosts": sorted({h for h in (_norm_host(x) for x in hosts) if h}),
             "host_source": _token(host_source) or _token(module) or "recon",
             "source_only_hosts": bool(source_only_hosts),
+            "aliases": sorted({_token(a) for a in aliases if _token(a)}),
             "nuclei_truncated": bool(nuclei_truncated),
             "reason": _detail(reason),
             "entries": [
@@ -1446,17 +1451,23 @@ def _aggregate(notes: list[dict]) -> CoverageReport:
 
     for note in notes:
         module = note["module"]
+        aliases = note.get("aliases") or []
         truncated = truncated or note["nuclei_truncated"]
         for source in note["sources"]:
             degraded_sources.add(source)
             _gap(source, module, note["reason"] or "coverage cut")
+        if note["sources"]:
+            degraded_sources.update(aliases)
         if note["hosts"]:
             skipped_hosts.update(note["hosts"])
             if note.get("source_only_hosts"):
-                per_source_hosts.setdefault(note["host_source"], set()).update(note["hosts"])
+                for source in (note["host_source"], *aliases):
+                    per_source_hosts.setdefault(source, set()).update(note["hosts"])
             else:
                 every_source_hosts.update(note["hosts"])
-            _gap(note["host_source"], module, "unreachable host(s) skipped",
+            # A host can be cut for a reason other than being down (js_recon's
+            # file cap): the note's own reason, when it gives one, says which.
+            _gap(note["host_source"], module, note["reason"] or "unreachable host(s) skipped",
                  hosts=len(note["hosts"]))
         if not note["sources"]:
             for entry in note["entries"]:

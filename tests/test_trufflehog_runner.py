@@ -125,7 +125,7 @@ class TestRunnerParsing(RunnerTestCase):
         self.assertEqual(len(found), 2)
         self.assertEqual(runner.stats["total_findings"], 2)
         self.assertEqual(runner.stats["validated"], 1)
-        self.assertEqual(runner.stats["unvalidated"], 1)
+        self.assertEqual(runner.stats["rejected"], 1)
         self.assertEqual(runner.stats["assets_scanned"], 1)
         self.assertEqual(runner.stats["detector_types"], {"AWS": 1, "Slack": 1})
 

@@ -113,6 +113,7 @@ Discover every subdomain that exists and squeeze every possible takeover finding
     // HTTP PROBE -- required inputs for Nuclei takeover pass
     // ============================================================
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxFollowRedirects: true,
     httpxProbeStatusCode: true,
     httpxProbeTitle: true,

@@ -15,6 +15,7 @@ from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
 from recon.helpers.docker_helpers import pull_image_or_use_local
+from recon.helpers.js_recon.urls import is_js_url
 from .form_helpers import parse_forms_from_html
 
 
@@ -80,6 +81,7 @@ def run_katana_crawler(
     print(f"[*][Katana] Allowed hosts: {len(allowed_hosts)} ({', '.join(sorted(allowed_hosts)[:5])}{'...' if len(allowed_hosts) > 5 else ''})")
 
     discovered_urls = set()
+    js_urls = set()
     filtered_out_of_scope = 0
     external_domain_entries = []  # Collect out-of-scope domains for situational awareness
     # Katana exits 0 on a crawl that genuinely found nothing, so an empty result
@@ -92,7 +94,7 @@ def run_katana_crawler(
     valid_urls = [u for u in target_urls if u.startswith(('http://', 'https://'))]
     if not valid_urls:
         print("[!][Katana] No valid HTTP(S) URLs to crawl")
-        return [], {"external_domains": []}
+        return [], {"external_domains": [], "js_urls": []}
 
     print(f"[*][Katana] Target URLs: {len(valid_urls)}")
 
@@ -216,6 +218,12 @@ def run_katana_crawler(
                     except Exception:
                         continue
 
+                    # The exclude list drops /static/, /_next/static and .min.js,
+                    # which is where an app keeps its own bundle; js_recon needs
+                    # those files, so they are handed over before the filter.
+                    if is_js_url(url):
+                        js_urls.add(url)
+
                     # Skip URLs matching exclude patterns
                     url_lower = url.lower()
                     if any(pattern.lower() in url_lower for pattern in exclude_patterns):
@@ -268,7 +276,7 @@ def run_katana_crawler(
                         crawl_failed = True
                     # Everything it printed was filtered by scope or excludes: that
                     # is the crawl working, not an empty result.
-                    if not filtered_out_of_scope:
+                    if not filtered_out_of_scope and not js_urls:
                         from recon.helpers.resource_enum import tool_health
                         tool_health.check_empty(
                             "katana", seeds=len(valid_urls), elapsed_s=elapsed,
@@ -301,7 +309,8 @@ def run_katana_crawler(
     if filtered_out_of_scope > 0:
         print(f"[+][Katana] Filtered {filtered_out_of_scope} out-of-scope URLs")
 
-    return urls_list, {"external_domains": external_domain_entries, "failed": crawl_failed}
+    return urls_list, {"external_domains": external_domain_entries, "failed": crawl_failed,
+                       "js_urls": sorted(js_urls)}
 
 
 def fetch_forms_from_urls(

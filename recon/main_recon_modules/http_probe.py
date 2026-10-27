@@ -231,9 +231,6 @@ def pull_httpx_docker_image(docker_image: str) -> bool:
 # Banner Grabbing for Non-HTTP Services
 # =============================================================================
 
-# HTTP ports that httpx handles (skip these for banner grabbing)
-HTTP_PORTS = {80, 443, 8080, 8443, 8000, 8888, 8008, 3000, 5000, 9000, 9090, 8800}
-
 # Service probes - sent to trigger banner responses
 SERVICE_PROBES = {
     21: b"",              # FTP - sends banner immediately
@@ -262,20 +259,19 @@ SERVICE_PATTERNS = [
     (r"OpenSSH[_\s]*([\d.p]+)", "ssh", lambda m: f"OpenSSH {m.group(1)}"),
     (r"dropbear[_\s]*([\d.]+)?", "ssh", lambda m: f"Dropbear {m.group(1) or ''}".strip()),
     
-    # FTP
-    (r"220[- ].*vsftpd\s*([\d.]+)?", "ftp", lambda m: f"vsFTPd {m.group(1) or ''}".strip()),
-    (r"220[- ].*ProFTPD\s*([\d.]+)?", "ftp", lambda m: f"ProFTPD {m.group(1) or ''}".strip()),
-    (r"220[- ].*Pure-FTPd", "ftp", lambda m: "Pure-FTPd"),
-    (r"220[- ].*FileZilla", "ftp", lambda m: "FileZilla FTP"),
-    (r"220[- ].*Microsoft FTP", "ftp", lambda m: "Microsoft FTP"),
-    (r"220[- ]", "ftp", lambda m: "FTP"),
-    
-    # SMTP
-    (r"220[- ].*Postfix", "smtp", lambda m: "Postfix"),
-    (r"220[- ].*Sendmail", "smtp", lambda m: "Sendmail"),
-    (r"220[- ].*Exim\s*([\d.]+)?", "smtp", lambda m: f"Exim {m.group(1) or ''}".strip()),
-    (r"220[- ].*Microsoft ESMTP", "smtp", lambda m: "Microsoft Exchange"),
-    (r"220[- ].*ESMTP", "smtp", lambda m: "SMTP"),
+    # FTP and SMTP both greet with 220, so the greeting is anchored at the
+    # start and the product decides; a bare 220 is decided by the port in
+    # identify_service (_BARE_220).
+    (r"^220[- ].*vsftpd\s*([\d.]+)?", "ftp", lambda m: f"vsFTPd {m.group(1) or ''}".strip()),
+    (r"^220[- ].*ProFTPD\s*([\d.]+)?", "ftp", lambda m: f"ProFTPD {m.group(1) or ''}".strip()),
+    (r"^220[- ].*Pure-FTPd", "ftp", lambda m: "Pure-FTPd"),
+    (r"^220[- ].*FileZilla", "ftp", lambda m: "FileZilla FTP"),
+    (r"^220[- ].*Microsoft FTP", "ftp", lambda m: "Microsoft FTP"),
+    (r"^220[- ].*Postfix", "smtp", lambda m: "Postfix"),
+    (r"^220[- ].*Sendmail", "smtp", lambda m: "Sendmail"),
+    (r"^220[- ].*Exim\s*([\d.]+)?", "smtp", lambda m: f"Exim {m.group(1) or ''}".strip()),
+    (r"^220[- ].*Microsoft ESMTP", "smtp", lambda m: "Microsoft Exchange"),
+    (r"^220[- ].*ESMTP", "smtp", lambda m: "SMTP"),
     
     # POP3/IMAP
     (r"\+OK.*Dovecot", "pop3", lambda m: "Dovecot POP3"),
@@ -362,6 +358,12 @@ def grab_banner(host: str, port: int, timeout: float = 5.0, use_ssl: bool = Fals
         return None
 
 
+# A greeting that names no product: FTP and SMTP both open with 220.
+_BARE_220 = re.compile(r"220[- ]")
+_SMTP_PORTS = {25, 465, 587, 2525}
+_FTP_PORTS = {21, 990}
+
+
 def identify_service(banner: str, port: int) -> Dict:
     """
     Identify service from banner using pattern matching.
@@ -381,7 +383,13 @@ def identify_service(banner: str, port: int) -> Dict:
                 }
             except:
                 return {"service": service, "version": None, "confidence": "medium"}
-    
+
+    if _BARE_220.match(banner):
+        if port in _SMTP_PORTS:
+            return {"service": "smtp", "version": "SMTP", "confidence": "medium"}
+        if port in _FTP_PORTS or re.search(r"\bftp\b", banner, re.IGNORECASE):
+            return {"service": "ftp", "version": "FTP", "confidence": "medium"}
+
     return {"service": "unknown", "version": None, "banner_hint": banner[:100], "confidence": "low"}
 
 
@@ -448,8 +456,8 @@ def run_banner_grab(recon_data: dict, settings: dict = None) -> Dict:
         ports = host_data.get("ports", [])
 
         for port in ports:
-            # Skip HTTP ports - httpx handles these
-            if port in HTTP_PORTS:
+            # Web ports are httpx's; a plaintext connect there only waits.
+            if port in BANNER_GRAB_SKIP_PORTS:
                 continue
             targets.append((ip, port, hostname))
 
@@ -544,6 +552,9 @@ def run_banner_grab(recon_data: dict, settings: dict = None) -> Dict:
 # Port classification shared by the URL builders below.
 HTTPS_PORTS = {443, 8443, 4443, 9443, 8843}
 HTTP_PORTS = {80, 8080, 8000, 8888, 8008, 3000, 5000, 9000}
+# The ports the banner grab leaves to httpx: every web port above, plus 9090
+# and 8800, common web ports in neither set (httpx tries them over both schemes).
+BANNER_GRAB_SKIP_PORTS = HTTP_PORTS | HTTPS_PORTS | {9090, 8800}
 
 
 def parse_port_spec(spec) -> Set[int]:
@@ -1016,6 +1027,29 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
 # Result Parsing
 # =============================================================================
 
+#: httpx fields (both spellings) that describe the last page of a redirect
+#: chain, dropped when that page is off scope.
+_FOREIGN_PAGE_FIELDS = frozenset({
+    "title", "tech", "technologies", "webserver", "server", "favicon", "hash",
+    "content_type", "content-type", "content_length", "content-length",
+    "words", "word-count", "lines", "line-count", "header", "body",
+    "tls", "tls-grab", "tls_version", "subject_cn", "subject_an", "issuer_org",
+})
+
+
+def _redirect_chain(chain_codes, status_code) -> Optional[List[int]]:
+    """The status of each hop, first to last; one hop when nothing redirected."""
+    chain = []
+    for code in chain_codes or []:
+        try:
+            chain.append(int(code))
+        except (TypeError, ValueError):
+            continue
+    if not chain and isinstance(status_code, int):
+        chain = [status_code]
+    return chain or None
+
+
 def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list = None, settings: dict = None,
                        *, exact: bool = False, include_root: bool = True) -> Dict:
     """
@@ -1069,8 +1103,11 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
             if not url:
                 continue
 
-            # Extract host from URL
+            # `url` is the URL httpx was asked for; with -fr the page it
+            # describes (title, tech, server, favicon, body) is the LAST hop.
             host = extract_host_from_url(url)
+            final_url = entry.get("final_url") or url
+            final_host = extract_host_from_url(final_url)
 
             # Filter URLs outside target scope
             # In filtered mode: only allow specific hosts from SUBDOMAIN_LIST
@@ -1096,6 +1133,26 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
                         })
                     continue
 
+            # The target is live and redirects away: keep the entry, but the
+            # last page is someone else's (a third-party IdP), so nothing it
+            # shows may be credited to the target.
+            redirected_off_scope = bool(root_domain and final_host and not in_scope(final_host))
+            if redirected_off_scope:
+                external_domain_entries.append({
+                    "domain": final_host,
+                    "source": "http_probe_redirect",
+                    "url": final_url,
+                    # Kept above through `input` when `url` is itself the last hop.
+                    "redirect_from_url": url if in_scope(host) else (entry.get("input") or url),
+                    "status_code": entry.get("status_code") or entry.get("status-code"),
+                    "title": entry.get("title"),
+                    "server": entry.get("webserver") or entry.get("server"),
+                })
+                # TLS goes too: Go's client reports the final connection's
+                # certificate. JARM, the IP, CNAME, ASN and CDN are measured on
+                # the requested host and stay.
+                entry = {k: v for k, v in entry.items() if k not in _FOREIGN_PAGE_FIELDS}
+
             # Extract status code (tracking deferred until after by_url dedup)
             status_code = entry.get("status_code") or entry.get("status-code")
 
@@ -1118,6 +1175,14 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
                 "is_cdn": bool(entry.get("cdn") or entry.get("cdn_name")),
                 "asn": entry.get("asn"),
             }
+            # status_code is the LAST hop's: rank on first_status_code.
+            chain = _redirect_chain(entry.get("chain_status_codes"), status_code)
+            url_entry.update({
+                "final_url": final_url,
+                "first_status_code": chain[0] if chain else None,
+                "redirect_chain_codes": chain,
+                "redirected_off_host": bool(final_host and host and final_host.lower() != host.lower()),
+            })
 
             # TLS information
             #
@@ -2025,7 +2090,9 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
             "by_host": results["by_host"],
             "technologies_found": results["technologies_found"],
             "servers_found": results.get("servers_found", {}),
-            "summary": results["summary"]
+            "summary": results["summary"],
+            # Read by main._aggregate_external_domains (ExternalDomain nodes).
+            "external_domains": results.get("external_domains", []),
         }
 
         # Print summary

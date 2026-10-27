@@ -160,6 +160,46 @@ class TestDetectorLabelsGraphLive(unittest.TestCase):
         self.client.set_human_verdict(self.user_a, self.p1, "a2", "likely_noise")
         self.assertEqual(self._labels(self.user_a), {DETECTOR: {"real": 0, "fp": 1}})
 
+    def test_secret_clicks_follow_the_detector_rename_after_one_publish(self):
+        """The secrets query names a js_recon Secret's detector by its pattern
+        (secret_type), not its category (key_type). Clicks a person made under
+        the category key must count under the pattern key once a run has
+        published, or the upgrade silently forgets them."""
+        from cypherfix_triage import score_model as sm
+        from cypherfix_triage.fact_queries import FINDING_QUERIES
+        from triage_layers_live_support import PUBLISH_COMBINE, layer_row
+
+        with self.driver.session() as s:
+            s.run("""
+                UNWIND ['k1', 'k2', 'k3'] AS i
+                CREATE (:Secret {id: i, user_id: $a, project_id: $p1, source: 'js_recon',
+                                 key_type: 'cloud', secret_type: 'AWS Access Key ID',
+                                 matched_text: 'AKIAIOSFODNN7EXAMPLE' + i, severity: 'high',
+                                 updated_at: datetime()})
+                """, a=self.user_a, p1=self.p1)
+
+        def publish(detector_of):
+            query = next(q for q in FINDING_QUERIES if q["name"] == "secrets")["query"]
+            with self.driver.session() as s:
+                found = [dict(r) for r in s.run(query, userId=self.user_a, projectId=self.p1)]
+            self.client.publish_triage_layers(self.user_a, self.p1, [
+                layer_row(row, detector=detector_of(row)) for row in found],
+                PUBLISH_COMBINE, guard_updated_at=False)
+            return found
+
+        # Before the upgrade the run stored the category key.
+        publish(lambda row: "js_recon:cloud")
+        self.client.set_human_verdict(self.user_a, self.p1, "k1", "likely_noise")
+        self.client.set_human_verdict(self.user_a, self.p1, "k2", "likely_noise")
+        self.assertEqual(self._labels(self.user_a).get("js_recon:cloud"), {"real": 0, "fp": 2})
+
+        rows = publish(sm.detector_key)
+        new_key = sm.detector_key(rows[0])
+        self.assertEqual(new_key, "js_recon:aws-access-key-id")
+        labels = self._labels(self.user_a)
+        self.assertEqual(labels.get(new_key), {"real": 0, "fp": 2})
+        self.assertNotIn("js_recon:cloud", labels)
+
     def test_an_imported_owners_decisions_do_not_teach_the_importer(self):
         """C13: an import keeps the previous owner's verdicts on the nodes."""
         self.client.set_human_verdict(self.user_a, self.p1, "a1", "likely_noise",

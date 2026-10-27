@@ -754,67 +754,6 @@ TOOL_WIRING: dict[str, dict[str, str]] = {
     "ai_surface_recon": {"module": "recon.main_recon_modules.ai_surface_recon"},
 }
 
-# tool -> the node labels its output becomes in the graph.
-#
-# Stated so the reverse question can be answered: "which tool has to run before
-# this label appears". A label with no producer is one nothing populates, and a
-# tool that produces nothing is a tool whose output the graph never sees.
-TOOL_PRODUCES: dict[str, list[str]] = {
-    "amass": ["Subdomain"],
-    "arjun": ["Parameter"],
-    "baddns": ["Vulnerability"],
-    "banner_grab": ["Service"],
-    "censys": ["IP", "Port", "Certificate"],
-    "criminalip": ["IP", "Port"],
-    "crtsh": ["Subdomain", "Certificate"],
-    "cve_lookup": ["CVE"],
-    "dns": ["DNSRecord", "Subdomain", "IP"],
-    "ffuf": ["Endpoint"],
-    "fofa": ["IP", "Port", "Technology"],
-    "gau": ["Endpoint", "Parameter"],
-    "github": ["GithubHunt", "GithubRepository", "GithubSecret", "GithubSensitiveFile", "GithubPath"],
-    "graphql": ["Endpoint", "Vulnerability"],
-    "graphql_cop": ["Vulnerability"],
-    "gvm": ["ExploitGvm", "Vulnerability"],
-    "hackertarget": ["Subdomain"],
-    "hakrawler": ["Endpoint"],
-    "httpx": ["BaseURL", "Technology", "Header", "Certificate"],
-    "js_recon": ["JsReconFinding", "Endpoint", "Secret"],
-    "jsluice": ["JsReconFinding", "Endpoint", "Secret"],
-    "katana": ["Endpoint", "Parameter"],
-    "kiterunner": ["Endpoint"],
-    "knockpy": ["Subdomain"],
-    "masscan": ["Port", "Service"],
-    "mitre": ["MitreData", "Capec"],
-    "naabu": ["Port"],
-    "netlas": ["IP", "Port"],
-    "nmap": ["Service", "Vulnerability"],
-    "nuclei": ["Vulnerability"],
-    "origin_discovery": ["IP"],
-    "otx": ["ThreatPulse", "Malware"],
-    "paramspider": ["Parameter"],
-    "puredns": ["Subdomain", "IP"],
-    "security_check": ["Vulnerability"],
-    "shodan": ["IP", "Port", "Service", "CVE"],
-    "subfinder": ["Subdomain"],
-    "subjack": ["Vulnerability"],
-    "supply_chain": ["Package", "MalPackageFinding"],
-    "supply_chain_recon": ["Package", "MalPackageFinding"],
-    "takeover": ["Vulnerability"],
-    "tlsx": ["Certificate", "Service"],
-    "trufflehog": ["MultiscannerScan", "MultiscannerFinding", "Secret"],
-    "uncover": ["IP", "Port"],
-    "urlscan": ["Endpoint", "ExternalDomain"],
-    "vhost_sni": ["Subdomain", "Certificate"],
-    "virustotal": ["Malware", "ExternalDomain"],
-    "wappalyzer": ["Technology"],
-    "web_cache_poison": ["Vulnerability"],
-    "whois": ["Domain"],
-    "zap": ["Endpoint", "Parameter"],
-    "zoomeye": ["IP", "Port"],
-    "agent": ["AttackChain", "ChainStep", "ChainFinding", "ChainDecision", "ChainFailure"],
-}
-
 # tool -> the partial-recon module that re-runs it on demand. A tool with none
 # cannot be re-run from the workflow graph, which is a real product gap rather
 # than an oversight, so null is a legitimate value here.
@@ -828,7 +767,7 @@ PARTIAL_RECON_MODULE: dict[str, str] = {
     # Banner grabbing runs inside the port-scan pass rather than on its own.
     "banner_grab": "port_scanning",
     "nuclei": "vulnerability_scanning",
-    "security_check": "http_probing",
+    "security_check": "vulnerability_scanning",
     "cve_lookup": "vulnerability_scanning",
     "mitre": "vulnerability_scanning",
     "censys": "osint_enrichment",
@@ -853,9 +792,9 @@ PARTIAL_RECON_MODULE: dict[str, str] = {
     "hakrawler": "web_crawling",
     "httpx": "http_probing",
     "js_recon": "js_analysis",
-    "jsluice": "js_analysis",
+    "jsluice": "web_crawling",
     "katana": "web_crawling",
-    "kiterunner": "web_crawling",
+    "kiterunner": "parameter_discovery",
     "knockpy": "subdomain_discovery",
     "masscan": "port_scanning",
     "naabu": "port_scanning",
@@ -869,7 +808,7 @@ PARTIAL_RECON_MODULE: dict[str, str] = {
     "supply_chain_recon": "supply_chain",
     "takeover": "vulnerability_scanning",
     "tlsx": "tlsx_scanning",
-    "vhost_sni": "http_probing",
+    "vhost_sni": "vulnerability_scanning",
     "wappalyzer": "http_probing",
     "web_cache_poison": "cache_scanning",
     "whois": "subdomain_discovery",
@@ -1462,8 +1401,6 @@ def build() -> str:
             entry["partial_recon_module"] = PARTIAL_RECON_MODULE[tool]
         if tool in FORM_SECTION:
             entry["form_section"] = FORM_SECTION[tool]
-        if tool in TOOL_PRODUCES:
-            entry["produces"] = TOOL_PRODUCES[tool]
         tools[tool] = entry
 
     out: list[str] = []
@@ -1487,8 +1424,6 @@ def build() -> str:
                     "partial_recon_module", "form_section"):
             if key in spec:
                 out.append(f"    {key}: {yaml_scalar(spec[key])}")
-        if "produces" in spec:
-            out.append(f"    produces: [{', '.join(yaml_scalar(v) for v in spec['produces'])}]")
     out.append("")
     out.append("fields:")
     for name in sorted(fields):

@@ -7,9 +7,15 @@
  * Network Topology, Recommendations, Appendix.
  */
 
-import type { ReportData, VulnFinding, CveChain, ExploitRecord } from './reportData'
+import type { ReportData, VulnFinding, CveChain, ExploitRecord, JsReconCoverage } from './reportData'
 import { type ScopeGroup, groupLabel, resolveScopeGroups, scopeSummary } from '@/lib/scopeGroups'
 import { projectTargetLabel } from '@/lib/projectSummary'
+import { validationLabel } from '@/lib/secrets/validationStatus'
+import { ownershipLabel } from '@/lib/ipOwnership'
+import {
+  DISPOSITION_LABELS, DISPOSITION_MEANINGS, SCANNER_SEVERITY_LABEL, topBlockers,
+  type DispositionSummary,
+} from '@/lib/triage/disposition'
 
 // ── Narrative types (from LLM summarizer) ──────────────────────────────────
 
@@ -573,16 +579,16 @@ function renderTOC(data: ReportData): string {
     { id: 'attack-surface', label: 'Attack Surface' },
     { id: 'cve-intelligence', label: 'CVE Intelligence' },
   ]
-  if (data.cveIntelligence.githubSecrets.secrets > 0 || data.cveIntelligence.githubSecrets.sensitiveFiles > 0) {
+  if (hasGithubSecretsSection(data)) {
     dynamicSections.push({ id: 'github-secrets', label: 'GitHub Secrets' })
   }
   if (data.trufflehog.totalFindings > 0) {
     dynamicSections.push({ id: 'trufflehog', label: 'Secret Multiscanner Findings' })
   }
-  if (data.secrets.total > 0) {
+  if (hasSecretsSection(data)) {
     dynamicSections.push({ id: 'secrets', label: 'Secret Detection' })
   }
-  if (data.jsRecon.totalFindings > 0) {
+  if (data.jsRecon.totalFindings > 0 || data.jsRecon.coverage?.recorded) {
     dynamicSections.push({ id: 'js-recon', label: 'JavaScript Reconnaissance' })
   }
   if (data.supplyChain && (data.supplyChain.totalPackages > 0 || data.supplyChain.findings.length > 0)) {
@@ -627,15 +633,49 @@ function renderTOC(data: ReportData): string {
 </div>`
 }
 
+const DISPOSITION_BORDER = { reportable: '#16a34a', candidate: '#2563eb', info: '#6b7280' } as const
+
+/**
+ * The report's headline: what is ready to report, what is stuck and why, and
+ * what has no impact. Candidates are grouped by their blocker, the largest
+ * first, so the reader sees what work would turn them into findings.
+ */
+function renderDispositionSummary(d: DispositionSummary): string {
+  const shown = ['reportable', 'candidate', 'info'] as const
+  const cards = shown.map(k =>
+    `<div class="metric-card-sm" style="border-left:3px solid ${DISPOSITION_BORDER[k]}" title="${esc(DISPOSITION_MEANINGS[k])}">` +
+    `<div class="metric-value-sm" data-testid="disposition-${k}">${d[k]}</div>` +
+    `<div class="metric-label-sm">${DISPOSITION_LABELS[k]}</div></div>`).join('')
+  const legend = shown.map(k => `${DISPOSITION_LABELS[k]}: ${DISPOSITION_MEANINGS[k]}`).join(' ')
+  const { top, otherCount, otherBlockers } = topBlockers(d.blockers)
+  const rows = top.map(b => `<tr><td>${esc(b.blocker)}</td><td>${b.count}</td></tr>`).join('') +
+    (otherBlockers > 0
+      ? `<tr><td>${otherBlockers} other blocker${otherBlockers === 1 ? '' : 's'}</td><td>${otherCount}</td></tr>`
+      : '')
+  return `
+  <div data-testid="disposition-summary" style="margin-bottom:12px">
+    <h3 style="margin-top:8px">Can it go in this report?</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">${cards}</div>
+    <p style="font-size:11px;color:#6b7280;margin:6px 0">${esc(legend)}</p>
+    ${d.candidate > 0 && rows ? `<table class="data-table">
+      <thead><tr><th>Candidates by blocker</th><th>Count</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : ''}
+  </div>`
+}
+
 function renderExecutiveSummary(data: ReportData, narrative?: string): string {
   const m = data.metrics
+  // Unreadable or older data keeps the old headline rather than printing zeros.
+  const disposition = data.disposition ?? null
   return `
 <div class="page-break"></div>
 <div class="section" id="executive-summary">
   <h2 class="section-title">1. Executive Summary</h2>
   ${narrative ? `<div class="narrative">${esc(narrative)}</div>` : ''}
+  ${disposition ? renderDispositionSummary(disposition) : ''}
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-    <div class="metric-card-sm" style="border-left:3px solid #6366f1"><div class="metric-value-sm">${m.totalCves + m.totalVulnerabilities}</div><div class="metric-label-sm">Total Findings</div></div>
+    ${disposition ? '' : `<div class="metric-card-sm" style="border-left:3px solid #6366f1"><div class="metric-value-sm">${m.totalCves + m.totalVulnerabilities}</div><div class="metric-label-sm">Total Findings</div></div>`}
     <div class="metric-card-sm" style="border-left:3px solid ${riskScoreColor(m.riskScore)}"><div class="metric-value-sm">${riskScoreBadge(m.riskScore, m.riskLabel)}</div><div class="metric-label-sm">Risk Score</div></div>
     <div class="metric-card-sm"><div class="metric-value-sm">${m.exploitableCount}</div><div class="metric-label-sm">Confirmed Exploits</div></div>
     <div class="metric-card-sm"><div class="metric-value-sm">${m.cvssAverage}</div><div class="metric-label-sm">Avg CVSS</div></div>
@@ -655,7 +695,7 @@ function renderExecutiveSummary(data: ReportData, narrative?: string): string {
       </div>
     </div>
     <div>
-      <h3 style="margin-top:8px">Other Vulnerabilities (${m.totalVulnerabilities})</h3>
+      <h3 style="margin-top:8px">Other Vulnerabilities (${m.totalVulnerabilities}) · ${SCANNER_SEVERITY_LABEL}</h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <div class="metric-card-sm" style="border-left:3px solid #dc2626"><div class="metric-value-sm">${m.criticalCount}</div><div class="metric-label-sm">Critical</div></div>
         <div class="metric-card-sm" style="border-left:3px solid #ea580c"><div class="metric-value-sm">${m.highCount}</div><div class="metric-label-sm">High</div></div>
@@ -668,7 +708,7 @@ function renderExecutiveSummary(data: ReportData, narrative?: string): string {
 </div>`
 }
 
-function renderScope(data: ReportData, narrative?: string): string {
+export function renderScope(data: ReportData, narrative?: string): string {
   const { project, graphOverview } = data
   const p = project as any
   const isIpMode = p.ipMode === true
@@ -709,7 +749,11 @@ function renderScope(data: ReportData, narrative?: string): string {
               const cdn = ip.isCdn && ip.cdnName
                 ? ` <span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:#dbeafe;color:#1d4ed8">${esc(ip.cdnName)}</span>`
                 : ''
-              return `${esc(ip.address)}${cdn}`
+              // An unknown or missing tag says nothing worth a client's attention here.
+              const owner = ip.ownership === 'shared_edge' || ip.ownership === 'dedicated'
+                ? ` <span style="color:#6b7280;font-size:10px">${esc(ownershipLabel(ip.ownership).toLowerCase())}</span>`
+                : ''
+              return `${esc(ip.address)}${cdn}${owner}`
             }).join('<br/>')
           : '<span style="color:#9ca3af;font-style:italic">Unresolved</span>'
         const ports = m.ips.length > 0 ? String(m.openPorts) : '<span style="color:#9ca3af">-</span>'
@@ -735,12 +779,12 @@ function renderScope(data: ReportData, narrative?: string): string {
         const cdn = m.isCdn && m.cdnName
           ? `<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:#dbeafe;color:#1d4ed8">${esc(m.cdnName)}</span>`
           : '<span style="color:#9ca3af">-</span>'
-        return `<tr><td>${esc(m.ip)}</td><td>${esc(m.version || '')}</td><td>${hostnames}</td><td>${cdn}</td><td>${m.openPorts}</td></tr>`
+        return `<tr><td>${esc(m.ip)}</td><td>${esc(m.version || '')}</td><td>${hostnames}</td><td>${cdn}</td><td>${esc(ownershipLabel(m.ownership))}</td><td>${m.openPorts}</td></tr>`
       }).join('')
       mappingTable = `
   <h3>IP Target Map</h3>
   <table class="data-table">
-    <thead><tr><th>IP Address</th><th>Version</th><th>Hostnames</th><th>CDN</th><th>Open Ports</th></tr></thead>
+    <thead><tr><th>IP Address</th><th>Version</th><th>Hostnames</th><th>CDN</th><th>Ownership</th><th>Open Ports</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`
     } else {
@@ -767,6 +811,9 @@ function renderScope(data: ReportData, narrative?: string): string {
   // from AI suggestions, so they are never worded as reviewed one by one.
   const byMultiMute = graphOverview.suppressedByMultiMute ?? 0
   const reviewedOneByOne = Math.max(0, (graphOverview.suppressedByPeople ?? 0) - byMultiMute)
+  // An AI review alone never removes a finding (it reads target-controlled
+  // text), so its line says the finding is still counted.
+  const judged = graphOverview.judged
 
   return `
 <div class="page-break"></div>
@@ -815,6 +862,15 @@ function renderScope(data: ReportData, narrative?: string): string {
               ? ` (${graphOverview.suppressedRules.map(r => `${esc(r.name)}: ${r.count}`).join('; ')})`
               : ''}</td></tr>`
         : ''}
+      ${judged?.personFalsePositive
+        ? `<tr><td>Judged false positive by a person</td><td>${judged.personFalsePositive} finding(s) excluded from this report</td></tr>`
+        : ''}
+      ${judged?.resolved
+        ? `<tr><td>Resolved (fixed, gone, inactive)</td><td>${judged.resolved} finding(s) excluded from this report</td></tr>`
+        : ''}
+      ${judged?.aiFlagged
+        ? `<tr><td>Flagged as likely false positive by AI review</td><td>${judged.aiFlagged} finding(s), still counted in this report</td></tr>`
+        : ''}
     </tbody>
   </table>
   ${roeTable}
@@ -861,7 +917,8 @@ function renderRiskSummary(data: ReportData, narrative?: string): string {
       </table>` : ''}
     </div>
     <div>
-      <h3>Other Vulnerabilities Severity Distribution</h3>
+      <h3>${SCANNER_SEVERITY_LABEL}</h3>
+      <p style="font-size:11px;color:#6b7280;margin:0 0 6px">Other vulnerabilities that are reportable or candidates. Findings with no impact are left out.</p>
       <table class="data-table">
         <thead><tr><th>Severity</th><th>Count</th><th>%</th></tr></thead>
         <tbody>${sevRows}</tbody>
@@ -1188,9 +1245,17 @@ function renderCveIntelligence(data: ReportData): string {
 </div>`
 }
 
+function hasGithubSecretsSection(data: ReportData): boolean {
+  const gh = data.cveIntelligence.githubSecrets
+  return gh.secrets > 0 || gh.sensitiveFiles > 0 || (gh.publicClientKeys ?? 0) > 0
+}
+
 function renderGithubSecrets(data: ReportData): string {
   const gh = data.cveIntelligence.githubSecrets
-  if (gh.secrets === 0 && gh.sensitiveFiles === 0) return ''
+  if (!hasGithubSecretsSection(data)) return ''
+  const publicRow = (gh.publicClientKeys ?? 0) > 0
+    ? `\n      <tr><td>Expected-public client keys (not counted)</td><td>${gh.publicClientKeys}</td></tr>`
+    : ''
 
   return `
 <div class="page-break"></div>
@@ -1203,7 +1268,7 @@ function renderGithubSecrets(data: ReportData): string {
     <tbody>
       <tr><td>Repositories Analyzed</td><td>${gh.repos}</td></tr>
       <tr><td>Secrets Found</td><td style="color:#dc2626;font-weight:600">${gh.secrets}</td></tr>
-      <tr><td>Sensitive Files</td><td style="color:#ea580c;font-weight:600">${gh.sensitiveFiles}</td></tr>
+      <tr><td>Sensitive Files</td><td style="color:#ea580c;font-weight:600">${gh.sensitiveFiles}</td></tr>${publicRow}
     </tbody>
   </table>
 </div>`
@@ -1214,6 +1279,8 @@ function renderGithubSecrets(data: ReportData): string {
  *  whoever reads this report, and merging them would overstate the assurance. */
 const TH_VALIDATION_LABEL: Record<string, { text: string; color: string; weight: string }> = {
   validated: { text: 'LIVE', color: '#dc2626', weight: '600' },
+  rejected: { text: 'Not live', color: '#6b7280', weight: '400' },
+  // Written before `rejected` existed, for the same verdict.
   unvalidated: { text: 'Not live', color: '#6b7280', weight: '400' },
   verify_error: { text: 'Verify failed', color: '#d97706', weight: '500' },
   unverified: { text: 'Not checked', color: '#d97706', weight: '400' },
@@ -1279,9 +1346,33 @@ function renderTrufflehog(data: ReportData): string {
 </div>`
 }
 
+function hasSecretsSection(data: ReportData): boolean {
+  return data.secrets.total > 0 || (data.secrets.publicClientKeys?.total ?? 0) > 0
+}
+
+/** Keys that are public by design (a browser key, a DSN, a publishable key):
+ *  named, but never counted with the exposed secrets. */
+function renderPublicClientKeys(sec: ReportData['secrets']): string {
+  const pub = sec.publicClientKeys
+  if (!pub || pub.total === 0) return ''
+  const types = pub.byType.map(t => `${esc(t.secretType)}: ${t.count}`).join(', ')
+  return `
+  <p class="muted">Expected-public client keys: ${pub.total} (${types}). These ship to every browser
+    that loads the page by design, so they are not counted above; check that each is restricted
+    to its intended use (an unrestricted Google key can still be billed).</p>`
+}
+
 function renderSecrets(data: ReportData): string {
   const sec = data.secrets
-  if (sec.total === 0) return ''
+  if (!hasSecretsSection(data)) return ''
+  if (sec.total === 0) {
+    return `
+<div class="page-break"></div>
+<div class="section" id="secrets">
+  <h2 class="section-title">Secret Detection</h2>
+  <p>No secret was detected beyond keys that are public by design.</p>${renderPublicClientKeys(sec)}
+</div>`
+  }
 
   const sevRows = sec.bySeverity.map(s => `
     <tr><td>${sevBadge(s.severity)}</td><td>${s.count}</td></tr>`).join('')
@@ -1295,7 +1386,7 @@ function renderSecrets(data: ReportData): string {
       <td>${sevBadge(f.severity)}</td>
       <td>${esc(f.source)}</td>
       <td style="font-family:monospace;font-size:11px">${esc(f.sample || '')}</td>
-      <td>${f.validationStatus ? esc(f.validationStatus) : ''}</td>
+      <td>${f.validationStatus ? esc(validationLabel(f.validationStatus)) : ''}</td>
     </tr>`).join('')
 
   return `
@@ -1304,7 +1395,7 @@ function renderSecrets(data: ReportData): string {
   <h2 class="section-title">Secret Detection</h2>
   <div class="alert alert-critical">
     ${sec.total} secret(s) detected across web resources and JavaScript files.
-  </div>
+  </div>${renderPublicClientKeys(sec)}
   <div class="two-col">
     <div>
       <h3>By Severity</h3>
@@ -1330,9 +1421,45 @@ function renderSecrets(data: ReportData): string {
 </div>`
 }
 
+/**
+ * "JavaScript analysis: 3 hosts analyzed, no findings; 1 host served no
+ * JavaScript; 2 hosts not analyzed (host unreachable)." Zero findings means
+ * something only next to the hosts that were actually read.
+ */
+function jsCoverageSentence(cov: JsReconCoverage, totalFindings: number): string {
+  const hosts = (n: number) => `${n} host${n === 1 ? '' : 's'}`
+  const reasonList = (rs: { reason: string; hosts: number }[], counted: boolean) =>
+    rs.map(r => counted ? `${r.hosts} ${esc(r.reason)}` : esc(r.reason)).join(', ')
+  const parts = [`JavaScript analysis: ${hosts(cov.complete + cov.partial)} analyzed${totalFindings === 0 ? ', no findings' : ''}`]
+  if (cov.partial) {
+    const why = reasonList(cov.partialReasons, false)
+    parts.push(`${cov.partial} only partly${why ? ` (${why})` : ''}`)
+  }
+  if (cov.noInput) parts.push(`${hosts(cov.noInput)} served no JavaScript`)
+  if (cov.failed + cov.notScanned) {
+    const why = [
+      reasonList(cov.failedReasons, true),
+      cov.notScanned ? `${cov.notScanned} never looked at` : '',
+    ].filter(Boolean).join(', ')
+    parts.push(`${hosts(cov.failed + cov.notScanned)} not analyzed${why ? ` (${why})` : ''}`)
+  }
+  return `${parts.join('; ')}.`
+}
+
 function renderJsRecon(data: ReportData): string {
   const js = data.jsRecon
-  if (js.totalFindings === 0) return ''
+  const coverage = js.coverage?.recorded
+    ? `<p style="margin-bottom:12px">${jsCoverageSentence(js.coverage, js.totalFindings)}</p>`
+    : ''
+  if (js.totalFindings === 0) {
+    if (!coverage) return ''
+    return `
+<div class="page-break"></div>
+<div class="section" id="js-recon">
+  <h2 class="section-title">JavaScript Reconnaissance</h2>
+  ${coverage}
+</div>`
+  }
 
   const sevRows = js.bySeverity.map(s => `
     <tr><td>${sevBadge(s.severity)}</td><td>${s.count}</td></tr>`).join('')
@@ -1354,6 +1481,7 @@ function renderJsRecon(data: ReportData): string {
 <div class="section" id="js-recon">
   <h2 class="section-title">JavaScript Reconnaissance</h2>
   <p style="margin-bottom:12px">Deep analysis of JavaScript files revealed ${js.totalFindings} finding(s) across dependency confusion risks, source map exposure, DOM sinks, developer comments, framework detection, and AI/LLM SDK exposure (vendor SDK imports, hard-coded provider API keys, the dangerouslyAllowBrowser opt-in, AI-frontend product markers, and provider base URLs visible in shipped JS chunks).</p>
+  ${coverage}
   <div class="two-col">
     <div>
       <h3>By Severity</h3>

@@ -16,7 +16,7 @@ Upstream: https://nmap.org/book/man.html
 | Run scoped nmap scans | `execute_nmap` | Pass arguments without the leading `nmap`. |
 | Run broad port discovery first | `execute_naabu` | Faster than nmap for "what is open"; feed open ports back into nmap for `-sV -sC`. |
 | Manual NSE category browsing | `kali_shell` | `ls /usr/share/nmap/scripts/ | grep -i <pattern>` |
-| Parse XML output | `kali_shell` | `xmllint` or feed into `nmap-parse-output`. |
+| Parse XML output | `kali_shell` | `xmllint --xpath` over the `-oX` file. |
 
 ## Two-pass model
 

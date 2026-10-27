@@ -26,27 +26,33 @@ def _load(name, path):
     return m
 
 
-# This is a cross-layer test: it needs agentic/, capture_proxy/ and mcp/servers/
-# siblings all present under one repo root. That layout exists in the repo-root
-# test run (full repo mounted) but NOT in the agentic-only section image (where
-# capture_proxy/ is not mounted). Locate the files defensively and self-skip
-# cleanly (bucket 2) when they are absent, rather than erroring at import.
+# This is a cross-layer test: it needs agentic/, scanners/capture_proxy/ and
+# mcp/servers/ under one repo root. The gate mounts the whole checkout, so there
+# a missing file means one of them moved and this test must fail, not skip: a
+# moved path is exactly how it once skipped on every run. Only a tree that is not
+# a full checkout (the baked agent image, where /app holds agentic/ alone) skips.
 _AGENT_CTX = REPO / "agentic" / "redamon_ctx.py"
-_INGEST_CTX = REPO / "capture_proxy" / "redamon_ctx.py"
+_INGEST_CTX = REPO / "scanners" / "capture_proxy" / "redamon_ctx.py"
 _KALI_ROUTING = REPO / "mcp" / "servers" / "capture_routing.py"
+_CROSS_LAYER = (_AGENT_CTX, _INGEST_CTX, _KALI_ROUTING)
+_FULL_CHECKOUT = (REPO / "redamon.sh").exists()
 
 agent_ctx = ingest_ctx = kali_routing = None
-if _AGENT_CTX.exists() and _INGEST_CTX.exists() and _KALI_ROUTING.exists():
+if all(p.exists() for p in _CROSS_LAYER):
     agent_ctx = _load("agent_redamon_ctx", _AGENT_CTX)
     ingest_ctx = _load("ingest_redamon_ctx", _INGEST_CTX)
     kali_routing = _load("kali_capture_routing", _KALI_ROUTING)
 
 
 def setUpModule():
-    if agent_ctx is None:
-        raise unittest.SkipTest(
-            "cross-layer capture files not all present in this image "
-            "(needs agentic/ + capture_proxy/ + mcp/servers/ under one root)")
+    if agent_ctx is not None:
+        return
+    missing = [str(p.relative_to(REPO)) for p in _CROSS_LAYER if not p.exists()]
+    if _FULL_CHECKOUT:
+        raise AssertionError(
+            f"cross-layer capture files missing from a full checkout: {missing}")
+    raise unittest.SkipTest(
+        f"not a full checkout, cross-layer capture files absent: {missing}")
 
 INTERNAL = "internal-key-abc"
 SCANNER = "scanner-key-xyz"

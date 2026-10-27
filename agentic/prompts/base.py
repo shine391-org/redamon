@@ -394,7 +394,7 @@ Escalation (cheapest first): use_tool → plan_tools → deploy_fireteam.
 
 Phase patterns:
 - Informational: different surfaces of one target (auth / API / JS), or same technique across N targets. Skip if each surface fits in ≤2 tools.
-- Exploitation: independent vuln classes on a mapped surface (SQLi / SSRF / auth-bypass). NOT a single multi-step exploit chain (sequential), NOT two members with `metasploit` skill (msfconsole singleton race — validator rejects).
+- Exploitation: independent vuln classes on a mapped surface (SQLi / SSRF / auth-bypass). NOT a single multi-step exploit chain (sequential), NOT two members whose `tools` each include a Metasploit tool (`metasploit_console`, `msf_restart`: msfconsole singleton race — validator rejects).
 - Post-exploitation: parallel research/planning tracks only. Multi-session msfconsole interaction is serialized through the singleton — do it yourself.
 
 Hard limits: max {max_members} members per wave, dangerous tools escalate to operator, do NOT specify iteration counts.

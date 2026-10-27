@@ -25,6 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from recon.helpers.isolated_result import TopLevelKeys
 from recon.main import _merge_isolated_result  # noqa: E402
 from recon.main_recon_modules.vuln_scan import (  # noqa: E402
     VULN_SCAN_TOP_LEVEL_KEYS,
@@ -73,7 +74,7 @@ class TestMergeIsolatedResult(unittest.TestCase):
         combined = {"domain": "example.com"}
         _merge_isolated_result(
             combined, "vuln_scan",
-            {"vuln_scan": {"findings": ["marker"]}, "technology_cves": CVES},
+            TopLevelKeys(vuln_scan={"findings": ["marker"]}, technology_cves=CVES),
         )
         self.assertEqual(combined["vuln_scan"], {"findings": ["marker"]})
         self.assertEqual(combined["technology_cves"], CVES)
@@ -92,7 +93,7 @@ class TestMergeIsolatedResult(unittest.TestCase):
         combined = {"domain": "example.com", "technology_cves": fresh}
         _merge_isolated_result(
             combined, "vuln_scan",
-            {"vuln_scan": {}, "technology_cves": CVES},
+            TopLevelKeys(vuln_scan={}, technology_cves=CVES),
         )
         self.assertIs(combined["technology_cves"], fresh)
 

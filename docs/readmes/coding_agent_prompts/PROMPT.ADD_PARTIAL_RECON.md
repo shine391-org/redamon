@@ -240,7 +240,7 @@ The graph-input counts and dropdown name lists live in the webapp only: add the 
 ### 3. Frontend: Types (`recon-types.ts`)
 
 - Add `'<ToolName>'` to `PARTIAL_RECON_SUPPORTED_TOOLS`
-- Add `<ToolName>: ['<Phase Name>']` to `PARTIAL_RECON_PHASE_MAP`
+- No phase entry: a partial run is always phase 1 of 1 (`PARTIAL_RECON_TOTAL_PHASES`). The orchestrator pins every partial-run log event to phase 1 (`stream_partial_logs` in `recon_orchestrator/container_manager.py`) and takes the phase name from the full pipeline's log patterns
 - Extend `GraphInputs` if the tool needs new count/list fields for the dropdown (e.g. `existing_baseurls`)
 - Extend `UserTargets` if the tool introduces new user input types (e.g. `urls: string[]`, `url_attach_to: string | null`)
 
@@ -359,7 +359,7 @@ Each tool's settings section has a header with a Toggle switch. Add a "Run parti
 | File | What to change |
 |------|----------------|
 | `recon/partial_recon.py` | Add `run_<tool>(config)` + register in `_dispatch()` |
-| `webapp/src/lib/recon-types.ts` | Add to `PARTIAL_RECON_SUPPORTED_TOOLS` + `PARTIAL_RECON_PHASE_MAP`, extend `UserTargets` if needed |
+| `webapp/src/lib/recon-types.ts` | Add to `PARTIAL_RECON_SUPPORTED_TOOLS`, extend `UserTargets` if needed |
 | `webapp/src/components/.../PartialReconModal.tsx` | Add per-type textareas + validation + dropdown for the tool |
 
 ### Files you MAY need to modify:
@@ -369,7 +369,7 @@ Each tool's settings section has a header with a Toggle switch. Add a "Run parti
 | `webapp/src/app/api/recon/[projectId]/graph-inputs/[toolId]/route.ts` | Add tool-specific Neo4j query for counts + names |
 | `webapp/src/lib/recon-types.ts` | Extend `GraphInputs` / `UserTargets` if tool has new input types |
 | `recon/tests/test_partial_recon.py` | Add test class for new tool |
-| `webapp/src/lib/partial-recon-types.test.ts` | Update supported tools, phase map, type shape tests |
+| `webapp/src/lib/partial-recon-types.test.ts` | Update supported tools and type shape tests |
 | `webapp/src/components/.../sections/<ToolName>Section.tsx` | Add `onRun` prop + "Run partial recon" button in section header |
 | `webapp/src/components/.../ProjectForm.tsx` | Pass `onRun` prop to the tool's section component |
 
@@ -377,7 +377,7 @@ Each tool's settings section has a header with a Toggle switch. Add a "Run parti
 
 | File | Why |
 |------|-----|
-| `recon/domain_recon.py`, `port_scan.py`, `http_probe.py`, etc. | Source pipeline modules. Import, don't modify. |
+| `recon/main_recon_modules/domain_recon.py`, `port_scan.py`, `http_probe.py`, etc. | Source pipeline modules. Import, don't modify. |
 | `recon/main.py` | Full pipeline. Partial recon is independent. |
 | `recon_orchestrator/api.py` | Already passes `user_targets` generically. |
 | `recon_orchestrator/models.py` | Already has `user_targets: dict \| None`. |
@@ -386,7 +386,7 @@ Each tool's settings section has a header with a Toggle switch. Add a "Run parti
 | `webapp/src/hooks/usePartialRecon*.ts` | Generic hooks. |
 | `webapp/src/components/.../ToolNode.tsx` | Checks `PARTIAL_RECON_SUPPORTED_TOOLS`. |
 | `webapp/src/components/.../WorkflowView.tsx`, `ProjectForm.tsx` | Already generic. |
-| `webapp/src/app/graph/page.tsx` | Uses `PARTIAL_RECON_PHASE_MAP`. |
+| `webapp/src/app/graph/page.tsx` | Uses `PARTIAL_RECON_TOTAL_PHASES`, the same for every tool. |
 | `webapp/src/app/graph/components/GraphToolbar/GraphToolbar.tsx` | Uses `WORKFLOW_TOOLS.find()`. |
 | `webapp/src/app/graph/components/ReconLogsDrawer/ReconLogsDrawer.tsx` | Has `hidePhaseProgress`. |
 

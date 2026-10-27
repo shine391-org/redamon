@@ -72,7 +72,7 @@ def _run(settings, user_inputs=(), result=None):
 
     def puredns(subs, domain, s):
         probed["puredns"].append(list(subs))
-        return list(subs)
+        return list(subs), "filtered"
 
     def resolve(domain, subs, **kw):
         probed["dns"].append(list(subs))

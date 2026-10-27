@@ -82,6 +82,9 @@ class MessageType(str, Enum):
     THINKING_CHUNK = "thinking_chunk"
     TOOL_START = "tool_start"
     TOOL_OUTPUT_CHUNK = "tool_output_chunk"
+    # The tool itself returned; its tool_complete (with the LLM's analysis)
+    # follows only after the next think turn.
+    TOOL_FINISHED = "tool_finished"
     TOOL_COMPLETE = "tool_complete"
     PHASE_UPDATE = "phase_update"
     TODO_UPDATE = "todo_update"
@@ -417,6 +420,15 @@ class WebSocketManager:
         """Remove task from registry"""
         self._active_tasks.pop(session_key, None)
 
+    def release_task(self, session_key: str, task: Optional[asyncio.Task]):
+        """Remove the registration only if it is still `task`'s.
+
+        A run that is finishing must not clear a NEWER run of the same session
+        that registered while it was draining its persist queue.
+        """
+        if task is not None and self._active_tasks.get(session_key) is task:
+            del self._active_tasks[session_key]
+
     def live_session_ids(self, project_id: str) -> List[str]:
         """Session ids of PROJECT whose agent task is still running.
 
@@ -443,6 +455,11 @@ class WebSocketManager:
     def clear_callback(self, session_key: str):
         """Remove callback from registry."""
         self._active_callbacks.pop(session_key, None)
+
+    def release_callback(self, session_key: str, callback: 'StreamingCallback'):
+        """Remove the callback only if it is still this run's (see release_task)."""
+        if self._active_callbacks.get(session_key) is callback:
+            del self._active_callbacks[session_key]
 
     def get_connection(self, user_id: str, project_id: str, session_id: str) -> Optional[WebSocketConnection]:
         """Get active connection by session identifiers"""
@@ -561,6 +578,7 @@ class StreamingCallback:
         self._emitted_tool_start_ids: set = set()
         self._emitted_tool_complete_ids: set = set()
         self._emitted_tool_output_ids: set = set()
+        self._emitted_tool_finished_ids: set = set()
         # Ordered persistence queue — messages are saved one-at-a-time in FIFO order
         self._persist_queue: asyncio.Queue = asyncio.Queue()
         self._persist_worker_task: Optional[asyncio.Task] = None
@@ -717,7 +735,8 @@ class StreamingCallback:
         ctx_key = f"{wave_id}:{step_index}:{tool_name}" if wave_id and step_index is not None else (f"{wave_id}:{tool_name}" if wave_id else tool_name)
         self._tool_context[ctx_key] = {"args": tool_args, "chunks": []}
 
-    async def on_tool_output_chunk(self, tool_name: str, chunk: str, is_final: bool = False, wave_id: str = None, step_index: int = None):
+    async def on_tool_output_chunk(self, tool_name: str, chunk: str, is_final: bool = False, wave_id: str = None, step_index: int = None,
+                                   step_id: Optional[str] = None):
         """Called when tool outputs data chunk"""
         payload = {
             "tool_name": tool_name,
@@ -728,11 +747,35 @@ class StreamingCallback:
             payload["wave_id"] = wave_id
         if step_index is not None:
             payload["step_index"] = step_index
+        if step_id:
+            payload["step_id"] = step_id
         await self.connection.send_message(MessageType.TOOL_OUTPUT_CHUNK, payload)
         # Accumulate chunks — they'll be joined and included in tool_complete
         ctx_key = f"{wave_id}:{step_index}:{tool_name}" if wave_id and step_index is not None else (f"{wave_id}:{tool_name}" if wave_id else tool_name)
         if ctx_key in self._tool_context:
             self._tool_context[ctx_key]["chunks"].append(chunk)
+
+    async def on_tool_finished(
+        self,
+        tool_name: str,
+        success: bool,
+        duration_ms: Optional[int] = None,
+        step_id: Optional[str] = None,
+    ):
+        """Called when a standalone tool call has returned, before its analysis.
+
+        Lets the UI stop the card's stopwatch at the tool's real duration and
+        show that the agent is analysing, instead of a "Running" card that
+        keeps counting through the whole next LLM turn. Persisted so a restore
+        mid-analysis shows the same thing.
+        """
+        payload = {"tool_name": tool_name, "success": success}
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if step_id:
+            payload["step_id"] = step_id
+        await self.connection.send_message(MessageType.TOOL_FINISHED, payload)
+        self._persist("tool_finished", payload)
 
     async def on_tool_complete(
         self,
@@ -1267,12 +1310,18 @@ class WebSocketHandler:
                     _features.append("fireteam")
             except Exception:
                 pass
+            # agent_running is the authoritative live answer to "is this
+            # session's run still going?". The client cannot know on its own:
+            # events emitted while its socket was down (tool_complete, STOPPED,
+            # task_complete) are lost, and its DB flag lags. On every
+            # (re)connect it uses this to clear or keep its spinner.
             await connection.send_message(MessageType.CONNECTED, {
                 "session_id": session_id,
                 "message": "WebSocket connection established",
                 "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "protocol_version": 2,
                 "features": _features,
+                "agent_running": self.ws_manager.get_task(connection.get_key()) is not None,
             })
 
             logger.info(f"Session initialized: {session_id}")
@@ -1283,6 +1332,26 @@ class WebSocketHandler:
                 "message": "Invalid initialization message",
                 "recoverable": False
             })
+
+    async def _finish_run(self, connection: WebSocketConnection, callback: 'StreamingCallback'):
+        """Release a finished run: task registration first, then persistence.
+
+        The registration is dropped BEFORE the persist queue drains, so a client
+        that reconnects during the drain is told agent_running=false; its final
+        events (response, task_complete, stopped) were already sent. Registry
+        entries are released only while they still belong to this run, so a
+        query started meanwhile keeps its own.
+        """
+        key = connection.get_key()
+        this_task = asyncio.current_task()
+        self.ws_manager.release_task(key, this_task)
+        # Drain the persist queue so all messages are saved before marking agent as done
+        await callback.drain_persist_queue()
+        if connection._active_task is this_task:
+            connection._active_task = None
+        self.ws_manager.release_callback(key, callback)
+        if self.ws_manager.get_task(key) is None:
+            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
 
     async def handle_query(self, connection: WebSocketConnection, payload: dict):
         """Handle user query — launches orchestrator as background task"""
@@ -1351,12 +1420,7 @@ class WebSocketHandler:
             except Exception:
                 pass
         finally:
-            # Drain the persist queue so all messages are saved before marking agent as done
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_approval(self, connection: WebSocketConnection, payload: dict):
         """Handle approval response — launches as background task"""
@@ -1422,11 +1486,7 @@ class WebSocketHandler:
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_answer(self, connection: WebSocketConnection, payload: dict):
         """Handle answer to agent question — launches as background task"""
@@ -1490,11 +1550,7 @@ class WebSocketHandler:
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_fireteam_member_confirmation(self, connection: WebSocketConnection, payload: dict):
         """Operator decision for a per-member dangerous-tool escalation.
@@ -1612,11 +1668,7 @@ class WebSocketHandler:
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_guidance(self, connection: WebSocketConnection, payload: dict):
         """Handle guidance message while agent is executing."""
@@ -1834,11 +1886,7 @@ class WebSocketHandler:
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_ping(self, connection: WebSocketConnection, payload: dict):
         """Handle ping for keep-alive"""

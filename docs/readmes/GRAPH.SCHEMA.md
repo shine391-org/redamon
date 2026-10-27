@@ -80,8 +80,12 @@ scan-container spawn and every agent graph call. Every statement is guarded by
 | | Count | Source |
 |---|---|---|
 | `CREATE CONSTRAINT` | 45 | rendered by `schema.build_constraints()` from `schema_keys.py` |
-| `CREATE INDEX` | 79 | `TENANT_INDEXES` + `ADDITIONAL_INDEXES` in `schema.py` |
-| `DROP` (legacy) | 43 | `DROP_LEGACY_CONSTRAINTS` in `schema.py` |
+| `CREATE INDEX` | 77, each with its own name | `TENANT_INDEXES` + `ADDITIONAL_INDEXES` in `schema.py` |
+| `DROP` (legacy, unconditional) | 41 | `DROP_LEGACY_CONSTRAINTS` in `schema.py` |
+| `DROP` (legacy-shaped, conditional) | 3 | `LEGACY_SHAPED_CONSTRAINTS`: `drop_legacy_shaped_constraints()` drops one only while the live constraint's key differs from `schema_keys.py`, so a live tenant-scoped constraint is never rebuilt |
+
+`tests/test_schema_legacy_drops.py` fails if an unconditional drop names a
+constraint or index the code still creates, or if two indexes share a name.
 
 ```bash
 # exactly what the database gets, in order
@@ -91,8 +95,7 @@ for s in DROP_LEGACY_CONSTRAINTS + CONSTRAINTS + TENANT_INDEXES + ADDITIONAL_IND
 ```
 
 This file used to carry that listing verbatim. It was accurate - checked name
-by name at removal, 78 index names and 43 drops matching the code exactly - but
-being accurate was never the point: it was a copy that had to be maintained by
+by name at removal - but being accurate was never the point: it was a copy that had to be maintained by
 hand, and the next label added would have been the one nobody remembered to add
 here.
 
@@ -107,7 +110,7 @@ Four tests, and they fail rather than warn:
 
 - every label declared in `schema_keys.py` has catalog documentation
 - every relationship and property the CODE writes is documented
-  (`recon/tests/test_graph_writes_documented.py`, hermetic, runs in CI)
+  (`recon/tests/test_graph_writes_documented.py`, hermetic, runs in the unit gate `./redamon.sh test unit`)
 - every relationship and property in a LIVE graph is documented
   (`recon/tests/test_schema_catalog.py`, skips without a database)
 - no query reads a relationship nothing writes - this one found a real bug,
@@ -349,6 +352,14 @@ across the run's scan roots of that org (`recon_coverage_roots`, keyed by
 `recon_coverage_run`), and `openapi_source_status` entries prefixed with their
 scan root (`<scanRoot>|<id>|<hash>|<code>|<time>`).
 
+That record lists what a run CUT. What a module did on each web host lives on the
+host instead: flat `<module>_at` / `_status` / `_inputs` / `_outputs` / `_reason`
+properties on `BaseURL` (a property cannot hold a map), written by JS Recon and
+Nuclei for every host they considered and by MATCH only. A host without its
+stamp reads "not scanned" only when the module stamped another host of the
+project, "coverage not recorded" otherwise. See README.RECON, "Per-host coverage
+stamps".
+
 ### AWS Deployment Architecture
 
 ```
@@ -424,9 +435,28 @@ render shape, because a snapshot must be restorable back into Neo4j:
   ],
   "relationships": [
     { "startExportId": "<uuid>", "endExportId": "<uuid>", "type": "RESOLVES_TO", "properties": {} }
+  ],
+  // absent in snapshots stored before plan 09.5
+  "referenceLinks": [
+    { "startExportId": "<uuid>", "endExportId": null, "type": "HAS_KNOWN_CVE",
+      "refLabel": "CVE", "refKey": "CVE-2021-23017", "properties": {} }
   ]
 }
 ```
+
+**Reference nodes are never captured, their links are.** `CVE`, `MitreData` and
+`Capec` carry no tenant key and are shared by every project, so a snapshot or a
+project export (manifest 1.1.0, `neo4j/reference_links.json`) holds no such node
+and no property of one. Each edge to one is a link record: the project end by
+export id, the other end (the `null` id) by its natural key. A restore validates
+the label against the catalogue and the key against its shape, MATCHes the node
+(never MERGE, never SET; label and key property from a fixed map), and skips and
+counts a link whose node is missing. A payload that carries a reference node
+anyway (one stored before the catalogue lost its tenant stamp) has the node
+dropped and its edges turned into link records. Activation sweeps orphaned
+reference nodes only after the
+restore, so a CVE only this project linked survives the swap
+(`webapp/src/lib/graphReferenceLinks.ts`).
 
 The graph screen renders a version by converting this to the same
 `{ nodes, links }` payload `/api/graph` returns, so the canvas, the clustering and

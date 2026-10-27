@@ -14,20 +14,37 @@ export type Phase = (typeof PHASES)[number]
 export const TRANSPORTS = ['sse', 'streamable_http', 'stdio'] as const
 export type Transport = (typeof TRANSPORTS)[number]
 
-/** Tool names reserved by built-in / system tools - user MCP tools must not use these. */
+/**
+ * Tool names reserved by built-in / system tools - user MCP tools must not use these.
+ *
+ * Must equal what the agent rejects at manifest load: `_builtin_tool_names()` in
+ * agentic/mcp_registry.py (the TOOL_REGISTRY keys, `tradecraft_lookup`, and every
+ * tool a system MCP server exposes, SYSTEM_MCP_TOOL_NAMES).
+ * A name missing here is accepted by the form and then refused by the agent.
+ * agentic/tests/test_reserved_tool_names_parity.py compares the two sets.
+ */
 export const BUILTIN_RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
-  // Built-in (Python) tools. graph_summary and graph_schema ship on BOTH the
-  // agent and the inbound MCP server from one definition; omitting them here
-  // let a user-registered plugin shadow a built-in graph tool with its own.
+  'bloodhound_ingest', 'graph_diff', 'mimikatz_parse',
+  // graph_summary and graph_schema ship on BOTH the agent and the inbound MCP
+  // server from one definition; omitting them here let a user-registered plugin
+  // shadow a built-in graph tool with its own.
   'query_graph', 'graph_summary', 'graph_schema',
   'web_search', 'cve_intel', 'shodan', 'google_dork',
-  'execute_code', 'tradecraft_lookup',
+  'execute_code', 'tradecraft_lookup', 'proxy_brain',
+  'execute_osv_scanner', 'execute_guarddog',
   // System MCP-backed tools (the 5 baseline kali-sandbox servers)
   'execute_curl', 'execute_naabu', 'execute_httpx', 'execute_subfinder',
   'execute_amass', 'execute_arjun', 'execute_ffuf', 'execute_gau',
   'execute_jsluice', 'execute_katana', 'execute_wpscan',
   'execute_nmap', 'execute_nuclei', 'kali_shell', 'execute_playwright',
-  'execute_hydra', 'metasploit_console', 'msf_restart',
+  'execute_hydra', 'metasploit_console', 'msf_restart', 'execute_masscan',
+  // Workspace filesystem tools
+  'fs_read', 'fs_read_many', 'fs_stat', 'fs_write', 'fs_edit', 'fs_multi_edit',
+  'fs_undo_edit', 'fs_delete', 'fs_move', 'fs_copy', 'fs_mkdir', 'fs_chmod',
+  'fs_symlink_create', 'fs_grep', 'fs_glob', 'fs_find', 'fs_list', 'fs_tree',
+  'fs_symbols', 'fs_symlink_read', 'fs_hash', 'fs_diff', 'fs_extract', 'fs_archive',
+  // Background-job tools
+  'job_spawn', 'job_status', 'job_wait', 'job_cancel', 'job_list',
 ])
 
 /** Server IDs reserved by system MCP servers - user IDs must not collide. */

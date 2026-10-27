@@ -1,9 +1,9 @@
 """Step 5 — LATS settings mapping + the camelCase<->Prisma contract.
 
 Covers fetch_agent_settings mapping (camelCase agentLats* -> LATS_* keys, the
-two-boolean phase assembly, default fallback) and asserts the /defaults
-to_camel_case emission for each scalar LATS_* key matches a real Prisma
-agentLats* column (guards the NO_PREFIX_KEYS drop, §19.0/§20).
+two-boolean phase assembly, default fallback) and asserts that the column
+AGENT_SETTING_COLUMNS gives each scalar LATS_* key is a real Prisma agentLats*
+column, the name both fetch_agent_settings and /defaults use (§19.0/§20).
 """
 
 from __future__ import annotations
@@ -21,13 +21,6 @@ import project_settings  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCHEMA_PATH = os.path.join(REPO_ROOT, "webapp", "prisma", "schema.prisma")
-
-
-def _to_camel_case(snake_str: str, prefix: str = "agent") -> str:
-    """Mirror of api.py /defaults to_camel_case (nested, not importable)."""
-    prefixed = f"{prefix}_{snake_str}" if prefix else snake_str
-    components = prefixed.lower().split("_")
-    return components[0] + "".join(x.title() for x in components[1:])
 
 
 def _fetch_with_project(project: dict) -> dict:
@@ -94,15 +87,15 @@ class TestCamelCaseContract(unittest.TestCase):
         self.columns = set(re.findall(r"\b(agentLats\w+)\b", self.schema))
 
     def test_scalar_lats_keys_map_to_prisma_columns(self):
-        # Each scalar LATS_* setting must emit a camelCase name that is a real
-        # Prisma column, or it silently drops on project create.
+        # Each scalar LATS_* setting must map to a real Prisma column, or it
+        # silently drops on project create.
         scalar_keys = [
             "LATS_ENABLED", "LATS_SHADOW_MODE", "LATS_MIN_HYPOTHESES",
             "LATS_BRANCHING", "LATS_MAX_DEPTH", "LATS_MAX_ROLLOUTS",
             "LATS_MAX_TREE_NODES", "LATS_UCT_C", "LATS_PRUNE_FLOOR",
         ]
         for k in scalar_keys:
-            camel = _to_camel_case(k)
+            camel = project_settings.AGENT_SETTING_COLUMNS[k]
             self.assertIn(camel, self.columns, f"{k} -> {camel} missing from Prisma")
 
     def test_phase_booleans_exist(self):
@@ -110,8 +103,7 @@ class TestCamelCaseContract(unittest.TestCase):
         self.assertIn("agentLatsPhasePostExpl", self.columns)
 
     def test_lats_keys_take_agent_prefix(self):
-        # LATS_ is NOT in NO_PREFIX_KEYS, so it must get the 'agent' prefix.
-        self.assertEqual(_to_camel_case("LATS_ENABLED"), "agentLatsEnabled")
+        self.assertEqual(project_settings.AGENT_SETTING_COLUMNS["LATS_ENABLED"], "agentLatsEnabled")
 
 
 if __name__ == "__main__":

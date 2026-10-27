@@ -679,20 +679,29 @@ async def smart_fetch(
 # Type detection
 # =========================================================================
 
+_CVE_ID_ANYWHERE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+_YEAR_DIR_RE = re.compile(r"(?:19|20)\d{2}")
+
+
 def detect_type(url: str, body: str, status: int = 200) -> str:
     """Run the 6-rule detection chain. Returns one of the 6 type strings."""
     host = urllib.parse.urlsplit(url).hostname or ""
     host = host.lower()
     body_lc = body.lower() if body else ""
-    # 1. CVE PoC DB
+    # 1. CVE PoC DB: an ARCHIVE of many CVEs laid out as {year}/{CVE}.md. A repo
+    # built around one or two CVEs is a plain github-repo: as cve-poc-db its
+    # lookups only probe archive paths it does not have, so every query
+    # answered "PoC not found" (observed: php2shell-poc, whose README repeats
+    # its two CVE ids more than 20 times).
     if "github.com" in host:
         m = re.match(r"^https?://github\.com/([^/]+)/([^/]+)", url)
         if m:
             owner, repo = m.groups()
-            if re.search(r"cve", repo, re.IGNORECASE):
+            # Named for CVEs ("cve", "cvelist") but not for ONE ("CVE-2024-1234-poc").
+            if re.search(r"cve", repo, re.IGNORECASE) and not _CVE_ID_ANYWHERE_RE.search(repo):
                 return "cve-poc-db"
-        cve_count = len(re.findall(r"CVE-\d{4}-\d{4,7}", body or ""))
-        if cve_count > 20:
+        distinct_cves = {c.upper() for c in _CVE_ID_ANYWHERE_RE.findall(body or "")}
+        if len(distinct_cves) > 20:
             return "cve-poc-db"
     # 2. github repo (any github page that isn't a CVE repo)
     if host == "github.com" or host == "raw.githubusercontent.com":
@@ -944,14 +953,27 @@ async def _build_sitemap_cve_poc_db(base_url: str, github_token: str = "") -> Di
     headers = {"User-Agent": USER_AGENT}
     if github_token:
         headers["Authorization"] = f"token {github_token}"
+    no_year_dirs = False
     try:
         async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
             meta = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
             if meta.status_code == 200:
                 branch = meta.json().get("default_branch", "main")
+            # Lookups probe {year}/{CVE}.md, so a repo with no year folders at
+            # its root is not an archive whatever its name or README says. Only
+            # a definite listing decides; an API error keeps the detection.
+            root = await client.get(f"https://api.github.com/repos/{owner}/{repo}/contents")
+            if root.status_code == 200 and isinstance(root.json(), list):
+                no_year_dirs = not any(
+                    it.get("type") == "dir" and _YEAR_DIR_RE.fullmatch(it.get("name", ""))
+                    for it in root.json()
+                )
     except Exception:
         pass
-    return {"owner": owner, "repo": repo, "branch": branch}
+    result: Dict[str, Any] = {"owner": owner, "repo": repo, "branch": branch}
+    if no_year_dirs:
+        result["_no_year_dirs"] = True
+    return result
 
 
 async def _build_sitemap_sphinx(base_url: str, github_token: str = "") -> Dict[str, Any]:
@@ -1216,13 +1238,31 @@ async def _cve_lookup(
     github_token: str,
 ) -> Tuple[str, str]:
     """Returns (markdown_content, source_url). Empty content on miss."""
+    content, src_url, _err = await _cve_lookup_detailed(
+        cve_id, sitemap, github_token=github_token
+    )
+    return content, src_url
+
+
+async def _cve_lookup_detailed(
+    cve_id: str,
+    sitemap: Dict[str, Any],
+    *,
+    github_token: str,
+) -> Tuple[str, str, str]:
+    """Returns (markdown_content, source_url, api_error).
+
+    api_error is non-empty when GitHub answered with something other than
+    200/404 (rate limit, outage) or the request failed, so a miss can be told
+    apart from "the archive has no entry for this CVE".
+    """
     if not CVE_ID_RE.match(cve_id or ""):
-        return "", ""
+        return "", "", ""
     owner = sitemap.get("owner")
     repo = sitemap.get("repo")
     branch = sitemap.get("branch") or "main"
     if not (owner and repo):
-        return "", ""
+        return "", "", ""
     year = cve_id.split("-")[1]
     headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github.raw"}
     if github_token:
@@ -1231,13 +1271,25 @@ async def _cve_lookup(
         f"https://api.github.com/repos/{owner}/{repo}/contents/{year}/{cve_id.upper()}.md",
         f"https://api.github.com/repos/{owner}/{repo}/contents/{year}/{cve_id.upper()}/README.md",
     ]
+    api_error = ""
+
+    def _note(resp) -> None:
+        nonlocal api_error
+        if resp.status_code not in (200, 404) and not api_error:
+            api_error = (
+                f"GitHub API returned HTTP {resp.status_code} "
+                f"(rate_remaining={resp.headers.get('x-ratelimit-remaining', '?')})"
+            )
+
     async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
         for url in candidates:
             try:
                 r = await client.get(url)
                 if r.status_code == 200 and r.text:
-                    return r.text, url
-            except Exception:
+                    return r.text, url, ""
+                _note(r)
+            except Exception as e:
+                api_error = api_error or f"GitHub request failed: {type(e).__name__}: {e}"
                 continue
         # Fallback: list /contents/{year} and substring match
         try:
@@ -1255,9 +1307,32 @@ async def _cve_lookup(
                             if dl:
                                 rd = await client.get(dl)
                                 if rd.status_code == 200:
-                                    return rd.text, dl
-        except Exception:
-            pass
+                                    return rd.text, dl, ""
+            else:
+                _note(list_resp)
+        except Exception as e:
+            api_error = api_error or f"GitHub request failed: {type(e).__name__}: {e}"
+    return "", "", api_error
+
+
+async def _repo_readme(
+    sitemap: Dict[str, Any], *, github_token: str
+) -> Tuple[str, str]:
+    """Returns (readme_markdown, html_url) of a GitHub resource; ("", "") on any failure."""
+    owner = sitemap.get("owner")
+    repo = sitemap.get("repo")
+    if not (owner and repo):
+        return "", ""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github.raw"}
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as client:
+            r = await client.get(f"https://api.github.com/repos/{owner}/{repo}/readme")
+            if r.status_code == 200 and r.text:
+                return r.text, f"https://github.com/{owner}/{repo}#readme"
+    except Exception as e:
+        logger.warning(f"[tradecraft] readme fetch failed {owner}/{repo}: {type(e).__name__}: {e}")
     return "", ""
 
 
@@ -1394,6 +1469,13 @@ async def verify_resource(
                     sitemap = await _build_sitemap_github_repo(url, github_token=github_token)
                 elif rtype == "cve-poc-db":
                     sitemap = await _build_sitemap_cve_poc_db(url, github_token=github_token)
+                    if sitemap.pop("_no_year_dirs", False):
+                        logger.info(
+                            f"[tradecraft] verify {url}: no year folders at the repo root, "
+                            f"re-typing cve-poc-db -> github-repo"
+                        )
+                        rtype = "github-repo"
+                        sitemap = await _build_sitemap_github_repo(url, github_token=github_token)
                 elif rtype == "sphinx-docs":
                     sitemap = await _build_sitemap_sphinx(url, github_token=github_token)
                 elif rtype == "gitbook":
@@ -1622,6 +1704,9 @@ class TradecraftLookupManager:
             lines.append(wrapped)
         lines.append("")
         lines.append('   For cve-poc-db slugs you MUST also pass `cve_id="CVE-YYYY-NNNNN"`.')
+        lines.append('   "PoC not found" is final for that slug and CVE: do not retry it with other')
+        lines.append("   spellings or sibling slugs of the same repo; move on (web_search, or fetch the")
+        lines.append("   repository's README directly with execute_curl).")
         lines.append("   Pass `force_refresh=true` to bypass cache.")
         return {
             "purpose": "Curated technique/payload/PoC fetcher",
@@ -1930,11 +2015,31 @@ class TradecraftLookupManager:
                         cache="hit",
                         tier=1,
                     )
-            content, src_url = await _cve_lookup(
+            content, src_url, api_error = await _cve_lookup_detailed(
                 cve_id_norm, r.sitemap, github_token=token
             )
+            section_title = cve_id_norm
+            if not content and api_error:
+                # Not a "no PoC" answer: say so, or the agent concludes the
+                # PoC does not exist and loops on other resources.
+                return (
+                    f"Error: could not look up {cve_id_norm} in resource '{resource_id}': "
+                    f"{api_error}. This is NOT a 'PoC not found' answer; retry later or "
+                    f"add a GitHub token in Global Settings -> API Keys."
+                )
             if not content:
-                return f"PoC not found for {cve_id_norm} in resource '{resource_id}'."
+                # A repo stored as cve-poc-db before the stricter detection may
+                # be a single-PoC repo with no {year}/{CVE} entries. Its README
+                # is the PoC when it names the CVE.
+                readme, readme_url = await _repo_readme(r.sitemap, github_token=token)
+                if readme and cve_id_norm in readme.upper():
+                    content, src_url = readme, readme_url
+                    section_title = f"{cve_id_norm} (repository README; no {cve_id_norm.split('-')[1]}/{cve_id_norm} entry)"
+            if not content:
+                return (
+                    f"PoC not found for {cve_id_norm} in resource '{resource_id}' "
+                    f"(no archive entry, and the repository README does not mention it)."
+                )
             self.cache.store(r.slug, cache_url, content, ttl, 1)
             elapsed = int((time.time() - t0) * 1000)
             logger.info(
@@ -1944,7 +2049,7 @@ class TradecraftLookupManager:
             return format_output(
                 resource_id=r.slug,
                 url=src_url,
-                section_title=cve_id_norm,
+                section_title=section_title,
                 content=content,
                 cache="miss",
                 tier=1,

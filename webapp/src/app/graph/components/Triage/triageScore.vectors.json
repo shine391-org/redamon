@@ -1,0 +1,22 @@
+{
+  "_comment": "The triage score formula, shared by agentic/cypherfix_triage/score_model.py (checked by agentic/tests/test_triage_score_vectors.py: score_for, TIER_LEVELS, TIER_LABELS, factor_values and the explanation sentence) and its TypeScript mirror triageLayers.ts (checked by triageLayers.parity.test.ts: tierForScore, TIER_LABELS, TIER_ORDER, FACTOR_KEYS, FACTOR_NAMES). score = 25 x tier_level + 25 x risk. A change to either side fails one of the two tests until this file and the other side follow.",
+  "tierLevels": { "T1": 3, "T2": 2, "T3": 1, "T4": 0 },
+  "tierLabels": { "T1": "Act now", "T2": "Act soon", "T3": "Plan", "T4": "Track" },
+  "factorKeys": ["C", "L", "I", "R"],
+  "factorNames": { "C": "real", "L": "exploit", "I": "impact", "R": "reach" },
+  "scores": [
+    { "tier": "T1", "risk": 0.0, "score": 75.0 },
+    { "tier": "T1", "risk": 0.5, "score": 87.5 },
+    { "tier": "T1", "risk": 1.0, "score": 100.0 },
+    { "tier": "T2", "risk": 0.0, "score": 50.0 },
+    { "tier": "T2", "risk": 0.25, "score": 56.25 },
+    { "tier": "T2", "risk": 0.9999, "score": 74.9975 },
+    { "tier": "T2", "risk": 1.0, "score": 75.0 },
+    { "tier": "T3", "risk": 0.0, "score": 25.0 },
+    { "tier": "T3", "risk": 0.123456, "score": 28.0864 },
+    { "tier": "T3", "risk": 1.0, "score": 50.0 },
+    { "tier": "T4", "risk": 0.0, "score": 0.0 },
+    { "tier": "T4", "risk": 0.6, "score": 15.0 },
+    { "tier": "T4", "risk": 1.0, "score": 25.0 }
+  ]
+}

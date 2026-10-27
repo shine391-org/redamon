@@ -209,4 +209,4 @@ Static findings rarely stand alone. Pair semgrep results with:
 
 - Black-box probes against the same routes via `/skill nextjs` / `/skill fastapi` / `/skill nestjs`.
 - Vulnerability classes via `/skill jwt_attacks`, `/skill csrf`, `/skill open_redirect`.
-- Tool follow-ups: `betterleaks` for secrets, `trivy fs` (when installed) for dependency CVEs.
+- Tool follow-ups: `betterleaks` for secrets, `osv-scanner scan source -r /path/to/repo` for dependency CVEs.

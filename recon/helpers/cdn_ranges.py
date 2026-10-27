@@ -1,38 +1,63 @@
 """
 RedAmon - CDN Identification Helpers
 ====================================
-Identify IPs and HTTP responses belonging to known CDN / edge providers so that
-'Direct IP Access' security findings on shared infrastructure are suppressed.
+The one place recon asks "is this a CDN / shared edge?": origin discovery,
+ip_filter (Shodan, Netlas, Uncover, the OSINT enrichers), security checks and
+vhost/SNI all read these lists, so they cannot drift apart.
 
-Three layers, in order of cost / reliability:
+Four layers, in order of cost / reliability:
 
-1. Published prefix lists  -> is_cloudflare_ip(ip)
-   Authoritative; the provider tells you which IPs are theirs.
+1. Published prefix lists  -> edge_cdn_for_ip(ip), is_cloudflare_ip(ip)
+   Authoritative; the provider tells you which IPs are theirs. Static, from
+   recon/helpers/cdn_edge_prefixes.py (plus Cloudflare's shipped list).
 
 2. ASN match               -> cdn_name_from_asn(asn)
    Cheap when ASN data is already in the recon data (httpx -asn or enrichers).
 
-3. Response fingerprint    -> response_is_cdn_edge(response)
+3. Certificate issuer      -> cdn_from_certificate(issuer)
+
+4. Response fingerprint    -> edge_from_headers(headers), response_is_cdn_edge(response)
    Header / body markers visible only at probe time. Used as a safety net
    when prefix and ASN data are missing (e.g. user-injected custom IPs).
+
+classify_ip(ip, ...) combines layers 1, 2 and 4 with the CDN name a scanner
+reported; the IP attribution step labels every IP of a run from it.
+
+Never in any list: a generic cloud provider's ranges or ASN (Amazon, Microsoft,
+Google, Akamai's Linode compute). Real origins run there.
+
+Refreshing the lists: nothing here is fetched at run time except Cloudflare's
+optional live list. Each list names its source and retrieval date beside it;
+refresh one by hand from that source and move the date. CDN_ASNS is checked
+against RDAP (rdap.org/autnum/<n>), the prefixes in cdn_edge_prefixes.py against
+each provider's published list. No script: the sources share no format (JSON
+with different keys, a weekly Azure file under a new name, an HTML page).
 """
 from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 import requests
 
+from recon.helpers.cdn_edge_prefixes import EDGE_PREFIXES
 
-# =============================================================================
-# Phase 1 scope: Cloudflare only.
-# Add CloudFront / Akamai / Fastly / Cloud LB providers in Phase 2.
-# =============================================================================
 
+# Edge-only ASNs, each verified against RDAP (rdap.org/autnum/<n>) on
+# 2026-10-25. CloudFront, Azure Front Door and Google Cloud CDN have none of
+# their own: they announce from the provider's general ASN (16509, 8075, 15169),
+# which also carries customer servers, so they are recognised by prefix or header.
 CDN_ASNS: dict[int, str] = {
-    13335: "cloudflare",
-    209242: "cloudflare",
+    13335: "cloudflare",     # CLOUDFLARENET
+    209242: "cloudflare",    # CLOUDFLARESPECTRUM
+    54113: "fastly",         # FASTLY
+    20940: "akamai",         # AKAMAI-ASN1
+    16625: "akamai",         # AKAMAI-AS
+    21342: "akamai",         # AKAMAI-ASN2
+    32787: "akamai",         # PROLEXIC (Akamai's DDoS scrubbing proxies)
+    19551: "imperva",        # INCAPSULA
+    30148: "sucuri",         # SUCURI-SEC
 }
 
 # Certificate-issuer fragments that RELIABLY identify a CDN edge (Phase 2.3).
@@ -198,6 +223,46 @@ def is_cloudflare_ip(ip: str) -> bool:
     return False
 
 
+_static_edge_networks: Optional[list] = None
+
+
+def _edge_networks() -> list:
+    """[(network, cdn)] for every shipped edge prefix, parsed once.
+
+    Cloudflare's live list is used when this run already fetched it; the
+    shipped copy otherwise. Never fetches: a caller on the OSINT path would
+    otherwise wait up to 5 s per list.
+    """
+    global _static_edge_networks
+    if _static_edge_networks is None:
+        parsed = []
+        cloudflare = list(_CLOUDFLARE_FALLBACK_V4) + list(_CLOUDFLARE_FALLBACK_V6)
+        for cdn, prefixes in (("cloudflare", cloudflare), *EDGE_PREFIXES.items()):
+            for entry in prefixes:
+                try:
+                    parsed.append((ipaddress.ip_network(entry, strict=False), cdn))
+                except ValueError:
+                    continue
+        _static_edge_networks = parsed
+    live = _cloudflare_networks_cache
+    if isinstance(live, list) and live:
+        return [(net, "cloudflare") for net in live] + [
+            (net, cdn) for net, cdn in _static_edge_networks if cdn != "cloudflare"]
+    return _static_edge_networks
+
+
+def edge_cdn_for_ip(ip) -> Optional[str]:
+    """The CDN whose published edge prefixes hold *ip*, or None. Static only."""
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return None
+    for net, cdn in _edge_networks():
+        if addr.version == net.version and addr in net:
+            return cdn
+    return None
+
+
 _ASN_NUMBER_RE = re.compile(r"AS?(\d+)", re.IGNORECASE)
 
 
@@ -312,4 +377,125 @@ def collect_asn_cdn_ips(recon_data: dict) -> set[str]:
 
 def collect_prefix_cdn_ips(ips: Iterable[str]) -> set[str]:
     """Return the subset of *ips* that fall inside a published CDN prefix."""
-    return {ip for ip in ips if ip and is_cloudflare_ip(ip)}
+    return {ip for ip in ips if ip and (edge_cdn_for_ip(ip) or is_cloudflare_ip(ip))}
+
+
+# =============================================================================
+# Edge response headers
+# =============================================================================
+#
+# A response carrying one of these came through an edge (a CDN, a WAF proxy or a
+# hosting edge), so the address that sent it is not an origin. Ported from
+# unwaf waf.go @ c8302eb, plus the CDN markers below.
+#
+# (header, value fragment or "" for any value, edge name). The value fragment
+# keeps a generic header name honest: an origin's own nginx or Squid also sets
+# x-cache, and an app may set x-served-by, so those count only with a value
+# that names the CDN.
+EDGE_HEADER_SIGNATURES: tuple[tuple[str, str, str], ...] = (
+    ("cf-ray", "", "cloudflare"), ("cf-cache-status", "", "cloudflare"),
+    ("cf-request-id", "", "cloudflare"),
+    ("x-akamai-transformed", "", "akamai"), ("akamai-origin-hop", "", "akamai"),
+    ("x-amz-cf-id", "", "cloudfront"), ("x-amz-cf-pop", "", "cloudfront"),
+    ("x-cache", "cloudfront", "cloudfront"), ("via", "cloudfront", "cloudfront"),
+    ("x-fastly-request-id", "", "fastly"), ("fastly-io-info", "", "fastly"),
+    # Fastly names its cache node: "cache-fra-etou8220036-FRA".
+    ("x-served-by", "cache-", "fastly"),
+    # Fastly's Varnish says "1.1 varnish". A self-hosted Varnish says the same,
+    # but it already sends x-varnish, which this list has always treated as an edge.
+    ("via", "varnish", "fastly"), ("x-varnish", "", "varnish"),
+    ("via", "1.1 google", "google"), ("x-goog-bot-verification", "", "google"),
+    ("x-sucuri-id", "", "sucuri"), ("x-sucuri-cache", "", "sucuri"),
+    ("x-iinfo", "", "imperva"), ("x-cdn", "", "imperva"),
+    ("x-azure-ref", "", "azurefrontdoor"), ("x-fd-healthprobe", "", "azurefrontdoor"),
+    ("x-sp-url", "", "stackpath"), ("x-sp-waf", "", "stackpath"),
+    ("barra_counter_session", "", "barracuda"), ("x-wa-info", "", "f5"),
+    ("x-cnection", "", "f5"), ("ddos-guard", "", "ddos-guard"),
+    ("ar-asg", "", "arvancloud"), ("ar-poweredby", "", "arvancloud"),
+    ("fortiwafsid", "", "fortiweb"), ("x-rdwr", "", "radware"),
+    ("x-vercel-id", "", "vercel"), ("x-vercel-cache", "", "vercel"),
+    ("x-nf-request-id", "", "netlify"),
+)
+EDGE_HEADER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("x-akamai-", "akamai"),
+)
+EDGE_SERVER_TOKENS: tuple[tuple[str, str], ...] = (
+    ("cloudflare", "cloudflare"), ("akamaighost", "akamai"), ("akamai", "akamai"),
+    ("sucuri", "sucuri"), ("incapsula", "imperva"), ("imperva", "imperva"),
+    ("ddos-guard", "ddos-guard"), ("fortiweb", "fortiweb"), ("netlify", "netlify"),
+)
+
+
+def edge_from_headers(headers: Optional[Mapping]) -> Optional[str]:
+    """The edge a response's headers name, or None. Header names are case-free."""
+    if not headers:
+        return None
+    try:
+        lowered = {str(k).lower(): str(v or "") for k, v in headers.items()}
+    except Exception:  # noqa: BLE001 - a header object we cannot read names nothing
+        return None
+    for name, fragment, edge in EDGE_HEADER_SIGNATURES:
+        value = lowered.get(name)
+        if value and (not fragment or fragment in value.lower()):
+            return edge
+    for prefix, edge in EDGE_HEADER_PREFIXES:
+        if any(k.startswith(prefix) for k in lowered):
+            return edge
+    server = lowered.get("server", "").lower()
+    for token, edge in EDGE_SERVER_TOKENS:
+        if token in server:
+            return edge
+    return None
+
+
+# =============================================================================
+# One verdict per IP
+# =============================================================================
+#
+# The reasons are fixed phrases: they are stored on the IP (ownership_reasons)
+# and shown in the graph drawer, and the attribution step compares them to tell
+# an ASN-only match from the others.
+EDGE_REASON_RANGE = "in a published CDN edge range"
+EDGE_REASON_SCANNER = "a scanner's CDN check named an edge CDN"
+EDGE_REASON_HEADERS = "response headers name an edge CDN"
+EDGE_REASON_ASN = "its ASN belongs to an edge-only CDN"
+
+
+def _asn_value(asn):
+    """httpx -asn reports {"as_number": "AS13335", ...}; every other source a string."""
+    if isinstance(asn, Mapping):
+        return asn.get("as_number")
+    return asn
+
+
+def classify_ip(ip, *, asn=None, headers: Optional[Mapping] = None,
+                cdn_name=None) -> tuple[bool, Optional[str], list[str]]:
+    """(is_edge, provider, reasons): is *ip* a shared CDN edge?
+
+    Any one signal is enough: a published edge prefix, an edge-only CDN a
+    scanner named (naabu, httpx or tlsx's ``cdn_name``), a response header only
+    an edge sets, an edge-only ASN. ``reasons`` lists every signal that fired,
+    in that order, and ``provider`` is the first one's CDN. A cloud label (aws,
+    google, azure) or a header an origin can set itself (Varnish, an on-premises
+    WAF) is no signal. Never fetches.
+    """
+    fired: list[tuple[str, str]] = []
+    in_range = edge_cdn_for_ip(ip) if ip else None
+    if in_range:
+        fired.append((EDGE_REASON_RANGE, in_range))
+    if is_reliable_edge_cdn_name(cdn_name):
+        fired.append((EDGE_REASON_SCANNER, str(cdn_name).strip().lower()))
+    if headers:
+        try:
+            dashed = {str(k).replace("_", "-"): v for k, v in headers.items()}
+        except Exception:  # noqa: BLE001 - a header object we cannot read names nothing
+            dashed = {}
+        by_header = edge_from_headers(dashed)
+        if is_reliable_edge_cdn_name(by_header):
+            fired.append((EDGE_REASON_HEADERS, by_header))
+    by_asn = cdn_name_from_asn(_asn_value(asn))
+    if by_asn:
+        fired.append((EDGE_REASON_ASN, by_asn))
+    if not fired:
+        return False, None, []
+    return True, fired[0][1], [reason for reason, _ in fired]

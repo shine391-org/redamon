@@ -50,7 +50,7 @@ def test_disabled_returns_input():
     settings = {"PUREDNS_ENABLED": False}
 
     with mock.patch("recon.main_recon_modules.domain_recon.subprocess.run") as mock_run:
-        result = run_puredns_resolve(subs, "example.com", settings)
+        result, _status = run_puredns_resolve(subs, "example.com", settings)
         mock_run.assert_not_called()
 
     assert result == subs
@@ -65,7 +65,7 @@ def test_empty_list_returns_empty():
     from recon.main_recon_modules.domain_recon import run_puredns_resolve
 
     with mock.patch("recon.main_recon_modules.domain_recon.subprocess.run") as mock_run:
-        result = run_puredns_resolve([], "example.com", {"PUREDNS_ENABLED": True})
+        result, _status = run_puredns_resolve([], "example.com", {"PUREDNS_ENABLED": True})
         mock_run.assert_not_called()
 
     assert result == []
@@ -139,7 +139,7 @@ def test_successful_filtering():
         return mock.MagicMock(returncode=0, stderr="")
 
     with mock.patch("recon.main_recon_modules.domain_recon.subprocess.run", side_effect=fake_puredns):
-        result = run_puredns_resolve(subs, "example.com", settings)
+        result, _status = run_puredns_resolve(subs, "example.com", settings)
 
     assert "a.example.com" in result
     assert "b.example.com" in result
@@ -260,7 +260,7 @@ def test_timeout_returns_unfiltered():
 
     with mock.patch("recon.main_recon_modules.domain_recon.subprocess.run",
                     side_effect=subprocess.TimeoutExpired(cmd="docker", timeout=600)):
-        result = run_puredns_resolve(subs, "example.com", settings)
+        result, _status = run_puredns_resolve(subs, "example.com", settings)
 
     assert result == subs
 
@@ -282,7 +282,7 @@ def test_docker_not_found_returns_unfiltered():
 
     with mock.patch("recon.main_recon_modules.domain_recon.subprocess.run",
                     side_effect=FileNotFoundError("docker")):
-        result = run_puredns_resolve(subs, "example.com", settings)
+        result, _status = run_puredns_resolve(subs, "example.com", settings)
 
     assert result == subs
 
@@ -307,7 +307,7 @@ def test_no_output_file_returns_unfiltered():
         return mock.MagicMock(returncode=1, stderr="some error")
 
     with mock.patch("recon.main_recon_modules.domain_recon.subprocess.run", side_effect=fake_run):
-        result = run_puredns_resolve(subs, "example.com", settings)
+        result, _status = run_puredns_resolve(subs, "example.com", settings)
 
     assert result == subs
 
@@ -373,14 +373,19 @@ def test_roe_rate_limit_includes_puredns():
 # ---------------------------------------------------------------------------
 def test_defaults_match_prisma():
     """DEFAULT_SETTINGS values should match Prisma @default() values."""
+    import json
     from recon.project_settings import DEFAULT_SETTINGS
 
-    assert DEFAULT_SETTINGS['PUREDNS_ENABLED'] is True
-    assert DEFAULT_SETTINGS['PUREDNS_DOCKER_IMAGE'] == 'frost19k/puredns:latest'
-    assert DEFAULT_SETTINGS['PUREDNS_THREADS'] == 0
-    assert DEFAULT_SETTINGS['PUREDNS_RATE_LIMIT'] == 0
-    assert DEFAULT_SETTINGS['PUREDNS_WILDCARD_BATCH'] == 0
-    assert DEFAULT_SETTINGS['PUREDNS_SKIP_VALIDATION'] is False
+    puredns_keys = {k for k in DEFAULT_SETTINGS if k.startswith('PUREDNS_')}
+    # The registry's default is the Prisma @default (registry.prisma.test.ts).
+    registry = Path(__file__).resolve().parents[2] / 'recon_settings' / 'registry.json'
+    fields = json.loads(registry.read_text(encoding='utf-8'))['fields']
+    prisma = {spec['runtime_key']: spec.get('default') for spec in fields.values()
+              if spec.get('runtime_key') in puredns_keys}
+    assert set(prisma) == puredns_keys, f"keys with no column: {puredns_keys - set(prisma)}"
+    for key in sorted(puredns_keys):
+        assert DEFAULT_SETTINGS[key] == prisma[key], \
+            f"{key}: Python {DEFAULT_SETTINGS[key]!r} != Prisma {prisma[key]!r}"
     print("PASS: test_defaults_match_prisma")
 
 
@@ -431,6 +436,138 @@ def test_input_file_content():
         f.unlink(missing_ok=True)
 
     print("PASS: test_input_file_content")
+
+
+# ---------------------------------------------------------------------------
+# Plan 08.2: a skipped wildcard filter is reported, never silent
+# ---------------------------------------------------------------------------
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+from recon.helpers import circuit_breaker as cb  # noqa: E402
+
+_SUBS = ["a.example.com", "b.example.com", "c.example.com"]
+
+
+@pytest.fixture
+def fresh_run():
+    cb.reset_registry()
+    Path("/tmp/redamon").mkdir(parents=True, exist_ok=True)
+    resolver = Path("/tmp/redamon/resolvers.txt")
+    if not resolver.exists():
+        resolver.write_text("8.8.8.8\n")
+    yield
+    for f in Path("/tmp/redamon").glob("puredns_*"):
+        f.unlink(missing_ok=True)
+    cb.reset_registry()
+
+
+def _puredns_gaps():
+    return [g for g in json.loads(cb.coverage_report().gaps_json())
+            if g["source"] == "puredns"]
+
+
+def _run(settings=None, subs=_SUBS, **patches):
+    from recon.main_recon_modules import domain_recon as dr
+    with mock.patch.object(dr, "_refresh_shared_resolvers"), \
+         mock.patch.object(dr.subprocess, "run", **patches):
+        return dr.run_puredns_resolve(list(subs), "example.com",
+                                      settings or {"PUREDNS_ENABLED": True})
+
+
+@pytest.mark.parametrize("patches, status", [
+    ({"side_effect": subprocess.TimeoutExpired(cmd="docker", timeout=600)}, "skipped:timeout"),
+    ({"side_effect": FileNotFoundError("docker")}, "skipped:docker_missing"),
+    ({"side_effect": RuntimeError("boom")}, "skipped:error"),
+    ({"return_value": mock.MagicMock(returncode=1, stderr="x")}, "skipped:no_output"),
+])
+def test_each_failure_returns_the_list_with_its_reason_and_records_a_gap(fresh_run, patches, status):
+    names, got = _run(**patches)
+    assert names == _SUBS
+    assert got == status
+    gaps = _puredns_gaps()
+    assert len(gaps) == 1
+    assert gaps[0]["skipped"] == len(_SUBS)
+    assert gaps[0]["reason"], "the report prints the reason"
+    assert gaps[0]["module"] == "puredns"
+
+
+def test_a_missing_resolver_list_is_a_recorded_skip(fresh_run):
+    from recon.main_recon_modules import domain_recon as dr
+    real_path = Path
+
+    def no_resolvers(p):
+        if str(p) == "/tmp/redamon":
+            return real_path("/tmp/redamon_no_resolvers_test")
+        return real_path(p)
+
+    with mock.patch.object(dr, "_refresh_shared_resolvers"), \
+         mock.patch.object(dr, "Path", side_effect=no_resolvers), \
+         mock.patch.object(dr.subprocess, "run") as run:
+        names, status = dr.run_puredns_resolve(list(_SUBS), "example.com", {"PUREDNS_ENABLED": True})
+    run.assert_not_called()
+    assert (names, status) == (_SUBS, "skipped:no_resolvers")
+    assert [g["skipped"] for g in _puredns_gaps()] == [len(_SUBS)]
+    shutil.rmtree("/tmp/redamon_no_resolvers_test", ignore_errors=True)
+
+
+def test_an_open_breaker_is_a_recorded_skip(fresh_run):
+    from recon.main_recon_modules import domain_recon as dr
+    with mock.patch.object(dr, "_source_skipped", return_value=True), \
+         mock.patch.object(dr.subprocess, "run") as run:
+        names, status = dr.run_puredns_resolve(list(_SUBS), "example.com", {"PUREDNS_ENABLED": True})
+    run.assert_not_called()
+    assert (names, status) == (_SUBS, "skipped:breaker_open")
+    assert [g["skipped"] for g in _puredns_gaps()] == [len(_SUBS)]
+
+
+@pytest.mark.parametrize("settings, subs, status", [
+    ({"PUREDNS_ENABLED": False}, _SUBS, "skipped:disabled"),
+    ({"PUREDNS_ENABLED": True}, [], "skipped:no_input"),
+])
+def test_switched_off_or_nothing_to_check_records_no_gap(fresh_run, settings, subs, status):
+    """Off by configuration (or by stealth mode) is not a cut, and an empty
+    list admitted nothing unfiltered."""
+    names, got = _run(settings=settings, subs=subs, side_effect=AssertionError("not run"))
+    assert (names, got) == (subs, status)
+    assert _puredns_gaps() == []
+
+
+def test_a_successful_run_is_filtered_and_records_no_gap(fresh_run):
+    def fake_puredns(cmd, **kwargs):
+        out = Path("/tmp/redamon") / Path(cmd[cmd.index("--write") + 1]).name
+        out.write_text("a.example.com\n")
+        return mock.MagicMock(returncode=0, stderr="")
+
+    names, status = _run(side_effect=fake_puredns)
+    assert (names, status) == (["a.example.com"], "filtered")
+    assert _puredns_gaps() == []
+
+
+def test_the_gap_source_is_a_valid_coverage_token(fresh_run):
+    """The Recon Delta rejects a run's whole gap list when one source breaks
+    [a-z0-9_]{1,64} (README, coverage notes)."""
+    import re
+    _run(side_effect=subprocess.TimeoutExpired(cmd="docker", timeout=600))
+    gaps = json.loads(cb.coverage_report().gaps_json())
+    assert gaps
+    for gap in gaps:
+        assert re.fullmatch(r"[a-z0-9_]{1,64}", gap["source"])
+
+
+def test_discovery_stores_the_filter_status_in_its_metadata(fresh_run):
+    from recon.main_recon_modules import domain_recon as dr
+    with mock.patch.object(dr, "query_crtsh", return_value={"a.example.com": {"crt.sh"}}), \
+         mock.patch.object(dr, "query_hackertarget", return_value={}), \
+         mock.patch.object(dr, "run_subfinder", return_value=set()), \
+         mock.patch.object(dr, "run_amass", return_value=set()), \
+         mock.patch.object(dr, "run_knockpy", return_value=set()), \
+         mock.patch.object(dr, "run_puredns_resolve",
+                           side_effect=lambda subs, d, s: (subs, "skipped:timeout")):
+        result = dr.discover_subdomains("example.com", resolve=False, save_output=False,
+                                        settings={"PUREDNS_ENABLED": True})
+    assert result["metadata"]["wildcard_filter"] == "skipped:timeout"
 
 
 # ---------------------------------------------------------------------------

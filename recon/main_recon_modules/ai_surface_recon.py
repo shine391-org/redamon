@@ -650,15 +650,19 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
         _log("disabled — skipping", "-")
         return combined_result
 
-    # RoE time window (lazy import to avoid circular import with main.py)
+    # RoE time window. Fail closed: a window that cannot be checked sends no
+    # probe. Either way nothing was re-checked, so the prune keeps the source.
     try:
-        from recon.main import _check_roe_time_window
-        allowed, reason = _check_roe_time_window(settings)
-        if not allowed:
-            _log(f"blocked by RoE time window: {reason}", "!")
-            return combined_result
-    except Exception:
-        pass
+        from recon.helpers import roe_scope
+        allowed, reason = roe_scope._check_roe_time_window(settings)
+    except Exception as e:  # noqa: BLE001
+        allowed, reason = False, f"the window could not be checked ({type(e).__name__})"
+    if not allowed:
+        _log(f"blocked by RoE time window: {reason}", "!")
+        from recon.helpers import circuit_breaker as _cb_window
+        _cb_window.note_degraded("ai_surface_recon", sources=["ai_surface_recon"],
+                                 reason="RoE time window")
+        return combined_result
 
     t0 = time.monotonic()
     timeout = float(settings.get("AI_SURFACE_RECON_TIMEOUT", 10))

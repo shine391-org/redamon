@@ -133,10 +133,14 @@ class _Session:
             for url, host in BASEURLS:
                 rows.append({"base": url, "host": host, "path": "/forms/aspnet",
                              "method": "POST", "names": SER_FORM_NAMES})
+        # The GraphQL builder: JS Recon's GraphQL Endpoint nodes, then every
+        # endpoint with its parameter names (plan 12.12's shapes).
+        elif "endpoint_type IN" in cypher:
+            for url, _ in BASEURLS:
+                rows.append({"base_url": url, "path": "/graphql", "type": "graphql", "full_url": ""})
         elif "HAS_ENDPOINT" in cypher and "base_url" in cypher:
             for url, _ in BASEURLS:
-                rows.append({"base_url": url, "endpoints": [{"path": "/x", "method": "GET"}],
-                             "parameters": [{"name": "q"}]})
+                rows.append({"base_url": url, "path": "/x", "method": "GET", "parameters": ["q"]})
         elif "HAS_ENDPOINT" in cypher and "e.full_url" in cypher:
             for url, _ in BASEURLS:
                 rows.append({"url": url + "/e?a=1", "baseurl": url})
@@ -314,8 +318,9 @@ class TestGraphqlBuilder:
     def test_a_stale_host_is_dropped_everywhere(self, graph):
         data = self.build()
         assert "https://www.old.test" not in data["http_probe"]["by_url"]
-        assert "https://www.old.test" not in data["resource_enum"]["endpoints"]
-        assert "https://www.old.test" not in data["resource_enum"]["parameters"]
+        assert "https://www.old.test" not in data["resource_enum"]["by_base_url"]
+        assert not [e for e in data["js_recon"]["endpoints"] if "old.test" in e["source_js"]]
+        assert "https://www.alpha.test" in data["resource_enum"]["by_base_url"]
 
     def test_no_apex_rule_is_added(self, graph):
         # GraphQL scanning never honoured Include Root Domain; it still does not.

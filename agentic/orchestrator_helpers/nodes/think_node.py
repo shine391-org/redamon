@@ -1377,11 +1377,11 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 })
                 updates["chain_failures_memory"] = chain_failures_mem
 
-            # 3. Write ChainStep to Neo4j (via executor to avoid blocking the event loop)
+            # 3. Write ChainStep to Neo4j on the chain writer thread. Bounded:
+            # the step's tool_complete reaches the UI only when this node
+            # returns, so a write stalled on Neo4j used to freeze the tool card.
             prev_step_id = state.get("_last_chain_step_id")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
+            step_written = await chain_graph.run_bounded_write(
                 lambda: chain_graph.sync_record_step(
                     neo4j_uri, neo4j_user, neo4j_password,
                     step_id=step_id,
@@ -1400,8 +1400,11 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     extracted_info=analysis.extracted_info.model_dump() if analysis and analysis.extracted_info else {},
                     **get_agent_context(state),
                 ),
+                label=f"ChainStep {step_id}",
             )
-            updates["_last_chain_step_id"] = step_id
+            # A dropped step will never exist; keep linking to the last one that does.
+            if step_written is not None:
+                updates["_last_chain_step_id"] = step_id
 
             # 4. Fire-and-forget: write exploit success (AFTER step so PRODUCED link works)
             if analysis.exploit_succeeded and analysis.exploit_details and phase == "exploitation":
@@ -1661,7 +1664,6 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         # Create one ExecutionStep per plan tool (for trace granularity)
         # Use sync writes so each step exists before the next links to it
         prev_chain_step_id = state.get("_last_chain_step_id")
-        loop = asyncio.get_running_loop()
 
         # Combined extracted_info for all wave tools (same for each — wave has one analysis)
         combined_extracted = {}
@@ -1715,8 +1717,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             # Neo4j chain step (sync so prev_step_id linkage is sequential)
             # Capture all loop variables via default args to avoid closure issues
             _ctx = get_agent_context(state)
-            await loop.run_in_executor(
-                None,
+            step_written = await chain_graph.run_bounded_write(
                 lambda _sid=step_id, _prev=prev_chain_step_id, _ps=plan_step,
                        _ei=combined_extracted, _thought=step_thought,
                        _reasoning=step_reasoning, _oa=step_output_analysis,
@@ -1740,9 +1741,12 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     agent_name=_c["agent_name"],
                     fireteam_id=_c["fireteam_id"],
                 ),
+                label=f"ChainStep {step_id}",
             )
-            # Update prev for next tool in wave (sequential chain linkage)
-            prev_chain_step_id = step_id
+            # Update prev for next tool in wave (sequential chain linkage),
+            # skipping a dropped step that will never exist.
+            if step_written is not None:
+                prev_chain_step_id = step_id
 
             # Neo4j ChainFailure node for failed tools (mirrors single-tool path)
             if not plan_step.get("success"):
@@ -1817,7 +1821,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         if not (decision.action == "plan_tools" and decision.tool_plan):
             updates["_current_plan"] = None
         if new_trace_entries:
-            updates["_last_chain_step_id"] = new_trace_entries[-1]["step_id"]
+            updates["_last_chain_step_id"] = prev_chain_step_id
         tool_summary = ", ".join(f"{s.get('tool_name')}({'OK' if s.get('success') else 'FAIL'})" for s in plan_steps)
         overall = analysis.interpretation if analysis else "Plan wave completed"
         updates["messages"] = [AIMessage(content=f"**Wave** [{phase}] {tool_summary}\n\n{overall}")]

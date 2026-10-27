@@ -435,6 +435,10 @@ services:
       # every other source-tree bind is forced :ro. Wired here (broker has no
       # env_file) so setting it in .env actually reaches the broker.
       DOCKER_BROKER_ALLOWED_RW_PREFIXES: ${DOCKER_BROKER_ALLOWED_RW_PREFIXES:-}
+      # The sibling tool cap is the governor's container_cap(): envelope x
+      # headroom, clamped to the per-container ceiling. Empty keeps the defaults.
+      PER_CONTAINER_MAX: ${PER_CONTAINER_MAX:-}
+      CONTAINER_CAP_HEADROOM: ${CONTAINER_CAP_HEADROOM:-}
     healthcheck:
       test: ["CMD-SHELL", "test -S /var/run/broker/docker.sock"]
       interval: 15s
@@ -531,6 +535,8 @@ services:
       # credential-free; the orchestrator never puts DB creds on it.
       TRAFFIC_INGEST_DATABASE_URL: ${TRAFFIC_INGEST_DATABASE_URL:-}
       CAPTURE_PROXY_IMAGE: ${CAPTURE_PROXY_IMAGE:-redamon-capture-proxy:latest}
+      # An external operator may bind the proxy's namespace into its own lifecycle.
+      CAPTURE_LIFECYCLE_OWNER: ${CAPTURE_LIFECYCLE_OWNER:-orchestrator}
       CAPTURE_PROXY_PORT: ${CAPTURE_PROXY_PORT:-8888}
       CAPTURE_PROXY_MAX_BODY_KB: ${CAPTURE_PROXY_MAX_BODY_KB:-64}
       CAPTURE_PROXY_STORE_BODIES: ${CAPTURE_PROXY_STORE_BODIES:-true}
@@ -560,6 +566,9 @@ services:
       # every item again. Coverage recording and the prune guard stay on. Apply
       # with `docker compose up -d recon-orchestrator`; takes effect next scan.
       RECON_CIRCUIT_BREAKERS: ${RECON_CIRCUIT_BREAKERS:-on}
+      # Seconds a stopped recon or partial-recon run may land its queued graph
+      # writes and apply the mute rules before it is killed. Blank means 45.
+      RECON_STOP_GRACE_S: ${RECON_STOP_GRACE_S:-}
       # Test labs only: point Shodan / InternetDB at a stub API. Leave unset.
       SHODAN_API_BASE: ${SHODAN_API_BASE:-}
       SHODAN_INTERNETDB_BASE: ${SHODAN_INTERNETDB_BASE:-}
@@ -662,6 +671,12 @@ services:
       RESOURCE_PROFILE_DEFAULT_PATH: ${RESOURCE_PROFILE_DEFAULT_PATH:-}
       MEM_SAFETY_TOLERANCE: ${MEM_SAFETY_TOLERANCE:-}
       MEM_BUDGET_FRACTION: ${MEM_BUDGET_FRACTION:-}
+      MEM_SCALE_HIGH: ${MEM_SCALE_HIGH:-}
+      MEM_SCALE_LOW: ${MEM_SCALE_LOW:-}
+      MEM_SCALE_FLOOR: ${MEM_SCALE_FLOOR:-}
+      MEM_READ_TTL_S: ${MEM_READ_TTL_S:-}
+      PER_CONTAINER_MAX: ${PER_CONTAINER_MAX:-}
+      CONTAINER_CAP_HEADROOM: ${CONTAINER_CAP_HEADROOM:-}
       # Forwarded to spawned recon containers (host network, so localhost).
       # NOT this service's own connection - see ORCHESTRATOR_NEO4J_URI below.
       NEO4J_URI: bolt://localhost:7687
@@ -801,6 +816,7 @@ services:
       MSF_AUTO_UPDATE: "${MSF_AUTO_UPDATE:-true}"
       NUCLEI_AUTO_UPDATE: "${NUCLEI_AUTO_UPDATE:-true}"
       TERMINAL_WS_PORT: "8016"
+      TERMINAL_MAX_SESSIONS: ${TERMINAL_MAX_SESSIONS:-}
       # INBOUND auth token the MCP servers validate on every SSE request (STRIDE
       # S10). This is NOT an outbound secret — it is the credential the worker
       # CHECKS, so holding it does not violate the "worker holds no secrets" rule.
@@ -897,6 +913,19 @@ services:
       # Knowledge Base
       KB_ENABLED: "${KB_ENABLED:-false}"
       KB_PATH: /app/knowledge_base/data
+      # The agent embeds every KB query, so it needs the same embedder choice as
+      # kb-refresh, which embeds the documents. Empty keeps the local model.
+      KB_EMBEDDING_USE_API: ${KB_EMBEDDING_USE_API:-}
+      KB_EMBEDDING_API_BASE_URL: ${KB_EMBEDDING_API_BASE_URL:-}
+      KB_EMBEDDING_API_KEY: ${KB_EMBEDDING_API_KEY:-}
+      KB_EMBEDDING_API_MODEL: ${KB_EMBEDDING_API_MODEL:-}
+      # Session, background-job and billed-LLM caps (websocket_api.py,
+      # job_runner.py, llm_guard.py). Empty keeps the code defaults.
+      MAX_AGENT_SESSIONS: ${MAX_AGENT_SESSIONS:-}
+      MAX_BACKGROUND_JOBS: ${MAX_BACKGROUND_JOBS:-}
+      LLM_GUARD_RATE_CAPACITY: ${LLM_GUARD_RATE_CAPACITY:-}
+      LLM_GUARD_RATE_REFILL_PER_SEC: ${LLM_GUARD_RATE_REFILL_PER_SEC:-}
+      LLM_GUARD_DAILY_CALL_CAP: ${LLM_GUARD_DAILY_CALL_CAP:-}
       # Fireteam requires AsyncPostgresSaver for safe mid-wave checkpointing.
       PERSISTENT_CHECKPOINTER: "true"
       DATABASE_URL: "postgresql://${POSTGRES_USER:-redamon}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set - run redamon.sh (STRIDE S13)}@postgres:5432/${POSTGRES_DB:-redamon}"
@@ -965,6 +994,10 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set - run redamon.sh (STRIDE S13)}
       KB_PATH: /app/knowledge_base/data
       NVD_API_KEY: "${NVD_API_KEY:-}"
+      KB_EMBEDDING_USE_API: ${KB_EMBEDDING_USE_API:-}
+      KB_EMBEDDING_API_BASE_URL: ${KB_EMBEDDING_API_BASE_URL:-}
+      KB_EMBEDDING_API_KEY: ${KB_EMBEDDING_API_KEY:-}
+      KB_EMBEDDING_API_MODEL: ${KB_EMBEDDING_API_MODEL:-}
     volumes:
       - ./services/knowledge_base/kb_config.yaml:/app/knowledge_base/kb_config.yaml:ro
       - kb_data:/app/knowledge_base/data

@@ -698,6 +698,43 @@ describe('preflight_scope_check reports RESOLVED values', () => {
     expect(r.silentNoOps.some(x => x.field === 'ffufEnabled')).toBe(true)
   })
 
+  // Plan 06.7: js_recon is not a scanModules phase. JS recon runs on
+  // jsReconEnabled alone and reads what resource_enum and http_probe found;
+  // jsluice runs inside resource_enum.
+  test('JS recon without a js_recon scan module is not a no-op when it has crawler input', async () => {
+    h.findProject.mockResolvedValue(projectRow({
+      scanModules: ['domain_discovery', 'http_probe', 'resource_enum'], jsReconEnabled: true,
+      jsReconAiSdkDetectionEnabled: true, jsluiceEnabled: true,
+    }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    for (const field of ['jsReconEnabled', 'jsReconAiSdkDetectionEnabled', 'jsluiceEnabled']) {
+      expect(r.silentNoOps.some(x => x.field === field), field).toBe(false)
+    }
+  })
+
+  test('JS recon with neither resource_enum nor http_probe is named as having no input', async () => {
+    h.findProject.mockResolvedValue(projectRow({ scanModules: ['domain_discovery'], jsReconEnabled: true }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    const hit = r.silentNoOps.find(x => x.field === 'jsReconEnabled')
+    expect(hit?.why).toMatch(/resource_enum.*http_probe/)
+    expect(hit?.why).not.toMatch(/'js_recon' is not in scanModules/)
+  })
+
+  test('a JS recon option is a no-op while JS recon itself is off, whatever scanModules says', async () => {
+    h.findProject.mockResolvedValue(projectRow({
+      scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'js_recon'],
+      jsReconEnabled: false, jsReconAiSdkDetectionEnabled: true,
+    }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.silentNoOps.find(x => x.field === 'jsReconAiSdkDetectionEnabled')?.why).toMatch(/jsReconEnabled/)
+  })
+
+  test('jsluice is a no-op exactly when resource_enum does not run', async () => {
+    h.findProject.mockResolvedValue(projectRow({ scanModules: ['domain_discovery', 'http_probe'], jsluiceEnabled: true }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.silentNoOps.find(x => x.field === 'jsluiceEnabled')?.why).toMatch(/resource_enum/)
+  })
+
   test('a tool enabled in a phase that IS running is not a no-op', async () => {
     h.findProject.mockResolvedValue(projectRow({
       scanModules: ['domain_discovery', 'port_scan'], naabuEnabled: true,

@@ -98,6 +98,7 @@ Cloud security engineers, red teams targeting cloud-hosted organizations, and se
 
     // --- httpx: all probes including ASN, CDN, TLS ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

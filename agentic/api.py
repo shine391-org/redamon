@@ -2077,37 +2077,19 @@ async def get_defaults():
     """
     Get default agent settings for frontend project creation.
 
-    Returns DEFAULT_AGENT_SETTINGS with camelCase keys prefixed with 'agent'
-    for frontend compatibility (e.g., OPENAI_MODEL -> agentOpenaiModel).
+    Returns DEFAULT_AGENT_SETTINGS keyed by Project column name, from
+    AGENT_SETTING_COLUMNS (e.g. OPENAI_MODEL -> agentOpenaiModel, SSRF_GOPHER_ENABLED
+    -> ssrfGopherEnabled). Settings with no column are not served.
     """
-    from project_settings import DEFAULT_AGENT_SETTINGS
-
-    def to_camel_case(snake_str: str, prefix: str = "agent") -> str:
-        """Convert SCREAMING_SNAKE_CASE to prefixCamelCase."""
-        prefixed = f"{prefix}_{snake_str}" if prefix else snake_str
-        components = prefixed.lower().split('_')
-        return components[0] + ''.join(x.title() for x in components[1:])
+    from project_settings import AGENT_SETTING_COLUMNS, DEFAULT_AGENT_SETTINGS
 
     # STEALTH_MODE is a project-level setting (not agent-specific), served by
-    # recon defaults as "stealthMode".  Exclude it here to avoid creating a
-    # duplicate "agentStealthMode" key that Prisma doesn't recognise.
-    SKIP_KEYS = {'STEALTH_MODE', 'USER_ATTACK_SKILLS'}
-
-    # HYDRA_* keys map to Prisma fields without the 'agent' prefix
-    # (e.g. HYDRA_ENABLED -> hydraEnabled, not agentHydraEnabled)
-    NO_PREFIX_KEYS = {k for k in DEFAULT_AGENT_SETTINGS if k.startswith(('HYDRA_', 'PHISHING_', 'ROE_', 'ATTACK_SKILL_', 'SHODAN_', 'DOS_', 'FIRETEAM_'))}
-    # Exclude internal-only fireteam keys that the frontend should not see.
-    # SKILL_TEXT_OVERRIDES is runtime data from the plugin platform, not a project field.
-    SKIP_KEYS = SKIP_KEYS | {'PERSISTENT_CHECKPOINTER', 'SKILL_TEXT_OVERRIDES'}
-
-    camel_case_defaults = {}
-    for k, v in DEFAULT_AGENT_SETTINGS.items():
-        if k in SKIP_KEYS:
-            continue
-        if k in NO_PREFIX_KEYS:
-            camel_case_defaults[to_camel_case(k, prefix="")] = v
-        else:
-            camel_case_defaults[to_camel_case(k)] = v
+    # recon defaults as "stealthMode".
+    camel_case_defaults = {
+        column: DEFAULT_AGENT_SETTINGS[key]
+        for key, column in AGENT_SETTING_COLUMNS.items()
+        if key != 'STEALTH_MODE'
+    }
 
     # An engagement LIMIT has no global default: it belongs to one engagement,
     # not to the installation. It matters more than tidiness, because the
@@ -4608,13 +4590,23 @@ def _graph_exec_summary(params: dict) -> JSONResponse:
     (hostnames, secrets, endpoints) and would leak recon output into an external
     agent's context ahead of any deliberate query.
     """
+    from graph_db.coverage_stamps import COVERAGE_SUMMARY_CYPHER, coverage_summary
+
     try:
         nodes, _ = _graph_exec_run(_GRAPH_SUMMARY_NODES_CYPHER, params)
         rels, _ = _graph_exec_run(_GRAPH_SUMMARY_RELS_CYPHER, params)
     except Exception as e:
         logger.error(f"graph/exec summary failed: {e}")
         return JSONResponse(status_code=500, content={"error": "graph query failed"})
-    return JSONResponse(content={"nodes": nodes, "relationships": rels})
+    body = {"nodes": nodes, "relationships": rels}
+    # The per-host coverage counts explain the census, they are not part of it:
+    # an unreadable count drops the block, never the answer, and never reads as 0.
+    try:
+        coverage, _ = _graph_exec_run(COVERAGE_SUMMARY_CYPHER, params)
+        body["coverage"] = coverage_summary(coverage[0] if coverage else None)
+    except Exception as e:
+        logger.warning(f"graph/exec summary: coverage counts unreadable: {e}")
+    return JSONResponse(content=body)
 
 
 def _graph_exec_respond(final: str, params: dict) -> JSONResponse:

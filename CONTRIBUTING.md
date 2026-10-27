@@ -21,7 +21,6 @@ Before anything else, read the [DISCLAIMER.md](DISCLAIMER.md). This is a securit
 - [Architecture & Development Workflow](#architecture--development-workflow)
 - [Reporting Issues](#reporting-issues)
 - [Security Vulnerabilities](#security-vulnerabilities)
-- [Hall of Fame](#hall-of-fame)
 - [Maintainers](#maintainers)
 
 ---
@@ -120,7 +119,7 @@ Open a Pull Request against `master`. The [PR template](.github/PULL_REQUEST_TEM
 
 ### Step 5 — Celebrate
 
-Your first merged PR earns you the **Scout** rank and a spot in the [Contributors Wall of Fame](README.md#contributors-wall-of-fame). Welcome to the team.
+Your merged PR counts toward your rank (see [Contributor Ranks](#contributor-ranks)). Welcome to the team.
 
 ---
 
@@ -218,7 +217,7 @@ Share your RedAmon experience with the community — record videos, write about 
 3. The maintainer reviews for policy compliance (authorized targets, no sensitive data, disclaimer present)
 4. Once approved:
    - Your content is added to the [Community Showcase](README.md#community-showcase) in the README
-   - You earn the **Broadcaster** rank and get added to the Wall of Fame
+   - You earn the **Broadcaster** rank
    - The maintainer posts about your content on LinkedIn and **tags your profile**
 
 **What you get:**
@@ -235,8 +234,8 @@ Your contributions earn you ranks. The naming follows red team terminology becau
 
 | Rank | How to earn it | Key reward |
 |------|---------------|------------|
-| **Scout** | 5 merged PRs or 5 confirmed bug reports + 1 merged PR | Name in Wall of Fame |
-| **Broadcaster** | 1 published YouTube video featuring RedAmon | Video in README showcase, name in Wall of Fame |
+| **Scout** | 5 merged PRs or 5 confirmed bug reports + 1 merged PR | — |
+| **Broadcaster** | 1 published YouTube video featuring RedAmon | Video in README showcase |
 | **Hunter** | 10 merged PRs across at least 2 tracks | LinkedIn recommendation from maintainer |
 | **Elite** | 15 merged PRs including at least 1 major roadmap feature | Blog co-authorship, private contributor channel |
 | **Core** | Sustained contribution + demonstrated deep codebase knowledge | Push access, roadmap vote, release credits |
@@ -257,8 +256,7 @@ Every rank unlocks real rewards. No empty promises.
 
 | Reward | Starting rank | Details |
 |--------|--------------|---------|
-| Wall of Fame recognition | Scout | Name + GitHub link in [Contributors Wall of Fame](README.md#contributors-wall-of-fame) |
-| Video in README showcase | Broadcaster | Your video embedded in the [Video Showcase](README.md#video-showcase) section — visible to every visitor |
+| Video in README showcase | Broadcaster | Your video listed in the [Community Showcase](README.md#community-showcase) section — visible to every visitor |
 | LinkedIn recommendation | Hunter | The maintainer writes a personalized LinkedIn recommendation highlighting your open-source contributions |
 | Early access | Hunter | Access to feature branches before public release |
 | Blog co-authorship | Elite | Co-author technical writeups about features you built (published on project blog / Medium / dev.to) |
@@ -399,18 +397,6 @@ If you discover a security vulnerability in RedAmon itself (not in target system
 3. Allow reasonable time for a fix before any public disclosure
 
 For full details, see [SECURITY.md](SECURITY.md). We follow responsible disclosure and credit reporters in release notes.
-
----
-
-## Hall of Fame
-
-The [Contributors Wall of Fame](README.md#contributors-wall-of-fame) in README.md is the living leaderboard. It's updated with every rank promotion and tracks:
-
-- Your name and GitHub profile
-- Your current rank
-- The tracks you've contributed to
-
-This is visible to everyone who visits the repo — your work gets seen.
 
 ---
 

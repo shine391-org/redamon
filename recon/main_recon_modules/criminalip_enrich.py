@@ -351,8 +351,8 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
 
     domain = combined_result.get("domain", "")
     is_ip_mode = combined_result.get("metadata", {}).get("ip_mode", False)
-    ips = _extract_ips_from_recon(combined_result)
-    ips = filter_ips_for_enrichment(ips, combined_result, "CriminalIP")
+    all_ips = _extract_ips_from_recon(combined_result)
+    ips = filter_ips_for_enrichment(all_ips, combined_result, "CriminalIP")
 
     print("[*][CriminalIP] Starting OSINT enrichment")
     print(f"[+][CriminalIP] Extracted {len(ips)} unique IPs for enrichment")
@@ -362,6 +362,10 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
         "domain_report": None,
     }
     cip_scope = cb.scope("criminalip", label="CriminalIP", unit="IP(s)")
+    # IPs Criminal IP answered for, "no data" included; the prune keeps the
+    # others' CVEs.
+    checked: set[str] = set()
+    failed = False
 
     try:
         def _domain_report(d):
@@ -397,6 +401,8 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
             rate_limiter.wait()
             print(f"[*][CriminalIP] Fetching IP data for {ip}...")
             res = _cip_get("ip/data", keys, params={"ip": ip, "full": "true"}, admitted=True)
+            if res.answered:
+                checked.add(ip)
             if not res.ok:
                 return None
             report = _parse_ip_report(ip, res.data)
@@ -427,8 +433,12 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
         logger.error(f"CriminalIP enrichment failed: {type(e).__name__}")
         print(f"[!][CriminalIP] Enrichment error: {type(e).__name__}")
         print(f"[!][CriminalIP] Pipeline continues without full Criminal IP data")
+        failed = True
 
     cip_scope.finish("criminalip_enrich", payload=cip_data)
+    from recon.helpers.passive_cve_coverage import note_cve_coverage
+    note_cve_coverage("criminalip", "criminalip_enrich", ips, checked,
+                      no_input=not all_ips, failed=failed)
     combined_result["criminalip"] = cip_data
     return combined_result
 

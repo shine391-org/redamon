@@ -101,6 +101,7 @@ Red team operators running authorized engagements where some active probing is a
 
     // --- httpx: essential probes, throttled ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 3,
     httpxRateLimit: 5,
     httpxTimeout: 15,

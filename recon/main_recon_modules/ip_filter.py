@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import socket
 from typing import Set
 from urllib.parse import urlparse
@@ -158,50 +159,37 @@ def is_address_safe_to_scan(host: str, operator_hosts=(), operator_networks=()) 
     return not any(is_never_scannable_ip(ip) for ip in resolved)
 
 
-_published_networks: list | None = None
-
-
-def _published_cdn_networks() -> list:
-    """The CDN prefixes recon/helpers/cdn_ranges.py ships, parsed once.
-
-    The live list is used only if something in this run already fetched it;
-    otherwise the shipped copy is enough, so the OSINT path never makes a
-    request of its own (cdn_ranges' fetch waits up to 5 s per list).
-    """
-    global _published_networks
-    try:
-        from recon.helpers import cdn_ranges
-        live = getattr(cdn_ranges, "_cloudflare_networks_cache", None)
-        if isinstance(live, list) and live:
-            return live
-        if _published_networks is None:
-            shipped = (tuple(getattr(cdn_ranges, "_CLOUDFLARE_FALLBACK_V4", ()))
-                       + tuple(getattr(cdn_ranges, "_CLOUDFLARE_FALLBACK_V6", ())))
-            networks = []
-            for entry in shipped:
-                try:
-                    networks.append(ipaddress.ip_network(entry, strict=False))
-                except (TypeError, ValueError):
-                    continue
-            _published_networks = networks
-        return _published_networks
-    except Exception:  # noqa: BLE001 - a missing list only means fewer IPs skipped
-        return []
-
-
 def in_published_cdn_range(ip_str: str) -> bool:
     """True for an address inside a CDN's published edge prefixes.
 
     The CDN flags collect_cdn_ips reads come from naabu and httpx, which have
     not run yet when Uncover (GROUP 2b) and Shodan (GROUP 3, beside the port
-    scan) filter their IPs; the published prefixes need no scan.
+    scan) filter their IPs; the published prefixes need no scan. The list is
+    cdn_ranges' static one, so this never makes a request.
     """
     try:
-        addr = ipaddress.ip_address(ip_str)
-        return any(addr.version == net.version and addr in net
-                   for net in _published_cdn_networks())
-    except Exception:  # noqa: BLE001
+        from recon.helpers.cdn_ranges import edge_cdn_for_ip
+        return edge_cdn_for_ip(ip_str) is not None
+    except Exception:  # noqa: BLE001 - a missing list only means fewer IPs skipped
         return False
+
+
+# Providers whose IPs front many unrelated tenants, as a passive source names
+# the IP's owner (Shodan's org/isp, Netlas's isp/ASN). The published prefixes do
+# not cover every edge provider, so the provider's attribution is used as well. Only
+# providers that sell no servers are named: Akamai (which now runs Linode),
+# G-Core and StackPath also rent VMs, so an org name alone cannot say an IP of
+# theirs is an edge.
+SHARED_EDGE_ORG = re.compile(
+    r"\b(?:cloudflare|fastly|vercel|netlify|incapsula|imperva|sucuri"
+    r"|edgecast|edgio|limelight|bunnyway|bunny\.net|cdn77|cloudfront)\b",
+    re.IGNORECASE,
+)
+
+
+def is_shared_edge_org(owner: str) -> bool:
+    """True when a passive source attributes an IP to a shared edge provider."""
+    return bool(SHARED_EDGE_ORG.search(str(owner or "")))
 
 
 def collect_cdn_ips(combined_result: dict) -> Set[str]:

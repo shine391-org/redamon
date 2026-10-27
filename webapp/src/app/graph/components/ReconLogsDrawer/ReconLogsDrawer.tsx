@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { X, Terminal, CheckCircle, AlertCircle, Pause, Play, Trash2, Square, Loader2, Download } from 'lucide-react'
-import type { ReconLogEvent, ReconStatus } from '@/lib/recon-types'
+import { RECON_TOTAL_PHASES, type ReconLogEvent, type ReconStatus } from '@/lib/recon-types'
 import styles from './ReconLogsDrawer.module.css'
 import { nodeFilterLineKind } from './nodeFilterLog'
 
@@ -40,7 +40,7 @@ export function ReconLogsDrawer({
   onResume,
   onStop,
   title = 'Reconnaissance Logs',
-  totalPhases = 7,
+  totalPhases = RECON_TOTAL_PHASES,
   errorMessage,
   hidePhaseProgress = false,
   currentGroup = null,

@@ -1,0 +1,15 @@
+{
+ "_comment": "Repo paths cited by README.md, CONTRIBUTING.md, a SKILL.md or an AGENTS.md that do not exist at the path shown, found by skills/skill-sync/assets/drift-audit.sh --docs; read by tests/docs_cited_paths_test.sh. Remove an entry in the same commit as its fix. An item starting 'not a path:' is a token the audit cannot tell from a path; it stays until the prose changes.",
+ "entries": [
+  {
+   "file": "CONTRIBUTING.md",
+   "path": "docs/update-api-reference",
+   "item": "not a path: an example branch name"
+  },
+  {
+   "file": "skills/orchestrator-container-spawn/SKILL.md",
+   "path": "scanners/graph_db",
+   "item": "not a path: named as the nonexistent bind source on purpose"
+  }
+ ]
+}

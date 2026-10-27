@@ -9,8 +9,10 @@
  * Run: npx vitest run src/components/projects/ProjectForm/sections/AgentBehaviourSection.test.tsx
  */
 import { describe, test, expect, vi, afterEach } from 'vitest'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { render, screen, cleanup, fireEvent } from '@testing-library/react'
-import { AgentBehaviourSection } from './AgentBehaviourSection'
+import { AgentBehaviourSection, FIRETEAM_TIMEOUT_SEC_DEFAULT } from './AgentBehaviourSection'
 
 vi.mock('@/components/shared/ModelPicker', () => ({ ModelPicker: () => null }))
 vi.mock('@/providers/ProjectProvider', () => ({ useProject: () => ({ userId: 'u1' }) }))
@@ -148,5 +150,52 @@ describe('a forbidden tool or category can only be one the gate enforces', () =>
     for (const label of ['Credential testing', 'Availability testing', 'Social engineering']) {
       expect(text).toContain(label)
     }
+  })
+})
+
+/**
+ * drift-map #12: the wave-timeout fallbacks (shown for a project without a value,
+ * and written back when an entry is not a number) were 3600 and 1800 while the
+ * agent runs with FIRETEAM_TIMEOUT_SEC = 7200. The Python default is read from
+ * its source, so a change on either side fails here.
+ */
+describe('the fireteam wave-timeout fallback is the agent default', () => {
+  const AGENT_SETTINGS_PY = join(__dirname, '../../../../../../agentic/project_settings.py')
+  const available = existsSync(AGENT_SETTINGS_PY)
+
+  function pythonDefault(): number {
+    const src = readFileSync(AGENT_SETTINGS_PY, 'utf8')
+    const m = src.match(/['"]FIRETEAM_TIMEOUT_SEC['"]\s*:\s*(\d+)/)
+    expect(m, 'FIRETEAM_TIMEOUT_SEC not found in agentic/project_settings.py').toBeTruthy()
+    return Number(m![1])
+  }
+
+  function timeoutInput(container: HTMLElement): HTMLInputElement {
+    const label = [...container.querySelectorAll('label')]
+      .find(l => l.textContent === 'Wave timeout (seconds)')
+    const input = label?.parentElement?.querySelector('input')
+    expect(input, 'wave timeout input not rendered').toBeTruthy()
+    return input as HTMLInputElement
+  }
+
+  test.skipIf(!available)('the constant equals DEFAULT_AGENT_SETTINGS FIRETEAM_TIMEOUT_SEC', () => {
+    expect(FIRETEAM_TIMEOUT_SEC_DEFAULT).toBe(pythonDefault())
+  })
+
+  test('a project without a value shows the default', () => {
+    const { container } = renderSection()
+    expect(timeoutInput(container).value).toBe(String(FIRETEAM_TIMEOUT_SEC_DEFAULT))
+  })
+
+  test('an entry that is not a number is replaced by the default on blur', () => {
+    const { container, updateField } = renderSection({ fireteamTimeoutSec: 900 })
+    fireEvent.blur(timeoutInput(container), { target: { value: '' } })
+    expect(updateField).toHaveBeenLastCalledWith('fireteamTimeoutSec', FIRETEAM_TIMEOUT_SEC_DEFAULT)
+  })
+
+  test('a number is clamped, not replaced', () => {
+    const { container, updateField } = renderSection({ fireteamTimeoutSec: 900 })
+    fireEvent.blur(timeoutInput(container), { target: { value: '99999' } })
+    expect(updateField).toHaveBeenLastCalledWith('fireteamTimeoutSec', 7200)
   })
 })

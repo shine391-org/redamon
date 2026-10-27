@@ -1,7 +1,7 @@
 """The registry's forbidden-tool vocabulary must match the agent's real tools.
 
 `roeForbiddenTools` is enforced by an EXACT string match in
-`execute_plan_node._check_roe_blocked`:
+`orchestrator_helpers/roe_gate.py`, the gate every executor path asks:
 
     forbidden = set(get_setting('ROE_FORBIDDEN_TOOLS', []))
     ...
@@ -39,7 +39,7 @@ for path in (str(REPO_ROOT), str(REPO_ROOT / "agentic")):
 REGISTRY = json.loads((REPO_ROOT / "recon_settings" / "registry.json").read_text(encoding="utf-8"))
 SETTINGS_SRC = (REPO_ROOT / "agentic" / "project_settings.py").read_text(encoding="utf-8")
 GATE_SRC = (
-    REPO_ROOT / "agentic" / "orchestrator_helpers" / "nodes" / "execute_plan_node.py"
+    REPO_ROOT / "agentic" / "orchestrator_helpers" / "roe_gate.py"
 ).read_text(encoding="utf-8")
 
 

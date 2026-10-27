@@ -34,11 +34,22 @@ These queries READ ONLY. Nothing here writes; publishing is Step E.
 
 from __future__ import annotations
 
-from .score_model import ProjectFacts
+from .score_model import (AGENT_CONFIDENCE_DEFAULT, PROOF_MIN_AGENT_CONFIDENCE,
+                          ProjectFacts, agent_proof_counts)
 
 # ===========================================================================
 # Project fact sets
 # ===========================================================================
+#: The hosts a run skipped (a tripped breaker: the coverage record's `host:port`
+#: keys, normalised as circuit_breaker.hostname_of does for the prune), bound
+#: to `skipped`. Shared by the two queries that read them.
+_SKIPPED_HOSTS = """OPTIONAL MATCH (d:Domain {user_id: $userId, project_id: $projectId})
+WITH reduce(acc = [], hs IN collect(d.recon_skipped_hosts) | acc + coalesce(hs, [])) AS keys
+WITH [k IN [x IN keys | toLower(trim(toString(x)))] |
+      CASE WHEN k STARTS WITH '[' THEN substring(split(k, ']')[0], 1)
+           WHEN size(split(k, ':')) = 2 THEN split(k, ':')[0]
+           ELSE k END] AS skipped"""
+
 # Each query returns rows of simple scalars. `name` selects the reducer in
 # `build_project_facts`. A query that fails leaves its fact set EMPTY, which the
 # model reads as "we do not know" rather than as "it is not true".
@@ -68,11 +79,14 @@ RETURN collect(DISTINCT b.url) AS hosts
     {
         "name": "port_hosts",
         "description": "open ports, and whether an active scanner found them",
+        # `passive_only = false` is the port scan's or nmap's mark: it beats the
+        # source of a Port a passive provider happened to create first.
         "query": """
 MATCH (ip:IP {user_id: $userId, project_id: $projectId})-[:HAS_PORT]->(p:Port)
 WHERE toLower(coalesce(p.state, 'open')) = 'open'
 RETURN ip.address AS host,
-       CASE WHEN toLower(coalesce(p.source, 'nmap')) IN
+       CASE WHEN p.passive_only = false THEN 'active'
+            WHEN toLower(coalesce(p.source, 'nmap')) IN
             ['shodan', 'censys', 'fofa', 'netlas', 'zoomeye', 'internetdb',
              'criminalip', 'uncover']
             THEN 'passive' ELSE 'active' END AS how,
@@ -100,6 +114,18 @@ RETURN collect(DISTINCT s.name) AS hosts
 """,
     },
     {
+        "name": "ip_ownership",
+        "description": "each IP's attribution tag and how many current DNS names point at it",
+        # Written by recon's IP attribution step. An IP written before it has
+        # neither property and is left out: "not known", never "not the target's".
+        "query": """
+MATCH (ip:IP {user_id: $userId, project_id: $projectId})
+WHERE ip.ownership IS NOT NULL OR ip.current_dns_names IS NOT NULL
+RETURN ip.address AS ip, ip.ownership AS ownership,
+       ip.current_dns_names AS dns_names, coalesce(ip.ip_mode, false) AS ip_mode
+""",
+    },
+    {
         "name": "threat_intel_hosts",
         "description": "hosts named in threat intelligence",
         "query": """
@@ -116,11 +142,12 @@ RETURN collect(DISTINCT coalesce(n.name, n.address, n.url)) AS hosts
     {
         "name": "proof",
         "description": "what the agent actually demonstrated (K1)",
-        "query": """
-MATCH (cf:ChainFinding {user_id: $userId, project_id: $projectId})
+        "query": f"""
+MATCH (cf:ChainFinding {{user_id: $userId, project_id: $projectId}})
 WHERE cf.finding_type IN ['exploit_success', 'access_gained',
                           'privilege_escalation', 'credential_found',
                           'vulnerability_confirmed']
+  AND coalesce(toInteger(cf.confidence), {AGENT_CONFIDENCE_DEFAULT}) >= {PROOF_MIN_AGENT_CONFIDENCE}
 OPTIONAL MATCH (cf)-[:FINDING_RELATES_CVE]->(c:CVE)
 OPTIONAL MATCH (cf)-[:CONFIRMS]->(f)
 OPTIONAL MATCH (cf)-[:FOUND_ON]->(t)
@@ -128,7 +155,8 @@ RETURN cf.id AS chain_id, cf.finding_type AS finding_type,
        collect(DISTINCT c.id) AS cve_ids,
        collect(DISTINCT coalesce(f.id, f.finding_id)) AS finding_ids,
        collect(DISTINCT coalesce(t.name, t.address, t.url)) AS hosts,
-       coalesce(cf.target_host, cf.target_url, '') AS target_host
+       coalesce(cf.target_host, cf.target_url, '') AS target_host,
+       cf.confidence AS confidence
 """,
     },
     {
@@ -203,7 +231,12 @@ RETURN collect(DISTINCT b.url) AS hosts
     {
         "name": "gone_hosts",
         "description": "no live endpoint, no open port, nothing resolves",
-        "query": """
+        # RESOLVES_TO runs Subdomain -> IP, so each label reads its own end of
+        # it. Only forward DNS counts: Shodan's reverse-DNS and domain-DNS
+        # answers write the same edge with source 'shodan_rdns' / 'shodan_dns',
+        # and a PTR record does not say the host resolves today. A host the run
+        # skipped was not re-checked, so its absence proves nothing.
+        "query": _SKIPPED_HOSTS + """
 MATCH (n {user_id: $userId, project_id: $projectId})
 WHERE (n:Subdomain OR n:IP)
   AND NOT EXISTS {
@@ -213,9 +246,35 @@ WHERE (n:Subdomain OR n:IP)
   AND NOT EXISTS {
     MATCH (n)-[:HAS_PORT]->(p:Port) WHERE toLower(coalesce(p.state, 'open')) = 'open'
   }
-  AND NOT EXISTS { MATCH (n)-[:RESOLVES_TO]->() }
+  AND NOT (n:Subdomain AND EXISTS {
+    MATCH (n)-[r:RESOLVES_TO]->(:IP) WHERE NOT coalesce(r.source, '') STARTS WITH 'shodan_'
+  })
+  AND NOT (n:IP AND EXISTS {
+    MATCH (n)<-[r:RESOLVES_TO]-(:Subdomain) WHERE NOT coalesce(r.source, '') STARTS WITH 'shodan_'
+  })
   AND coalesce(n.is_live, false) = false
+  AND NOT toLower(coalesce(n.name, n.address, '')) IN skipped
 RETURN collect(DISTINCT coalesce(n.name, n.address)) AS hosts
+""",
+    },
+    {
+        "name": "skipped_hosts",
+        "description": "hosts the run could not re-check (a tripped breaker)",
+        "query": _SKIPPED_HOSTS + """
+RETURN skipped AS hosts
+""",
+    },
+    {
+        "name": "name_ownership",
+        "description": "the attribution tags of the IPs each DNS name currently resolves to",
+        # Forward DNS only, as in gone_hosts: a PTR answer Shodan recorded does
+        # not say the name points there today. An IP no run attributed yet
+        # comes back as '' and keeps the name's attribution unknown.
+        "query": """
+MATCH (s:Subdomain {user_id: $userId, project_id: $projectId})-[r:RESOLVES_TO]->(ip:IP)
+WHERE ip.user_id = $userId AND ip.project_id = $projectId
+  AND NOT coalesce(r.source, '') STARTS WITH 'shodan_'
+RETURN s.name AS name, collect(DISTINCT coalesce(ip.ownership, '')) AS tags
 """,
     },
     {
@@ -291,6 +350,7 @@ RETURN v.id AS id, 'Vulnerability' AS label,
        v.matcher_status AS matcher_status, v.matched_at AS matched_at,
        v.matcher_name AS matcher_name, v.fuzzing_parameter AS fuzzing_parameter,
        v.target_port AS target_port, v.solution_type AS solution_type,
+       v.port_confirmed AS port_confirmed, v.control_check AS control_check,
        v.extracted_results AS extracted_results, v.is_dast_finding AS is_dast_finding,
        v.template_id AS template_id, v.tags AS tags, v.state AS state,
        coalesce(v.oid, v.nvt_oid) AS oid,
@@ -363,15 +423,21 @@ RETURN ex.id AS id, 'ExploitGvm' AS label, 'gvm' AS source,
         "name": "secrets",
         "id_expr": "s.id",
         "label": "Secret",
+        # js_recon's key_type is the pattern's CATEGORY (cloud, auth...) and
+        # secret_type its name. Keyed on the category with no value, every secret
+        # of one category on one host fell into one group; the value lets
+        # grouping hash it, and the evidence redacts it.
         "query": """
 MATCH (s:Secret {user_id: $userId, project_id: $projectId})
 WHERE NOT s:Muted
 RETURN s.id AS id, 'Secret' AS label, coalesce(s.source, 'js_recon') AS source,
-       coalesce(s.key_type, s.secret_type, 'secret') AS name,
+       coalesce(s.secret_type, s.key_type, 'secret') AS name,
        coalesce(s.severity, 'medium') AS severity,
-       s.secret_type AS secret_type, s.key_type AS detector_name,
+       s.secret_type AS secret_type,
+       coalesce(s.secret_type, s.key_type) AS detector_name,
+       s.matched_text AS matched_text, s.context AS context,
        s.validation_status AS validation_status, s.validated_at AS validated_at,
-       s.validation_info AS validation_info,
+       s.validation_info AS validation_info, s.public_client_key AS public_client_key,
        s.stale_since AS stale_since, s.confidence AS confidence,
        s.triage_status AS triage_status, s.triage_source AS triage_source,
        s.triage_evidence_hash AS triage_evidence_hash,
@@ -391,7 +457,7 @@ RETURN j.id AS id, 'JsReconFinding' AS label, 'js_recon' AS source,
        coalesce(j.title, j.finding_type) AS name,
        coalesce(j.severity, 'low') AS severity,
        j.finding_type AS finding_type, j.confidence AS confidence,
-       j.detail AS description, j.evidence AS evidence,
+       j.detail AS description, j.evidence AS evidence, j.control_check AS control_check,
        j.package_name AS package_name, j.stale_since AS stale_since,
        j.triage_status AS triage_status, j.triage_source AS triage_source,
        j.triage_evidence_hash AS triage_evidence_hash,
@@ -575,6 +641,13 @@ def build_project_facts(raw: dict) -> ProjectFacts:
         facts.injectable_auth_hosts |= _clean(row.get("hosts"))
     for row in raw.get("gone_hosts") or []:
         facts.gone_hosts |= _clean(row.get("hosts"))
+    for row in raw.get("skipped_hosts") or []:
+        facts.skipped_hosts |= {h.lower() for h in _clean(row.get("hosts"))}
+    for row in raw.get("name_ownership") or []:
+        name = str(row.get("name") or "").strip().lower()
+        if name:
+            facts.name_ownership.setdefault(name, set()).update(
+                str(t or "").strip() for t in row.get("tags") or [None])
 
     for row in raw.get("port_hosts") or []:
         host = str(row.get("host") or "").strip()
@@ -582,11 +655,29 @@ def build_project_facts(raw: dict) -> ProjectFacts:
             continue
         # "active" wins: one active confirmation beats any number of passive
         # sightings, and the order rows arrive in must not decide this.
-        if row.get("how") == "active" or facts.port_hosts.get(host) != "active":
-            facts.port_hosts[host] = row.get("how") or "active"
+        how = row.get("how") or "active"
+        if how == "active" or facts.port_hosts.get(host) != "active":
+            facts.port_hosts[host] = how
+        for port in row.get("ports") or []:
+            key = (host, _int(port))
+            if key[1] and (how == "active" or facts.port_status.get(key) != "active"):
+                facts.port_status[key] = how
         if set(row.get("ports") or []) & {3306, 5432, 6379, 9200, 27017,
                                           1433, 5984, 11211}:
             facts.sensitive_hosts.add(host)
+
+    for row in raw.get("ip_ownership") or []:
+        ip = str(row.get("ip") or "").strip()
+        if not ip:
+            continue
+        tag = str(row.get("ownership") or "").strip()
+        if tag:
+            facts.ip_ownership[ip] = tag
+        if tag == "shared_edge":
+            facts.shared_edge_hosts.add(ip)
+        # An operator-listed IP-mode target has no DNS name by design.
+        if row.get("dns_names") is not None and not row.get("ip_mode") and _int(row.get("dns_names")) == 0:
+            facts.no_dns_name_hosts.add(ip)
 
     for row in raw.get("package_exposure") or []:
         package = str(row.get("package") or "").strip()
@@ -605,6 +696,8 @@ def build_project_facts(raw: dict) -> ProjectFacts:
         facts.proven_cve_ids |= {c.upper() for c in _clean(row.get("cve_ids"))}
 
     for row in raw.get("proof") or []:
+        if not agent_proof_counts(row.get("confidence")):
+            continue
         facts.proven_cve_ids |= {c.upper() for c in _clean(row.get("cve_ids"))}
         facts.proven_finding_ids |= _clean(row.get("finding_ids"))
         hosts = _clean(row.get("hosts"))

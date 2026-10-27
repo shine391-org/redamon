@@ -244,6 +244,40 @@ class LiveLayersCase(unittest.TestCase):
         self.assertEqual(p["triage_status"], "unreviewed")
         self.assertEqual(self.rows()["mid"]["triage_priority_score"], before)
 
+    def test_the_disposition_is_stored_by_the_publish_and_by_every_rescore(self):
+        """Plan 10.5: the stored answer moves with the layers, in their transaction."""
+        from cypherfix_triage.layers import combine_props
+        self.publish(self.row(MID))
+        p = self.props("mid")
+        self.assertEqual(p["triage_disposition"], "candidate")
+        self.assertTrue(p["triage_blocker"].startswith(("unknown: ", "not reachable now")))
+        self.assertEqual(self.rows()["mid"]["triage_blocker"], p["triage_blocker"])
+
+        self.client.set_human_verdict(self.uid, self.pid, "mid", "confirmed", combine=combine_props)
+        p = self.props("mid")
+        self.assertEqual(p["triage_disposition"], "reportable")
+        self.assertNotIn("triage_blocker", p)
+
+        self.client.set_human_verdict(self.uid, self.pid, "mid", "unreviewed", combine=combine_props)
+        self.assertEqual(self.props("mid")["triage_disposition"], "candidate")
+
+        # An external agent's false positive labels it; it never excludes it.
+        evidence_hash = self.props("mid")["triage_evidence_hash"]
+        review = dict(self.mcp_review(MID, verdict="false_positive"),
+                      triage_ai_evidence_hash=evidence_hash)
+        out = self.client.write_review(self.uid, self.pid, "mid",
+                                       lambda props, proven, updated, label: {"review": review},
+                                       combine_props)
+        self.assertTrue(out["rescored"])
+        p = self.props("mid")
+        self.assertEqual((p["triage_state"], p["triage_disposition"], p["triage_blocker"]),
+                         ("false_positive", "candidate", "AI review: likely false positive"))
+
+        self.client.set_human_verdict(self.uid, self.pid, "mid", "likely_noise", combine=combine_props)
+        p = self.props("mid")
+        self.assertEqual(p["triage_disposition"], "excluded")
+        self.assertNotIn("triage_blocker", p)
+
     def test_mcp_cannot_touch_a_decision_made_in_the_app_even_with_no_channel(self):
         """C7: every decision before channels existed carries none, and was a click."""
         with self.driver.session() as s:

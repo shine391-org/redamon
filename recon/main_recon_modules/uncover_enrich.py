@@ -391,8 +391,9 @@ def run_uncover_expansion(
 ) -> dict:
     """Run uncover target expansion and merge new hosts/IPs into combined_result.
 
-    Designed to run BEFORE Shodan + port scan (GROUP 3) so newly discovered
-    assets are processed by all downstream modules.
+    Runs before Shodan and the port scan (GROUP 3), so a new subdomain is
+    scanned like any other. A bare IP is recorded, never scanned: see
+    merge_uncover_into_pipeline.
 
     Args:
         combined_result: Pipeline's combined result dict (mutated in place)
@@ -584,9 +585,6 @@ def merge_uncover_into_pipeline(
             uncover_data["hosts"] = [h for h in uncover_data.get("hosts", []) if h not in rejected]
             print(f"[*][Uncover] {len(rejected)} hostname(s) failed the scope gates and are dropped")
 
-    # For IPs discovered without a hostname, track them
-    # so OSINT enrichment modules can process them
-    ip_ports = uncover_data.get("ip_ports", {})
     existing_ips = set()
     domain_dns = dns.get("domain", {})
     for ip in domain_dns.get("ips", {}).get("ipv4", []):
@@ -600,9 +598,12 @@ def merge_uncover_into_pipeline(
         if ip not in existing_ips:
             new_ip_count += 1
 
-    # Store the uncover IP data for OSINT enrichment modules to consume. They
-    # feed js_recon's probe scope and the graph's host scope, so only a group
-    # whose scan root is its org takes the org-wide addresses (§4.9).
+    # Bare IPs are never port-scanned or OSINT-enriched: those readers take
+    # metadata.expanded_ips only in IP mode. Here the key widens js_recon's probe
+    # and first-party scopes and the graph's host scope, so only a group whose
+    # scan root is its org takes the org-wide addresses.
+    # update_graph_from_uncover records them either way.
+    added_ips = 0
     if uncover_data.get("ips") and not _owns_its_org(combined_result):
         print(f"[*][Uncover] {len(uncover_data['ips'])} IP(s) not added as targets: "
               f"this group's scan root is below its registrable domain")
@@ -613,13 +614,14 @@ def merge_uncover_into_pipeline(
             for ip in uncover_data["ips"]:
                 if ip not in existing_expanded:
                     expanded.append(ip)
+                    added_ips += 1
             combined_result.setdefault("metadata", {})["expanded_ips"] = expanded
 
-    total = merged + new_ip_count
-    if total:
-        print(f"[+][Uncover] Merged: {merged} new subdomains, {new_ip_count} new IPs into pipeline")
+    if merged or added_ips:
+        print(f"[+][Uncover] Merged: {merged} new subdomain(s); "
+              f"{added_ips} new IP(s) join the host scope, not the port scan")
 
-    return total
+    return merged + new_ip_count
 
 
 def run_uncover_expansion_isolated(combined_result: dict, settings: dict[str, Any]) -> dict:

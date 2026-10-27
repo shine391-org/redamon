@@ -890,7 +890,7 @@
    "unit": "count"
   },
   "agentToolPhaseMap": {
-   "default": "{\"query_graph\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"proxy_brain\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"web_search\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"cve_intel\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"shodan\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"google_dork\":[\"informational\"],\"execute_curl\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_naabu\":[\"informational\",\"exploitation\"],\"execute_httpx\":[\"informational\",\"exploitation\"],\"execute_subfinder\":[\"informational\",\"exploitation\"],\"execute_wpscan\":[\"informational\",\"exploitation\"],\"execute_jsluice\":[\"informational\",\"exploitation\"],\"execute_amass\":[\"informational\",\"exploitation\"],\"execute_katana\":[\"informational\",\"exploitation\"],\"execute_arjun\":[\"informational\",\"exploitation\"],\"execute_ffuf\":[\"informational\",\"exploitation\"],\"execute_gau\":[\"informational\",\"exploitation\"],\"execute_nmap\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_nuclei\":[\"informational\",\"exploitation\"],\"kali_shell\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_code\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_playwright\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_hydra\":[\"exploitation\",\"post_exploitation\"],\"metasploit_console\":[\"exploitation\",\"post_exploitation\"],\"msf_restart\":[\"exploitation\",\"post_exploitation\"],\"tradecraft_lookup\":[\"exploitation\",\"post_exploitation\"],\"execute_osv_scanner\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_guarddog\":[\"informational\",\"exploitation\"]}",
+   "default": "{\"query_graph\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"proxy_brain\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"web_search\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"cve_intel\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"shodan\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"google_dork\":[\"informational\"],\"execute_curl\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_naabu\":[\"informational\",\"exploitation\"],\"execute_httpx\":[\"informational\",\"exploitation\"],\"execute_subfinder\":[\"informational\",\"exploitation\"],\"execute_wpscan\":[\"informational\",\"exploitation\"],\"execute_jsluice\":[\"informational\",\"exploitation\"],\"execute_amass\":[\"informational\",\"exploitation\"],\"execute_katana\":[\"informational\",\"exploitation\"],\"execute_arjun\":[\"informational\",\"exploitation\"],\"execute_ffuf\":[\"informational\",\"exploitation\"],\"execute_gau\":[\"informational\",\"exploitation\"],\"execute_nmap\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_nuclei\":[\"informational\",\"exploitation\"],\"kali_shell\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_code\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_playwright\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_hydra\":[\"exploitation\",\"post_exploitation\"],\"metasploit_console\":[\"exploitation\",\"post_exploitation\"],\"msf_restart\":[\"exploitation\",\"post_exploitation\"],\"tradecraft_lookup\":[\"exploitation\",\"post_exploitation\"],\"execute_osv_scanner\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_guarddog\":[\"informational\",\"exploitation\"],\"graph_diff\":[\"informational\"],\"bloodhound_ingest\":[\"post_exploitation\"],\"mimikatz_parse\":[\"post_exploitation\"]}",
    "form_section": "ToolMatrixSection",
    "group": "agent",
    "has_default": true,
@@ -1626,7 +1626,7 @@
    "unit": "seconds"
   },
   "attackSkillConfig": {
-   "default": "{\"builtIn\":{\"cve_exploit\":true,\"brute_force_credential_guess\":true,\"phishing_social_engineering\":true,\"denial_of_service\":true,\"sql_injection\":true,\"xss\":true,\"ssrf\":true,\"rce\":true,\"deserialization\":false,\"path_traversal\":true,\"access_control\":true,\"http_request_smuggling\":false,\"xxe\":true,\"crypto_attack\":true},\"user\":{}}",
+   "default": "{\"builtIn\":{\"cve_exploit\":true,\"brute_force_credential_guess\":false,\"phishing_social_engineering\":false,\"denial_of_service\":false,\"sql_injection\":true,\"xss\":true,\"ssrf\":true,\"rce\":true,\"deserialization\":false,\"path_traversal\":true,\"access_control\":true,\"http_request_smuggling\":false,\"xxe\":true,\"crypto_attack\":true},\"user\":{}}",
    "form_section": "AttackSkillsSection",
    "group": "agent",
    "has_default": true,
@@ -3196,8 +3196,8 @@
   },
   "fireteamPropensity": {
    "bounds": {
-    "min": 0,
-    "max": 10
+    "min": 1,
+    "max": 5
    },
    "default": 3,
    "form_section": "AgentBehaviourSection",
@@ -3220,7 +3220,7 @@
     "min": 60,
     "max": 7200
    },
-   "default": 3600,
+   "default": 7200,
    "form_section": "AgentBehaviourSection",
    "group": "agent",
    "has_default": true,
@@ -3307,7 +3307,41 @@
    "unit": "threads"
   },
   "gauBlacklistExtensions": {
-   "default": [],
+   "default": [
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "ico",
+    "webp",
+    "avif",
+    "css",
+    "woff",
+    "woff2",
+    "ttf",
+    "eot",
+    "otf",
+    "mp3",
+    "mp4",
+    "avi",
+    "mov",
+    "wmv",
+    "flv",
+    "webm",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "gz"
+   ],
    "form_section": "GauSection",
    "group": "not-tuning",
    "has_default": true,
@@ -4983,7 +5017,19 @@
    "unit": "none"
   },
   "httpxCustomHeaders": {
-   "default": [],
+   "default": [
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language: en-US,en;q=0.9",
+    "Accept-Encoding: gzip, deflate",
+    "Connection: keep-alive",
+    "Upgrade-Insecure-Requests: 1",
+    "Sec-Fetch-Dest: document",
+    "Sec-Fetch-Mode: navigate",
+    "Sec-Fetch-Site: none",
+    "Sec-Fetch-User: ?1",
+    "Cache-Control: max-age=0"
+   ],
    "form_section": "HttpxSection",
    "group": "headers",
    "has_default": true,
@@ -5772,6 +5818,46 @@
    "unit": "none",
    "validator": "free_text"
   },
+  "ipAttributionEnabled": {
+   "default": true,
+   "form_section": "IpAttributionSection",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Whether IP attribution runs. After the HTTP probe it tags every IP of the run shared_edge (a CDN edge serving many tenants), dedicated (the certificate it presents without SNI covers a target domain) or unknown, never \"not ours\". Vhost/SNI skips its wordlist on a shared edge, origin discovery never reports one as an origin, Shodan and Netlas write no CVE on one, and the Priority Board caps the reach of findings on one. Off, IPs keep no tag and those consumers fall back to their own CDN checks.",
+   "optional": false,
+   "phase": "http_probe",
+   "prisma_type": "Boolean",
+   "roe_capped": false,
+   "runtime_key": "IP_ATTRIBUTION_ENABLED",
+   "tool": "ip_attribution",
+   "traffic": "active",
+   "type": "boolean",
+   "unit": "none"
+  },
+  "ipAttributionTlsMaxProbes": {
+   "bounds": {
+    "min": 0,
+    "max": 5000
+   },
+   "default": 500,
+   "form_section": "IpAttributionSection",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "The most TLS handshakes without SNI IP attribution makes in one run, one per IP where port 443 was found open, to read the certificate the IP falls back to. 0 means no handshake at all: the tag then uses only the CDN signals the run already holds. The handshakes skip RoE-excluded hosts and are paced at the engagement rate ceiling, and stealth mode sets this to 0.",
+   "optional": false,
+   "phase": "http_probe",
+   "prisma_type": "Int",
+   "roe_capped": false,
+   "runtime_key": "IP_ATTRIBUTION_TLS_MAX_PROBES",
+   "stealth": {
+    "set": 0
+   },
+   "tool": "ip_attribution",
+   "traffic": "active",
+   "type": "int",
+   "unit": "count",
+   "zero_means": "disabled"
+  },
   "ipMode": {
    "default": false,
    "form_section": "TargetSection",
@@ -5795,7 +5881,7 @@
    "group": "llm",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "Whether JS recon runs. Configuration is two levels: this flag decides whether the tool runs INSIDE its phase, and scanModules decides whether the phase runs at all. Setting one without the other is a silent no-op.",
+   "meaning": "Whether JS recon looks for AI SDKs in the JS it analyzes: LLM and vector database SDK imports, hard-coded provider keys, browser-mode opt-ins and AI front-end markers. Sends no extra traffic. Does nothing while jsReconEnabled is off.",
    "optional": false,
    "phase": "js_recon",
    "prisma_type": "Boolean",
@@ -5986,7 +6072,7 @@
    "form_section": "JsReconSection",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "Whether JS recon runs. Configuration is two levels: this flag decides whether the tool runs INSIDE its phase, and scanModules decides whether the phase runs at all. Setting one without the other is a silent no-op.",
+   "meaning": "Whether JS recon runs. This flag alone switches it on: JS recon is not a scanModules phase. It runs after resource enumeration and analyzes the JS files the crawlers and HTTP probing found (and any uploaded files), so with neither resource_enum nor http_probe in scanModules it has nothing to read.",
    "optional": false,
    "phase": "js_recon",
    "prisma_type": "Boolean",
@@ -6175,7 +6261,7 @@
    "group": "not-tuning",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "The most results JS recon accumulates in one pass. The memory governor budgets it against available RAM, so the effective value can be below what is written here.",
+   "meaning": "The most JS files JS recon downloads and analyzes in one run, shared round-robin between hosts; files over the cap are recorded as a coverage gap. The memory governor budgets it against available RAM, so the effective value can be below what is written here.",
    "optional": false,
    "phase": "js_recon",
    "prisma_type": "Int",
@@ -6409,7 +6495,7 @@
    "form_section": "JsluiceSection",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "Whether jsluice runs. Configuration is two levels: this flag decides whether the tool runs INSIDE its phase, and scanModules decides whether the phase runs at all. Setting one without the other is a silent no-op.",
+   "meaning": "Whether jsluice runs. It runs inside resource enumeration, on the JS files the crawlers found, so it is a silent no-op unless resource_enum is in scanModules.",
    "optional": false,
    "phase": "js_recon",
    "prisma_type": "Boolean",
@@ -6421,7 +6507,73 @@
    "unit": "none"
   },
   "jsluiceExcludePatterns": {
-   "default": [],
+   "default": [
+    "/_next/image",
+    "/_next/static",
+    "/_next/data",
+    "/__nextjs",
+    "/_nuxt/",
+    "/__nuxt",
+    "/runtime.",
+    "/polyfills.",
+    "/vendor.",
+    "/webpack",
+    "/chunk.",
+    ".chunk.js",
+    ".bundle.js",
+    "hot-update",
+    "/static/",
+    "/public/",
+    "/dist/",
+    "/build/",
+    "/lib/",
+    "/vendor/",
+    "/node_modules/",
+    ".js",
+    ".mjs",
+    ".map",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".webp",
+    ".avif",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+    ".mp3",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    "/rxjs/",
+    "/react/",
+    "/angular/",
+    "/lodash/",
+    "/zone.js/"
+   ],
    "fallback": "falsy",
    "form_section": "JsluiceSection",
    "group": "not-tuning",
@@ -6724,7 +6876,11 @@
    "unit": "threads"
   },
   "katanaCustomHeaders": {
-   "default": [],
+   "default": [
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language: en-US,en;q=0.9"
+   ],
    "form_section": "KatanaSection",
    "group": "headers",
    "has_default": true,
@@ -6816,7 +6972,170 @@
    "unit": "none"
   },
   "katanaExcludePatterns": {
-   "default": [],
+   "default": [
+    "/_next/image",
+    "/_next/static",
+    "/_next/data",
+    "/__nextjs",
+    "/_nuxt/",
+    "/__nuxt",
+    "/runtime.",
+    "/polyfills.",
+    "/vendor.",
+    "/webpack",
+    "/chunk.",
+    ".chunk.js",
+    ".bundle.js",
+    "hot-update",
+    "/static/",
+    "/public/",
+    "/dist/",
+    "/build/",
+    "/lib/",
+    "/vendor/",
+    "/node_modules/",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".webp",
+    ".avif",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".heic",
+    ".heif",
+    ".raw",
+    "/images/",
+    "/img/",
+    "/image/",
+    "/pics/",
+    "/pictures/",
+    "/thumbnails/",
+    "/thumb/",
+    "/thumbs/",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".css.map",
+    "/css/",
+    "/styles/",
+    "/style/",
+    "/stylesheet/",
+    ".js.map",
+    ".min.js",
+    "/js/lib/",
+    "/js/vendor/",
+    "/js/plugins/",
+    "jquery",
+    "bootstrap.js",
+    "popper.js",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+    "/fonts/",
+    "/font/",
+    "/webfonts/",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".rtf",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".mp3",
+    ".mp4",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".mkv",
+    ".wav",
+    ".ogg",
+    ".aac",
+    ".m4a",
+    ".flac",
+    "/video/",
+    "/videos/",
+    "/audio/",
+    "/music/",
+    "/sounds/",
+    "/wp-content/uploads/",
+    "/wp-content/themes/",
+    "/wp-includes/",
+    "/sites/default/files/",
+    "/core/assets/",
+    "/pub/static/",
+    "/pub/media/",
+    "/storage/",
+    "/staticfiles/",
+    "/packs/",
+    "cdn.",
+    "cdnjs.",
+    "cloudflare.",
+    "akamai.",
+    "fastly.",
+    "googleapis.com",
+    "gstatic.com",
+    "cloudfront.net",
+    "unpkg.com",
+    "jsdelivr.net",
+    "bootstrapcdn.com",
+    "google-analytics",
+    "googletagmanager",
+    "gtag/",
+    "facebook.com/tr",
+    "facebook.net",
+    "analytics.",
+    "tracking.",
+    "pixel.",
+    "hotjar.",
+    "mouseflow.",
+    "clarity.",
+    "googlesyndication",
+    "doubleclick",
+    "adservice",
+    "platform.twitter",
+    "connect.facebook",
+    "platform.linkedin",
+    "maps.google",
+    "maps.googleapis",
+    "openstreetmap",
+    "mapbox",
+    "recaptcha",
+    "hcaptcha",
+    "captcha",
+    "manifest.json",
+    "sw.js",
+    "service-worker",
+    "browserconfig.xml",
+    "robots.txt",
+    "sitemap.xml",
+    ".well-known/",
+    "favicon",
+    "apple-touch-icon",
+    "android-chrome",
+    "/icons/",
+    "/icon/"
+   ],
    "form_section": "KatanaSection",
    "group": "not-tuning",
    "has_default": true,
@@ -7500,7 +7819,7 @@
    "validator": "free_text"
   },
   "masscanEnabled": {
-   "default": true,
+   "default": false,
    "form_section": "MasscanSection",
    "has_default": true,
    "mcp": "settable",
@@ -10336,7 +10655,7 @@
    "group": "engagement_limits",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "Technique categories the agent may not run on this engagement. Each token is expanded to the tools that perform it and refused before the tool executes (CATEGORY_TOOL_MAP in agentic/orchestrator_helpers/nodes/execute_plan_node.py), and the list is also withheld from the classifier's options. What each token covers: brute_force is any credential guessing, including brute forcing, password spraying and credential stuffing; dos is anything aimed at availability, including denial of service, resource exhaustion and volumetric or high-volume testing; social_engineering is anything aimed at a person rather than a system, including phishing, vishing, smishing and pretexting; physical is physical premises, hardware or tailgating; exploitation is taking a confirmed finding further than proving it. The vocabulary is closed because the gate matches these tokens EXACTLY: a free-text category such as \"Denial of Service\" reaches the agent's prompt as advice and never reaches the gate, so the refusal the UI promises silently does not happen.",
+   "meaning": "Technique categories the agent may not run on this engagement. Each token is expanded to the tools that perform it and refused before the tool executes, on every executor path (CATEGORY_TOOL_MAP in agentic/orchestrator_helpers/roe_gate.py), and the list is also withheld from the classifier's options. What each token covers: brute_force is any credential guessing, including brute forcing, password spraying and credential stuffing; dos is anything aimed at availability, including denial of service, resource exhaustion and volumetric or high-volume testing; social_engineering is anything aimed at a person rather than a system, including phishing, vishing, smishing and pretexting; physical is physical premises, hardware or tailgating; exploitation is taking a confirmed finding further than proving it. The vocabulary is closed because the gate matches these tokens EXACTLY: a free-text category such as \"Denial of Service\" reaches the agent's prompt as advice and never reaches the gate, so the refusal the UI promises silently does not happen.",
    "optional": false,
    "phase": "standalone",
    "prisma_type": "String[]",
@@ -10362,7 +10681,7 @@
    "group": "engagement_limits",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "Tools the agent may not run on this engagement, by name, whatever their own enable flag says. Refused before the tool executes, in agentic/orchestrator_helpers/nodes/execute_plan_node.py. The vocabulary is closed to the agent's real tool names because that gate is an exact string match: a near-miss like \"hydra\" for execute_hydra never matches, and the tool runs with the ban recorded and unenforced.",
+   "meaning": "Tools the agent may not run on this engagement, by name, whatever their own enable flag says. Refused before the tool executes, on every executor path, by agentic/orchestrator_helpers/roe_gate.py. The vocabulary is closed to the agent's real tool names because that gate is an exact string match: a near-miss like \"hydra\" for execute_hydra never matches, and the tool runs with the ban recorded and unenforced.",
    "optional": false,
    "phase": "standalone",
    "prisma_type": "String[]",
@@ -10753,7 +11072,7 @@
    "form_section": "ScanModulesSection",
    "has_default": true,
    "mcp": "settable",
-   "meaning": "Pipeline phases to run. Values: \"domain_discovery\", \"port_scan\", \"http_probe\", \"resource_enum\", \"vuln_scan\", \"js_recon\"",
+   "meaning": "Pipeline phases to run. Values: \"domain_discovery\", \"port_scan\", \"http_probe\", \"resource_enum\", \"vuln_scan\". \"js_recon\" is still accepted so older projects and presets load, but it does nothing: JS recon runs on jsReconEnabled alone.",
    "optional": false,
    "phase": "standalone",
    "prisma_type": "String[]",
@@ -15188,13 +15507,6 @@
   "agent": {
    "form_section": "AgentBehaviourSection",
    "phase": "standalone",
-   "produces": [
-    "AttackChain",
-    "ChainStep",
-    "ChainFinding",
-    "ChainDecision",
-    "ChainFailure"
-   ],
    "title": "Agent",
    "traffic": "active"
   },
@@ -15204,6 +15516,9 @@
    "module": "recon.main_recon_modules.ai_surface_recon",
    "partial_recon_module": "ai_surface_recon",
    "phase": "http_probe",
+   "produces": [
+    "Vulnerability"
+   ],
    "title": "AI attack-surface recon",
    "traffic": "active"
   },
@@ -15214,9 +15529,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Subdomain"
-   ],
    "title": "Amass",
    "traffic": "passive"
   },
@@ -15245,9 +15557,6 @@
    "module": "recon.main_recon_modules.subdomain_takeover",
    "partial_recon_module": "vulnerability_scanning",
    "phase": "vuln_scan",
-   "produces": [
-    "Vulnerability"
-   ],
    "title": "BadDNS",
    "traffic": "active"
   },
@@ -15257,9 +15566,6 @@
    "module": "recon.main_recon_modules.port_scan",
    "partial_recon_module": "port_scanning",
    "phase": "port_scan",
-   "produces": [
-    "Service"
-   ],
    "title": "Banner grab",
    "traffic": "active"
   },
@@ -15278,11 +15584,6 @@
    "module": "recon.main_recon_modules.censys_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "IP",
-    "Port",
-    "Certificate"
-   ],
    "title": "Censys",
    "traffic": "passive"
   },
@@ -15294,10 +15595,6 @@
    "module": "recon.main_recon_modules.criminalip_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "IP",
-    "Port"
-   ],
    "title": "CriminalIP",
    "traffic": "passive"
   },
@@ -15307,10 +15604,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Subdomain",
-    "Certificate"
-   ],
    "title": "crt.sh",
    "traffic": "passive"
   },
@@ -15320,7 +15613,9 @@
    "partial_recon_module": "vulnerability_scanning",
    "phase": "vuln_scan",
    "produces": [
-    "CVE"
+    "CVE",
+    "MitreData",
+    "Capec"
    ],
    "title": "CVE lookup",
    "traffic": "passive"
@@ -15343,11 +15638,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "DNSRecord",
-    "Subdomain",
-    "IP"
-   ],
    "title": "DNS",
    "traffic": "active"
   },
@@ -15376,7 +15666,9 @@
    "partial_recon_module": "web_crawling",
    "phase": "resource_enum",
    "produces": [
-    "Endpoint"
+    "Endpoint",
+    "BaseURL",
+    "ExternalDomain"
    ],
    "title": "ffuf",
    "traffic": "active"
@@ -15395,11 +15687,6 @@
    "module": "recon.main_recon_modules.fofa_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "IP",
-    "Port",
-    "Technology"
-   ],
    "title": "FOFA",
    "traffic": "passive"
   },
@@ -15412,7 +15699,9 @@
    "phase": "resource_enum",
    "produces": [
     "Endpoint",
-    "Parameter"
+    "Parameter",
+    "BaseURL",
+    "ExternalDomain"
    ],
    "title": "gau",
    "traffic": "passive"
@@ -15423,9 +15712,9 @@
    "produces": [
     "GithubHunt",
     "GithubRepository",
+    "GithubPath",
     "GithubSecret",
-    "GithubSensitiveFile",
-    "GithubPath"
+    "GithubSensitiveFile"
    ],
    "title": "GitHub secret hunt",
    "traffic": "passive"
@@ -15438,8 +15727,8 @@
    "partial_recon_module": "graphql_scanning",
    "phase": "vuln_scan",
    "produces": [
-    "Endpoint",
-    "Vulnerability"
+    "Vulnerability",
+    "Endpoint"
    ],
    "title": "GraphQL security",
    "traffic": "active"
@@ -15450,9 +15739,6 @@
    "image": "dolevf/graphql-cop:1.14",
    "partial_recon_module": "graphql_scanning",
    "phase": "vuln_scan",
-   "produces": [
-    "Vulnerability"
-   ],
    "title": "GraphQL Cop",
    "traffic": "active"
   },
@@ -15460,8 +15746,14 @@
    "form_section": "GvmScanSection",
    "phase": "standalone",
    "produces": [
+    "Vulnerability",
+    "Technology",
+    "Traceroute",
+    "Certificate",
     "ExploitGvm",
-    "Vulnerability"
+    "CVE",
+    "MitreData",
+    "Capec"
    ],
    "title": "GVM vulnerability scan",
    "traffic": "active"
@@ -15472,9 +15764,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Subdomain"
-   ],
    "title": "HackerTarget",
    "traffic": "passive"
   },
@@ -15486,7 +15775,10 @@
    "partial_recon_module": "web_crawling",
    "phase": "resource_enum",
    "produces": [
-    "Endpoint"
+    "Endpoint",
+    "Parameter",
+    "BaseURL",
+    "ExternalDomain"
    ],
    "title": "hakrawler",
    "traffic": "active"
@@ -15506,9 +15798,9 @@
    "phase": "http_probe",
    "produces": [
     "BaseURL",
+    "Certificate",
     "Technology",
-    "Header",
-    "Certificate"
+    "Header"
    ],
    "title": "httpx",
    "traffic": "active"
@@ -15519,6 +15811,18 @@
    "title": "Hydra",
    "traffic": "active"
   },
+  "ip_attribution": {
+   "enabled_key": "IP_ATTRIBUTION_ENABLED",
+   "form_section": "IpAttributionSection",
+   "graph_writer": "update_graph_from_ip_attribution",
+   "isolated_fn": "run_ip_attribution_isolated",
+   "module": "recon.main_recon_modules.ip_attribution",
+   "partial_recon_module": "ip_attribution",
+   "phase": "http_probe",
+   "produces": [],
+   "title": "IP attribution",
+   "traffic": "active"
+  },
   "js_recon": {
    "enabled_key": "JS_RECON_ENABLED",
    "form_section": "JsReconSection",
@@ -15526,9 +15830,9 @@
    "partial_recon_module": "js_analysis",
    "phase": "js_recon",
    "produces": [
-    "JsReconFinding",
+    "Secret",
     "Endpoint",
-    "Secret"
+    "JsReconFinding"
    ],
    "title": "JS recon",
    "traffic": "active"
@@ -15537,12 +15841,14 @@
    "enabled_key": "JSLUICE_ENABLED",
    "form_section": "JsluiceSection",
    "module": "recon.main_recon_modules.js_recon",
-   "partial_recon_module": "js_analysis",
+   "partial_recon_module": "web_crawling",
    "phase": "js_recon",
    "produces": [
-    "JsReconFinding",
     "Endpoint",
-    "Secret"
+    "Parameter",
+    "BaseURL",
+    "Secret",
+    "ExternalDomain"
    ],
    "title": "jsluice",
    "traffic": "active"
@@ -15556,7 +15862,9 @@
    "phase": "resource_enum",
    "produces": [
     "Endpoint",
-    "Parameter"
+    "Parameter",
+    "BaseURL",
+    "ExternalDomain"
    ],
    "title": "Katana",
    "traffic": "active"
@@ -15565,10 +15873,11 @@
    "enabled_key": "KITERUNNER_ENABLED",
    "form_section": "KiterunnerSection",
    "module": "recon.main_recon_modules.resource_enum",
-   "partial_recon_module": "web_crawling",
+   "partial_recon_module": "parameter_discovery",
    "phase": "resource_enum",
    "produces": [
-    "Endpoint"
+    "Endpoint",
+    "BaseURL"
    ],
    "title": "Kiterunner",
    "traffic": "active"
@@ -15579,9 +15888,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Subdomain"
-   ],
    "title": "knockpy",
    "traffic": "passive"
   },
@@ -15621,7 +15927,8 @@
    "partial_recon_module": "port_scanning",
    "phase": "port_scan",
    "produces": [
-    "Port"
+    "Port",
+    "Service"
    ],
    "title": "naabu",
    "traffic": "active"
@@ -15634,10 +15941,6 @@
    "module": "recon.main_recon_modules.netlas_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "IP",
-    "Port"
-   ],
    "title": "Netlas",
    "traffic": "passive"
   },
@@ -15648,8 +15951,9 @@
    "partial_recon_module": "port_scanning",
    "phase": "port_scan",
    "produces": [
-    "Service",
-    "Vulnerability"
+    "Technology",
+    "Vulnerability",
+    "CVE"
    ],
    "title": "Nmap",
    "traffic": "active"
@@ -15662,7 +15966,12 @@
    "partial_recon_module": "vulnerability_scanning",
    "phase": "vuln_scan",
    "produces": [
-    "Vulnerability"
+    "Vulnerability",
+    "Endpoint",
+    "Parameter",
+    "CVE",
+    "MitreData",
+    "Capec"
    ],
    "title": "Nuclei",
    "traffic": "active"
@@ -15675,8 +15984,8 @@
    "phase": "resource_enum",
    "produces": [
     "Endpoint",
-    "Parameter",
-    "BaseURL"
+    "BaseURL",
+    "Parameter"
    ],
    "title": "OpenAPI ingestion",
    "traffic": "active"
@@ -15689,7 +15998,8 @@
    "partial_recon_module": "origin_enrichment",
    "phase": "http_probe",
    "produces": [
-    "IP"
+    "IP",
+    "Vulnerability"
    ],
    "title": "Origin discovery",
    "traffic": "active"
@@ -15699,6 +16009,18 @@
    "form_section": "OsintEnrichmentSection",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
+   "produces": [
+    "Subdomain",
+    "Port",
+    "Service",
+    "ExternalDomain",
+    "DNSRecord",
+    "ThreatPulse",
+    "Malware",
+    "Certificate",
+    "Vulnerability",
+    "CVE"
+   ],
    "title": "OSINT enrichment",
    "traffic": "passive"
   },
@@ -15710,10 +16032,6 @@
    "module": "recon.main_recon_modules.otx_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "ThreatPulse",
-    "Malware"
-   ],
    "title": "AlienVault OTX",
    "traffic": "passive"
   },
@@ -15724,7 +16042,10 @@
    "partial_recon_module": "parameter_discovery",
    "phase": "resource_enum",
    "produces": [
-    "Parameter"
+    "Endpoint",
+    "Parameter",
+    "BaseURL",
+    "ExternalDomain"
    ],
    "title": "ParamSpider",
    "traffic": "passive"
@@ -15772,10 +16093,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Subdomain",
-    "IP"
-   ],
    "title": "puredns",
    "traffic": "active"
   },
@@ -15801,7 +16118,7 @@
   "security_check": {
    "enabled_key": "SECURITY_CHECK_ENABLED",
    "form_section": "SecurityChecksSection",
-   "partial_recon_module": "http_probing",
+   "partial_recon_module": "vulnerability_scanning",
    "phase": "http_probe",
    "produces": [
     "Vulnerability"
@@ -15831,9 +16148,12 @@
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
    "produces": [
-    "IP",
     "Port",
     "Service",
+    "Subdomain",
+    "ExternalDomain",
+    "DNSRecord",
+    "Vulnerability",
     "CVE"
    ],
    "title": "Shodan",
@@ -15856,6 +16176,12 @@
    "form_section": "SubdomainDiscoverySection",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
+   "produces": [
+    "Subdomain",
+    "IP",
+    "DNSRecord",
+    "ExternalDomain"
+   ],
    "title": "Subdomain discovery",
    "traffic": "passive"
   },
@@ -15866,9 +16192,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Subdomain"
-   ],
    "title": "subfinder",
    "traffic": "passive"
   },
@@ -15879,19 +16202,12 @@
    "module": "recon.main_recon_modules.subdomain_takeover",
    "partial_recon_module": "vulnerability_scanning",
    "phase": "vuln_scan",
-   "produces": [
-    "Vulnerability"
-   ],
    "title": "subjack",
    "traffic": "active"
   },
   "supply_chain": {
    "form_section": "SupplyChainScanSection",
    "phase": "standalone",
-   "produces": [
-    "Package",
-    "MalPackageFinding"
-   ],
    "title": "Supply chain scan",
    "traffic": "passive"
   },
@@ -15935,7 +16251,7 @@
    "phase": "http_probe",
    "produces": [
     "Certificate",
-    "Service"
+    "Subdomain"
    ],
    "title": "tlsx",
    "traffic": "active"
@@ -15943,11 +16259,6 @@
   "trufflehog": {
    "form_section": "TrufflehogSection",
    "phase": "standalone",
-   "produces": [
-    "MultiscannerScan",
-    "MultiscannerFinding",
-    "Secret"
-   ],
    "title": "TruffleHog",
    "traffic": "passive"
   },
@@ -15961,7 +16272,9 @@
    "phase": "domain_discovery",
    "produces": [
     "IP",
-    "Port"
+    "Subdomain",
+    "Port",
+    "Endpoint"
    ],
    "title": "uncover",
    "traffic": "passive"
@@ -15973,8 +16286,10 @@
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
    "produces": [
+    "Subdomain",
+    "ExternalDomain",
     "Endpoint",
-    "ExternalDomain"
+    "Parameter"
    ],
    "title": "urlscan.io",
    "traffic": "passive"
@@ -15984,11 +16299,12 @@
    "form_section": "VhostSniSection",
    "isolated_fn": "run_vhost_sni_enrichment_isolated",
    "module": "recon.main_recon_modules.vhost_sni_enum",
-   "partial_recon_module": "http_probing",
+   "partial_recon_module": "vulnerability_scanning",
    "phase": "http_probe",
    "produces": [
-    "Subdomain",
-    "Certificate"
+    "Vulnerability",
+    "BaseURL",
+    "Subdomain"
    ],
    "title": "Vhost / SNI enumeration",
    "traffic": "active"
@@ -16001,10 +16317,6 @@
    "module": "recon.main_recon_modules.virustotal_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "Malware",
-    "ExternalDomain"
-   ],
    "title": "VirusTotal",
    "traffic": "passive"
   },
@@ -16020,9 +16332,6 @@
    "module": "recon.main_recon_modules.http_probe",
    "partial_recon_module": "http_probing",
    "phase": "http_probe",
-   "produces": [
-    "Technology"
-   ],
    "title": "Wappalyzer",
    "traffic": "active"
   },
@@ -16044,9 +16353,6 @@
    "module": "recon.main_recon_modules.domain_recon",
    "partial_recon_module": "subdomain_discovery",
    "phase": "domain_discovery",
-   "produces": [
-    "Domain"
-   ],
    "title": "WHOIS",
    "traffic": "passive"
   },
@@ -16059,7 +16365,9 @@
    "phase": "resource_enum",
    "produces": [
     "Endpoint",
-    "Parameter"
+    "Parameter",
+    "BaseURL",
+    "ExternalDomain"
    ],
    "title": "ZAP Ajax Spider",
    "traffic": "active"
@@ -16072,10 +16380,6 @@
    "module": "recon.main_recon_modules.zoomeye_enrich",
    "partial_recon_module": "osint_enrichment",
    "phase": "domain_discovery",
-   "produces": [
-    "IP",
-    "Port"
-   ],
    "title": "ZoomEye",
    "traffic": "passive"
   }

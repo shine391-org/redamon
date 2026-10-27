@@ -2,13 +2,22 @@
 #
 # Tracked pre-commit hook. Installed into .git/hooks/ by tooling/hooks/install-hooks.sh.
 #
-# Its only job today is the ADVISORY skills citation check: on every commit it
-# reports which skills / AGENTS.md files cite the files being committed, so you
-# know you may have just invalidated a rule. It NEVER blocks a commit.
+# Two jobs:
+#   1. BLOCKING: the three generator checks (docs/readmes/README.DRIFT_MAP.md
+#      section 3.1). There is no CI, so a commit that leaves a generated
+#      artifact stale is otherwise caught only when someone runs the unit gate.
+#      The checks read the working tree, so they run only when the commit stages
+#      something under GENERATOR_AREAS: in a checkout several sessions share, an
+#      unrelated commit must not be blocked by someone else's half-finished
+#      regeneration. Without python3, or without PyYAML for the two YAML-driven
+#      generators, the hook says so and lets the commit through.
+#   2. ADVISORY: the skills citation check reports which skills / AGENTS.md
+#      files cite the files being committed, so you know you may have just
+#      invalidated a rule. It NEVER blocks a commit.
 #
-# The check runs from an EXIT trap rather than a plain call at the bottom, so
-# that if this hook ever grows early `exit` paths (formatters, lint) the notice
-# still fires on every path, runs LAST, and never changes the commit's status.
+# The citation check runs from an EXIT trap rather than a plain call at the
+# bottom, so that it fires on every path, runs LAST, and never changes the
+# commit's status (it only runs when the commit is going ahead).
 #
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
@@ -22,5 +31,63 @@ _skill_citation_check() {
 }
 trap _skill_citation_check EXIT
 
-# --- other pre-commit logic, if any, goes ABOVE this line ------------------
-# (none yet)
+# --- generator checks ---------------------------------------------------------
+# What the three generators read or write (each one's paths are at the top of
+# its script). A path left out here only means the check waits for the gate.
+GENERATOR_AREAS=(
+  "recon_settings/"
+  "graph_db/"
+  "tooling/scripts/"
+  "webapp/prisma/schema.prisma"
+  "webapp/src/lib/reconSettings/"
+  "webapp/src/lib/nodeFilters/"
+  "webapp/src/components/projects/ProjectForm/ProjectForm.tsx"
+  "webapp/src/components/projects/ProjectForm/nodeMapping.ts"
+  "recon/helpers/finding_sources.py"
+)
+# script|1 when it needs PyYAML
+GENERATOR_CHECKS=(
+  "recon_settings/build.py|1"
+  "graph_db/node_filters/build.py|1"
+  "tooling/scripts/seed_schema_catalog.py|0"
+)
+
+_stages_generator_area() {
+  local f a
+  while IFS= read -r f; do
+    for a in "${GENERATOR_AREAS[@]}"; do
+      case "$f" in "$a"*) return 0 ;; esac
+    done
+  done < <(git diff --cached --name-only 2>/dev/null)
+  return 1
+}
+
+_generator_checks() {
+  _stages_generator_area || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[pre-commit] python3 not found: generator checks skipped; ./redamon.sh test unit still runs them."
+    return 0
+  fi
+  local have_yaml=1 entry script needs_yaml out failed=0
+  python3 -c 'import yaml' >/dev/null 2>&1 || have_yaml=0
+  for entry in "${GENERATOR_CHECKS[@]}"; do
+    script="${entry%|*}"; needs_yaml="${entry#*|}"
+    if [ "$needs_yaml" = "1" ] && [ "$have_yaml" -eq 0 ]; then
+      echo "[pre-commit] PyYAML not installed (pip install pyyaml): $script --check skipped; ./redamon.sh test unit still runs it."
+      continue
+    fi
+    if ! out="$(cd "$PROJECT_ROOT" && python3 "$script" --check 2>&1)"; then
+      failed=1
+      echo "[pre-commit] STALE: python3 $script --check failed:"
+      printf '%s\n' "$out" | sed 's/^/    /'
+      echo "  fix: python3 $script   then stage what it rewrote"
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    echo "[pre-commit] commit blocked: generated artifacts are stale (see fix lines above)."
+    return 1
+  fi
+  return 0
+}
+
+_generator_checks || exit 1

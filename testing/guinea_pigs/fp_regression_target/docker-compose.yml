@@ -1,0 +1,167 @@
+# RedAmon false-positive regression guinea pig
+#
+# Bring up:    docker compose up -d --build
+# Bring down:  docker compose down
+#
+# 192.88.94.0/24 sits in the deprecated 6to4 relay prefix, like the other recon
+# labs: JS recon fetches through an SSRF guard that rejects loopback, RFC1918
+# and TEST-NET, and Python treats this prefix as global. The recon container
+# runs network_mode: host and reaches the lab over the local bridge route;
+# nothing leaves the host. See README.md for the cases each address carries.
+
+x-lab: &lab
+  build: .
+  image: redamon-fp-regression-target:latest
+  restart: unless-stopped
+  mem_limit: 128m
+  pids_limit: 128
+  cpus: 0.5
+  volumes:
+    - ./server.py:/app/server.py:ro
+    - ./static:/app/static:ro
+
+services:
+  fp-fastly:
+    <<: *lab
+    container_name: redamon-fp-fastly
+    environment: { ROLE: fastly, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.10 } }
+
+  fp-cloudflare:
+    <<: *lab
+    container_name: redamon-fp-cloudflare
+    environment: { ROLE: cloudflare, PORTS: "443", TLS_PORTS: "443" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.11 } }
+
+  fp-redirect:
+    <<: *lab
+    container_name: redamon-fp-redirect
+    environment: { ROLE: redirect, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.12 } }
+
+  fp-akamai:
+    <<: *lab
+    container_name: redamon-fp-akamai
+    environment: { ROLE: akamai, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.13 } }
+
+  fp-ratelimit:
+    <<: *lab
+    container_name: redamon-fp-ratelimit
+    environment: { ROLE: ratelimit, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.14 } }
+
+  fp-cache:
+    <<: *lab
+    container_name: redamon-fp-cache
+    environment: { ROLE: cache, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.15 } }
+
+  fp-spa:
+    <<: *lab
+    container_name: redamon-fp-spa
+    environment: { ROLE: spa, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.20 } }
+
+  fp-vendor:
+    <<: *lab
+    container_name: redamon-fp-vendor
+    environment: { ROLE: vendor, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.21 } }
+
+  fp-shodan:
+    <<: *lab
+    container_name: redamon-fp-shodan
+    environment: { ROLE: shodan, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.30 } }
+
+  # HTTP layer (plan 03): each silent case next to one that must fire.
+  fp-api:
+    <<: *lab
+    container_name: redamon-fp-api
+    environment: { ROLE: api, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.22 } }
+
+  fp-sso:
+    <<: *lab
+    container_name: redamon-fp-sso
+    environment: { ROLE: sso, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.23 } }
+
+  fp-loginwall:
+    <<: *lab
+    container_name: redamon-fp-loginwall
+    environment: { ROLE: loginwall, PORTS: "443", TLS_PORTS: "443" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.24 } }
+
+  fp-jsonall:
+    <<: *lab
+    container_name: redamon-fp-jsonall
+    environment: { ROLE: jsonall, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.25 } }
+
+  fp-deny-a:
+    <<: *lab
+    container_name: redamon-fp-deny-a
+    environment: { ROLE: deny, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.26 } }
+
+  fp-deny-b:
+    <<: *lab
+    container_name: redamon-fp-deny-b
+    environment: { ROLE: deny, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.27 } }
+
+  fp-deny-c:
+    <<: *lab
+    container_name: redamon-fp-deny-c
+    environment: { ROLE: deny, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.28 } }
+
+  # JS coverage (plan 06): a large Next.js-style site for the file budget and
+  # the volume measurement. Its chunks are generated per request.
+  fp-bulk:
+    <<: *lab
+    container_name: redamon-fp-bulk
+    environment: { ROLE: bulk, PORTS: "80", BULK_CHUNKS: "520" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.29 } }
+
+  # vhost naming and the tlsx CDN tag (plan 07).
+  fp-tlsvhost:
+    <<: *lab
+    container_name: redamon-fp-tlsvhost
+    environment: { ROLE: tlsvhost, PORTS: "443", TLS_PORTS: "443" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.31 } }
+
+  fp-cdncert:
+    <<: *lab
+    container_name: redamon-fp-cdncert
+    environment:
+      ROLE: cdncert
+      PORTS: "443"
+      TLS_PORTS: "443"
+      TLS_SUBJECT: "/CN=Cloudflare Inc ECC CA-3/O=Cloudflare, Inc./C=US"
+    networks: { fp_lab: { ipv4_address: 192.88.94.32 } }
+
+  # Per-host coverage (plan 09): a host no stamping module looks at.
+  fp-down:
+    <<: *lab
+    container_name: redamon-fp-down
+    environment: { ROLE: down, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.33 } }
+
+  # ... and a host JS Recon reads and finds nothing on.
+  fp-plainjs:
+    <<: *lab
+    container_name: redamon-fp-plainjs
+    environment: { ROLE: plainjs, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.34 } }
+
+networks:
+  fp_lab:
+    name: redamon_fp_lab
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.88.94.0/24
+          gateway: 192.88.94.1

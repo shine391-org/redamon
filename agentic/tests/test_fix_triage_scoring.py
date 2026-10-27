@@ -78,11 +78,27 @@ def producer_check_types() -> set:
     return types
 
 
+def _python_string_block(text: str, opener: str) -> set:
+    """The quoted strings of the tuple or frozenset that starts at `opener`."""
+    start = text.index(opener)
+    end = text.index(")", start)
+    return set(re.findall(r'"([^"]+)"', text[start + len(opener):end]))
+
+
 def producer_secret_names() -> dict:
-    """{producer: {secret_type names}} from the two pattern tables."""
+    """{producer: {secret_type names}} from the two pattern tables. js_recon
+    also writes the names it re-reads a hit under (DERIVED_SECRET_NAMES)."""
     hunt = set(re.findall(r'^\s*"([^"]+)":\s*r["\']', _read(GITHUB_HUNT_SRC), re.M))
-    js = set(re.findall(r'^\s*\("([^"]+)",\s*r["\']', _read(JS_PATTERNS_SRC), re.M))
+    js_src = _read(JS_PATTERNS_SRC)
+    js = set(re.findall(r'^\s*\("([^"]+)",\s*r["\']', js_src, re.M))
+    js |= _python_string_block(js_src, "DERIVED_SECRET_NAMES = (")
     return {"github_hunt": hunt, "js_recon": js}
+
+
+def js_public_client_key_names() -> set:
+    """js_recon's PUBLIC_CLIENT_KEY_NAMES, read from its source: the recon
+    module is not importable in the agent image."""
+    return _python_string_block(_read(JS_PATTERNS_SRC), "PUBLIC_CLIENT_KEY_NAMES = frozenset({")
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +143,9 @@ class TestSecurityCheckConfidence(unittest.TestCase):
     def test_waf_bypass_confidence_follows_the_detection_method(self):
         def c(method):
             return self.c_of(check("waf_bypass", "high", detection_method=method))
-        self.assertEqual(c("payload_differential"), 1.0)
+        # The producer now needs a 2xx origin page matching the edge's benign
+        # page, so a 302 to login, a 401, a 404 or a 421 is no longer "served".
+        self.assertEqual(c("payload_differential"), 0.95)
         self.assertEqual(c("static_headers"), 0.75)
         self.assertEqual(c("ai_classifier"), 0.6)
         self.assertEqual(c("jev_classifier"), 0.6)
@@ -309,21 +327,48 @@ class TestSecurityCheckClasses(unittest.TestCase):
 # F3: public-by-design client keys
 # ---------------------------------------------------------------------------
 class TestPublicClientKeys(unittest.TestCase):
-    PRODUCER_NAMES = ("GCP API Key", "Stripe Publishable Key", "Google reCAPTCHA Key",
-                      "Sentry DSN", "Mapbox Token")
+    PRODUCER_NAMES = ("GCP API Key", "Firebase API Key", "Segment Write Key",
+                      "Amplitude API Key", "New Relic Browser API Token", "Sentry DSN",
+                      "Stripe Publishable Key", "Google reCAPTCHA Key", "Mapbox Token",
+                      "Algolia App ID", "Algolia Search Key", "Intercom App ID",
+                      "Pusher Key", "Clerk Publishable Key", "Mailgun Public Key",
+                      "Flutterwave Public Key", "Supabase anon key", "Supabase Publishable Key")
 
-    def test_the_public_names_exist_in_both_producers(self):
+    def test_the_list_is_js_recons_list(self):
+        """js_recon writes these at info with the flag; the board must agree on
+        every name, or a key the detector calls public is ranked as a secret."""
+        self.assertEqual(set(sm.PUBLIC_CLIENT_KEY_TYPES) - {"gcpkey"},
+                         {n.lower() for n in js_public_client_key_names()})
+        self.assertEqual({n.lower() for n in self.PRODUCER_NAMES},
+                         {n.lower() for n in js_public_client_key_names()})
+
+    def test_the_public_names_exist_in_a_producer(self):
         """A rename in a producer would silently turn the rule off."""
         names = producer_secret_names()
-        for producer, found in names.items():
-            for name in self.PRODUCER_NAMES:
-                with self.subTest(producer=producer, name=name):
-                    self.assertIn(name, found)
+        for name in self.PRODUCER_NAMES:
+            with self.subTest(name=name):
+                self.assertIn(name, names["js_recon"])
+        # The GitHub hunt shares most of them; these are js_recon-only.
+        hunt_only_missing = {"Intercom App ID", "Algolia Search Key", "Supabase anon key",
+                             "Supabase Publishable Key"}
+        for name in set(self.PRODUCER_NAMES) - hunt_only_missing:
+            with self.subTest(producer="github_hunt", name=name):
+                self.assertIn(name, names["github_hunt"])
 
     def test_every_public_name_is_one_a_producer_writes(self):
         known = {n.lower() for found in producer_secret_names().values() for n in found}
         # jsluice is a Go binary; its AIza key kind is "gcpKey".
         self.assertEqual(set(sm.PUBLIC_CLIENT_KEY_TYPES) - known, {"gcpkey"})
+
+    def test_each_public_family_lands_in_t4(self):
+        for name in self.PRODUCER_NAMES:
+            for severity in ("info", "critical"):  # critical: a node written before the flag
+                with self.subTest(name=name, severity=severity):
+                    row = js_secret(name, "js_service", severity=severity,
+                                    validation_status="unvalidated")
+                    self.assertEqual(sm.score(row, LIVE).tier, "T4")
+                    hunt = secret("GithubSecret", "github_hunt", name, severity=severity)
+                    self.assertEqual(sm.score(hunt, LIVE).tier, "T4")
 
     def test_public_keys_are_classed_as_public(self):
         for name in self.PRODUCER_NAMES + ("gcpKey",):
@@ -593,10 +638,12 @@ GUARD = {
         {'confidence': 'high', 'detector_name': 'payment', 'host': 'h1', 'id': 's', 'label': 'Secret', 'secret_type': 'Stripe Secret Key', 'severity': 'critical', 'source': 'js_recon', 'validation_info': '{"status": "invalid", "valid": false, "info": "status=429", "error": ""}', 'validation_status': 'invalid'},
         ('open', 'T2', 60.125),
         ('open', 'T2', 58.1)),
+    # The Firebase web config's apiKey is public by design (plan 05.2): it
+    # left T3 for T4 on purpose, as a node written before the flag.
     'js_firebase_api_key': (
         {'confidence': 'medium', 'detector_name': 'cloud', 'host': 'h1', 'id': 's', 'label': 'Secret', 'secret_type': 'Firebase API Key', 'severity': 'high', 'source': 'js_recon', 'validation_status': 'unvalidated'},
-        ('open', 'T3', 28.6),
-        ('open', 'T3', 27.88)),
+        ('open', 'T4', 0.3),
+        ('open', 'T4', 0.24)),
     'jsluice_aws': (
         {'detector_name': 'AWSAccessKey', 'host': 'h1', 'id': 's', 'label': 'Secret', 'secret_type': 'AWSAccessKey', 'severity': 'high', 'source': 'jsluice'},
         ('open', 'T3', 31.75),
@@ -641,10 +688,11 @@ GUARD = {
         {'host': 'h1', 'id': 'x', 'label': 'Vulnerability', 'severity': 'medium', 'source': 'security_check', 'type': 'waf_bypass'},
         ('open', 'T3', 27.25),
         ('open', 'T3', 26.8)),
+    # C 0.95: the producer requires a 2xx origin page matching the edge's own.
     'waf_bypass_payload_differential': (
         {'detection_method': 'payload_differential', 'host': 'h1', 'id': 'x', 'label': 'Vulnerability', 'severity': 'high', 'source': 'security_check', 'type': 'waf_bypass'},
-        ('open', 'T3', 27.25),
-        ('open', 'T3', 26.8)),
+        ('open', 'T3', 27.1375),
+        ('open', 'T3', 26.71)),
     'direct_ip_http_medium': (
         {'host': 'h1', 'id': 'x', 'label': 'Vulnerability', 'severity': 'medium', 'source': 'security_check', 'type': 'direct_ip_http'},
         ('open', 'T3', 27.25),
@@ -743,3 +791,102 @@ class TestUnaffectedFindingsDidNotMove(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Plan 05.5: a keyword-anchored pattern with a generic value is medium
+# ---------------------------------------------------------------------------
+def js_pattern(name: str) -> tuple:
+    """(severity, confidence, category) of one js_recon pattern, from its source."""
+    m = re.search(r'^\s*\("' + re.escape(name) + r'",\s*r"(?:[^"\\]|\\.)*",\s*"(\w+)",\s*"(\w+)",\s*"(\w+)"',
+                  _read(JS_PATTERNS_SRC), re.M)
+    if m is None:
+        raise AssertionError(f"no js_recon pattern named {name}")
+    return m.group(1), m.group(2), m.group(3)
+
+
+class TestKeywordAnchoredConfidence(unittest.TestCase):
+    #: Values with no provider prefix, found only by a keyword nearby.
+    GENERIC_VALUE = ("AWS Secret Key", "Azure AD Client Secret", "Azure Connection String",
+                     "Plaid Secret Key", "GoCardless API Token", "Notion API Token",
+                     "Harness API Key", "Basic Auth Header")
+
+    def test_they_are_medium_confidence(self):
+        for name in self.GENERIC_VALUE:
+            with self.subTest(name=name):
+                self.assertEqual(js_pattern(name)[1], "medium")
+
+    def test_an_unvalidated_hit_scores_at_most_t3(self):
+        for name in self.GENERIC_VALUE:
+            severity, confidence, category = js_pattern(name)
+            with self.subTest(name=name):
+                row = js_secret(name, category, severity=severity, confidence=confidence,
+                                validation_status="unvalidated")
+                self.assertIn(sm.score(row, LIVE).tier, ("T3", "T4"))
+
+    def test_high_confidence_was_what_reached_t2(self):
+        severity, _, category = js_pattern("AWS Secret Key")
+        row = js_secret("AWS Secret Key", category, severity=severity, confidence="high",
+                        validation_status="unvalidated")
+        self.assertEqual(sm.score(row, LIVE).tier, "T2")
+
+    def test_provider_prefixed_patterns_keep_high(self):
+        for name in ("AWS Access Key ID", "GitHub Token Classic", "Slack Bot Token",
+                     "Stripe Secret Key", "HashiCorp Terraform Token", "Azure Storage Key"):
+            with self.subTest(name=name):
+                self.assertEqual(js_pattern(name)[1], "high")
+
+
+class TestPrivilegedSupabaseKeys(unittest.TestCase):
+    """Plan 05.6: a service_role JWT or an sb_secret_ key is a credential."""
+
+    def test_they_are_credentials(self):
+        for name in ("Supabase service_role key", "Supabase Secret Key"):
+            with self.subTest(name=name):
+                self.assertEqual(sm.classify_secret(name, name).name, "credential")
+                self.assertEqual(sm.classify_secret("js_service", name).name, "credential")
+
+    def test_the_anon_key_is_public(self):
+        self.assertEqual(sm.classify_secret("Supabase anon key", "Supabase anon key").name,
+                         "public_client_id")
+
+
+# ---------------------------------------------------------------------------
+# Plan 05.7: the validation states are stored explicitly
+# ---------------------------------------------------------------------------
+class TestExplicitValidationStates(unittest.TestCase):
+    def state(self, label="Secret", **kwargs):
+        if label == "Secret":
+            return sm.score(js_secret("Stripe Secret Key", "payment", **kwargs), LIVE).state
+        return sm.score(secret(label, "trufflehog", "AWS", **kwargs), LIVE).state
+
+    def test_rejected_is_inactive_with_nothing_to_parse(self):
+        self.assertEqual(self.state(validation_status="rejected"), sm.STATE_INACTIVE)
+        self.assertEqual(self.state(validation_status="Rejected", validation_info="{}"),
+                         sm.STATE_INACTIVE)
+
+    def test_a_malformed_value_is_inactive(self):
+        self.assertEqual(self.state(validation_status="format_invalid"), sm.STATE_INACTIVE)
+
+    def test_unknown_stays_open_whatever_its_detail_says(self):
+        for info in (validation_info("status=401"), validation_info("", "timeout"), None):
+            with self.subTest(info=info):
+                self.assertEqual(self.state(validation_status="unknown", validation_info=info),
+                                 sm.STATE_OPEN)
+
+    def test_legacy_invalid_is_read_as_before(self):
+        self.assertEqual(self.state(validation_status="invalid",
+                                    validation_info=validation_info("status=401")),
+                         sm.STATE_INACTIVE)
+        self.assertEqual(self.state(validation_status="invalid",
+                                    validation_info=validation_info("", "timeout")),
+                         sm.STATE_OPEN)
+
+    def test_a_trufflehog_credential_tested_and_dead_is_inactive(self):
+        self.assertEqual(self.state("MultiscannerFinding", validation_status="rejected"),
+                         sm.STATE_INACTIVE)
+
+    def test_the_model_version_moved_with_plan_05(self):
+        # Public client keys, the credential needles and the explicit states
+        # rescore existing findings.
+        self.assertNotIn(sm.SCORE_MODEL_VERSION, ("v3.7.0",))

@@ -23,12 +23,14 @@ that proves what changed.
 Run:
     python3 tooling/scripts/seed_schema_catalog.py [--check]
 
-`--check` verifies the committed catalog still reproduces the fixture without
-rewriting it, which is what CI wants.
+`--check` regenerates the catalog in memory and exits 1 when it differs from
+the committed `graph_db/schema_catalog.py`, without writing anything. The gate
+runs it (`recon/tests/test_schema_catalog.py`).
 """
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import re
 import sys
@@ -46,7 +48,6 @@ REPO = Path(__file__).resolve().parent.parent.parent
 #: proof has something to compare against. The catalog is now the source of
 #: truth: base.py holds only the invariant rules and a __GRAPH_SCHEMA__ marker.
 SEED = REPO / "graph_db" / "schema_sections.md"
-FIXTURE = SEED
 OUT = REPO / "graph_db" / "schema_catalog.py"
 
 START_TOKEN = 'TEXT_TO_CYPHER_SYSTEM = """'
@@ -264,14 +265,22 @@ def main() -> int:
     print(f"segments   : {len(segs)} ({n_labels} labels)")
     print("round-trip : byte-identical")
 
-    if FIXTURE.exists():
-        fx = FIXTURE.read_text(encoding="utf-8")
-        print(f"fixture    : {'MATCHES' if fx == doc else 'DIFFERS (update the fixture deliberately)'}")
-
+    generated = emit(segs)
     if args.check:
+        committed = OUT.read_text(encoding="utf-8") if OUT.exists() else ""
+        if committed != generated:
+            print(f"FAIL: {OUT.relative_to(REPO)} is not what {SEED.relative_to(REPO)} "
+                  "generates. Re-run without --check and commit both:", file=sys.stderr)
+            diff = difflib.unified_diff(
+                committed.splitlines(), generated.splitlines(),
+                "committed", "generated", lineterm="", n=1)
+            for ln in list(diff)[:20]:
+                print(f"  {ln[:120]}", file=sys.stderr)
+            return 1
+        print(f"catalog    : up to date ({OUT.relative_to(REPO)})")
         return 0
 
-    OUT.write_text(emit(segs), encoding="utf-8")
+    OUT.write_text(generated, encoding="utf-8")
     print(f"wrote      : {OUT.relative_to(REPO)}")
     return 0
 

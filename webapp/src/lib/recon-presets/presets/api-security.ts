@@ -87,6 +87,7 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 
     // --- httpx: tech detect + response capture for API detection ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

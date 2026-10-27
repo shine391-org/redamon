@@ -37,6 +37,11 @@ gen_cert web1 api.nwlab.test \
     "DNS:api.nwlab.test,DNS:v1.api.nwlab.test,DNS:v2.api.nwlab.test,DNS:admin.v1.api.nwlab.test,DNS:internal.v1.api.nwlab.test,DNS:www.nwlab.test,DNS:shop.nwlab.test,DNS:mail.nwlab.test,DNS:secret.nwlab.test"
 gen_cert web2 nwlab-two.test \
     "DNS:nwlab-two.test,DNS:www.nwlab-two.test,DNS:portal.nwlab-two.test,DNS:api.nwlab-two.test,DNS:v1.api.nwlab-two.test,DNS:v2.api.nwlab-two.test"
+# Scenario WC: web1 serves this one for wild.nwlab.test. The lab has no brute
+# force, so these SANs are how names under the DNS wildcard reach the scan:
+# four that exist only through *.wild (dropped) and real.wild (kept).
+gen_cert wild wild.nwlab.test \
+    "DNS:wild.nwlab.test,DNS:real.wild.nwlab.test,DNS:admin.wild.nwlab.test,DNS:dev.wild.nwlab.test,DNS:vpn.wild.nwlab.test,DNS:staging.wild.nwlab.test"
 
 docker compose up -d
 

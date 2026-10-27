@@ -452,7 +452,35 @@ class TestStartPartialRecon:
 # Stop Partial Recon Tests
 # ---------------------------------------------------------------------------
 
+async def _stop_and_finish(manager, project_id, run_id):
+    """Stop is asynchronous (plan 12.3): it answers `stopping`, then a task ends
+    the run. These MagicMock containers stay `running`, so the grace is patched
+    small and the task awaited."""
+    with patch('container_manager.RECON_STOP_GRACE_S', 0.05), \
+            patch('container_manager.STOP_TOOL_SWEEP_INTERVAL_S', 0.01):
+        state = await manager.stop_partial_recon(project_id, run_id)
+        task = manager._stop_tasks_by_run().get(("partial_recon", project_id, run_id))
+        if task is not None:
+            await task
+    return state
+
+
 class TestStopPartialRecon:
+    @pytest.mark.asyncio
+    async def test_stop_answers_stopping_at_once(self, manager, mock_docker_client):
+        state = PartialReconState(
+            project_id="proj-1", run_id="r1", status=PartialReconStatus.RUNNING,
+            container_id="c1",
+        )
+        manager.partial_recon_states["proj-1"] = {"r1": state}
+        mock_docker_client.containers.get.return_value = MagicMock(status="running")
+
+        with patch('container_manager.RECON_STOP_GRACE_S', 0.05), \
+                patch('container_manager.STOP_TOOL_SWEEP_INTERVAL_S', 0.01):
+            result = await manager.stop_partial_recon("proj-1", "r1")
+            assert result.status == PartialReconStatus.STOPPING
+            await manager._stop_tasks_by_run()[("partial_recon", "proj-1", "r1")]
+
     @pytest.mark.asyncio
     async def test_stop_removes_from_dict(self, manager, mock_docker_client):
         state = PartialReconState(
@@ -465,7 +493,7 @@ class TestStopPartialRecon:
         mock_container.status = "running"
         mock_docker_client.containers.get.return_value = mock_container
 
-        result = await manager.stop_partial_recon("proj-1", "r1")
+        result = await _stop_and_finish(manager, "proj-1", "r1")
         assert result.status == PartialReconStatus.IDLE
         assert "proj-1" not in manager.partial_recon_states
 
@@ -479,7 +507,7 @@ class TestStopPartialRecon:
         mock_container.status = "running"
         mock_docker_client.containers.get.return_value = mock_container
 
-        await manager.stop_partial_recon("proj-1", "r1")
+        await _stop_and_finish(manager, "proj-1", "r1")
         assert "r1" not in manager.partial_recon_states["proj-1"]
         assert "r2" in manager.partial_recon_states["proj-1"]
 
@@ -489,7 +517,7 @@ class TestStopPartialRecon:
         assert result.status == PartialReconStatus.IDLE
 
     @pytest.mark.asyncio
-    async def test_stop_does_not_cleanup_sub_containers(self, manager, mock_docker_client):
+    async def test_stop_cleans_up_only_its_own_runs_tool_containers(self, manager, mock_docker_client):
         state = PartialReconState(
             project_id="proj-1", run_id="r1", status=PartialReconStatus.RUNNING,
             container_id="c1",
@@ -499,10 +527,15 @@ class TestStopPartialRecon:
         mock_container = MagicMock()
         mock_container.status = "running"
         mock_docker_client.containers.get.return_value = mock_container
+        mock_docker_client.containers.list.return_value = []
 
-        await manager.stop_partial_recon("proj-1", "r1")
-        # _cleanup_sub_containers should NOT be called
-        mock_docker_client.containers.list.assert_not_called()
+        await _stop_and_finish(manager, "proj-1", "r1")
+        # Selected by its run's label (plan 12.4), so a parallel partial recon's
+        # tools are never in the listing.
+        for call in mock_docker_client.containers.list.call_args_list:
+            assert set(call.kwargs["filters"]["label"]) == {
+                "redamon.broker-owned=1", "redamon.run_id=r1"}
+        assert mock_docker_client.containers.list.called
 
 
 # ---------------------------------------------------------------------------

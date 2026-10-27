@@ -14,6 +14,7 @@ import { deriveAgentStatus, hasAgentStatus } from './agentStatus'
 import { SuggestionPanels } from './SuggestionPanels'
 import { extractTextFromChildren } from './phaseConfig'
 import { parseNodeContextQuery } from '@/lib/agentQueryEnvelope'
+import { copyText } from '@/lib/copyText'
 import type { ChatItem, Message, FileDownloadItem, FireteamItem, LatsSearchItem } from './types'
 import type { ThinkingItem, ToolExecutionItem, PlanWaveItem, DeepThinkItem } from './AgentTimeline'
 import styles from './AIAssistantDrawer.module.css'
@@ -94,14 +95,14 @@ export function ChatArea({
   }, [isLoading])
 
   const handleCopyMessage = useCallback((messageId: string, content: string) => {
-    navigator.clipboard.writeText(content).then(() => {
+    copyText(content).then(() => {
       setCopiedMessageId(messageId)
       setTimeout(() => setCopiedMessageId(null), 2000)
     })
   }, [])
 
   const handleCopyField = useCallback((key: string, text: string) => {
-    navigator.clipboard.writeText(text).then(() => {
+    copyText(text).then(() => {
       setCopiedFieldKey(key)
       setTimeout(() => setCopiedFieldKey(null), 2000)
     })

@@ -24,8 +24,8 @@ from graph_db.node_filters.guards import GUARD_KEEP_CHECK
 # Load environment variables from local .env file
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-#: `n:CVE OR n:MitreData OR n:Capec`, built once from the schema's own list so a
-#: label added there is covered here too.
+#: `n:CVE OR n:Capec OR n:MitreData`, built once from the tenant filter's list
+#: (through graph_db.schema) so a label added there is covered here too.
 _REFERENCE_LABEL_PREDICATE = " OR ".join(
     f"n:`{label}`" for label in GLOBAL_REFERENCE_LABELS)
 _REFERENCE_LABEL_PREDICATE_X = " OR ".join(

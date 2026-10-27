@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { reconcileScanJobStatus } from '@/lib/scanTimeline'
+import { RECON_TOTAL_PHASES } from '@/lib/recon-types'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -50,7 +51,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
         status: 'idle',
         current_phase: null,
         phase_number: null,
-        total_phases: 7,
+        total_phases: RECON_TOTAL_PHASES,
         started_at: null,
         completed_at: null,
         error: null,

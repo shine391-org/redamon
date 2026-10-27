@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.4.0] - 2026-10-27
+
+Fewer false positives, honest coverage, and scans that stop, pause and resume as they should.
+
+### Added
+
+- **Finding disposition.** Each finding is reportable, a candidate (naming what blocks it) or info, and the report and the Priority Board follow it.
+- **IP ownership.** Each IP is a shared edge, dedicated or unknown, so a CDN edge no longer collects passive CVEs or passes for an origin.
+- **Coverage record.** A host or module that was never scanned reads "not scanned", not clean, and a lost graph is flagged.
+
+### Fixed
+
+- **False positives.** A locked Firebase database, catch-all JSON, a 302/401/404 "WAF bypass", a deny page many hosts share, a vhost already in public DNS and wildcard DNS names are no longer findings.
+- **Secrets.** Long or font-adjacent secrets are kept, public-by-design keys are info, each secret keeps its masked context, and "rejected" is stored apart from "could not check".
+- **JS Recon.** It gets every in-scope bundle, shares its budget between hosts, scans source maps, and takes each endpoint's own HTTP method.
+- **Report and Priority Board.** They count findings the way the board judged them; agent proof needs the agent's own confidence; different secrets on one host are separate rows; a host is gone only once re-checked.
+- **Passive CVEs** (Shodan, InternetDB, Netlas, CriminalIP). They are pruned when no longer reported, checked against the open ports, one per IP and port, and refreshed every run.
+- **Exports and version snapshots** keep their CVE, MitreData and Capec links.
+- **Stop, Pause, Resume.** Stop lands the queued graph writes and the mute rules within 45 s (`RECON_STOP_GRACE_S`) and ends only its own scan's tools; Pause freezes the tools too; Resume re-checks the RoE time window.
+- **Domain mode.** The CVE lookup writes its CVEs to the graph, and supply chain runs.
+- **Rules of Engagement.** The rate ceiling wins over stealth mode, AI Surface's window check fails closed, and GraphQL discovery honours the RoE list.
+- **Queue and schedules.** A passing error is retried, a start with no answer goes to review, a failed spawn is a refusal, and a schedule waits for a live agent session.
+- **Also:** the progress label follows the pipeline, DNS resolves again after an outage, banner grab skips web ports and tells SMTP from FTP, and the agent's skills name only tools the Kali image has.
+  - **Upgrade.** Finish or stop running scans, then `./redamon.sh update` (it rebuilds every image). Before the first scan, with `agent`, `webapp` and `recon-orchestrator` stopped, run `tooling/scripts/netlas_finding_rekey.py --all --apply` and `tooling/scripts/js_secret_rekey.py --all --apply` once (both are dry runs without `--apply`). The first triage run re-reviews existing findings once, which costs LLM calls.
+
+## [7.3.0] - 2026-10-23
+
+### Fixed
+
+- **Copy buttons work when RedAmon is opened from another machine.** Opened over plain http on a network address (`http://<host-ip>:3000`), the page is not a secure context, so the browser offers no Clipboard API, and most copy buttons did nothing: no copy, no tick, only an error in the browser console. They worked only on the host itself, at `localhost`. Affected: the JS Recon secret value; the chat's message, code-block and table-cell copies; the Thinking, Deep Think and tool-execution cards; TrafficMind's curl, URL, header and body copies; the `./redamon.sh update` command in Settings and the update notice; the MCP token, client snippet and agent onboarding files; and the TruffleHog detector list. Every copy now falls back to the browser's legacy copy when the Clipboard API is missing or refuses, as the Node ID column and the node drawer already did, and a test fails if new code calls the Clipboard API directly.
+- **Copying keeps keyboard focus where it was.** The fallback copy left focus on the page body, so after copying inside a dialog, Escape no longer closed it; focus now returns to the button you pressed.
+- **TrafficMind no longer says "Copied" when nothing was copied.** It reports the failure instead.
+  - **Upgrade.** Rebuild the `webapp` image.
+- **A tool call can no longer hang an agent session.** Each tool call now has a deadline: the tool's own limit in the Kali sandbox plus a minute (`execute_code` 240 s, `kali_shell` 360 s, `execute_nmap` 660 s; 31 minutes for tools without an entry, `TOOL_DEADLINE_DEFAULT` to change it). Before, a reply lost between the sandbox and the agent was waited on forever: the sandbox's 15-second keep-alive kept resetting the read timeout, so a card could sit at "Running..." for half an hour on a script the sandbox had already stopped. A call past its deadline now fails with a message saying the result was lost, and the agent moves on.
+- **A slow Neo4j no longer freezes the agent.** Attack-chain writes run on their own thread, each with a 30-second server-side timeout, and a turn waits at most 20 seconds for its step to be recorded, once, however many tools it ran; the write still lands when Neo4j recovers. They used to share the thread pool behind every LLM call and every new connection, so an overloaded Neo4j could stall the whole agent at near-zero CPU. `query_graph`, `graph_summary` and the prior-sessions read also run off the agent's event loop, on their own pool, with a 120-second query timeout.
+- **Tool cards show what is happening.** A card stops counting as soon as its tool returns and reads "Analyzing output (12s)" while the agent studies the result, instead of "Running..." through the whole next turn. A card cut off by Stop or by the end of a run reads "Interrupted" instead of running forever. Each card is matched to its own events, so one lost message no longer leaves the next tool of the same name stuck on "Running". The chat's Markdown export marks these cards `ANALYZING` and `INTERRUPTED`.
+- **The chat catches up after a dropped connection.** Closing the AI drawer during a run no longer disconnects it: the connection stays open until the run ends. After any reconnect, the server tells the page whether the run is still going, and the page re-reads the conversation, so events it missed appear and the spinner stops when the run is over, also for a conversation started in the same tab. Stop and guidance clicked while the connection is down are sent once it is back, a connection that stops answering is replaced, and changing the graph view during a run reconnects only after it.
+- **Tradecraft reads repositories built around one or two CVEs.** Such a repository was filed as a CVE archive and every lookup answered "PoC not found". It is now filed as a repository; a resource already saved that way returns the README when the README names the CVE, and a GitHub error (rate limit, rejected token) is reported as an error instead of "PoC not found".
+  - **Upgrade.** Rebuild the `agent` and `webapp` images. To re-file an existing tradecraft resource, refresh it in Global Settings → Tradecraft.
+
 ## [7.2.0] - 2026-10-22
 
 ### Security

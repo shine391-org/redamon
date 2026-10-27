@@ -6,14 +6,13 @@
  *   - SECTION_INPUT_MAP / SECTION_NODE_MAP / SECTION_ENRICH_MAP point at
  *     existing-only node types (no new labels)
  *   - PARTIAL_RECON_SUPPORTED_TOOLS contains 'VhostSni'
- *   - PARTIAL_RECON_PHASE_MAP['VhostSni'] returns a non-empty phase list
  *   - INPUT_LOGIC_TOOLTIPS has a VhostSni entry referencing the right node names
  */
 import { describe, test, expect } from 'vitest'
 import { SECTION_INPUT_MAP, SECTION_NODE_MAP, SECTION_ENRICH_MAP } from './nodeMapping'
 import { WORKFLOW_TOOLS } from './WorkflowView/workflowDefinition'
 import { INPUT_LOGIC_TOOLTIPS } from './WorkflowView/inputLogicTooltips'
-import { PARTIAL_RECON_SUPPORTED_TOOLS, PARTIAL_RECON_PHASE_MAP } from '@/lib/recon-types'
+import { PARTIAL_RECON_SUPPORTED_TOOLS } from '@/lib/recon-types'
 
 const EXISTING_NODE_TYPES = new Set([
   'Domain', 'Subdomain', 'IP', 'Port', 'Service', 'DNSRecord', 'Certificate',
@@ -83,13 +82,6 @@ describe('nodeMapping -- VhostSni I/O', () => {
 describe('Partial Recon registration -- VhostSni', () => {
   test('PARTIAL_RECON_SUPPORTED_TOOLS contains VhostSni', () => {
     expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('VhostSni')).toBe(true)
-  })
-
-  test('PARTIAL_RECON_PHASE_MAP has a non-empty phase list for VhostSni', () => {
-    const phases = PARTIAL_RECON_PHASE_MAP.VhostSni
-    expect(phases).toBeDefined()
-    expect(phases!.length).toBeGreaterThan(0)
-    expect(phases![0].toLowerCase()).toMatch(/vhost|sni/)
   })
 })
 

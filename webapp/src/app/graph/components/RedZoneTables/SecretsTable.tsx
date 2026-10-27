@@ -24,6 +24,7 @@ import {
 import { normalizeSeverity } from './types'
 import { redactSecret } from './redact'
 import rowStyles from './RedZoneTableRow.module.css'
+import { type ValidationTone, validationLabel, validationTone } from '@/lib/secrets/validationStatus'
 
 interface SecretRow {
   nodeId: string | null
@@ -42,6 +43,9 @@ interface SecretRow {
   keyType: string | null
   detectionMethod: string | null
   validationStatus: string | null
+  /** A key that is public by design (a browser, publishable or analytics key),
+   *  shown at info. Absent on rows from an older server. */
+  publicClientKey?: boolean
   baseUrl: string | null
   subdomain: string | null
   jsFileUrl: string | null
@@ -61,32 +65,22 @@ function secretNodeLabel(origin: string): string {
 
 const PAGE_SIZE = 100
 
-const VALIDATION_CLASS: Record<string, string> = {
-  validated:        rowStyles.sevCritical,
-  format_validated: rowStyles.sevMedium,
-  // The verify call itself failed. NOT proof the credential is dead, so it must
-  // not share the muted styling of a checked-and-dead one.
-  verify_error:     rowStyles.sevMedium,
-  unvalidated:      rowStyles.sevInfo,
-  // Verification was switched off: nobody looked. Kept distinct from
-  // `unvalidated` because collapsing them would overstate the assurance.
-  unverified:       rowStyles.sevInfo,
-  skipped:          rowStyles.sevInfo,
-  invalid:          rowStyles.sevLow,
+// A check that got no verdict (a failed verify call, a timeout) must not share
+// the muted styling of a credential checked and dead.
+const TONE_CLASS: Record<ValidationTone, string> = {
+  live: rowStyles.sevCritical,
+  warn: rowStyles.sevMedium,
+  dead: rowStyles.sevLow,
+  none: rowStyles.sevInfo,
 }
 
-const VALIDATION_LABEL: Record<string, string> = {
-  validated: 'LIVE',
-  unvalidated: 'not live',
-  verify_error: 'verify error',
-  unverified: 'not checked',
-}
-
-function ValidationChip({ status }: { status: string | null }) {
+function ValidationChip({ status, origin }: { status: string | null; origin: string }) {
   if (!status) return <span className={rowStyles.nullCell}>-</span>
-  const cls = VALIDATION_CLASS[status] || rowStyles.sevInfo
-  const label = VALIDATION_LABEL[status] ?? status.replace('_', ' ')
-  return <span className={`${rowStyles.sevBadge} ${cls}`}>{label}</span>
+  return (
+    <span className={`${rowStyles.sevBadge} ${TONE_CLASS[validationTone(status, origin)]}`}>
+      {validationLabel(status, origin)}
+    </span>
+  )
 }
 
 /** Module-level: the filter profiles are keyed off these, and a fresh array
@@ -184,13 +178,21 @@ export const SecretsTable = memo(function SecretsTable({ projectId }: Props) {
           {sliced.map((r, i) => (
             <tr key={r.id || `${r.sourceUrl}-${i}`}>
               <td><NodeIdCell value={r.nodeId} /></td>
-              <td><Mono>{r.secretType}</Mono></td>
+              <td>
+                <Mono>{r.secretType}</Mono>
+                {r.publicClientKey && (
+                  <span className={rowStyles.listChip}
+                    title="Public by design: it ships to every browser that loads the page. Check it is restricted to its intended use.">
+                    public key
+                  </span>
+                )}
+              </td>
               <td>{r.keyType ? <span className={rowStyles.listChip}>{r.keyType}</span> : <span className={rowStyles.nullCell}>-</span>}</td>
               <td><Mono>{redactSecret(r.valueSample || r.matchedText)}</Mono></td>
               <td>{r.entropy != null ? <span className={rowStyles.numCell}>{r.entropy.toFixed(2)}</span> : <span className={rowStyles.nullCell}>-</span>}</td>
               <td>{r.confidence != null ? <span className={rowStyles.numCell}>{String(r.confidence)}</span> : <span className={rowStyles.nullCell}>-</span>}</td>
               <td><SeverityBadge severity={normalizeSeverity(r.severity)} /></td>
-              <td><ValidationChip status={r.validationStatus} /></td>
+              <td><ValidationChip status={r.validationStatus} origin={r.origin} /></td>
               <td><span className={rowStyles.listChip}>{r.origin}</span></td>
               <td>{r.trufflehogSource || r.sourceModule
                 ? <span className={rowStyles.listChip}>{r.trufflehogSource || r.sourceModule}</span>

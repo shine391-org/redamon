@@ -1,10 +1,5 @@
 import { describe, test, expect } from 'vitest'
-import {
-  PARTIAL_RECON_SUPPORTED_TOOLS,
-  PARTIAL_RECON_PHASES,
-  PARTIAL_RECON_PHASE_MAP,
-  RECON_PHASES,
-} from './recon-types'
+import { PARTIAL_RECON_SUPPORTED_TOOLS } from './recon-types'
 import type {
   PartialReconStatus,
   PartialReconState,
@@ -87,6 +82,10 @@ describe('PARTIAL_RECON_SUPPORTED_TOOLS', () => {
     expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('OriginDiscovery')).toBe(true)
   })
 
+  test('contains IpAttribution', () => {
+    expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('IpAttribution')).toBe(true)
+  })
+
   test('contains Urlscan', () => {
     expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('Urlscan')).toBe(true)
   })
@@ -125,172 +124,6 @@ describe('PARTIAL_RECON_SUPPORTED_TOOLS', () => {
 
   test('does not contain unsupported tools', () => {
     expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('GVM')).toBe(false)
-  })
-})
-
-// === PARTIAL_RECON_PHASE_MAP ===
-describe('PARTIAL_RECON_PHASE_MAP', () => {
-  test('every supported tool has a phase list', () => {
-    // Per-tool assertions below only cover the tools someone remembered to add.
-    for (const id of PARTIAL_RECON_SUPPORTED_TOOLS) {
-      expect(PARTIAL_RECON_PHASE_MAP[id], `${id} has no phase list`).toBeDefined()
-      expect(PARTIAL_RECON_PHASE_MAP[id].length).toBeGreaterThan(0)
-    }
-  })
-
-  test('has Tlsx phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Tlsx']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Tlsx'][0]).toBe('TLS Certificate Grab')
-  })
-
-  test('has SubdomainDiscovery phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['SubdomainDiscovery']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['SubdomainDiscovery'][0]).toBe('Subdomain Discovery')
-  })
-
-  test('has AiSurfaceRecon phase', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['AiSurfaceRecon']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['AiSurfaceRecon'][0]).toBe('AI Surface Recon')
-  })
-
-  test('has Naabu phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Naabu']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Naabu'][0]).toBe('Port Scanning')
-  })
-
-  test('maps OriginDiscovery to Origin Discovery', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['OriginDiscovery']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['OriginDiscovery'][0]).toBe('Origin Discovery')
-  })
-
-  test('has Masscan phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Masscan']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Masscan'][0]).toBe('Port Scanning')
-  })
-
-  test('has Nmap phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Nmap']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Nmap'][0]).toBe('Nmap Service Detection')
-  })
-
-  test('has Httpx phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Httpx']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Httpx'][0]).toBe('HTTP Probing')
-  })
-
-  test('has Katana phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Katana']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Katana'][0]).toBe('Resource Enumeration')
-  })
-
-  test('OpenAPI runs inside Resource Enumeration, in full and partial runs', () => {
-    expect(PARTIAL_RECON_PHASE_MAP.OpenAPI).toEqual(['Resource Enumeration'])
-    expect(RECON_PHASES).not.toContain('OpenAPI Ingestion')
-  })
-
-  test('has Hakrawler phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Hakrawler']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Hakrawler'][0]).toBe('Resource Enumeration')
-  })
-
-  test('has ZapAjaxSpider phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['ZapAjaxSpider']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['ZapAjaxSpider'][0]).toBe('Resource Enumeration')
-  })
-
-  test('has Jsluice phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Jsluice']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Jsluice'][0]).toBe('Resource Enumeration')
-  })
-
-  test('has JsRecon phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['JsRecon']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['JsRecon'][0]).toBe('JS Recon')
-  })
-
-  test('has SupplyChainRecon phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['SupplyChainRecon']).toHaveLength(2)
-    expect(PARTIAL_RECON_PHASE_MAP['SupplyChainRecon'][0]).toBe('Package Harvest')
-    expect(PARTIAL_RECON_PHASE_MAP['SupplyChainRecon'][1]).toBe('Offline OSV Verdict')
-  })
-
-  test('every supported tool has a phase map entry', () => {
-    for (const tool of PARTIAL_RECON_SUPPORTED_TOOLS) {
-      expect(PARTIAL_RECON_PHASE_MAP[tool], `${tool} missing from PARTIAL_RECON_PHASE_MAP`).toBeDefined()
-    }
-  })
-
-  test('has Shodan phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Shodan']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Shodan'][0]).toBe('Shodan Enrichment')
-  })
-
-  test('has OsintEnrichment phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['OsintEnrichment']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['OsintEnrichment'][0]).toBe('OSINT Enrichment')
-  })
-
-  test('has SecurityChecks phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['SecurityChecks']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['SecurityChecks'][0]).toBe('Security Checks')
-  })
-
-  test('has Urlscan phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Urlscan']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Urlscan'][0]).toBe('URLScan Enrichment')
-  })
-
-  test('has Uncover phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Uncover']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Uncover'][0]).toBe('Uncover Expansion')
-  })
-
-  test('has Nuclei phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['Nuclei']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['Nuclei'][0]).toBe('Vulnerability Scanning')
-  })
-
-  test('has SubdomainTakeover phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['SubdomainTakeover']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['SubdomainTakeover'][0]).toBe('Subdomain Takeover Detection')
-  })
-
-  test('has VhostSni phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['VhostSni']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['VhostSni'][0]).toBe('VHost & SNI Enumeration')
-  })
-
-  test('has WebCachePoison phases', () => {
-    expect(PARTIAL_RECON_PHASE_MAP['WebCachePoison']).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASE_MAP['WebCachePoison'][0]).toBe('Cache Poisoning Detection')
-  })
-
-  test('has GraphqlScan phases (Phase 1 §9.5)', () => {
-    const phases = PARTIAL_RECON_PHASE_MAP['GraphqlScan']
-    expect(phases).toBeDefined()
-    expect(phases.length).toBeGreaterThan(0)
-    expect(phases).toContain('Endpoint Discovery')
-    expect(phases).toContain('Introspection Testing')
-    expect(phases).toContain('Vulnerability Detection')
-  })
-
-  test('each supported tool has a phase entry', () => {
-    for (const toolId of PARTIAL_RECON_SUPPORTED_TOOLS) {
-      expect(PARTIAL_RECON_PHASE_MAP[toolId]).toBeDefined()
-      expect(PARTIAL_RECON_PHASE_MAP[toolId].length).toBeGreaterThan(0)
-    }
-  })
-})
-
-// === PARTIAL_RECON_PHASES (backward compat) ===
-describe('PARTIAL_RECON_PHASES', () => {
-  test('defaults to SubdomainDiscovery phases', () => {
-    expect(PARTIAL_RECON_PHASES).toHaveLength(1)
-    expect(PARTIAL_RECON_PHASES[0]).toBe('Subdomain Discovery')
-  })
-
-  test('is an array', () => {
-    expect(Array.isArray(PARTIAL_RECON_PHASES)).toBe(true)
   })
 })
 

@@ -3,21 +3,26 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
   return typeof val === 'number' ? val : 0
 }
 
-// Sensitive-port categories for network-layer initial-access targeting.
-// Keep in sync with recon/helpers/security_checks.py port lists.
+// Sensitive-port categories for network-layer initial-access targeting. Every
+// port in ADMIN_PORTS, DATABASE_PORTS and KUBERNETES_API_PORTS of
+// recon/helpers/security_checks.py is here (recon/tests/test_net_init_access_parity.py),
+// except 443: the Kubernetes check only probes it, and categorising it would
+// list every HTTPS service. The rest are management ports Python does not flag.
 const PORT_CATEGORY: Record<number, string> = {
   22: 'ssh', 23: 'telnet', 3389: 'rdp', 5985: 'winrm', 5986: 'winrm',
-  3306: 'database', 5432: 'database', 1433: 'database', 27017: 'database',
-  6379: 'database', 9200: 'database', 11211: 'database', 5984: 'database',
+  3306: 'database', 5432: 'database', 1433: 'database', 1521: 'database',
+  27017: 'database', 27018: 'database', 6379: 'database', 9200: 'database',
+  9300: 'database', 11211: 'database', 5984: 'database',
   2375: 'k8s', 2376: 'k8s', 10250: 'k8s', 6443: 'k8s', 8443: 'k8s',
   25: 'smtp', 465: 'smtp', 587: 'smtp',
-  161: 'snmp', 623: 'ipmi', 445: 'smb', 139: 'smb', 5900: 'vnc',
+  161: 'snmp', 623: 'ipmi', 445: 'smb', 139: 'smb', 5900: 'vnc', 5901: 'vnc',
 }
 
 // Vulnerability.type strings emitted by recon/helpers/security_checks.py
@@ -49,7 +54,7 @@ export async function GET(request: NextRequest) {
        OPTIONAL MATCH (sd:Subdomain)-[:RESOLVES_TO]->(ip)
        OPTIONAL MATCH (ip)-[:HAS_VULNERABILITY]->(v:Vulnerability)
          WHERE (v.type IN $vulnTypes OR v.vulnerability_type IN $vulnTypes OR v.name IN $vulnTypes)
-           AND ${notMuted('v')}
+           AND ${notMuted('v')} AND ${reportCountable('v')}
        RETURN toString(id(p))       AS nodeId,
               'port'                AS origin,
               ip.address            AS ipAddress,
@@ -75,7 +80,7 @@ export async function GET(request: NextRequest) {
     const vulnResult = await session.run(
       `MATCH (ip:IP {project_id: $pid})-[:HAS_VULNERABILITY]->(v:Vulnerability)
        WHERE (v.type IN $vulnTypes OR v.vulnerability_type IN $vulnTypes OR v.name IN $vulnTypes)
-         AND ${notMuted('v')}
+         AND ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (sd:Subdomain)-[:RESOLVES_TO]->(ip)
        // Grouped on (ip, port, timestamp), not on v: in practice one
        // Vulnerability, but not by construction, and making v a grouping key

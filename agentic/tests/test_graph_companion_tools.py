@@ -22,9 +22,10 @@ from tools import Neo4jToolManager  # noqa: E402
 
 
 class _FakeGraph:
-    def __init__(self, nodes=None, rels=None, raises=False):
+    def __init__(self, nodes=None, rels=None, raises=False, coverage=None):
         self._nodes = nodes if nodes is not None else []
         self._rels = rels if rels is not None else []
+        self._coverage = coverage
         self.raises = raises
         self.queries = []
         self.params = []
@@ -34,6 +35,10 @@ class _FakeGraph:
             raise RuntimeError("neo4j unreachable")
         self.queries.append(cypher)
         self.params.append(params)
+        if "BaseURL" in cypher:
+            if isinstance(self._coverage, Exception):
+                raise self._coverage
+            return [self._coverage] if self._coverage else []
         return self._rels if "type(r)" in cypher else self._nodes
 
 
@@ -119,10 +124,13 @@ class GraphSummaryToolTests(unittest.IsolatedAsyncioTestCase):
             out = await _call(_manager(graph).get_summary_tool())
 
         self.assertIn("Secret: 3", out)
+        from graph_db.coverage_stamps import COVERAGE_SUMMARY_CYPHER
         for cypher in graph.queries:
-            # Only label/type and a count are ever projected.
+            # Only label/type and a count are ever projected. The coverage
+            # query is the fixed constant tests/test_coverage_stamps.py pins
+            # to sums of CASE tests, never a URL.
             self.assertNotIn("RETURN n\n", cypher)
-            self.assertTrue("count(*)" in cypher)
+            self.assertTrue("count(*)" in cypher or cypher == COVERAGE_SUMMARY_CYPHER)
 
     async def test_the_query_carries_the_FULL_tenant_key(self):
         graph = _FakeGraph(nodes=[{"label": "IP", "count": 1}])
@@ -154,6 +162,15 @@ class GraphSummaryToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("EMPTY", out)
         self.assertIn("not looked for", out)
 
+    async def test_an_EMPTY_graph_names_lost_data_as_a_cause(self):
+        # Plan 09.4: a reset database or a failed restore also empties the
+        # graph, and "nothing has been scanned yet" would then be a false claim.
+        with _tenant():
+            out = await _call(_manager(_FakeGraph(nodes=[])).get_summary_tool())
+        self.assertIn("graph data was lost", out)
+        self.assertIn("scan history", out)
+        self.assertNotIn("Nothing has been scanned yet, so", out)
+
     async def test_a_read_failure_is_an_ERROR_never_an_empty_summary(self):
         with _tenant():
             out = await _call(_manager(_FakeGraph(raises=True)).get_summary_tool())
@@ -161,6 +178,34 @@ class GraphSummaryToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(out.startswith("Error"))
         # It must not be mistakable for "this project has nothing".
         self.assertNotIn("EMPTY", out)
+
+    async def test_it_reports_per_host_coverage_per_module(self):
+        # Plan 09.2: "no Secret here" means something only next to what was
+        # actually analyzed.
+        graph = _FakeGraph(nodes=[{"label": "BaseURL", "count": 5}],
+                           coverage={"js_recon_complete": 3, "js_recon_partial": 1, "js_recon_not_scanned": 1})
+        with _tenant():
+            out = await _call(_manager(graph).get_summary_tool())
+        self.assertIn("JS Recon: 3 complete, 1 partial, 0 no input, 0 failed; 1 live hosts not scanned", out)
+        self.assertIn("Nuclei: coverage not recorded", out)
+
+    async def test_absence_is_never_read_as_never_scanned_alone(self):
+        graph = _FakeGraph(nodes=[{"label": "IP", "count": 1}])
+        with _tenant():
+            tool = _manager(graph).get_summary_tool()
+            out = await _call(tool)
+        for text in (out, tool.description):
+            self.assertNotIn("that surface was never scanned", text)
+        self.assertIn("muted", out)
+        self.assertIn("never scanned, scanned and clean", out)
+
+    async def test_an_unreadable_coverage_count_keeps_the_census(self):
+        graph = _FakeGraph(nodes=[{"label": "IP", "count": 2}], coverage=RuntimeError("timeout"))
+        with _tenant():
+            out = await _call(_manager(graph).get_summary_tool())
+        self.assertIn("IP: 2", out)
+        self.assertIn("Coverage could not be read", out)
+        self.assertNotIn("coverage not recorded", out)
 
     async def test_a_missing_tenant_refuses_rather_than_querying(self):
         graph = _FakeGraph(nodes=[{"label": "IP", "count": 1}])

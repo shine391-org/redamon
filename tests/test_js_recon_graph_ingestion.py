@@ -131,6 +131,27 @@ class TestJsReconGraphIngestion(unittest.TestCase):
         self.assertNotIn("MATCH (n:Endpoint {id: $nid})", link_calls[0][0])
         self.assertEqual(stats["errors"], [])
 
+    def test_a_template_literal_endpoint_keeps_its_template(self):
+        """Plan 06.6: `/api/users/${id}` is stored as path `/api/users/` with
+        its template beside it; a plain literal stores no template."""
+        client = GraphClient()
+        client.update_graph_from_js_recon({
+            "domain": "example.com",
+            "js_recon": {
+                "scan_metadata": {"scan_timestamp": "2026-10-24T00:00:00Z"},
+                "endpoints": [
+                    {"path": "/api/users/", "method": "GET", "source_js": "https://example.com/app.js",
+                     "full_url": "/api/users/", "parameterized": True, "path_template": "/api/users/${id}"},
+                    {"path": "/api/plain", "method": "GET", "source_js": "https://example.com/app.js",
+                     "full_url": "/api/plain", "parameterized": False},
+                ],
+            },
+        }, "u1", "p1")
+        writes = {kw["path"]: kw for q, kw in client.driver.session_obj.calls
+                  if "MERGE (e:Endpoint" in q and "ON CREATE SET" in q}
+        self.assertEqual(writes["/api/users/"]["path_template"], "/api/users/${id}")
+        self.assertIsNone(writes["/api/plain"]["path_template"])
+
     def test_existing_endpoint_and_unmatched_file_link_do_not_increment_counts(self):
         client = GraphClient(endpoint_created=False, endpoint_linked=False)
         recon_data = {
@@ -155,7 +176,9 @@ class TestJsReconGraphIngestion(unittest.TestCase):
         stats = client.update_graph_from_js_recon(recon_data, "u1", "p1")
 
         self.assertEqual(stats["endpoints_created"], 0)
-        self.assertEqual(stats["relationships_created"], 1)
+        # This fake makes no link at all, the file's own HAS_JS_FILE edge
+        # included, and only made links count (plan 06.9).
+        self.assertEqual(stats["relationships_created"], 0)
         link_calls = [
             (query, kwargs) for query, kwargs in client.driver.session_obj.calls
             if "MERGE (file)-[r:HAS_ENDPOINT]->(n)" in query
@@ -202,6 +225,33 @@ class TestJsReconGraphIngestion(unittest.TestCase):
         self.assertEqual(stats["endpoints_created"], 2)
         self.assertEqual({k["path"] for k in endpoint_calls}, {"/api/a", "/api/b"})
         self.assertEqual(stats["errors"], [])
+
+    def test_a_catch_all_endpoint_is_dropped_like_a_dead_one(self):
+        # The host answered a made-up path the same way (an SPA shell), so the
+        # path's "hittable" status proved nothing: no Endpoint node for it.
+        client = GraphClient()
+        ep = {"method": "GET", "source_js": "https://example.com/app.js", "base_url": "https://example.com"}
+        recon_data = {
+            "domain": "example.com",
+            "js_recon": {
+                "scan_metadata": {"scan_timestamp": "2026-05-28T00:00:00Z"},
+                "endpoints": [
+                    {**ep, "path": "/api/read", "validation_status": "catch_all", "status_code": 200},
+                    {**ep, "path": "/api/v1", "validation_status": "hittable", "status_code": 200},
+                ],
+            },
+        }
+
+        stats = client.update_graph_from_js_recon(recon_data, "u1", "p1")
+
+        endpoint_calls = [
+            kwargs for query, kwargs in client.driver.session_obj.calls
+            if "MERGE (e:Endpoint" in query
+        ]
+        self.assertEqual({k["path"] for k in endpoint_calls}, {"/api/v1"})
+        self.assertEqual(stats["endpoints_created"], 1)
+        linked_paths = {k.get("path") for q, k in client.driver.session_obj.calls if "HAS_ENDPOINT" in q}
+        self.assertNotIn("/api/read", linked_paths)
 
 
 class TestJsReconFindingPackageFields(unittest.TestCase):
@@ -443,9 +493,9 @@ class TestJsReconEndpointScopeAndOwnership(unittest.TestCase):
             _domain_run([_ep("/api/users", base_url="https://app.example.com")]),
             endpoint_linked=False)
         self.assertEqual(len(owners), 1)
-        # Only the file node's own HAS_JS_FILE edge counts: neither the
-        # file->endpoint nor the owner edge reported a link.
-        self.assertEqual(stats["relationships_created"], 1)
+        # No edge reported a link, the file's own HAS_JS_FILE edge included,
+        # so nothing counts (plan 06.9).
+        self.assertEqual(stats["relationships_created"], 0)
 
     def test_no_query_deletes_anything(self):
         client = GraphClient()

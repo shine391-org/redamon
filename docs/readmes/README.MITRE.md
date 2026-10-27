@@ -2,7 +2,7 @@
 
 ## Complete Technical Documentation
 
-> **Module:** `recon/add_mitre.py` (automatically called by `vuln_scan`)
+> **Module:** `recon/main_recon_modules/add_mitre.py` (called by `recon/main.py` right after the vuln scan)
 > **Purpose:** Enrich CVE data with CWE weaknesses and CAPEC attack patterns
 > **Author:** RedAmon Security Suite
 
@@ -187,7 +187,9 @@ MITRE_ENRICH_RECON = True    # Enrich recon output (vuln_scan + technology_cves)
 MITRE_ENRICH_GVM = True      # Enrich GVM/OpenVAS output
 
 # Local database cache settings
-MITRE_DATABASE_PATH = "recon/data/mitre_db"  # Where to store the database
+# MITRE_DATABASE_PATH is not a project setting: add_mitre.py defaults it to the
+# data/mitre_db folder beside itself (DEFAULT_MITRE_SETTINGS)
+MITRE_DATABASE_PATH = "recon/main_recon_modules/data/mitre_db"
 MITRE_CACHE_TTL_HOURS = 24                    # How long before checking for updates
 ```
 
@@ -200,7 +202,7 @@ MITRE_CACHE_TTL_HOURS = 24                    # How long before checking for upd
 | `MITRE_INCLUDE_CAPEC` | bool | `True` | Add CAPEC attack patterns (direct only) |
 | `MITRE_ENRICH_RECON` | bool | `True` | Enrich recon scan results |
 | `MITRE_ENRICH_GVM` | bool | `True` | Enrich GVM scan results |
-| `MITRE_DATABASE_PATH` | str | `recon/data/mitre_db` | Database cache location |
+| `MITRE_DATABASE_PATH` | str | `recon/main_recon_modules/data/mitre_db` | Database cache location (`DEFAULT_MITRE_SETTINGS` in `add_mitre.py`, not a project setting) |
 | `MITRE_CACHE_TTL_HOURS` | int | `24` | Hours before database refresh |
 
 ---
@@ -427,20 +429,17 @@ MITRE_AUTO_UPDATE_DB = False  # Use cached database only
 ### Database Location
 
 ```
-recon/data/mitre_db/
-├── resources/
+recon/main_recon_modules/data/mitre_db/
+├── resources/                      # tracked in git, refreshed in place
 │   ├── capec_db.json               # CAPEC patterns with names (from CVE2CAPEC)
 │   ├── cwe_db.json                 # CWE hierarchy and relationships
 │   ├── cwe_metadata.json           # CWE metadata (name, abstraction, mapping, descriptions, mitigations)
 │   └── capec_metadata.json         # CAPEC metadata (descriptions, severity, execution flow, examples)
-├── database/
-│   ├── CVE-2020.jsonl              # CVE mappings for 2020
-│   ├── CVE-2021.jsonl              # CVE mappings for 2021
-│   ├── CVE-2022.jsonl              # CVE mappings for 2022
-│   ├── CVE-2023.jsonl              # CVE mappings for 2023
-│   ├── CVE-2024.jsonl              # CVE mappings for 2024
-│   └── CVE-2025.jsonl              # CVE mappings for 2025
-└── .last_update                    # Timestamp of last update
+├── database/                       # downloaded at scan time, gitignored
+│   └── CVE-<year>.jsonl            # one file per year the scan's CVEs need
+│                                   # (without a CVE list: the current year and the ten before it)
+├── .last_update                    # timestamp of last update (gitignored)
+└── .unavailable_years.json         # years upstream did not serve, retried once per TTL (gitignored)
 ```
 
 ### Cache TTL
@@ -455,7 +454,7 @@ The database is refreshed when:
 To force a database update, delete the `.last_update` file:
 
 ```bash
-rm recon/data/mitre_db/.last_update
+rm recon/main_recon_modules/data/mitre_db/.last_update
 ```
 
 Or set a shorter TTL:

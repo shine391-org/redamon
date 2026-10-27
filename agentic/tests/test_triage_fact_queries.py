@@ -127,6 +127,76 @@ class TestQueryInvariants(unittest.TestCase):
                 self.assertNotIn("OPTIONAL MATCH", query_def["query"])
 
 
+class TestGoneHostsQuery(unittest.TestCase):
+    """`gone_hosts` drops a host from the board, so it must test what it says.
+    The live counterpart is tests/test_fix_fact_queries_graph_live.py."""
+
+    QUERY = next(q for q in PROJECT_FACT_QUERIES if q["name"] == "gone_hosts")["query"]
+
+    def test_resolution_is_read_in_the_direction_the_edge_runs(self):
+        # RESOLVES_TO runs Subdomain -> IP, so an outgoing pattern from an IP
+        # never matched and the "nothing resolves" clause was always true.
+        self.assertRegex(self.QUERY, r"n:Subdomain AND EXISTS \{\s*MATCH \(n\)-\[r:RESOLVES_TO\]->\(:IP\)")
+        self.assertRegex(self.QUERY, r"n:IP AND EXISTS \{\s*MATCH \(n\)<-\[r:RESOLVES_TO\]-\(:Subdomain\)")
+        self.assertNotIn("MATCH (n)-[:RESOLVES_TO]->()", self.QUERY)
+
+    def test_hosts_the_run_skipped_are_not_gone(self):
+        # Read from every org Domain of THIS tenant, never another project's.
+        self.assertIn("(d:Domain {user_id: $userId, project_id: $projectId})", self.QUERY)
+        self.assertIn("d.recon_skipped_hosts", self.QUERY)
+        self.assertRegex(self.QUERY, r"NOT toLower\(coalesce\(n\.name, n\.address, ''\)\) IN skipped")
+
+    def test_skipped_keys_are_normalised_as_the_prune_does(self):
+        # circuit_breaker.hostname_of: lower-case, IPv6 brackets and the port
+        # stripped, a bare IPv6 literal left whole.
+        self.assertIn("toLower(trim(toString(x)))", self.QUERY)
+        self.assertIn("WHEN k STARTS WITH '[' THEN substring(split(k, ']')[0], 1)", self.QUERY)
+        self.assertIn("WHEN size(split(k, ':')) = 2 THEN split(k, ':')[0]", self.QUERY)
+
+
+class TestGateFactQueries(unittest.TestCase):
+    """Plan 10.4: the facts the reachable-now and attributed gates read."""
+
+    @staticmethod
+    def _query(name):
+        return next(q for q in PROJECT_FACT_QUERIES if q["name"] == name)["query"]
+
+    def test_skipped_hosts_are_read_as_the_gone_query_reads_them(self):
+        """The same keys, normalised the same way: a host the gone query spares
+        because the run skipped it is the host the gate calls unknown."""
+        skipped, gone = self._query("skipped_hosts"), TestGoneHostsQuery.QUERY
+        self.assertIn("(d:Domain {user_id: $userId, project_id: $projectId})", skipped)
+        normalise = gone[gone.index("WITH reduce"):gone.index("AS skipped") + len("AS skipped")]
+        self.assertIn(normalise, skipped)
+
+    def test_name_ownership_reads_forward_dns_of_this_tenant_only(self):
+        query = self._query("name_ownership")
+        self.assertIn("(s:Subdomain {user_id: $userId, project_id: $projectId})-[r:RESOLVES_TO]->(ip:IP)", query)
+        self.assertIn("NOT coalesce(r.source, '') STARTS WITH 'shodan_'", query)
+        self.assertIn("ip.user_id = $userId AND ip.project_id = $projectId", query)
+
+    def test_the_reducers_build_the_two_facts(self):
+        facts = build_project_facts({
+            "skipped_hosts": [{"hosts": ["App.Example.com", None, " ", "203.0.113.4"]}],
+            "name_ownership": [{"name": "App.example.com", "tags": ["dedicated", None]},
+                               {"name": "cdn.example.com", "tags": ["shared_edge"]},
+                               {"name": "", "tags": ["dedicated"]}],
+        })
+        self.assertEqual(facts.skipped_hosts, {"app.example.com", "203.0.113.4"})
+        self.assertEqual(facts.name_ownership, {"app.example.com": {"dedicated", ""},
+                                                "cdn.example.com": {"shared_edge"}})
+
+    def test_a_failed_read_leaves_both_facts_unknown(self):
+        facts = build_project_facts({"skipped_hosts": None, "name_ownership": None})
+        self.assertEqual((facts.skipped_hosts, facts.name_ownership), (set(), {}))
+
+    def test_the_finding_rows_carry_what_the_gates_read(self):
+        self.assertIn("control_check", TestQueryInvariants._aliases("Vulnerability"))
+        self.assertIn("evidence", TestQueryInvariants._aliases("Vulnerability"))
+        self.assertIn("control_check", TestQueryInvariants._aliases("JsReconFinding"))
+        self.assertIn("public_client_key", TestQueryInvariants._aliases("Secret"))
+
+
 # ---------------------------------------------------------------------------
 # Reducers
 # ---------------------------------------------------------------------------
@@ -370,3 +440,39 @@ class TestDetectorLearningFilters(unittest.TestCase):
         """An unattended agent over MCP must not retune detectors everywhere."""
         self.assertIn("coalesce(n.triage_verdict_channel, 'app') = 'app'", self.Q)
 
+
+
+class TestAgentProofConfidence(unittest.TestCase):
+    """A ChainFinding proves a finding only at confidence >= 70; a missing value
+    is the writer's default 80. A low-confidence "confirmation" read off a
+    status code must not make a finding T1 and immune to review."""
+
+    PROOF = next(q for q in PROJECT_FACT_QUERIES if q["name"] == "proof")["query"]
+
+    def test_the_rule(self):
+        for value, counts in ((None, True), (80, True), (70, True), (69, False), (50, False),
+                              (0, False), ("85", True), ("40", False), (75.9, True),
+                              ("high", True), (100, True)):
+            with self.subTest(confidence=value):
+                self.assertIs(sm.agent_proof_counts(value), counts)
+
+    def test_the_proof_query_filters_on_the_model_s_threshold(self):
+        self.assertIn(
+            f"coalesce(toInteger(cf.confidence), {sm.AGENT_CONFIDENCE_DEFAULT}) "
+            f">= {sm.PROOF_MIN_AGENT_CONFIDENCE}", self.PROOF)
+        self.assertIn("cf.confidence AS confidence", self.PROOF)
+
+    def test_a_low_confidence_proof_row_proves_nothing(self):
+        facts = build_project_facts({"proof": [
+            {"chain_id": "c1", "finding_type": "vulnerability_confirmed", "confidence": 50,
+             "finding_ids": ["f-low"], "hosts": ["h-low"], "cve_ids": ["CVE-2020-0001"]},
+            {"chain_id": "c2", "finding_type": "vulnerability_confirmed", "confidence": None,
+             "finding_ids": ["f-old"], "hosts": ["h-old"], "cve_ids": []},
+            {"chain_id": "c3", "finding_type": "exploit_success", "confidence": 90,
+             "finding_ids": ["f-high"], "hosts": [], "cve_ids": []},
+        ]})
+        self.assertEqual(facts.proven_finding_ids, {"f-old", "f-high"})
+        self.assertNotIn("h-low", facts.compromised_hosts)
+        self.assertNotIn("CVE-2020-0001", facts.proven_cve_ids)
+        self.assertFalse(sm.is_proven({"id": "f-low"}, facts))
+        self.assertTrue(sm.is_proven({"id": "f-old"}, facts))

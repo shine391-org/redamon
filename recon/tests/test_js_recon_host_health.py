@@ -71,7 +71,7 @@ class TestEndpointValidationGate:
 
         def requester(method, url, **kw):
             probed.append(url)
-            return _resp(200)
+            return _resp(404 if "/rdm-" in url else 200)   # a real server 404s the catch-all control
 
         # The SSRF guard resolves DNS; pin it True so the live host reaches the
         # requester (the gate for the dead host runs before this check anyway).
@@ -82,7 +82,8 @@ class TestEndpointValidationGate:
         by_url = {e["full_url"]: e for e in out}
         assert by_url["https://dead.example.test/api"]["validation_error"] == "host_unreachable"
         assert by_url["https://dead.example.test/api"]["validation_status"] == "unvalidated"
-        assert probed == ["https://live.example.test/api"]
+        assert [u for u in probed if "/rdm-" not in u] == ["https://live.example.test/api"]
+        assert not [u for u in probed if "dead.example.test" in u]      # no control either
 
 
 class TestSourceMapGate:

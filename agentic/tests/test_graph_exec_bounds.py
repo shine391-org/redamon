@@ -264,7 +264,9 @@ class SummaryOpTests(unittest.TestCase):
     """`op: "summary"` returns early, so it must take the concurrency ceiling
     itself rather than at the shared exit the other ops use."""
 
-    def test_it_runs_two_fixed_queries(self):
+    def test_it_runs_three_fixed_queries(self):
+        from graph_db.coverage_stamps import COVERAGE_SUMMARY_CYPHER
+
         driver, session, _ = _driver_with(2)
         seen = []
         real = api._graph_exec_run
@@ -278,9 +280,42 @@ class SummaryOpTests(unittest.TestCase):
             resp = api._graph_exec_summary({"tenant_user_id": "u1", "tenant_project_id": "p1"})
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(seen), 2)
-        # Both are the server-controlled constants, never caller input.
-        self.assertIn(seen[0], (api._GRAPH_SUMMARY_NODES_CYPHER, api._GRAPH_SUMMARY_RELS_CYPHER))
+        # All three are server-controlled constants, never caller input: the
+        # label census, the relationship census and the BaseURL coverage counts.
+        self.assertEqual(seen, [api._GRAPH_SUMMARY_NODES_CYPHER, api._GRAPH_SUMMARY_RELS_CYPHER,
+                                COVERAGE_SUMMARY_CYPHER])
+
+    def test_it_returns_the_coverage_block(self):
+        import json
+
+        def fake_run(final, params, max_records=None):
+            if "BaseURL" in final:
+                return [{"js_recon_complete": 2, "js_recon_not_scanned": 1}], False
+            return [], False
+
+        with mock.patch.object(api, "_graph_exec_run", fake_run):
+            resp = api._graph_exec_summary({"tenant_user_id": "u1", "tenant_project_id": "p1"})
+        body = json.loads(resp.body)
+        self.assertEqual(body["coverage"]["js_recon"]["complete"], 2)
+        self.assertEqual(body["coverage"]["js_recon"]["not_scanned"], 1)
+        self.assertEqual(body["coverage"]["nuclei"], {"recorded": False})
+
+    def test_an_unreadable_coverage_count_drops_the_block_not_the_census(self):
+        # The counts are still true, so the census answers; a coverage block
+        # read as all-zero would be the "never scanned" false negative again.
+        import json
+
+        def fake_run(final, params, max_records=None):
+            if "BaseURL" in final:
+                raise RuntimeError("timeout")
+            return [{"label": "IP", "count": 3}], False
+
+        with mock.patch.object(api, "_graph_exec_run", fake_run):
+            resp = api._graph_exec_summary({"tenant_user_id": "u1", "tenant_project_id": "p1"})
+        body = json.loads(resp.body)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(body["nodes"], [{"label": "IP", "count": 3}])
+        self.assertNotIn("coverage", body)
 
     def test_both_queries_carry_the_tenant_key_and_the_exclusions(self):
         for cypher in (api._GRAPH_SUMMARY_NODES_CYPHER, api._GRAPH_SUMMARY_RELS_CYPHER):

@@ -463,6 +463,10 @@
   min-width: 200px;
 }
 
+.dispositionCell {
+  white-space: nowrap;
+}
+
 .scoreValue {
   font-variant-numeric: tabular-nums;
   font-weight: var(--font-bold);

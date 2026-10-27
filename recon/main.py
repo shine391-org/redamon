@@ -30,6 +30,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Before the settings load below: a stop that arrives while the webapp answers
+# slowly must still run the end-of-run steps (recon/helpers/shutdown.py). Only
+# as the container's command, never when a test or a module imports this file.
+from recon.helpers import shutdown as _shutdown
+if __name__ == "__main__":
+    _shutdown.install()
+
 from recon.project_settings import get_settings, log_scope
 
 # Load settings from the webapp API (PROJECT_ID/WEBAPP_API_URL set) or the
@@ -81,6 +88,7 @@ from recon.main_recon_modules.resource_enum import run_resource_enum
 from recon.main_recon_modules.ai_surface_recon import run_ai_surface_recon
 from recon.main_recon_modules.vuln_scan import run_vuln_scan
 from recon.main_recon_modules.add_mitre import run_mitre_enrichment
+from recon.helpers.isolated_result import TopLevelKeys
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -227,8 +235,15 @@ _graph_futures = []
 
 
 def _graph_reset():
-    """Create a fresh background executor for a new pipeline run."""
+    """Create a fresh background executor for a new pipeline run.
+
+    A writer still live from an earlier group (one that raised before its
+    _graph_wait_all) is drained first: replacing it would run two writers at
+    once, against the one-writer rule.
+    """
     global _graph_executor, _graph_futures
+    if _graph_executor is not None:
+        _graph_wait_all()
     _graph_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="graph-db")
     _graph_futures = []
 
@@ -238,9 +253,13 @@ def _graph_update_bg(update_method_name: str, combined_result: dict,
     """Submit a graph DB update to the background thread.
 
     Takes a deep-copy snapshot of combined_result so the main thread can
-    keep mutating it safely.
+    keep mutating it safely. Once a stop is requested nothing new is queued:
+    the stopper is landing what is already queued within its deadline.
     """
     if not UPDATE_GRAPH_DB or _graph_executor is None:
+        return
+    if _shutdown.stop_requested():
+        print(f"[!][graph-db] Stop requested: {update_method_name} not queued")
         return
     snapshot = copy.deepcopy(combined_result)
 
@@ -261,6 +280,14 @@ def _graph_update_bg(update_method_name: str, combined_result: dict,
     _graph_futures.append(future)
 
 
+def _stamp_wildcard_zones(combined_result: dict) -> None:
+    """Stamp every zone the wildcard control checked this group. The domain
+    writer already stamped discovery's zones; the SAN, tlsx, js_recon and
+    uncover merges can check new ones later in the run."""
+    if (combined_result or {}).get("wildcard_zones"):
+        _graph_update_bg("update_graph_wildcard_zones", combined_result, USER_ID, PROJECT_ID)
+
+
 def _graph_wait_all():
     """Wait for every queued graph DB update to finish, then tear down the executor."""
     global _graph_executor
@@ -274,69 +301,28 @@ def _graph_wait_all():
     _graph_executor = None
 
 
-def _merge_isolated_result(combined_result: dict, key: str, result) -> None:
-    """
-    Store a fan-out tool result into combined_result.
-
-    A namespace-only result (the contract of every _isolated wrapper except
-    run_vuln_scan_isolated) lands under its key exactly as before. An envelope
-    result — a dict that already contains `key` — additionally carries payloads
-    that belong beside the namespace at the top level (technology_cves, read
-    there by vuln_mixin and the MITRE enrichment); those land via setdefault so
-    a value written earlier in this run is never reverted by the wrapper's
-    pre-scan copy.
-    """
-    if isinstance(result, dict) and key in result:
-        for result_key, value in result.items():
-            if result_key == key:
-                combined_result[key] = value
-            else:
-                combined_result.setdefault(result_key, value)
-    else:
-        combined_result[key] = result
+def _drain_graph_writes(deadline: float) -> None:
+    """The stopper's drain: let the queued graph writes land, until `deadline`
+    (time.monotonic). What is still running then is cut by the exit."""
+    import time
+    from concurrent.futures import wait
+    pending = [f for f in list(_graph_futures) if not f.done()]
+    if not pending:
+        return
+    print(f"[*][graph-db] Stop: landing {len(pending)} queued graph write(s)", flush=True)
+    _done, not_done = wait(pending, timeout=max(0.0, deadline - time.monotonic()))
+    if not_done:
+        print(f"[!][graph-db] Stop: {len(not_done)} queued graph write(s) did not land "
+              f"before the deadline", flush=True)
 
 
-# RoE excluded-host matching lives in recon.helpers.roe_scope so active scanners
-# (origin_discovery) can enforce it without importing this module. Re-exported
-# here so `from main import _is_roe_excluded/_filter_roe_excluded` still resolves.
-from recon.helpers.roe_scope import _is_roe_excluded, _filter_roe_excluded
+# RoE matching and the time window live in recon.helpers.roe_scope so the
+# modules can enforce them without importing this file (which would re-run its
+# top level as a second module). Re-exported so the old `main` names resolve,
+# and _run_pipeline calls the module-global name, which tests monkeypatch.
+from recon.helpers.roe_scope import _is_roe_excluded, _filter_roe_excluded, _check_roe_time_window
 
 
-def _check_roe_time_window(settings: dict, _now=None) -> tuple[bool, str]:
-    """Check if current time is within the RoE-allowed window.
-
-    Returns (allowed, reason_message). Always returns (True, "") if
-    RoE or its time window is disabled. Pass _now for testing.
-    """
-    if not settings.get('ROE_ENABLED') or not settings.get('ROE_TIME_WINDOW_ENABLED'):
-        return True, ""
-
-    from datetime import datetime as _dt
-    import zoneinfo as _zi
-
-    tz_name = settings.get('ROE_TIME_WINDOW_TIMEZONE', 'UTC')
-    try:
-        tz = _zi.ZoneInfo(tz_name)
-    except Exception:
-        print(f"[RoE] Unknown timezone '{tz_name}', falling back to UTC")
-        tz = _zi.ZoneInfo('UTC')
-
-    now = _now or _dt.now(tz)
-
-    # Check day of week
-    allowed_days = [d.lower() for d in settings.get('ROE_TIME_WINDOW_DAYS', [])]
-    current_day = now.strftime('%A').lower()
-    if current_day not in allowed_days:
-        return False, f"Current day ({current_day}) is not in allowed days: {', '.join(allowed_days)} ({tz_name})"
-
-    # Check time range
-    start = settings.get('ROE_TIME_WINDOW_START_TIME', '09:00')
-    end = settings.get('ROE_TIME_WINDOW_END_TIME', '18:00')
-    current_time = now.strftime('%H:%M')
-    if current_time < start or current_time >= end:
-        return False, f"Current time ({current_time} {tz_name}) is outside allowed window ({start}\u2013{end})"
-
-    return True, ""
 
 
 def _merge_external_domain(aggregated: dict, entry: dict):
@@ -573,6 +559,7 @@ def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
         "status_map": {s: st for s, st in status_map.items()
                        if s in set(discovered_subs)},
         "include_root": include_root,
+        "wildcard_zones": dict((recon_result or {}).get("wildcard_zones") or {}),
     }
 
 
@@ -622,10 +609,17 @@ _save_lock = threading.Lock()
 
 
 def save_recon_file(data: dict, output_file: Path):
-    """Save recon data to JSON file (thread-safe)."""
+    """Save recon data to JSON file (thread-safe).
+
+    Every phase ends here, so once a stop is requested the calling thread parks
+    after the save instead of starting the next phase: a phase that runs in
+    Python (OSINT calls, security checks) would otherwise send new traffic until
+    the stopper ends the process.
+    """
     with _save_lock:
         with open(output_file, 'w') as f:
             json.dump(data, f, indent=2)
+    _shutdown.park()
 
 
 _TLS_HYGIENE_CHECK_SETTINGS = {
@@ -691,6 +685,7 @@ def _maybe_run_ai_surface(result: dict, settings: dict, output_file: Path) -> di
     """
     if not settings.get('AI_SURFACE_RECON_ENABLED', True):
         return result
+    print(f"\n[*][Pipeline] GROUP 4.5: AI Surface Recon")
     try:
         result = run_ai_surface_recon(result, output_file=output_file, settings=settings)
         result.setdefault("metadata", {}).setdefault("modules_executed", [])
@@ -706,6 +701,30 @@ def _maybe_run_ai_surface(result: dict, settings: dict, output_file: Path) -> di
             save_recon_file(result, output_file)
         except Exception:
             pass
+    return result
+
+
+def _maybe_run_supply_chain(result: dict, settings: dict, output_file: Path) -> dict:
+    """GROUP 5.5 — Supply-Chain Recon, in both pipelines, after JS Recon.
+
+    It reads js_recon's source maps and work dir, http_probe and the
+    technologies, and judges packages offline (OSV), so it runs even when the
+    active scans are skipped; only the opt-in GuardDog leg downloads packages
+    from public registries. Its findings are not recon prune sources, so a
+    crash records a phase error and nothing else.
+    """
+    if not settings.get('SUPPLY_CHAIN_RECON_ENABLED', False):
+        return result
+    print(f"\n[*][Pipeline] GROUP 5.5: Supply-Chain Recon")
+    try:
+        from recon.main_recon_modules.supply_chain_recon import run_supply_chain_recon
+        result = run_supply_chain_recon(result, settings=settings)
+        result.setdefault("metadata", {}).setdefault("modules_executed", []).append("supply_chain_recon")
+        save_recon_file(result, output_file)
+        _graph_update_bg("update_graph_from_supply_chain_recon", result, USER_ID, PROJECT_ID)
+    except Exception as e:
+        print(f"[!][SupplyChainRecon] Error: {e}")
+        result.setdefault("metadata", {}).setdefault("phase_errors", {})["supply_chain_recon"] = str(e)
     return result
 
 
@@ -810,136 +829,145 @@ def _drop_shodan_cdn_ips(combined_result: dict) -> None:
         print(f"[*][Shodan] Dropped results for {dropped} CDN IP(s) flagged by the port scan")
 
 
-def _apply_nmap_detail(ps_pd: dict, nmap_pd: dict) -> None:
-    if nmap_pd.get("product"):
-        ps_pd["product"] = nmap_pd["product"]
-    if nmap_pd.get("version"):
-        ps_pd["version"] = nmap_pd["version"]
-    if nmap_pd.get("cpe"):
-        ps_pd["cpe"] = nmap_pd["cpe"]
-    if nmap_pd.get("scripts"):
-        ps_pd["scripts"] = nmap_pd["scripts"]
+def _reachcheck_shodan_cves(combined_result: dict, settings: dict) -> None:
+    """Mark each Shodan CVE with whether this run's port scan found its port open.
 
-
-def _add_nmap_confirmed_ports(nmap_data: dict, port_scan: dict) -> list:
-    """Add the open ports nmap confirmed that the port scan did not report.
-
-    nmap probes every IP with the union of all IPs' ports, so it can confirm a
-    port naabu/masscan missed on one of them. Each one joins by_ip, every
-    by_host entry on that IP, all_ports and the summary counts in naabu's
-    shape, and is returned for the graph writer, which creates its Port node.
-    A CDN edge is skipped: NAABU_EXCLUDE_CDN limits those to 80/443 on purpose,
-    and an edge's other ports belong to the CDN, not to the target.
+    Shodan runs beside the port scan, so this is the first point where both
+    are known; nmap re-probes only what the port scan found, so nothing else
+    looks at a port only Shodan reported. No traffic. Never raises: a CVE left
+    unmarked keeps whatever it had.
     """
-    from recon.main_recon_modules.nmap_scan import normalize_ip
-
-    by_ip = port_scan.get("by_ip") or {}
-    by_host = port_scan.get("by_host") or {}
-    ip_keys = {normalize_ip(ip): ip for ip in by_ip}
-    hosts_on: dict = {}
-    for entry in by_host.values():
-        if isinstance(entry, dict) and entry.get("ip"):
-            hosts_on.setdefault(normalize_ip(entry["ip"]), []).append(entry)
-
-    added = []
-    for nmap_host in (nmap_data.get("by_host") or {}).values():
-        ip = normalize_ip(nmap_host.get("ip"))
-        if not ip:
-            continue
-        ip_entry = by_ip.get(ip_keys.get(ip))
-        if not isinstance(ip_entry, dict):
-            ip_entry = None
-        if ip_entry is not None and ip_entry.get("is_cdn"):
-            continue
-        entries = hosts_on.get(ip, [])
-        known = set((ip_entry or {}).get("ports") or [])
-        for entry in entries:
-            known.update(entry.get("ports") or [])
-
-        for nmap_pd in nmap_host.get("port_details", []):
-            port = nmap_pd.get("port")
-            if not port or port in known or nmap_pd.get("state", "open") != "open":
-                continue
-            known.add(port)
-            protocol = nmap_pd.get("protocol") or "tcp"
-            service = nmap_pd.get("service") or ""
-            if ip_entry is not None:
-                ip_entry.setdefault("ports", []).append(port)
-                ip_entry["ports"].sort()
-                if isinstance(ip_entry.get("port_details"), list):
-                    ip_entry["port_details"].append(
-                        {"port": port, "protocol": protocol, "service": service})
-            for entry in entries:
-                entry.setdefault("ports", []).append(port)
-                entry["ports"].sort()
-                detail = {"port": port, "protocol": protocol, "service": service}
-                _apply_nmap_detail(detail, nmap_pd)
-                entry.setdefault("port_details", []).append(detail)
-                entry["port_details"].sort(key=lambda x: x["port"])
-            added.append({"ip": ip_keys.get(ip) or nmap_host.get("ip"), "port": port,
-                          "protocol": protocol, "service": service})
-
-    if added:
-        all_ports = sorted(set(port_scan.get("all_ports") or []) | {a["port"] for a in added})
-        port_scan["all_ports"] = all_ports
-        summary = port_scan.get("summary")
-        if isinstance(summary, dict):
-            if "total_open_ports" in summary:
-                summary["total_open_ports"] = sum(len(h.get("ports", [])) for h in by_host.values())
-            if "hosts_with_open_ports" in summary:
-                summary["hosts_with_open_ports"] = len([h for h in by_host.values() if h.get("ports")])
-            if "unique_ports" in summary:
-                summary["unique_ports"] = all_ports
-            if "unique_port_count" in summary:
-                summary["unique_port_count"] = len(all_ports)
-    return added
-
-
-def merge_nmap_into_port_scan(combined_result: dict) -> None:
-    """
-    Merge Nmap service version data into port_scan.port_details.
-
-    Enriches existing port_details entries (from Naabu/Masscan) with Nmap's
-    product, version, CPE, and NSE script results, and adds the open ports nmap
-    confirmed that the port scan missed (listed in nmap_scan.new_open_ports).
-    """
-    from recon.main_recon_modules.nmap_scan import normalize_ip
-
-    nmap_data = combined_result.get("nmap_scan", {})
-    port_scan = combined_result.get("port_scan", {})
-    if not nmap_data or not port_scan:
+    shodan_data = combined_result.get("shodan")
+    if not shodan_data or not shodan_data.get("cves"):
         return
+    try:
+        from recon.helpers.port_coverage import port_scan_coverage
+        from recon.main_recon_modules.shodan_enrich import reachcheck_cves
+        counts = reachcheck_cves(shodan_data, port_scan_coverage(combined_result, settings))
+    except Exception as e:  # noqa: BLE001 - an unchecked CVE beats losing the run
+        print(f"[!][Shodan] Could not check CVE ports against the port scan: {type(e).__name__}")
+        return
+    print(f"[*][Shodan] CVE ports against the port scan: {counts['open']} open, "
+          f"{counts['closed']} closed, {counts['unknown']} not scanned")
 
-    enriched_count = 0
 
-    for host, nmap_host in nmap_data.get("by_host", {}).items():
-        ps_host = port_scan.get("by_host", {}).get(host)
-        if not ps_host:
-            continue
-        # A hostname can front several IPs; never copy one IP's versions onto another's ports.
-        if (ps_host.get("ip") and nmap_host.get("ip")
-                and normalize_ip(ps_host["ip"]) != normalize_ip(nmap_host["ip"])):
-            continue
-        for nmap_pd in nmap_host.get("port_details", []):
-            for ps_pd in ps_host.get("port_details", []):
-                if ps_pd.get("port") == nmap_pd.get("port"):
-                    _apply_nmap_detail(ps_pd, nmap_pd)
-                    enriched_count += 1
-                    break
+def _without_shodan_cves(combined_result: dict) -> dict:
+    """The run's data with Shodan's CVEs held back for _write_shodan_cves.
 
-    added = _add_nmap_confirmed_ports(nmap_data, port_scan)
-    if added:
-        nmap_data["new_open_ports"] = added
-        print(f"[+][Nmap] Added {len(added)} open port(s) the port scan did not report")
+    Shodan's hosts, ports and names are written at GROUP 3 as before; its CVEs
+    wait for IP attribution, which runs after http_probe and decides which IPs
+    are a shared edge.
+    """
+    shodan = combined_result.get("shodan")
+    if not isinstance(shodan, dict) or not shodan.get("cves"):
+        return combined_result
+    return {**combined_result, "shodan": {**shodan, "cves": []}}
 
-    # Update scan_metadata to include nmap
-    scanners = port_scan.get("scan_metadata", {}).get("scanners", [])
-    if "nmap" not in scanners:
-        scanners.append("nmap")
-        port_scan.get("scan_metadata", {})["scanners"] = scanners
 
-    if enriched_count:
-        print(f"[+][Nmap] Enriched {enriched_count} port(s) with service version data")
+def _write_shodan_cves(combined_result: dict) -> None:
+    """Queue the graph write of the Shodan CVEs held back at GROUP 3, minus
+    those on a shared edge. The prune then removes an earlier run's CVE on such
+    an IP: the lookup did re-check it."""
+    shodan = combined_result.get("shodan")
+    if not isinstance(shodan, dict) or not shodan.get("cves"):
+        return
+    from recon.main_recon_modules.ip_attribution import shared_edge_ips
+    from recon.main_recon_modules.shodan_enrich import drop_shared_edge_cves
+    dropped = drop_shared_edge_cves(shodan, shared_edge_ips(combined_result))
+    if dropped:
+        print(f"[*][Shodan] Dropped {dropped} passive CVE(s) on shared edge IP(s)")
+    if shodan["cves"]:
+        _graph_update_bg("update_graph_from_shodan", {**combined_result, "shodan": {"cves": shodan["cves"]}},
+                         USER_ID, PROJECT_ID)
+
+
+def _write_netlas(combined_result: dict) -> None:
+    """Queue the Netlas graph write held back at GROUP 3b, its shared edge rows
+    marked so the writer gives them no CVE finding."""
+    netlas = combined_result.get("netlas")
+    if not isinstance(netlas, dict) or not netlas.get("results"):
+        return
+    from recon.main_recon_modules.ip_attribution import shared_edge_ips
+    from recon.main_recon_modules.netlas_enrich import retag_shared_edge
+    retagged = retag_shared_edge(netlas, shared_edge_ips(combined_result))
+    if retagged:
+        print(f"[*][Netlas] {retagged} row(s) on shared edge IP(s) get no CVE finding")
+    _graph_update_bg("update_graph_from_netlas", combined_result, USER_ID, PROJECT_ID)
+
+
+def _run_ip_attribution(combined_result: dict, settings: dict, output_file) -> None:
+    """Tag every IP of the run shared_edge / dedicated / unknown. Never raises.
+
+    After the port scan, tlsx and http_probe, whose CDN flags, ASN and headers
+    it reads; before vhost/SNI, origin discovery and the Shodan CVE and Netlas
+    writes, which read the tag.
+    """
+    if not settings.get('IP_ATTRIBUTION_ENABLED', True):
+        print("\n[-][IpAttribution] Disabled via settings -- skipping")
+        return
+    try:
+        from recon.main_recon_modules.ip_attribution import run_ip_attribution
+        run_ip_attribution(combined_result, settings)
+        combined_result["metadata"]["modules_executed"].append("ip_attribution")
+        save_recon_file(combined_result, output_file)
+        _graph_update_bg("update_graph_from_ip_attribution", combined_result, USER_ID, PROJECT_ID)
+    except Exception as e:  # noqa: BLE001 - the tag is optional; the run is not
+        print(f"[!][IpAttribution] failed: {type(e).__name__}")
+        combined_result["metadata"].setdefault("phase_errors", {})["ip_attribution"] = str(e)
+
+
+# The Nmap merge lives in recon.helpers.nmap_merge, so partial recon reaches it
+# without importing this file.
+from recon.helpers.nmap_merge import (  # noqa: E402
+    _add_nmap_confirmed_ports,
+    _apply_nmap_detail,
+    merge_nmap_into_port_scan,
+)
+
+
+def _merge_isolated_result(combined: dict, key: str, result) -> None:
+    """Store one `_isolated` wrapper's answer in combined_result.
+
+    A TopLevelKeys answer carries several top-level keys and each is merged
+    (vuln_scan also hands back the CVE lookup's technology_cves); any other
+    answer is the payload of `key` itself, even a dict that names other keys.
+    Existing sibling keys win so a pre-scan snapshot cannot revert newer data.
+    """
+    if isinstance(result, TopLevelKeys):
+        combined[key] = result.get(key, {})
+        for name, value in result.items():
+            if name != key:
+                combined.setdefault(name, value)
+    else:
+        combined[key] = result
+
+
+def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
+                         output_file) -> None:
+    """GROUP 6 Phase A: run the active scanners concurrently on deep copies.
+
+    Each answer is merged before its graph update is queued, because the
+    update snapshots combined_result at queue time.
+    """
+    if not tools:
+        return
+    print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning (fan-out: {', '.join(tools.keys())})")
+    print("-" * 40)
+    with ThreadPoolExecutor(max_workers=len(tools)) as pool:
+        futures = {pool.submit(fn, combined_result, settings): key
+                   for key, fn in tools.items()}
+        for fut in as_completed(futures):
+            key = futures[fut]
+            try:
+                _merge_isolated_result(combined_result, key, fut.result())
+                combined_result["metadata"]["modules_executed"].append(key)
+                save_recon_file(combined_result, output_file)
+                _graph_update_bg(f"update_graph_from_{key}", combined_result, USER_ID, PROJECT_ID)
+            except Exception as e:
+                print(f"[!][Pipeline] {key} failed: {e}")
+                combined_result["metadata"].setdefault("phase_errors", {})[key] = str(e)
+                _note_phase_error(key)
+                save_recon_file(combined_result, output_file)
 
 
 def run_ip_recon(target_ips: list, settings: dict) -> dict:
@@ -1003,8 +1031,12 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
 
     dns_enabled = settings.get('DNS_ENABLED', True)
 
+    # The orchestrator takes the progress label from these GROUP headers only
+    # (PIPELINE_HEADER_PHASES in recon_orchestrator/container_manager.py).
+    print(f"\n[*][Pipeline] GROUP 1: Reverse DNS + DNS + IP WHOIS (IP mode)")
+
     if dns_enabled:
-        print(f"\n[*][DNS] PHASE 1: Reverse DNS Lookup")
+        print(f"\n[*][DNS] IP STEP 1: Reverse DNS Lookup")
         print("-" * 40)
 
         # Parallel PTR lookups: one IP at a time serialised the whole /24 sweep.
@@ -1039,7 +1071,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                 ip_to_hostname[ip] = mock_name
                 print(f"[-][DNS] {ip} -> no PTR (using {mock_name})")
     else:
-        print(f"\n[-][DNS] PHASE 1: Reverse DNS Lookup — SKIPPED (disabled)")
+        print(f"\n[-][DNS] IP STEP 1: Reverse DNS Lookup — SKIPPED (disabled)")
         for ip in expanded_ips:
             mock_name = ip.replace('.', '-').replace(':', '-')
             ip_to_hostname[ip] = mock_name
@@ -1047,7 +1079,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     # Step 3: Build DNS data structure for each "subdomain"
     subdomain_names = []
     if dns_enabled:
-        print(f"\n[*][DNS] PHASE 2: DNS Resolution for Discovered Hosts")
+        print(f"\n[*][DNS] IP STEP 2: DNS Resolution for Discovered Hosts")
         print("-" * 40)
 
         for ip, hostname in ip_to_hostname.items():
@@ -1075,7 +1107,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                 }
                 subdomain_names.append(hostname)
     else:
-        print(f"\n[-][DNS] PHASE 2: DNS Resolution — SKIPPED (disabled)")
+        print(f"\n[-][DNS] IP STEP 2: DNS Resolution — SKIPPED (disabled)")
         for ip, hostname in ip_to_hostname.items():
             is_v6 = ':' in ip
             subdomains_dns[hostname] = {
@@ -1093,7 +1125,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     # Step 4: IP WHOIS (best-effort)
     ip_whois = {}
     if settings.get('WHOIS_ENABLED', True):
-        print(f"\n[*][WHOIS] PHASE 3: IP WHOIS Lookup")
+        print(f"\n[*][WHOIS] IP STEP 3: IP WHOIS Lookup")
         print("-" * 40)
         try:
             from recon.helpers import circuit_breaker
@@ -1123,7 +1155,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         except Exception as e:
             print(f"[!][WHOIS] IP WHOIS module error: {e}")
     else:
-        print(f"\n[-][WHOIS] PHASE 3: IP WHOIS Lookup — SKIPPED (disabled)")
+        print(f"\n[-][WHOIS] IP STEP 3: IP WHOIS Lookup — SKIPPED (disabled)")
 
     # Build the subdomain_filter (all IPs + any PTR-resolved hostnames)
     # This becomes allowed_hosts for http_probe scope checking
@@ -1206,7 +1238,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         print("[!][Pipeline] Downstream modules (HTTP probe, vuln scan) require open ports to work")
 
     if shodan_enabled or "port_scan" in SCAN_MODULES:
-        print(f"\n[*][Pipeline] GROUP: Shodan + Port Scan (parallel fan-out)")
+        print(f"\n[*][Pipeline] GROUP 3: Shodan + Port Scan (parallel fan-out)")
         print("-" * 40)
 
         port_scan_workers = (1 if naabu_enabled else 0) + (1 if masscan_enabled else 0)
@@ -1242,17 +1274,20 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                         combined_result["metadata"]["modules_executed"].append("masscan_scan")
                 except Exception as e:
                     print(f"[!][{name}] Failed: {e}")
+                    _note_phase_error(name)
 
         # Merge masscan results into port_scan for downstream consumers
         if "masscan_scan" in combined_result:
             merge_port_scan_results(combined_result)
 
         _drop_shodan_cdn_ips(combined_result)
+        _reachcheck_shodan_cves(combined_result, settings)
 
         save_recon_file(combined_result, output_file)
 
         if "shodan" in combined_result:
-            _graph_update_bg("update_graph_from_shodan", combined_result, USER_ID, PROJECT_ID)
+            _graph_update_bg("update_graph_from_shodan", _without_shodan_cves(combined_result),
+                             USER_ID, PROJECT_ID)
 
         if "port_scan" in combined_result:
             _graph_update_bg("update_graph_from_port_scan", combined_result, USER_ID, PROJECT_ID)
@@ -1334,7 +1369,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
             )
         }
     if enabled_ip_osint:
-        print(f"\n[*][Pipeline] OSINT Enrichment ({', '.join(enabled_ip_osint.keys())}) — parallel")
+        print(f"\n[*][Pipeline] GROUP 3b: OSINT Enrichment ({', '.join(enabled_ip_osint.keys())}) — parallel")
         print("-" * 40)
         import importlib
         osint_workers = min(len(enabled_ip_osint), 5)
@@ -1353,8 +1388,11 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                         print(f"[+][{name.upper()}] Enrichment merged")
                 except Exception as e:
                     print(f"[!][{name.upper()}] Enrichment failed: {e}")
+                    _note_phase_error(name)
         save_recon_file(combined_result, output_file)
         for name, (_, _, _, graph_method) in enabled_ip_osint.items():
+            if name == "netlas":
+                continue  # written after IP attribution (_write_netlas)
             if name in combined_result:
                 _graph_update_bg(graph_method, combined_result, USER_ID, PROJECT_ID)
 
@@ -1363,6 +1401,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         if not settings.get('HTTPX_ENABLED', True):
             print("\n[*][httpx] HTTP probing disabled -- skipping")
         else:
+            print(f"\n[*][Pipeline] GROUP 4: HTTP Probing")
             try:
                 combined_result = run_http_probe(combined_result, output_file=output_file, settings=settings)
                 combined_result["metadata"]["modules_executed"].append("http_probe")
@@ -1377,6 +1416,10 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                 _note_phase_error("http_probe")
                 save_recon_file(combined_result, output_file)
 
+    _run_ip_attribution(combined_result, settings, output_file)
+    _write_shodan_cves(combined_result)
+    _write_netlas(combined_result)
+
     # Check if active scans should be skipped
     skip_active_scans, skip_reason = should_skip_active_scans(combined_result)
 
@@ -1388,6 +1431,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         combined_result = _maybe_run_cert_hygiene(combined_result, settings, output_file)
     else:
         if "resource_enum" in SCAN_MODULES:
+            print(f"\n[*][Pipeline] GROUP 5: Resource Enumeration")
             try:
                 combined_result = run_resource_enum(combined_result, output_file=output_file, settings=settings)
                 combined_result["metadata"]["modules_executed"].append("resource_enum")
@@ -1405,6 +1449,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     # GROUP 5b -- JS Recon (runs after resource_enum, before vuln_scan;
     # runs even when active scans are skipped -- uploaded files don't need live targets)
     if settings.get('JS_RECON_ENABLED', False):
+        print(f"\n[*][Pipeline] GROUP 5b: JS Recon")
         try:
             from recon.main_recon_modules.js_recon import run_js_recon
             combined_result = run_js_recon(combined_result, settings=settings)
@@ -1429,18 +1474,11 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
 
     # GROUP 5.5 -- Supply-Chain Recon (L2): runs AFTER JS-recon (consumes its
     # source_maps + technologies). Black-box package harvest + offline OSV verdict.
-    if settings.get('SUPPLY_CHAIN_RECON_ENABLED', False):
-        try:
-            from recon.main_recon_modules.supply_chain_recon import run_supply_chain_recon
-            combined_result = run_supply_chain_recon(combined_result, settings=settings)
-            combined_result["metadata"]["modules_executed"].append("supply_chain_recon")
-            save_recon_file(combined_result, output_file)
-            _graph_update_bg("update_graph_from_supply_chain_recon", combined_result, USER_ID, PROJECT_ID)
-        except Exception as e:
-            print(f"[!][SupplyChainRecon] Error: {e}")
+    combined_result = _maybe_run_supply_chain(combined_result, settings, output_file)
 
     if not skip_active_scans:
         if "vuln_scan" in SCAN_MODULES:
+            print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
             try:
                 combined_result = run_vuln_scan(combined_result, output_file=output_file, settings=settings)
                 combined_result["metadata"]["modules_executed"].append("vuln_scan")
@@ -1482,24 +1520,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
             from recon.main_recon_modules.origin_discovery import run_origin_discovery_enrichment_isolated
             ip_phase_a['origin_discovery'] = run_origin_discovery_enrichment_isolated
 
-        if ip_phase_a:
-            print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning (fan-out: {', '.join(ip_phase_a.keys())})")
-            print("-" * 40)
-            with ThreadPoolExecutor(max_workers=len(ip_phase_a)) as pool:
-                futures = {pool.submit(fn, combined_result, settings): key
-                           for key, fn in ip_phase_a.items()}
-                for fut in as_completed(futures):
-                    key = futures[fut]
-                    try:
-                        _merge_isolated_result(combined_result, key, fut.result())
-                        combined_result["metadata"]["modules_executed"].append(key)
-                        save_recon_file(combined_result, output_file)
-                        _graph_update_bg(f"update_graph_from_{key}", combined_result, USER_ID, PROJECT_ID)
-                    except Exception as e:
-                        print(f"[!][Pipeline] {key} failed: {e}")
-                        combined_result["metadata"].setdefault("phase_errors", {})[key] = str(e)
-                        _note_phase_error(key)
-                        save_recon_file(combined_result, output_file)
+        _run_phase_a_fan_out(ip_phase_a, combined_result, settings, output_file)
 
     # External Domains -- aggregate from all sources and persist
     try:
@@ -1795,6 +1816,10 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         combined_result["subdomain_count"] = len(discovered_subs)
         combined_result["dns"] = merged["dns"]
         combined_result["subdomain_status_map"] = merged["status_map"]
+        combined_result["wildcard_zones"] = merged["wildcard_zones"]
+        wildcard_filter = ((recon_result or {}).get("metadata") or {}).get("wildcard_filter")
+        if wildcard_filter:
+            combined_result["metadata"]["wildcard_filter"] = wildcard_filter
         # Always stamped: a missing key defaults to True in target_helpers, which
         # would scan the apex the operator deliberately left out.
         combined_result["metadata"]["include_root_domain"] = merged["include_root"]
@@ -1902,18 +1927,21 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                         print(f"[+][Masscan] Port scan merged")
                 except Exception as e:
                     print(f"[!][{name}] Failed: {e}")
+                    _note_phase_error(name)
 
         # Merge masscan results into port_scan for downstream consumers
         if "masscan_scan" in combined_result:
             merge_port_scan_results(combined_result)
 
         _drop_shodan_cdn_ips(combined_result)
+        _reachcheck_shodan_cves(combined_result, _settings)
 
         save_recon_file(combined_result, output_file)
 
         # Background graph updates for Shodan + port scan
         if "shodan" in combined_result:
-            _graph_update_bg("update_graph_from_shodan", combined_result, USER_ID, PROJECT_ID)
+            _graph_update_bg("update_graph_from_shodan", _without_shodan_cves(combined_result),
+                             USER_ID, PROJECT_ID)
 
         if "port_scan" in combined_result:
             _graph_update_bg("update_graph_from_port_scan", combined_result, USER_ID, PROJECT_ID)
@@ -2031,11 +2059,14 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                         print(f"[+][{name.upper()}] Enrichment merged")
                 except Exception as e:
                     print(f"[!][{name.upper()}] Enrichment failed: {e}")
+                    _note_phase_error(name)
 
         save_recon_file(combined_result, output_file)
 
         # Queue graph updates for completed OSINT tools
         for name, (_, _, _, graph_method) in enabled_osint.items():
+            if name == "netlas":
+                continue  # written after IP attribution (_write_netlas)
             if name in combined_result:
                 _graph_update_bg(graph_method, combined_result, USER_ID, PROJECT_ID)
 
@@ -2047,6 +2078,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         if not _settings.get('HTTPX_ENABLED', True):
             print("\n[*][httpx] HTTP probing disabled -- skipping")
         else:
+            print(f"\n[*][Pipeline] GROUP 4: HTTP Probing")
             try:
                 combined_result = run_http_probe(combined_result, output_file=output_file, settings=_settings)
                 combined_result["metadata"]["modules_executed"].append("http_probe")
@@ -2088,6 +2120,11 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         except Exception as e:
             print(f"[!][Pipeline] certificate SAN feedback failed: {e}")
 
+    # After the SAN feedback: a name it resolved counts as a current DNS name.
+    _run_ip_attribution(combined_result, _settings, output_file)
+    _write_shodan_cves(combined_result)
+    _write_netlas(combined_result)
+
     # Check if we should skip active scanning modules (resource_enum, vuln_scan)
     # These require live targets from http_probe to work
     skip_active_scans, skip_reason = should_skip_active_scans(combined_result)
@@ -2104,6 +2141,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     else:
         # GROUP 5 — Resource Enum (already parallel internally: Katana || GAU || Kiterunner)
         if "resource_enum" in SCAN_MODULES:
+            print(f"\n[*][Pipeline] GROUP 5: Resource Enumeration")
             try:
                 combined_result = run_resource_enum(combined_result, output_file=output_file, settings=_settings)
                 combined_result["metadata"]["modules_executed"].append("resource_enum")
@@ -2121,6 +2159,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     # GROUP 5b — JS Recon (runs after resource_enum, before vuln_scan;
     # runs even when active scans are skipped -- uploaded files don't need live targets)
     if _settings.get('JS_RECON_ENABLED', False):
+        print(f"\n[*][Pipeline] GROUP 5b: JS Recon")
         try:
             from recon.main_recon_modules.js_recon import run_js_recon
             combined_result = run_js_recon(combined_result, settings=_settings)
@@ -2144,6 +2183,9 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         except Exception as e:
             print(f"[!][SerializedScan] Error: {e}")
             _note_phase_error("serialized_scan")
+
+    # GROUP 5.5 -- Supply-Chain Recon, after JS Recon as in IP mode.
+    combined_result = _maybe_run_supply_chain(combined_result, _settings, output_file)
 
     if not skip_active_scans:
         # ================================================================
@@ -2174,24 +2216,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             from recon.main_recon_modules.origin_discovery import run_origin_discovery_enrichment_isolated
             phase_a_tools['origin_discovery'] = run_origin_discovery_enrichment_isolated
 
-        if phase_a_tools:
-            print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning (fan-out: {', '.join(phase_a_tools.keys())})")
-            print("-" * 40)
-            with ThreadPoolExecutor(max_workers=len(phase_a_tools)) as pool:
-                futures = {pool.submit(fn, combined_result, _settings): key
-                           for key, fn in phase_a_tools.items()}
-                for fut in as_completed(futures):
-                    key = futures[fut]
-                    try:
-                        _merge_isolated_result(combined_result, key, fut.result())
-                        combined_result["metadata"]["modules_executed"].append(key)
-                        save_recon_file(combined_result, output_file)
-                        _graph_update_bg(f"update_graph_from_{key}", combined_result, USER_ID, PROJECT_ID)
-                    except Exception as e:
-                        print(f"[!][Pipeline] {key} failed: {e}")
-                        combined_result["metadata"].setdefault("phase_errors", {})[key] = str(e)
-                        _note_phase_error(key)
-                        save_recon_file(combined_result, output_file)
+        _run_phase_a_fan_out(phase_a_tools, combined_result, _settings, output_file)
 
         # ================================================================
         # GROUP 6 Phase B — MITRE enrichment (depends on Nuclei CVEs)
@@ -2217,6 +2242,8 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             _graph_update_bg("update_graph_from_external_domains", combined_result, USER_ID, PROJECT_ID)
     except Exception as e:
         print(f"[!][Pipeline] external_domains aggregation failed: {e}")
+
+    _stamp_wildcard_zones(combined_result)
 
     # Wait for all background graph DB updates to finish before returning
     _graph_wait_all()
@@ -2308,7 +2335,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     return combined_result
 
 
-from recon.helpers.finding_sources import RECON_FINDING_SOURCES  # noqa: E402
+from recon.helpers.finding_sources import PASSIVE_CVE_SOURCES, RECON_FINDING_SOURCES  # noqa: E402
 
 #: When this run started. Everything it writes gets a later `updated_at`, so the
 #: prune at the end can tell "still reported" from "gone".
@@ -2450,6 +2477,10 @@ def _prune_recon_findings():
     """
     if not UPDATE_GRAPH_DB or not _RUN_STARTED_AT:
         return
+    if _shutdown.stop_requested():
+        # Its killed tools returned empty results, which would read as "gone".
+        print("[!][graph-db] Finding prune skipped: the run was stopped")
+        return
     if _COVERAGE_WRITE_FAILED:
         print("[!][graph-db] Finding prune skipped: this run's coverage record was not written")
         return
@@ -2478,6 +2509,16 @@ def _prune_recon_findings():
         from graph_db import Neo4jClient
         with Neo4jClient() as graph_client:
             if graph_client.verify_connection():
+                # A host kept above is matched on the finding's host fields;
+                # passive CVEs written before they carried one get it first.
+                try:
+                    graph_client.backfill_passive_cve_hosts(USER_ID, PROJECT_ID)
+                except Exception as e:  # noqa: BLE001 - fail closed for those sources only
+                    print(f"[!][graph-db] Could not backfill passive CVE hosts ({e}) - "
+                          f"passive CVEs are not pruned this run")
+                    passive = {s for group in PASSIVE_CVE_SOURCES.values() for s in group}
+                    batches = {keep: [s for s in batch if s not in passive]
+                               for keep, batch in batches.items()}
                 for keep, batch in batches.items():
                     graph_client.prune_unseen_findings(
                         USER_ID, PROJECT_ID, batch, _RUN_STARTED_AT,
@@ -2504,6 +2545,7 @@ _PHASE_FINDING_SOURCES = {
     "cache_scan": ("cache_poisoning", "wcvs"),
     "origin_discovery": ("origin_discovery",),
     "serialized_scan": ("serialized_scan",),
+    **PASSIVE_CVE_SOURCES,
 }
 
 
@@ -2513,6 +2555,10 @@ def _note_phase_error(phase: str, reason: str = "the phase failed") -> None:
     if not sources:
         return
     try:
+        if phase in PASSIVE_CVE_SOURCES:
+            from recon.helpers.passive_cve_coverage import note_cve_coverage
+            note_cve_coverage(phase, phase, failed=True, reason=reason)
+            return
         from recon.helpers import circuit_breaker
         circuit_breaker.note_degraded(phase, sources=sources, reason=reason)
     except Exception:  # noqa: BLE001
@@ -2651,6 +2697,10 @@ def run_domain_batch(groups: list, start_time) -> int:
     failed = []
     for idx, group in enumerate(groups, 1):
         root = group['scanRoot']
+        if _shutdown.stop_requested():
+            print(f"[!][Batch] Stop requested: group(s) {idx}..{total} not started")
+            failed.extend(g['scanRoot'] for g in groups[idx - 1:])
+            break
         # The marker the orchestrator parses into live "Group 2/3" progress;
         # the root stays one token (container_manager BATCH_GROUP_PATTERN).
         print(f"\n[Batch] Group {idx}/{total}: {root}")
@@ -2696,12 +2746,20 @@ def main():
     """Run the pipeline, then sweep node filters over what it wrote, whatever happened.
 
     The sweep sits in a `finally` so an early return or an exception still
-    applies the rules to the findings the run managed to write.
+    applies the rules to the findings the run managed to write. The graph
+    writer is drained first, so the writes still queued land before the sweep
+    reads them. A stopped run leaves both to the stopper, which bounds them by
+    the stop deadline (recon/helpers/shutdown.py).
     """
+    _shutdown.register_drain(_drain_graph_writes)
+    _shutdown.set_sweep(_apply_node_filters)
     try:
         return _run_pipeline()
     finally:
-        _apply_node_filters()
+        if not _shutdown.stop_requested():
+            _graph_wait_all()
+            _shutdown.sweep_once()
+        _shutdown.park()
 
 
 def _run_pipeline():
@@ -2724,6 +2782,18 @@ def _run_pipeline():
     from recon.helpers import circuit_breaker
     circuit_breaker.announce_mode()
 
+    # RoE: check the time window ONCE, before any target is touched and before
+    # the clear, in both modes. The orchestrator checks it too, but this
+    # container may start late (image pulls) after the window closed. A batch
+    # that starts inside the window runs to completion; re-checking per group
+    # would abandon a run half way through and leave the graph partially
+    # rebuilt.
+    allowed, reason = _check_roe_time_window(_settings)
+    if not allowed:
+        print(f"\n[RoE] BLOCKED: {reason}")
+        print(f"[RoE] Reconnaissance aborted: outside Rules of Engagement time window.")
+        return 1
+
     # IP Mode: skip domain verification and run IP-based recon instead
     if IP_MODE and TARGET_IPS:
         print(f"  [*][Pipeline] MODE:              IP-BASED TARGETING")
@@ -2745,15 +2815,6 @@ def _run_pipeline():
         duration = end_time - start_time
         print(f"\n[✓][Pipeline] Total time: {duration}")
         return 0
-
-    # RoE: check the time window ONCE, before any target is touched. A batch that
-    # starts inside the window runs to completion; re-checking per group would
-    # abandon a run half way through and leave the graph partially rebuilt.
-    allowed, reason = _check_roe_time_window(_settings)
-    if not allowed:
-        print(f"\n[RoE] BLOCKED: {reason}")
-        print(f"[RoE] Reconnaissance aborted: outside Rules of Engagement time window.")
-        return 1
 
     log_scope(_settings)
     groups = _batch_groups()
@@ -2780,6 +2841,65 @@ def _run_pipeline():
     return rc
 
 
+# What run_domain_group's legacy branch (domain_discovery off) can re-check:
+# http_probe, resource_enum (with jsluice), AI Surface, JS Recon and vuln_scan
+# with its security checks. Every other recon source is never run there.
+_LEGACY_PATH_SOURCES = frozenset({
+    "http_probe", "resource_enum", "jsluice", "ai_surface_recon", "js_recon",
+    "nuclei", "security_check", "vuln_scan",
+})
+
+
+def _note_legacy_unrun_sources() -> None:
+    """Keep the findings of every recon source the legacy path does not run:
+    they were not re-checked, so the prune must not read them as gone."""
+    unrun = [s for s in RECON_FINDING_SOURCES if s not in _LEGACY_PATH_SOURCES]
+    if not unrun:
+        return
+    print(f"[*][Pipeline] Domain discovery is off: {len(unrun)} finding source(s) this "
+          f"path does not run keep their earlier findings")
+    try:
+        from recon.helpers import circuit_breaker
+        circuit_breaker.note_degraded("legacy_pipeline", sources=unrun,
+                                      reason="not run: domain discovery is off")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _drop_roe_excluded_subdomains(domain_result: dict, excluded: list) -> None:
+    """Remove RoE-excluded hosts from a loaded recon file, wherever it lists them."""
+    subs = (domain_result.get('dns') or {}).get('subdomains') or {}
+    status_map = domain_result.get('subdomain_status_map') or {}
+    listed = domain_result.get('subdomains') or []
+    dropped = {h for h in [*subs, *listed, *status_map] if _is_roe_excluded(h, excluded)}
+    if not dropped:
+        return
+    for host in dropped:
+        subs.pop(host, None)
+        status_map.pop(host, None)
+    domain_result['subdomains'] = [h for h in listed if h not in dropped]
+    if 'subdomain_count' in domain_result:
+        domain_result['subdomain_count'] = len(domain_result['subdomains'])
+    print(f"[RoE] Removed {len(dropped)} excluded subdomain(s) from loaded recon file")
+
+
+def _write_legacy_domain_nodes(domain_result: dict) -> None:
+    """Rebuild the Domain and Subdomain nodes from the loaded file. Synchronous,
+    like the legacy path's other writes; never raises."""
+    if not UPDATE_GRAPH_DB:
+        return
+    try:
+        from graph_db import Neo4jClient
+        with Neo4jClient() as graph_client:
+            if not graph_client.verify_connection():
+                print("[!][graph-db] Could not connect to Neo4j - Domain and subdomains not rebuilt")
+                return
+            graph_client.update_graph_from_domain_discovery(domain_result, USER_ID, PROJECT_ID)
+            print("[+][graph-db] Domain and subdomains rebuilt from the loaded recon file")
+    except Exception as e:  # noqa: BLE001
+        print(f"[!][graph-db] Could not rebuild the Domain and subdomains: {e}")
+
+
 def run_domain_group(group: dict, start_time=None) -> int:
     """Run the whole domain pipeline for ONE scope group: a single-domain
     project's one group, or one group of a Domain batch.
@@ -2802,6 +2922,11 @@ def run_domain_group(group: dict, start_time=None) -> int:
     from recon.helpers import circuit_breaker
     coverage_group = circuit_breaker.group_scope()
     target_domain = group['scanRoot']
+
+    # One bad moment in an earlier group must not leave this one unresolved;
+    # before ownership, whose TXT lookup the latch would otherwise refuse.
+    from recon.main_recon_modules.domain_recon import resolver_breaker
+    resolver_breaker.recheck()
 
     # RoE before ownership: an excluded root gets no TXT lookup either.
     if _roe_refuses_root(target_domain):
@@ -2894,23 +3019,27 @@ def run_domain_group(group: dict, start_time=None) -> int:
         )
         _stamp_project_roots(domain_result)
     else:
-        # Load existing recon file if domain_discovery not in modules
+        # The legacy path: domain_discovery is off, so the previous run's file
+        # is reloaded and a few phases run on it, after _run_pipeline cleared the
+        # graph. Its graph writes go through the background writer like the
+        # main pipeline's, and before anything can let the prune run, the recon
+        # sources this path never runs keep their findings.
+        _graph_reset()
+        _note_legacy_unrun_sources()
         if output_file.exists():
             with open(output_file, 'r') as f:
                 domain_result = json.load(f)
             _stamp_project_roots(domain_result)
             print(f"[*][Pipeline] Loaded existing recon file: {output_file}")
 
-            # RoE: filter excluded hosts from loaded recon data
+            # RoE: filter excluded hosts from every place the loaded file lists
+            # them; the domain writer reads the top-level list.
             if _settings.get('ROE_ENABLED') and _settings.get('ROE_EXCLUDED_HOSTS'):
-                roe_excluded = _settings['ROE_EXCLUDED_HOSTS']
-                dns_data = domain_result.get('dns', {})
-                subs = dns_data.get('subdomains', {})
-                excluded_subs = [s for s in subs if _is_roe_excluded(s, roe_excluded)]
-                for s in excluded_subs:
-                    del subs[s]
-                if excluded_subs:
-                    print(f"[RoE] Removed {len(excluded_subs)} excluded subdomain(s) from loaded recon file")
+                _drop_roe_excluded_subdomains(domain_result, _settings['ROE_EXCLUDED_HOSTS'])
+
+            # The clear removed the Domain and Subdomain nodes, and no other
+            # writer on this path MERGEs them (they only MATCH).
+            _write_legacy_domain_nodes(domain_result)
         else:
             print(f"[!][Pipeline] No existing recon file found: {output_file}")
             print(f"[!][Pipeline] Add 'domain_discovery' to SCAN_MODULES to create it first")
@@ -2925,6 +3054,7 @@ def run_domain_group(group: dict, start_time=None) -> int:
                 print("\n[!][Pipeline] Both Naabu and Masscan are disabled — skipping port scan phase")
                 print("[!][Pipeline] Downstream modules (HTTP probe, vuln scan) require open ports to work")
             else:
+                print(f"\n[*][Pipeline] GROUP 3: Port Scan")
                 if _naabu_on:
                     domain_result = run_port_scan(domain_result, output_file=output_file, settings=_settings)
                     if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
@@ -2972,6 +3102,7 @@ def run_domain_group(group: dict, start_time=None) -> int:
             if not _settings.get('HTTPX_ENABLED', True):
                 print("\n[*][httpx] HTTP probing disabled -- skipping")
             else:
+                print(f"\n[*][Pipeline] GROUP 4: HTTP Probing")
                 domain_result = run_http_probe(domain_result, output_file=output_file, settings=_settings)
                 if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
                     if "http_probe" not in domain_result["metadata"]["modules_executed"]:
@@ -3023,6 +3154,7 @@ def run_domain_group(group: dict, start_time=None) -> int:
         else:
             # Run resource_enum if in SCAN_MODULES (when domain_discovery is skipped)
             if "resource_enum" in SCAN_MODULES:
+                print(f"\n[*][Pipeline] GROUP 5: Resource Enumeration")
                 domain_result = run_resource_enum(domain_result, output_file=output_file, settings=_settings)
                 if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
                     if "resource_enum" not in domain_result["metadata"]["modules_executed"]:
@@ -3062,6 +3194,7 @@ def run_domain_group(group: dict, start_time=None) -> int:
         # GROUP 5b — JS Recon (runs after resource_enum, before vuln_scan;
         # runs even when active scans are skipped -- uploaded files don't need live targets)
         if _settings.get('JS_RECON_ENABLED', False):
+            print(f"\n[*][Pipeline] GROUP 5b: JS Recon")
             try:
                 from recon.main_recon_modules.js_recon import run_js_recon
                 domain_result = run_js_recon(domain_result, settings=_settings)
@@ -3093,6 +3226,7 @@ def run_domain_group(group: dict, start_time=None) -> int:
             # Run vuln_scan if in SCAN_MODULES (when domain_discovery is skipped)
             # vuln_scan automatically includes MITRE CWE/CAPEC enrichment
             if "vuln_scan" in SCAN_MODULES:
+                print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
                 domain_result = run_vuln_scan(domain_result, output_file=output_file, settings=_settings)
                 if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
                     if "vuln_scan" not in domain_result["metadata"]["modules_executed"]:
@@ -3220,7 +3354,9 @@ def run_domain_group(group: dict, start_time=None) -> int:
 
     # The prune is run-level (see _run_pipeline / run_domain_batch): a batch
     # group that pruned here would delete the later groups' findings before
-    # they were rescanned.
+    # they were rescanned. The group's queued writes land first, so the record
+    # is stamped on what they wrote (the legacy path's Domain included).
+    _graph_wait_all()
     _write_coverage_record(root_domain, coverage_group)
 
     return 0

@@ -126,6 +126,21 @@ describe('defaultRecordingScope', () => {
   test('empty project → empty scope (fail-safe)', () => {
     expect(defaultRecordingScope({})).toEqual([])
   })
+
+  // drift-map #20: the matcher was exact host or `.suffix` only, so a wildcard,
+  // CIDR or IPv6 exclusion the scans enforce left the host in the recording.
+  test('a wildcard, CIDR or IPv6 exclusion removes the hosts recon would refuse', () => {
+    expect(defaultRecordingScope({
+      targetDomain: 'target.test', subdomainList: ['app.', 'pay.', '.'],
+      roeExcludedHosts: ['*.target.test'],
+    })).toEqual(['target.test'])
+    expect(defaultRecordingScope({
+      ipMode: true, targetIps: ['10.0.0.5', '192.0.2.10'], roeExcludedHosts: ['10.0.0.0/24'],
+    })).toEqual(['192.0.2.10'])
+    expect(defaultRecordingScope({
+      ipMode: true, targetIps: ['2001:db8::5'], roeExcludedHosts: ['2001:0DB8::/32'],
+    })).toEqual([])
+  })
 })
 
 describe('refreshActiveRecordingScope', () => {

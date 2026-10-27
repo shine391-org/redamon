@@ -241,12 +241,11 @@ export function AttackSkillsSection({ data, updateField, projectId }: AttackSkil
     if (skillId in config.builtIn) {
       return config.builtIn[skillId] !== false
     }
-    // Key missing from saved config: fall back to the shipped default so the
-    // UI matches what the Python agent does (get_enabled_builtin_skills is a
-    // strict has-key check; missing key = disabled). Without this fallback,
-    // legacy projects show new skills as ON in the UI while the agent treats
-    // them as OFF, and toggling does not persist until the user explicitly
-    // clicks. Default-OFF skills like ssrf are the obvious victim.
+    // Key missing from the saved config (a project older than the skill): show
+    // the shipped default. The agent's get_enabled_builtin_skills is a strict
+    // has-key check, so a missing key is OFF there. The two agree for a skill
+    // that is false in DEFAULT_CONFIG; a skill that is true in it shows ON here
+    // while the agent treats it as OFF, until it is toggled and saved.
     return DEFAULT_CONFIG.builtIn[skillId] ?? false
   }
 

@@ -285,6 +285,8 @@ TRIAGE_PROPS = (
     "triage_factors",         # JSON, the factors after review and decision
     "triage_state",           # open | fixed | gone | inactive | false_positive
     "triage_decided_by",      # rules | review | person
+    "triage_disposition",     # reportable | candidate | info | excluded (plan 10)
+    "triage_blocker",         # what a candidate still lacks; null otherwise
     "triage_rescored_at",
 )
 
@@ -307,11 +309,22 @@ _PERSON_DECIDED = ("(coalesce(n.triage_source, '') = 'human' "
 #: here would lift every finding on a compromised host to T1 "proven".
 _PROOF_TYPES = ("['exploit_success', 'access_gained', 'privilege_escalation', "
                 "'credential_found', 'vulnerability_confirmed']")
+#: score_model.PROOF_MIN_AGENT_CONFIDENCE and AGENT_CONFIDENCE_DEFAULT, pinned
+#: equal by a test: a confirmation the agent rated below 70 is not proof, and a
+#: missing confidence is the writer's default.
+_PROOF_MIN_CONFIDENCE = 70
+_PROOF_DEFAULT_CONFIDENCE = 80
+_PROOF_CONFIDENCE = (f"coalesce(toInteger(cf.confidence), {_PROOF_DEFAULT_CONFIDENCE}) "
+                     f">= {_PROOF_MIN_CONFIDENCE}")
 #: score_model.PUBLIC_CLIENT_KEY_TYPES. graph_db cannot import the agent's
 #: model, so a test pins the two lists equal.
 _PUBLIC_CLIENT_KEY_TYPES = sorted({
-    "gcp api key", "gcpkey", "stripe publishable key", "google recaptcha key",
-    "sentry dsn", "mapbox token",
+    "gcp api key", "gcpkey", "firebase api key", "segment write key",
+    "amplitude api key", "new relic browser api token", "sentry dsn",
+    "stripe publishable key", "google recaptcha key", "mapbox token",
+    "algolia app id", "algolia search key", "intercom app id", "pusher key",
+    "clerk publishable key", "mailgun public key", "flutterwave public key",
+    "supabase anon key", "supabase publishable key",
 })
 
 #: A validated public client key proves only that it works as designed, so like
@@ -326,7 +339,8 @@ _LIVE_PROOF = f"""(n:ExploitGvm
           OR toUpper(coalesce(n.finding_id, n.id, '')) STARTS WITH 'MAL-'
           OR EXISTS {{ MATCH (cf:ChainFinding)-[:CONFIRMS]->(n)
                       WHERE cf.user_id = n.user_id AND cf.project_id = n.project_id
-                        AND cf.finding_type IN {_PROOF_TYPES} }})"""
+                        AND cf.finding_type IN {_PROOF_TYPES}
+                        AND {_PROOF_CONFIDENCE} }})"""
 
 #: Which layer set the final values. A node no v3.2 publish has touched has no
 #: `triage_decided_by`, so it is derived the way a tolerant reader must.
@@ -387,6 +401,10 @@ VALID_TRIAGE_STATE = ("open", "fixed", "gone", "inactive", "false_positive")
 
 #: What the AI review may conclude.
 VALID_AI_VERDICT = ("real", "doubtful", "false_positive", "unclear", "not_reviewed")
+
+#: score_model.DISPOSITIONS. graph_db cannot import the agent's model, so a
+#: test pins the two equal.
+VALID_DISPOSITION = ("reportable", "candidate", "info", "excluded")
 
 #: The board's four sections, in the order they are always shown.
 SECTION_RANKED = 0
@@ -1055,6 +1073,10 @@ class TriageMixin:
                coalesce(n.severity, '')            AS severity,
                coalesce(n.source, '')              AS source,
                coalesce(n.matched_at, n.url, n.endpoint, '') AS location,
+               // The webapp's disposition reads these: a key that is public by
+               // design is "info" whatever its tier (lib/triage/disposition.ts).
+               coalesce(n.public_client_key, false) AS public_client_key,
+               coalesce(n.secret_type, '')      AS secret_type,
                // The host the model actually used, not a non-deterministic pick
                // from whichever parent Neo4j returned first (R5).
                coalesce(n.triage_host, parent.name, parent.address, parent.url, '') AS host,
@@ -1080,6 +1102,9 @@ class TriageMixin:
                coalesce(n.triage_base_tier_rule, '') AS triage_base_tier_rule,
                n.triage_base_state                 AS triage_base_state,
                n.triage_tier_inputs                AS triage_tier_inputs,
+               // combine's answer; absent until a v3.10 run rescores the node
+               n.triage_disposition               AS triage_disposition,
+               n.triage_blocker                   AS triage_blocker,
                decided_by                          AS triage_decided_by,
                CASE WHEN {_PERSON_DECIDED}
                     THEN coalesce(n.triage_verdict_channel, 'app') ELSE '' END AS decided_via,
@@ -1304,7 +1329,8 @@ class TriageMixin:
                {_LIVE_PROOF}                       AS proven_now,
                [(cf:ChainFinding)-[:CONFIRMS]->(n)
                   WHERE cf.user_id = n.user_id AND cf.project_id = n.project_id
-                    AND cf.finding_type IN {_PROOF_TYPES} | cf.finding_type] AS proof_types"""
+                    AND cf.finding_type IN {_PROOF_TYPES}
+                    AND {_PROOF_CONFIDENCE} | cf.finding_type] AS proof_types"""
         query = f"""
         MATCH (n:{label_expr})
         WHERE {_BY_ID} AND n.user_id = $user_id AND n.project_id = $project_id
@@ -1453,6 +1479,13 @@ class TriageMixin:
                 factors = _json.dumps(factors or {}, default=str)
             except (TypeError, ValueError):
                 factors = "{}"
+        # Null for both unless they make a whole answer: a reader then computes
+        # it, which beats storing a candidate with no reason.
+        disposition = final.get("disposition")
+        blocker = final.get("blocker")
+        blocker = blocker.strip()[:200] if isinstance(blocker, str) else ""
+        if disposition not in VALID_DISPOSITION or (disposition == "candidate" and not blocker):
+            disposition = None
         return {
             "score": _float(final.get("score"), 0.0, 100.0),
             "tier": tier,
@@ -1461,6 +1494,8 @@ class TriageMixin:
             "factors": factors[:8000],
             "state": state,
             "decided_by": decided_by,
+            "disposition": disposition,
+            "blocker": blocker if disposition == "candidate" else None,
         }
 
     _FINAL_SET = """n.triage_priority_score = $final.score,
@@ -1470,6 +1505,8 @@ class TriageMixin:
             n.triage_factors        = $final.factors,
             n.triage_state          = $final.state,
             n.triage_decided_by     = $final.decided_by,
+            n.triage_disposition    = $final.disposition,
+            n.triage_blocker        = $final.blocker,
             n.triage_rescored_at    = datetime()"""
 
     #: What a review may write, and nothing else.
@@ -1650,6 +1687,8 @@ class TriageMixin:
             n.triage_factors        = row.final.factors,
             n.triage_state          = row.final.state,
             n.triage_decided_by     = row.final.decided_by,
+            n.triage_disposition    = row.final.disposition,
+            n.triage_blocker        = row.final.blocker,
             n.triage_rescored_at    = datetime()
         FOREACH (_ IN CASE WHEN row.proof IS NOT NULL THEN [1] ELSE [] END |
           SET n.triage_proof = row.proof)

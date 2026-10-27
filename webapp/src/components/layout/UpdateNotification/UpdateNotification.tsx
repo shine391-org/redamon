@@ -4,6 +4,7 @@ import { useState, useCallback } from 'react'
 import { Download, Copy, Check, ExternalLink, ChevronDown, ChevronRight } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { useVersionCheck } from '@/hooks/useVersionCheck'
+import { copyText } from '@/lib/copyText'
 import type { ChangelogEntry } from '@/lib/parseChangelog'
 import styles from './UpdateNotification.module.css'
 
@@ -66,7 +67,7 @@ function CopyCommand({ command }: { command: string }) {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(command).then(() => {
+    copyText(command).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })

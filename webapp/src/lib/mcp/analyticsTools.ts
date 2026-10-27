@@ -104,31 +104,101 @@ const CENSUS: CensusEntry[] = [
   { key: 'technologies', pattern: 'a7:Technology' },
   { key: 'certificates', pattern: 'a8:Certificate' },
   { key: 'dnsRecords', pattern: 'a9:DNSRecord' },
+  // Findings are counted as the client report counts them: a person's False
+  // positive and a rule-resolved finding are left out and counted apart in
+  // the last three entries; an AI-only false positive stays (its reviewer reads
+  // target-controlled text). The predicate is reportCountable /
+  // reportBucketCypher written out, pinned to them by analyticsTools.test.ts.
   {
     key: 'criticalVulnerabilities',
     pattern: 'b0:Vulnerability',
-    where: "b0.stale_since IS NULL AND toLower(coalesce(b0.severity, '')) = 'critical'",
+    where: "b0.stale_since IS NULL AND toLower(coalesce(b0.severity, '')) = 'critical' AND " +
+      "NOT (coalesce(b0.triage_status, '') = 'likely_noise' AND coalesce(b0.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b0.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
   },
   {
     key: 'highVulnerabilities',
     pattern: 'b1:Vulnerability',
-    where: "b1.stale_since IS NULL AND toLower(coalesce(b1.severity, '')) = 'high'",
+    where: "b1.stale_since IS NULL AND toLower(coalesce(b1.severity, '')) = 'high' AND " +
+      "NOT (coalesce(b1.triage_status, '') = 'likely_noise' AND coalesce(b1.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b1.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
   },
   {
     key: 'mediumVulnerabilities',
     pattern: 'b2:Vulnerability',
-    where: "b2.stale_since IS NULL AND toLower(coalesce(b2.severity, '')) = 'medium'",
+    where: "b2.stale_since IS NULL AND toLower(coalesce(b2.severity, '')) = 'medium' AND " +
+      "NOT (coalesce(b2.triage_status, '') = 'likely_noise' AND coalesce(b2.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b2.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
   },
   {
     key: 'otherVulnerabilities',
     pattern: 'b3:Vulnerability',
     where: "b3.stale_since IS NULL AND NOT toLower(coalesce(b3.severity, '')) IN " +
-      "['critical', 'high', 'medium']",
+      "['critical', 'high', 'medium'] AND " +
+      "NOT (coalesce(b3.triage_status, '') = 'likely_noise' AND coalesce(b3.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b3.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
   },
-  { key: 'exposedSecrets', pattern: 'b4:Secret', where: 'b4.stale_since IS NULL' },
-  { key: 'jsFindings', pattern: 'b5:JsReconFinding', where: 'b5.stale_since IS NULL' },
-  { key: 'maliciousPackages', pattern: 'b6:MalPackageFinding', where: 'b6.stale_since IS NULL' },
-  { key: 'knownExploits', pattern: 'b7:ExploitGvm', where: 'b7.stale_since IS NULL' },
+  {
+    key: 'exposedSecrets',
+    pattern: 'b4:Secret',
+    where: "b4.stale_since IS NULL AND " +
+      "NOT (coalesce(b4.triage_status, '') = 'likely_noise' AND coalesce(b4.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b4.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
+  },
+  {
+    key: 'jsFindings',
+    pattern: 'b5:JsReconFinding',
+    where: "b5.stale_since IS NULL AND " +
+      "NOT (coalesce(b5.triage_status, '') = 'likely_noise' AND coalesce(b5.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b5.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
+  },
+  {
+    key: 'maliciousPackages',
+    pattern: 'b6:MalPackageFinding',
+    where: "b6.stale_since IS NULL AND " +
+      "NOT (coalesce(b6.triage_status, '') = 'likely_noise' AND coalesce(b6.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b6.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
+  },
+  {
+    key: 'knownExploits',
+    pattern: 'b7:ExploitGvm',
+    where: "b7.stale_since IS NULL AND " +
+      "NOT (coalesce(b7.triage_status, '') = 'likely_noise' AND coalesce(b7.triage_source, '') = 'human') " +
+      "AND NOT coalesce(b7.triage_state, 'open') IN ['fixed', 'gone', 'inactive']",
+  },
+  {
+    key: 'judgedFalsePositiveVulnerabilities',
+    pattern: 'b8:Vulnerability',
+    where: "b8.stale_since IS NULL AND " +
+      "CASE WHEN coalesce(b8.triage_state, 'open') IN ['fixed', 'gone', 'inactive'] THEN 'resolved' " +
+      "WHEN coalesce(b8.triage_status, '') = 'likely_noise' AND coalesce(b8.triage_source, '') = 'human' " +
+      "THEN 'person_false_positive' " +
+      "WHEN coalesce(b8.triage_state, 'open') = 'false_positive' " +
+      "OR (coalesce(b8.triage_status, '') = 'likely_noise' AND coalesce(b8.triage_source, '') = 'ai') " +
+      "THEN 'ai_flagged' ELSE 'counted' END = 'person_false_positive'",
+  },
+  {
+    key: 'resolvedVulnerabilities',
+    pattern: 'b9:Vulnerability',
+    where: "b9.stale_since IS NULL AND " +
+      "CASE WHEN coalesce(b9.triage_state, 'open') IN ['fixed', 'gone', 'inactive'] THEN 'resolved' " +
+      "WHEN coalesce(b9.triage_status, '') = 'likely_noise' AND coalesce(b9.triage_source, '') = 'human' " +
+      "THEN 'person_false_positive' " +
+      "WHEN coalesce(b9.triage_state, 'open') = 'false_positive' " +
+      "OR (coalesce(b9.triage_status, '') = 'likely_noise' AND coalesce(b9.triage_source, '') = 'ai') " +
+      "THEN 'ai_flagged' ELSE 'counted' END = 'resolved'",
+  },
+  {
+    key: 'aiFlaggedVulnerabilities',
+    pattern: 'b10:Vulnerability',
+    where: "b10.stale_since IS NULL AND " +
+      "CASE WHEN coalesce(b10.triage_state, 'open') IN ['fixed', 'gone', 'inactive'] THEN 'resolved' " +
+      "WHEN coalesce(b10.triage_status, '') = 'likely_noise' AND coalesce(b10.triage_source, '') = 'human' " +
+      "THEN 'person_false_positive' " +
+      "WHEN coalesce(b10.triage_state, 'open') = 'false_positive' " +
+      "OR (coalesce(b10.triage_status, '') = 'likely_noise' AND coalesce(b10.triage_source, '') = 'ai') " +
+      "THEN 'ai_flagged' ELSE 'counted' END = 'ai_flagged'",
+  },
 ]
 
 export function attackSurfaceCypher(): string {
@@ -155,7 +225,7 @@ export function attackSurfaceCypher(): string {
  * truncate or 413 on any real project.
  */
 export const EXPLOIT_PATHS_CYPHER = `MATCH (t:Technology)-[:HAS_KNOWN_CVE]->(c:CVE)
-OPTIONAL MATCH (ex:ExploitGvm)-[:EXPLOITED_CVE]->(c:CVE) WHERE ex.stale_since IS NULL
+OPTIONAL MATCH (ex:ExploitGvm)-[:EXPLOITED_CVE]->(c:CVE) WHERE ex.stale_since IS NULL AND NOT (coalesce(ex.triage_status, '') = 'likely_noise' AND coalesce(ex.triage_source, '') = 'human') AND NOT coalesce(ex.triage_state, 'open') IN ['fixed', 'gone', 'inactive']
 OPTIONAL MATCH (c:CVE)-[:HAS_CWE]->(m:MitreData)
 OPTIONAL MATCH (bu:BaseURL)-[:USES_TECHNOLOGY]->(t)
 OPTIONAL MATCH (svc:Service)-[:USES_TECHNOLOGY]->(t)
@@ -174,7 +244,7 @@ export const BLAST_RADIUS_CYPHER = `MATCH (t:Technology)-[:HAS_KNOWN_CVE]->(c:CV
 OPTIONAL MATCH (bu:BaseURL)-[:USES_TECHNOLOGY]->(t)
 OPTIONAL MATCH (svc:Service)-[:USES_TECHNOLOGY]->(t)
 OPTIONAL MATCH (p:Port)-[:HAS_TECHNOLOGY]->(t)
-OPTIONAL MATCH (ex:ExploitGvm)-[:EXPLOITED_CVE]->(c:CVE) WHERE ex.stale_since IS NULL
+OPTIONAL MATCH (ex:ExploitGvm)-[:EXPLOITED_CVE]->(c:CVE) WHERE ex.stale_since IS NULL AND NOT (coalesce(ex.triage_status, '') = 'likely_noise' AND coalesce(ex.triage_source, '') = 'human') AND NOT coalesce(ex.triage_state, 'open') IN ['fixed', 'gone', 'inactive']
 WITH t, count(DISTINCT c) AS cveCount, max(toFloat(c.cvss)) AS maxCvss,
      count(DISTINCT ex) AS knownExploitCount,
      count(DISTINCT bu) AS baseUrlCount,
@@ -199,8 +269,20 @@ async function runAnalytics(
 }
 
 const STALE_NOTE =
-  'Counts exclude findings someone suppressed and findings a later scan stopped reporting, so ' +
-  'they match graph_summary rather than raw Cypher.'
+  'Counts exclude findings someone suppressed and findings a later scan stopped reporting, as ' +
+  'graph_summary does and raw Cypher does not.'
+
+/** The Priority Board half, worded as the client report words it. */
+const BOARD_NOTE =
+  'Every finding count also leaves out what a person judged a false positive on the Priority ' +
+  'Board and what the board resolved (fixed, gone, inactive), exactly as the client report does; ' +
+  'for vulnerabilities those are counted separately in judgedFalsePositiveVulnerabilities and ' +
+  'resolvedVulnerabilities. A finding only an AI review flagged as a false positive is still ' +
+  'counted (aiFlaggedVulnerabilities says how many), because a reviewer reads target-controlled text.'
+
+const EXPLOIT_BOARD_NOTE =
+  'An exploit record a person judged a false positive, or the Priority Board resolved, does not ' +
+  'count as a known exploit.'
 
 /**
  * Why an empty answer is empty.
@@ -236,6 +318,7 @@ export async function getAttackSurfaceOverview(ctx: McpContext, projectId: strin
     surface: row,
     notes: [
       STALE_NOTE,
+      BOARD_NOTE,
       'A category at zero means nothing of that kind is in the graph, which can equally mean ' +
         'that surface was never scanned. graph_summary and get_project_activity tell those apart.',
       'endpoints and parameters count what a tool observed. declaredEndpoints and ' +
@@ -264,6 +347,7 @@ export async function listExploitPaths(ctx: McpContext, projectId: string) {
       'reachedBy counts the base URLs, services and ports running the technology: it is how ' +
         'widely the problem is exposed, not how severe it is.',
       STALE_NOTE,
+      EXPLOIT_BOARD_NOTE,
       ...(rows.length === 0 ? [NO_CVE_LINKS_NOTE] : []),
     ],
   }
@@ -285,6 +369,7 @@ export async function getBlastRadius(ctx: McpContext, projectId: string) {
         'usually the highest-leverage single fix.',
       'hostSurfaceCount counts services and ports; baseUrlCount counts web origins.',
       STALE_NOTE,
+      EXPLOIT_BOARD_NOTE,
       ...(rows.length === 0 ? [NO_CVE_LINKS_NOTE] : []),
     ],
   }

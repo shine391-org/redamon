@@ -66,6 +66,7 @@ class MemberScopedCallback:
         self._emitted_tool_start_ids: set = set()
         self._emitted_tool_complete_ids: set = set()
         self._emitted_tool_output_ids: set = set()
+        self._emitted_tool_finished_ids: set = set()
         self._emitted_thinking_ids: set = set()
         self._emitted_approval_key: str = ""
         self._emitted_question_key: str = ""
@@ -125,7 +126,8 @@ class MemberScopedCallback:
         )
 
     async def on_tool_output_chunk(self, tool_name: str, chunk: str, is_final: bool = False,
-                                   wave_id: Optional[str] = None, step_index: Optional[int] = None):
+                                   wave_id: Optional[str] = None, step_index: Optional[int] = None,
+                                   **kwargs):
         # Emit FIRETEAM_TOOL_OUTPUT_CHUNK so the UI can append to the
         # correct member's tool card instead of showing silence during
         # long-running tools. Persistence is handled by the callback itself.
@@ -174,6 +176,11 @@ class MemberScopedCallback:
             successful=successful,
             failed=failed,
         )
+
+    async def on_tool_finished(self, *args, **kwargs):
+        # Root-only event. Without this override __getattr__ would forward it to
+        # the ROOT callback and a member's step would update a root tool card.
+        return
 
     async def on_plan_analysis(self, *args, **kwargs):
         # Analysis happens at root only; swallow for members to keep UI focused

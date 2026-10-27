@@ -70,6 +70,16 @@ def _import_js_recon():
     sys.modules["recon.helpers.roe_scope"] = roe_scope
     spec.loader.exec_module(roe_scope)
 
+    # The catch-all control helper needs only the stdlib and roe_scope.
+    spec = importlib.util.spec_from_file_location(
+        "recon.helpers.catchall",
+        os.path.join(_REPO_ROOT, "recon", "helpers", "catchall.py"),
+    )
+    catchall = importlib.util.module_from_spec(spec)
+    sys.modules["recon.helpers.catchall"] = catchall
+    sys.modules["recon.helpers"].catchall = catchall  # type: ignore[attr-defined]
+    spec.loader.exec_module(catchall)
+
     # Stub the other helpers js_recon needs at import time. We toggle every
     # non-AI analysis pass OFF in the settings so these stubs never execute.
     for name in (

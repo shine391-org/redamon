@@ -153,6 +153,10 @@
   color: var(--dp-muted-fg);
 }
 
+.disposition {
+  font-weight: var(--font-semibold);
+}
+
 .note {
   padding: var(--space-1-5) var(--space-2);
   border: 1px solid var(--dp-amber-bd);

@@ -25,6 +25,7 @@ import { listMutedFindings, listTriageFindings, type TriageFinding } from '@/lib
 import { enforceRate, type McpContext } from '@/lib/mcp/tools'
 import { describeMutedBy } from '@/lib/nodeFilters/model'
 import { loadMutedRuleDoc, mutedViaOf, MUTED_TOKEN_PATTERN, type MutedVia } from '@/lib/nodeFilters/mutedAnnotate'
+import { DISPOSITIONS, disposition, type Disposition } from '@/lib/triage/disposition'
 
 export const FINDINGS_DEFAULT_LIMIT = 25
 export const FINDINGS_MAX_LIMIT = 100
@@ -56,8 +57,9 @@ const MUTED_FETCH_CEILING = 2000
  * context, and `triage_ai_quote` is literally quoted target output - it is
  * behind an explicit argument and never travels without the untrusted-data
  * note. No property outside this list reaches a caller (bar `nodeId`, which
- * `graphNodeId` admits only as digits), which is also what keeps
- * `Secret.matched_text` and its kind off this surface by construction.
+ * `graphNodeId` admits only as digits, and the `disposition` and `blocker`
+ * derived from the row), which is also what keeps `Secret.matched_text` and
+ * its kind off this surface by construction.
  */
 const FINDING_FIELDS = [
   'id', 'label', 'name', 'severity', 'source', 'location', 'host', 'section',
@@ -97,6 +99,10 @@ function projectFinding(raw: TriageFinding, includeQuote: boolean): Record<strin
   if (nodeId) out.nodeId = nodeId
   const section = typeof raw.section === 'number' ? raw.section : null
   if (section !== null) out.sectionName = SECTION_NAMES[section] ?? 'unknown'
+  // Can it go in a report? The same answer the report and the board give.
+  const d = disposition(raw)
+  out.disposition = d.disposition
+  if (d.blocker) out.blocker = d.blocker
   // Reviewer text, which an external agent may have written: only on request,
   // like the quote.
   if (includeQuote && raw.triage_ai_quote) out.triage_ai_quote = raw.triage_ai_quote
@@ -163,6 +169,8 @@ export interface ListFindingsArgs {
   offset?: number
   severity?: string
   section?: string
+  /** Filtered on this side, like severity and section. */
+  disposition?: Disposition
   includeQuotes?: boolean
   /** Pushed down to the graph, before the cap: an exact total. */
   decidedBy?: 'person' | 'review' | 'rules'
@@ -204,13 +212,20 @@ export async function listFindings(
     )
   }
   const severity = args.severity?.trim().toLowerCase()
+  const wanted = args.disposition
+  if (wanted !== undefined && !(DISPOSITIONS as readonly string[]).includes(wanted)) {
+    throw new McpToolError(
+      `Unknown disposition '${wanted}'. One of: ${DISPOSITIONS.join(', ')}.`,
+      'bad_args'
+    )
+  }
 
   // `/graph/triage` has no offset, so the page is sliced here. The cap sent to
   // the agent covers the window the caller asked for, which keeps the internal
   // transfer bounded for the common offset-0 call instead of shipping the
   // mixin's full 2000 every time. A filter widens the window, because filtering
   // happens on this side.
-  const filtering = Boolean(section || severity)
+  const filtering = Boolean(section || severity || wanted)
   const want = filtering ? TRIAGE_FETCH_CEILING : Math.min(offset + limit, TRIAGE_FETCH_CEILING)
 
   const pushed = {
@@ -227,6 +242,7 @@ export async function listFindings(
   if (section) {
     rows = rows.filter(f => SECTION_NAMES[Number(f.section)] === section)
   }
+  if (wanted) rows = rows.filter(f => disposition(f).disposition === wanted)
 
   const matched = filtering ? rows.length : (total ?? rows.length)
   const page = rows.slice(offset, offset + limit)

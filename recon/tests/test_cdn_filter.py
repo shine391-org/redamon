@@ -111,20 +111,25 @@ class TestCdnNameFromAsn:
         assert cdn_name_from_asn(209242) == "cloudflare"
 
     def test_unknown_asn_returns_none(self):
-        # Phase 1 is Cloudflare-only; Fastly should NOT match.
-        assert cdn_name_from_asn(54113) is None
+        # Generic cloud ASNs carry real origins: never a CDN edge.
+        assert cdn_name_from_asn(15169) is None
         assert cdn_name_from_asn("AS16509") is None
+
+    def test_edge_provider_asns(self):
+        assert cdn_name_from_asn(54113) == "fastly"
+        assert cdn_name_from_asn("AS20940") == "akamai"
 
     def test_invalid_inputs_return_none(self):
         assert cdn_name_from_asn(None) is None
         assert cdn_name_from_asn("") is None
         assert cdn_name_from_asn("garbage") is None
 
-    def test_phase1_scope_is_cloudflare_only(self):
+    def test_asn_scope_is_edge_providers_only(self):
         # Guard against accidental CDN_ASNS expansion that would change
-        # behavior for cases 4-7. This test is meant to fail loudly when
-        # Phase 2 lands and is updated explicitly.
-        assert set(CDN_ASNS.values()) == {"cloudflare"}
+        # behavior for cases 4-7: only edge-only providers, never a generic
+        # cloud ASN (Amazon, Microsoft, Google, Akamai's Linode compute).
+        assert set(CDN_ASNS.values()) == {"cloudflare", "fastly", "akamai", "imperva", "sucuri"}
+        assert not {16509, 8075, 15169, 396982, 63949} & set(CDN_ASNS)
 
 
 # ===========================================================================
@@ -236,9 +241,10 @@ class TestCollectAsnCdnIps:
     def test_http_probe_cdn_asn(self):
         recon = {"http_probe": {"by_url": {
             "https://x/": {"ip": "1.2.3.4", "asn": "AS13335 Cloudflare, Inc."},
-            "https://y/": {"ip": "5.6.7.8", "asn": "AS54113 Fastly"},
+            "https://y/": {"ip": "5.6.7.8", "asn": "AS15169 Google LLC"},
+            "https://z/": {"ip": "9.10.11.12", "asn": "AS54113 Fastly"},
         }}}
-        assert collect_asn_cdn_ips(recon) == {"1.2.3.4"}
+        assert collect_asn_cdn_ips(recon) == {"1.2.3.4", "9.10.11.12"}
 
     def test_port_scan_cdn_asn(self):
         recon = {"port_scan": {"by_ip": {

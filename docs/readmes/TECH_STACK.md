@@ -57,7 +57,7 @@ See [README.PLUGINS.md](README.PLUGINS.md) for the design and [README.PLUGIN_SDK
 
 | Technology | Role |
 |-----------|------|
-| **Neo4j** (Community Edition) | Graph database — stores the entire attack surface as an interconnected knowledge graph with 17 node types and 20+ relationship types |
+| **Neo4j** (Community Edition) | Graph database — stores the entire attack surface as an interconnected knowledge graph; every node type and relationship is declared in `graph_db/schema_sections.md` |
 | **APOC** | Neo4j plugin providing advanced procedures and functions for graph operations |
 | **PostgreSQL** (v16) | Relational database — stores project settings, user accounts, and configuration data |
 | **Prisma** | TypeScript ORM for PostgreSQL — schema management, migrations, and type-safe queries |
@@ -67,7 +67,7 @@ See [README.PLUGINS.md](README.PLUGINS.md) for the design and [README.PLUGIN_SDK
 
 | Tool | Category | Role |
 |------|----------|------|
-| **Kali Linux** | Base Platform | Penetration testing distribution used as the base Docker image for recon and MCP tool containers |
+| **Kali Linux** | Base Platform | Penetration testing distribution used as the base image of the `kali-sandbox` (MCP tool) container; the recon image is `python:3.11-slim-bookworm` |
 | **Metasploit Framework** | Exploitation | Exploit execution, payload delivery, Meterpreter sessions, auxiliary scanners, and post-exploitation |
 | **Naabu** | Port Scanning | Fast SYN/CONNECT port scanner from ProjectDiscovery |
 | **Nmap** | Network Scanning | Network mapper for deep service detection, OS fingerprinting, and NSE vulnerability scripts — exposed as a dedicated MCP server |
@@ -114,7 +114,7 @@ See [README.PLUGINS.md](README.PLUGINS.md) for the design and [README.PLUGIN_SDK
 | **Docker** (Engine 28.0.0+) | Container runtime — every component runs containerized with zero host dependencies |
 | **Docker Compose** (v2) | Multi-container orchestration — defines and manages the entire 12+ container stack |
 | **Docker-in-Docker (DinD)** | Architecture pattern allowing the Recon Orchestrator to spawn ephemeral scan containers |
-| **Python** (3.11) | Core language for all backend services — recon pipeline, agent, orchestrator, GVM scanner, GitHub hunter |
+| **Python** (3.11, 3.12) | Core language for all backend services. On 3.11 (each Dockerfile's `FROM python:3.11-slim...`): the agent, recon pipeline, recon orchestrator, plugin runner, supply-chain scanner and analyzer. On 3.12: the GVM scanner, GitHub hunter, TruffleHog, AI attack-surface, capture proxy, BadDNS and Docker broker images. The Kali sandbox runs whatever Python `kalilinux/kali-rolling:latest` ships |
 | **Node.js** (v22) | JavaScript runtime for the Next.js webapp |
 | **Go** (1.25) | Build environment for compiling ProjectDiscovery tools (Naabu, Nuclei) from source |
 | **Bash / Shell** | Container entrypoint scripts, tool orchestration, and automation |
@@ -123,7 +123,7 @@ See [README.PLUGINS.md](README.PLUGINS.md) for the design and [README.PLUGIN_SDK
 
 | Protocol | Role |
 |----------|------|
-| **MCP (Model Context Protocol)** | Standardized tool integration — four MCP servers (Network Recon, Nuclei, Metasploit, Nmap) running inside the Kali sandbox |
+| **MCP (Model Context Protocol)** | Standardized tool integration — five MCP servers (Network Recon, Nuclei, Metasploit, Nmap, Playwright) running inside the Kali sandbox |
 | **SSE (Server-Sent Events)** | Unidirectional real-time streaming for recon logs, GVM scan progress, and GitHub hunt output |
 | **WebSocket** | Bidirectional real-time communication for the agent chat interface |
 | **Bolt** (Neo4j) | Binary protocol for high-performance Neo4j graph database queries |

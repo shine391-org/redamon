@@ -119,6 +119,7 @@ Internal penetration testers and red teamers assessing a corporate LAN, a VPN-re
 
     // --- httpx: internal web apps, admin panels, appliance UIs ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

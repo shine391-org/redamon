@@ -102,6 +102,9 @@ OSINT analysts, threat intelligence teams, or red team operators building a targ
 
     // --- DISABLE httpx ---
     httpxEnabled: false,
+    // IP attribution stays on with no TLS handshake: it only reads the CDN signals already collected
+    ipAttributionEnabled: true,
+    ipAttributionTlsMaxProbes: 0,
 
     // --- DISABLE Wappalyzer ---
     wappalyzerEnabled: false,

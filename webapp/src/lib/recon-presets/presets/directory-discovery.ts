@@ -75,6 +75,7 @@ Pentesters and bug bounty hunters in the early recon phase who want a complete m
 
     // --- httpx: essential probes only ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

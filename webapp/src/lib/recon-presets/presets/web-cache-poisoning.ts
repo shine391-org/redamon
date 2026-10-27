@@ -76,6 +76,7 @@ Use \`Web App Pentester\` or \`Full Active Scan\` if you want WCP as one tool am
 
     // --- httpx: CDN detection + tech detect + response capture (cache targeting) ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

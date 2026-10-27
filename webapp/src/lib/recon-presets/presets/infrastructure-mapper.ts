@@ -108,6 +108,7 @@ Network pentesters and infrastructure security teams mapping an external or inte
 
     // --- httpx: all probes for web service fingerprinting ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 3,

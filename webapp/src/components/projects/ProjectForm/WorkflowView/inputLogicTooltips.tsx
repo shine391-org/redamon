@@ -400,6 +400,28 @@ const Httpx = (
 // RESOURCE ENUMERATION
 // ============================================================================
 
+const IpAttribution = (
+  <div style={wrapperStyle}>
+    <div style={firstSectionTitleStyle}>How input is generated</div>
+    <p style={paraStyle}>
+      IP Attribution reads every <strong>IP</strong> node linked to an in-scope Subdomain (via <span style={codeStyle}>RESOLVES_TO</span>), with its open <strong>Port</strong> nodes and the CDN name a scanner already put on it. A link written by Shodan&apos;s reverse DNS does not count as a name resolving to the IP.
+    </p>
+    <p style={paraStyle}>
+      The only traffic is one TLS handshake without SNI to port 443 of each IP with 443 open, to read the certificate the IP presents when no name is asked for. It is capped per scan, paced at the engagement rate ceiling, never sent to a host the rules of engagement exclude, and skipped in stealth mode. There is no custom input: the step tags IPs already in the graph.
+    </p>
+
+    <div style={sectionTitleStyle}>How output transforms the graph</div>
+    <ul style={listStyle}>
+      <li>Each <strong>IP</strong> node gets an ownership tag: shared edge (a CDN edge serving many companies), dedicated (its default certificate covers a target domain) or unknown, with the reasons, the default certificate&apos;s names and how many names resolve to it.</li>
+      <li>A shared edge is also marked as a CDN on the IP node, without clearing a tag another scanner set.</li>
+      <li>No node is created: an IP not already in the graph is not tagged.</li>
+    </ul>
+    <p style={{ ...paraStyle, margin: 0 }}>
+      Vhost/SNI, origin discovery, the Shodan and Netlas CVE writers and the Priority Board read the tag.
+    </p>
+  </div>
+)
+
 const Katana = (
   <div style={wrapperStyle}>
     <div style={firstSectionTitleStyle}>How input is generated</div>
@@ -901,8 +923,7 @@ const VhostSni = (
       <li><strong>ExternalDomain</strong> nodes that resolve to the same IP (out-of-scope, but co-hosted, often the highest-signal source).</li>
       <li>TLS Subject Alternative Names captured on each <strong>BaseURL</strong> served from this IP, plus any standalone <strong>Certificate</strong> nodes.</li>
       <li>CNAME targets recorded in <strong>DNSRecord</strong> entries.</li>
-      <li>Reverse-DNS PTR record stored on the <strong>IP</strong> node.</li>
-      <li>The default wordlist (~2,300 admin / dev / staging / internal / modern-stack prefixes), expanded as <span style={codeStyle}>{`{prefix}.{scan_root}`}</span> for an enumerated scope group; a listed group gets no wordlist.</li>
+      <li>The default wordlist (~2,300 admin / dev / staging / internal / modern-stack prefixes), expanded as <span style={codeStyle}>{`{prefix}.{scan_root}`}</span> for an enumerated scope group; a listed group gets no wordlist, and a shared CDN edge IP (flagged by naabu, httpx or tlsx with an edge CDN name, or inside a CDN&apos;s published edge ranges) gets none either: it would only find the CDN. That skip shows in the report&apos;s Coverage Limitations.</li>
       <li>Any custom wordlist provided in the section settings (newline-separated, prefixes or full hostnames).</li>
     </ul>
     <p style={paraStyle}>
@@ -914,7 +935,8 @@ const VhostSni = (
 
     <div style={sectionTitleStyle}>How output transforms the graph</div>
     <ul style={listStyle}>
-      <li>Each anomaly produces a <strong>Vulnerability</strong> node typed as <em>Hidden Virtual Host</em> (L7 only), <em>Hidden SNI Route</em> (L4 only), or <em>Routing Inconsistency / Host Header Bypass</em> (L7 vs L4 disagreement). Severity is escalated to <em>medium</em> when the discovered hostname matches an internal-keyword pattern (admin, jenkins, k8s, vault, etc.) and to <em>high</em> when L7 and L4 routing disagree.</li>
+      <li>Each anomaly produces a <strong>Vulnerability</strong> node typed as <em>Hidden Virtual Host</em> (L7 only, or both layers serving the same page), <em>Hidden SNI Route</em> (L4 only), or <em>Routing Inconsistency / Host Header Bypass</em> (L7 and L4 serving different pages). Severity is escalated to <em>medium</em> when the discovered hostname matches an internal-keyword pattern (admin, jenkins, k8s, vault, etc.) and to <em>high</em> when L7 and L4 routing disagree.</li>
+      <li>A name this run&apos;s DNS already points at the IP is never a hidden vhost, since anyone can resolve it: it is still probed, and reported only for a routing inconsistency.</li>
       <li>The Vulnerability is attached to the discovered <strong>Subdomain</strong> via <span style={codeStyle}>HAS_VULNERABILITY</span>. For host-header-bypass findings the <strong>IP</strong> also gets the same Vulnerability so it surfaces in IP-level dashboards.</li>
       <li>Every probed Subdomain is enriched in place with <em>vhost_tested</em>, <em>vhost_hidden</em>, <em>vhost_routing_layer</em>, <em>vhost_status_code</em>, <em>vhost_size_delta</em>, and <em>sni_routed</em>.</li>
       <li>Every probed IP is enriched with <em>vhost_baseline_status</em>, <em>vhost_baseline_size</em>, <em>hosts_hidden_vhosts</em>, <em>hidden_vhost_count</em>, and <em>is_reverse_proxy</em>.</li>
@@ -1093,6 +1115,7 @@ export const INPUT_LOGIC_TOOLTIPS: Record<string, ReactNode> = {
   Tlsx,
   // HTTP probing
   Httpx,
+  IpAttribution,
   // Resource enumeration
   Katana,
   ZapAjaxSpider,

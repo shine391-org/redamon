@@ -6,6 +6,7 @@ import type { ThinkingItem, ToolExecutionItem, PlanWaveItem, DeepThinkItem, Fire
 import type { ActiveSkill } from './useSendHandlers'
 import { foldLatsRestoreMarkers } from './latsChatState'
 import { reconcileTimeline } from './timelineReconcile'
+import { settleRunningTools } from './toolCardState'
 import { saveProjectSession, getProjectSession } from '../sessionMemory'
 
 interface ConversationRestorationDeps {
@@ -25,6 +26,7 @@ interface ConversationRestorationDeps {
   setIterationCount: (v: number) => void
   setIsLoading: (v: boolean) => void
   setIsStopped: (v: boolean) => void
+  setIsStopping?: (v: boolean) => void
   setTodoList: (v: TodoItem[]) => void
   isRestoringConversation: React.MutableRefObject<boolean>
   shouldAutoScroll: React.MutableRefObject<boolean>
@@ -53,7 +55,7 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
     onSwitchSession, onRefetchGraph,
     projectId, userId,
     setChatItems, setCurrentPhase, setAttackPathType, setIterationCount,
-    setIsLoading, setIsStopped, setTodoList,
+    setIsLoading, setIsStopped, setIsStopping, setTodoList,
     isRestoringConversation, shouldAutoScroll,
     setAwaitingApproval, setApprovalRequest,
     setAwaitingQuestion, setQuestionRequest,
@@ -73,6 +75,9 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
   // flushed its queue by then) we re-read and reconcile. Held in a ref so the
   // stable socket-connect handler always sees the latest target.
   const pendingResyncConvRef = useRef<Conversation | null>(null)
+  // Read by the socket-connect resync, which must see the latest id.
+  const conversationIdRef = useRef<string | null>(null)
+  conversationIdRef.current = conversationId
 
   // Fetch + auto-refresh conversations when history panel opens
   useEffect(() => {
@@ -83,7 +88,10 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
     }
   }, [showHistory, projectId, userId, fetchConversations])
 
-  const handleSelectConversation = useCallback(async (conv: Conversation, opts?: { resync?: boolean }) => {
+  const handleSelectConversation = useCallback(async (
+    conv: Conversation,
+    opts?: { resync?: boolean; isRunActive?: () => boolean },
+  ) => {
     // Resync mode re-reads a *running* session already on screen (triggered on
     // socket connect) and folds the fresh DB timeline back in via reconcile,
     // instead of switching sessions / resetting interaction state.
@@ -148,6 +156,16 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
         const name = d?.tool_name || ''
         if (!startsByNameFIFO.has(name)) startsByNameFIFO.set(name, [])
         startsByNameFIFO.get(name)!.push(rec)
+      }
+    }
+
+    // tool_finished rows: the tool returned but its analysis (tool_complete)
+    // was not persisted yet. Restores a mid-analysis card as finished.
+    const finishedByStepId = new Map<string, { success: boolean; duration_ms?: number }>()
+    for (const msg of full.messages) {
+      const d = msg.data as any
+      if (msg.type === 'tool_finished' && d?.step_id) {
+        finishedByStepId.set(d.step_id, { success: !!d.success, duration_ms: d.duration_ms })
       }
     }
 
@@ -227,6 +245,7 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
         // A start paired to a complete is represented by the complete card.
         if (consumedStartIds.has(msg.id)) return null
         // Otherwise this tool is still running - render it as its own card.
+        const finished = data.step_id ? finishedByStepId.get(data.step_id) : undefined
         return {
           type: 'tool_execution',
           id: msg.id,
@@ -235,6 +254,12 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
           tool_args: data.tool_args || {},
           status: 'running',
           output_chunks: [],
+          step_id: data.step_id,
+          ...(finished && {
+            finished: true,
+            finishedSuccess: finished.success,
+            duration: finished.duration_ms,
+          }),
         } as ToolExecutionItem
       } else if (msg.type === 'tool_complete') {
         if (data.wave_id) return null
@@ -254,6 +279,7 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
           actionable_findings: data.actionable_findings || [],
           recommended_next_steps: data.recommended_next_steps || [],
           duration,
+          step_id: data.step_id,
         } as ToolExecutionItem
       } else if (msg.type === 'error') {
         return {
@@ -903,18 +929,26 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
     if (isResync) {
       // Fold the authoritative DB timeline back in without dropping live events
       // that arrived over the socket since we started this re-read. Metadata
-      // (phase/iteration/todos) is refreshed too, but session/interaction/skill
-      // state is left untouched so an in-flight run isn't disturbed.
-      setChatItems(prev => reconcileTimeline(restored, prev))
+      // (phase/iteration/todos) is refreshed from the fresh read. The run state
+      // is read NOW (isRunActive), not taken from before the read: a STOPPED or
+      // final response that arrived meanwhile must win. Session/interaction/
+      // skill state is left untouched so an in-flight run isn't disturbed.
+      const running = opts?.isRunActive ? opts.isRunActive() : full.agentRunning
+      setChatItems(prev => {
+        const merged = reconcileTimeline(restored, prev)
+        return running ? merged : settleRunningTools(merged)
+      })
       setConversationId(conv.id)
-      setCurrentPhase((conv.currentPhase || 'informational') as Phase)
+      setCurrentPhase((full.currentPhase || conv.currentPhase || 'informational') as Phase)
       setAttackPathType(lastAttackPathType)
-      setIterationCount(conv.iterationCount || 0)
+      setIterationCount(full.iterationCount ?? conv.iterationCount ?? 0)
       setTodoList(lastTodoList)
       return
     }
 
-    setChatItems(restored)
+    // A conversation that is not running has no tool left to finish: a start
+    // with no complete was cut off (stop, crash) and must not tick forever.
+    setChatItems(conv.agentRunning ? restored : settleRunningTools(restored))
     setConversationId(conv.id)
     // Remember this conversation as the project's active session so switching
     // projects later restores it (per-project session memory).
@@ -994,11 +1028,46 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
   // session, re-read it now that the backend has flushed its persist queue and
   // reconcile so the timeline is complete. Guarded by session so a resync can't
   // leak into a different session the user switched to mid-flight.
-  const resyncActiveConversation = useCallback(async (connectedSessionId: string) => {
-    const conv = pendingResyncConvRef.current
-    if (!conv || conv.sessionId !== connectedSessionId) return
-    await handleSelectConversation(conv, { resync: true })
-  }, [handleSelectConversation])
+  //
+  // `live` is what the socket just reported. When the server says a run is
+  // going, or the page still believes one is, the timeline is re-read even for
+  // a conversation started in this tab: events emitted while the socket was
+  // down (drawer closed, network drop) were lost and exist only in the DB.
+  //
+  // `live.isRunActive` reads the page's run state at the moment it is called;
+  // without it the server's connect-time answer stands in.
+  const resyncActiveConversation = useCallback(async (
+    connectedSessionId: string,
+    live?: { agentRunning?: boolean; clientRunning?: boolean; isRunActive?: () => boolean },
+  ) => {
+    const serverAnswered = live?.agentRunning !== undefined
+    if (serverAnswered) {
+      // Apply the server's answer now, synchronously: anything the socket
+      // delivers after CONNECTED (STOPPED, the final response) then overrides
+      // it, which a state applied after the re-read below could not.
+      setIsLoading(!!live.agentRunning)
+      if (!live.agentRunning) {
+        setIsStopping?.(false)
+        setChatItems(settleRunningTools)
+      }
+    }
+    const isRunActive = serverAnswered
+      ? (live.isRunActive ?? (() => !!live.agentRunning))
+      : undefined
+    const armed = pendingResyncConvRef.current
+    if (armed && armed.sessionId === connectedSessionId) {
+      await handleSelectConversation(armed, { resync: true, isRunActive })
+      return
+    }
+    if (!serverAnswered) return
+    if (!live.agentRunning && !live.clientRunning) return
+    const id = conversationIdRef.current
+    if (!id) return   // nothing persisted to re-read; the state above is all there is
+    await handleSelectConversation(
+      { id, sessionId: connectedSessionId } as Conversation,
+      { resync: true, isRunActive },
+    )
+  }, [handleSelectConversation, setChatItems, setIsLoading, setIsStopping])
 
   const handleHistoryNewChat = useCallback(() => {
     pendingResyncConvRef.current = null

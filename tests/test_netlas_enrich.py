@@ -537,5 +537,129 @@ class TestNetlasCircuitBreaker(unittest.TestCase):
         self.assertEqual(used, ["nl-a", "nl-b"])
 
 
+# ---------------------------------------------------------------------------
+# Plan 04.5: one finding per IP and port, the IP as host, current IPs only
+# ---------------------------------------------------------------------------
+
+DNS_IP, OTHER_IP, OLD_IP, EDGE_IP = "198.51.100.60", "198.51.100.61", "198.51.100.62", "198.51.100.63"
+CVE = "CVE-2018-15473"
+
+
+def _row(ip, port=22, **extra):
+    return {"ip": ip, "port": port, "protocol": "ssh", "isp": "", "asn_name": "",
+            "cve_list": [{"id": CVE, "base_score": 5.3, "severity": "medium",
+                          "has_exploit": True}], **extra}
+
+
+def _items(*rows):
+    return {"items": [{"data": {"ip": r["ip"], "port": r["port"], "protocol": "ssh",
+                                "isp": r.get("isp", ""),
+                                "cve": [{"name": CVE, "base_score": 5.3}]}} for r in rows],
+            "total": len(rows)}
+
+
+def _domain_mode(*ips):
+    return {"domain": "example.com", "metadata": {"ip_mode": False},
+            "dns": {"domain": {"ips": {"ipv4": list(ips)}}, "subdomains": {}}}
+
+
+class TestNetlasAttribution(unittest.TestCase):
+    """Domain mode asks Netlas's index for every response it ever stored for the
+    name: an IP the name no longer resolves to is history, not the target."""
+
+    def _run(self, recon, body):
+        settings = {"NETLAS_ENABLED": True, "NETLAS_API_KEY": "nl-key", "NETLAS_MAX_RESULTS": 100}
+        with patch("netlas_enrich.time.sleep"), \
+                patch("netlas_enrich.requests.get", return_value=_mock_response(200, body)):
+            return {r["ip"]: r for r in run_netlas_enrichment(recon, settings)["netlas"]["results"]}
+
+    def test_an_ip_outside_this_runs_dns_is_historical(self):
+        rows = self._run(_domain_mode(DNS_IP), _items(_row(DNS_IP), _row(OLD_IP)))
+        self.assertNotIn("attribution", rows[DNS_IP])
+        self.assertEqual(rows[OLD_IP]["attribution"], "historical")
+
+    def test_a_shared_edge_ip_gets_no_cve(self):
+        rows = self._run(_domain_mode(DNS_IP, EDGE_IP),
+                         _items(_row(DNS_IP), _row(EDGE_IP, isp="Cloudflare, Inc.")))
+        self.assertEqual(rows[EDGE_IP]["attribution"], "shared_edge")
+        self.assertNotIn("attribution", rows[DNS_IP])
+
+    def test_an_ip_the_port_scan_flagged_cdn_gets_no_cve(self):
+        recon = _domain_mode(DNS_IP, EDGE_IP)
+        recon["port_scan"] = {"by_ip": {EDGE_IP: {"is_cdn": True}}}
+        rows = self._run(recon, _items(_row(DNS_IP), _row(EDGE_IP)))
+        self.assertEqual(rows[EDGE_IP]["attribution"], "shared_edge")
+
+
+class _Session:
+    def __init__(self):
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def run(self, query, **params):
+        self.calls.append((query, params))
+        result = MagicMock()
+        result.single.return_value = None
+        return result
+
+
+def _write(rows):
+    from graph_db.mixins.osint_mixin import OsintMixin
+
+    class _Writer(OsintMixin):
+        pass
+
+    w = _Writer()
+    session = _Session()
+    w.driver = MagicMock()
+    w.driver.session.return_value = session
+    w.update_graph_from_netlas({"domain": "example.com", "domains": ["example.com"],
+                                "netlas": {"results": rows}}, "u1", "p1")
+    return session.calls
+
+
+class TestNetlasGraphWrite(unittest.TestCase):
+    def _vulns(self, calls):
+        return [(q, p) for q, p in calls if "MERGE (v:Vulnerability" in q]
+
+    def test_one_cve_on_two_ips_is_two_findings_hanging_off_each_ip(self):
+        vulns = self._vulns(_write([_row(DNS_IP), _row(OTHER_IP)]))
+        self.assertEqual([p["vuln_id"] for _, p in vulns],
+                         [f"netlas-{CVE}-{DNS_IP}-22", f"netlas-{CVE}-{OTHER_IP}-22"])
+        query, params = vulns[0]
+        self.assertIn("MERGE (i)-[:HAS_VULNERABILITY]->(v)", query)
+        self.assertIn("MATCH (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})", query)
+        self.assertNotIn("MERGE (svc)-[:HAS_VULNERABILITY]->(v)", query)
+        self.assertEqual((params["props"]["target_ip"], params["props"]["target_port"]), (DNS_IP, 22))
+        self.assertEqual(params["props"]["cve_ids"], [CVE])
+        self.assertEqual((params["props"]["cvss_score"], params["props"]["has_exploit"]), (5.3, True))
+
+    def test_source_is_provenance_and_the_service_parent_goes(self):
+        query, _ = self._vulns(_write([_row(DNS_IP)]))[0]
+        self.assertIn("ON CREATE SET v.source = 'netlas'", query)
+        self.assertNotIn("source", self._vulns(_write([_row(DNS_IP)]))[0][1]["props"])
+        self.assertIn("MATCH (:Service)-[stale:HAS_VULNERABILITY]->(v)", query)
+
+    def test_each_cve_links_its_reference_node(self):
+        calls = _write([_row(DNS_IP)])
+        self.assertTrue(any("MERGE (c:CVE {id: $cve_id})" in q and "user_id" not in q.split("MERGE (c:CVE")[1].split("\n")[0]
+                            for q, _ in calls))
+        self.assertTrue(any("MERGE (v)-[:INCLUDES_CVE]->(c)" in q for q, _ in calls))
+
+    def test_a_historical_row_writes_nothing(self):
+        calls = _write([_row(OLD_IP, attribution="historical")])
+        self.assertFalse([p for _, p in calls if OLD_IP in str(p)])
+
+    def test_a_shared_edge_row_writes_its_ports_but_no_cve(self):
+        calls = _write([_row(EDGE_IP, attribution="shared_edge")])
+        self.assertTrue(any("MERGE (p:Port" in q for q, _ in calls))
+        self.assertFalse(self._vulns(calls))
+
+
 if __name__ == "__main__":
     unittest.main()

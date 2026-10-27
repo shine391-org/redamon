@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 import {
   extractSpfRecord,
   isSpfStrict,
@@ -46,7 +47,7 @@ export async function GET(request: NextRequest) {
        OPTIONAL MATCH (apex)-[:HAS_DNS_RECORD]->(dns:DNSRecord)
        OPTIONAL MATCH (d)-[:HAS_VULNERABILITY]->(v:Vulnerability)
          WHERE (v.type IN $dnsTypes OR v.vulnerability_type IN $dnsTypes OR v.name IN $dnsTypes)
-           AND ${notMuted('v')}
+           AND ${notMuted('v')} AND ${reportCountable('v')}
        WITH d,
             collect(DISTINCT CASE WHEN dns.type = 'MX'  THEN dns.value END) AS mxVals,
             collect(DISTINCT CASE WHEN dns.type = 'NS'  THEN dns.value END) AS nsVals,

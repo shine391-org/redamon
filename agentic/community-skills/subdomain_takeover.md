@@ -38,7 +38,7 @@ This workflow uses only tools already present in the agent's runtime:
 - `execute_amass` for active brute / passive sweep when subfinder coverage is low.
 - `execute_httpx` for status / title / server / cert SAN / tech-detect probes across the resolved set.
 - `execute_nuclei` for the curated `takeovers/` template pack (140+ provider fingerprints).
-- `kali_shell` for `subzy` (90+ provider fingerprints, sharper than httpx -td banks), `dig`, `dnsx`, `dnsrecon`, `whois`, `host`, `nslookup`, `whatweb`, `curl`, `jq`, `interactsh-client` (verification listener), `ngrok` (expose your own claim from the sandbox), `python3 -m http.server` (serve PoC content).
+- `kali_shell` for `subzy` (90+ provider fingerprints, sharper than httpx -td banks), `dig`, `dnsx`, `dnsrecon`, `host`, `nslookup`, `whatweb`, `curl` (RDAP registration lookups via `https://rdap.org/domain/<name>`), `jq`, `interactsh-client` (verification listener), `ngrok` (expose your own claim from the sandbox), `python3 -m http.server` (serve PoC content).
 - `execute_code` for reading bulk JSON output, building CNAME chain graphs, looking up provider fingerprints, and orchestrating the claim/verify loop in one place.
 - `execute_curl` for raw HTTP/HTTPS probes against suspected dangling targets and for reading the resource at the alternate provider endpoint.
 
@@ -132,9 +132,9 @@ The goal of Phase 1 is to land in Phase 2 with a small, high-confidence list of 
        if [ -z "$(dig +short A "$ns" AAAA "$ns")" ]; then
          echo "ORPHAN_NS host=$host ns=$ns"
        fi
-       # Check WHOIS expiry on the NS parent zone
+       # Check registration expiry on the NS parent zone (RDAP, no whois in image)
        parent=$(echo "$ns" | awk -F. '{print $(NF-1)"."$NF}')
-       expiry=$(whois "$parent" 2>/dev/null | grep -iE 'expir|expiry|paid-till' | head -1)
+       expiry=$(curl -s "https://rdap.org/domain/$parent" | jq -r '.events[]? | select(.eventAction=="expiration") | .eventDate' 2>/dev/null | head -1)
        echo "NS_PARENT host=$host ns=$ns parent=$parent $expiry"
      done
    done < /tmp/subs_all.txt | tee /tmp/ns_probe.txt
@@ -238,6 +238,8 @@ The goal of Phase 2 is one solid PoC for the report. Pick the highest-impact can
 
 Confirm the engagement scope explicitly authorizes "register and claim" on the third-party provider before going further. Some legal teams treat creating an S3 bucket named after the victim subdomain as an action that needs separate written approval.
 
+The provider CLIs in the claim steps below (`aws`, `gh`, `heroku`, `fastly`, `certbot`) are NOT in the Kali sandbox and need your own provider accounts and credentials: run them from the operator workstation, not through `kali_shell`. The agent should surface the exact resource name and claim steps for the operator to execute, then verify the result over HTTP with `execute_curl` / `curl`.
+
 #### 2.1 Storage and static-site hosting (S3, GCS, Azure Blob, GitHub/GitLab Pages, Netlify, Vercel)
 
 Most cases reduce to: register the resource with the exact required name, upload an ownership-proof artifact, hit the subdomain over HTTPS.
@@ -319,9 +321,9 @@ If the CDN rejects the alias because it requires DNS-based proof of ownership, d
 
 Goal: control the nameservers responsible for an entire delegated zone, then publish arbitrary records.
 
-1. From Phase 1.6, identify a delegated subzone whose NS hostnames live under an expired parent. Confirm WHOIS expiry one more time:
+1. From Phase 1.6, identify a delegated subzone whose NS hostnames live under an expired parent. Confirm the registration expiry one more time (RDAP; the image has no whois):
    ```bash
-   whois <parent-of-ns>
+   curl -s "https://rdap.org/domain/<parent-of-ns>" | jq '.events'
    ```
 2. Register the parent (legal scope must permit purchasing domains on the engagement target's behalf or under a clearly-marked PoC company; if not, stop and report the orphan as a finding without claiming).
 3. Stand up authoritative NS for the parent (Route 53, Cloudflare, BIND on a sandbox VM); make the NS hostnames the same labels the victim NS records point at.

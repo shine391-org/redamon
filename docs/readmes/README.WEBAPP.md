@@ -17,12 +17,12 @@ Production-ready Next.js 16 web application with Neo4j integration, PostgreSQL p
 ```
 webapp/
 ├── prisma/
-│   └── schema.prisma          # Database schema (169+ project params)
+│   └── schema.prisma          # Database schema (each Project column is described in recon_settings/registry.yaml)
 ├── src/
 │   ├── app/                    # Next.js App Router
 │   │   ├── api/               # API Routes
+│   │   │   ├── graph/         # Graph query endpoint (+ neo4j.ts, the Neo4j driver)
 │   │   │   ├── health/        # Health check endpoint
-│   │   │   ├── neo4j/         # Neo4j query endpoint
 │   │   │   ├── nuclei-templates/ # Custom nuclei template CRUD (global)
 │   │   │   ├── projects/      # Project CRUD endpoints
 │   │   │   └── recon/         # Recon control endpoints
@@ -38,16 +38,15 @@ webapp/
 │   │   │       ├── ReconConfirmModal/ # Confirmation dialog
 │   │   │       └── AIAssistantDrawer/ # Agent chat & tool confirmation UI
 │   │   ├── plugins/           # Plugins page and plugin screens (plugin platform)
-│   │   ├── layout.tsx         # Root layout
-│   │   ├── page.tsx           # Home page
-│   │   └── globals.css        # Global styles
+│   │   ├── layout.tsx         # Root layout (imports styles/index.css)
+│   │   └── page.tsx           # Home page
+│   ├── styles/                # Global styles: index.css imports tokens, themes, base/global.css
 │   ├── components/            # React components
 │   ├── hooks/                 # Custom hooks
 │   │   ├── useReconStatus.ts  # Status polling
 │   │   ├── useReconSSE.ts     # SSE log streaming
 │   │   └── useAgentWebSocket.ts # Agent WebSocket (queries, approvals, tool confirmation)
 │   ├── lib/
-│   │   ├── neo4j.ts           # Neo4j driver
 │   │   ├── prisma.ts          # Prisma client
 │   │   ├── recon-types.ts     # TypeScript types
 │   │   ├── websocket-types.ts # Agent WebSocket message types
@@ -56,7 +55,7 @@ webapp/
 │   └── providers/             # React context providers
 ├── public/                    # Static assets
 ├── Dockerfile                 # Production multi-stage build
-├── docker-compose.yml         # Production compose
+├── docker-compose.yml         # Standalone compose (the root docker-compose.yml runs the stack)
 └── package.json
 ```
 
@@ -363,22 +362,17 @@ Returns service health status:
 }
 ```
 
-### Neo4j Status
+### Project Graph
 ```
-GET /api/neo4j
+GET /api/graph?projectId=<id>[&fresh=1]
 ```
-Returns database connection status and node count.
+Returns the project's graph for the visualization (cached per project, ETag-aware;
+`fresh=1` drops the cache). The caller must own the project.
 
-### Execute Query
 ```
-POST /api/neo4j
-Content-Type: application/json
-
-{
-  "query": "MATCH (n) RETURN n LIMIT 10",
-  "params": {}
-}
+DELETE /api/graph?nodeId=<id>&projectId=<id>
 ```
+Deletes one node of the project's graph.
 
 ### Recon Control API
 

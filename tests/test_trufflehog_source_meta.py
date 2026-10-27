@@ -158,13 +158,13 @@ class TestValidationStatus(unittest.TestCase):
     def test_verified_is_validated(self):
         self.assertEqual(fnd.validation_status({"Verified": True}), fnd.VALIDATED)
 
-    def test_verification_ran_and_failed_is_unvalidated(self):
-        self.assertEqual(fnd.validation_status({"Verified": False}), fnd.UNVALIDATED)
+    def test_verification_ran_and_failed_is_rejected(self):
+        self.assertEqual(fnd.validation_status({"Verified": False}), fnd.REJECTED)
 
     def test_verify_error_is_not_proof_of_death(self):
         status = fnd.validation_status({"Verified": False, "VerificationError": "dial tcp: timeout"})
         self.assertEqual(status, fnd.VERIFY_ERROR)
-        self.assertNotEqual(status, fnd.UNVALIDATED)
+        self.assertNotEqual(status, fnd.REJECTED)
 
     def test_verification_disabled_makes_everything_unverified(self):
         # Even a `Verified: true` payload cannot be trusted as live when we told
@@ -176,7 +176,7 @@ class TestValidationStatus(unittest.TestCase):
 
     def test_statuses_are_the_four_documented_ones(self):
         self.assertEqual(set(fnd.VALIDATION_STATUSES),
-                         {"validated", "unvalidated", "verify_error", "unverified"})
+                         {"validated", "rejected", "verify_error", "unverified"})
 
 
 class TestStableIds(unittest.TestCase):

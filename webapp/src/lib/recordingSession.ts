@@ -1,6 +1,7 @@
 import type { Prisma } from '@prisma/client'
 import { normalizeScopeHosts } from '@/lib/authProfile'
 import { recordingScope, resolveScopeGroups, type ScopeFields } from '@/lib/scopeGroups'
+import { isRoeExcluded } from '@/lib/roeScope'
 
 // Server-side max recording window. The operator re-starts to extend.
 export const RECORDING_TTL_MS = 30 * 60 * 1000
@@ -118,15 +119,6 @@ export function mergeMaterial(prev: RecordingMaterial | null | undefined, next: 
 interface ProjectScopeFields extends ScopeFields {
   targetIps?: string[]
   roeExcludedHosts?: string[]
-}
-
-function isRoeExcluded(host: string, excluded: string[]): boolean {
-  for (const raw of excluded) {
-    const e = raw.trim().toLowerCase()
-    if (!e) continue
-    if (host === e || host.endsWith('.' + e)) return true
-  }
-  return false
 }
 
 /**

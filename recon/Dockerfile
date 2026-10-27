@@ -122,7 +122,6 @@ RUN groupadd -f docker && \
 
 # Create necessary directories
 RUN mkdir -p /app/recon/output \
-             /app/recon/data/mitre_db \
              /app/utils \
              /data/output \
              /data/.env \

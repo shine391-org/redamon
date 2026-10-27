@@ -130,9 +130,6 @@ class TestNmapAndHttpx:
     def test_nmap_builds_over_every_root(self, monkeypatch, graph):
         builder = MagicMock(side_effect=lambda roots, *a, **kw: _port_recon(roots))
         monkeypatch.setattr(port_scanning, "_build_port_scan_data_from_graph", builder)
-        # run_nmap imports merge_nmap_into_port_scan from recon.main, which loads
-        # the project settings at import time: stand the module in for it.
-        monkeypatch.setitem(sys.modules, "recon.main", MagicMock())
         with patch("recon.main_recon_modules.nmap_scan.run_nmap_scan",
                    side_effect=lambda rd, output_file=None, settings=None: rd):
             port_scanning.run_nmap(dict(BASE))

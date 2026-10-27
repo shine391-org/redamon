@@ -159,7 +159,8 @@ def run_subdomain_discovery(config: dict) -> dict:
         if new_user_subs:
             print(f"[*][Partial Recon] Adding {len(new_user_subs)} user-provided subdomains under {domain}")
             all_subs = sorted(set(discovered_subs + new_user_subs))
-            all_subs = run_puredns_resolve(all_subs, domain, settings)
+            all_subs, wildcard_filter = run_puredns_resolve(all_subs, domain, settings)
+            result.setdefault("metadata", {})["wildcard_filter"] = wildcard_filter
             print(f"[*][Partial Recon] Resolving DNS for {len(all_subs)} subdomains...")
             result["subdomains"] = all_subs
             result["subdomain_count"] = len(all_subs)

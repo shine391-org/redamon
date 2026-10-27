@@ -15,6 +15,7 @@
  * @vitest-environment node
  */
 import { existsSync, readFileSync, readdirSync } from 'fs'
+import { wikiCheckoutPresent } from '@/lib/wikiCheckout.testUtils'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, test, expect, beforeAll, vi } from 'vitest'
@@ -51,12 +52,8 @@ const MCP_AUTH = fileURLToPath(new URL('../mcpAuth.ts', import.meta.url))
 
 const WIKI_DIR = process.env.MCP_DOCS_WIKI_DIR
   || fileURLToPath(new URL('../../../../redamon.wiki/', import.meta.url))
-/**
- * A real wiki CHECKOUT, not merely the directory: the main repo records the
- * wiki as a submodule pointer with no .gitmodules, so a fresh clone leaves
- * redamon.wiki/ empty. Same guard apiReference.test.ts uses.
- */
-const hasWikiCheckout = () => existsSync(path.join(WIKI_DIR, 'Home.md'))
+/** A real wiki checkout; an empty one fails unless allowed (wikiCheckout.testUtils.ts). */
+const hasWikiCheckout = () => wikiCheckoutPresent(WIKI_DIR)
 
 const known = new Set<string>(MCP_SCOPES)
 

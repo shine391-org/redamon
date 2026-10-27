@@ -42,9 +42,10 @@ from cypherfix_codefix.tools.repo_paths import (  # noqa: E402
 )
 from cypherfix_codefix.tools.write_tool import github_write  # noqa: E402
 from cypherfix_errors import safe_error  # noqa: E402
-from cypherfix_triage.prompts.cypher_queries import (  # noqa: E402
-    SCORING_QUERIES,
-    TRIAGE_QUERIES,
+from cypherfix_triage.fact_queries import (  # noqa: E402
+    FINDING_QUERIES,
+    PROJECT_FACT_QUERIES,
+    STORED_LAYERS,
 )
 from cypherfix_triage.tools import TriageNeo4jToolManager  # noqa: E402
 
@@ -172,6 +173,12 @@ class TestCollectionQueriesStayInTenant(unittest.TestCase):
             for m in re.finditer(
                 r"\(\s*(\w+)\s*:\s*(?:%s)\b" % "|".join(self.GLOBAL_LABELS), query)
         }
+        # Variables bound with the tenant keys somewhere in the query. A pattern
+        # one relationship away from one of them is in the same project.
+        anchored = {
+            m.group(1)
+            for m in re.finditer(r"\(\s*(\w+)\s*:\s*\w+\s*\{[^}]*\$userId", query)
+        }
         bad = []
         for clause in self._clauses(query):
             touches_global = any(
@@ -183,22 +190,19 @@ class TestCollectionQueriesStayInTenant(unittest.TestCase):
             for match in re.finditer(r"\(\s*\w*\s*:\s*(\w+)([^)]*)\)", clause):
                 if match.group(1) not in self.PER_PROJECT_LABELS:
                     continue
-                if "$userId" not in match.group(2):
-                    bad.append(f"{match.group(0)} in: {clause}")
+                if "$userId" in match.group(2):
+                    continue
+                hop = re.match(r"\s*<?-\[[^\]]*\]->?\s*\(\s*(\w+)\s*\)", clause[match.end():])
+                if hop and hop.group(1) in anchored:
+                    continue
+                bad.append(f"{match.group(0)} in: {clause}")
         return bad
 
     def test_no_static_query_reads_another_tenant_through_a_cve(self):
-        for query_def in list(TRIAGE_QUERIES) + list(SCORING_QUERIES):
+        # The queries a triage run sends through run_static_query (orchestrator.py).
+        for query_def in list(PROJECT_FACT_QUERIES) + list(FINDING_QUERIES) + [STORED_LAYERS]:
             with self.subTest(query=query_def["name"]):
                 self.assertEqual(self._leaks(query_def["query"]), [])
-
-    def test_cve_chains_anchors_exploitgvm(self):
-        query = next(q for q in TRIAGE_QUERIES if q["name"] == "cve_chains")["query"]
-        self.assertIn("ExploitGvm {user_id: $userId, project_id: $projectId}", query)
-
-    def test_exploits_anchors_technology(self):
-        query = next(q for q in TRIAGE_QUERIES if q["name"] == "exploits")["query"]
-        self.assertIn("Technology {user_id: $userId, project_id: $projectId}", query)
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ class TrufflehogRunner:
             # queries that read repositories_scanned keep working (6.3).
             "repositories_scanned": 0,
             "validated": 0,
-            "unvalidated": 0,
+            "rejected": 0,
             "verify_error": 0,
             "unverified": 0,
             "detector_types": {},

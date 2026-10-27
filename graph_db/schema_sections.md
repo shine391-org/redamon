@@ -33,6 +33,8 @@
 - recon_coverage_run (string): the start of the full recon run that wrote the coverage record; the groups of one run merge into it, a new run replaces it
 - recon_skipped_hosts (list[string]): host:port targets this run skipped as unreachable (first 500, sorted); their findings were kept, not re-checked
 - recon_nuclei_truncated (boolean): a Nuclei pass hit NUCLEI_MAX_RUNTIME and was stopped; its partial findings were kept
+- is_wildcard_zone (boolean): RedAmon's wildcard control probed random names under this domain and they resolved, so the zone answers EVERY name (wildcard DNS); false when they did not resolve; absent when it was never checked (DNS resolution off, or the probe failed). Names that only resolve through the wildcard are not kept as Subdomains
+- wildcard_ips (list[string]): the addresses the wildcard answers with (empty when the zone is no wildcard)
 Additional properties present on this node type, not yet described:
 - admin_name (string)
 - admin_org (string)
@@ -84,11 +86,12 @@ Additional properties present on this node type, not yet described:
 - name (string): "api.example.com", "www.example.com"
 - is_scan_root (boolean): true on a scan root below its org Domain that is itself a target (the operator listed `api.example.com`, or `*.api.example.com` with Include Root); absent otherwise
 - has_dns_records (boolean): a CACHED FLAG from the resolver, which can be true while no DNSRecord node was ever written. Prefer the relationship - `(s)-[:HAS_DNS_RECORD]->(:DNSRecord)` - whenever the question is about the records themselves; the flag answers "did resolution succeed", the traversal answers "what do we hold", and they do not always agree
-- status (string): "resolved" (DNS only, not yet probed), "no_http" (no HTTP response), or HTTP status code as string ("200", "301", "403", "404", "500", etc.)
+- status (string): "resolved" (DNS only, not yet probed), "unverified" (nobody resolved it: written with the DNS step off, or by a passive source such as uncover or passive DNS; never count it as resolved), "no_http" (no HTTP response), or HTTP status code as string ("200", "301", "403", "404", "500", etc.)
 - status_codes (list[int]): all unique HTTP status codes seen e.g. [200, 301, 404]
 - http_live_url_count (int): count of URLs with status < 500
 - http_probed_at (datetime): when last HTTP-probed
 - source (string): discovery source ("crt.sh", "hackertarget", "knockpy", "shodan_rdns", "shodan_dns", "urlscan", "fofa", "otx_passive_dns", "censys_rdns", "uncover")
+- is_wildcard_zone (boolean), wildcard_ips (list[string]): set only on a subdomain that is itself a zone the wildcard control checked (a scan root below its org, or a parent with many discovered names), with the same meaning as on Domain
 Additional properties present on this node type, not yet described:
 - actual_ip (string)
 - discovered_at (datetime)
@@ -101,7 +104,8 @@ Additional properties present on this node type, not yet described:
 
 **IP** - Resolved IP addresses
 - address (string): "192.168.1.1"
-- is_ipv6 (boolean)
+- version (string): "ipv4" or "ipv6". IP-mode nodes from older scans may hold "v4" / "v6"; match both, e.g. `ip.version IN ['ipv4', 'v4']`
+- organization (string): whois organization of the address (IP-mode scans); absent when whois names none
 - asn, isp, country (IP enrichment data)
 - shodan_enriched, censys_enriched, fofa_enriched, netlas_enriched, zoomeye_enriched (boolean): which OSINT tools enriched this IP
 - zoomeye_last_seen (string): ISO timestamp of the ZoomEye host record update_time (e.g. "2026-03-01T12:00:00")
@@ -150,10 +154,15 @@ Additional properties present on this node type, not yet described:
 - uncover_source_counts (string): JSON-encoded dict of engine->result count
 - uncover_total_raw (integer): total raw results before deduplication
 - uncover_total_deduped (integer): total results after deduplication
+- is_cdn (boolean): a CDN, WAF or cloud front end serves this address, by naabu's or httpx's CDN check or by the issuer of the certificate tlsx grabbed on it. A cloud label (cdn_name "aws", "google") does not make the address a shared edge: `ownership` is the attribution. Only ever set true by tlsx, httpx and IP attribution, never cleared by them
+- cdn_name (string): the CDN that is_cdn names (e.g. "cloudflare"); the first tool to name one keeps it
+- cdn_source (string): "tlsx", "httpx" or "ip_attribution" when the CDN tag came from that tool (tlsx: the certificate issuer; ip_attribution: a published edge range, an edge's headers or an edge-only ASN) and no other tool had tagged the address first; absent when naabu tagged it
+- ownership (string): "shared_edge" (a CDN edge serving many tenants), "dedicated" (the certificate the address presents without SNI covers a target domain) or "unknown" (neither can be shown). Written by IP attribution after the HTTP probe; never "not ours", since a real server on a cloud provider has a generic PTR and the cloud's whois. Absent on an IP no run has attributed yet: read it as unknown
+- ownership_reasons (list[string]): why `ownership` says what it says, sorted, e.g. ["default certificate covers no target domain", "in a published CDN edge range"]; "default certificate not checked (stealth mode)" when no handshake was made
+- default_cert_names (list[string]): the CN and SANs of the certificate the address presents to a TLS client that sends no SNI, sorted; absent when no handshake read one
+- current_dns_names (int): how many names in the scan's own DNS results resolved to the address; 0 means no current name points at it (the address may have left the target). An IP-mode target is listed by address, so 0 says nothing there
 Additional properties present on this node type, not yet described:
-- cdn_name (string)
 - ip_mode (boolean)
-- is_cdn (boolean)
 - origin_discovery_enriched (boolean)
 - urlscan_enriched (boolean)
 - ai_attack_synthetic
@@ -163,12 +172,13 @@ Additional properties present on this node type, not yet described:
 - number (integer): 80, 443, 22
 - protocol (string): "tcp", "udp"
 - state (string): "open", "closed", "filtered"
-- source (string): which tool discovered it ("naabu", "masscan", "shodan", "censys", "fofa", "netlas", "zoomeye", "criminalip", "uncover")
+- source (string): the passive provider that first reported it, set on create only so a later enricher never takes over a port the scan found ("shodan", "censys", "fofa", "netlas", "zoomeye", "criminalip", "uncover"); "nmap" for a port nmap found that the port scan missed; absent on a port the port scan (naabu, masscan) created
 - product (string): software product from Nmap -sV (e.g. "vsftpd", "Apache Tomcat", "MySQL")
 - version (string): software version from Nmap -sV (e.g. "2.3.4", "8.5.19")
 - cpe (string): CPE string from Nmap (e.g. "cpe:/a:vsftpd:vsftpd:2.3.4")
 - nmap_scanned (boolean): true if Nmap has probed this port
 - A Port with source "nmap" was missed by the port scan and confirmed open by Nmap, which created it
+- passive_only (boolean): true on a Port only Shodan or InternetDB reported (set on create); naabu, masscan and nmap set it false when they find the same port. Absent on ports written before the mark
 Additional properties present on this node type, not yet described:
 - ip_address (string)
 
@@ -200,14 +210,21 @@ Additional properties present on this node type, not yet described:
 
 ### Web Application Nodes (Hierarchy: BaseURL -> Endpoint -> Parameter)
 
-**BaseURL** - HTTP-probed base URLs, or declared OpenAPI server origins
+**BaseURL** - HTTP-probed base URLs, or declared OpenAPI server origins. A thin service identity: the probe's answer (status_code, first_status_code, title, content_type, final_url, server) is on the Endpoint it probed (HAS_ENDPOINT, path "/" unless extra probe paths are set)
 - scheme (string): "http" or "https"
 - host (string): hostname or IP
 - url (string): "https://api.example.com:443"
-- status_code (integer): 200, 301, 404
-- title (string): page title
-- content_type (string): "text/html"
-- final_url (string): after redirects
+Coverage stamp properties (what js_recon and nuclei did on this host in their last run; a BaseURL a module never considered has none of that module's five):
+- js_recon_status (string): "complete" (every JS file it had was read), "partial" (some were cut: see js_recon_reason), "no_input" (a live host serving no JavaScript), "failed" (none could be read). ABSENT means JS Recon never looked at this host when other BaseURLs of the project carry it ("not scanned"), and "coverage not recorded" when none does (scanned before stamps existed, or JS Recon never ran). Never read a missing JS finding on an unstamped BaseURL as "clean"
+- js_recon_at (datetime): when that JS Recon run started
+- js_recon_inputs (integer): JS files read for this host
+- js_recon_outputs (integer): JS Recon findings reported for this host
+- js_recon_reason (string): why the status is not "complete": "file cap", "host unreachable", "analyzer failed or timed out" or "fatal: <error>", comma-separated when several; absent when complete
+- nuclei_status (string): "complete", "partial", "failed", read like js_recon_status; absent likewise means "not scanned" or "coverage not recorded"
+- nuclei_at (datetime): when that Nuclei run started
+- nuclei_inputs (integer): URLs on this host sent to Nuclei
+- nuclei_outputs (integer): Nuclei findings reported for this host
+- nuclei_reason (string): why the status is not "complete": "runtime cap", "nuclei exited <code>", "Docker not found", "Docker daemon not running", "nuclei templates unavailable" or "no Nuclei templates selected"; absent when complete
 Additional properties present on this node type, not yet described:
 - urlscan_enriched (boolean)
 - urlscan_screenshot_url (string)
@@ -232,7 +249,13 @@ Additional properties present on this node type, not yet described:
 - url (string): "https://api.example.com/api/v1/users"
 - path (string): "/api/v1/users"
 - method (string): "GET", "POST"
-- status_code (integer)
+- status_code (integer): the LAST answer; http_probe follows redirects, so a host that answers 302 to a login page reads 200 here
+- Redirect chain (set by http_probe on the Endpoint it probed):
+  - first_status_code (integer): the first answer, before any redirect; rank on this, not status_code
+  - redirect_chain_codes (list[integer]): the status of each hop, first to last; one entry when nothing redirected
+  - final_url (string): the URL the answer came from after redirects; equals url when nothing redirected
+  - redirected_off_host (boolean): the last hop is on another host. When that host is out of scope the probe keeps no title, technologies, server, favicon or body hash for this Endpoint (they describe someone else's page) and records the host as an ExternalDomain
+- shared_body_cluster (integer): set by http_probe on a root Endpoint (path "/") whose exact body (body_sha256) 3 or more distinct BaseURLs serve with status 200 or 403: that number of BaseURLs. It marks one deny, parking or gateway page shared by many hosts, not each host's own content. Recomputed over the whole project on every http_probe write, full or partial; absent when the page is not shared
 - GraphQL enrichment (set by graphql_scan when endpoint is a GraphQL endpoint):
   - is_graphql (boolean): True if the endpoint is a GraphQL endpoint
   - graphql_introspection_enabled (boolean): True if __schema introspection query succeeded
@@ -255,6 +278,11 @@ Additional properties present on this node type, not yet described:
   - page_class (string): "app", "login_only", "parked", "default", "placeholder" or "error"
   - page_class_confidence (integer): 0-100; 100 when the pre-filter placed the page
   - page_class_source (string): "jev_classifier", or "prefilter" where Jev gave no answer
+- Endpoint probe (set by js_recon on endpoints it extracted from JavaScript, when JS_RECON_VALIDATE_ENDPOINTS is on):
+  - validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get) or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme). "not_hittable" (dead) and "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell) are never written: the endpoint is dropped
+  - js_status_code (integer): the status js_recon's own probe got; status_code stays http_probe's when both probed
+- Path template (set by js_recon when the JS built the URL from a template literal):
+  - path_template (string): the literal as written, e.g. "/api/users/${id}"; `path` is then its literal prefix ("/api/users/"). Absent for a plain literal
 Additional properties present on this node type, not yet described:
 - body_param_count (integer)
 - body_sha256 (string)
@@ -284,7 +312,6 @@ Additional properties present on this node type, not yet described:
 - ai_mcp_resource_count
 - ai_model_ids
 - js_recon_source
-- js_status_code
 
 **Parameter** - URL/form parameters
 - name (string): "id", "username", "page"
@@ -356,8 +383,10 @@ Additional properties present on this node type, not yet described:
 JS Recon secret properties (source="js_recon" only):
 - key_type (string): the matching pattern's category
 - confidence (string): high, medium, low
-- validation_status (string): validated, invalid, unvalidated, skipped, incomplete, format_validated, error
+- validation_status (string): validated (the provider accepted it), rejected (the provider refused it), unknown (no verdict: a timeout, a 429 or 5xx, a 403, a skipped call), format_invalid, format_validated, incomplete, unvalidated (no validator for it), skipped. Nodes written before these states hold invalid or error
 - detection_method (string): "regex"
+- context (string): the code around the match, at most 400 characters, with this key and every other secret-shaped value in it shown redacted
+- public_client_key (boolean): true for a key that is public by design (a browser key, a publishable key, a DSN, a write-only analytics key); written at severity info. Absent on nodes written before it existed: readers then also treat a secret_type in the public-client list as public
 
 **Traceroute** - Network route from scanner to target (from GVM)
 - target_ip (string): target IP address
@@ -395,9 +424,11 @@ Common properties (all sources):
 - cvss_score (float): 0.0 to 10.0
 
 Netlas-specific properties (source="netlas"):
-- id (string): CVE identifier e.g. "CVE-2021-44228"
+- id pattern: `netlas-{cve}-{ip}-{port}`, one finding per CVE, IP and port (rows written before were keyed on the bare CVE id, one per project; `tooling/scripts/netlas_finding_rekey.py` moves them)
 - has_exploit (boolean): whether a known public exploit exists (from NVD data)
-- Relationship: `(svc:Service)-[:HAS_VULNERABILITY]->(v:Vulnerability)` — linked to the Service where the vulnerable software was detected
+- target_ip (string), target_port (integer): where Netlas saw the vulnerable service
+- cves, cve_ids (list[string]): the CVE id; the finding also links `(v)-[:INCLUDES_CVE]->(:CVE)`
+- Relationship: `(i:IP)-[:HAS_VULNERABILITY]->(v)`, the finding's only parent. A domain-mode row for an IP this run's DNS does not give is history and is not written; a CDN or shared-edge IP gets its ports but no CVE
 
 Shodan passive CVE properties (source="shodan_api" or "internetdb"):
 - detection_method (string): "passive_verified" (Shodan verified the CVE on the banner), "passive_version_match" (a banner's product and version matched), or "passive_catalog" (no banner version: the IP's CVE list alone, or a banner naming no version); absent on rows written before the grading. It only rises across runs
@@ -406,8 +437,17 @@ Shodan passive CVE properties (source="shodan_api" or "internetdb"):
 - target_port (integer): the banner's port, absent when no banner named the CVE
 - product (string): the banner's product, absent when the banner named none
 - version (string): the banner's version, absent when the banner named none
+- port_confirmed (boolean): whether this run's port scan found `target_port` open (true) or looked at it and did not (false). Absent means unknown: the scan did not cover that IP and port (a top-N port list, another port list, no port scan, a UDP banner, or a row written before the check). A full run writes it every time; partial recon only ever sets true
 - id pattern: `shodan-{cve}-{ip}`; a shared CDN/edge IP (Shodan's `cdn` tag or an edge provider's attribution) yields no CVE rows
 - Relationship: `(i:IP)-[:HAS_VULNERABILITY]->(v)`, the finding's only parent (match the Service by `target_port` and `product`)
+
+CriminalIP passive CVE properties (source="criminalip"):
+- target_ip (string): the IP Criminal IP reported the CVE on, refreshed every run
+- cvss_score (float): the CVSS v3 score, else v2, refreshed every run (rows written before held it as `cvss`; the next CriminalIP run moves it)
+- id pattern: `criminalip-{cve}-{ip}`
+- Relationship: `(i:IP)-[:HAS_VULNERABILITY]->(v)`
+
+Passive CVEs (Shodan, InternetDB, Netlas, CriminalIP) are recon finding sources: a full scan prunes the ones it no longer reports, and keeps those on an IP the provider could not be asked about.
 
 Nuclei-specific properties (source="nuclei"):
 - template_id (string): nuclei template ID
@@ -488,7 +528,7 @@ Subdomain-takeover properties (source="takeover_scan"):
 - Typical query: "list confirmed Heroku takeovers" → `MATCH (s:Subdomain)-[:HAS_VULNERABILITY]->(v:Vulnerability {source: 'takeover_scan'}) WHERE v.takeover_provider = 'heroku' AND v.verdict = 'confirmed' RETURN s.name AS subdomain, v.cname_target, v.confidence, v.sources`
 
 VHost & SNI properties (source="vhost_sni_enum"):
-- type (string): "hidden_vhost" (L7 anomaly only), "hidden_sni_route" (L4/SNI anomaly only), or "host_header_bypass" (L7 vs L4 disagreement — proxy bypass primitive)
+- type (string): "hidden_vhost" (L7 anomaly only, or both layers serving the same page; layer then reads "both"), "hidden_sni_route" (L4/SNI anomaly only), or "host_header_bypass" (L7 and L4 serve different pages for the name — proxy bypass primitive). Findings written before that split typed every layer-"both" anomaly "host_header_bypass"; the next vhost run renames them in place (same id)
 - hostname (string): the hidden virtual host FQDN that was discovered (e.g. "admin.acme.com")
 - ip (string): the IP address that hosts the hidden vhost
 - port (integer): TCP port tested (commonly 443, also 80, 8443, 8080, etc.)
@@ -500,13 +540,14 @@ VHost & SNI properties (source="vhost_sni_enum"):
 - observed_size (integer): body size in bytes for the observed response
 - size_delta (integer): observed_size - baseline_size (signed)
 - internal_pattern_match (string, nullable): matched internal-keyword in hostname (e.g. "admin", "jenkins", "k8s") that triggered severity escalation, or null
+- dns_known (boolean): this run's DNS points the hostname at this IP. Such a name is never reported as hidden: it yields a finding only when L7 and L4 serve different pages (type "host_header_bypass"), and is never injected as a new BaseURL. Absent on findings written before the check
 - severity (string): "high" (L7 vs L4 disagreement, proxy bypass), "medium" (hidden vhost matching internal-keyword), "low" (different status code), "info" (size delta only)
 - description (string): human-readable explanation
 - id pattern: `vhost_sni_{hostname}_{ip}_{port}_{layer}` — deterministic, MERGE-safe
 - Attachment: a hidden vhost is a routing fact, not a DNS one, so this source writes NO `RESOLVES_TO` edge. A candidate under the engagement's domain gets its `Subdomain` (created if recon has not seen the name, with `source: 'vhost_sni_enum'` and `has_dns_records: false` until a resolver confirms it) and owns the finding via `HAS_VULNERABILITY`. A candidate outside that domain (a co-hosted third party) is never added to the inventory: its finding hangs off the `IP` that served it instead
-- Subdomain enrichment (set on the (:Subdomain) flagged as a hidden vhost): vhost_tested (bool), vhost_hidden (bool), vhost_routing_layer ("L7"|"L4"|"both"), vhost_status_code (int), vhost_size_delta (int), sni_routed (bool), vhost_tested_at (ISO ts)
+- Subdomain enrichment (set on the (:Subdomain) that owns a finding): vhost_tested (bool), vhost_hidden (bool — false when DNS points the name at the IP, so only a routing inconsistency was reported), vhost_routing_layer ("L7"|"L4"|"both"), vhost_status_code (int), vhost_size_delta (int), sni_routed (bool), vhost_tested_at (ISO ts)
 - IP enrichment (set on (:IP) nodes that have been probed): vhost_sni_tested (bool), vhost_baseline_status (int), vhost_baseline_size (int), vhost_candidates_tested (int — total candidate hostnames probed against this IP), vhost_ports_tested (int — number of (port, scheme) pairs that produced a usable baseline), hosts_hidden_vhosts (bool), hidden_vhost_count (int), is_reverse_proxy (bool), vhost_sni_tested_at (ISO ts)
-- Noise bookkeeping (same (:IP) nodes): is_permissive_frontend (bool — a port answered every candidate alike, so its anomalies were discarded as noise), vhost_sni_suppressed_by_control (int — candidates dropped for matching a random-hostname control probe), vhost_sni_suppressed_as_noise (int — anomalies discarded on permissive-frontend ports; none of them became a finding), vhost_sni_suppressed_sample (list of "hostname:port" strings, sorted, at most 20 — which names those were)
+- Noise bookkeeping (same (:IP) nodes): is_permissive_frontend (bool — a port answered every candidate alike, so its anomalies were discarded as noise), vhost_sni_suppressed_by_control (int — candidates dropped for matching a random-hostname control probe), vhost_sni_suppressed_dns_known (int — names DNS points at this IP that served their own site and so were not reported as hidden), vhost_sni_suppressed_as_noise (int — anomalies discarded on permissive-frontend ports; none of them became a finding), vhost_sni_suppressed_sample (list of "hostname:port" strings, sorted, at most 20 — which names those were)
 - Typical query: "list hidden admin panels uncovered by vhost enumeration" → `MATCH (s:Subdomain)-[:HAS_VULNERABILITY]->(v:Vulnerability {source: 'vhost_sni_enum'}) WHERE v.internal_pattern_match IS NOT NULL RETURN s.name AS hostname, v.ip, v.port, v.layer, v.severity, v.internal_pattern_match` (that traversal covers in-scope names; a co-hosted one is reached as `MATCH (i:IP)-[:HAS_VULNERABILITY]->(v:Vulnerability {source: 'vhost_sni_enum'})`)
 
 Web cache poisoning properties (source="cache_poisoning"):
@@ -527,6 +568,7 @@ Web cache poisoning properties (source="cache_poisoning"):
 Security-check properties (source="security_check"):
 - detection_method (string): how a waf_bypass was decided, "payload_differential", "static_headers", "ai_classifier" or "jev_classifier"; waf_confidence (float), waf_type (string) and ai_reasoning (string) carry the WAF classifier's verdict
 - service (string): the service admin_port_exposed or database_exposed found on the port, as the check names it (case-sensitive): "SSH", "Telnet", "RDP", "VNC", "MySQL", "PostgreSQL", "MongoDB", "MSSQL", "Oracle", "Redis", "Elasticsearch"; redis_no_auth and smtp_open_relay write none
+- control_check (string): did a made-up path get the same answer? "passed" (it did not: the hit is real) or "failed" (the control could not be sent or read: no conclusion either way); the evidence text says why. A catch-all ("same answer") is never written: the check drops the hit. Set by ip_api_exposed and the payload-differential waf_bypass; absent on checks with no control and on findings from before it existed
 - A port/service check that reports no URL (admin_port_exposed, database_exposed, redis_no_auth, smtp_open_relay) carries matched_ip and port, and matched_at "<ip>:<port>" (an IPv6 address in brackets, e.g. "[2001:db8::1]:6379"), one finding per IP and port, linked from its IP via HAS_VULNERABILITY
 
 Per-source properties node filters also read (graph_db/node_filters/catalog.yaml):
@@ -773,7 +815,8 @@ Additional properties present on this node type, not yet described:
 - detector_description (string): human-readable detector description
 - validation_status (string): THE attribute that matters.
   * "validated"    = the owning API confirmed the credential is LIVE (act on this)
-  * "unvalidated"  = verification ran, the API said it is not live
+  * "rejected"     = verification ran, the API said it is not live
+  * "unvalidated"  = the same, on nodes written before "rejected" existed
   * "verify_error" = the verify call itself failed — NOT proof it is dead
   * "unverified"   = verification was switched off — never checked, NOT safe
   Never treat "unverified" as "not live"; it means nobody looked.
@@ -883,12 +926,13 @@ Source-map properties (finding_type source_map_exposure or source_map_reference)
 - map_url (string): the source map URL the script references or the probe found
 - accessible (boolean): the map was served and parsed as a v3 source map
 - fetch_result (string): ok for a served map; http_401 or http_403 for a referenced map that refused access
+- control_check (string): on an http_403 reference, the missing-key control: passed (a made-up sibling was not refused alike, so the map likely exists) or failed (the control got no answer, so the refusal is unconfirmed); absent otherwise. A 403 that object storage gives for any missing key is not reported at all
 - discovery_method (string): comment, header or probe
 - files_count (integer): sources listed in the map
 - first_party_files (integer): sources outside node_modules and the bundler runtime
 - has_sources_content (boolean): the map embeds the target's own source text
 - source_files (list[string]): the first-party source paths, capped at 100
-- secrets_in_source (integer): secret-pattern hits in the embedded first-party source text
+- secrets_in_source (integer): Secret nodes found in the map's embedded first-party sources (their source_url is `<map_url>#<source>`)
 - third_party (boolean): the script is served from a vendor's host outside the target (a generic CDN or storage host is not counted, since targets serve their own bundles from those); also set on a dom_sink
 DOM-sink and developer-reference properties (finding_type dom_sink or dev_reference; a dev_reference is a localhost or internal/staging URL or a debug flag in shipped JS, a recon lead rather than a credential):
 - line (integer): line of the JS file where the sink or reference matched
@@ -899,10 +943,10 @@ DOM-sink and developer-reference properties (finding_type dom_sink or dev_refere
 
 1. **JS File nodes** (finding_type='js_file') - Represent each analyzed JavaScript file. All findings from that file are linked to this node.
    - finding_type: 'js_file'
-   - title (string): filename (e.g. "app.js", "test_app.js")
+   - title (string): filename (e.g. "app.js", "test_app.js"); "main.js.map#src/config.ts" for a source recovered from a source map
    - detail (string): full URL or upload:// path
    - is_uploaded (boolean): true if manually uploaded, false if from pipeline crawl
-   - source_url (string): full URL or upload://filename
+   - source_url (string): full URL or upload://filename; `<map_url>#<source path>` for a first-party source recovered from a source map, which is analyzed like a downloaded file
 
 2. **Finding nodes** (finding_type != 'js_file') - Individual findings linked to their parent JS file node.
    - finding_type (string): dependency_confusion, source_map_exposure, dom_sink, framework, dev_comment, source_map_reference, dev_reference
@@ -917,13 +961,14 @@ DOM-sink and developer-reference properties (finding_type dom_sink or dev_refere
 Graph hierarchy: Domain/BaseURL -> JS file node -> findings/secrets/endpoints
 - `(Domain)-[:HAS_JS_FILE]->(JsReconFinding {finding_type: 'js_file'})` for uploaded files
 - `(BaseURL)-[:HAS_JS_FILE]->(JsReconFinding {finding_type: 'js_file'})` for pipeline-crawled files
+- `(Subdomain)-[:HAS_JS_FILE]->(JsReconFinding {finding_type: 'js_file'})` for a file on an in-scope host with no BaseURL (a host only the JS named, an unprobed port)
 - `(JsReconFinding {finding_type: 'js_file'})-[:HAS_JS_FINDING]->(JsReconFinding)` findings from that file
 - `(JsReconFinding {finding_type: 'js_file'})-[:HAS_SECRET]->(Secret)` secrets found in that file
 - `(JsReconFinding {finding_type: 'js_file'})-[:HAS_ENDPOINT]->(Endpoint)` endpoints extracted from that file
 - `(BaseURL)-[:HAS_ENDPOINT]->(Endpoint)` also owns every JS endpoint on a network host, like any other endpoint. Only in-scope hosts get an Endpoint; a third-party URL found in the JS is an external domain, not an Endpoint. A relative path in uploaded JS has `baseurl: 'upload'` and no BaseURL
 
 Note: JS Recon also creates Secret nodes with source='js_recon' and extra fields:
-- validation_status (string): validated, invalid, unvalidated, skipped, incomplete
+- validation_status (string): validated, rejected, unknown, format_invalid, format_validated, incomplete, unvalidated, skipped (legacy: invalid, error)
 - validation_info (string): JSON with validation details (scope, account info)
 - confidence (string): high, medium, low
 - detection_method (string): regex (or "ai_sdk_catalogue" when matched by Phase 6)
@@ -1023,7 +1068,8 @@ machine reading the evidence: the built-in AI during a run, or an external
 agent over MCP (`triage_ai_*`). DECISION is a person's Real or False positive
 (`triage_status`, `triage_source`, `triage_verdict_*`). The FINAL values
 (`triage_priority_score`, `triage_tier`, `triage_state`, `triage_factors`,
-`triage_decided_by`) are computed from the three; nobody writes them directly.
+`triage_decided_by`, `triage_disposition`, `triage_blocker`) are computed from
+the three; nobody writes them directly.
 
 Suppression is a HUMAN action and triage never performs it: a triage run
 ranks a finding, it never hides one. A suppressed finding carries the
@@ -1047,10 +1093,12 @@ not so you can query for one.
 - triage_base_tier (string): The rules-only tier
 - triage_base_tier_rule (string): The rule behind the rules-only tier
 - triage_base_state (string): `open` | `fixed` | `gone` | `inactive`, from the facts alone; never `false_positive`
-- triage_tier_inputs (string): JSON `{proven, kev}`, what the tier rules read besides the factors
+- triage_tier_inputs (string): JSON `{proven, kev}`, what the tier rules read besides the factors, plus `passive_unconfirmed: true` on a passive CVE no port scan confirmed open (a "real" review then raises its C to 0.6 at most), `public_client_key: true` on a key public by design, and `gates`: the four report gates `{reachable_now, attributed, controlled, impactful}`, each true, false or null (unknown). The gates name a candidate's blocker and move no score; no `gates` key means a run before score model v3.10 scored it
 - triage_signals (list[string]): The readable fact chips: `KEV`, `EPSS 0.94`, `live endpoint`
 - triage_state (string): `open` | `fixed` | `gone` | `inactive` | `false_positive`. Only `open` is ranked. `false_positive` comes from a person's decision or a still-valid review
 - triage_decided_by (string): Which layer set the final values: `rules` | `review` | `person`
+- triage_disposition (string): Can this go in a report? `reportable` (proven, or a person's Real) | `candidate` (might be real; `triage_blocker` says what is missing) | `info` (no impact even if real: nothing here has any impact, or a key public by design) | `excluded` (a person's False positive, or fixed / gone / inactive). An AI review's false positive is a `candidate`, never `excluded`. Absent on a node no v3.10 run has rescored: the webapp then computes it from the props above
+- triage_blocker (string): What a `candidate` still lacks, null otherwise: `AI review: likely false positive` when a review called it one; else the first report gate that failed (`not reachable now`, `shared edge`, `failed its control check`, `no impact shown`); else the first one the run could not tell (`unknown: reachable now` | `unknown: attributed` | `unknown: controlled` | `unknown: impactful`); else the tier rule. `shared edge` says a CDN edge may be what answered, never that the target does not own it
 - triage_rescored_at (datetime): When the final values were last computed
 - triage_host (string): The host the model resolved and scored against, deterministically
 - triage_group_key (string): One problem, one fix. Replaces `triage_cluster_id`
@@ -1093,7 +1141,7 @@ not so you can query for one.
 - `(d:Domain)-[:HAS_IP]->(i:IP)` - An address uncover's org-wide search tied to this org Domain, with no hostname to hang it on. NOT the apex's A record: the apex's own addresses are on `Subdomain {name: d.name}` via RESOLVES_TO, when the apex is a target
 - `(d:Domain)-[:HAS_SUBDOMAIN]->(s:Subdomain)` - Domain has subdomain. The INVERSE of BELONGS_TO; both directions are written, so traverse whichever reads better and never assume only one exists
 - `(ed:ExternalDomain)-[:DISCOVERED_BY]->(d:Domain)` - A foreign domain encountered during this domain's recon. Points BACK at the domain that found it, so an ExternalDomain is attributable rather than orphaned
-- `(s:Subdomain)-[:RESOLVES_TO {record_type, timestamp, last_seen_at, first_seen, last_seen, discovered_via}]->(i:IP)` - Subdomain resolves to IP (DNS). Exactly ONE edge per Subdomain->IP pair, whichever tool found it; its properties describe the resolution and may be absent. record_type is A or AAAA; OTX passive_dns adds first_seen/last_seen (earliest/latest passive-DNS sighting); discovered_via = 'vhost_sni_enum' marks an edge a vhost/SNI probe created before that was stopped; the probe no longer writes this edge at all, and re-probing a pair removes a leftover one that no DNS writer ever corroborated
+- `(s:Subdomain)-[:RESOLVES_TO {record_type, timestamp, last_seen_at, first_seen, last_seen, discovered_via, source}]->(i:IP)` - Subdomain resolves to IP (DNS). Exactly ONE edge per Subdomain->IP pair, whichever tool found it; its properties describe the resolution and may be absent. record_type is A or AAAA; OTX passive_dns adds first_seen/last_seen (earliest/latest passive-DNS sighting); discovered_via = 'vhost_sni_enum' marks an edge a vhost/SNI probe created before that was stopped; the probe no longer writes this edge at all, and re-probing a pair removes a leftover one that no DNS writer ever corroborated. source = 'shodan_rdns' (Shodan's reverse DNS: the IP's PTR names the host) or 'shodan_dns' (Shodan's domain-DNS records) marks an edge Shodan created, which is NOT current forward DNS: to ask "what does this name resolve to now", skip it with `WHERE NOT coalesce(r.source, '') STARTS WITH 'shodan_'`. An edge with no source is forward DNS (or older), and a DNS resolution of the same pair removes the Shodan source
 - `(i:IP)-[:HAS_PORT]->(p:Port)` - IP has open Port
 - `(p:Port)-[:RUNS_SERVICE]->(svc:Service)` - Port runs Service
 - `(i:IP)-[:HAS_TRACEROUTE]->(tr:Traceroute)` - IP has network route data
@@ -1205,6 +1253,7 @@ hostname directly (nuclei vulns aren't linked to Domain/Subdomain via HAS_VULNER
 
 ### JS Recon Relationships (hierarchical: parent -> file -> findings)
 - `(b:BaseURL)-[:HAS_JS_FILE]->(jf:JsReconFinding {finding_type: 'js_file'})` - BaseURL has analyzed JS file (pipeline crawl)
+- `(s:Subdomain)-[:HAS_JS_FILE]->(jf:JsReconFinding {finding_type: 'js_file'})` - in-scope Subdomain has analyzed JS file when its host has no BaseURL
 - `(d:Domain)-[:HAS_JS_FILE]->(jf:JsReconFinding {finding_type: 'js_file'})` - Domain has analyzed JS file (uploaded files)
 - `(jf:JsReconFinding {finding_type: 'js_file'})-[:HAS_JS_FINDING]->(f:JsReconFinding)` - File has finding (dep confusion, DOM sink, etc.)
 - `(jf:JsReconFinding {finding_type: 'js_file'})-[:HAS_SECRET]->(s:Secret)` - File has secret (source='js_recon')

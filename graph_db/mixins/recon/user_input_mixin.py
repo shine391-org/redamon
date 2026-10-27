@@ -349,4 +349,9 @@ class UserInputMixin:
             if stats["errors"]:
                 print(f"[!][graph-db] Partial discovery: {len(stats['errors'])} errors")
 
+        try:
+            stats["wildcard_zones_stamped"] = self.update_graph_wildcard_zones(
+                recon_data, user_id, project_id)
+        except Exception as e:
+            stats["errors"].append(f"Wildcard zone stamp failed: {e}")
         return stats

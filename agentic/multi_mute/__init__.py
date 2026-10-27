@@ -56,7 +56,7 @@ POOL_EXTRA_FIELDS = (
     "matcher_name", "raw_request", "fuzzing_parameter",
     "missing_header", "provider", "technique", "vector", "vulnerability_type",
     "ai_owasp_llm_id", "payload_class",
-    "matched_text", "sample", "location", "path",
+    "matched_text", "sample", "context", "location", "path",
     "target_port", "solution_type",
     "cwe_ids",
     "source_tool",

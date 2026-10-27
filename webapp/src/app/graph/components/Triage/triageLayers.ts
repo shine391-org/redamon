@@ -41,6 +41,12 @@ export interface TriageFinding {
   source: string
   location?: string
   host?: string
+  /** Read by the disposition only; absent from an agent older than them. */
+  public_client_key?: boolean | null
+  secret_type?: string | null
+  /** The disposition a v3.10 run stored, which the board shows when it is whole. */
+  triage_disposition?: string | null
+  triage_blocker?: string | null
   /** Which of the board's four sections this row belongs in. Decided by the
    *  server so the client cannot disagree with it. */
   section?: number

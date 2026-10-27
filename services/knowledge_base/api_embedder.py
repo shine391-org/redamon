@@ -37,7 +37,7 @@ class APIEmbedder:
         api_key: str | None = None,
         base_url: str | None = None,
     ):
-        self.model = model or os.getenv("KB_EMBEDDING_API_MODEL", "text-embedding-3-small")
+        self.model = model or os.getenv("KB_EMBEDDING_API_MODEL") or "text-embedding-3-small"
         self.api_key = api_key or os.getenv("KB_EMBEDDING_API_KEY")
         self.base_url = base_url or os.getenv("KB_EMBEDDING_API_BASE_URL") or None
         if not self.api_key:

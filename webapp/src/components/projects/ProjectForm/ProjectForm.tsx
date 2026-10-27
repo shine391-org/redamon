@@ -30,7 +30,7 @@ import { clearRoeEntry, roeEntryBusy, useRoeEntry } from '@/components/roe/roePa
 import { mergeServerRow } from '@/components/roe/mergeServerRow'
 import { postUserSkillsChanged, useUserSkillsChanged } from '@/lib/userSkillsChannel'
 import type { PartialReconParams, PartialReconState } from '@/lib/recon-types'
-import { PARTIAL_RECON_PHASE_MAP } from '@/lib/recon-types'
+import { PARTIAL_RECON_TOTAL_PHASES } from '@/lib/recon-types'
 import type { ReconStatus } from '@/lib/recon-types'
 import { WORKFLOW_TOOLS } from './WorkflowView/workflowDefinition'
 import { MINIMAL_DEFAULTS } from './formDefaults'
@@ -47,6 +47,7 @@ import { MasscanSection } from './sections/MasscanSection'
 import { NmapSection } from './sections/NmapSection'
 import { TlsxSection } from './sections/TlsxSection'
 import { HttpxSection } from './sections/HttpxSection'
+import { IpAttributionSection } from './sections/IpAttributionSection'
 import { NucleiSection } from './sections/NucleiSection'
 import { KatanaSection } from './sections/KatanaSection'
 import { OpenApiSection } from './sections/OpenApiSection'
@@ -1329,7 +1330,10 @@ export function ProjectForm({
         )}
 
         {activeTab === 'http' && viewMode === 'tabs' && (
-          <HttpxSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('Httpx') : undefined} />
+          <>
+            <HttpxSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('Httpx') : undefined} />
+            <IpAttributionSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('IpAttribution') : undefined} />
+          </>
         )}
 
         {activeTab === 'resource' && viewMode === 'tabs' && (
@@ -1480,7 +1484,7 @@ export function ProjectForm({
             }
           }}
           title={`Partial Recon: ${WORKFLOW_TOOLS.find(t => t.id === activePartialLogsRun.tool_id)?.label || 'Running'}`}
-          totalPhases={(PARTIAL_RECON_PHASE_MAP[activePartialLogsRun.tool_id || ''] || ['Running']).length}
+          totalPhases={PARTIAL_RECON_TOTAL_PHASES}
           hidePhaseProgress
         />
       )}

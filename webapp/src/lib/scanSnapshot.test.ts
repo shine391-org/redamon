@@ -155,11 +155,31 @@ describe('captureGraphSnapshot', () => {
         records: [
           rec({ startId: 'e1', endId: 'e2', relType: 'RESOLVES_TO', relProps: {} }),
           rec({ startId: 'e2', endId: 'e3', relType: 'HAS_PORT', relProps: { seen: { low: 2, high: 0 } } }),
-          // Endpoint outside the captured node set (e.g. a global CVE node or an
-          // excluded chain node) — must be dropped, exactly like on export.
+          // Endpoint outside the captured node set (an excluded chain node) —
+          // must be dropped, exactly like on export.
           rec({ startId: 'e3', endId: 'eOTHER', relType: 'RUNS_SERVICE', relProps: {} }),
+          // A global CVE node is not captured either, but the LINK to it is
+          // (plan 09.5): a project file must never carry shared reference data.
+          rec({ startId: 'e3', endId: 'eCVE', relType: 'HAS_KNOWN_CVE', relProps: {},
+                endRefLabel: 'CVE', endRefKey: 'CVE-2021-44228' }),
         ],
       })
+  })
+
+  test('the reference node is still not captured, and the link record is (plan 09.5)', async () => {
+    const snap = await captureGraphSnapshot('p1')
+    const [nodeCypher, nodeParams] = mockRun.mock.calls[0]
+    expect(nodeCypher).toContain('NONE(l IN labels(n) WHERE l IN $referenceLabels)')
+    expect(nodeParams.referenceLabels).toEqual(['CVE', 'MitreData', 'Capec'])
+    expect(snap.nodes.some(n => n.labels.includes('CVE'))).toBe(false)
+    const port = snap.nodes.find(n => n.labels[0] === 'Port')!
+    expect(snap.referenceLinks).toEqual([{
+      startExportId: port._exportId, endExportId: null, type: 'HAS_KNOWN_CVE',
+      refLabel: 'CVE', refKey: 'CVE-2021-44228', properties: {},
+    }])
+    expect(snap.linkCount).toBe(2)
+    // And it survives the stored bytes.
+    expect(deserializeSnapshot(serializeSnapshot(snap)).referenceLinks).toEqual(snap.referenceLinks)
   })
 
   test('excludes agent session labels in the node query (F1)', async () => {
@@ -245,6 +265,11 @@ describe('snapshot serialization', () => {
     expect(deserializeSnapshot(gz)).toEqual(payload)
     // Actually gzip, not raw JSON.
     expect(JSON.parse(gunzipSync(gz).toString())).toEqual(payload)
+  })
+
+  test('a snapshot stored before link records restores with none', () => {
+    const back = deserializeSnapshot(serializeSnapshot(payload))
+    expect(back.referenceLinks).toBeUndefined()
   })
 
   test('deserialize tolerates a payload missing either collection', () => {

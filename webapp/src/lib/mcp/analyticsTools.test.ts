@@ -49,6 +49,7 @@ import {
 } from './analyticsTools'
 import type { McpContext } from './tools'
 import { DECLARED_ONLY } from '@/lib/declaredOnly'
+import { isReportCountable, reportBucketCypher, reportCountable } from '@/lib/triage/reportable'
 
 const ctx = (scopes: string[] = ['recon:read']): McpContext => ({
   token: {
@@ -337,5 +338,65 @@ describe('an empty analytics answer explains itself', () => {
     })
     const r = await getBlastRadius(ctx(), 'p1')
     expect(r.notes.join(' ')).not.toMatch(/not the same as/)
+  })
+})
+
+// The board's verdict, as the client report reads it: a person's False positive
+// and a rule-resolved finding leave the counts; an AI-only false positive stays
+// (its reviewer reads target-controlled text). The predicate's semantics are
+// proven on a real graph in src/lib/triage/reportable.integration.test.ts; this
+// pins every finding count here to that same text.
+describe('the counts honour the Priority Board', () => {
+  const FINDING_VARS: [string, string][] = [
+    ['b0', 'criticalVulnerabilities'], ['b1', 'highVulnerabilities'],
+    ['b2', 'mediumVulnerabilities'], ['b3', 'otherVulnerabilities'],
+    ['b4', 'exposedSecrets'], ['b5', 'jsFindings'],
+    ['b6', 'maliciousPackages'], ['b7', 'knownExploits'],
+  ]
+
+  test.each(FINDING_VARS)('%s (%s) carries the report predicate on its own match', (v, key) => {
+    const lines = attackSurfaceCypher().split('\n')
+    const i = lines.findIndex((l) => l.startsWith(`OPTIONAL MATCH (${v}:`))
+    expect(i).toBeGreaterThanOrEqual(0)
+    expect(lines[i]).toContain(reportCountable(v))
+    expect(lines[i + 1]).toContain(`AS ${key}`)
+  })
+
+  test('a likely_noise High is out of the high bucket, an AI-only false positive is in', () => {
+    // The bucket is exactly severity AND stale AND reportCountable, nothing else.
+    expect(attackSurfaceCypher()).toContain(
+      "OPTIONAL MATCH (b1:Vulnerability) WHERE b1.stale_since IS NULL AND " +
+      `toLower(coalesce(b1.severity, '')) = 'high' AND ${reportCountable('b1')}\n`)
+    expect(isReportCountable({ triage_status: 'likely_noise', triage_source: 'human' })).toBe(false)
+    expect(isReportCountable({ triage_state: 'false_positive', triage_decided_by: 'review' })).toBe(true)
+  })
+
+  test('what the board set aside is counted separately, per bucket', () => {
+    const q = attackSurfaceCypher()
+    for (const [key, bucket] of [
+      ['judgedFalsePositiveVulnerabilities', 'person_false_positive'],
+      ['resolvedVulnerabilities', 'resolved'],
+      ['aiFlaggedVulnerabilities', 'ai_flagged'],
+    ]) {
+      const line = q.split('\n').find((l, i, all) => all[i + 1]?.includes(`AS ${key}`))
+      expect(line, key).toBeDefined()
+      expect(line).toMatch(/^OPTIONAL MATCH \(\w+:Vulnerability\) WHERE \w+\.stale_since IS NULL AND /)
+      const v = line!.match(/\((\w+):Vulnerability\)/)![1]
+      expect(line).toContain(`${reportBucketCypher(v)} = '${bucket}'`)
+    }
+  })
+
+  test('a known exploit a person judged false no longer marks a CVE as exploited', () => {
+    for (const q of [EXPLOIT_PATHS_CYPHER, BLAST_RADIUS_CYPHER]) {
+      expect(q).toContain(`WHERE ex.stale_since IS NULL AND ${reportCountable('ex')}\n`)
+    }
+  })
+
+  test('the tool says what it excluded and where it is counted', async () => {
+    const r = await getAttackSurfaceOverview(ctx(), 'p1')
+    const notes = r.notes.join(' ')
+    expect(notes).toMatch(/a person judged a false positive/)
+    expect(notes).toMatch(/judgedFalsePositiveVulnerabilities/)
+    expect(notes).toMatch(/AI review .* still counted/)
   })
 })

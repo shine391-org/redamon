@@ -136,6 +136,10 @@ export const reconPresetSchema = z.object({
   httpProbeAiTitleDetectionEnabled: bool,
   httpProbeAiWappalyzerEnabled: bool,
 
+  // -- IP attribution (shared edge / dedicated / unknown per IP) --
+  ipAttributionEnabled: bool,
+  ipAttributionTlsMaxProbes: int,
+
   // -- Wappalyzer --
   wappalyzerEnabled: bool,
   wappalyzerMinConfidence: int,
@@ -597,7 +601,7 @@ export type ReconPresetParams = z.infer<typeof reconPresetSchema>
 
 export const RECON_PARAMETER_CATALOG = `
 ## Scan Modules & Global
-- scanModules: string[] - Pipeline phases to run. Values: "domain_discovery", "port_scan", "http_probe", "resource_enum", "vuln_scan", "js_recon"
+- scanModules: string[] - Pipeline phases to run. Values: "domain_discovery", "port_scan", "http_probe", "resource_enum", "vuln_scan". JS recon is not one of them: set jsReconEnabled, and keep resource_enum or http_probe on, since it analyzes the JS files those phases found
 - stealthMode: boolean - Reduce scan aggressiveness and network noise
 - aiInPipeline: boolean - Master toggle that enables AI-powered enhancements across all recon modules that support them. Cascades on/off to per-tool AI flags (ffufAiExtensions, nucleiAiTags, wafAiClassifier, nucleiAiResponseFilter, takeoverAiClassifier).
 - aiPipelineModel: string - Model identifier for the AI hooks in recon (e.g. "claude-opus-4-6", "claude-haiku-4-5-20251001"). Independent of agentOpenaiModel.
@@ -708,6 +712,10 @@ export const RECON_PARAMETER_CATALOG = `
 - httpProbeAiFaviconHashEnabled: boolean - Match captured favicon MMH3 hash against the AI frontend catalogue (Open WebUI, LibreChat, Flowise, Dify, Gradio, Streamlit, ComfyUI, …) and set BaseURL.ai_frontend_product_guess
 - httpProbeAiTitleDetectionEnabled: boolean - Regex page title against AI frontend products; fills BaseURL.ai_frontend_product_guess when favicon hash is unknown
 - httpProbeAiWappalyzerEnabled: boolean - Local Wappalyzer fingerprint additions for AI frameworks (LangChain JS marker, vLLM cookie, TGI route, …); rides existing Wappalyzer pass
+
+## IP Attribution
+- ipAttributionEnabled: boolean - After the HTTP probe, tag every IP shared_edge (a CDN edge serving many tenants), dedicated (its default certificate covers a target domain) or unknown. Vhost/SNI, origin discovery, the Shodan/Netlas CVE writers and the Priority Board read the tag. Keep true; it costs one TLS handshake per IP with 443 open
+- ipAttributionTlsMaxProbes: integer - 0-5000. Most TLS handshakes without SNI per scan, one per IP with 443 open, paced at the engagement rate ceiling. 0 means no handshake (the tag then uses only CDN signals already collected); stealth presets should use 0
 
 ## Technology Fingerprinting - Wappalyzer
 - wappalyzerEnabled: boolean
@@ -828,7 +836,7 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - serializedScanJevRank: boolean - Ask TypeSafe AI Jev (jev-1.13.0), per distinct flagged blob, which serialization format it is and how likely it is to be an attacker-reachable sink, to rank the serialized-object candidates for the agent. Only when aiInPipeline=true and serializedScanEnabled=true; needs a Jev token on the owner's account. Annotates and ranks only: never drops a candidate. Default false.
 
 ## JavaScript Analysis - JS Recon (deep)
-- jsReconEnabled: boolean - Run deep JS analysis
+- jsReconEnabled: boolean - Run deep JS analysis. This flag alone switches it on (no scanModules entry); it reads the JS URLs from resource_enum and http_probe
 - jsReconMaxFiles: integer
 - jsReconTimeout: integer - Seconds
 - jsReconConcurrency: integer

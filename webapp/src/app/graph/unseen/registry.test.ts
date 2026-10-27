@@ -102,11 +102,19 @@ describe('ALL_GRAPH_LABELS tracks the graph schema', () => {
   // Skipped in the webapp image, which copies only webapp/.
   const available = existsSync(SCHEMA_PY) && existsSync(SCHEMA_KEYS_PY)
 
+  test('names each label once', () => {
+    expect(ALL_GRAPH_LABELS.length).toBe(new Set(ALL_GRAPH_LABELS).size)
+  })
+
   test.skipIf(!available)('matches the tenant-indexed labels, minus the KB corpus', () => {
     const src = readFileSync(SCHEMA_PY, 'utf8')
+    // CREATE INDEX statements only: a label quoted in a comment or a DROP is
+    // not indexed, and must not keep a label nothing writes on this list.
     const indexed = new Set(
-      [...src.matchAll(/FOR \([a-zA-Z_]+:([A-Za-z][A-Za-z0-9_]*)\)/g)].map(m => m[1]),
+      [...src.matchAll(/"CREATE INDEX \w+ IF NOT EXISTS FOR \([a-zA-Z_]+:([A-Za-z][A-Za-z0-9_]*)\)/g)]
+        .map(m => m[1]),
     )
+    expect(indexed.size, 'no CREATE INDEX statement parsed in schema.py').toBeGreaterThan(20)
     // ...plus every label with a uniqueness key, now declared as data.
     const keysSrc = readFileSync(SCHEMA_KEYS_PY, 'utf8')
     for (const m of keysSrc.matchAll(/"label":\s*"([A-Za-z][A-Za-z0-9_]*)"/g)) {

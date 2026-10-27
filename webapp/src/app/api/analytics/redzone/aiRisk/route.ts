@@ -3,6 +3,7 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 import { DECLARED_ONLY } from '@/lib/declaredOnly'
 import { corroborateAttackFindings, type RawAttackRow } from '@/lib/report/aiAttackFindings'
 
@@ -28,7 +29,7 @@ export async function GET(request: NextRequest) {
     // --- MCP tool-poisoning / exfiltration / annotation findings ---
     const findings = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid, source: 'ai_surface_recon'})
-       WHERE ${notMuted('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (e:Endpoint)-[:HAS_VULNERABILITY]->(v)
        RETURN toString(id(v)) AS nodeId,
               v.severity AS severity, v.type AS type, v.name AS name,
@@ -91,7 +92,7 @@ export async function GET(request: NextRequest) {
     const tested = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid})
        WHERE v.source IN ['garak', 'pyrit', 'giskard', 'promptfoo']
-         AND ${notMuted('v')}
+         AND ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (parent)-[:HAS_VULNERABILITY]->(v)
        // One row per finding even when it has several parents (Endpoint + IP);
        // prefer the most specific parent so corroboration isn't double-counted.

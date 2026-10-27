@@ -2,11 +2,12 @@
 GraphQL Endpoint Discovery Module
 
 Discovers potential GraphQL endpoints from multiple sources:
-1. Explicit patterns (/graphql, /api/graphql, /v1/graphql)
-2. Resource enumeration results
-3. JS Recon findings
-4. HTTP probe results
-5. User-specified endpoints
+1. Explicit patterns (/graphql, /api/graphql, /v1/graphql) on live web roots
+2. Resource enumeration results (resource_enum.by_base_url)
+3. JS Recon endpoints (js_recon.endpoints)
+4. URLScan pages with a GraphQL path (urlscan.urls_with_paths)
+5. HTTP probe results (http_probe.by_url, content_type)
+6. User-specified endpoints
 """
 
 import re
@@ -52,6 +53,13 @@ def discover_graphql_endpoints(combined_result: dict, settings: dict) -> List[st
     """
     Discover potential GraphQL endpoints from multiple sources.
 
+    Every source is read in the shape its writer produces (http_probe.by_url,
+    resource_enum.by_base_url, js_recon.endpoints, urlscan.urls_with_paths);
+    partial recon's graph builder produces the same shapes. Only candidates on
+    a host in this run's scope are kept: a live http_probe host, or a host the
+    run's scope admits. The operator's own GRAPHQL_ENDPOINTS are kept as given.
+    The RoE exclusion list is applied by the caller (scanner.run_graphql_scan).
+
     Args:
         combined_result: The combined recon data
         settings: Project settings
@@ -59,201 +67,208 @@ def discover_graphql_endpoints(combined_result: dict, settings: dict) -> List[st
     Returns:
         List of unique GraphQL endpoint URLs to test
     """
-    discovered_endpoints = set()
+    user_endpoints = set()
+    for endpoint in (settings.get('GRAPHQL_ENDPOINTS', '') or '').split(','):
+        endpoint = endpoint.strip()
+        if endpoint:
+            user_endpoints.add(endpoint)
+            print(f"[+][GraphQL] User-specified endpoint: {endpoint}")
 
-    # 1. User-specified endpoints
-    user_endpoints = settings.get('GRAPHQL_ENDPOINTS', '')
-    if user_endpoints:
-        for endpoint in user_endpoints.split(','):
-            endpoint = endpoint.strip()
-            if endpoint:
-                discovered_endpoints.add(endpoint)
-                print(f"[+][GraphQL] User-specified endpoint: {endpoint}")
-
-    # 2. Extract base URLs from HTTP probe results
+    # Only live, in-scope web roots get pattern guesses: never a URLScan page.
     base_urls = _extract_base_urls(combined_result)
 
-    # 3. Check for GraphQL evidence first
-    graphql_evidence_urls = set()
+    discovered = set()
+    discovered.update(_extract_from_http_probe(combined_result))
+    discovered.update(_extract_from_resource_enum(combined_result))
+    discovered.update(_extract_from_js_recon(combined_result))
+    discovered.update(_extract_from_urlscan(combined_result))
 
-    # Check HTTP probe for GraphQL indicators
-    probe_endpoints = _extract_from_http_probe(combined_result)
-    discovered_endpoints.update(probe_endpoints)
-
-    # Check resource enumeration results
-    resource_endpoints = _extract_from_resource_enum(combined_result, base_urls)
-    discovered_endpoints.update(resource_endpoints)
-
-    # Check JS Recon findings
-    js_endpoints = _extract_from_js_recon(combined_result, base_urls)
-    discovered_endpoints.update(js_endpoints)
-
-    # Extract base URLs that have GraphQL evidence
-    for endpoint in list(discovered_endpoints):
-        parsed = urlparse(endpoint)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        graphql_evidence_urls.add(base)
-
-    # 4. Generate pattern-based endpoints intelligently
+    # A base URL with GraphQL evidence gets the less common patterns too.
+    evidence = {_origin(endpoint) for endpoint in discovered}
     for base_url in base_urls:
-        if base_url in graphql_evidence_urls:
-            # We have evidence, try more patterns
-            patterns_to_try = PRIMARY_GRAPHQL_PATTERNS + SECONDARY_GRAPHQL_PATTERNS
-        else:
-            # No evidence, only try the most common patterns
-            patterns_to_try = PRIMARY_GRAPHQL_PATTERNS
+        patterns = PRIMARY_GRAPHQL_PATTERNS
+        if base_url in evidence:
+            patterns = PRIMARY_GRAPHQL_PATTERNS + SECONDARY_GRAPHQL_PATTERNS
+        for pattern in patterns:
+            discovered.add(urljoin(base_url, pattern))
 
-        for pattern in patterns_to_try:
-            endpoint_url = urljoin(base_url, pattern)
-            discovered_endpoints.add(endpoint_url)
-
-    # 5. All extraction already done above
-
-    # Remove duplicates and sort
-    unique_endpoints = sorted(list(discovered_endpoints))
+    admits = _scope_admits(combined_result)
+    out_of_scope = sorted(e for e in discovered if not admits(urlparse(e).hostname or ''))
+    if out_of_scope:
+        print(f"[-][GraphQL] Scope: skipped {len(out_of_scope)} candidate(s) on hosts outside this run")
+    unique_endpoints = sorted((discovered - set(out_of_scope)) | user_endpoints)
 
     print(f"[+][GraphQL] Discovered {len(unique_endpoints)} potential endpoints")
     return unique_endpoints
 
 
+_GRAPHQL_PATH_HINTS = ('graphql', 'gql', 'query')
+_GRAPHQL_PARAM_NAMES = {'query', 'mutation', 'variables', 'operationname'}
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _live_hosts(combined_result: dict) -> Set[str]:
+    return {
+        (urlparse(url).hostname or '').lower()
+        for url in (combined_result.get('http_probe') or {}).get('by_url', {}) or {}
+    } - {''}
+
+
+def _scope_admits(combined_result: dict):
+    """host -> bool: a live http_probe host, or one this run's scope admits
+    (the group's scope from its metadata; a partial run's roots)."""
+    from recon.helpers.recon_scope import recon_scope
+
+    live = _live_hosts(combined_result)
+    scope = recon_scope(combined_result)
+    roots = [str(r).strip().strip('.').lower()
+             for r in combined_result.get('domains') or [] if str(r).strip()]
+
+    def admits(host: str) -> bool:
+        host = (host or '').strip().strip('.').lower()
+        if not host:
+            return False
+        if host in live or scope.admits(host):
+            return True
+        return any(host == root or host.endswith('.' + root) for root in roots)
+
+    return admits
+
+
 def _extract_base_urls(combined_result: dict) -> Set[str]:
-    """Extract unique base URLs from HTTP probe results."""
+    """Unique base URLs of the live web roots http_probe found."""
     base_urls = set()
-
-    # From HTTP probe
-    http_probe = combined_result.get('http_probe', {})
-    for url in http_probe.get('by_url', {}):
+    http_probe = combined_result.get('http_probe', {}) or {}
+    for url in http_probe.get('by_url', {}) or {}:
         parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-        base_urls.add(base_url)
-
-    # From URLScan if available
-    urlscan = combined_result.get('urlscan', {})
-    for domain_data in urlscan.get('by_domain', {}).values():
-        for url_info in domain_data.get('urls', []):
-            url = url_info.get('url', '')
-            if url:
-                parsed = urlparse(url)
-                base_url = f"{parsed.scheme}://{parsed.netloc}"
-                base_urls.add(base_url)
-
+        if parsed.scheme and parsed.netloc:
+            base_urls.add(f"{parsed.scheme}://{parsed.netloc}")
     return base_urls
 
 
-def _extract_from_resource_enum(combined_result: dict, base_urls: Set[str]) -> Set[str]:
-    """Extract GraphQL endpoints from resource enumeration results."""
+def _extract_from_resource_enum(combined_result: dict) -> Set[str]:
+    """GraphQL endpoints from resource_enum.by_base_url[base].endpoints[path]:
+    a path that names GraphQL (any method: GET is allowed by many servers), or
+    one that takes GraphQL's own parameters (query, variables, ...)."""
     graphql_endpoints = set()
-
-    resource_enum = combined_result.get('resource_enum', {})
-
-    # Check discovered endpoints
-    for base_url in base_urls:
-        endpoints = resource_enum.get('endpoints', {}).get(base_url, [])
-        for endpoint in endpoints:
-            path = endpoint.get('path', '')
-            method = endpoint.get('method', 'GET')
-
-            # Check if path suggests GraphQL
-            if any(pattern in path.lower() for pattern in ['graphql', 'gql', 'query']):
-                # GraphQL typically uses POST
-                if method == 'POST':
-                    endpoint_url = urljoin(base_url, path)
-                    graphql_endpoints.add(endpoint_url)
-                    print(f"[+][GraphQL] Found from resource enum: {endpoint_url}")
-
-    # Check parameters that might indicate GraphQL
-    parameters = resource_enum.get('parameters', {})
-    for base_url, params in parameters.items():
-        for param in params:
-            param_name = param.get('name', '').lower()
-            if param_name in ['query', 'mutation', 'variables', 'operationname']:
-                # This endpoint accepts GraphQL-like parameters
-                graphql_endpoints.add(base_url)
-                print(f"[+][GraphQL] Found from parameters: {base_url}")
-                break
-
+    by_base = (combined_result.get('resource_enum') or {}).get('by_base_url') or {}
+    for base_url, base_data in by_base.items():
+        endpoints = (base_data or {}).get('endpoints') or {}
+        for path, endpoint in endpoints.items():
+            endpoint = endpoint or {}
+            path = endpoint.get('path') or path
+            if not path:
+                continue
+            url = urljoin(base_url, path)
+            if any(hint in path.lower() for hint in _GRAPHQL_PATH_HINTS):
+                graphql_endpoints.add(url)
+                print(f"[+][GraphQL] Found from resource enum: {url}")
+                continue
+            params = endpoint.get('parameters') or {}
+            names = {
+                str((p or {}).get('name', '')).lower()
+                for kind in ('query', 'body', 'path')
+                for p in params.get(kind) or []
+            }
+            if names & _GRAPHQL_PARAM_NAMES:
+                graphql_endpoints.add(url)
+                print(f"[+][GraphQL] Found from parameters: {url}")
     return graphql_endpoints
 
 
-def _extract_from_js_recon(combined_result: dict, base_urls: Set[str]) -> Set[str]:
-    """Extract GraphQL endpoints from JS Recon findings."""
+def _extract_from_js_recon(combined_result: dict) -> Set[str]:
+    """GraphQL endpoints JS Recon found in the bundles (js_recon.endpoints).
+
+    A relative path is joined to the origin of the script that named it, never
+    to every base URL; an absolute one is kept as found and judged by scope.
+    """
     graphql_endpoints = set()
+    for endpoint in (combined_result.get('js_recon') or {}).get('endpoints') or []:
+        endpoint = endpoint or {}
+        kind = endpoint.get('type', '')
+        path = endpoint.get('full_url') or endpoint.get('path') or ''
+        if kind not in ('graphql', 'graphql_introspection') and 'graphql' not in path.lower():
+            continue
+        if not path:
+            continue
+        if path.startswith(('http://', 'https://')):
+            url = path
+        else:
+            source = endpoint.get('source_js') or ''
+            if not source.startswith(('http://', 'https://')):
+                continue  # an uploaded bundle names no host
+            url = urljoin(_origin(source), path)
+        graphql_endpoints.add(url)
+        print(f"[+][GraphQL] Found from JS recon: {url}")
+    return graphql_endpoints
 
-    js_recon = combined_result.get('js_recon', {})
-    findings = js_recon.get('findings', [])
 
-    for finding in findings:
-        finding_type = finding.get('type', '')
-
-        # Check for GraphQL-specific findings
-        if finding_type in ['graphql', 'graphql_introspection']:
-            path = finding.get('path', '')
-            method = finding.get('method', 'POST')
-
-            # Try to construct full URL
-            if path.startswith('http'):
-                graphql_endpoints.add(path)
-                print(f"[+][GraphQL] Found from JS recon: {path}")
-            else:
-                # Try to match with base URLs
-                for base_url in base_urls:
-                    endpoint_url = urljoin(base_url, path)
-                    graphql_endpoints.add(endpoint_url)
-
-        # Also check for GraphQL in endpoint findings
-        elif finding_type == 'rest' and 'graphql' in finding.get('path', '').lower():
-            path = finding.get('path', '')
-            if path.startswith('http'):
-                graphql_endpoints.add(path)
-            else:
-                for base_url in base_urls:
-                    endpoint_url = urljoin(base_url, path)
-                    graphql_endpoints.add(endpoint_url)
-
+def _extract_from_urlscan(combined_result: dict) -> Set[str]:
+    """GraphQL paths URLScan saw on in-scope pages (urlscan.urls_with_paths).
+    Its `entries` include out-of-scope pages, so they are never read."""
+    graphql_endpoints = set()
+    for row in (combined_result.get('urlscan') or {}).get('urls_with_paths') or []:
+        row = row or {}
+        path = row.get('path') or ''
+        base = row.get('base_url') or ''
+        if base and any(hint in path.lower() for hint in ('graphql', 'gql')):
+            url = urljoin(base, path)
+            graphql_endpoints.add(url)
+            print(f"[+][GraphQL] Found from URLScan: {url}")
     return graphql_endpoints
 
 
 def _extract_from_http_probe(combined_result: dict) -> Set[str]:
-    """Extract endpoints that show GraphQL indicators in responses."""
+    """Endpoints whose response says GraphQL, plus the common paths on each
+    live URL as candidates to test."""
     graphql_endpoints = set()
 
-    http_probe = combined_result.get('http_probe', {})
-
-    # Check response headers and content for GraphQL indicators
-    for url, probe_data in http_probe.get('by_url', {}).items():
-        headers = probe_data.get('headers', {})
-
-        # Check Content-Type header
-        content_type = headers.get('content-type', '').lower()
+    http_probe = combined_result.get('http_probe', {}) or {}
+    for url, probe_data in (http_probe.get('by_url', {}) or {}).items():
+        probe_data = probe_data or {}
+        content_type = str(probe_data.get('content_type') or '').lower()
         if 'graphql' in content_type:
             graphql_endpoints.add(url)
-            print(f"[+][GraphQL] Found from Content-Type header: {url}")
+            print(f"[+][GraphQL] Found from Content-Type: {url}")
             continue
 
-        # Check if response body contains GraphQL indicators
-        # Note: In real implementation, we'd need to fetch and check response bodies
-        # For now, we'll check common GraphQL paths on live URLs
-        if probe_data.get('status_code', 0) < 400:
+        if (probe_data.get('status_code') or 0) < 400:
             parsed = urlparse(url)
             for pattern in ['/graphql', '/api/graphql', '/query']:
-                potential_endpoint = f"{parsed.scheme}://{parsed.netloc}{pattern}"
-                # We'll add these as candidates to test
-                graphql_endpoints.add(potential_endpoint)
+                graphql_endpoints.add(f"{parsed.scheme}://{parsed.netloc}{pattern}")
 
     return graphql_endpoints
 
 
+def roe_settings_for(combined_result: dict, settings: dict) -> dict:
+    """The RoE exclusion settings: the run's own settings, falling back to the
+    copy a partial-recon graph builder stamps in metadata.roe."""
+    if settings.get('ROE_ENABLED', False):
+        return {'ROE_ENABLED': True, 'ROE_EXCLUDED_HOSTS': list(settings.get('ROE_EXCLUDED_HOSTS') or [])}
+    meta_roe = (combined_result.get('metadata') or {}).get('roe') or {}
+    return {'ROE_ENABLED': bool(meta_roe.get('ROE_ENABLED')),
+            'ROE_EXCLUDED_HOSTS': list(meta_roe.get('ROE_EXCLUDED_HOSTS') or [])}
+
+
 def filter_by_roe(endpoints: List[str], roe_settings: dict) -> List[str]:
     """
-    Filter endpoints by Rules of Engagement (RoE).
+    Filter endpoints by Rules of Engagement (RoE), with the pipeline's one
+    matcher (roe_scope._is_roe_excluded): CIDRs and IPs, a domain that covers
+    its subdomains, `*.domain` for subdomains only, case and port ignored.
 
     Args:
         endpoints: List of discovered endpoints
-        roe_settings: RoE settings from project
+        roe_settings: {'ROE_ENABLED', 'ROE_EXCLUDED_HOSTS'}
 
     Returns:
         List of in-scope endpoints
     """
+    from recon.helpers.roe_scope import _is_roe_excluded
+
     if not roe_settings.get('ROE_ENABLED', False):
         return endpoints
 
@@ -261,33 +276,11 @@ def filter_by_roe(endpoints: List[str], roe_settings: dict) -> List[str]:
     if not excluded_hosts:
         return endpoints
 
-    filtered_endpoints = []
-    excluded_count = 0
-
-    for endpoint in endpoints:
-        # Parse the endpoint URL to get the hostname
-        parsed = urlparse(endpoint)
-        hostname = parsed.hostname or parsed.netloc
-
-        # Check if hostname matches any excluded pattern
-        is_excluded = False
-        for excluded in excluded_hosts:
-            # Support wildcards: *.example.com
-            if excluded.startswith('*.'):
-                domain = excluded[2:]
-                if hostname == domain or hostname.endswith('.' + domain):
-                    is_excluded = True
-                    break
-            # Exact match
-            elif hostname == excluded:
-                is_excluded = True
-                break
-
-        if not is_excluded:
-            filtered_endpoints.append(endpoint)
-        else:
-            excluded_count += 1
-
+    filtered_endpoints = [
+        e for e in endpoints
+        if not _is_roe_excluded(urlparse(e).hostname or urlparse(e).netloc, excluded_hosts)
+    ]
+    excluded_count = len(endpoints) - len(filtered_endpoints)
     if excluded_count > 0:
         print(f"[-][GraphQL] RoE: excluded {excluded_count} out-of-scope endpoint(s)")
 

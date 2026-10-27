@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef, memo } from 'react'
 import { Loader2, AlertTriangle, Copy, Check } from 'lucide-react'
 import { ExternalLink } from '@/components/ui'
+import { copyText } from '@/lib/copyText'
 import styles from './JsReconTable.module.css'
 import { ColumnFilterButton, ActiveFilterChips } from '../ColumnFilterPanel'
 import { useRedZoneFilters, type RedZoneFilterColumn } from '../RedZoneTables/useRedZoneFilters'
@@ -16,6 +17,7 @@ import {
 } from '../RedZoneTables/updatedAt'
 import { NODE_ID_KEY, NodeIdCell, NodeIdTh, withNodeId } from '../RedZoneTables/nodeId'
 import { MuteNodeButton, useMuteNodeContext } from '../MuteNode'
+import { type ValidationTone, validationLabel, validationRank, validationTone } from '@/lib/secrets/validationStatus'
 import {
   timestampSlug,
   downloadStreaming,
@@ -259,15 +261,18 @@ function sevBadge(severity: string) {
   return <span className={`${styles.badge} ${cls}`}>{severity}</span>
 }
 
-function valBadge(status: string) {
-  if (status === 'validated') return <span className={`${styles.badge} ${styles.badgeLive}`}>LIVE</span>
-  if (status === 'format_validated') return <span className={`${styles.badge} ${styles.badgeFormatValid}`}>format ok</span>
-  if (status === 'invalid') return <span className={`${styles.badge} ${styles.badgeInvalid}`}>invalid</span>
-  return <span className={`${styles.badge} ${styles.badgeUnvalidated}`}>{status || 'n/a'}</span>
+const TONE_BADGE: Record<ValidationTone, string> = {
+  live: styles.badgeLive,
+  warn: styles.badgeFormatValid,
+  dead: styles.badgeInvalid,
+  none: styles.badgeUnvalidated,
 }
 
-const VALIDATION_PRIORITY: Record<string, number> = {
-  validated: 0, format_validated: 1, incomplete: 2, unvalidated: 3, skipped: 4, invalid: 5,
+function valBadge(status: string) {
+  if (!status) return <span className={`${styles.badge} ${styles.badgeUnvalidated}`}>n/a</span>
+  return (
+    <span className={`${styles.badge} ${TONE_BADGE[validationTone(status)]}`}>{validationLabel(status)}</span>
+  )
 }
 const SEVERITY_PRIORITY: Record<string, number> = {
   critical: 0, high: 1, medium: 2, low: 3, info: 4,
@@ -275,8 +280,8 @@ const SEVERITY_PRIORITY: Record<string, number> = {
 
 function sortSecrets(rows: any[]): any[] {
   return [...rows].sort((a, b) => {
-    const va = VALIDATION_PRIORITY[a.validation?.status ?? 'unvalidated'] ?? 3
-    const vb = VALIDATION_PRIORITY[b.validation?.status ?? 'unvalidated'] ?? 3
+    const va = validationRank(a.validation?.status)
+    const vb = validationRank(b.validation?.status)
     if (va !== vb) return va - vb
     const sa = SEVERITY_PRIORITY[a.severity ?? 'info'] ?? 4
     const sb = SEVERITY_PRIORITY[b.severity ?? 'info'] ?? 4
@@ -454,7 +459,7 @@ function filterRows(rows: readonly any[], search: string): any[] {
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(text).then(() => {
+    copyText(text).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     })

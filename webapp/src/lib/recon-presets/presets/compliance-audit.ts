@@ -77,6 +77,7 @@ Security teams running compliance audits, blue teamers validating hardening base
 
     // --- httpx: all probes enabled for header auditing ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,

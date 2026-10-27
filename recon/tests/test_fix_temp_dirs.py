@@ -338,7 +338,8 @@ def _run_puredns(subs, fake_run):
     with mock.patch.object(dr, "_source_skipped", return_value=False), \
          mock.patch.object(dr, "_source_record"), \
          mock.patch.object(dr.subprocess, "run", side_effect=fake_run):
-        return dr.run_puredns_resolve(list(subs), _PUREDNS_DOMAIN, {"PUREDNS_ENABLED": True})
+        names, _status = dr.run_puredns_resolve(list(subs), _PUREDNS_DOMAIN, {"PUREDNS_ENABLED": True})
+        return names
 
 
 class TestPurednsTempFiles:

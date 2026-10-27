@@ -128,6 +128,125 @@ class LiveFactQueriesCase(unittest.TestCase):
         rows = {r["id"]: r for r in self._run(query)}
         self.assertEqual(rows["sec"]["validation_info"], VALIDATION_INFO)
 
+    def test_different_secrets_of_one_category_on_one_host_are_separate_groups(self):
+        from cypherfix_triage import grouping
+        from cypherfix_triage.fact_queries import FINDING_QUERIES
+
+        with self.driver.session() as s:
+            s.run("""
+                UNWIND $rows AS row
+                CREATE (x:Secret {id: row.id, source: 'js_recon', key_type: 'cloud',
+                                  secret_type: row.type, matched_text: row.value,
+                                  sample: 'redacted', base_url: row.host,
+                                  user_id: $u, project_id: $p, updated_at: datetime()})
+                """, u=self.uid, p=self.pid, rows=[
+                {"id": "gk", "type": "GCP API Key", "value": "AIzaSyD-EXAMPLEKEY0000000000000000000",
+                 "host": "https://app.factq.test"},
+                {"id": "ak", "type": "AWS Access Key ID", "value": "AKIAIOSFODNN7EXAMPLE",
+                 "host": "https://app.factq.test"},
+                {"id": "ak2", "type": "AWS Access Key ID", "value": "AKIAIOSFODNN7EXAMPLE",
+                 "host": "https://cdn.factq.test"},
+            ])
+        query = next(q for q in FINDING_QUERIES if q["name"] == "secrets")["query"]
+        rows = {r["id"]: r for r in self._run(query)}
+        keys = {i: grouping.group_key(rows[i]) for i in ("gk", "ak", "ak2")}
+        self.assertNotEqual(keys["gk"], keys["ak"])
+        self.assertEqual(keys["ak"], keys["ak2"])
+        self.assertEqual(rows["gk"]["detector_name"], "GCP API Key")
+
+    def _gone(self):
+        from cypherfix_triage.fact_queries import PROJECT_FACT_QUERIES
+
+        query = next(q for q in PROJECT_FACT_QUERIES if q["name"] == "gone_hosts")["query"]
+        rows = self._run(query)
+        self.assertEqual(len(rows), 1)
+        return set(rows[0]["hosts"])
+
+    def test_an_ip_a_subdomain_resolves_to_is_not_gone(self):
+        # No open port and no endpoint, but DNS still points at it.
+        with self.driver.session() as s:
+            s.run("""
+                CREATE (sd:Subdomain {name: 'www.factq.test', user_id: $u, project_id: $p})
+                CREATE (ip:IP {address: '192.0.2.10', user_id: $u, project_id: $p})
+                CREATE (sd)-[:RESOLVES_TO]->(ip)
+                CREATE (:IP {address: '192.0.2.11', user_id: $u, project_id: $p})
+                CREATE (:Subdomain {name: 'old.factq.test', user_id: $u, project_id: $p})
+                """, u=self.uid, p=self.pid)
+        gone = self._gone()
+        self.assertNotIn("192.0.2.10", gone)
+        self.assertNotIn("www.factq.test", gone)
+        # Controls: nothing resolves to or from these, no port, no endpoint.
+        self.assertIn("192.0.2.11", gone)
+        self.assertIn("old.factq.test", gone)
+
+    def test_a_host_the_run_skipped_is_unknown_not_gone(self):
+        with self.driver.session() as s:
+            s.run("""
+                CREATE (:Domain {name: 'factq.test', user_id: $u, project_id: $p,
+                                 recon_skipped_hosts: ['Skipped.factq.test:443',
+                                                       '[2001:db8::5]:8443', '192.0.2.12']})
+                CREATE (:Subdomain {name: 'skipped.factq.test', user_id: $u, project_id: $p})
+                CREATE (:IP {address: '2001:db8::5', user_id: $u, project_id: $p})
+                CREATE (:IP {address: '192.0.2.12', user_id: $u, project_id: $p})
+                CREATE (:Subdomain {name: 'unskipped.factq.test', user_id: $u, project_id: $p})
+                """, u=self.uid, p=self.pid)
+            # Another project's coverage record must not shelter this one's hosts.
+            s.run("""
+                CREATE (:Domain {name: 'factq.test', user_id: $u, project_id: $other,
+                                 recon_skipped_hosts: ['unskipped.factq.test:443']})
+                """, u=self.uid, other=self.pid + "_other")
+        try:
+            gone = self._gone()
+        finally:
+            with self.driver.session() as s:
+                s.run("MATCH (n {project_id: $other}) DETACH DELETE n", other=self.pid + "_other")
+        self.assertNotIn("skipped.factq.test", gone)
+        self.assertNotIn("2001:db8::5", gone)
+        self.assertNotIn("192.0.2.12", gone)
+        self.assertIn("unskipped.factq.test", gone)
+
+    def _facts(self, *names):
+        from cypherfix_triage.fact_queries import PROJECT_FACT_QUERIES, build_project_facts
+
+        return build_project_facts({q["name"]: self._run(q["query"])
+                                    for q in PROJECT_FACT_QUERIES if q["name"] in names})
+
+    def test_the_gate_reads_the_skipped_hosts_as_one_normalised_set(self):
+        with self.driver.session() as s:
+            s.run("""
+                CREATE (:Domain {name: 'factq.test', user_id: $u, project_id: $p,
+                                 recon_skipped_hosts: ['Skipped.factq.test:443', '[2001:db8::5]:8443']})
+                CREATE (:Domain {name: 'factq.test', user_id: $u, project_id: $other,
+                                 recon_skipped_hosts: ['other.factq.test:443']})
+                """, u=self.uid, p=self.pid, other=self.pid + "_other")
+        try:
+            facts = self._facts("skipped_hosts")
+        finally:
+            with self.driver.session() as s:
+                s.run("MATCH (n {project_id: $other}) DETACH DELETE n", other=self.pid + "_other")
+        self.assertEqual(facts.skipped_hosts, {"skipped.factq.test", "2001:db8::5"})
+
+    def test_a_name_carries_the_tags_of_the_ips_it_resolves_to(self):
+        with self.driver.session() as s:
+            s.run("""
+                CREATE (own:Subdomain {name: 'own.factq.test', user_id: $u, project_id: $p})
+                CREATE (edge:Subdomain {name: 'edge.factq.test', user_id: $u, project_id: $p})
+                CREATE (mixed:Subdomain {name: 'mixed.factq.test', user_id: $u, project_id: $p})
+                CREATE (d:IP {address: '192.0.2.20', ownership: 'dedicated', user_id: $u, project_id: $p})
+                CREATE (e:IP {address: '198.51.100.20', ownership: 'shared_edge', user_id: $u, project_id: $p})
+                CREATE (n:IP {address: '203.0.113.20', user_id: $u, project_id: $p})
+                CREATE (own)-[:RESOLVES_TO]->(d)
+                CREATE (edge)-[:RESOLVES_TO]->(e)
+                // A PTR answer Shodan recorded is not current DNS.
+                CREATE (edge)-[:RESOLVES_TO {source: 'shodan_rdns'}]->(d)
+                CREATE (mixed)-[:RESOLVES_TO]->(d)
+                CREATE (mixed)-[:RESOLVES_TO]->(n)
+                """, u=self.uid, p=self.pid)
+        facts = self._facts("name_ownership")
+        self.assertEqual(facts.name_ownership, {"own.factq.test": {"dedicated"},
+                                                "edge.factq.test": {"shared_edge"},
+                                                "mixed.factq.test": {"dedicated", ""}})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,7 @@ export async function copyText(text: string): Promise<void> {
       // Fall through to the legacy path.
     }
   }
+  const previousFocus = document.activeElement
   const el = document.createElement('textarea')
   el.value = text
   el.setAttribute('readonly', '')
@@ -29,5 +30,9 @@ export async function copyText(text: string): Promise<void> {
     if (!document.execCommand('copy')) throw new Error('copy failed')
   } finally {
     document.body.removeChild(el)
+    // select() moved focus to the textarea, so removing it leaves focus on
+    // <body>: a Modal's Escape (an onKeyDown on the dialog) stops working and
+    // a keyboard user loses their place. Hand focus back.
+    if (previousFocus instanceof HTMLElement) previousFocus.focus({ preventScroll: true })
   }
 }

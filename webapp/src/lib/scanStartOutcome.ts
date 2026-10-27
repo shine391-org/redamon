@@ -11,13 +11,26 @@
  *   - ANY 409. "Already active for project X" refusals arrive as plain strings
  *     with no limit object, so the status is the only reliable signal.
  *
- * Permanent: everything else, notably 400 (bad config), 404 (missing project),
- * 500 (server error). Nothing about queueing changes those.
+ * Two more classes exist only for a headless caller (the queue's dispatch
+ * route and the scheduler), which says whether the orchestrator answered:
+ *   - unknown: body.startOutcome === 'unknown', checked FIRST. The orchestrator
+ *     did not answer, so the container may or may not exist; retrying blindly
+ *     can start a second scan. Never temporary.
+ *   - transient: an answered 500 or 503, or the webapp's own freeze failure
+ *     (snapshotFailed: nothing started). Retried with backoff, spending an
+ *     attempt; not a capacity wait. A body code that names a configuration
+ *     problem (`spawn_failed`, `not_configured`) stays permanent: it fails
+ *     every retry.
  *
- * Pure: no I/O, no globals. Given (status, body) it always returns the same value.
+ * Permanent: everything else, notably 400 (bad config), 404 (missing project),
+ * 403 (outside the RoE window), and a 500 when the caller did not say the
+ * orchestrator answered (the browser hook keeps that). Nothing about queueing
+ * changes those.
+ *
+ * Pure: no I/O, no globals. Given (status, body, opts) it always returns the same value.
  */
 
-export type StartFailureKind = 'temporary' | 'permanent'
+export type StartFailureKind = 'temporary' | 'transient' | 'unknown' | 'permanent'
 
 /** Mirrors JobQueue.blockedCode so a queued row can record why it is waiting. */
 export type StartBlockedCode =
@@ -26,6 +39,8 @@ export type StartBlockedCode =
   | 'hard'
   | 'activating'
   | 'busy'
+  | 'transient'
+  | 'start_unknown'
 
 export interface StartFailureBody {
   error?: string
@@ -33,7 +48,22 @@ export interface StartFailureBody {
   activationInProgress?: boolean
   snapshotFailed?: boolean
   busy?: string
+  /** 'unknown' when the orchestrator call threw (startFullScan, dispatchStart). */
+  startOutcome?: 'unknown'
+  /** The orchestrator's reason code (orchestratorError.ts). */
+  code?: string
 }
+
+export interface StartFailureOptions {
+  /**
+   * Set by the headless callers only. True when the orchestrator gave an answer
+   * (whatever it was), which is what makes a 5xx safe to retry.
+   */
+  orchestratorAnswered?: boolean
+}
+
+/** Body codes for a refusal no retry can fix. */
+const PERMANENT_CODES = new Set(['spawn_failed', 'not_configured'])
 
 export interface StartFailureClassification {
   kind: StartFailureKind
@@ -63,9 +93,19 @@ export function isCapacityWait(code: string): boolean {
 export function classifyStartFailure(
   status: number | undefined,
   body: StartFailureBody | null | undefined,
+  opts: StartFailureOptions = {},
 ): StartFailureClassification {
   const b = body ?? {}
   const limitType = b.limit?.limitType
+
+  if (b.startOutcome === 'unknown') {
+    return {
+      kind: 'unknown',
+      temporary: false,
+      blockedCode: 'start_unknown',
+      reason: b.error || 'The orchestrator did not answer, so it is unknown whether the scan started.',
+    }
+  }
 
   if (limitType === 'ram') {
     return {
@@ -97,6 +137,18 @@ export function classifyStartFailure(
       temporary: true,
       blockedCode: 'busy',
       reason: b.error || b.busy || 'The project is busy with another scan right now.',
+    }
+  }
+  if (
+    opts.orchestratorAnswered
+    && !(b.code && PERMANENT_CODES.has(b.code))
+    && (b.snapshotFailed || status === 500 || status === 503)
+  ) {
+    return {
+      kind: 'transient',
+      temporary: true,
+      blockedCode: 'transient',
+      reason: b.error || 'The scan could not be started because of a passing error; it will be retried.',
     }
   }
 

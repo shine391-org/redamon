@@ -25,6 +25,7 @@ import styles from '@/components/settings/Settings.module.css'
 import { buildTemplate, templateToJson, validateAndParse, isValidationError } from '@/lib/apiKeysTemplate'
 import type { ParsedImport } from '@/lib/apiKeysTemplate'
 import { ROTATION_TOOL_BY_FIELD, ROTATION_TOOL_NAMES } from '@/lib/rotationTools'
+import { copyText } from '@/lib/copyText'
 import { useApiUsageReport } from '@/components/settings/api-usage/useApiUsageReport'
 import { ApiUsageControls } from '@/components/settings/api-usage/ApiUsageControls'
 import { ApiUsageReportModal } from '@/components/settings/api-usage/ApiUsageReportModal'
@@ -1910,7 +1911,7 @@ function SystemSection() {
   const [expandedVersions, setExpandedVersions] = useState<Set<string>>(new Set())
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText('./redamon.sh update').then(() => {
+    copyText('./redamon.sh update').then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })

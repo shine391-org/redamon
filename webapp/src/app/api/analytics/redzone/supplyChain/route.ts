@@ -3,6 +3,7 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -33,7 +34,7 @@ export async function GET(request: NextRequest) {
   try {
     const result = await session.run(
       `MATCH (j:JsReconFinding {project_id: $pid})
-       WHERE j.finding_type IN $types AND ${notMuted('j')}
+       WHERE j.finding_type IN $types AND ${notMuted('j')} AND ${reportCountable('j')}
        OPTIONAL MATCH (bu:BaseURL)-[:HAS_JS_FILE]->(parent:JsReconFinding {finding_type: 'js_file'})-[:HAS_JS_FINDING]->(j)
        OPTIONAL MATCH (buDirect:BaseURL)-[:HAS_JS_FILE]->(j)
        OPTIONAL MATCH (sd:Subdomain)-[:HAS_BASE_URL]->(bu)

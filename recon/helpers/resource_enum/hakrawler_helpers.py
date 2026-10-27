@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from recon.helpers.docker_helpers import pull_image_or_use_local
+from recon.helpers.js_recon.urls import is_js_url
 from recon.helpers.resource_enum import tool_health
 
 
@@ -61,9 +62,13 @@ def _crawl_single_url(
     urls_lock: threading.Lock,
     max_urls: int,
     health: Optional[dict] = None,
+    js_urls: Optional[set] = None,
 ) -> Tuple[set, int, list]:
     """
     Crawl a single URL with Hakrawler. Thread-safe via shared_urls + lock.
+
+    ``js_urls``, when given, collects every in-scope JS URL before the exclude
+    filter (under the lock), for js_recon and jsluice; see run_katana_crawler.
 
     A seed that printed nothing is classified (tool_health): a non-zero exit, a
     watchdog kill or error output counts in `health["failed"]` (under the lock),
@@ -193,6 +198,10 @@ def _crawl_single_url(
                 except Exception:
                     continue
 
+                if js_urls is not None and is_js_url(url):
+                    with urls_lock:
+                        js_urls.add(url)
+
                 url_lower = url.lower()
                 if any(pattern.lower() in url_lower for pattern in exclude_patterns):
                     continue
@@ -290,6 +299,7 @@ def run_hakrawler_crawler(
     print(f"[*][Hakrawler] Allowed hosts: {len(allowed_hosts)} ({', '.join(sorted(allowed_hosts)[:5])}{'...' if len(allowed_hosts) > 5 else ''})")
 
     discovered_urls = set()
+    js_found = set()
     filtered_out_of_scope = 0
     external_domain_entries = []
     urls_lock = threading.Lock()
@@ -297,7 +307,7 @@ def run_hakrawler_crawler(
 
     valid_urls = _crawlable_urls(target_urls)
     if not valid_urls:
-        return [], {"external_domains": [], "failed": False, "failed_seeds": 0}
+        return [], {"external_domains": [], "failed": False, "failed_seeds": 0, "js_urls": []}
 
     # Skip a seed whose host another module already found unreachable: each
     # crawl otherwise costs its full per-seed timeout against a dead host. The
@@ -308,7 +318,7 @@ def run_hakrawler_crawler(
     live_urls = [u for u in valid_urls if not _scope.skip_if_down(u)]
     if not live_urls:
         _scope.finish("resource_enum", host_source="resource_enum")
-        return [], {"external_domains": [], "failed": False, "failed_seeds": 0}
+        return [], {"external_domains": [], "failed": False, "failed_seeds": 0, "js_urls": []}
 
     max_workers = min(parallelism, len(live_urls))
 
@@ -318,7 +328,7 @@ def run_hakrawler_crawler(
                 _crawl_single_url,
                 url, docker_image, depth, threads, timeout,
                 include_subs, insecure, allowed_hosts, custom_headers,
-                exclude_patterns, discovered_urls, urls_lock, max_urls, health,
+                exclude_patterns, discovered_urls, urls_lock, max_urls, health, js_found,
             ): url
             for url in live_urls
         }
@@ -345,7 +355,8 @@ def run_hakrawler_crawler(
               f"clean exit")
 
     return urls_list, {"external_domains": external_domain_entries,
-                       "failed": health["failed"] > 0, "failed_seeds": health["failed"]}
+                       "failed": health["failed"] > 0, "failed_seeds": health["failed"],
+                       "js_urls": sorted(js_found)}
 
 
 def pull_hakrawler_docker_image(docker_image: str) -> bool:

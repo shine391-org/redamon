@@ -14,6 +14,17 @@ from datetime import datetime
 from typing import Optional
 
 
+def _redact_sample(text: str) -> str:
+    """GithubSecret.sample: first and last characters only, as the GitHub hunt
+    (scanners/github_secret_hunt `redact_sample`) and js_recon redact them.
+    The two images cannot share code; tests pin the two equal."""
+    if len(text) > 12:
+        return text[:6] + '...' + text[-4:]
+    if len(text) > 4:
+        return text[:3] + '...'
+    return '***'
+
+
 class SecretMixin:
     @staticmethod
     def _github_digest(*parts: str) -> str:
@@ -454,7 +465,9 @@ class SecretMixin:
                     if details.get("matches"):
                         node_props["matches"] = details["matches"]
                     if details.get("sample"):
-                        node_props["sample"] = details["sample"]
+                        # Artifacts written before the hunt redacted its sample
+                        # hold the raw match; the redaction is idempotent.
+                        node_props["sample"] = _redact_sample(str(details["sample"]))
                     if isinstance(visibility, bool):
                         node_props["repository_public"] = visibility
 
@@ -587,7 +600,8 @@ class SecretMixin:
 
         MUST match scanners/trufflehog_scan/findings.py:digest — the two run in
         different images and cannot import each other, and
-        tests/test_trufflehog_stable_ids.py asserts they agree. Replaces the
+        test_digest_matches_the_scanner_side_implementation in
+        tests/test_trufflehog_graph_scoped_clear.py asserts they agree. Replaces the
         builtin hash(), which is randomised per process via PYTHONHASHSEED and so
         produced a different node id for the same repository on every run. The
         old blanket pre-clear hid that; with source-scoped clearing it would
@@ -601,7 +615,7 @@ class SecretMixin:
 
         Prefers the scanner's own field (it alone knows whether verification was
         switched off for the run); the derivation is only a fallback for findings
-        written before the field existed. 'unvalidated' (checked, dead) and
+        written before the field existed. 'rejected' (checked, dead) and
         'unverified' (never checked) must not collapse — the difference decides
         whether a pentest report can call a credential safe.
         """
@@ -612,7 +626,7 @@ class SecretMixin:
             return "validated"
         if finding.get("verification_error"):
             return "verify_error"
-        return "unvalidated"
+        return "rejected"
 
     def clear_trufflehog_data(self, user_id: str, project_id: str,
                               source: Optional[str] = None) -> dict:
