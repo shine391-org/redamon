@@ -12,6 +12,9 @@ Covers paths the earlier suite did not reach:
 - SSRF edge cases (cloud metadata, IPv6 ULA, link-local)
 - Agentic crawl depth + time bounds
 - Github-repo path joining (no double slash)
+
+The cache, path-joining and HTTP-status cases stub URL admission as well as
+fetching so they do not depend on DNS. Dedicated SSRF cases exercise admission.
 """
 
 from __future__ import annotations
@@ -343,7 +346,8 @@ class TestForceRefresh(unittest.TestCase):
             async def fake_smart(url, **kw):
                 return FetchResult(text="NEW CONTENT", content_type="text/html",
                                    status=200, tier=1)
-            with mock.patch("orchestrator_helpers.tradecraft_lookup.smart_fetch", fake_smart):
+            with mock.patch("orchestrator_helpers.tradecraft_lookup.smart_fetch", fake_smart), \
+                 mock.patch("orchestrator_helpers.tradecraft_lookup.validate_url", return_value=(True, "")):
                 # Without force_refresh: hits cache, returns OLD
                 out_cached = run_async(tool.ainvoke({
                     "resource_id": "h", "section_path": "https://x.com/a.html",
@@ -568,7 +572,8 @@ class TestGithubRepoPathJoining(unittest.TestCase):
                 return FetchResult(text="ok content " * 200,
                                    content_type="text/markdown",
                                    status=200, tier=1)
-            with mock.patch("orchestrator_helpers.tradecraft_lookup.smart_fetch", fake_smart):
+            with mock.patch("orchestrator_helpers.tradecraft_lookup.smart_fetch", fake_smart), \
+                 mock.patch("orchestrator_helpers.tradecraft_lookup.validate_url", return_value=(True, "")):
                 tool = mgr.get_tool()
                 out = run_async(tool.ainvoke({
                     "resource_id": "p", "query": "sql injection",
@@ -605,7 +610,8 @@ class TestVerifyPreflightErrors(unittest.TestCase):
                 tier=1,
                 raw_bytes=b"<html>Not Found</html>",
             )
-        with mock.patch("orchestrator_helpers.tradecraft_lookup.smart_fetch", fake_smart):
+        with mock.patch("orchestrator_helpers.tradecraft_lookup.smart_fetch", fake_smart), \
+             mock.patch("orchestrator_helpers.tradecraft_lookup.validate_url", return_value=(True, "")):
             from orchestrator_helpers.tradecraft_lookup import verify_resource
             result = run_async(verify_resource(
                 "https://example.com/missing.pdf",

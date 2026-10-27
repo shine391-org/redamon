@@ -304,3 +304,6 @@ testing/guinea_pigs/supply_chain_target/.dryrun/
 # use, plus its in-flight temp name if a copy is interrupted
 recon/wordlists/jhaddix-all.txt
 recon/wordlists/.jhaddix-all.txt.*.tmp
+
+# The synthetic AI lab fixture is shared; deployment overrides remain local.
+!agentic/labs/ai-surface/docker-compose.override.yml

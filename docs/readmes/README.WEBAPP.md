@@ -746,3 +746,16 @@ The production image runs as non-root user. Ensure mounted volumes have correct 
 - Configure proper security groups for AWS deployment
 - Implement rate limiting for API endpoints
 - Use HTTPS with proper certificates (ALB handles this)
+
+
+### ESLint with Next.js 16
+
+`npm run lint` runs the ESLint CLI using `webapp/eslint.config.mjs` and the
+installed `eslint-config-next/core-web-vitals` preset. Generated build,
+coverage and distribution output is ignored. The removed `next lint`
+subcommand is not used.
+
+The lint command checks all webapp code and returns a nonzero status for
+errors. It does not suppress existing diagnostics or replace type checking;
+run `npm run type-check` separately. From `webapp/`, a focused check can use
+`npm exec -- eslint <file> ...` with the same configuration.

@@ -77,7 +77,7 @@ its UI `src/components/plugins/` and `src/app/plugins/`; the `plugin-platform` s
 cd webapp
 npm run test          # vitest run --no-file-parallelism (full parallelism OOMs the box)
 npm run type-check    # tsc --noEmit
-npm run lint          # next lint
+npm run lint          # ESLint flat config (Next.js core-web-vitals)
 
 # Prisma schema changes: db push, NOT migrate
 docker compose exec webapp npx prisma db push
