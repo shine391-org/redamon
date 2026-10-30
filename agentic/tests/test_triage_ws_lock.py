@@ -303,6 +303,32 @@ class TestStartDetachedRun(unittest.IsolatedAsyncioTestCase):
                           kwargs["real_actor_user_id"]), ("mcp", "tok1", 1000, "admin"))
         await run.task
 
+    async def test_an_internal_error_names_its_class_and_phase_never_its_text(self):
+        """G-34: every crash read the same; the class and phase tell them apart."""
+        test = self
+
+        class Crashing:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["callback"]
+
+            async def run(self, state):
+                await self.callback.on_phase("reviewing", "Reviewing", 45)
+                raise KeyError("finding a.example.com")
+
+            async def cleanup(self):
+                pass
+
+        import unittest.mock as mock
+        with mock.patch.object(self.wh, "TriageOrchestrator", Crashing):
+            tab = FakeSocket()
+            run, _, _ = self.wh.start_detached_run("u1", P1, socket=tab)
+            await run.task
+        error = [m for m in tab.sent if m["type"] == "error"][-1]["payload"]
+        test.assertEqual(error["code"], "internal_error")
+        test.assertEqual(error["error_class"], "KeyError")
+        test.assertEqual(error["phase"], "reviewing")
+        test.assertNotIn("a.example.com", str(error))
+
     async def test_a_second_start_attaches(self):
         import asyncio
         self.gate = asyncio.Event()

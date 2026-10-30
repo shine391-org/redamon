@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireConversationAccessBySession } from '@/lib/access'
@@ -45,7 +46,6 @@ export async function PATCH(
     if (error?.code === 'P2025') {
       return NextResponse.json({ error: 'Member not found' }, { status: 404 })
     }
-    console.error('Failed to patch fireteam member:', error)
-    return NextResponse.json({ error: 'Failed to patch fireteam member' }, { status: 500 })
+    return internalError(error, 'Failed to patch fireteam member')
   }
 }

@@ -12,6 +12,7 @@ import { requireEffectiveUser } from '@/lib/access'
 import { readJsonBody } from '@/lib/jsonBody'
 import { coerceDoc } from '@/lib/nodeFilters/model'
 import { parsePresetText, presetSummary } from '@/lib/nodeFilters/presets'
+import { withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -24,16 +25,16 @@ async function ownPreset(id: string, userId: string) {
   return row && row.userId === userId ? row : null
 }
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to read the preset', async (_request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
   const row = await ownPreset(id, eff.userId)
   if (!row) return NextResponse.json(NOT_FOUND, { status: 404 })
   return NextResponse.json({ ...presetSummary(row), rules: coerceDoc(row.rules) })
-}
+})
 
-export async function PATCH(request: NextRequest, { params }: RouteParams) {
+export const PATCH = withRouteErrors('Failed to rename the preset', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
@@ -51,9 +52,9 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     data: { name: text.name, description: text.description },
   })
   return NextResponse.json(presetSummary(updated))
-}
+})
 
-export async function DELETE(_request: NextRequest, { params }: RouteParams) {
+export const DELETE = withRouteErrors('Failed to delete the preset', async (_request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -61,4 +62,4 @@ export async function DELETE(_request: NextRequest, { params }: RouteParams) {
   if (!row) return NextResponse.json(NOT_FOUND, { status: 404 })
   await prisma.userMuteRulesPreset.delete({ where: { id } })
   return NextResponse.json({ ok: true })
-}
+})

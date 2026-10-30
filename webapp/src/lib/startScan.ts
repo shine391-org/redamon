@@ -14,7 +14,7 @@ import { loadEngagement } from '@/lib/engagement'
 import { resolveTrufflehogStart } from '@/lib/trufflehogStart'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
-import { startFullScan } from '@/lib/startFullScan'
+import { classifyOrchestratorThrow, startFullScan } from '@/lib/startFullScan'
 import { parseScanMode, type ScanTrigger } from '@/lib/scanTimeline'
 import { legacyGraphDomains, legacyGraphRefusal } from '@/lib/legacyGraph'
 import { resolveScopeGroups } from '@/lib/scopeGroups'
@@ -38,6 +38,10 @@ export interface DispatchStartResult {
   snapshotFailed?: boolean
   /** The orchestrator's (or startFullScan's) reason code, e.g. 'spawn_failed'. */
   code?: string
+  /** The orchestrator's own HTTP status, when it answered with an error. */
+  upstreamStatus?: number
+  /** The errno of a start call that got no answer. */
+  cause?: string
 }
 
 export type StartScanPayload = Record<string, unknown>
@@ -121,6 +125,8 @@ export async function dispatchStart(
       ...(r.startOutcome ? { startOutcome: r.startOutcome } : {}),
       ...(r.snapshotFailed ? { snapshotFailed: true } : {}),
       ...(r.code ? { code: r.code } : {}),
+      ...(r.upstreamStatus ? { upstreamStatus: r.upstreamStatus } : {}),
+      ...(r.cause ? { cause: r.cause } : {}),
     }
   }
 
@@ -261,15 +267,21 @@ export async function dispatchStart(
       body: JSON.stringify(body),
     })
   } catch (err) {
-    // A thrown fetch (timeout, reset) is not a refusal: the orchestrator may
-    // have spawned the container anyway, and partial recon and AI attack allow
-    // parallel runs, so a blind retry could start a duplicate.
     console.error(`[jobQueue] orchestrator start call for ${kind} on ${projectId} failed:`, err)
+    const thrown = classifyOrchestratorThrow(err)
+    const why = { code: thrown.code, ...(thrown.cause ? { cause: thrown.cause } : {}) }
+    if (!thrown.outcomeUnknown) {
+      return { ok: false, status: thrown.status, error: 'The orchestrator could not be reached, so the scan was not started.', ...why }
+    }
+    // A timeout or a reset is not a refusal: the orchestrator may have spawned
+    // the container anyway, and partial recon and AI attack allow parallel
+    // runs, so a blind retry could start a duplicate.
     return {
       ok: false,
-      status: 503,
+      status: thrown.status,
       startOutcome: 'unknown',
       error: 'The orchestrator did not answer, so it is unknown whether the scan started.',
+      ...why,
     }
   }
 
@@ -282,6 +294,7 @@ export async function dispatchStart(
       error,
       ...(limit ? { limit: limit as Record<string, unknown> } : {}),
       ...(code ? { code } : {}),
+      upstreamStatus: response.status,
     }
   }
 

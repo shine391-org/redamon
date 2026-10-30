@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { useOptionalProject } from '@/providers/ProjectProvider'
+import { readApiError } from '@/lib/apiError'
+import { failureText } from '@/components/settings/failureText'
 
 /**
  * Read/write access to the Global Settings credentials from wherever a scan is
@@ -32,8 +34,14 @@ export interface CredentialKeysApi {
   /** The key currently being written, or null. */
   saving: string | null
   error: string
+  /** Why the saved keys could not be read, with its status; a key then only LOOKS unset. */
+  loadError?: string
   refresh: () => Promise<void>
 }
+
+const LOAD_FAILED = "Couldn't read your saved keys"
+const SAVE_FAILED = 'Could not save the key'
+
 
 export function useCredentialKeys(): CredentialKeysApi {
   // Optional on purpose: this hook is embedded in scan cards that also render
@@ -44,16 +52,22 @@ export function useCredentialKeys(): CredentialKeysApi {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState<string | null>(null)
   const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
 
   const refresh = useCallback(async () => {
     if (!userId) { setLoading(false); return }
     try {
       const res = await fetch(`/api/users/${userId}/settings`)
-      if (!res.ok) return
+      if (!res.ok) {
+        setLoadError(failureText(LOAD_FAILED, await readApiError(res, LOAD_FAILED)))
+        return
+      }
       setValues(await res.json())
-    } catch {
+      setLoadError('')
+    } catch (err) {
       // A failed read must not break the form this is embedded in; the shortcut
-      // simply shows the key as unset and the user can still type into it.
+      // shows the key as unset, says why, and the user can still type into it.
+      setLoadError(failureText(LOAD_FAILED, err))
     } finally {
       setLoading(false)
     }
@@ -79,8 +93,7 @@ export function useCredentialKeys(): CredentialKeysApi {
         body: JSON.stringify({ [name]: value }),
       })
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        setError(body.error ?? 'Could not save the key')
+        setError((await readApiError(res, SAVE_FAILED)).message)
         return false
       }
       // Re-read rather than storing what was typed: the value we hold must be
@@ -88,13 +101,13 @@ export function useCredentialKeys(): CredentialKeysApi {
       // plaintext secret back to the server.
       await refresh()
       return true
-    } catch {
-      setError('Could not save the key')
+    } catch (err) {
+      setError(failureText(SAVE_FAILED, err))
       return false
     } finally {
       setSaving(null)
     }
   }, [userId, refresh])
 
-  return { loading, isSet, masked, save, saving, error, refresh }
+  return { loading, isSet, masked, save, saving, error, loadError: loadError || undefined, refresh }
 }

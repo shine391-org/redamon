@@ -445,6 +445,9 @@ def _dispatch(tool_id: str, config: dict):
         return run_jsrecon(config)
     elif tool_id == "SerializedScan":
         return run_serialized_scan_partial(config)
+    elif tool_id == "RouteExposure":
+        from recon.partial_recon_modules.route_exposure_scanning import run_route_exposure_partial
+        return run_route_exposure_partial(config)
     elif tool_id == "SupplyChainRecon":
         return run_supply_chain(config)
     elif tool_id == "GraphqlScan":

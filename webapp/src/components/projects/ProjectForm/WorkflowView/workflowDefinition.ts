@@ -9,6 +9,8 @@ export interface WorkflowToolDef {
   enabledField: string
   group: number
   badge?: 'active' | 'passive' | 'both'
+  /** Recently shipped module: shows a "New!" badge on its node. */
+  isNew?: boolean
   /** Enabled but given nothing to work on: shown as Idle, and not a source of its outputs. */
   idleWhen?: (formData: Record<string, unknown>) => boolean
 }
@@ -67,6 +69,7 @@ export const WORKFLOW_TOOLS: WorkflowToolDef[] = [
   { id: 'SubdomainTakeover',  label: 'Subdomain Takeover', enabledField: 'subdomainTakeoverEnabled',   group: 6, badge: 'active' },
   { id: 'VhostSni',           label: 'VHost & SNI',        enabledField: 'vhostSniEnabled',             group: 6, badge: 'active' },
   { id: 'WebCachePoison',     label: 'Cache Poisoning',    enabledField: 'webCachePoisonEnabled',       group: 6, badge: 'active' },
+  { id: 'RouteExposure',      label: 'Route Exposure',     enabledField: 'routeExposureEnabled',        group: 6, badge: 'active', isNew: true },
 
   // Group 7 - CVE & MITRE
   { id: 'CveLookup', label: 'CVE Lookup', enabledField: 'cveLookupEnabled', group: 7 },

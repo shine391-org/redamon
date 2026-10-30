@@ -85,10 +85,11 @@ describe('all red-zone routes', () => {
     ['secrets', secretsRoute.GET],
     ['netInitAccess', netInitAccessRoute.GET],
     ['graphql', graphqlRoute.GET],
-  ])('%s returns 500 when Neo4j throws', async (_, handler) => {
+  ])('%s returns 500 when Neo4j throws, with a fixed message and no raw text', async (_, handler) => {
     shouldThrow = new Error('connection refused')
     const res = await handler(makeRequest('p1'))
     expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Query failed', code: 'internal_error' })
   })
 
   test.each([

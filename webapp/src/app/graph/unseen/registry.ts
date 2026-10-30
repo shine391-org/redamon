@@ -68,7 +68,7 @@ export const BADGED_TABS = [
   'nodeDetails', 'all', 'jsRecon', 'aiSurface', 'aiRisk', 'killChain', 'blastRadius',
   'takeover', 'secrets', 'netInitAccess', 'graphql', 'webInitAccess', 'paramMatrix',
   'sharedInfra', 'dnsEmail', 'threatIntel', 'jsDepSignals', 'supplyChainSca',
-  'dnsDrift', 'webCachePoison',
+  'dnsDrift', 'webCachePoison', 'routeExposure',
 ] as const satisfies readonly Exclude<
   TableViewMode, 'reconDelta' | 'scanSchedule' | 'triage' | 'nodeFilters' | 'muted'
 >[]

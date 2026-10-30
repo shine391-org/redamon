@@ -16,6 +16,7 @@ import { describe, test, expect, beforeEach, vi } from 'vitest'
 
 const mockFindUnique = vi.fn()
 const mockUpdate = vi.fn()
+const mockDelete = vi.fn()
 const mockGetSession = vi.fn()
 const mockIsInternal = vi.fn()
 
@@ -24,7 +25,9 @@ vi.mock('@/lib/prisma', () => ({
     user: {
       findUnique: (...args: unknown[]) => mockFindUnique(...args),
       update: (...args: unknown[]) => mockUpdate(...args),
+      delete: (...args: unknown[]) => mockDelete(...args),
     },
+    capturedHttpTransaction: { findMany: vi.fn().mockResolvedValue([]) },
   },
 }))
 
@@ -33,7 +36,7 @@ vi.mock('@/lib/session', () => ({
   isInternalRequest: (...args: unknown[]) => mockIsInternal(...args),
 }))
 
-import { GET, PUT } from './route'
+import { GET, PUT, DELETE } from './route'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -149,6 +152,15 @@ describe('GET /api/users/[id]', () => {
     expect(res.status).toBe(500)
     errSpy.mockRestore()
   })
+
+  test('the 500 names the Prisma code, never the message', async () => {
+    mockGetSession.mockResolvedValue(makeSession('user-1'))
+    mockFindUnique.mockRejectedValue(Object.assign(new Error("Can't reach database server at db:5432"), { code: 'P1001' }))
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await GET(getReq(), makeParams('user-1'))
+    expect(await res.json()).toEqual({ error: 'Failed to fetch user', code: 'P1001' })
+    errSpy.mockRestore()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -246,5 +258,30 @@ describe('PUT /api/users/[id]', () => {
     const res = await PUT(putReq({ defaultAgentModel: 'x' }), makeParams('user-1'))
     expect(res.status).toBe(500)
     errSpy.mockRestore()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// DELETE
+// ---------------------------------------------------------------------------
+
+describe('DELETE /api/users/[id]', () => {
+  const delReq = () => new Request('http://localhost/api/users/user-2', { method: 'DELETE' }) as never
+
+  test('a cascade the database refused names its code, never its message', async () => {
+    mockGetSession.mockResolvedValue(makeSession('admin-1', 'admin'))
+    mockDelete.mockRejectedValue(Object.assign(new Error('Foreign key constraint failed on the field: `user_id`'), { code: 'P2003' }))
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await DELETE(delReq(), makeParams('user-2'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to delete user', code: 'P2003' })
+    errSpy.mockRestore()
+  })
+
+  test('a user already gone is still a 404', async () => {
+    mockGetSession.mockResolvedValue(makeSession('admin-1', 'admin'))
+    mockDelete.mockRejectedValue(Object.assign(new Error('Record to delete does not exist.'), { code: 'P2025' }))
+    const res = await DELETE(delReq(), makeParams('user-2'))
+    expect(res.status).toBe(404)
   })
 })

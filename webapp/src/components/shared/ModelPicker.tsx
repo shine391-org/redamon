@@ -7,7 +7,9 @@ import {
   formatContextLength,
   getDisplayName,
 } from '@/app/graph/components/AIAssistantDrawer/modelUtils'
+import { formatApiError, toApiError } from '@/lib/apiError'
 import styles from '@/components/projects/ProjectForm/ProjectForm.module.css'
+import { MODELS_LOAD_FAILED, fetchModelOptions } from './modelOptions'
 
 interface ModelPickerProps {
   userId?: string | null
@@ -49,7 +51,8 @@ export function ModelPicker({
 }: ModelPickerProps) {
   const [fetchedModels, setFetchedModels] = useState<Record<string, ModelOption[]>>({})
   const [fetchLoading, setFetchLoading] = useState(true)
-  const [fetchError, setFetchError] = useState(false)
+  // The failure's cause, e.g. "Failed to load models (agent_unreachable · HTTP 503)".
+  const [fetchError, setFetchError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
@@ -58,30 +61,15 @@ export function ModelPicker({
 
   useEffect(() => {
     if (provided) return
-    fetch('/api/models', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(userId ? { userId } : {}),
-      cache: 'no-store',
-    })
-      .then(r => {
-        if (!r.ok) throw new Error('Failed to fetch')
-        return r.json()
-      })
-      .then(data => {
-        if (data && typeof data === 'object' && !data.error) {
-          setFetchedModels(data)
-        } else {
-          setFetchError(true)
-        }
-      })
-      .catch(() => setFetchError(true))
+    fetchModelOptions(userId)
+      .then(setFetchedModels)
+      .catch(err => setFetchError(formatApiError({ ...toApiError(err, MODELS_LOAD_FAILED), reason: MODELS_LOAD_FAILED })))
       .finally(() => setFetchLoading(false))
   }, [userId, provided])
 
   const allModels = models ?? fetchedModels
   const modelsLoading = provided ? false : fetchLoading
-  const modelsError = provided ? false : fetchError
+  const modelsError = provided ? null : fetchError
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
@@ -161,10 +149,10 @@ export function ModelPicker({
           {modelsError ? (
             <div className={styles.modelDropdownEmpty}>
               {hideManualFallback ? (
-                <span>Failed to load models.</span>
+                <span>{modelsError}.</span>
               ) : (
                 <>
-                  <span>Failed to load models. Type a model ID manually:</span>
+                  <span>{modelsError}. Type a model ID manually:</span>
                   <input
                     className="textInput"
                     type="text"

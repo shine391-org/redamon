@@ -113,7 +113,7 @@ describe('MutedNodesTable', () => {
   test('a failed load offers a retry', async () => {
     fetchMock.mockReturnValueOnce(reply({ error: 'agent down' }, 503))
     render(<MutedNodesTable projectId="p1" />)
-    expect(await screen.findByText('agent down')).toBeInTheDocument()
+    expect(await screen.findByText('agent down (HTTP 503)')).toBeInTheDocument()
     fetchMock.mockReturnValue(reply({ total: 1, findings: [row()] }))
     fireEvent.click(screen.getByText('Retry'))
     expect(await screen.findByText('tech-detect:nginx')).toBeInTheDocument()

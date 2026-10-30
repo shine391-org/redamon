@@ -1,9 +1,10 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import prisma from '@/lib/prisma'
-import { sessionRunningState } from '@/lib/agentSessions'
+import { sessionRunningCheck } from '@/lib/agentSessions'
 import { getEffectiveUser } from '@/lib/session'
 import { strictContext } from '@/lib/plugins/actions'
 import { isValidPluginId } from '@/lib/plugins/ids'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { findInstall, servesActions } from '@/lib/plugins/registry'
 import { pickableSessionSkills } from '@/lib/plugins/sessionPick'
@@ -25,7 +26,10 @@ export const dynamic = 'force-dynamic'
 
 const refuse = (status: number, code: string, error: string) => NextResponse.json({ error, code }, { status })
 
-export async function GET(request: NextRequest, { params }: { params: Promise<{ pluginId: string }> }) {
+export const GET = pluginRoute('session skills', 'The skills of this session could not be read; see the webapp log.', async (
+  request: NextRequest,
+  { params }: { params: Promise<{ pluginId: string }> },
+) => {
   const eff = await getEffectiveUser()
   if (!eff) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const { pluginId } = await params
@@ -50,8 +54,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   })
   if (!conversation) return refuse(404, 'not_found', 'Not found')
 
-  const [running, skills] = await Promise.all([
-    sessionRunningState(conversation),
+  const [check, skills] = await Promise.all([
+    sessionRunningCheck(conversation),
     pickableSessionSkills(plugin, conversation.id, eff.userId),
   ])
   const withVersions = await Promise.all(skills.map(async (s) => {
@@ -59,8 +63,14 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const set = await ov.effectiveForProject(context.projectId, s.target).catch(() => null)
     return { ...s, revision: set && set.applies ? set.revision : ov.FACTORY_REVISION }
   }))
+  // `agentCheck`: why 'unverified', so the picker can say whether the agent was down, slow or failing.
   return NextResponse.json(
-    { running, skills: withVersions, suggested: suggestedSkill(skills)?.ref ?? null },
+    {
+      running: check.running,
+      ...(check.failure ? { agentCheck: check.failure } : {}),
+      skills: withVersions,
+      suggested: suggestedSkill(skills)?.ref ?? null,
+    },
     { headers: { 'Cache-Control': 'no-store' } },
   )
-}
+})

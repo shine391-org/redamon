@@ -52,7 +52,9 @@ class TestMutedFindingsDoNotSeedAScan(unittest.TestCase):
         # back in. JS Recon writes its GraphQL endpoints as Endpoint nodes (an
         # asset, never muted), and the finding query matched nothing, so plan
         # 12.12 replaced it: no finding label seeds the GraphQL scan any more.
-        blocks = [b for b in cypher_blocks(source()) if "endpoint_type" in b]
+        # The route exposure builder reads endpoint_type too (its router routes), so
+        # the GraphQL seed is the block that names graphql.
+        blocks = [b for b in cypher_blocks(source()) if "endpoint_type" in b and "graphql" in b.lower()]
         self.assertTrue(blocks, "the GraphQL Endpoint seed query is missing")
         for block in blocks:
             self.assertIn("e.endpoint_type IN ['graphql', 'graphql_introspection']", block)

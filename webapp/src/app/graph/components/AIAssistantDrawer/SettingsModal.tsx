@@ -1,7 +1,7 @@
 'use client'
 
 import React from 'react'
-import { X, Loader2 } from 'lucide-react'
+import { X, Loader2, AlertCircle } from 'lucide-react'
 import { AgentBehaviourSection } from '@/components/projects/ProjectForm/sections/AgentBehaviourSection'
 import { AttackSkillsSection } from '@/components/projects/ProjectForm/sections/AttackSkillsSection'
 import { ToolMatrixSection } from '@/components/projects/ProjectForm/sections/ToolMatrixSection'
@@ -16,6 +16,8 @@ interface SettingsModalProps {
   updateProjectField: (field: any, value: any) => void
   /** The chat is always for a saved project; passed so Agent Skills shows plugin version controls. */
   projectId?: string | null
+  /** The project could not be read; shown in place of the spinner. */
+  loadError?: string | null
 }
 
 export function SettingsModal({
@@ -24,6 +26,7 @@ export function SettingsModal({
   projectFormData,
   updateProjectField,
   projectId,
+  loadError,
 }: SettingsModalProps) {
   // Suggested LHOST for the Agent Behaviour form (issue #180). Fetch only while the
   // agent modal is open; refetches each open so it tracks the last `redamon.sh up`.
@@ -50,6 +53,11 @@ export function SettingsModal({
             ) : (
               <AttackSkillsSection data={projectFormData} updateField={updateProjectField} projectId={projectId} />
             )
+          ) : loadError ? (
+            <div role="alert" style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', padding: '2rem', color: 'var(--status-error, #ef4444)' }}>
+              <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+              <span>{loadError}</span>
+            </div>
           ) : (
             <div style={{ display: 'flex', justifyContent: 'center', padding: '2rem' }}>
               <Loader2 size={24} className={styles.spinner} />

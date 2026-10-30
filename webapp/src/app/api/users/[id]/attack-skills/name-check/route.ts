@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { readJsonBody } from '@/lib/jsonBody'
 import { MAX_SKILLS_PER_BATCH } from '@/lib/userSkills'
 import { requireOwnBrowserRequest } from '@/lib/userSkillRouteGuard'
@@ -47,8 +48,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       ...(problem ? { reason: problem.code } : taken ? { reason: 'name_taken' } : {}),
     })
   } catch (error) {
-    console.error('Failed to check a skill name:', error)
-    return NextResponse.json({ error: 'Failed to check the name' }, { status: 500 })
+    return internalError(error, 'Failed to check the name', { log: 'Failed to check a skill name' })
   }
 }
 
@@ -74,7 +74,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     }
     return NextResponse.json({ results: await checkNames(prisma, id, names as string[]) })
   } catch (error) {
-    console.error('Failed to check skill names:', error)
-    return NextResponse.json({ error: 'Failed to check the names' }, { status: 500 })
+    return internalError(error, 'Failed to check the names', { log: 'Failed to check skill names' })
   }
 }

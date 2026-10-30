@@ -10,9 +10,10 @@ type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'use
 interface PathTraversalSectionProps {
   data: FormData
   updateField: <K extends keyof FormData>(field: K, value: FormData[K]) => void
+  onOpenRoe?: () => void
 }
 
-export function PathTraversalSection({ data, updateField }: PathTraversalSectionProps) {
+export function PathTraversalSection({ data, updateField, onOpenRoe }: PathTraversalSectionProps) {
   return (
     <div className={styles.skillSettings}>
       <div className={styles.skillSettingsHead}>
@@ -120,6 +121,59 @@ export function PathTraversalSection({ data, updateField }: PathTraversalSection
           </span>
         </div>
       </div>
+
+      <h3 className={styles.subSectionTitle}>Route exposure findings</h3>
+      {data.routeExposureEnabled ? (
+        <div>
+          <div className={styles.toggleRow}>
+            <div>
+              <span className={styles.toggleLabel}>Reconstruct exposed .git repositories</span>
+              <p className={styles.toggleDescription}>
+                Rebuilds a repository from an exposed .git the Route Exposure scan found, counts the secrets in it
+                and deletes it. Off by default.
+              </p>
+              <p className={`${styles.fieldHint} ${styles.fieldHintCaution}`}>
+                Needs data exfiltration allowed in{' '}
+                {onOpenRoe ? (
+                  <button
+                    type="button"
+                    onClick={onOpenRoe}
+                    style={{ background: 'none', border: 0, padding: 0, color: 'var(--accent-primary)',
+                             fontWeight: 500, cursor: 'pointer' }}
+                  >
+                    Rules of Engagement
+                  </button>
+                ) : (
+                  <>Rules of Engagement</>
+                )}
+                .
+              </p>
+            </div>
+            <Toggle
+              checked={data.pathTraversalGitReconstructEnabled ?? false}
+              onChange={(checked) => updateField('pathTraversalGitReconstructEnabled', checked)}
+              aria-label="Reconstruct exposed .git repositories"
+            />
+          </div>
+          <div className={styles.toggleRow}>
+            <div>
+              <span className={styles.toggleLabel}>Validate secrets found in exposed files</span>
+              <p className={styles.toggleDescription}>
+                Checks each secret with one identity-only call to its provider, which sees the call. Off by default.
+              </p>
+            </div>
+            <Toggle
+              checked={data.pathTraversalValidateSecretsEnabled ?? false}
+              onChange={(checked) => updateField('pathTraversalValidateSecretsEnabled', checked)}
+              aria-label="Validate secrets found in exposed files"
+            />
+          </div>
+        </div>
+      ) : (
+        <p className={styles.fieldHint}>
+          These apply to files the Route Exposure scan finds. Enable it in Vulnerability Scanning.
+        </p>
+      )}
     </div>
   )
 }

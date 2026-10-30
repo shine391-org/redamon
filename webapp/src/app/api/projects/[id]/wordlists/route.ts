@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { mkdir, readdir, stat, unlink, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
+import { guardProject } from '@/lib/access'
+import { declaredBodyTooLarge } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
 
 const WORDLIST_UPLOAD_PATH = process.env.WORDLIST_UPLOAD_PATH || '/data/recon-wordlists'
 const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50 MB
@@ -54,14 +57,12 @@ async function listWordlists(projectId: string) {
 export async function GET(_request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
+    const denied = await guardProject(id)
+    if (denied) return denied
     const wordlists = await listWordlists(id)
     return NextResponse.json({ wordlists })
   } catch (error) {
-    console.error('Error listing wordlists:', error)
-    return NextResponse.json(
-      { error: 'Failed to list wordlists' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list wordlists', { log: 'Error listing wordlists' })
   }
 }
 
@@ -69,7 +70,20 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const formData = await request.formData()
+    const denied = await guardProject(id)
+    if (denied) return denied
+    const lengthProblem = declaredBodyTooLarge(request, MAX_FILE_SIZE)
+    if (lengthProblem) return lengthProblem
+
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch {
+      return NextResponse.json(
+        { error: 'The upload could not be read as multipart form data.', code: 'invalid_multipart' },
+        { status: 400 }
+      )
+    }
     const file = formData.get('file') as File | null
 
     if (!file) {
@@ -78,7 +92,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     if (file.size > MAX_FILE_SIZE) {
       return NextResponse.json(
-        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB` },
+        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB`, code: 'file_too_large', limitBytes: MAX_FILE_SIZE },
         { status: 400 }
       )
     }
@@ -104,11 +118,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       uploaded: { name: safeName, path: toContainerPath(id, safeName) },
     })
   } catch (error) {
-    console.error('Error uploading wordlist:', error)
-    return NextResponse.json(
-      { error: 'Failed to upload wordlist' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to upload wordlist', { log: 'Error uploading wordlist' })
   }
 }
 
@@ -116,6 +126,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
+    const denied = await guardProject(id)
+    if (denied) return denied
     const name = request.nextUrl.searchParams.get('name')
 
     if (!name) {
@@ -136,10 +148,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     const wordlists = await listWordlists(id)
     return NextResponse.json({ wordlists })
   } catch (error) {
-    console.error('Error deleting wordlist:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete wordlist' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete wordlist', { log: 'Error deleting wordlist' })
   }
 }

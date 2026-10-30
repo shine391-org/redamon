@@ -183,7 +183,8 @@ describe('Supply Chain card - org batch mode', () => {
     fetchMock.mockImplementationOnce(() =>
       Promise.resolve({ ok: false, status: 403, json: async () => ({ error: 'token lacks org scope' }) }))
     fireEvent.click(buttonsByLabel('Queue org batch')[0])
-    await waitFor(() => expect(alertError).toHaveBeenCalledWith('token lacks org scope', 'Supply-chain org batch'))
+    // The status rides along so a screenshot tells a scope refusal from an outage.
+    await waitFor(() => expect(alertError).toHaveBeenCalledWith('token lacks org scope (HTTP 403)', 'Supply-chain org batch'))
   })
 
   test('with no account configured the queue button is dead and says why', async () => {

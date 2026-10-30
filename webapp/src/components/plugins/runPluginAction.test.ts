@@ -126,8 +126,29 @@ describe('the POST and its answer', () => {
     const h = handlers()
     vi.stubGlobal('fetch', vi.fn(async () => json(409, { error: 'This plugin is disabled or not ready.', code: 'plugin_unavailable' })))
     await runPluginAction({ plugin, item: action(), context, gate: gate(), handlers: h })
-    expect(h.toast.error).toHaveBeenCalledWith('This plugin is disabled or not ready.')
+    expect(h.toast.error).toHaveBeenCalledWith('This plugin is disabled or not ready. (plugin_unavailable · HTTP 409)')
     expect(h.onJob).not.toHaveBeenCalled()
     expect(h.onReviewProposal).not.toHaveBeenCalled()
+  })
+
+  test('a runner that is down: the reason, the code and the status reach the toast', async () => {
+    const h = handlers()
+    vi.stubGlobal('fetch', vi.fn(async () => json(503, {
+      error: 'The plugin runner did not answer in time (upstream_timeout); the action may still have run.',
+      code: 'runner_unavailable',
+      reason: 'timeout',
+      proxyCode: 'upstream_timeout',
+    })))
+    await runPluginAction({ plugin, item: action(), context, gate: gate(), handlers: h })
+    expect(h.toast.error).toHaveBeenCalledWith('The plugin runner did not answer in time (upstream_timeout); the action may still have run. (runner_unavailable · HTTP 503)')
+  })
+
+  test('no answer at all is a named network failure, not a generic one', async () => {
+    const h = handlers()
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new TypeError('Failed to fetch')
+    }))
+    await runPluginAction({ plugin, item: action(), context, gate: gate(), handlers: h })
+    expect(h.toast.error).toHaveBeenCalledWith('The plugin action got no answer from RedAmon (network_error).')
   })
 })

@@ -107,3 +107,50 @@ describe('an old-model graph (§4.11.6)', () => {
     expect(res.status).toBe(200)
   })
 })
+
+describe('a partial start that got no answer says whether it may have started', () => {
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}) })
+
+  test('a refused connection is 503 orchestrator_unreachable: not started, safe to retry', async () => {
+    h.orchestratorFetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8010'), { code: 'ECONNREFUSED' }),
+    }))
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({
+      error: 'The orchestrator could not be reached, so the partial recon was not started.',
+      code: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+    })
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test('a timeout is 504 orchestrator_timeout with an unknown outcome, never the bare abort message', async () => {
+    h.orchestratorFetch.mockRejectedValue(
+      Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }))
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(504)
+    const body = await res.json()
+    expect(body).toMatchObject({ code: 'orchestrator_timeout', startOutcome: 'unknown' })
+    expect(body.error).toMatch(/unknown whether the partial recon started/)
+    expect(JSON.stringify(body)).not.toMatch(/aborted due to timeout/)
+  })
+
+  test('an answered refusal keeps the orchestrator code and status', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500,
+      json: async () => ({ detail: { detail: 'Failed to start: image missing', code: 'spawn_failed' } }),
+    })
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(500)
+    expect(await res.json()).toMatchObject({
+      error: 'Failed to start: image missing', code: 'spawn_failed', upstreamStatus: 500,
+    })
+  })
+
+  test('an unexpected throw answers a fixed sentence and a code', async () => {
+    h.findUnique.mockRejectedValue(Object.assign(new Error('select * from "Project" where id = p1'), { code: 'P1001' }))
+    const res = await post({ tool_id: 'Tlsx' })
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to start partial recon', code: 'P1001' })
+  })
+})

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { Toggle, useToast } from '@/components/ui'
+import { errorMessage, readApiError } from '@/lib/apiError'
 
 /**
  * Per-project TrafficMind capture-routing toggle.
@@ -56,11 +57,11 @@ export function TrafficCaptureToggle({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ captureProxyEnabled: next }),
       })
-      if (!res.ok) throw new Error(String(res.status))
+      if (!res.ok) throw await readApiError(res, 'Failed to update traffic capture setting')
       toast.success(`Traffic capture ${next ? 'enabled' : 'disabled'}${projectName ? ` for ${projectName}` : ''}`)
-    } catch {
+    } catch (err) {
       setEnabled(prev ?? false)
-      toast.error('Failed to update traffic capture setting')
+      toast.error(errorMessage(err, 'Failed to update traffic capture setting'))
     } finally {
       setSaving(false)
     }

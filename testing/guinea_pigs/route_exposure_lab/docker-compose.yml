@@ -1,0 +1,86 @@
+# Route exposure lab: four services for the recon route exposure scan and the
+# agent's route-exposure parts (access_control, path_traversal, rce).
+#
+#   docker compose up -d --build
+#   docker exec redamon-route-exposure-main cat /tmp/hits.jsonl     # what a scan sent
+#   docker exec redamon-route-exposure-main touch /tmp/flags/close-export
+#
+# Pin recon projects (IP mode) at the bridge IPs; scan containers run --net=host
+# and cannot resolve container names. The addresses are LAB_NET_PREFIX.93-.96
+# (default 172.25.0); ./up.sh reads the prefix off redamon-network, whose subnet
+# Docker picks when the network is first created. The lab also answers on
+# redamon_pentest-net at PENTEST_NET_PREFIX.93-.96: the capture proxy (TrafficMind,
+# proxy_brain) is on that network only, so a project that captures traffic is
+# pinned at those addresses. The outsider (.96) is named by the other
+# services' JS and must receive 0 requests. Host aliases are loopback-only: the
+# lab serves open admin, debug and backup routes on purpose.
+
+x-lab: &lab
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: redamon-route-exposure-lab:latest
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 80)); s.close()\" || exit 1"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
+
+services:
+  route-exposure-main:
+    <<: *lab
+    container_name: redamon-route-exposure-main
+    environment: [ROLE=main, "OUTSIDER_IP=${LAB_NET_PREFIX:-172.25.0}.96"]
+    ports:
+      - "127.0.0.1:9101:80"
+    networks:
+      redamon:
+        ipv4_address: ${LAB_NET_PREFIX:-172.25.0}.93
+      pentest:
+        ipv4_address: ${PENTEST_NET_PREFIX:-172.28.0}.93
+
+  route-exposure-twin:
+    <<: *lab
+    container_name: redamon-route-exposure-twin
+    environment: [ROLE=twin, "OUTSIDER_IP=${LAB_NET_PREFIX:-172.25.0}.96"]
+    ports:
+      - "127.0.0.1:9102:80"
+    networks:
+      redamon:
+        ipv4_address: ${LAB_NET_PREFIX:-172.25.0}.94
+      pentest:
+        ipv4_address: ${PENTEST_NET_PREFIX:-172.28.0}.94
+
+  route-exposure-hostile:
+    <<: *lab
+    container_name: redamon-route-exposure-hostile
+    environment: [ROLE=hostile, "OUTSIDER_IP=${LAB_NET_PREFIX:-172.25.0}.96"]
+    ports:
+      - "127.0.0.1:9103:80"
+    networks:
+      redamon:
+        ipv4_address: ${LAB_NET_PREFIX:-172.25.0}.95
+      pentest:
+        ipv4_address: ${PENTEST_NET_PREFIX:-172.28.0}.95
+
+  route-exposure-outsider:
+    <<: *lab
+    container_name: redamon-route-exposure-outsider
+    environment: [ROLE=outsider, "OUTSIDER_IP=${LAB_NET_PREFIX:-172.25.0}.96"]
+    ports:
+      - "127.0.0.1:9104:80"
+    networks:
+      redamon:
+        ipv4_address: ${LAB_NET_PREFIX:-172.25.0}.96
+      pentest:
+        ipv4_address: ${PENTEST_NET_PREFIX:-172.28.0}.96
+
+networks:
+  redamon:
+    external: true
+    name: redamon-network
+  pentest:
+    external: true
+    name: redamon_pentest-net

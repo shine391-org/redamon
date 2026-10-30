@@ -115,8 +115,89 @@ describe('a model it cannot use opens the picker', () => {
     const res = await generate({ prompt: 'stealthy' })
     const text = await res.text()
     expect(res.status).toBe(502)
-    expect(JSON.parse(text).code).toBeUndefined()
+    // A code that opens no picker: the model is kept.
+    expect(JSON.parse(text)).toEqual({
+      error: 'The model provider answered 529. Try again in a moment.',
+      code: 'provider_error',
+      upstreamStatus: 529,
+    })
     expect(text).not.toContain('LEAKED')
+  })
+})
+
+describe('why a generation failed, safe to show', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  test("a provider refusal carries the provider's error type as the code, never its text", async () => {
+    saved('claude-haiku-9')
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      type: 'error', error: { type: 'rate_limit_error', message: 'slow down, key sk-ant-LEAKED' },
+    }), { status: 429 }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ prompt: 'stealthy' })
+    const text = await res.text()
+    expect(res.status).toBe(502)
+    expect(JSON.parse(text)).toEqual({
+      error: 'The model provider answered 429. Try again in a moment.',
+      code: 'rate_limit_error',
+      upstreamStatus: 429,
+    })
+    expect(text).not.toContain('LEAKED')
+  })
+
+  test('a provider type that reads as a model-gate code is not passed on: it would open the picker', async () => {
+    saved('claude-haiku-9')
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: { type: 'model_required' } }), { status: 500 }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ prompt: 'stealthy' })
+    expect(await res.json()).toMatchObject({ code: 'provider_error', upstreamStatus: 500 })
+  })
+
+  test('a provider that never answered names the errno', async () => {
+    saved('claude-haiku-9')
+    fetchMock.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('getaddrinfo ENOTFOUND api.anthropic.com'), { code: 'ENOTFOUND' }),
+    }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ prompt: 'stealthy' })
+    const text = await res.text()
+    expect(res.status).toBe(502)
+    expect(JSON.parse(text)).toEqual({
+      error: 'Failed to generate preset. The details are in the webapp log.',
+      code: 'ENOTFOUND',
+    })
+    expect(text).not.toContain('getaddrinfo')
+  })
+
+  test("a certificate failure names OpenSSL's code, not just TypeError", async () => {
+    saved('claude-haiku-9')
+    fetchMock.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('self-signed certificate'), { code: 'DEPTH_ZERO_SELF_SIGNED_CERT' }),
+    }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ prompt: 'stealthy' })
+    expect(await res.json()).toMatchObject({ code: 'DEPTH_ZERO_SELF_SIGNED_CERT' })
+  })
+
+  test('a database failure names the Prisma code, never its message', async () => {
+    saved('claude-haiku-9')
+    mockProviders.mockRejectedValue(Object.assign(new Error('Timed out fetching a connection; query: SELECT secret'), {
+      code: 'P2024', name: 'PrismaClientKnownRequestError',
+    }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ prompt: 'stealthy' })
+    const text = await res.text()
+    expect(res.status).toBe(502)
+    expect(JSON.parse(text).code).toBe('P2024')
+    expect(text).not.toContain('SELECT')
+  })
+
+  test('a timeout is 504 with the code timeout', async () => {
+    saved('claude-haiku-9')
+    fetchMock.mockRejectedValue(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+    const res = await generate({ prompt: 'stealthy' })
+    expect(res.status).toBe(504)
+    expect((await res.json()).code).toBe('timeout')
   })
 })
 

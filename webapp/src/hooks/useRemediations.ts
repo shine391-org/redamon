@@ -5,6 +5,7 @@
  */
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { fetchJson, fetchOk } from '@/lib/apiError'
 import type { Remediation, RemediationSeverity, RemediationStatus } from '@/lib/cypherfix-types'
 
 // =============================================================================
@@ -32,40 +33,33 @@ async function fetchRemediations(
   if (filters?.sort) params.set('sort', filters.sort)
   if (filters?.order) params.set('order', filters.order)
 
-  const res = await fetch(`/api/remediations?${params}`)
-  if (!res.ok) throw new Error('Failed to fetch remediations')
-  return res.json()
+  return fetchJson<Remediation[]>(`/api/remediations?${params}`, undefined, 'Failed to fetch remediations')
 }
 
 async function updateRemediation(
   id: string,
   data: Partial<Remediation>
 ): Promise<Remediation> {
-  const res = await fetch(`/api/remediations/${id}`, {
+  return fetchJson<Remediation>(`/api/remediations/${id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
-  })
-  if (!res.ok) throw new Error('Failed to update remediation')
-  return res.json()
+  }, 'Failed to update remediation')
 }
 
 async function deleteRemediation(id: string): Promise<void> {
-  const res = await fetch(`/api/remediations/${id}`, { method: 'DELETE' })
-  if (!res.ok) throw new Error('Failed to delete remediation')
+  await fetchOk(`/api/remediations/${id}`, { method: 'DELETE' }, 'Failed to delete remediation')
 }
 
 async function updateBlockStatuses(
   id: string,
   fileChanges: Remediation['fileChanges']
 ): Promise<Remediation> {
-  const res = await fetch(`/api/remediations/${id}/blocks`, {
+  return fetchJson<Remediation>(`/api/remediations/${id}/blocks`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ fileChanges }),
-  })
-  if (!res.ok) throw new Error('Failed to update block statuses')
-  return res.json()
+  }, 'Failed to update block statuses')
 }
 
 // =============================================================================
@@ -132,6 +126,9 @@ export function useRemediations({
     refetch,
     updateRemediation: updateMutation.mutate,
     deleteRemediation: deleteMutation.mutate,
+    /** Resolve on success and reject with the ApiError, for a caller that must say when it failed. */
+    updateRemediationAsync: updateMutation.mutateAsync,
+    deleteRemediationAsync: deleteMutation.mutateAsync,
     updateBlocks: updateBlocksMutation.mutate,
     isUpdating: updateMutation.isPending,
     isDeleting: deleteMutation.isPending,

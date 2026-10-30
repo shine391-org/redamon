@@ -594,10 +594,13 @@ def _origin_url(txn: Dict[str, Any], path: str, query: str) -> str:
 
 
 def build_replay_curl(txn: Dict[str, Any], mutate: Dict[str, Any],
-                      auth_base: Dict[str, str] = None) -> str:
+                      auth_base: Dict[str, str] = None, strip_headers=None) -> str:
     """Build a curl arg string for a replay. Host/scheme/port are pinned to the
     origin; method/path/query/params/headers/cookie/body are mutable.
-    ``auth_base`` are AuthProfile headers seeded UNDER the origin + mutate."""
+    ``auth_base`` are AuthProfile headers seeded UNDER the origin + mutate.
+    ``strip_headers`` (lower-cased names) are removed last, whoever set them:
+    an anonymous send carries no credential from the origin, the profile or a
+    mutate."""
     method = str(mutate.get("method") or txn.get("method") or "GET").upper()
     path = str(mutate.get("path", txn.get("path") or "/"))
     q = str(mutate.get("query", txn.get("query") or "") or "").lstrip("?")
@@ -607,6 +610,9 @@ def build_replay_curl(txn: Dict[str, Any], mutate: Dict[str, Any],
         q = urlencode(pairs)
     url = _origin_url(txn, path, q)
     headers = _apply_header_mutations(txn.get("req_headers") or {}, mutate, base_headers=auth_base)
+    if strip_headers is not None:
+        headers = {k: v for k, v in headers.items()
+                   if k.lower() not in strip_headers and not _is_redacted(v)}
     body = mutate.get("body", txn.get("req_body"))
     parts = ["-s", "-i", "-X", method]
     for k, v in headers.items():
@@ -618,12 +624,13 @@ def build_replay_curl(txn: Dict[str, Any], mutate: Dict[str, Any],
 
 
 def build_fuzz_curls(txn: Dict[str, Any], insertion_point: str, payloads: List[str],
-                     auth_base: Dict[str, str] = None):
+                     auth_base: Dict[str, str] = None, strip_headers=None):
     """Yield (payload, curl_args) for each payload substituted into the query
     param `insertion_point`. Capped at _FUZZ_MAX_PAYLOADS."""
     capped = list(payloads)[:_FUZZ_MAX_PAYLOADS]
     for pl in capped:
-        args = build_replay_curl(txn, {"param": {insertion_point: pl}}, auth_base=auth_base)
+        args = build_replay_curl(txn, {"param": {insertion_point: pl}}, auth_base=auth_base,
+                                 strip_headers=strip_headers)
         yield str(pl), args
     return
 

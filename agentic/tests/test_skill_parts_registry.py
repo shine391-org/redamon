@@ -37,10 +37,15 @@ EXPECTED = [
     ("ssrf", "dns_rebinding", "plain"),
     ("ssrf", "payload_reference", "plain"),
     ("path_traversal", "tools", "template"),
+    ("path_traversal", "safe_values", "plain"),
+    ("path_traversal", "safe_state", "plain"),
     ("path_traversal", "php_wrappers", "plain"),
     ("path_traversal", "oob_workflow", "plain"),
     ("path_traversal", "archive_extraction", "plain"),
     ("path_traversal", "payload_reference", "plain"),
+    ("path_traversal", "exposed_files", "template"),
+    ("path_traversal", "git_reconstruct", "plain"),
+    ("path_traversal", "validate_secrets", "plain"),
     ("deserialization", "tools", "template"),
     ("deserialization", "find_sinks", "plain"),
     ("deserialization", "oob_workflow", "template"),
@@ -51,12 +56,18 @@ EXPECTED = [
     ("rce", "oob_workflow", "plain"),
     ("rce", "deserialization_workflow", "plain"),
     ("rce", "payload_reference", "plain"),
+    ("rce", "route_exposure_consoles", "template"),
+    ("rce", "heapdump_analysis", "plain"),
     ("cve_exploit", "tools", "plain"),
     ("cve_exploit", "payload_guidance_statefull", "plain"),
     ("cve_exploit", "payload_guidance_stateless", "plain"),
     ("cve_exploit", "no_module_fallback_statefull", "plain"),
     ("cve_exploit", "no_module_fallback_stateless", "plain"),
     ("access_control", "tools", "plain"),
+    ("access_control", "safe_values", "plain"),
+    ("access_control", "safe_state", "plain"),
+    ("access_control", "route_exposure_leads", "plain"),
+    ("access_control", "route_exposure_browser_leads", "plain"),
     ("http_request_smuggling", "tools", "plain"),
     ("http_request_smuggling", "zero_cl_step", "plain"),
     ("http_request_smuggling", "expect_step", "plain"),
@@ -91,6 +102,8 @@ EXPECTED_PLACEHOLDERS = {
     "deserialization/oob_workflow": {"deser_oob_provider"},
     "rce/tools": {"rce_aggressive_block", "rce_aggressive_payloads",
                   "rce_deserialization_enabled", "rce_oob_callback_enabled"},
+    "path_traversal/exposed_files": {"git_reconstruct", "validate_secrets"},
+    "rce/route_exposure_consoles": {"heapdump_analysis"},
 }
 
 
@@ -102,7 +115,7 @@ def _resolve(constant: str):
 def test_parts_and_order_are_the_published_list():
     got = [(p.skill_id, p.part_id, p.kind) for p in skill_parts.all_parts()]
     assert got == EXPECTED
-    assert len(got) == 47
+    assert len(got) == 58
 
 
 def test_text_is_the_module_constant_itself():

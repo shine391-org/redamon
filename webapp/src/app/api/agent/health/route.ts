@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { internalError, upstreamFailure } from '@/lib/routeErrors'
 
 export interface AgentHealthResponse {
   status: string
@@ -27,12 +28,11 @@ export async function GET() {
   } catch (error) {
     if (error instanceof AgentUnreachableError) {
       console.error('Agent health check: agent unreachable:', error.message, error.cause_)
-      return NextResponse.json({ error: error.message }, { status: 503 })
+      // describeAgentFailure's sentence names the service and what to run; the
+      // code says refused/unresolved/timeout for a screenshot.
+      const { code, cause } = upstreamFailure('agent', error.cause_, error.message).body
+      return NextResponse.json({ error: error.message, code, ...(cause ? { cause } : {}) }, { status: 503 })
     }
-    console.error('Agent health check error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Health check failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Health check failed', { log: 'Agent health check error' })
   }
 }

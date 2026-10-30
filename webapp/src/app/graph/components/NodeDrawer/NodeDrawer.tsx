@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react'
 import { AlertTriangle, ArrowLeft, Bot, Check, Copy, Trash2 } from 'lucide-react'
 import { Drawer, ExternalLink, useToast } from '@/components/ui'
 import { trufflehogDisplayFields } from '@/lib/trufflehogDisplay'
+import { confirmedInGraph, endpointExposureFields, isRouteExposureFinding, routeExposureDisplayFields } from '@/lib/routeExposureDisplay'
 import { COVERAGE_STAMP_PROPERTIES, coverageLines, recordedCoverageModules } from '@/lib/coverageStamps'
 import { copyText } from '@/lib/copyText'
 import { muteableLabel } from '@/lib/muteTarget'
@@ -145,6 +146,14 @@ export function NodeDrawer({
   const trufflehogFields = displayNode?.type === 'MultiscannerFinding'
     ? trufflehogDisplayFields((displayNode.properties ?? {}) as Record<string, unknown>)
     : []
+
+  const routeExposure = !displayNode
+    ? []
+    : isRouteExposureFinding(displayNode.type, displayNode.properties)
+      ? routeExposureDisplayFields(displayNode.properties ?? {}, confirmedInGraph(displayNode.id, graphData?.links))
+      : displayNode.type === 'Endpoint'
+        ? endpointExposureFields(displayNode.properties ?? {})
+        : []
 
   const drawerTitle = node
     ? showList && listCluster
@@ -324,6 +333,18 @@ export function NodeDrawer({
                 <div key={label} className={styles.propertyRow}>
                   <span className={styles.propertyKey}>{label}</span>
                   <span className={styles.propertyValue}>{value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {routeExposure.length > 0 && (
+            <div className={styles.section} data-testid="route-exposure-section">
+              <h3 className={styles.sectionTitleProperties}>Route exposure</h3>
+              {routeExposure.map(({ label, value }) => (
+                <div key={label} className={styles.propertyRow}>
+                  <span className={styles.propertyKey}>{label}</span>
+                  <span className={`${styles.propertyValue} ${styles.proseValue}`}>{value}</span>
                 </div>
               ))}
             </div>

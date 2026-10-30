@@ -5,6 +5,7 @@ import { getSession, isInternalRequest } from '@/lib/session'
 import { isReasoningEffort } from '@/lib/llmReasoning'
 import { requireUserExists, isForeignKeyViolation } from '@/lib/userScopedWrite'
 import { JEV_MODEL, JEV_PROVIDER_NAME } from '@/lib/llmProviderKinds'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -65,11 +66,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(providers.map(p => maskProvider(p as unknown as Record<string, unknown>)))
   } catch (error) {
-    console.error('Failed to fetch LLM providers:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch LLM providers' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch LLM providers')
   }
 }
 
@@ -194,10 +191,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         { status: 404 }
       )
     }
-    console.error('Failed to create LLM provider:', error)
-    return NextResponse.json(
-      { error: 'Failed to create LLM provider' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create LLM provider')
   }
 }

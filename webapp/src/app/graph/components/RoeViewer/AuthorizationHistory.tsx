@@ -24,6 +24,7 @@ import { useEffect, useState } from 'react'
 import { FileCheck } from 'lucide-react'
 
 import { ExternalLink } from '@/components/ui'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import styles from './RoeViewer.module.css'
 
 export interface AuthorizationRecord {
@@ -61,6 +62,8 @@ function formatWhen(iso: string): string {
   }
 }
 
+const READ_FAILED = 'Could not read the authorization records'
+
 export function AuthorizationHistory({
   projectId,
   engagementKind,
@@ -73,6 +76,7 @@ export function AuthorizationHistory({
 }) {
   const [state, setState] = useState<'loading' | 'error' | 'ready'>('loading')
   const [records, setRecords] = useState<AuthorizationRecord[]>([])
+  const [failure, setFailure] = useState<string | null>(null)
 
   useEffect(() => {
     if (!projectId) return
@@ -80,7 +84,7 @@ export function AuthorizationHistory({
     setState('loading')
     fetch(`/api/projects/${projectId}/authorizations`)
       .then(async r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        if (!r.ok) throw await readApiError(r, READ_FAILED)
         return r.json()
       })
       .then(body => {
@@ -88,8 +92,12 @@ export function AuthorizationHistory({
         setRecords(Array.isArray(body.authorizations) ? body.authorizations : [])
         setState('ready')
       })
-      .catch(() => {
-        if (!cancelled) setState('error')
+      .catch(err => {
+        if (cancelled) return
+        // The panel's own sentence, which says what a failure means here, with the cause.
+        const { code, status } = toApiError(err, READ_FAILED)
+        setFailure(formatApiError({ reason: READ_FAILED, code, status }))
+        setState('error')
       })
     return () => { cancelled = true }
   }, [projectId])
@@ -101,7 +109,7 @@ export function AuthorizationHistory({
   if (state === 'error') {
     return (
       <p className={styles.authWarn}>
-        Could not read the authorization records. This is not the same as there being none:
+        {failure ?? READ_FAILED}. This is not the same as there being none:
         retry before concluding anything about whether this engagement is authorized.
       </p>
     )

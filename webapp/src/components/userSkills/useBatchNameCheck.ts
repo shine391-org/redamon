@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import type { NameCheckResult } from '@/lib/userSkills'
+import { ApiError, readApiError, toApiError } from '@/lib/apiError'
 
 const DEBOUNCE_MS = 400
 
@@ -7,7 +8,9 @@ export interface NameEntry { key: string; name: string }
 
 export type BatchNameCheckOutcome =
   | { keys: string[]; results: NameCheckResult[] }
-  | { keys: string[]; failed: true }
+  | { keys: string[]; failed: true; error?: ApiError }
+
+const CHECK_FAILED = 'The names could not be checked'
 
 /**
  * The upload dialog's early name answer for every row at once (POST .../name-check).
@@ -40,16 +43,21 @@ export function useBatchNameCheck(
         body: JSON.stringify({ names: list.map((e) => e.name) }),
         signal: ctrl.signal,
       })
+      if (!res.ok) {
+        const error = await readApiError(res, CHECK_FAILED)
+        if (!ctrl.signal.aborted) report.current({ keys, failed: true, error })
+        return null
+      }
       const body = await res.json().catch(() => null)
       if (ctrl.signal.aborted) return null
-      if (!res.ok || !Array.isArray(body?.results) || body.results.length !== keys.length) {
-        report.current({ keys, failed: true })
+      if (!Array.isArray(body?.results) || body.results.length !== keys.length) {
+        report.current({ keys, failed: true, error: new ApiError({ reason: CHECK_FAILED, status: res.status, code: 'invalid_response' }) })
         return null
       }
       report.current({ keys, results: body.results })
       return body.results
-    } catch {
-      if (!ctrl.signal.aborted) report.current({ keys, failed: true })
+    } catch (err) {
+      if (!ctrl.signal.aborted) report.current({ keys, failed: true, error: toApiError(err, CHECK_FAILED) })
       return null
     }
   }, [userId])

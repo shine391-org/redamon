@@ -37,12 +37,13 @@ import { invalidateCache } from '@/app/api/graph/cache'
 import { acquireActivationLock, releaseActivationLock } from '@/lib/activationLock'
 import { describeLiveGraphWriters } from '@/lib/graphWriters'
 import { describeNodeFilterWriter } from '@/lib/nodeFilterRun'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; versionId: string }>
 }
 
-export async function POST(_request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Activation failed', async (_request: NextRequest, { params }: RouteParams) => {
   const { id, versionId } = await params
 
   const eff = await requireEffectiveUser()
@@ -88,7 +89,14 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
   // A node-filter apply can start between the writer check above and the lock:
   // the apply route checks for an activation only before it creates its run.
   // Re-checked under the lock so the freeze below never captures a half-applied graph.
-  const applying = await describeNodeFilterWriter(id)
+  let applying: Awaited<ReturnType<typeof describeNodeFilterWriter>>
+  try {
+    applying = await describeNodeFilterWriter(id)
+  } catch (err) {
+    // The try/finally below is not entered yet: without this the lock outlives the request.
+    await releaseActivationLock(id)
+    throw err
+  }
   if (applying) {
     await releaseActivationLock(id)
     return NextResponse.json(
@@ -120,15 +128,10 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
         await storeSnapshot(current.id, captured)
       }
     } catch (err) {
-      console.error('[scanTimeline] activation aborted before any delete:', err)
-      return NextResponse.json(
-        {
-          error: 'Could not save the current graph before switching, so nothing was changed. ' +
-            (err instanceof Error ? err.message : String(err)),
-          freezeFailed: true,
-        },
-        { status: 500 }
-      )
+      return internalError(err, 'Could not save the current graph before switching, so nothing was changed.', {
+        log: '[scanTimeline] activation aborted before any delete',
+        extra: { freezeFailed: true },
+      })
     }
 
     // --- 2. swap the live graph ----------------------------------------------
@@ -159,17 +162,12 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
         }
       })
     } catch (err) {
-      console.error('[scanTimeline] activation failed mid-restore (retriable):', err)
       invalidateCache(id)
-      return NextResponse.json(
-        {
-          error: 'Activation failed while rebuilding the graph. No version data was lost - ' +
-            'retry the activation to rebuild it. ' + (err instanceof Error ? err.message : String(err)),
-          restoreFailed: true,
-          retriable: true,
-        },
-        { status: 500 }
-      )
+      return internalError(err, 'Activation failed while rebuilding the graph. No version data was lost - ' +
+        'retry the activation to rebuild it.', {
+        log: '[scanTimeline] activation failed mid-restore (retriable)',
+        extra: { restoreFailed: true, retriable: true },
+      })
     }
 
     // --- 3. move the pointer (only after the restore succeeded) --------------
@@ -212,12 +210,8 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
         'are project-level and still reflect the latest scan.',
     })
   } catch (error) {
-    console.error('[scanTimeline] activation error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Activation failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Activation failed', { log: '[scanTimeline] activation error' })
   } finally {
     await releaseActivationLock(id)
   }
-}
+})

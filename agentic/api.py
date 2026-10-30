@@ -30,7 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from langchain_core.messages import SystemMessage, HumanMessage
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from llm_guard import (master_key_is_weak, require_configured_master_auth,
                        require_internal_auth, require_internal_auth_only,
@@ -491,12 +491,17 @@ from llm_builder import (  # noqa: E402
     fetch_user_providers,
     is_model_unavailable_error,
     log_provider_error,
+    provider_error_details,
 )
 
 
-def _feature_error(code: str, model: str, status: int, error: str) -> JSONResponse:
+def _feature_error(code: str, model: str, status: int, error: str,
+                   exc: Optional[BaseException] = None) -> JSONResponse:
+    # The provider's class and HTTP status tell a bad key from a rate limit or
+    # an overflowing context; its message stays in the log (it can quote the key).
+    details = provider_error_details(exc) if exc is not None else {}
     return JSONResponse(
-        content={"error": error, "code": code, "model_used": model},
+        content={"error": error, "code": code, "model_used": model, **details},
         status_code=status,
     )
 
@@ -525,7 +530,7 @@ async def _build_feature_llm(feature: str, model: str, user_id: str):
     except Exception as exc:                                      # noqa: BLE001
         log_provider_error(feature, model, exc)
         return None, _feature_error("model_unavailable", model, 503,
-                                    MODEL_UNAVAILABLE_MESSAGE.format(model=model))
+                                    MODEL_UNAVAILABLE_MESSAGE.format(model=model), exc)
     return llm, None
 
 
@@ -541,10 +546,10 @@ async def _invoke_feature_llm(feature: str, model: str, llm, messages):
         log_provider_error(feature, model, exc)
         if is_model_unavailable_error(exc):
             return None, _feature_error("model_unavailable", model, 503,
-                                        MODEL_UNAVAILABLE_MESSAGE.format(model=model))
+                                        MODEL_UNAVAILABLE_MESSAGE.format(model=model), exc)
         return None, JSONResponse(
             content={"error": "The model call failed. Try again in a moment.",
-                     "model_used": model},
+                     "model_used": model, **provider_error_details(exc)},
             status_code=502,
         )
 
@@ -580,10 +585,10 @@ async def summarize_report(body: ReportSummarizeRequest):
         log_provider_error("Report summarizer", requested_model, exc)
         if is_model_unavailable_error(exc):
             return _feature_error("model_unavailable", requested_model, 503,
-                                  MODEL_UNAVAILABLE_MESSAGE.format(model=requested_model))
+                                  MODEL_UNAVAILABLE_MESSAGE.format(model=requested_model), exc)
         return JSONResponse(
             content={"error": "Failed to generate report narratives. The details are in the agent log.",
-                     "model_used": requested_model},
+                     "model_used": requested_model, **provider_error_details(exc)},
             status_code=500,
         )
     if isinstance(narratives, dict):
@@ -1442,6 +1447,61 @@ class SerializedClassifyRequest(BaseModel):
     project_id: Optional[str] = None
 
 
+class RoutePrivacyItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=200)
+    method: Literal["GET", "HEAD"] = "GET"
+    category: Literal["admin", "admin_debug", "api", "api_documentation", "authentication", "dynamic",
+                      "endpoint", "file_access", "file_upload", "search", "upload", "other"] = "other"
+    openapi_secured: bool = False
+    declared_only: bool = False
+    js_only: bool = False
+    host_internal: bool = False
+
+
+class RoutePrivacyRankRequest(BaseModel):
+    routes: List[RoutePrivacyItem] = Field(min_length=1, max_length=400)
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
+class RouteCandidateItem(BaseModel):
+    # Evidence only: no route_class and no signature, so Jev's kind is a second
+    # opinion rather than the classifier read back. Key names, never values.
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=200)
+    method: Literal["GET", "HEAD"] = "GET"
+    anon_status: int = Field(default=0, ge=0, le=999)
+    authed_status: Optional[int] = Field(default=None, ge=0, le=999)
+    content_class: Literal["json", "html", "text", "xml", "binary", "other"] = "other"
+    size_bucket: Literal["<1k", "1-10k", "10-100k", ">100k"] = "<1k"
+    bodies_match: Optional[bool] = None
+    key_paths: List[str] = Field(default_factory=list, max_length=60)
+    max_array_len: int = Field(default=0, ge=0)
+    det_signals: List[Literal["pii", "pii_others", "sensitive_fields", "secret"]] = Field(
+        default_factory=list, max_length=4)
+    auth_expected_by: List[Literal["openapi", "openapi_tag", "declared_only", "seen_denied", "path_word",
+                                   "host_word", "siblings_locked", "version_locked", "vary_auth"]] = Field(
+        default_factory=list, max_length=9)
+    generated_by: Literal["found", "seed", "vcs", "backup", "version", "sibling", "framework", "catalog",
+                          "cross_host"] = "found"
+
+    @field_validator("key_paths")
+    @classmethod
+    def _short_keys(cls, value):
+        if any(len(k) > 80 for k in value):
+            raise ValueError("key paths are at most 80 characters")
+        return value
+
+
+class RouteExposureAssessRequest(BaseModel):
+    candidates: List[RouteCandidateItem] = Field(min_length=1, max_length=50)
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
 @app.post("/jev/ffuf-base-paths", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
 async def jev_ffuf_base_paths(body: FfufBasePathsRequest):
     import jev_hooks
@@ -1487,6 +1547,25 @@ async def jev_serialized_classify(body: SerializedClassifyRequest):
         "serialized-classify", body.user_id or "", body.project_id or "",
         len(body.blobs) * 2,
         lambda key: jev_hooks.serialized_classify(key, [b.model_dump() for b in body.blobs]),
+    )
+
+
+@app.post("/jev/route-privacy-rank", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
+async def jev_route_privacy_rank(body: RoutePrivacyRankRequest):
+    import jev_hooks
+    return await _run_jev(
+        "route-privacy-rank", body.user_id or "", body.project_id or "", len(body.routes),
+        lambda key: jev_hooks.route_privacy_rank(key, [r.model_dump() for r in body.routes]),
+    )
+
+
+@app.post("/jev/route-exposure-assess", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
+async def jev_route_exposure_assess(body: RouteExposureAssessRequest):
+    import jev_hooks
+    return await _run_jev(
+        "route-exposure-assess", body.user_id or "", body.project_id or "",
+        len(body.candidates) * 2,
+        lambda key: jev_hooks.route_exposure_assess(key, [c.model_dump() for c in body.candidates]),
     )
 
 
@@ -2918,8 +2997,8 @@ def _skill_metadata_size_error(body: SkillMetadataRequest, model: str) -> Option
     if not 1 <= len(body.items) <= skill_metadata.MAX_ITEMS:
         return refuse(f"Send 1 to {skill_metadata.MAX_ITEMS} skills")
     for item in body.items:
-        if not item.content.strip() or len(item.content) > 50 * 1024:
-            return refuse("Each skill needs a text of at most 50 KB")
+        if not item.content.strip() or len(item.content) > skill_metadata.CONTENT_MAX_CHARS:
+            return refuse(f"Each skill needs a text of at most {skill_metadata.CONTENT_MAX_CHARS // 1024} KB")
         if not (item.want_name or item.want_description):
             return refuse("Each skill must ask for a name or a description")
         if len(item.key) > 64:
@@ -3128,12 +3207,35 @@ class TextToCypherRequest(BaseModel):
 
 
 class _CypherSetupError(Exception):
-    """Carries the (status, safe message) to answer with."""
+    """Carries the (status, safe message) to answer with, plus safe extra fields
+    (a code, the provider's class and HTTP status) for the body."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, fields: Optional[dict] = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.fields = dict(fields or {})
+
+
+def _cypher_model_error(exc: BaseException) -> _CypherSetupError:
+    """A failed model call while generating Cypher.
+
+    Not a bad query: retrying it with the "previous error" fed back would bill
+    the same refused key or exhausted quota three more times and then tell the
+    person to rephrase their question.
+    """
+    log_provider_error("text-to-cypher", "", exc)
+    details = provider_error_details(exc)
+    if is_model_unavailable_error(exc):
+        return _CypherSetupError(
+            503,
+            "The AI model could not be used. Check the project's AI model and its API key.",
+            {"code": "model_unavailable", **details},
+        )
+    return _CypherSetupError(
+        502, "The AI model call failed. Try again in a moment.",
+        {"code": "model_call_failed", **details},
+    )
 
 
 async def _build_cypher_manager(user_id: str, project_id: str):
@@ -3256,15 +3358,20 @@ async def _generate_validated_cypher(
 
     for attempt in range(max_retries):
         try:
-            if attempt == 0:
-                cypher = await manager._generate_cypher(question, for_graph_view=for_graph_view)
-            else:
-                cypher = await manager._generate_cypher(
-                    question,
-                    previous_error=last_error,
-                    previous_cypher=last_cypher,
-                    for_graph_view=for_graph_view,
-                )
+            try:
+                if attempt == 0:
+                    cypher = await manager._generate_cypher(question, for_graph_view=for_graph_view)
+                else:
+                    cypher = await manager._generate_cypher(
+                        question,
+                        previous_error=last_error,
+                        previous_cypher=last_cypher,
+                        for_graph_view=for_graph_view,
+                    )
+            except CypherGenerationTimeout:
+                raise
+            except Exception as gen_exc:                          # noqa: BLE001
+                raise _cypher_model_error(gen_exc) from gen_exc
 
             if manager._find_disallowed_write_operation(cypher):
                 raise _CypherSetupError(400, "Write operations are not allowed in data filters")
@@ -3327,7 +3434,7 @@ async def text_to_cypher(body: TextToCypherRequest):
             manager, body.question, body.user_id, body.project_id, body.for_graph_view
         )
     except _CypherSetupError as e:
-        return JSONResponse(content={"error": e.message}, status_code=e.status)
+        return JSONResponse(content={"error": e.message, **e.fields}, status_code=e.status)
     return JSONResponse(content={"cypher": cypher})
 
 
@@ -3371,7 +3478,7 @@ async def graph_nl_query(body: GraphNlQueryRequest):
         )
     except _CypherSetupError as e:
         return JSONResponse(
-            status_code=e.status, content={"error": e.message, "stage": "generate"}
+            status_code=e.status, content={"error": e.message, "stage": "generate", **e.fields}
         )
 
     from graph_db.tenant_filter import scope_query, TenantScopeError
@@ -4164,7 +4271,15 @@ async def graph_triage(body: GraphTriageRequest):
             return JSONResponse(status_code=503, content={
                 "error": "The graph was busy; nothing was changed. Try again.",
                 "code": "retry"})
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # A Neo4j message quotes the Cypher and its values; its status code
+        # (Neo.ClientError.Schema...) or the class says enough to tell causes apart.
+        neo4j_code = getattr(e, "code", None)
+        error_class = (neo4j_code if isinstance(neo4j_code, str)
+                       and re.fullmatch(r"Neo\.[A-Za-z]+\.[A-Za-z]+\.[A-Za-z]+", neo4j_code)
+                       else type(e).__name__)
+        return JSONResponse(status_code=500, content={
+            "error": "The triage operation failed. The details are in the agent log.",
+            "code": "internal_error", "error_class": error_class})
 
     # An acknowledgement the CALLER can check. The agent's Python is baked into
     # its image while the webapp is a separate one, so a deploy that rebuilds
@@ -4653,6 +4768,46 @@ _AUTH_PROFILE_CACHE: dict[str, tuple[float, dict]] = {}
 _AUTH_PROFILE_TTL_SEC = 60.0
 
 
+async def _cached_project(project_id: str) -> dict:
+    """The project row behind replay auth, cached (see _AUTH_PROFILE_CACHE). Raises."""
+    webapp_url = os.environ.get("WEBAPP_API_URL", "http://webapp:3000")
+    def _fetch():
+        import requests as _rq
+        r = _rq.get(f"{webapp_url.rstrip('/')}/api/projects/{project_id}",
+                    headers={"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    import time as _time  # `time` is not imported at module scope in this file
+    from project_settings import seen_project_updated_at
+    _now = _time.time()
+    _hit = _AUTH_PROFILE_CACHE.get(project_id)
+    _seen = seen_project_updated_at(project_id)
+    if (_hit and (_now - _hit[0]) < _AUTH_PROFILE_TTL_SEC
+            and (_seen is None or _hit[1].get("updatedAt") == _seen)):
+        return _hit[1]
+    project = await asyncio.to_thread(_fetch)
+    _AUTH_PROFILE_CACHE[project_id] = (_now, project)
+    return project
+
+
+#: Always credentials, whatever the profile says.
+_CREDENTIAL_HEADERS = frozenset({"cookie", "authorization", "proxy-authorization"})
+
+
+async def _anonymous_strip_names(project_id: str) -> frozenset:
+    """Header names an anonymous send must not carry: the standard credential
+    headers plus every name the project's profile sets (its header, apikey and
+    extraHeaders names), whatever host it is scoped to."""
+    names = set(_CREDENTIAL_HEADERS)
+    try:
+        from auth_profile import build_auth_headers
+        profile = (await _cached_project(project_id)).get("authProfile")
+        names |= {str(k).lower() for k in build_auth_headers(profile or {})}
+    except Exception:  # noqa: BLE001 - the standard names are still stripped
+        pass
+    return frozenset(names)
+
+
 async def _profile_auth_base(project_id: str, txn: dict) -> dict:
     """AuthProfile headers to seed under an in-scope replay/browser send.
 
@@ -4664,24 +4819,7 @@ async def _profile_auth_base(project_id: str, txn: dict) -> dict:
         host = txn.get("host")
         if not host:
             return {}
-        webapp_url = os.environ.get("WEBAPP_API_URL", "http://webapp:3000")
-        def _fetch():
-            import requests as _rq
-            r = _rq.get(f"{webapp_url.rstrip('/')}/api/projects/{project_id}",
-                        headers={"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")}, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        import time as _time  # `time` is not imported at module scope in this file
-        from project_settings import seen_project_updated_at
-        _now = _time.time()
-        _hit = _AUTH_PROFILE_CACHE.get(project_id)
-        _seen = seen_project_updated_at(project_id)
-        if (_hit and (_now - _hit[0]) < _AUTH_PROFILE_TTL_SEC
-                and (_seen is None or _hit[1].get("updatedAt") == _seen)):
-            project = _hit[1]
-        else:
-            project = await asyncio.to_thread(_fetch)
-            _AUTH_PROFILE_CACHE[project_id] = (_now, project)
+        project = await _cached_project(project_id)
         profile = project.get("authProfile")
         if not profile:
             return {}
@@ -4727,6 +4865,9 @@ class TrafficReplayRequest(BaseModel):
     mutate: dict = {}
     insertion_point: Optional[str] = None  # fuzz only
     payloads: Optional[list] = None        # fuzz only
+    # The same request with no credentials at all: no profile seeded, and the
+    # origin's Cookie/Authorization/profile headers stripped (an authz check).
+    anonymous: bool = False
 
 
 def _verify_traffic_ctx(ctx: str) -> Optional[dict]:
@@ -4849,8 +4990,12 @@ async def traffic_replay(body: TrafficReplayRequest):
     except Exception:  # noqa: BLE001
         replay_tag = ""
 
-    # Authenticated identity for in-scope hosts (best-effort; {} otherwise).
-    auth_base = await _profile_auth_base(claims["project_id"], txn)
+    # Authenticated identity for in-scope hosts (best-effort; {} otherwise), or
+    # none at all for an anonymous send.
+    if body.anonymous:
+        auth_base, strip = {}, await _anonymous_strip_names(claims["project_id"])
+    else:
+        auth_base, strip = await _profile_auth_base(claims["project_id"], txn), None
 
     try:
         if body.op == "fuzz":
@@ -4860,10 +5005,12 @@ async def traffic_replay(body: TrafficReplayRequest):
             payloads = [str(x) for x in (body.payloads or [])[:200]]
             if not ip or not payloads:
                 return JSONResponse(status_code=400, content={"error": "fuzz requires insertion_point + payloads"})
-            sends = [{"payload": pl, "curl_args": args} for pl, args in build_fuzz_curls(txn, ip, payloads, auth_base=auth_base)]
+            sends = [{"payload": pl, "curl_args": args}
+                     for pl, args in build_fuzz_curls(txn, ip, payloads, auth_base=auth_base, strip_headers=strip)]
         else:
             mutate = body.mutate if isinstance(body.mutate, dict) else {}
-            sends = [{"payload": None, "curl_args": build_replay_curl(txn, mutate, auth_base=auth_base)}]
+            sends = [{"payload": None,
+                      "curl_args": build_replay_curl(txn, mutate, auth_base=auth_base, strip_headers=strip)}]
     except ValueError as e:
         # Host-pin / scope violation (F1) or a malformed mutate — refuse, fail closed.
         return JSONResponse(status_code=400, content={"error": f"replay refused: {str(e)[:200]}"})
@@ -4880,7 +5027,8 @@ async def traffic_replay(body: TrafficReplayRequest):
             "error": f"replay send budget exhausted for this session ({used}/{budget}); refusing {len(sends)} more"})
     _TRAFFIC_REPLAY_SENDS[bkey] = used + len(sends)
 
-    return JSONResponse(content={"sends": sends, "ctx": replay_tag})
+    return JSONResponse(content={"sends": sends, "ctx": replay_tag,
+                                 "identity": "anonymous" if body.anonymous else "session"})
 
 
 # Per-session browser-action budget for /traffic/browser. proxy_brain's
@@ -4908,6 +5056,7 @@ class TrafficBrowserRequest(BaseModel):
     action: str  # open | navigate | interact | eval
     origin_id: str
     url: Optional[str] = None  # navigate only (for the host-pin check)
+    anonymous: bool = False    # open only: no session in the browser context
 
 
 @app.post("/traffic/browser", tags=["Traffic"], dependencies=[Depends(require_internal_auth_only)])
@@ -4992,13 +5141,14 @@ async def traffic_browser(body: TrafficBrowserRequest):
         # to the origin transaction's host, which _profile_auth_base scope-checks,
         # so the session rides every request the page makes (best-effort, {} when
         # no profile / out of scope). Same write-only channel as the ctx tag.
-        auth_headers = await _profile_auth_base(claims["project_id"], txn)
+        auth_headers = {} if body.anonymous else await _profile_auth_base(claims["project_id"], txn)
         return JSONResponse(content={
             "origin_host": origin_host,
             "scheme": origin_scheme,
             "port": origin_port,
             "ctx": cap_tag,
             "auth_headers": auth_headers,
+            "identity": "anonymous" if body.anonymous else "session",
         })
 
     return JSONResponse(content={"ok": True})
@@ -5336,6 +5486,7 @@ async def kali_terminal_proxy(websocket: WebSocket):
 
     await websocket.accept()
 
+    close_code, close_reason = 1000, ""
     try:
         async with websockets.connect(
             upstream_url,
@@ -5378,9 +5529,13 @@ async def kali_terminal_proxy(websocket: WebSocket):
 
     except Exception as e:
         logger.error("Kali terminal proxy error: %s", e)
+        # The class only: the terminal shows the reason, and the text can carry
+        # the upstream URL with the tenant ids in its query.
+        close_code = 1011
+        close_reason = f"Kali sandbox terminal unavailable ({type(e).__name__})"
     finally:
         try:
-            await websocket.close()
+            await websocket.close(code=close_code, reason=close_reason)
         except Exception:
             pass
 
@@ -5400,11 +5555,15 @@ async def agent_websocket(websocket: WebSocket):
 
     The client must send an 'init' message first to authenticate the session.
     """
+    # Closing before accept() refuses the handshake, which the browser sees as a
+    # bare 1006; accepting first lets the code and reason reach the drawer.
     if not orchestrator:
+        await websocket.accept()
         await websocket.close(code=1011, reason="Orchestrator not initialized")
         return
 
     if not ws_manager:
+        await websocket.accept()
         await websocket.close(code=1011, reason="WebSocket manager not initialized")
         return
 

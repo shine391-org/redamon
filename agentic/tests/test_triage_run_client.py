@@ -114,3 +114,69 @@ class TestHeartbeat(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _StatusResponse:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+        self.content = b"x"
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class _AnsweringClient(_FakeClient):
+    answer = None
+
+    async def post(self, url, json=None, headers=None):
+        if isinstance(_AnsweringClient.answer, Exception):
+            raise _AnsweringClient.answer
+        return _AnsweringClient.answer
+
+
+class TestARefusalCarriesTheWebappsOwnReason(unittest.IsolatedAsyncioTestCase):
+    """G-33: the tab used to get one fixed sentence for every refusal."""
+
+    def setUp(self):
+        patcher = mock.patch.object(run_client.httpx, "AsyncClient", _AnsweringClient)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = run_client.TriageRunClient("p1", "u1")
+
+    async def _refusal(self):
+        with self.assertRaises(run_client.TriageRunAborted) as raised:
+            await self.client.authorize("m", "v")
+        return raised.exception
+
+    async def test_a_409_keeps_the_webapps_sentence_and_the_status(self):
+        _AnsweringClient.answer = _StatusResponse(
+            409, {"error": "A version activation is in progress for this project."})
+        refusal = await self._refusal()
+        self.assertEqual(refusal.error_class, "authorize_failed")
+        self.assertEqual(refusal.public_reason,
+                         "A version activation is in progress for this project.")
+        self.assertEqual(refusal.details, {"upstream_status": 409})
+
+    async def test_a_5xx_body_is_never_shown(self):
+        _AnsweringClient.answer = _StatusResponse(500, {"error": "Prisma said P2024 for x"})
+        refusal = await self._refusal()
+        self.assertEqual(refusal.public_reason, "")
+        self.assertEqual(refusal.details, {"upstream_status": 500})
+
+    async def test_an_unreachable_webapp_names_the_class_not_the_message(self):
+        _AnsweringClient.answer = ConnectionError("connect to http://webapp:3000 failed")
+        refusal = await self._refusal()
+        self.assertEqual(refusal.public_reason, "The webapp could not be reached.")
+        self.assertEqual(refusal.details, {"error_class": "ConnectionError"})
+
+    async def test_a_publish_refusal_keeps_its_class_and_reason(self):
+        self.client.run_id = "r1"
+        _AnsweringClient.answer = _StatusResponse(
+            409, {"error": "The run stopped checking in.", "errorClass": "agent_lost"})
+        with self.assertRaises(run_client.TriageRunAborted) as raised:
+            await self.client.claim_publish()
+        self.assertEqual(raised.exception.error_class, "agent_lost")
+        self.assertEqual(raised.exception.public_reason, "The run stopped checking in.")

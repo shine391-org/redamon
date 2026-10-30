@@ -6,6 +6,7 @@ import { createHash } from 'crypto'
 import { getGraphSession } from '../../../graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { jsReconSecretFromRecord } from '@/lib/secrets/jsReconSecret'
+import { internalError } from '@/lib/routeErrors'
 
 const PROJECT_ID_RE = /^[a-zA-Z0-9_-]+$/
 
@@ -397,11 +398,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       headers: { 'ETag': `"${etag}"`, 'Cache-Control': 'private, no-cache' },
     })
   } catch (error) {
-    console.error('JS Recon query error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'JS Recon query failed', { log: 'JS Recon query error' })
   } finally {
     await session.close()
   }

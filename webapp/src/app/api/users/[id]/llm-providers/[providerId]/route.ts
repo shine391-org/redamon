@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { isInternalRequest, requireUserAccess } from '@/lib/session'
 import { isReasoningEffort } from '@/lib/llmReasoning'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; providerId: string }>
@@ -47,11 +48,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(maskProvider(provider as unknown as Record<string, unknown>))
   } catch (error) {
-    console.error('Failed to fetch LLM provider:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch LLM provider' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch LLM provider')
   }
 }
 
@@ -143,11 +140,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(maskProvider(provider as unknown as Record<string, unknown>))
   } catch (error) {
-    console.error('Failed to update LLM provider:', error)
-    return NextResponse.json(
-      { error: 'Failed to update LLM provider' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update LLM provider')
   }
 }
 
@@ -172,10 +165,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error('Failed to delete LLM provider:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete LLM provider' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete LLM provider')
   }
 }

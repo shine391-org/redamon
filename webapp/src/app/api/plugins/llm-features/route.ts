@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { requireEffectiveUser } from '@/lib/access'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import { listPluginLlmFeatures } from '@/lib/plugins/pluginLlmFeatures'
 
 /**
@@ -10,8 +11,8 @@ import { listPluginLlmFeatures } from '@/lib/plugins/pluginLlmFeatures'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export async function GET() {
+export const GET = pluginRoute('llm features', 'The plugin model features could not be read; see the webapp log.', async () => {
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
   return NextResponse.json(await listPluginLlmFeatures(), { headers: { 'Cache-Control': 'no-store' } })
-}
+})

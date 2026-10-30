@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -154,11 +155,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Red-zone sharedInfra error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Red-zone sharedInfra error' })
   } finally {
     await session.close()
   }

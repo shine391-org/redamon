@@ -493,6 +493,28 @@ export const reconPresetSchema = z.object({
   webCachePoisonBehavioralOracle: bool,
   webCachePoisonBehavioralDelay: float,
   webCachePoisonDifferential: bool,
+  routeExposureEnabled: bool,
+  routeExposureMaxRps: float,
+  routeExposureWorkers: int,
+  routeExposureTimeout: int,
+  routeExposureMaxRoutesPerHost: int,
+  routeExposureMaxRoutesTotal: int,
+  routeExposureSeedPaths: bool,
+  routeExposureVcsFiles: bool,
+  routeExposureBackupFiles: bool,
+  routeExposureVersionVariants: bool,
+  routeExposureCompareLoggedIn: bool,
+  routeExposurePiiDetection: bool,
+  routeExposureSiblings: bool,
+  routeExposureFrameworkSeeds: bool,
+  routeExposureFollowCatalogs: bool,
+  routeExposureGitWalk: bool,
+  routeExposureCrossHost: bool,
+  routeExposureCorsRider: bool,
+  routeExposureCacheRider: bool,
+  routeExposureJevRank: bool,
+  routeExposureJevWallCheck: bool,
+  routeExposureJevAssess: bool,
 
   // -- CVE Lookup --
   cveLookupEnabled: bool,
@@ -1063,6 +1085,30 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - webCachePoisonBehavioralOracle: boolean - Detect *silent* caches (no cache-status headers, common with default Varnish/nginx or hardened CDNs) via a frozen-Date probe: fetch twice across a short delay; a frozen Date header + identical body implies a cache. Catches caches header detection alone would miss. Default true.
 - webCachePoisonBehavioralDelay: number - Seconds to wait between the two frozen-Date probes. Larger = more reliable on slow origins, but adds latency per silent URL. Default 1.1.
 - webCachePoisonDifferential: boolean - Non-reflective detection. Beyond looking for a benign canary echoed back, also flag a poison that changes the response *behaviour* (a persisted status code / Location redirect / body) with no echoed marker, guarded against false positives by requiring the affected response dimension to be stable across two clean baselines. Catches CPDoS-style status flips, scheme/redirect poisoning, and cache-key confusion. Adds one extra baseline request per vector. Default true.
+
+## Route Exposure (active, GET/HEAD only)
+- routeExposureEnabled: boolean - Request the routes recon found plus generated ones (internal/admin/debug seed paths, .git/.env/web.config, backup copies, older API versions) without credentials, and logged in where the authentication profile covers the host. Writes info-severity leads the agent's access_control skill confirms (a route answering anonymously where auth was expected, or returning sensitive fields / other people's personal data) and signature findings with real severity (exposed .git, .env, backups, debug consoles, actuator env, debug pages). Never requests logout/delete/reset paths. Runs in GROUP 6 whenever active scanning runs. Good fit for API, web-app and bug-bounty presets. Default false.
+- routeExposureMaxRps: number - Requests per second across all hosts (1-50), capped to the RoE ceiling. Adds to the other Phase A scanners' load. Default 5.
+- routeExposureWorkers: integer - Routes requested at once (1-16). Default 4.
+- routeExposureTimeout: integer - Seconds to wait for one answer (2-60). Default 10.
+- routeExposureMaxRoutesPerHost: integer - Route budget per host (10-5000); OpenAPI-secured, seen-denied and .git/.env routes go first. Default 300.
+- routeExposureMaxRoutesTotal: integer - Route budget per run across hosts (50-50000). Default 3000.
+- routeExposureSeedPaths: boolean - Request well-known internal/admin/debug paths, at most 60 per host. Default true.
+- routeExposureVcsFiles: boolean - Request .git/.svn/.hg/.env/web.config files at each host and top-level folder, at most 30 per host. Default true.
+- routeExposureBackupFiles: boolean - Guess backup copies of server-side files and root archives/dumps, read with HEAD and a 1 KB Range only. Default true.
+- routeExposureVersionVariants: boolean - Try older API versions of versioned routes (/api/v2/x -> /api/v1/x, /api/x). Default true.
+- routeExposureCompareLoggedIn: boolean - Also request each route logged in where the authentication profile covers the host. Default true.
+- routeExposurePiiDetection: boolean - Detect personal data in answers; stores types and one count, never values. Default true.
+- routeExposureSiblings: boolean - Generate sibling routes from each API route (collection, /export, /all, /list, admin/internal segments), at most 6 per route and 100 per host. Default true.
+- routeExposureFrameworkSeeds: boolean - Request framework debug/management paths from the host's detected technologies (Spring actuator incl. heapdump HEAD-only, Django/Laravel/Rails/Go/.NET/PHP/Apache), at most 30 per host. Default true.
+- routeExposureFollowCatalogs: boolean - When an open route catalog is found (actuator mappings, anonymous OpenAPI/Swagger, rails routes), parse and request its routes once, at most 500 per host. Default true.
+- routeExposureGitWalk: boolean - After an exposed .git/HEAD, fetch the ref and one commit object and inflate it bounded to prove reconstructability; stores only the proof, never the tree or blobs. Default true.
+- routeExposureCrossHost: boolean - Try a path that hit on one host against other in-scope hosts with the same technology or title, at most 50. Default false.
+- routeExposureCorsRider: boolean - On a personalised, sensitive logged-in route, resend with crafted Origin headers to detect a credentialed reflected origin; headers only, never a body. Default true.
+- routeExposureJevRank: boolean - Ask TypeSafe AI Jev (jev-1.13.0) whether each route is meant only for logged-in, internal or admin callers; its answer fills the request budget after the always-requested floor (private-looking routes first) and is saved on each lead. Only when aiInPipeline=true and routeExposureEnabled=true; needs a Jev token on the owner's account. Never cuts a floor route. Default false.
+- routeExposureJevWallCheck: boolean - Ask Jev whether an HTML lead the deterministic page check kept is really a login wall, error page or placeholder; the page class is saved on the lead and a wall at confidence >= 70 is confirmed last. Never drops a lead. Same gating and token rule. Default false.
+- routeExposureJevAssess: boolean - Ask Jev which kind of route each lead is and how sensitive its answer is, from the evidence alone (never the route class or a value); both are saved on the lead and the agent confirms the most sensitive first, public content last. Never drops a lead or rewrites its route class. Same gating and token rule. Default false.
+- routeExposureCacheRider: boolean - On a personalised, sensitive logged-in route, check whether the answer is cacheable to an anonymous visitor; never plants or fetches from cache. Default true.
 
 ## CVE Lookup
 - cveLookupEnabled: boolean

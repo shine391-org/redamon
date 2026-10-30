@@ -117,7 +117,7 @@ describe('useReconStatus resume refusal (plan 12.5)', () => {
     let answer: ReconState | null = state('running')
     await act(async () => { answer = await result.current.resumeRecon() })
     expect(answer).toBeNull()
-    expect(result.current.getLastResumeError()).toBe(REFUSAL)
+    expect(result.current.getLastResumeError()).toBe(`${REFUSAL} (HTTP 403)`)
     expect(result.current.state?.status).toBe('paused')
   })
 

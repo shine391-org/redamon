@@ -88,6 +88,32 @@ function refusedBeforeSending(err: unknown): boolean {
   return typeof code === 'string' && REFUSED_BEFORE_SENDING.has(code)
 }
 
+const ERRNO = /^(E[A-Z0-9_]{2,40}|UND_ERR_[A-Z_]{2,40})$/
+const AGENT_CODE = /^[a-z][a-z0-9_]{0,63}$/
+const AGENT_CLASS = /^[A-Za-z_][A-Za-z0-9_.]{0,79}$/
+
+/** The errno or timeout class of a transport failure, which tells a stopped
+ *  agent (ECONNREFUSED) from a hung one (TimeoutError); `{}` when there is none. */
+function transportCause(err: unknown): { cause?: string } {
+  const e = err as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | null
+  const code = e?.cause?.code ?? e?.code
+  if (typeof code === 'string' && ERRNO.test(code)) return { cause: code }
+  return e?.name === 'TimeoutError' || e?.name === 'AbortError' ? { cause: String(e.name) } : {}
+}
+
+/** What the agent said about a failure it answered: its status, its own code
+ *  and the exception class it reported, never its message. */
+function agentFailureFacts(status: number, body: Record<string, unknown> | null): Record<string, unknown> {
+  const agentCode = typeof body?.code === 'string' && AGENT_CODE.test(body.code) ? body.code : undefined
+  const errorClass = typeof body?.error_class === 'string' && AGENT_CLASS.test(body.error_class)
+    ? body.error_class : undefined
+  return {
+    upstreamStatus: status,
+    ...(agentCode ? { agentCode } : {}),
+    ...(errorClass ? { errorClass } : {}),
+  }
+}
+
 interface CallOptions {
   channel: TriageChannel
   write?: boolean
@@ -123,9 +149,10 @@ export async function agentTriage(
       throw new TriageActionError(
         'The request was sent but its answer was lost, so it may or may not have been applied. ' +
           'Re-read the finding before trying again.',
-        'outcome_unknown', 502)
+        'outcome_unknown', 502, transportCause(err))
     }
-    throw new TriageActionError('The findings service is unavailable.', 'agent_unreachable', 503)
+    throw new TriageActionError('The findings service is unavailable.', 'agent_unreachable', 503,
+                                transportCause(err))
   }
   const body = (await resp.json().catch(() => null)) as Record<string, unknown> | null
   if (!resp.ok) {
@@ -146,7 +173,13 @@ export async function agentTriage(
       throw new TriageActionError(message || 'Refused.', String(body?.code || 'busy'), 409)
     }
     console.error(`[triage] ${op} failed (${resp.status})`, message)
-    throw new TriageActionError('The findings service failed.', 'agent_failed', 502)
+    const facts = agentFailureFacts(resp.status, body)
+    // The agent's own sentence for a deployment it refuses to serve
+    // (INTERNAL_API_KEY unset) says what to do; nothing else is forwarded.
+    if (facts.agentCode === 'not_configured' && message) {
+      throw new TriageActionError(message, 'agent_failed', 502, facts)
+    }
+    throw new TriageActionError('The findings service failed.', 'agent_failed', 502, facts)
   }
   if (!body || typeof body !== 'object') {
     if (opts.write) {

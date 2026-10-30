@@ -183,7 +183,6 @@ describe('GlobalHeader – structure', () => {
 /* ------------------------------------------------------------------ */
 
 describe('GlobalHeader – Plugins button', () => {
-  // The accessible name includes the "New!" badge text, so match the prefix.
   const pluginsLink = () => screen.queryByRole('link', { name: /^plugins/i })
 
   test('"Plugins" with the Puzzle icon, linking to /plugins', () => {
@@ -192,12 +191,6 @@ describe('GlobalHeader – Plugins button', () => {
     expect(link.getAttribute('href')).toBe('/plugins')
     expect(link.querySelector('svg.lucide-puzzle')).not.toBeNull()
     expect(link.className).toContain('coreNavItem')
-  })
-
-  test('carries the green "New!" badge', () => {
-    render(<GlobalHeader />)
-    const badge = pluginsLink()!.querySelector('span[class*="newBadge"]')
-    expect(badge?.textContent).toBe('New!')
   })
 
   test('in the core nav group, directly before Reports', () => {

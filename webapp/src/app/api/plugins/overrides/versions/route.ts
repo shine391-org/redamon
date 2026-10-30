@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { getEffectiveUser } from '@/lib/session'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import { buildVersionsModel } from '@/lib/plugins/versionsModel'
 import { buildUserSkillVersionsModel } from '@/lib/plugins/userSkillVersionsModel'
 
@@ -15,7 +16,7 @@ import { buildUserSkillVersionsModel } from '@/lib/plugins/userSkillVersionsMode
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export async function GET(request: NextRequest) {
+export const GET = pluginRoute('override versions', 'The versions could not be read; see the webapp log.', async (request: NextRequest) => {
   const eff = await getEffectiveUser()
   if (!eff) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
@@ -34,4 +35,4 @@ export async function GET(request: NextRequest) {
   const model = await buildVersionsModel(eff.userId, group, projectId)
   if (!model) return NextResponse.json({ error: 'No such built-in skill.', code: 'unknown_skill' }, { status: 404 })
   return NextResponse.json(model, { headers: { 'Cache-Control': 'no-store' } })
-}
+})

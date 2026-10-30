@@ -40,6 +40,8 @@ export class RunnerUnavailableError extends Error {
   constructor(
     message: string,
     readonly reason: UnavailableReason,
+    /** The plugin-gateway proxy's own code (`upstream_timeout`, `proxy_busy`) when it answered. */
+    readonly proxyCode?: string,
   ) {
     super(message)
     this.name = 'RunnerUnavailableError'
@@ -55,6 +57,19 @@ export class RunnerError extends Error {
     super(message)
     this.name = 'RunnerError'
   }
+}
+
+/**
+ * A runner failure in one short line for a plugin's `lastError` and the log:
+ * `runner_unavailable (timeout)`, `runner_unavailable (unreachable, proxy_busy)`,
+ * `runner_error: <code> (HTTP n)`. Only codes and the status: both errors' messages are
+ * the platform's own, but a line that is stored and shown stays terse.
+ */
+export function runnerFailureSummary(e: RunnerUnavailableError | RunnerError): string {
+  if (e instanceof RunnerUnavailableError) {
+    return `runner_unavailable (${e.reason}${e.proxyCode ? `, ${e.proxyCode}` : ''})`
+  }
+  return `runner_error: ${e.code} (HTTP ${e.status})`
 }
 
 export interface RunnerConfig {
@@ -152,7 +167,7 @@ async function call(
   if (!res.ok) {
     if (obj && typeof obj.code === 'string' && typeof obj.error === 'string') {
       const proxyReason = Object.hasOwn(PROXY_UNAVAILABLE, obj.code) ? PROXY_UNAVAILABLE[obj.code] : undefined
-      if (proxyReason) throw new RunnerUnavailableError(`The plugin runner is unavailable (${obj.code}).`, proxyReason)
+      if (proxyReason) throw new RunnerUnavailableError(`The plugin runner is unavailable (${obj.code}).`, proxyReason, obj.code)
       throw new RunnerError(res.status, obj.code, obj.error)
     }
     throw new RunnerError(res.status, 'runner_error', `The plugin runner answered HTTP ${res.status}.`)

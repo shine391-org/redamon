@@ -3,6 +3,7 @@ import { getEffectiveUser, getSession } from '@/lib/session'
 import { requireProjectAccess } from '@/lib/access'
 import { createWsTicket } from '@/lib/auth'
 import { assertGraphNotActivating } from '@/lib/activationLock'
+import { withRouteErrors } from '@/lib/routeErrors'
 
 // POST /api/agent/ws-ticket
 //
@@ -13,7 +14,7 @@ import { assertGraphNotActivating } from '@/lib/activationLock'
 // acts as the impersonated user (fetches X's keys, tags the graph as X), and an
 // admin can only mint a ticket for a project the simulated user owns. An
 // internal-key caller has no cookie and cannot mint a ticket for anyone.
-export async function POST(request: NextRequest) {
+export const POST = withRouteErrors('Could not issue a ticket for the agent connection', async (request: NextRequest) => {
   const eff = await getEffectiveUser()
   if (!eff) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -45,7 +46,7 @@ export async function POST(request: NextRequest) {
     ? await createWsTicket(eff.userId, projectId, sessionId, actor)
     : await createWsTicket(eff.userId, projectId, sessionId)
   return NextResponse.json({ ticket })
-}
+})
 
 /** The signed-in person, which differs from the effective user while an admin simulates. */
 async function realActorOf(): Promise<string | undefined> {

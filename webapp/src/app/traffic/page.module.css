@@ -232,6 +232,18 @@
   color: var(--text-tertiary);
 }
 
+.listError {
+  padding: var(--space-4);
+  text-align: center;
+  color: var(--status-error);
+  overflow-wrap: anywhere;
+}
+
+.facetsError {
+  font-size: var(--text-xs);
+  color: var(--status-warning);
+}
+
 .noProject {
   display: flex;
   flex-direction: column;

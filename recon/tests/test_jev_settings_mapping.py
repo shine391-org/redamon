@@ -16,7 +16,8 @@ from recon.tests.golden_settings import _defaults_row
 from recon.tests.golden_settings_runner import resolve
 
 JEV_ONLY_COLUMNS = ("ffufJevBasePaths", "httpxJevPageType", "resourceEnumJevToolHealth",
-                    "hakrawlerJevSeedOrder", "serializedScanJevRank")
+                    "hakrawlerJevSeedOrder", "serializedScanJevRank",
+                    "routeExposureJevRank", "routeExposureJevWallCheck", "routeExposureJevAssess")
 
 
 def _runtime_key(column: str) -> str:

@@ -11,7 +11,7 @@
  */
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act, cleanup } from '@testing-library/react'
-import { useReconSSE } from './useReconSSE'
+import { STREAM_EVENT_ERROR, describeStreamFailure, isStreamReconnecting, useReconSSE } from './useReconSSE'
 
 afterEach(cleanup)
 
@@ -134,5 +134,72 @@ describe('reset', () => {
     expect(result.current.groupNumber).toBeNull()
     expect(result.current.totalGroups).toBeNull()
     expect(result.current.currentGroup).toBeNull()
+  })
+})
+
+describe('a stream that cannot be reopened says why', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  test('each retry is announced, and the final error carries the probed status', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ error: 'Failed to connect to recon log stream', code: 'orchestrator_unreachable' }),
+      { status: 503 },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const onError = vi.fn()
+    const { result } = renderHook(() => useReconSSE({ projectId: 'p1', enabled: true, onError }))
+
+    act(() => { stream().onerror?.() })
+    expect(result.current.error).toBe('Log stream disconnected; reconnecting (attempt 1 of 5)')
+    expect(isStreamReconnecting(result.current.error)).toBe(true)
+
+    for (let i = 0; i < 5; i++) {
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      act(() => { stream().onerror?.() })
+    }
+    await act(async () => { await vi.runOnlyPendingTimersAsync() })
+    expect(fetchMock).toHaveBeenCalledWith('/api/recon/p1/logs', expect.anything())
+    expect(result.current.error).toBe('Failed to connect to recon log stream (orchestrator_unreachable · HTTP 503)')
+    expect(isStreamReconnecting(result.current.error)).toBe(false)
+    expect(onError).toHaveBeenCalledWith('Failed to connect to recon log stream (orchestrator_unreachable · HTTP 503)')
+  })
+
+  test('a reopened stream clears the notice', () => {
+    const { result } = renderHook(() => useReconSSE({ projectId: 'p1', enabled: true }))
+    act(() => { stream().onerror?.() })
+    expect(result.current.error).toMatch(/reconnecting/)
+    act(() => { stream().onopen?.() })
+    expect(result.current.error).toBeNull()
+  })
+})
+
+describe('describeStreamFailure', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  test('no answer at all is a network error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    expect(await describeStreamFailure('/api/recon/p1/logs')).toBe('Connection lost. Max reconnection attempts reached. (network_error)')
+  })
+
+  test('a stream that answers again was interrupted mid-way', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 200 })))
+    expect(await describeStreamFailure('/api/recon/p1/logs')).toBe('Connection lost. Max reconnection attempts reached. (stream_interrupted)')
+  })
+})
+
+describe("the stream's own error event", () => {
+  test('shows a fixed line; the orchestrator exception text stays in the console', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const onError = vi.fn()
+    const { result } = renderHook(() => useReconSSE({ projectId: 'p1', enabled: true, onError }))
+    act(() => stream().emit('error', { error: '404 Client Error: Not Found ("No such container: redamon-recon-p1 on 10.0.0.7")' }))
+    expect(result.current.error).toBe(STREAM_EVENT_ERROR)
+    expect(onError).toHaveBeenCalledWith(STREAM_EVENT_ERROR)
+    expect(consoleError).toHaveBeenCalledWith('Recon log stream error event:', expect.stringContaining('No such container'))
+    consoleError.mockRestore()
   })
 })

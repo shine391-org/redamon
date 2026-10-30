@@ -10,6 +10,8 @@ import { describeNodeFilterWriter } from '@/lib/nodeFilterRun'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
 import { legacyGraphDomains, legacyGraphRefusal } from '@/lib/legacyGraph'
 import { resolveScopeGroups } from '@/lib/scopeGroups'
+import { classifyOrchestratorThrow } from '@/lib/startFullScan'
+import { internalError } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 const WEBAPP_URL = process.env.WEBAPP_URL || 'http://localhost:3000'
@@ -63,29 +65,49 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     // Forward to orchestrator
     // Read before the start, so a RoE replaced mid-start cannot misattribute the run.
     const roeTextSha256 = await currentRoeTextSha256(projectId)
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        project_id: projectId,
-        user_id: project.userId,
-        webapp_api_url: WEBAPP_URL,
-        tool_id: body.tool_id,
-        graph_inputs: body.graph_inputs,
-        user_inputs: body.user_inputs || [],
-        user_targets: body.user_targets || null,
-        include_graph_targets: body.include_graph_targets ?? true,
-        settings_overrides: body.settings_overrides || {},
-      }),
-    })
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          user_id: project.userId,
+          webapp_api_url: WEBAPP_URL,
+          tool_id: body.tool_id,
+          graph_inputs: body.graph_inputs,
+          user_inputs: body.user_inputs || [],
+          user_targets: body.user_targets || null,
+          include_graph_targets: body.include_graph_targets ?? true,
+          settings_overrides: body.settings_overrides || {},
+        }),
+      })
+    } catch (err) {
+      console.error('Partial recon start got no answer from the orchestrator:', err)
+      const thrown = classifyOrchestratorThrow(err)
+      const why = { code: thrown.code, ...(thrown.cause ? { cause: thrown.cause } : {}) }
+      // Partial runs may run in parallel, so retrying a start that may have
+      // happened can launch a second one: the caller is told which case it is.
+      return NextResponse.json(
+        thrown.outcomeUnknown
+          ? {
+              error: 'The orchestrator did not answer, so it is unknown whether the partial recon started. '
+                + 'Check the running partial recons before retrying.',
+              startOutcome: 'unknown',
+              ...why,
+            }
+          : { error: 'The orchestrator could not be reached, so the partial recon was not started.', ...why },
+        { status: thrown.status },
+      )
+    }
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
       // Governor rejections carry a structured object detail; normalize to a
       // string message (+ limit) so it is never rendered as a raw React child.
-      const { error, limit } = normalizeOrchestratorStartError(errorData, 'Failed to start partial recon')
+      const { error, limit, code } = normalizeOrchestratorStartError(errorData, 'Failed to start partial recon')
       return NextResponse.json(
-        { error, ...(limit ? { limit } : {}) },
+        { error, ...(limit ? { limit } : {}), ...(code ? { code } : {}), upstreamStatus: response.status },
         { status: response.status }
       )
     }
@@ -110,10 +132,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json(data)
 
   } catch (error) {
-    console.error('Error starting partial recon:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to start partial recon', { log: 'Error starting partial recon' })
   }
 }

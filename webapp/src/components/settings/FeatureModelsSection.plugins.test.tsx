@@ -1,7 +1,9 @@
 /**
  * Models by feature shows one tile per plugin the user can choose a model for (F-16,
  * F-17, D-47): after the core tiles, badged "plugin", "Not set" by default, saved under
- * `plugin:<id>` like any feature. When its list fails the section is exactly as before.
+ * `plugin:<id>` like any feature. When its list fails the core tiles are as before and one
+ * line says the plugin items could not be loaded, with the status and a Retry. A failed
+ * model list or saved-model read says why too.
  */
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, within, fireEvent, waitFor } from '@testing-library/react'
@@ -110,11 +112,59 @@ describe('plugin tiles', () => {
     expect(screen.queryByText('plugin')).toBeNull()
   })
 
+  test('a failed list says so in one line with its status, and Retry brings the tiles back', async () => {
+    pluginFeatures = { status: 503, body: { error: 'Plugin runner unavailable', code: 'plugin_runner_unreachable' } }
+    renderSection()
+    const notice = await screen.findByText(/Plugin items could not be loaded/)
+    expect(notice).toHaveTextContent('Plugin items could not be loaded (plugin_runner_unreachable · HTTP 503) · Retry')
+    pluginFeatures = { status: 200, body: [SKILLER] }
+    fireEvent.click(within(notice).getByRole('button', { name: /Retry/ }))
+    await pluginTile()
+    await waitFor(() => expect(screen.queryByText(/Plugin items could not be loaded/)).toBeNull())
+  })
+
+  test('a list that is not a list shows no notice: nothing failed', async () => {
+    pluginFeatures = { status: 200, body: { features: [] } }
+    renderSection()
+    await screen.findByText(LLM_FEATURES[0].label)
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => u === '/api/plugins/llm-features')).toBe(true))
+    expect(screen.queryByText(/Plugin items could not be loaded/)).toBeNull()
+  })
+
   test('entries that are not plugin features are ignored', async () => {
     pluginFeatures = { status: 200, body: [{ ...SKILLER, featureId: 'triage' }, { label: 'x' }, SKILLER] }
     renderSection()
     await pluginTile()
     expect(document.querySelectorAll('[data-feature="triage"]')).toHaveLength(1)
     expect(document.querySelectorAll('[data-feature^="plugin:"]')).toHaveLength(1)
+  })
+})
+
+describe('the models and the saved models', () => {
+  test('a model list that fails says why above the tiles (it used to show only Retry)', async () => {
+    const real = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (
+      url === '/api/models'
+        ? json(503, { error: 'Failed to fetch models from agent API', code: 'agent_error', upstreamStatus: 500 })
+        : real(url, init)
+    ))
+    renderSection()
+    expect(await screen.findByText(
+      "Couldn't load your models (agent_error · HTTP 503 · upstream HTTP 500). Retry on any feature below.",
+    )).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /Retry/ }).length).toBeGreaterThan(0)
+  })
+
+  test('saved models that cannot be read say so with the status', async () => {
+    const real = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (
+      url === '/api/users/user-1/settings' && !init?.method
+        ? json(500, { error: 'Failed to fetch settings', code: 'P1001' })
+        : real(url, init)
+    ))
+    renderSection()
+    expect(await screen.findByText(/Couldn't read your saved models/)).toHaveTextContent(
+      "Couldn't read your saved models (P1001 · HTTP 500). Reload the page to try again.",
+    )
   })
 })

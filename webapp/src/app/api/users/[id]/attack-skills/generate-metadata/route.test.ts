@@ -34,6 +34,7 @@ vi.mock('@/lib/audit', () => ({ writeAudit: async (e: Record<string, unknown>) =
 
 import { POST } from './route'
 import { contentSha256 } from '@/lib/userSkillWrites'
+import { MAX_CONTENT_SIZE } from '@/lib/userSkills'
 
 const MODEL = 'claude-haiku-4-5'
 const params = (id: string) => ({ params: Promise.resolve({ id }) })
@@ -119,7 +120,7 @@ describe('generate-metadata: the model and the agent', () => {
     ['empty fields', { items: [item('a', { fields: [] })] }],
     ['an unknown field', { items: [item('a', { fields: ['name', 'content'] })] }],
     ['blank content', { items: [item('a', { content: '  \n' })] }],
-    ['oversized content', { items: [item('a', { content: 'x'.repeat(50 * 1024 + 1) })] }],
+    ['oversized content', { items: [item('a', { content: 'x'.repeat(MAX_CONTENT_SIZE + 1) })] }],
     ['an overlong key', { items: [item('k'.repeat(65))] }],
     ['an overlong name', { items: [item('a', { name: 'n'.repeat(101) })] }],
     ['an overlong file name', { items: [item('a', { fileName: `${'f'.repeat(253)}.md` })] }],
@@ -161,6 +162,34 @@ describe('generate-metadata: who may call it', () => {
     expect(res.status).toBe(status)
     expect(h.settings).not.toHaveBeenCalled()
     expect(h.agentFetch).not.toHaveBeenCalled()
+  })
+})
+
+describe('generate-metadata: failures it did not expect', () => {
+  test('a settings read that throws is 500 with its Prisma code, never a bodiless 500', async () => {
+    h.settings.mockRejectedValue(Object.assign(new Error('Timed out: SELECT "featureModels"'), {
+      name: 'PrismaClientKnownRequestError', code: 'P2024',
+    }))
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ items: [item('a')] })
+    const text = await res.text()
+    expect(res.status).toBe(500)
+    expect(JSON.parse(text)).toEqual({ error: 'Failed to generate the names and descriptions', code: 'P2024' })
+    expect(text).not.toContain('SELECT')
+    expect(h.agentFetch).not.toHaveBeenCalled()
+    log.mockRestore()
+  })
+
+  test("an agent crash is 502 with the agent's status", async () => {
+    h.agentFetch.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await generate({ items: [item('a')] })
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({
+      error: 'The agent failed while handling this request. The details are in the agent log.',
+      upstreamStatus: 500,
+    })
+    log.mockRestore()
   })
 })
 

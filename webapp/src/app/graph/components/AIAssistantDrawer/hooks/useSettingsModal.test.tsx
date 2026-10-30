@@ -205,3 +205,21 @@ test('mergeOwnToggles keeps only what this window changed', async () => {
   expect(mergeOwnToggles(base, local, fresh)).toEqual({ builtIn: { xss: false, rce: true }, user: { a: false, b: true, c: true } })
   expect(mergeOwnToggles(base, base, fresh)).toEqual(fresh)
 })
+
+test('a project that cannot be read is an error, not a spinner forever (G-51)', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => json(503, { error: 'Failed to fetch project', code: 'P1001' })))
+  const hook = renderHook(() => useSettingsModal('p1'))
+  act(() => hook.result.current.setSettingsModal('agent'))
+  await waitFor(() => expect(hook.result.current.projectLoadError).toBe('Failed to fetch project (P1001 · HTTP 503)'))
+  expect(hook.result.current.projectFormData).toBeNull()
+})
+
+test('the settings modal shows the load error in place of the spinner (G-51)', async () => {
+  const { render, screen } = await import('@testing-library/react')
+  const { SettingsModal } = await import('../SettingsModal')
+  render(
+    <SettingsModal settingsModal="agent" setSettingsModal={() => {}} projectFormData={null}
+      updateProjectField={() => {}} loadError="Failed to fetch project (P1001 · HTTP 503)" />,
+  )
+  expect(screen.getByRole('alert')).toHaveTextContent('Failed to fetch project (P1001 · HTTP 503)')
+})

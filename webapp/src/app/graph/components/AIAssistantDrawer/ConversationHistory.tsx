@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
-import { ArrowLeft, Plus, Trash2, MessageSquare, Loader2 } from 'lucide-react'
+import { ArrowLeft, Plus, Trash2, MessageSquare, Loader2, AlertCircle } from 'lucide-react'
 import type { Conversation } from '@/hooks/useConversations'
 import styles from './ConversationHistory.module.css'
 
@@ -31,6 +31,8 @@ interface ConversationHistoryProps {
   onDelete: (id: string) => void
   onNewChat: () => void
   loading?: boolean
+  /** The list could not be loaded: shown instead of "No sessions yet", or above a stale list. */
+  error?: string | null
 }
 
 export function ConversationHistory({
@@ -41,6 +43,7 @@ export function ConversationHistory({
   onDelete,
   onNewChat,
   loading = false,
+  error = null,
 }: ConversationHistoryProps) {
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -85,7 +88,19 @@ export function ConversationHistory({
       </div>
 
       <div className={styles.list}>
-        {loading && conversations.length === 0 ? (
+        {error && conversations.length > 0 && (
+          <div className={styles.listError} role="alert">
+            <AlertCircle size={12} />
+            <span>{error}</span>
+          </div>
+        )}
+        {error && conversations.length === 0 ? (
+          <div className={styles.empty} role="alert">
+            <AlertCircle size={22} style={{ marginBottom: 8, opacity: 0.7 }} />
+            <span>Could not load the sessions</span>
+            <span className={styles.emptyDetail}>{error}</span>
+          </div>
+        ) : loading && conversations.length === 0 ? (
           <div className={styles.empty}>
             <Loader2 size={22} className={styles.spinner} />
             <span>Loading sessions…</span>

@@ -51,6 +51,16 @@ SERIALIZED_BODY = {"blobs": [{"snippet": "rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcA",
                               "transport": "cookie", "location": "session",
                               "encoding_layers": ["base64"]}],
                    "user_id": "u1", "project_id": "p1"}
+ROUTE_PRIVACY_BODY = {"routes": [{"path": "/api/internal/users", "category": "api", "openapi_secured": True},
+                                 {"path": "/about"}],
+                      "user_id": "u1", "project_id": "p1"}
+ROUTE_ASSESS_BODY = {"candidates": [{"path": "/internal/users/export", "anon_status": 200,
+                                     "authed_status": 200, "content_class": "json",
+                                     "size_bucket": "1-10k", "bodies_match": True,
+                                     "key_paths": ["users[].email", "users[].role"], "max_array_len": 50,
+                                     "det_signals": ["pii_others"], "auth_expected_by": ["path_word"],
+                                     "generated_by": "found"}],
+                     "user_id": "u1", "project_id": "p1"}
 
 
 @pytest.fixture(scope="module")
@@ -105,6 +115,8 @@ PATHS = {
     "/jev/tool-health": TOOL_HEALTH_BODY,
     "/jev/crawl-seed-order": CRAWL_SEED_BODY,
     "/jev/serialized-classify": SERIALIZED_BODY,
+    "/jev/route-privacy-rank": ROUTE_PRIVACY_BODY,
+    "/jev/route-exposure-assess": ROUTE_ASSESS_BODY,
 }
 
 
@@ -425,6 +437,22 @@ def _noul_answers_for(req):
     ("/jev/crawl-seed-order", {"hosts": []}),
     ("/jev/crawl-seed-order", {"hosts": [{"hostname": ""}]}),
     ("/jev/crawl-seed-order", {"hosts": [{"hostname": "h"}] * 401}),
+    ("/jev/route-privacy-rank", {"routes": []}),
+    ("/jev/route-privacy-rank", {"routes": [{"path": "/a"}] * 401}),
+    ("/jev/route-privacy-rank", {"routes": [{"path": ""}]}),
+    ("/jev/route-privacy-rank", {"routes": [{"path": "/" + "x" * 200}]}),
+    ("/jev/route-privacy-rank", {"routes": [{"path": "/a", "method": "POST"}]}),   # recon never probes it
+    ("/jev/route-privacy-rank", {"routes": [{"path": "/a", "category": "secret"}]}),
+    ("/jev/route-exposure-assess", {"candidates": []}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a"}] * 51}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "content_class": "pdf"}]}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "det_signals": ["ssn"]}]}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "generated_by": "guess"}]}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "key_paths": ["k" * 81]}]}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "key_paths": ["k"] * 61}]}),
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "anon_status": 1000}]}),
+    # The verdict is never an input: Jev's kind must stay a second opinion.
+    ("/jev/route-exposure-assess", {"candidates": [{"path": "/a", "route_class": "internal_api"}]}),
 ])
 def test_the_per_item_request_models_refuse_out_of_bounds_bodies(client, path, patch_body):
     s1 = AsyncMock()
@@ -457,6 +485,25 @@ def test_tool_health_success_shape(client):
     assert resp.json() == {"transient": True, "confidence": 80, "model": "jev-1.13.0"}
 
 
+def test_route_privacy_rank_success_shape(client):
+    with _owner_ok(), _providers([JEV_ROW]), _mock_typesafe(_noul_answers_for):
+        resp = _post(client, "/jev/route-privacy-rank", ROUTE_PRIVACY_BODY)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"scores": [0.8, 0.8], "model": "jev-1.13.0"}
+
+
+def test_route_exposure_assess_success_shape(client):
+    answers = {"kind": {"type": "choice", "choice": "data_export", "confidence": 0.83},
+               "sensitive": {"type": "noul", "noul": 0.91}}
+    with _owner_ok(), _providers([JEV_ROW]), \
+            patch("jev_client.system_one", AsyncMock(return_value={"model": "jev-1.13.0", "answers": answers})):
+        resp = _post(client, "/jev/route-exposure-assess", ROUTE_ASSESS_BODY)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"labels": [{"kind": "data_export", "kind_confidence": 83, "sensitivity": 91}],
+                           "model": "jev-1.13.0"}
+    assert CANARY not in resp.text
+
+
 def test_crawl_seed_order_success_shape(client):
     with _owner_ok(), _providers([JEV_ROW]), _mock_typesafe(_noul_answers_for):
         resp = _post(client, "/jev/crawl-seed-order", CRAWL_SEED_BODY)
@@ -467,11 +514,13 @@ def test_crawl_seed_order_success_shape(client):
 @pytest.mark.parametrize("path,questions", [
     ("/jev/ffuf-base-paths", 3), ("/jev/page-type", 5), ("/jev/tool-health", 1),
     ("/jev/crawl-seed-order", 2), ("/jev/serialized-classify", 2),
+    ("/jev/route-privacy-rank", 2), ("/jev/route-exposure-assess", 2),
 ])
 def test_the_per_item_log_line_counts_the_questions_asked(client, caplog, path, questions):
     caplog.set_level(logging.INFO)
-    # serialized-classify asks a choice, which a noul-only answer would fail.
-    answers = _valid_answers if path == "/jev/serialized-classify" else _noul_answers_for
+    # These two ask a choice, which a noul-only answer would fail.
+    answers = _valid_answers if path in ("/jev/serialized-classify", "/jev/route-exposure-assess") \
+        else _noul_answers_for
     with _owner_ok(), _providers([JEV_ROW]), _mock_typesafe(answers):
         _post(client, path, PATHS[path])
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("jev ")]

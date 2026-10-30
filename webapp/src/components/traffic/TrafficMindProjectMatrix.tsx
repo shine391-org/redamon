@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { TrafficCaptureToggle } from './TrafficCaptureToggle'
+import { fetchJson, errorMessage } from '@/lib/apiError'
 
 type ProjectRow = { id: string; name: string; captureProxyEnabled: boolean }
 
@@ -13,16 +14,16 @@ type ProjectRow = { id: string; name: string; captureProxyEnabled: boolean }
  */
 export function TrafficMindProjectMatrix() {
   const [rows, setRows] = useState<ProjectRow[] | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
-    fetch('/api/projects')
-      .then((r) => (r.ok ? r.json() : []))
-      .then((list: Array<{ id: string; name: string; captureProxyEnabled?: boolean }>) => {
+    fetchJson<Array<{ id: string; name: string; captureProxyEnabled?: boolean }>>('/api/projects', undefined, 'Could not load projects')
+      .then((list) => {
         if (cancelled) return
         setRows(list.map((p) => ({ id: p.id, name: p.name, captureProxyEnabled: !!p.captureProxyEnabled })))
       })
-      .catch(() => { if (!cancelled) setRows([]) })
+      .catch((err) => { if (!cancelled) setLoadError(errorMessage(err, 'Could not load projects')) })
     return () => { cancelled = true }
   }, [])
 
@@ -35,7 +36,9 @@ export function TrafficMindProjectMatrix() {
         </span>
       </div>
 
-      {rows === null ? (
+      {loadError ? (
+        <div style={{ color: 'var(--status-error, #e5484d)', fontSize: 13 }} role="alert">{loadError}</div>
+      ) : rows === null ? (
         <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>Loading projects…</div>
       ) : rows.length === 0 ? (
         <div style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>No projects.</div>

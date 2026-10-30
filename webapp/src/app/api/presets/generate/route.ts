@@ -4,6 +4,8 @@ import { requireEffectiveUser } from '@/lib/access'
 import { reconPresetSchema, extractJson, RECON_PARAMETER_CATALOG } from '@/lib/recon-preset-schema'
 import { assertSafeLlmBaseUrl, BaseUrlValidationError } from '@/lib/llm-url-guard'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
+import { readFeatureModelCode } from '@/lib/llmFeatures'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { isChatProvider } from '@/lib/llmProviderKinds'
 import { builtinSendsTemperature, customSendsTemperature, rejectsTemperature } from '@/lib/llmTemperature'
 
@@ -191,19 +193,38 @@ async function callOpenAICompatible(opts: OpenAICompatOptions): Promise<string> 
   }
 }
 
+class ProviderHttpError extends Error {
+  constructor(provider: string, readonly status: number, readonly kind: string | undefined) {
+    super(`${provider} API returned ${status}: ${kind ?? 'no error code'}`)
+    this.name = 'ProviderHttpError'
+  }
+}
+
 /**
- * A provider's refusal as something safe to log: the status and, when the body
- * is JSON, its short error type or code. Never the body's text: a 401 body can
+ * A provider's refusal as something safe to log and show: the status and, when the
+ * body is JSON, its short error type or code. Never the body's text: a 401 body can
  * quote part of the key it refused.
  */
-function providerError(provider: string, status: number, text: string): Error {
+function providerError(provider: string, status: number, text: string): ProviderHttpError {
   let body: unknown = null
   try { body = JSON.parse(text) } catch { /* not JSON: the status alone is logged */ }
   const error = body && typeof body === 'object' ? (body as { error?: unknown }).error : null
   const fields = error && typeof error === 'object' ? error as { type?: unknown; code?: unknown } : {}
   const kind = [fields.type, fields.code].find(
     (v): v is string => typeof v === 'string' && /^[A-Za-z0-9_.-]{1,60}$/.test(v))
-  return new Error(`${provider} API returned ${status}: ${kind ?? 'no error code'}`)
+  return new ProviderHttpError(provider, status, kind)
+}
+
+// OpenSSL names a certificate failure (DEPTH_ZERO_SELF_SIGNED_CERT, CERT_HAS_EXPIRED) in
+// undici's `cause`, in a shape safeErrorCode does not take for an errno; without it a
+// self-signed custom base URL would read as a bare TypeError.
+const OPENSSL_CODE = /^[A-Z][A-Z0-9_]{2,60}$/
+
+function failureCode(error: unknown): string {
+  const code = safeErrorCode(error)
+  if (code !== 'TypeError') return code
+  const nested = (error as { cause?: { code?: unknown } }).cause?.code
+  return typeof nested === 'string' && OPENSSL_CODE.test(nested) ? nested : code
 }
 
 /**
@@ -427,7 +448,7 @@ export async function POST(request: NextRequest) {
 
     if (error instanceof Error && error.name === 'AbortError') {
       return NextResponse.json(
-        { error: 'LLM request timed out. Try a simpler description or check your provider settings.' },
+        { error: 'LLM request timed out. Try a simpler description or check your provider settings.', code: 'timeout' },
         { status: 504 },
       )
     }
@@ -435,14 +456,26 @@ export async function POST(request: NextRequest) {
     console.error('Preset generation failed:', message)
     // A refused key or an unknown model opens the model picker. Neither the
     // log nor the answer carries the provider's own text (`providerError`).
-    if (/API returned (401|403|404):/.test(message)) {
+    if (error instanceof ProviderHttpError && [401, 403, 404].includes(error.status)) {
       return featureModelErrorResponse('model_unavailable', 'preset_generator', {
         model: savedModel || undefined,
       })
     }
-    const status = /API returned (\d{3}):/.exec(message)?.[1]
+    if (error instanceof ProviderHttpError) {
+      // The provider's own type (insufficient_quota, overloaded_error) says why; one that
+      // reads as a model-gate code would open the picker for a model that is fine.
+      const kind = error.kind && !readFeatureModelCode({ code: error.kind }) ? error.kind : undefined
+      return NextResponse.json(
+        {
+          error: `The model provider answered ${error.status}. Try again in a moment.`,
+          code: kind ?? 'provider_error',
+          upstreamStatus: error.status,
+        },
+        { status: 502 },
+      )
+    }
     return NextResponse.json(
-      { error: status ? `The model provider answered ${status}. Try again in a moment.` : 'Failed to generate preset. The details are in the webapp log.' },
+      { error: 'Failed to generate preset. The details are in the webapp log.', code: failureCode(error) },
       { status: 502 },
     )
   }

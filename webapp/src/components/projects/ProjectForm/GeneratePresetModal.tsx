@@ -6,6 +6,7 @@ import { Modal } from '@/components/ui/Modal/Modal'
 import { useToast, WikiInfoButton } from '@/components/ui'
 import { FeatureModelLine, useFeatureModelGate } from '@/components/shared/FeatureModelGate'
 import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { ApiError, readApiError, toApiError } from '@/lib/apiError'
 import formStyles from './ProjectForm.module.css'
 import styles from './GeneratePresetModal.module.css'
 
@@ -133,23 +134,22 @@ export function GeneratePresetModal({
         body: JSON.stringify({ prompt: prompt.trim() }),
       }))
 
-      const data = await res.json()
-
       if (!res.ok) {
-        const code = readFeatureModelCode(data)
+        const err = await readApiError(res, 'Failed to generate preset')
+        const code = readFeatureModelCode(err.body)
         // model_unavailable keeps the route's own text: for Bedrock it says why.
-        setError(code && code !== 'model_unavailable'
-          ? featureModelMessage(code)
-          : data.error || 'Failed to generate preset')
-        if (data.details) setErrorDetails(data.details)
+        setError(code && code !== 'model_unavailable' ? featureModelMessage(code) : err.message)
+        if (err.details) setErrorDetails(err.details)
         return
       }
 
+      const data = await res.json().catch(() => null)
+      if (!data) throw new ApiError({ reason: 'Failed to generate preset', status: res.status, code: 'invalid_json' })
       setGeneratedParams(data.parameters)
       setDescription(prompt.trim())
       setStep('review')
-    } catch {
-      setError('Network error. Check your connection and try again.')
+    } catch (err) {
+      setError(toApiError(err, 'Network error. Check your connection and try again.').message)
     } finally {
       setIsGenerating(false)
     }
@@ -171,16 +171,13 @@ export function GeneratePresetModal({
         }),
       })
 
-      if (!res.ok) {
-        const data = await res.json()
-        throw new Error(data.error || 'Failed to save preset')
-      }
+      if (!res.ok) throw await readApiError(res, 'Failed to save preset')
 
       toast.success(`Preset "${name.trim()}" saved`, 'Preset Created')
       onSaved()
       onClose()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save preset')
+      toast.error(toApiError(err, 'Failed to save preset').message)
     } finally {
       setIsSaving(false)
     }

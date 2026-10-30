@@ -259,7 +259,7 @@ setup_ssh() {
   if [[ -f "${auth}" ]]; then
     AUTH_MODE="key"; PEM="${auth}"
   elif [[ "${auth}" == "pass" || "${auth}" == "-" ]]; then
-    AUTH_MODE="password"; read -rs -p "SSH password for ${REMOTE_USER}@${HOST_IP}: " SSH_PASSWORD; echo
+    AUTH_MODE="password"; read -ers -p "SSH password for ${REMOTE_USER}@${HOST_IP}: " SSH_PASSWORD; echo
   elif [[ "${auth}" == pass:* ]]; then
     AUTH_MODE="password"; SSH_PASSWORD="${auth#pass:}"
   else
@@ -435,7 +435,7 @@ cmd_init() {
   hr "INIT ${HOST_IP}  (DESTRUCTIVE -- wipes ALL Docker state + the checkout)"
   if ! is_true "${INIT_FORCE}"; then
     echo "This ERASES every container, image, volume and network on ${HOST_IP} (not just RedAmon)."
-    read -rp "Type INIT to wipe ${HOST_IP}: " confirm
+    read -erp "Type INIT to wipe ${HOST_IP}: " confirm
     [[ "${confirm}" == "INIT" ]] || die "Aborted (confirmation not given)"
   fi
   ship_assets

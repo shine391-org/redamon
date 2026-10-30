@@ -5,6 +5,8 @@ import { Terminal as TerminalIcon, Wifi, WifiOff, RefreshCw, Maximize2, Minimize
 import type { Terminal } from '@xterm/xterm'
 import type { FitAddon } from '@xterm/addon-fit'
 import { buildAgentWsUrl } from '@/hooks/agentWsUrl'
+import { describeWsClose, wsUrlForDisplay } from '@/hooks/agentWsClose'
+import { mintWsTicket, type WsTicketResult } from '@/lib/wsTicket'
 import styles from './KaliTerminal.module.css'
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
@@ -19,23 +21,23 @@ function getWsUrl(ticket?: string): string {
   return buildAgentWsUrl('/ws/kali-terminal', ticket)
 }
 
-// STRIDE S3: mint a ws-ticket bound to the effective user + project before
-// opening the terminal socket (mirrors useAgentWebSocket). Returns null when the
-// mint fails (no project, unauthorized, or the secret is unset) - the caller
-// surfaces a connection error since the agent now fails closed.
-async function fetchKaliTicket(projectId: string, sessionId: string): Promise<string | null> {
-  try {
-    const resp = await fetch('/api/agent/ws-ticket', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId, sessionId }),
-    })
-    if (!resp.ok) return null
-    const data = await resp.json()
-    return data?.ticket ?? null
-  } catch {
-    return null
+/**
+ * The line for a ticket the terminal could not use: the mint's own refusal
+ * (expired session, no project access, a version activation in progress), or
+ * no ticket at all, which here means the webapp has no ticket secret: the
+ * terminal proxy fails closed without one.
+ */
+export function ticketFailureLine(minted: WsTicketResult): string | null {
+  if (!minted.ok) return `Terminal authentication failed: ${minted.error.message}`
+  if (!minted.ticket) {
+    return 'Terminal authentication failed: the webapp issued no ticket (AGENT_WS_TICKET_SECRET is not set). Run ./redamon.sh update, then restart the webapp and agent.'
   }
+  return null
+}
+
+/** "Disconnected from kali-sandbox (close 1011: Kali sandbox terminal unavailable (ConnectionRefusedError))". */
+export function disconnectLine(code: number, reason: string): string {
+  return `Disconnected from kali-sandbox (${describeWsClose(code, reason)})`
 }
 
 export interface KaliTerminalProps {
@@ -174,16 +176,16 @@ export const KaliTerminal = memo(function KaliTerminal({ userId, projectId }: Ka
       terminal.writeln('\x1b[1;31m✗ No project selected - open a project to use the terminal\x1b[0m')
       return
     }
-    const ticket = await fetchKaliTicket(String(pid), sessionIdRef.current)
-    if (!ticket) {
+    const minted = await mintWsTicket(String(pid), sessionIdRef.current)
+    if (!minted.ok || !minted.ticket) {
       connectingRef.current = false
       setStatus('error')
-      terminal.writeln('\x1b[1;31m✗ Terminal authentication failed (could not obtain a ticket)\x1b[0m')
+      terminal.writeln(`\x1b[1;31m✗ ${ticketFailureLine(minted)}\x1b[0m`)
       return
     }
     if (!mountedRef.current) { connectingRef.current = false; return }
 
-    const url = getWsUrl(ticket)
+    const url = getWsUrl(minted.ticket)
     const ws = new WebSocket(url)
     wsRef.current = ws
     connectingRef.current = false
@@ -257,10 +259,10 @@ export const KaliTerminal = memo(function KaliTerminal({ userId, projectId }: Ka
     ws.onerror = () => {
       if (!mountedRef.current) return
       setStatus('error')
-      terminal.writeln('\n\x1b[1;31mWebSocket connection failed. Is the kali-sandbox running?\x1b[0m')
+      terminal.writeln(`\n\x1b[1;31mWebSocket connection to ${wsUrlForDisplay(url)} failed. Is the kali-sandbox running?\x1b[0m`)
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
       if (!mountedRef.current) return
 
       // Clear keepalive
@@ -270,7 +272,7 @@ export const KaliTerminal = memo(function KaliTerminal({ userId, projectId }: Ka
       }
 
       setStatus('disconnected')
-      terminal.writeln('\n\x1b[1;31m\u2717 Disconnected from kali-sandbox\x1b[0m')
+      terminal.writeln(`\n\x1b[1;31m\u2717 ${disconnectLine(event.code, event.reason)}\x1b[0m`)
 
       // Auto-reconnect with exponential backoff
       const attempt = reconnectAttemptRef.current

@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { upstreamErrorResponse, upstreamFailureResponse, withRouteErrors } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -8,24 +9,26 @@ interface RouteParams {
   params: Promise<{ projectId: string }>
 }
 
-export async function GET(request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to connect to recon log stream', async (request: NextRequest, { params }: RouteParams) => {
   const { projectId } = await params
   const __denied = await guardProject(projectId)
   if (__denied) return __denied
 
   // Proxy the SSE stream from the recon orchestrator
-  const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/logs`, {
-    headers: {
-      'Accept': 'text/event-stream',
-    },
-    signal: request.signal,
-  })
+  let response: Response
+  try {
+    response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/logs`, {
+      headers: {
+        'Accept': 'text/event-stream',
+      },
+      signal: request.signal,
+    })
+  } catch (err) {
+    return upstreamFailureResponse('orchestrator', err, 'Failed to connect to recon log stream')
+  }
 
   if (!response.ok) {
-    return new Response(
-      JSON.stringify({ error: 'Failed to connect to recon log stream' }),
-      { status: response.status, headers: { 'Content-Type': 'application/json' } }
-    )
+    return upstreamErrorResponse('orchestrator', response, 'Failed to connect to recon log stream', { forwardText: true })
   }
 
   // Forward the SSE stream directly to the client
@@ -36,4 +39,4 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       'Connection': 'keep-alive',
     },
   })
-}
+})

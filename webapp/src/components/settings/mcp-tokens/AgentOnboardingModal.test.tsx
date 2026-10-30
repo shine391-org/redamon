@@ -284,3 +284,23 @@ describe('downloading the pack', () => {
     expect(URL.revokeObjectURL).not.toHaveBeenCalled()
   })
 })
+
+describe('a pack that could not be generated says why', () => {
+  test('a server failure shows its code and status', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ error: 'Could not generate the onboarding pack', code: 'TypeError' }), { status: 500 },
+    )))
+    render(<AgentOnboardingModal {...props()} />)
+    fireEvent.click(screen.getByText('Generate'))
+    await waitFor(() =>
+      expect(screen.getByText('Could not generate the onboarding pack (TypeError · HTTP 500)')).toBeTruthy())
+  })
+
+  test('a proxy error page names its status', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>504</html>', { status: 504 })))
+    render(<AgentOnboardingModal {...props()} />)
+    fireEvent.click(screen.getByText('Generate'))
+    await waitFor(() =>
+      expect(screen.getByText('Could not generate the pack (non_json_response · HTTP 504)')).toBeTruthy())
+  })
+})

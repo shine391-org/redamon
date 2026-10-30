@@ -116,3 +116,34 @@ describe('the agent answers model_required', () => {
     expect(screen.queryByRole('button', { name: 'Choose a model and start' })).toBeNull()
   })
 })
+
+describe('a failure before the first event is shown (G-4)', () => {
+  test('a refused ticket is rendered with Try again instead of a blank panel', async () => {
+    codefix.state = {
+      ...codefix.state, status: 'error', errorCode: null,
+      error: 'CodeFix authentication failed (could not obtain a ticket): Not found (HTTP 404)',
+    }
+    gateSpies.ensureFeatureModel.mockResolvedValue('m')
+    renderViewer()
+    expect(screen.getByRole('alert')).toHaveTextContent('Not found (HTTP 404)')
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    await waitFor(() => expect(codefix.startFix).toHaveBeenCalledWith('rem-1'))
+  })
+
+  test('an agent error already in the log is not shown twice', () => {
+    const message = 'The repository could not be cloned. (clone_failed)'
+    codefix.state = {
+      ...codefix.state, status: 'error', errorCode: 'clone_failed', error: message,
+      activityLog: [{ id: 'log-1', type: 'error', message, ts: 0 }],
+    }
+    renderViewer()
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
+  })
+
+  test('model_required keeps its own picker, not the generic block', () => {
+    codefix.state = { ...codefix.state, status: 'error', errorCode: 'model_required', error: 'x' }
+    renderViewer()
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Choose a model and start' })).toBeInTheDocument()
+  })
+})

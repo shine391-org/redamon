@@ -5,6 +5,7 @@ import { Loader2, ArrowRight, Plus, Minus, RefreshCw, ShieldAlert, Download, X }
 import type { ScanVersionSummary } from '../../hooks/useScanVersions'
 import type { GraphNode, DeltaState } from '../../types'
 import { WikiInfoButton } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
 import { GraphCanvas } from '../GraphCanvas'
 import { useDimensions } from '../../hooks'
 import styles from './ReconDeltaTable.module.css'
@@ -144,15 +145,16 @@ export function ReconDeltaTable({ projectId, versions, isDark = true }: ReconDel
     setOverlayError(null)
     fetch(`/api/projects/${projectId}/delta?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&overlay=1`)
       .then(async res => {
-        const body = await res.json().catch(() => ({}))
-        if (cancelled) return
         if (!res.ok) {
-          setOverlayError(String(body.error || 'Failed to load the graph overlay'))
+          const failure = await readApiError(res, 'Failed to load the graph overlay')
+          if (!cancelled) setOverlayError(failure.message)
           return
         }
+        const body = await res.json().catch(() => ({}))
+        if (cancelled) return
         setOverlay(body.overlay ?? { nodes: [], links: [] })
       })
-      .catch(err => { if (!cancelled) setOverlayError(err instanceof Error ? err.message : String(err)) })
+      .catch(err => { if (!cancelled) setOverlayError(toApiError(err, 'Failed to load the graph overlay').message) })
       .finally(() => { if (!cancelled) setOverlayLoading(false) })
     return () => { cancelled = true }
   }, [section, projectId, from, to])
@@ -164,12 +166,16 @@ export function ReconDeltaTable({ projectId, versions, isDark = true }: ReconDel
     setError(null)
     fetch(`/api/projects/${projectId}/delta?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
       .then(async res => {
+        if (!res.ok) {
+          const failure = await readApiError(res, 'Failed to compare versions')
+          if (!cancelled) { setError(failure.message); setData(null) }
+          return
+        }
         const body = await res.json()
         if (cancelled) return
-        if (!res.ok) { setError(body.error || 'Failed to compare versions'); setData(null); return }
         setData(body)
       })
-      .catch(err => { if (!cancelled) setError(String(err)) })
+      .catch(err => { if (!cancelled) setError(toApiError(err, 'Failed to compare versions').message) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [projectId, from, to])

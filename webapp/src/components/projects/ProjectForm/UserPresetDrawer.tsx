@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { X, Trash2, Loader2, FolderOpen } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { useAlertModal, useToast } from '@/components/ui'
+import { fetchJson, readApiError, toApiError } from '@/lib/apiError'
 import styles from './UserPresetDrawer.module.css'
 import provenanceStyles from './presetProvenance.module.css'
 import {
@@ -33,6 +34,7 @@ export function UserPresetDrawer({ isOpen, onClose, onLoad, userId }: UserPreset
   const { dangerConfirm } = useAlertModal()
   const [presets, setPresets] = useState<PresetListItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [loadingPresetId, setLoadingPresetId] = useState<string | null>(null)
   const [deletingPresetId, setDeletingPresetId] = useState<string | null>(null)
   const [nameFilter, setNameFilter] = useState('')
@@ -41,11 +43,12 @@ export function UserPresetDrawer({ isOpen, onClose, onLoad, userId }: UserPreset
     if (!isOpen || !userId) return
 
     setIsLoading(true)
-    fetch(`/api/presets?userId=${userId}`)
-      .then(r => r.ok ? r.json() : [])
+    setLoadError(null)
+    fetchJson<PresetListItem[]>(`/api/presets?userId=${userId}`, undefined, 'Failed to load presets')
       .then(setPresets)
-      .catch(() => {
-        toast.error('Failed to load presets')
+      .catch(err => {
+        setPresets([])
+        setLoadError(toApiError(err, 'Failed to load presets').message)
       })
       .finally(() => setIsLoading(false))
   }, [isOpen, userId]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -85,12 +88,12 @@ export function UserPresetDrawer({ isOpen, onClose, onLoad, userId }: UserPreset
     setDeletingPresetId(preset.id)
     try {
       const res = await fetch(`/api/presets/${preset.id}?userId=${userId}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete preset')
+      if (!res.ok) throw await readApiError(res, 'Failed to delete preset')
 
       setPresets(prev => prev.filter(p => p.id !== preset.id))
       toast.success(`Preset "${preset.name}" deleted`, 'Preset Deleted')
-    } catch {
-      toast.error('Failed to delete preset')
+    } catch (err) {
+      toast.error(toApiError(err, 'Failed to delete preset').message)
     } finally {
       setDeletingPresetId(null)
     }
@@ -124,6 +127,10 @@ export function UserPresetDrawer({ isOpen, onClose, onLoad, userId }: UserPreset
           {isLoading ? (
             <div className={styles.loading}>
               <Loader2 size={20} className={styles.spinner} />
+            </div>
+          ) : loadError ? (
+            <div className={styles.emptyState} role="alert">
+              <p>{loadError}</p>
             </div>
           ) : presets.length === 0 ? (
             <div className={styles.emptyState}>

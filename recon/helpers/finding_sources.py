@@ -10,7 +10,7 @@ RECON_FINDING_SOURCES = (
     "nuclei", "security_check", "js_recon", "jsluice", "takeover_scan",
     "cache_poisoning", "graphql_scan", "graphql_cop", "ai_surface_recon",
     "vhost_sni_enum", "origin_discovery", "nmap_nse", "resource_enum",
-    "http_probe", "vuln_scan", "wcvs", "serialized_scan",
+    "http_probe", "vuln_scan", "wcvs", "serialized_scan", "route_exposure",
     "shodan_api", "internetdb", "shodan", "shodan_host_lookup", "netlas", "criminalip",
 )
 

@@ -15,6 +15,7 @@ import { isValidGitRef, parseGithubRepo } from '@/lib/validation/supplyChainInpu
 import { GITHUB_DOT_COM, hostHint, parseOwnerTarget } from '@/lib/github/ownerTarget'
 import { RegistryFields } from '../RegistryFields'
 import { announceProjectWrite } from '@/lib/projectVersion'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -88,6 +89,10 @@ export function SupplyChainScanSection({
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // A failed listing says so where the file would be: "No file uploaded yet"
+  // would invite an upload over a file that is there, and a stale name would
+  // pass for the current input.
+  const [listError, setListError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const keys = useCredentialKeys()
 
@@ -105,12 +110,12 @@ export function SupplyChainScanSection({
     setLoading(true)
     try {
       const res = await fetch(`/api/supply-chain/${projectId}/upload`)
-      if (res.ok) {
-        const body = await res.json()
-        setFile((body.files || [])[0] || null)
-      }
-    } catch {
-      setError('Could not list the uploaded file')
+      if (!res.ok) throw await readApiError(res, 'Could not list the uploaded file')
+      const body = await res.json()
+      setFile((body.files || [])[0] || null)
+      setListError(null)
+    } catch (e) {
+      setListError(toApiError(e, 'Could not list the uploaded file').message)
     } finally {
       setLoading(false)
     }
@@ -131,19 +136,19 @@ export function SupplyChainScanSection({
       const form = new FormData()
       form.append('file', picked)
       const res = await fetch(`/api/supply-chain/${projectId}/upload`, { method: 'POST', body: form })
-      const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        setError(body.error || 'Upload failed')
+        setError((await readApiError(res, 'Upload failed')).message)
         return
       }
+      const body = await res.json().catch(() => ({}))
       // The upload route already recorded this as the scan input. Mirroring it
       // into the form is not cosmetic: saving the form afterwards would write
       // back the stale name it was loaded with and un-point the scan.
       setField(updateField, 'supplyChainSbomFile', body.filename ?? '')
       announceProjectWrite(projectId, body.projectUpdatedAt)
       await loadFiles()
-    } catch {
-      setError('Upload failed')
+    } catch (err) {
+      setError(toApiError(err, 'Upload failed').message)
     } finally {
       setBusy(false)
     }
@@ -152,15 +157,23 @@ export function SupplyChainScanSection({
   const removeFile = async () => {
     if (!file || !projectId) return
     setBusy(true)
+    setError(null)
     try {
       const res = await fetch(
         `/api/supply-chain/${projectId}/upload?filename=${encodeURIComponent(file.name)}`,
         { method: 'DELETE' })
-      if (res.ok) announceProjectWrite(projectId, (await res.json().catch(() => ({}))).projectUpdatedAt)
+      // A failed delete leaves the file (and the project's pointer to it) in
+      // place, so the field must keep naming it.
+      if (!res.ok) {
+        setError((await readApiError(res, 'Could not remove the file')).message)
+        await loadFiles()
+        return
+      }
+      announceProjectWrite(projectId, (await res.json().catch(() => ({}))).projectUpdatedAt)
       setField(updateField, 'supplyChainSbomFile', '')
       await loadFiles()
-    } catch {
-      setError('Could not remove the file')
+    } catch (e) {
+      setError(toApiError(e, 'Could not remove the file').message)
     } finally {
       setBusy(false)
     }
@@ -262,6 +275,8 @@ export function SupplyChainScanSection({
 
                     {loading ? (
                       <span className={styles.fieldHint}>Loading current input...</span>
+                    ) : listError ? (
+                      <span className={styles.fieldHintWarning} role="alert">{listError}</span>
                     ) : file ? (
                       <div className={styles.activeFile}>
                         <FileText size={13} />

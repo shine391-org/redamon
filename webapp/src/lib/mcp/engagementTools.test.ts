@@ -88,6 +88,7 @@ describe('preflight_scope_check: the effective engine of each AI hook', () => {
     expect(r.aiHooks.map(x => x.hook)).toEqual([
       'ffuf_extensions', 'nuclei_tags', 'waf_classification', 'takeover_disambiguation',
       'ffuf_base_paths', 'page_type', 'tool_health', 'crawl_seed_order', 'serialized_assess',
+      'route_privacy_rank', 'route_exposure_wall', 'route_exposure_assess',
     ])
     expect(byHook(r).ffuf_extensions).toEqual(
       { hook: 'ffuf_extensions', kind: 'engine', engine: 'llm', effective: 'llm' })
@@ -98,7 +99,7 @@ describe('preflight_scope_check: the effective engine of each AI hook', () => {
     h.findProject.mockResolvedValue(projectRow({ aiInPipeline: true }))
     const r = await preflightScopeCheck(ctx(), 'p1')
     for (const hook of ['ffuf_base_paths', 'page_type', 'tool_health', 'crawl_seed_order',
-      'serialized_assess']) {
+      'serialized_assess', 'route_privacy_rank', 'route_exposure_wall', 'route_exposure_assess']) {
       expect(byHook(r)[hook]).toEqual({ hook, kind: 'enable', engine: 'off', effective: 'off' })
     }
   })

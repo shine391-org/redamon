@@ -156,19 +156,29 @@ const NOTES = [
   'Where zeroMeans is "unlimited", 0 is the FASTEST value the field accepts and not the ' +
     'safest. Under an engagement ceiling a 0 there is rewritten to the ceiling.',
   'Settings apply to the NEXT scan. A scan already running read its settings when it started.',
+  'routeExposureEnabled writes two kinds of Vulnerability under one source, route_exposure: ' +
+    'leads for the agent (needs_agent_confirmation true, severity info, hidden from reports until ' +
+    'confirmed) and findings a signature proves (real severity). It runs whenever active scanning ' +
+    'runs, with no scanModules phase of its own, and sends GET and HEAD only.',
   'AI hooks have THREE levels: aiInPipeline, then the per-hook AI flag, then the *UseJev engine. ' +
     'At scan start aiInPipeline forces every per-hook AI flag to its own value; it does not touch ' +
     'the engine fields. A *UseJev flag only switches which engine answers (false = the LLM in ' +
     'aiPipelineModel, true = TypeSafe Jev), and switching one ON is refused unless the project ' +
     'owner has a Jev token. preflight_scope_check reports each hook\'s effective engine.',
   'Jev-only hooks have TWO levels: aiInPipeline, then the hook\'s own *Jev* flag (ffufJevBasePaths, ' +
-    'httpxJevPageType, resourceEnumJevToolHealth, hakrawlerJevSeedOrder, serializedScanJevRank). ' +
+    'httpxJevPageType, resourceEnumJevToolHealth, hakrawlerJevSeedOrder, serializedScanJevRank, ' +
+    'routeExposureJevRank, routeExposureJevWallCheck, routeExposureJevAssess). ' +
     'They have no LLM engine, aiInPipeline does not set or reset them, and switching one ON is ' +
     'refused unless the project owner has a Jev token. Page types, base paths and seed order take ' +
     'effect from Jev\'s answers (page-type labels land on the Endpoint, FFuf fuzzes Jev\'s ' +
     'directories, Hakrawler crawls Jev\'s host order, and each serialized-object candidate gets ' +
     'Jev\'s deser_jev_format and deser_jev_exploitability, the order the deserialization skill ' +
-    'confirms them in; that ranking needs serializedScanEnabled too). The tool-health check records ' +
+    'confirms them in; that ranking needs serializedScanEnabled too). The three route exposure ' +
+    'hooks act too, and need routeExposureEnabled: Jev\'s privacy answer fills the request budget ' +
+    'after the always-requested floor, and each lead gets Jev\'s route_jev_kind, ' +
+    'route_jev_sensitivity and anon_page_class, the order the access_control skill confirms them ' +
+    'in (most sensitive first, a login wall, error page or public content last; no lead is ' +
+    'ever dropped). The tool-health check records ' +
     'its verdict in the recon output. Without a token, or when Jev cannot answer, each step runs ' +
     'exactly as it does without AI.',
 ]

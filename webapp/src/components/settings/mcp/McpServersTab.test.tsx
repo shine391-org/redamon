@@ -1,0 +1,148 @@
+/**
+ * Settings > MCP Tool Plugins: every failure says its cause.
+ *
+ * Before: a list that failed read as "nothing saved", the Enable toggle did
+ * nothing on a refused write, a save whose agent reload failed read as applied,
+ * and the Test panel crashed on a FastAPI `{detail}` body (no `warnings`) or
+ * showed a SyntaxError on a proxy's HTML page.
+ */
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+
+const ui = vi.hoisted(() => ({
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() },
+  alerts: {
+    alert: vi.fn(async () => {}),
+    alertError: vi.fn(async () => {}),
+    alertWarning: vi.fn(async () => {}),
+    confirm: vi.fn(async () => true),
+    dangerConfirm: vi.fn(async () => true),
+  },
+}))
+vi.mock('@/components/ui', () => ({
+  useToast: () => ui.toast,
+  useAlertModal: () => ui.alerts,
+}))
+
+import McpServersTab from './McpServersTab'
+
+const SERVER = {
+  id: 'probe', name: 'Probe', description: '', enabled: true, transport: 'stdio',
+  default_phases: ['informational', 'exploitation', 'post_exploitation'], tags: [],
+  headers: {}, connect_timeout: 60, read_timeout: 600,
+  command: 'echo', args: [], env: {}, cwd: '', encoding: 'utf-8', tools: [],
+}
+
+type Answer = Response | (() => Response)
+let answers: { list: Answer; put: Answer; test: Answer }
+const fetchMock = vi.fn()
+
+const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status })
+const resolve = (a: Answer) => (typeof a === 'function' ? a() : a)
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  answers = {
+    list: json(200, { servers: [SERVER] }),
+    put: json(200, { server: SERVER, servers: [SERVER] }),
+    test: json(200, { ok: true, discovered_tools: [], warnings: [], elapsed_ms: 12, error: null }),
+  }
+  fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    const method = init?.method ?? 'GET'
+    if (url === '/api/mcp/test') return resolve(answers.test).clone()
+    if (method === 'PUT') return resolve(answers.put).clone()
+    return resolve(answers.list).clone()
+  })
+  vi.stubGlobal('fetch', fetchMock)
+})
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+async function openEdit() {
+  render(<McpServersTab userId="u1" />)
+  fireEvent.click(await screen.findByTitle('Edit'))
+  await screen.findByText('Edit MCP Tool Plugin: probe')
+}
+
+describe('list', () => {
+  test('a failed load shows its cause with a Retry, not "nothing saved"', async () => {
+    answers.list = json(500, { error: 'Failed to list MCP servers', code: 'P1001' })
+    render(<McpServersTab userId="u1" />)
+    expect((await screen.findByRole('alert')).textContent)
+      .toContain("Couldn't load your MCP Tool Plugins (P1001 · HTTP 500).")
+    expect(screen.queryByText(/No saved MCP Tool Plugins yet/)).toBeNull()
+
+    answers.list = json(200, { servers: [SERVER] })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('Probe')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+describe('Enable toggle', () => {
+  test('a refused write is a toast with the code and status', async () => {
+    answers.put = json(500, { error: 'Failed to update MCP server', code: 'P2034' })
+    render(<McpServersTab userId="u1" />)
+    fireEvent.click(await screen.findByRole('checkbox'))
+    await waitFor(() => expect(ui.toast.error)
+      .toHaveBeenCalledWith('Disable failed: Failed to update MCP server (P2034 · HTTP 500)'))
+  })
+
+  test('a save whose agent reload failed warns that it is not live yet', async () => {
+    answers.put = json(200, {
+      server: SERVER, servers: [SERVER],
+      warnings: [{ service: 'agent', message: 'The agent did not reload its MCP Tool Plugins', code: 'agent_unreachable', cause: 'ECONNREFUSED' }],
+    })
+    render(<McpServersTab userId="u1" />)
+    fireEvent.click(await screen.findByRole('checkbox'))
+    await waitFor(() => expect(ui.toast.warning).toHaveBeenCalledWith(
+      'The agent did not reload its MCP Tool Plugins (agent_unreachable · ECONNREFUSED)', 'Saved, but not live yet'))
+  })
+})
+
+describe('Save', () => {
+  test('a database failure shows the code and status in the banner', async () => {
+    answers.put = json(500, { error: 'Failed to update MCP server', code: 'P2034' })
+    await openEdit()
+    fireEvent.change(screen.getByPlaceholderText('My MCP Tool Plugin'), { target: { value: 'Probe 2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('Failed to update MCP server (P2034 · HTTP 500)')).toBeInTheDocument()
+  })
+
+  test('a proxy error page names its status instead of a SyntaxError', async () => {
+    answers.put = new Response('<html>502 Bad Gateway</html>', { status: 502 })
+    await openEdit()
+    fireEvent.change(screen.getByPlaceholderText('My MCP Tool Plugin'), { target: { value: 'Probe 2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('Failed to update the MCP Tool Plugin (non_json_response · HTTP 502)')).toBeInTheDocument()
+  })
+})
+
+describe('Test (Discover)', () => {
+  test('the agent failing shows the route\'s code and both statuses, and the panel survives', async () => {
+    answers.test = json(502, {
+      ok: false, error: 'The agent could not run the MCP test', code: 'agent_error', upstreamStatus: 401,
+      discovered_tools: [], warnings: [], elapsed_ms: 0,
+    })
+    await openEdit()
+    fireEvent.click(screen.getByRole('button', { name: /Discover and add new tools/ }))
+    expect(await screen.findByText('- The agent could not run the MCP test (agent_error · HTTP 502 · upstream HTTP 401)', { exact: false }))
+      .toBeInTheDocument()
+  })
+
+  test('a proxy error page names its status', async () => {
+    answers.test = new Response('<html>504 Gateway Time-out</html>', { status: 504 })
+    await openEdit()
+    fireEvent.click(screen.getByRole('button', { name: /Discover and add new tools/ }))
+    expect(await screen.findByText(/The MCP test failed \(non_json_response · HTTP 504\)/)).toBeInTheDocument()
+  })
+
+  test('a 200 missing its lists does not crash the panel', async () => {
+    answers.test = json(200, { ok: false, error: 'server is disabled — enable it before testing' })
+    await openEdit()
+    fireEvent.click(screen.getByRole('button', { name: /Discover and add new tools/ }))
+    expect(await screen.findByText(/server is disabled/)).toBeInTheDocument()
+  })
+})

@@ -12,6 +12,7 @@ import { AiToggleLabel } from '../AiToggleLabel'
 import { JevEngineControl } from '../JevEngineControl'
 import { useHasJevProvider } from '@/hooks/useHasJevProvider'
 import { RegistryFields } from '../RegistryFields'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -38,6 +39,7 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
   const [customTemplates, setCustomTemplates] = useState<CustomTemplate[]>([])
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const templateFileRef = useRef<HTMLInputElement>(null)
 
   const fetchTemplates = useCallback(async () => {
@@ -69,15 +71,15 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
         body: formData,
       })
 
-      const result = await res.json()
       if (!res.ok) {
-        setUploadError(result.error || 'Upload failed')
+        setUploadError((await readApiError(res, 'Upload failed')).message)
         return
       }
 
+      const result = await res.json()
       setCustomTemplates(result.templates || [])
-    } catch {
-      setUploadError('Upload failed. Please try again.')
+    } catch (err) {
+      setUploadError(toApiError(err, 'Upload failed. Please try again.').message)
     } finally {
       setIsUploading(false)
       if (templateFileRef.current) templateFileRef.current.value = ''
@@ -85,18 +87,21 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
   }
 
   const handleTemplateDelete = async (templatePath: string) => {
+    setDeleteError(null)
     try {
       const res = await fetch(
         `/api/nuclei-templates?path=${encodeURIComponent(templatePath)}`,
         { method: 'DELETE' }
       )
 
-      if (res.ok) {
-        const result = await res.json()
-        setCustomTemplates(result.templates || [])
+      if (!res.ok) {
+        setDeleteError((await readApiError(res, `Could not delete ${templatePath}`)).message)
+        return
       }
-    } catch {
-      // Silently fail
+      const result = await res.json()
+      setCustomTemplates(result.templates || [])
+    } catch (err) {
+      setDeleteError(toApiError(err, `Could not delete ${templatePath}`).message)
     }
   }
 
@@ -475,6 +480,7 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
               </div>
 
               {uploadError && <p className={styles.inlineError}>{uploadError}</p>}
+              {deleteError && <p className={styles.inlineError}>{deleteError}</p>}
 
               {customTemplates.length === 0 ? (
                 <p className={styles.itemEmpty}>No custom templates uploaded yet.</p>

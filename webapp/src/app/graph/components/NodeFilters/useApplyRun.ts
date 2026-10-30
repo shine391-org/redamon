@@ -8,6 +8,7 @@
  * so it always ends.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { readApiError } from '@/lib/apiError'
 import type { NodeFilterRunSummary } from './useNodeFilters'
 
 export type ApplyTarget = 'current' | 'scans' | 'both'
@@ -65,8 +66,8 @@ export function useApplyRun(projectId: string | null, initialRunId: string | nul
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ target, revision, versionId }),
     })
+    if (!res.ok) throw await readApiError(res, 'Apply failed')
     const body = await res.json().catch(() => ({}))
-    if (!res.ok) throw new Error(body.error || `Apply failed (${res.status})`)
     if (body.runId) {
       setRun(null)
       setRunId(body.runId)

@@ -39,6 +39,7 @@ from orchestrator_helpers.llm_setup import setup_llm, apply_project_settings
 from agent_context import current_llm
 from prompt_safety import fence_node_context
 from orchestrator_helpers.streaming import clear_stale_streaming_state, emit_streaming_events
+from orchestrator_helpers.body_sweep import sweep_session_bodies
 from orchestrator_helpers.nodes import (
     initialize_node,
     think_node,
@@ -633,6 +634,7 @@ class AgentOrchestrator:
             return await execute_plan_node(state, config, tool_executor=self.tool_executor, streaming_callbacks=self._streaming_callbacks, session_manager_base=_SESSION_MANAGER_BASE, graph_view_cyphers=self._graph_view_cyphers)
 
         async def _await_approval(state, config=None):
+            await sweep_session_bodies(self.tool_executor, state)
             return await await_approval_node(state, config)
 
         async def _process_approval(state, config=None):
@@ -645,6 +647,7 @@ class AgentOrchestrator:
             return await process_answer_node(state, config)
 
         async def _generate_response(state, config=None):
+            await sweep_session_bodies(self.tool_executor, state)
             return await generate_response_node(state, config, llm=(current_llm.get() or self.llm), streaming_callbacks=self._streaming_callbacks, neo4j_creds=neo4j_creds)
 
         async def _await_tool_confirmation(state, config=None):
@@ -1067,6 +1070,34 @@ class AgentOrchestrator:
             tool_confirmation_request=state.get("tool_confirmation_pending"),
         )
 
+    async def _report_llm_unavailable(self, streaming_callback, user_id: str,
+                                      project_id: str, session_id: str) -> InvokeResponse:
+        """Fail a run whose model could not be built, saying which failure it was.
+
+        "No key" is only the message when a key or provider row is really
+        missing; any other build failure names the model and the exception's
+        class (llm_setup_failed), so a broken provider is not read as a missing key.
+        """
+        failure = getattr(self, "llm_setup_failure", None) or {}
+        if failure.get("code") == "llm_setup_failed":
+            msg = (f"Could not set up the model {failure.get('model')}. "
+                   "Check its provider in Global Settings.")
+        else:
+            msg = "LLM not configured. Please add an API key in Global Settings."
+            failure = {"code": "llm_not_configured", **failure}
+        logger.error(f"[{user_id}/{project_id}/{session_id}] {msg} {failure}")
+        await streaming_callback.on_error(msg, recoverable=False, **failure)
+        return InvokeResponse(error=msg)
+
+    async def _report_run_failure(self, streaming_callback, msg: str,
+                                  exc: BaseException) -> InvokeResponse:
+        """Fail a run with its exception's class and provider HTTP status, never
+        its text: a provider message can quote a key, the prompt or target data."""
+        from llm_builder import provider_error_details
+        await streaming_callback.on_error(
+            msg, recoverable=False, code="agent_run_failed", **provider_error_details(exc))
+        return InvokeResponse(error=msg)
+
     # =========================================================================
     # STREAMING PUBLIC API
     # =========================================================================
@@ -1109,10 +1140,7 @@ class AgentOrchestrator:
         # self.llm): the per-session LLM is authoritative when set, with the shared
         # self.llm as fallback.
         if (current_llm.get() or self.llm) is None:
-            msg = "LLM not configured. Please add an API key in Global Settings."
-            logger.error(f"[{user_id}/{project_id}/{session_id}] {msg}")
-            await streaming_callback.on_error(msg, recoverable=False)
-            return InvokeResponse(error=msg)
+            return await self._report_llm_unavailable(streaming_callback, user_id, project_id, session_id)
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with streaming: {question[:10000]}")
 
@@ -1156,8 +1184,7 @@ class AgentOrchestrator:
 
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Streaming error: {e}", exc_info=True)
-            await streaming_callback.on_error(str(e), recoverable=False)
-            return InvokeResponse(error=str(e))
+            return await self._report_run_failure(streaming_callback, "The agent run failed", e)
         finally:
             self._streaming_callbacks.pop(session_id, None)
             self._guidance_queues.pop(session_id, None)
@@ -1180,10 +1207,7 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
 
         if self.llm is None:
-            msg = "LLM not configured. Please add an API key in Global Settings."
-            logger.error(f"[{user_id}/{project_id}/{session_id}] {msg}")
-            await streaming_callback.on_error(msg, recoverable=False)
-            return InvokeResponse(error=msg)
+            return await self._report_llm_unavailable(streaming_callback, user_id, project_id, session_id)
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming approval: {decision}")
 
@@ -1233,8 +1257,7 @@ class AgentOrchestrator:
 
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
-            await streaming_callback.on_error(str(e), recoverable=False)
-            return InvokeResponse(error=str(e))
+            return await self._report_run_failure(streaming_callback, "The agent run failed after the approval", e)
         finally:
             self._streaming_callbacks.pop(session_id, None)
             self._guidance_queues.pop(session_id, None)
@@ -1256,10 +1279,7 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
 
         if self.llm is None:
-            msg = "LLM not configured. Please add an API key in Global Settings."
-            logger.error(f"[{user_id}/{project_id}/{session_id}] {msg}")
-            await streaming_callback.on_error(msg, recoverable=False)
-            return InvokeResponse(error=msg)
+            return await self._report_llm_unavailable(streaming_callback, user_id, project_id, session_id)
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming answer: {answer[:10000]}")
 
@@ -1308,8 +1328,7 @@ class AgentOrchestrator:
 
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
-            await streaming_callback.on_error(str(e), recoverable=False)
-            return InvokeResponse(error=str(e))
+            return await self._report_run_failure(streaming_callback, "The agent run failed after the answer", e)
         finally:
             self._streaming_callbacks.pop(session_id, None)
             self._guidance_queues.pop(session_id, None)
@@ -1332,10 +1351,7 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
 
         if self.llm is None:
-            msg = "LLM not configured. Please add an API key in Global Settings."
-            logger.error(f"[{user_id}/{project_id}/{session_id}] {msg}")
-            await streaming_callback.on_error(msg, recoverable=False)
-            return InvokeResponse(error=msg)
+            return await self._report_llm_unavailable(streaming_callback, user_id, project_id, session_id)
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming tool confirmation: {decision}")
 
@@ -1388,8 +1404,7 @@ class AgentOrchestrator:
 
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
-            await streaming_callback.on_error(str(e), recoverable=False)
-            return InvokeResponse(error=str(e))
+            return await self._report_run_failure(streaming_callback, "The agent run failed after the tool confirmation", e)
         finally:
             self._streaming_callbacks.pop(session_id, None)
             self._guidance_queues.pop(session_id, None)
@@ -1410,10 +1425,7 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
 
         if self.llm is None:
-            msg = "LLM not configured. Please add an API key in Global Settings."
-            logger.error(f"[{user_id}/{project_id}/{session_id}] {msg}")
-            await streaming_callback.on_error(msg, recoverable=False)
-            return InvokeResponse(error=msg)
+            return await self._report_llm_unavailable(streaming_callback, user_id, project_id, session_id)
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming execution from checkpoint")
 
@@ -1455,8 +1467,7 @@ class AgentOrchestrator:
 
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume execution error: {e}")
-            await streaming_callback.on_error(str(e), recoverable=False)
-            return InvokeResponse(error=str(e))
+            return await self._report_run_failure(streaming_callback, "The agent run failed while resuming", e)
         finally:
             self._streaming_callbacks.pop(session_id, None)
             self._guidance_queues.pop(session_id, None)

@@ -2,6 +2,25 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ReconLogEvent } from '@/lib/recon-types'
+import { LOG_STREAM_EVENT_ERROR, LOG_STREAM_LOST, describeLogStreamLoss } from './logStreamError'
+
+export const STREAM_EVENT_ERROR = LOG_STREAM_EVENT_ERROR
+
+export function describeStreamFailure(url: string): Promise<string> {
+  return describeLogStreamLoss(url, LOG_STREAM_LOST)
+}
+
+const RECONNECTING = 'Log stream disconnected; reconnecting'
+
+/** Shown while a dropped stream is retried, so the drawer does not look live. */
+export function reconnectingText(attempt: number, max: number): string {
+  return `${RECONNECTING} (attempt ${attempt} of ${max})`
+}
+
+/** True for the retry notice: a caller that toasts errors skips it. */
+export function isStreamReconnecting(error: string | null | undefined): boolean {
+  return !!error && error.startsWith(RECONNECTING)
+}
 
 interface UseReconSSEOptions {
   projectId: string | null
@@ -66,7 +85,8 @@ export function useReconSSE({
       eventSourceRef.current.close()
     }
 
-    const eventSource = new EventSource(`/api/recon/${projectId}/logs`)
+    const url = `/api/recon/${projectId}/logs`
+    const eventSource = new EventSource(url)
     eventSourceRef.current = eventSource
 
     eventSource.onopen = () => {
@@ -122,8 +142,9 @@ export function useReconSSE({
 
         const data = JSON.parse(eventData)
         if (data.error) {
-          setError(data.error)
-          onError?.(data.error)
+          console.error('Recon log stream error event:', data.error)
+          setError(STREAM_EVENT_ERROR)
+          onError?.(STREAM_EVENT_ERROR)
         }
       } catch (err) {
         console.error('Error parsing SSE error event:', err)
@@ -154,8 +175,9 @@ export function useReconSSE({
 
         // Handle error events
         if (data.error) {
-          setError(data.error)
-          onError?.(data.error)
+          console.error('Recon log stream error event:', data.error)
+          setError(STREAM_EVENT_ERROR)
+          onError?.(STREAM_EVENT_ERROR)
           return
         }
 
@@ -198,13 +220,19 @@ export function useReconSSE({
       if (reconnectAttempts.current < maxReconnectAttempts) {
         const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 10000)
         reconnectAttempts.current++
+        setError(reconnectingText(reconnectAttempts.current, maxReconnectAttempts))
 
         reconnectTimeoutRef.current = setTimeout(() => {
           connect()
         }, delay)
       } else {
-        setError('Connection lost. Max reconnection attempts reached.')
-        onError?.('Connection lost. Max reconnection attempts reached.')
+        setError(LOG_STREAM_LOST)
+        void describeStreamFailure(url).then(message => {
+          // A newer connection (or an unmount) replaced this one meanwhile.
+          if (eventSourceRef.current !== eventSource) return
+          setError(message)
+          onError?.(message)
+        })
       }
     }
 

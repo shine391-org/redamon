@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, assertOwner } from '@/lib/access'
 import { projectPresetForRead } from '@/lib/reconPresets/server'
 import { clearPresetBadges } from '@/lib/reconPresets/badges'
@@ -29,11 +30,7 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
     // carry a target or a credential, and applying ignores those anyway.
     return NextResponse.json({ ...preset, settings: projectPresetForRead(preset.settings).settings })
   } catch (error) {
-    console.error('Failed to fetch preset:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to fetch preset' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch preset')
   }
 }
 
@@ -64,10 +61,6 @@ export async function DELETE(_request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true, badgesCleared })
   } catch (error) {
-    console.error('Failed to delete preset:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to delete preset' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete preset')
   }
 }

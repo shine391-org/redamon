@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { isInternalRequest, requireUserAccess } from '@/lib/session'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; resourceId: string }>
@@ -38,11 +39,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     }
     return NextResponse.json(maskResource(resource as unknown as Record<string, unknown>))
   } catch (error) {
-    console.error('Failed to fetch tradecraft resource:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch tradecraft resource' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch tradecraft resource')
   }
 }
 
@@ -106,11 +103,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json(maskResource(updated as unknown as Record<string, unknown>))
   } catch (error) {
-    console.error('Failed to update tradecraft resource:', error)
-    return NextResponse.json(
-      { error: 'Failed to update tradecraft resource' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update tradecraft resource')
   }
 }
 
@@ -131,10 +124,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     await prisma.userTradecraftResource.delete({ where: { id: resourceId } })
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error('Failed to delete tradecraft resource:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete tradecraft resource' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete tradecraft resource')
   }
 }

@@ -6,6 +6,7 @@ import { useProject } from '@/providers/ProjectProvider'
 import { useAuth } from '@/providers/AuthProvider'
 import { useUsers } from '@/hooks/useUsers'
 import { useGuardedRouter, useNavigationGuard } from '@/context/NavigationGuardContext'
+import { useErrorToast } from '@/hooks/useErrorToast'
 import styles from './UserSelector.module.css'
 
 export function UserSelector() {
@@ -13,9 +14,12 @@ export function UserSelector() {
   const guard = useNavigationGuard()
   const [isOpen, setIsOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const { userId, setUserId, setCurrentProject } = useProject()
-  const { user: authUser, isAdmin, logout } = useAuth()
+  const { userId, setUserId, setCurrentProject, userSwitchError } = useProject()
+  const { user: authUser, isAdmin, logout, sessionError } = useAuth()
   const { data: users } = useUsers()
+  // Both providers sit above the toast layer, so their failures are shown here.
+  useErrorToast(userSwitchError, 'User not switched')
+  useErrorToast(sessionError, 'Your session could not be read')
 
   const currentUser = users?.find(u => u.id === userId)
 

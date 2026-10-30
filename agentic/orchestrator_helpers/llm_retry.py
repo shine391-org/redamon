@@ -202,6 +202,18 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     return bool(_TRANSIENT_STATUS_RE.search(err_str))
 
 
+def llm_error_reason(exc: BaseException) -> str:
+    """The ``llm_error: ...`` completion reason of a failed LLM call, which the
+    chat shows: the exception's class and the provider's HTTP status, never its
+    text, which can quote part of a key or the prompt. The log keeps the text."""
+    from llm_builder import provider_error_details
+    details = provider_error_details(exc)
+    label = details.get("error_class") or "LLM call failed"
+    if "provider_status" in details:
+        label += f" (provider HTTP {details['provider_status']})"
+    return f"llm_error: {label}"
+
+
 async def retry_llm_call(
     llm: Any,
     messages: list,

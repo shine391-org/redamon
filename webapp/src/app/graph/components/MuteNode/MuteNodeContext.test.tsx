@@ -171,7 +171,7 @@ describe('what a click does', () => {
     render(<Page><MuteNodeButton name="v" graphId="7" label="Vulnerability" onMuted={onMuted} /></Page>)
     fireEvent.click(screen.getByRole('button', { name: /Mute/ }))
     await waitFor(() => expect(mockAlertError).toHaveBeenCalled())
-    expect(mockAlertError.mock.calls[0][0]).toBe('A version activation is in progress for this project.')
+    expect(mockAlertError.mock.calls[0][0]).toBe('A version activation is in progress for this project. (HTTP 409)')
     expect(onGraphChanged).not.toHaveBeenCalled()
     expect(onMuted).not.toHaveBeenCalled()
   })
@@ -186,13 +186,33 @@ describe('what a click does', () => {
     expect(onGraphChanged).toHaveBeenCalledOnce()
   })
 
-  test('a server refusal is shown as the server worded it', async () => {
+  test('a server refusal is shown as the server worded it, with its status', async () => {
     fetchMock.mockImplementation(() => ok({ error: 'IP nodes cannot be muted.' }, 422))
     render(<Page><MuteNodeButton name="10.0.0.1:443" graphId="7" /></Page>)
     fireEvent.click(screen.getByRole('button', { name: /Mute/ }))
     await waitFor(() => expect(mockAlertError).toHaveBeenCalled())
-    expect(mockAlertError.mock.calls[0][0]).toBe('IP nodes cannot be muted.')
+    expect(mockAlertError.mock.calls[0][0]).toBe('IP nodes cannot be muted. (HTTP 422)')
     expect(onGraphChanged).not.toHaveBeenCalled()
+  })
+
+  test('an agent failure shows its code, the agent status and the agent class (G-17)', async () => {
+    fetchMock.mockImplementation(() => ok({
+      error: 'The triage operation failed. The details are in the agent log.',
+      code: 'internal_error', errorClass: 'ServiceUnavailable', upstreamStatus: 500,
+    }, 500))
+    render(<Page><MuteNodeButton name="v" graphId="7" /></Page>)
+    fireEvent.click(screen.getByRole('button', { name: /Mute/ }))
+    await waitFor(() => expect(mockAlertError).toHaveBeenCalled())
+    expect(mockAlertError.mock.calls[0][0]).toBe('The triage operation failed. The details are in the agent log. ' +
+      '(internal_error · ServiceUnavailable · HTTP 500 · upstream HTTP 500)')
+  })
+
+  test('no answer at all reads as a network error, not "Failed to fetch"', async () => {
+    fetchMock.mockImplementation(() => Promise.reject(new TypeError('Failed to fetch')))
+    render(<Page><MuteNodeButton name="v" graphId="7" /></Page>)
+    fireEvent.click(screen.getByRole('button', { name: /Mute/ }))
+    await waitFor(() => expect(mockAlertError).toHaveBeenCalled())
+    expect(mockAlertError.mock.calls[0][0]).toBe('The finding could not be muted. (network_error)')
   })
 
   test('the click does not reach the row, which may select or expand on click', async () => {

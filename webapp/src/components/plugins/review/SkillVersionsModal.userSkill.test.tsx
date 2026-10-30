@@ -135,6 +135,14 @@ describe('the selector', () => {
     expect(select().querySelector('option[value="user_skill:gone"]')!.textContent).toBe('A deleted skill')
   })
 
+  // A list that failed is not an empty list: the open skill must not read as deleted.
+  test('the own-skills list failing says so instead of "A deleted skill"', async () => {
+    h.responders['/api/users/alice/attack-skills'] = () => new Response('', { status: 500 })
+    draw({ initialSkill: 'user_skill:sk2' })
+    expect(await screen.findByTestId('own-skills-error')).toHaveTextContent('Your skills could not be loaded (empty_response · HTTP 500)')
+    expect(select().querySelector('option[value="user_skill:sk2"]')!.textContent).toBe('Your skills could not be loaded')
+  })
+
   test('picking a user skill in the selector switches to the user mode', async () => {
     draw({ initialSkill: 'ssrf' })
     await screen.findByTestId('scope-user')
@@ -284,7 +292,7 @@ describe('Delete older versions', () => {
     draw()
     fireEvent.click(await screen.findByRole('button', { name: 'Delete older versions' }))
     fireEvent.click((await screen.findAllByRole('button', { name: 'Delete' })).pop()!)
-    expect(await screen.findByText('The database is busy.')).toBeInTheDocument()
+    expect(await screen.findByText('The database is busy. (HTTP 500)')).toBeInTheDocument()
     await waitFor(() => expect(versionsCalls()).toHaveLength(2))
   })
 })

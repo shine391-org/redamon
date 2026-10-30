@@ -2,36 +2,23 @@
  * GET  /api/users/[id]/mcp        - list user's MCP servers
  * POST /api/users/[id]/mcp        - add a new MCP server
  *
- * Triggers async POST ${AGENT_API_URL}/mcp/reload after a successful write
- * so the running agent picks up changes without manual intervention.
+ * Asks the agent to reload (POST /mcp/reload) after a successful write so the
+ * running agent picks up changes without manual intervention; a failed reload
+ * comes back as `warnings` beside the saved server.
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
 import { mcpServerSchema, validateMcpServers, type MCPServer } from '@/lib/mcp/schema'
-import { internalKeyHeaders } from '@/lib/agentAuth'
 import { maskMcpServersForApi, restoreMaskedToken } from '@/lib/mcp/mask'
+import { internalError } from '@/lib/routeErrors'
+import { reloadAgentMcp } from './reload'
 
 // Re-exported for the per-server [serverId] route which imports from here.
 export { maskMcpServersForApi, restoreMaskedToken }
 
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://agent:8080'
-
 interface RouteParams {
   params: Promise<{ id: string }>
-}
-
-async function fireReload(userMcpServers: unknown) {
-  // Fire-and-forget: log a failure but don't block the request.
-  try {
-    await fetch(`${AGENT_API_URL}/mcp/reload`, {
-      method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ userMcpServers }),
-    })
-  } catch (e) {
-    console.warn('Failed to ping agent /mcp/reload:', e)
-  }
 }
 
 export async function GET(request: NextRequest, { params }: RouteParams) {
@@ -47,8 +34,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const servers = Array.isArray(raw) ? (raw as MCPServer[]) : []
     return NextResponse.json({ servers: maskMcpServersForApi(servers) })
   } catch (error) {
-    console.error('Failed to list MCP servers:', error)
-    return NextResponse.json({ error: 'Failed to list MCP servers' }, { status: 500 })
+    return internalError(error, 'Failed to list MCP servers')
   }
 }
 
@@ -92,12 +78,14 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       create: { userId: id, mcpServers: next as unknown as object },
     })
 
-    void fireReload(next)
+    const warnings = await reloadAgentMcp(next)
     // Mask the literal token in the response so the UI shows the placeholder.
     const [returned] = maskMcpServersForApi([newServer])
-    return NextResponse.json({ server: returned, servers: maskMcpServersForApi(next) }, { status: 201 })
+    return NextResponse.json({
+      server: returned, servers: maskMcpServersForApi(next),
+      ...(warnings.length ? { warnings } : {}),
+    }, { status: 201 })
   } catch (error) {
-    console.error('Failed to add MCP server:', error)
-    return NextResponse.json({ error: 'Failed to add MCP server' }, { status: 500 })
+    return internalError(error, 'Failed to add MCP server')
   }
 }

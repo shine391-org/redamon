@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { assertGraphNotActivating } from '@/lib/activationLock'
 import { defaultRecordingScope, publicRecordingSession, RECORDING_TTL_MS } from '@/lib/recordingSession'
@@ -26,8 +27,10 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
     let activating: NextResponse | null
     try {
       activating = await assertGraphNotActivating(id)
-    } catch {
-      return NextResponse.json({ error: 'activation check failed; try again' }, { status: 409 })
+    } catch (err) {
+      return internalError(err, 'activation check failed; try again', {
+        status: 409, log: 'Recording start: activation lock check failed',
+      })
     }
     if (activating) return activating
 
@@ -105,7 +108,6 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ session: publicRecordingSession(session) })
   } catch (error) {
-    console.error('Failed to start recording:', error)
-    return NextResponse.json({ error: 'Failed to start recording' }, { status: 500 })
+    return internalError(error, 'Failed to start recording')
   }
 }

@@ -22,6 +22,7 @@ vi.mock('@/lib/session', () => ({
 vi.mock('@/lib/audit', () => ({ writeAudit: async (e: Record<string, unknown>) => void h.audits.push(e) }))
 
 import { createFakePrisma, type FakePrisma } from '@/lib/plugins/__testing__/fakePrisma'
+import { MAX_CONTENT_SIZE } from '@/lib/userSkills'
 import { DELETE, PUT } from './route'
 
 let db: FakePrisma
@@ -84,7 +85,7 @@ describe('PUT', () => {
   test.each([
     ['empty content', { content: '' }, 'content_required'],
     ['whitespace content', { content: '   ' }, 'content_required'],
-    ['content over 50 KB', { content: 'x'.repeat(50 * 1024 + 1) }, 'content_too_large'],
+    ['content over MAX_CONTENT_SIZE', { content: 'x'.repeat(MAX_CONTENT_SIZE + 1) }, 'content_too_large'],
     ['a name over 100', { name: 'n'.repeat(101) }, 'name_too_long'],
     ['a blank name', { name: '  ' }, 'name_invalid'],
     ['a description over 500', { description: 'd'.repeat(501) }, 'description_too_long'],

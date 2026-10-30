@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { projectTargetLabel } from '@/lib/projectSummary'
 import { guardProject } from '@/lib/access'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 
 function groupByDay<T extends { createdAt: Date }>(items: T[], valueFn: (item: T) => Record<string, number>) {
   const map = new Map<string, Record<string, number>>()
@@ -127,10 +128,6 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Analytics activity error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Analytics activity error' })
   }
 }

@@ -212,6 +212,7 @@ export function useWorkflowGraph(formData: Record<string, unknown>) {
           enabledField: tool.enabledField,
           group: tool.group,
           badge: tool.badge,
+          isNew: tool.isNew,
           idle,
           chainBroken: !enabled ? false : brokenInputs.length > 0,
           starvedInputs: brokenInputs,

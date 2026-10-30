@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { Prisma, type PluginData, type PluginInstall } from '@prisma/client'
 import prisma from '@/lib/prisma'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { isValidRange, isValidVersion, satisfies } from '@/lib/semver'
 import { auditPlugin } from './audit'
 import { CatalogError, isRevoked, loadCatalog, type LoadedCatalog } from './catalog'
@@ -24,7 +25,7 @@ import {
   type OperationKind,
   type PluginStatus,
 } from './registry'
-import { RunnerError, RunnerUnavailableError, runnerHealth, runnerReload } from './runnerClient'
+import { RunnerError, RunnerUnavailableError, runnerFailureSummary, runnerHealth, runnerReload } from './runnerClient'
 import type { CatalogRelease } from './schemas/catalog'
 import { SkillPartsRegistryError, registrySkill, type RegistrySkill } from './skillPartsRegistry'
 import {
@@ -299,7 +300,7 @@ async function heal(row: PluginInstall, d: Deps): Promise<{ ok: true } | { ok: f
     try {
       bytes = await d.fetchArchive(release.url)
     } catch (e) {
-      lastError = `heal_failed: download_failed: ${e instanceof FetchRemoteError ? e.code : (e as Error).message}`
+      lastError = `heal_failed: download_failed: ${e instanceof FetchRemoteError ? `${e.code}: ${e.message}` : safeErrorCode(e)}`.slice(0, 2000)
       return { ok: false, lastError }
     }
     const checked = await checkAndStage(op.operationId, { pluginId: row.pluginId, archiveBytes: bytes, release, platformVersion: d.platformVersion })
@@ -593,8 +594,8 @@ export async function reconcile(deps: ReconcileDeps = {}): Promise<ReconcileRepo
         if (health.state === 'out_of_date') why = 'runner_out_of_date'
         else workers = health.workers
       } catch (e) {
-        if (e instanceof RunnerError) why = `runner_error: ${e.code}`
-        else if (!(e instanceof RunnerUnavailableError)) note('reloading the runner', e)
+        if (e instanceof RunnerError || e instanceof RunnerUnavailableError) why = runnerFailureSummary(e)
+        else note('reloading the runner', e)
       }
       for (const pluginId of retry) {
         const row = await prisma.pluginInstall.findUnique({ where: { pluginId } })

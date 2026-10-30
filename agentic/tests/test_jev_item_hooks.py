@@ -1,5 +1,5 @@
 """`jev_hooks` per-item hooks: FFuf base paths, page type, tool health, crawl-seed order,
-serialized blobs.
+serialized blobs, route privacy and route exposure leads.
 
 These hooks have no /llm/* twin, and their items (directory names, pages, hosts)
 are target data. This locks in:
@@ -512,3 +512,102 @@ def test_a_failed_blob_request_fails_the_whole_call():
         with pytest.raises(JevError):
             _run(jev_hooks.serialized_classify(KEY, [BLOB, BLOB, BLOB]))
     assert n["i"] == 2
+
+
+# ---------------------------------------------------------------------------
+# route_privacy_rank: tiny items, many per request
+# ---------------------------------------------------------------------------
+
+def test_routes_are_state_named_by_index_and_flags_stay_plain():
+    routes = [{"path": HOSTILE, "method": "GET", "category": "api", "openapi_secured": True,
+               "declared_only": False, "js_only": True, "host_internal": False},
+              {"path": "/about"}]
+    calls, fake = _recorder()
+    with patch("jev_client.system_one", fake):
+        _run(jev_hooks.route_privacy_rank(KEY, routes))
+    assert HOSTILE not in _instructions(calls)
+    item = calls[0]["state"]["items"]["route_0"]
+    assert item["path"].startswith("<<<UNTRUSTED_TARGET_PATH id=")
+    assert (item["category"], item["openapi_secured"], item["js_only"]) == ("api", True, True)
+    assert calls[0]["state"]["items"]["route_1"]["category"] == "other"
+
+
+def test_route_scores_align_with_the_request_and_are_bounded():
+    routes = [{"path": f"/r{i}"} for i in range(jev_hooks.ROUTE_PRIVACY_MAX + 10)]
+    calls, fake = _recorder(per_name={"route_3": 0.9})
+    with patch("jev_client.system_one", fake):
+        out = _run(jev_hooks.route_privacy_rank(KEY, routes))
+    assert len(out["scores"]) == jev_hooks.ROUTE_PRIVACY_MAX
+    assert out["scores"][3] == 0.9 and out["scores"][0] == 0.1
+    assert all(len(c["questions"]) <= jev_hooks.JEV_MAX_QUESTIONS_PER_CALL for c in calls)
+
+
+def test_route_paths_are_clipped_before_they_are_wrapped():
+    calls, fake = _recorder()
+    with patch("jev_client.system_one", fake):
+        _run(jev_hooks.route_privacy_rank(KEY, [{"path": "/" + "q" * 5000}]))
+    assert calls[0]["state"]["items"]["route_0"]["path"].count("q") == jev_hooks.ROUTE_PATH_CHARS - 1
+
+
+# ---------------------------------------------------------------------------
+# route_exposure_assess: one lead per request, a closed choice plus one noul
+# ---------------------------------------------------------------------------
+
+LEAD = {"path": "/internal/users/export", "method": "GET", "anon_status": 200, "authed_status": 200,
+        "content_class": "json", "size_bucket": "1-10k", "bodies_match": True,
+        "key_paths": ["users[].email"], "max_array_len": 50, "det_signals": ["pii_others"],
+        "auth_expected_by": ["path_word"], "generated_by": "found"}
+
+
+def _lead_fake(kind="data_export", conf=0.8, noul=0.6, calls=None):
+    async def fake(key, model, state, questions):
+        if calls is not None:
+            calls.append({"state": state, "questions": questions})
+        return {"model": model, "answers": {
+            "kind": {"type": "choice", "choice": kind, "confidence": conf},
+            "sensitive": {"type": "noul", "noul": noul}}}
+    return fake
+
+
+def test_a_lead_is_asked_a_closed_kind_and_one_noul_with_fixed_wording():
+    calls = []
+    with patch("jev_client.system_one", _lead_fake(calls=calls)):
+        _run(jev_hooks.route_exposure_assess(KEY, [dict(LEAD, path=HOSTILE, key_paths=[HOSTILE])]))
+    qs = calls[0]["questions"]
+    assert set(qs) == {"kind", "sensitive"}
+    assert set(qs["kind"]["criteria"]) == set(jev_hooks.ROUTE_EXPOSURE_KINDS)
+    assert all(v is None for v in qs["kind"]["criteria"].values())
+    assert qs["sensitive"]["type"] == "noul"
+    assert HOSTILE not in _instructions(calls)
+
+
+def test_a_lead_state_wraps_target_text_and_keeps_closed_values_plain():
+    calls = []
+    with patch("jev_client.system_one", _lead_fake(calls=calls)):
+        _run(jev_hooks.route_exposure_assess(KEY, [LEAD]))
+    route = calls[0]["state"]["route"]
+    assert route["path"].startswith("<<<UNTRUSTED_TARGET_PATH id=")
+    assert route["key_paths"].startswith("<<<UNTRUSTED_TARGET_KEYS id=")
+    assert (route["anon_status"], route["content_class"], route["det_signals"]) == (200, "json", ["pii_others"])
+    assert "route_class" not in route
+
+
+@pytest.mark.parametrize("kind,conf,noul,expected", [
+    ("data_export", 0.83, 0.91, {"kind": "data_export", "kind_confidence": 83, "sensitivity": 91}),
+    ("public_content", 1.0, 0.0, {"kind": "public_content", "kind_confidence": 100, "sensitivity": 0}),
+])
+def test_a_lead_answer_maps_to_a_closed_kind_in_range(kind, conf, noul, expected):
+    with patch("jev_client.system_one", _lead_fake(kind=kind, conf=conf, noul=noul)):
+        out = _run(jev_hooks.route_exposure_assess(KEY, [LEAD]))
+    assert out == {"labels": [expected], "model": jev_hooks.JEV_MODEL}
+
+
+def test_each_lead_is_asked_in_its_own_request_and_one_failure_fails_all():
+    calls = []
+    with patch("jev_client.system_one", _lead_fake(calls=calls)):
+        out = _run(jev_hooks.route_exposure_assess(KEY, [LEAD] * 3))
+    assert len(calls) == 3 and all(set(c["state"]) == {"route"} for c in calls)
+    assert len(out["labels"]) == 3
+    with patch("jev_client.system_one", AsyncMock(side_effect=JevError("jev_unavailable"))):
+        with pytest.raises(JevError):
+            _run(jev_hooks.route_exposure_assess(KEY, [LEAD]))

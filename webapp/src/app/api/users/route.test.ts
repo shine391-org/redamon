@@ -68,3 +68,24 @@ describe('POST /api/users — S2/E2 write-bypass removal', () => {
     expect(mockCreate).toHaveBeenCalled()
   })
 })
+
+describe('POST /api/users — a database failure', () => {
+  test('answers its Prisma code beside the fixed sentence', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockIsInternal.mockReturnValue(false)
+    mockGetSession.mockResolvedValue({ userId: 'admin1', role: 'admin' })
+    mockCreate.mockRejectedValue(Object.assign(new Error('Timed out fetching a new connection'), { code: 'P2024' }))
+    const res = await POST(postReq(NEW_ADMIN))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to create user', code: 'P2024' })
+  })
+
+  test('a duplicate email is still a 409 with its own sentence', async () => {
+    mockIsInternal.mockReturnValue(false)
+    mockGetSession.mockResolvedValue({ userId: 'admin1', role: 'admin' })
+    mockCreate.mockRejectedValue(Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }))
+    const res = await POST(postReq(NEW_ADMIN))
+    expect(res.status).toBe(409)
+    expect((await res.json()).error).toBe('A user with this email already exists')
+  })
+})

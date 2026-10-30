@@ -373,3 +373,26 @@ describe('the other mutating triage routes refuse a non-JSON body', () => {
     expect(mockAgentFetch).not.toHaveBeenCalled()
   })
 })
+
+describe('a database failure is a readable 500 (G-17)', () => {
+  test('mute answers its fixed text and the Prisma code, not an empty body', async () => {
+    mockProjectFind.mockRejectedValue(Object.assign(new Error("Can't reach database server at db:5432"), { code: 'P1001' }))
+    const res = await postMute(post('http://x/api/triage/mute', { projectId: PROJECT, nodeId: 'n1' }))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'The finding could not be muted.', code: 'P1001' })
+  })
+
+  test('the muted list does too', async () => {
+    mockProjectFind.mockRejectedValue(Object.assign(new Error('pool'), { code: 'P2024' }))
+    const res = await getMuted(new NextRequest(`http://x/api/triage/muted?projectId=${PROJECT}`))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not load the muted nodes', code: 'P2024' })
+  })
+
+  test('an agent refusal reaches the browser with the agent status', async () => {
+    mockAgentFetch.mockResolvedValue(agentReply({ detail: 'Unauthorized' }, 401))
+    const res = await getMuted(new NextRequest(`http://x/api/triage/muted?projectId=${PROJECT}`))
+    expect(res.status).toBe(401)
+    expect(await res.json()).toMatchObject({ error: 'Unauthorized', upstreamStatus: 401 })
+  })
+})

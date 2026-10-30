@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string }>
@@ -40,11 +41,9 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
     }))
     return NextResponse.json({ targets, count: targets.length })
   } catch (error) {
-    console.error('AI Attack Surface targets error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed', targets: [] },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to load the LLM endpoints', {
+      log: 'AI Attack Surface targets error', extra: { targets: [] },
+    })
   } finally {
     await session.close()
   }

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import urllib.parse
 
 logger = logging.getLogger(__name__)
@@ -196,6 +197,50 @@ def is_model_unavailable_error(exc: BaseException) -> bool:
                 return True
         current = current.__cause__ or current.__context__
     return False
+
+
+_SAFE_CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _http_status_of(exc: BaseException):
+    """The HTTP status a provider error carries, or None. Same fields as above."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        code = getattr(exc, "code", None)
+        status = code if isinstance(code, int) and not isinstance(code, bool) else None
+    if status is None:
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def provider_error_details(exc: BaseException) -> dict:
+    """What a person may see of a provider failure: its class and HTTP status.
+
+    `{"error_class": "RateLimitError", "provider_status": 429}`; a key is left out
+    when it is unknown. The SDK's message is never included: a 401 body can quote
+    part of the key and a 400 the prompt. The class is the one that carried the
+    status (LangChain and the SDKs wrap it), else the outermost one.
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = _http_status_of(current)
+        if status is not None:
+            name = type(current).__name__
+            out = {"provider_status": status}
+            if _SAFE_CLASS_NAME.match(name):
+                out["error_class"] = name
+            return out
+        current = current.__cause__ or current.__context__
+    name = type(exc).__name__
+    return {"error_class": name} if _SAFE_CLASS_NAME.match(name) else {}
 
 
 def log_provider_error(feature: str, model: str, exc: BaseException) -> None:

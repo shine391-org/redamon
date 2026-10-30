@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from urllib.parse import urlparse
 
 #: Postgres indexes this as a unique key and Neo4j stores it as a property, so
 #: it is capped rather than left to whatever a scanner put in a title.
@@ -67,6 +68,17 @@ def _lowest_cve(finding: dict) -> str:
         if match:
             candidates.add(match.group(0).upper())
     return min(candidates) if candidates else ""
+
+
+_ID_SEGMENT = re.compile(r"^(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,})$",
+                         re.I)
+
+
+def _route_template(path: str) -> str:
+    """`/api/v1/orders/42` -> `/api/v1/orders/:id`: numeric, UUID and long-hex
+    segments are one route, so their exposures share one fix. `:id` survives
+    `_slug`, which strips braces."""
+    return "/".join(":id" if _ID_SEGMENT.match(seg) else seg for seg in (path or "/").split("/")) or "/"
 
 
 def group_key(finding: dict) -> str:
@@ -146,6 +158,20 @@ def group_key(finding: dict) -> str:
     if label == "JsReconFinding" or source in ("js_recon", "jsluice"):
         return (f"js:{_slug(finding.get('finding_type'))}:"
                 f"{_slug(finding.get('name') or finding.get('package_name'), 100)}")[:MAX_KEY_LENGTH]
+
+    if source == "route_exposure":
+        # Only projected fields: type and matched_at (fact_queries.py).
+        kind = _slug(finding.get("type"))
+        try:
+            parts = urlparse(str(finding.get("matched_at") or ""))
+            host, path = parts.hostname or "", parts.path
+        except ValueError:
+            host, path = "", ""
+        if kind in ("cors_credentialed_origin_reflection", "authenticated_content_cacheable"):
+            # A header policy is set once per application: one fix covers the host.
+            return f"route:{kind}:{_slug(host, 60)}"[:MAX_KEY_LENGTH]
+        # The same exposed path on several hosts is one deployment fix.
+        return f"route:{kind}:{_slug(_route_template(path), 100)}"[:MAX_KEY_LENGTH]
 
     # Nothing matched: the finding is its own group, so it still gets a
     # remediation rather than silently sharing one with an unrelated finding.

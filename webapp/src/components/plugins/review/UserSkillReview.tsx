@@ -8,6 +8,7 @@ import { PluginBadge } from '@/components/plugins/PluginBadge'
 import { SafeMarkdown } from '@/components/plugins/host/SafeMarkdown'
 import { TextDiff } from '@/components/plugins/host/TextDiff'
 import { nameCheckMessage, useSkillNameCheck } from '@/components/settings/useSkillNameCheck'
+import { errorMessage } from '@/lib/apiError'
 import type { UserSkillReviewModel } from '@/lib/plugins/userSkillReviewModel'
 import { DESCRIPTION_MAX_CHARS, NAME_MAX_CHARS } from '@/lib/userSkills'
 import { postUserSkillsChanged } from '@/lib/userSkillsChannel'
@@ -101,7 +102,7 @@ export function UserSkillReview({
         setSaveError(e.message)
         if (e.code === 'name_taken' && typeof e.extra.suggestion === 'string') setName(e.extra.suggestion)
       } else {
-        setSaveError('The new skill could not be saved.')
+        setSaveError(errorMessage(e, 'The new skill could not be saved.'))
       }
     } finally {
       setBusy(false)
@@ -118,7 +119,7 @@ export function UserSkillReview({
       toast.success('Proposal rejected.')
       onDecided({ outcome: 'rejected' })
     } catch (e) {
-      toast.error(e instanceof OverrideApiError ? e.message : 'Could not reject the proposal.')
+      toast.error(errorMessage(e, 'Could not reject the proposal.'))
     } finally {
       setBusy(false)
     }

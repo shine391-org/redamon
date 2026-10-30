@@ -1,3 +1,4 @@
+import { toApiError } from '@/lib/apiError'
 import { pluginFeatureId } from '@/lib/llmFeatures'
 import type { FeatureModelGateApi } from '@/components/shared/FeatureModelGate'
 import type { ChatSessionActionContribution } from '@/lib/plugins/contributions'
@@ -109,7 +110,7 @@ export async function runPluginAction(opts: {
     }
     handleResult(answer.result, handlers)
   } catch (e) {
-    handlers.toast.error(e instanceof PluginActionError ? e.message : 'The plugin action could not be run.')
+    handlers.toast.error(e instanceof PluginActionError ? e.message : toApiError(e, 'The plugin action could not be run').message)
   }
 }
 

@@ -19,7 +19,7 @@ vi.mock('@/lib/prisma', () => ({
 }))
 vi.mock('@/lib/agentFetch', () => ({ agentFetch: (...a: unknown[]) => h.agentFetch(...a) }))
 
-import { checkAgentSessions, describeAgentSessionState } from './agentSessions'
+import { checkAgentSessions, describeAgentSessionState, sessionRunningCheck, sessionRunningState } from './agentSessions'
 
 const T0 = new Date('2026-09-29T10:00:00.000Z')
 const flag = (id: string, sessionId: string) => ({ id, sessionId, updatedAt: T0 })
@@ -110,5 +110,37 @@ describe('describeAgentSessionState', () => {
     expect(describeAgentSessionState('running')).toBe('an agent session is running')
     expect(describeAgentSessionState('unverified')).toMatch(/marked running and the agent could not be reached/)
     expect(describeAgentSessionState('idle')).toBeNull()
+  })
+})
+
+describe('sessionRunningCheck: why a session is unverified', () => {
+  const conv = { id: 'c1', projectId: 'p1', sessionId: 's1', agentRunning: true, updatedAt: T0 }
+  // agentFetch wraps a transport failure as AgentUnreachableError, keeping the original in cause_.
+  const unreachable = (cause: unknown) => Object.assign(new Error('Cannot reach the agent'), { name: 'AgentUnreachableError', cause_: cause })
+
+  test.each<[string, () => void, Record<string, unknown>]>([
+    ['refused', () => h.agentFetch.mockRejectedValue(unreachable(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }))), { code: 'agent_unreachable', cause: 'ECONNREFUSED' }],
+    ['timed out', () => h.agentFetch.mockRejectedValue(unreachable(new DOMException('timed out', 'TimeoutError'))), { code: 'agent_timeout' }],
+    ['answered 500', () => h.agentFetch.mockResolvedValue({ ok: false, status: 500, json: async () => ({}) }), { code: 'agent_error', upstreamStatus: 500 }],
+    ['answered without a list', () => h.agentFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ sessions: 's1' }) }), { code: 'agent_bad_answer', upstreamStatus: 200 }],
+  ])('%s: unverified, with the cause', async (_label, arrange, failure) => {
+    arrange()
+    expect(await sessionRunningCheck(conv)).toEqual({ running: 'unverified', failure })
+    expect(h.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('the agent answers: no failure, and sessionRunningState (what the Gateway hands plugins) is unchanged', async () => {
+    h.agentFetch.mockResolvedValue(live(['s1']))
+    expect(await sessionRunningCheck(conv)).toEqual({ running: true })
+    expect(await sessionRunningState(conv)).toBe(true)
+    h.agentFetch.mockResolvedValue({ ok: false, status: 503, json: async () => ({}) })
+    expect(await sessionRunningState(conv)).toBe('unverified')
+  })
+
+  test('a non-OK answer is logged with its status (it was not logged at all)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    h.agentFetch.mockResolvedValue({ ok: false, status: 401, json: async () => ({}) })
+    await sessionRunningCheck(conv)
+    expect(warn.mock.calls.flat().join(' ')).toContain('the agent answered HTTP 401')
   })
 })

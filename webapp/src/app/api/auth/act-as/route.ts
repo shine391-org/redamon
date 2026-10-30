@@ -4,6 +4,7 @@ import { requireAdmin } from '@/lib/session'
 import { createActAsToken, ACT_AS_COOKIE_NAME } from '@/lib/auth'
 import { writeActAsAudit } from '@/lib/audit'
 import { isSecureRequest } from '@/lib/cookieSecurity'
+import { withRouteErrors } from '@/lib/routeErrors'
 
 // Impersonation ("switch user") is an ADMIN-only, server-authorized act. The
 // client can no longer decide "which user am I" via a localStorage value: the
@@ -23,7 +24,7 @@ function cookieOpts(request: NextRequest) {
 
 // POST /api/auth/act-as  { targetUserId }  -> begin simulating targetUserId.
 // Acting as self clears the cookie (equivalent to "stop simulating").
-export async function POST(request: NextRequest) {
+export const POST = withRouteErrors('Could not switch user', async (request: NextRequest) => {
   const admin = await requireAdmin()
   if (admin instanceof NextResponse) return admin
 
@@ -54,10 +55,10 @@ export async function POST(request: NextRequest) {
   const res = NextResponse.json({ actingAs: targetUserId })
   res.cookies.set(ACT_AS_COOKIE_NAME, token, cookieOpts(request))
   return res
-}
+})
 
 // DELETE /api/auth/act-as -> stop simulating (back to the admin's own data).
-export async function DELETE(request: NextRequest) {
+export const DELETE = withRouteErrors('Could not stop switching user', async (request: NextRequest) => {
   const admin = await requireAdmin()
   if (admin instanceof NextResponse) return admin
 
@@ -67,4 +68,4 @@ export async function DELETE(request: NextRequest) {
   const res = NextResponse.json({ actingAs: null })
   res.cookies.set(ACT_AS_COOKIE_NAME, '', { ...cookieOpts(request), maxAge: 0 })
   return res
-}
+})

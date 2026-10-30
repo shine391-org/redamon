@@ -167,4 +167,15 @@ describe('CredentialShortcut', () => {
     )
     expect(container.innerHTML).toBe('')
   })
+
+  test('a failed read says why, so an unset badge is not taken at its word', () => {
+    render(<CredentialShortcut settingsKey={KEY} keys={fakeKeys({ loadError: "Couldn't read your saved keys (P1001 · HTTP 500)" })} />)
+    expect(screen.getByRole('alert').textContent)
+      .toBe("Couldn't read your saved keys (P1001 · HTTP 500), so this key may already be set.")
+  })
+
+  test('a key that did load as set shows no read error', () => {
+    render(<CredentialShortcut settingsKey={KEY} keys={fakeKeys({ isSet: () => true, loadError: 'stale' })} />)
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
 })

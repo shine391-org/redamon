@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
-import { internalKeyHeaders } from '@/lib/agentAuth'
-
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { agentErrorResponse, callAgent } from '../../agentProxy'
 
 // Increase body size limit so this proxy can stream large uploads.
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-export async function POST(request: NextRequest) {
+const FAILED = 'Failed to upload'
+
+export const POST = withRouteErrors(FAILED, async (request: NextRequest) => {
   // Pass the original multipart body straight through; FastAPI parses it.
   const formData = await request.formData()
   const projectId = formData.get('projectId')
@@ -22,20 +23,14 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'file required' }, { status: 400 })
   }
 
-  try {
-    // Re-encode as multipart for upstream. fetch() handles this for FormData.
-    const resp = await fetch(`${AGENT_API_URL}/workspace/upload`, {
-      method: 'POST',
-      headers: internalKeyHeaders(),
-      body: formData,
-    })
-    const data = await resp.json()
-    return NextResponse.json(data, { status: resp.status })
-  } catch (error) {
-    console.error('workspace/upload proxy error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to upload' },
-      { status: 502 }
-    )
-  }
-}
+  // Re-encode as multipart for upstream. fetch() handles this for FormData;
+  // a large file needs the same budget as the route.
+  const call = await callAgent('/workspace/upload', {
+    method: 'POST',
+    body: formData,
+  }, FAILED, { timeoutMs: 60_000 })
+  if (!call.ok) return call.response
+  // A 409 keeps the agent's `code: exists`, which the drawer turns into an overwrite prompt.
+  if (!call.res.ok) return agentErrorResponse(call.res, FAILED)
+  return NextResponse.json(await call.res.json())
+})

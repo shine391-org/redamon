@@ -134,7 +134,7 @@ describe('the POST', () => {
   test('a refusal of the pick (invalid_pick) is an error toast and opens nothing', async () => {
     const s = setup({ answer: json(400, { code: 'invalid_pick', error: 'This skill cannot be picked in this session.' }) })
     await runPluginAction({ plugin, item: item(), context, gate: s.gate, handlers: s.handlers })
-    expect(s.handlers.toast.error).toHaveBeenCalledWith('This skill cannot be picked in this session.')
+    expect(s.handlers.toast.error).toHaveBeenCalledWith('This skill cannot be picked in this session. (invalid_pick · HTTP 400)')
     expect(s.handlers.onJob).not.toHaveBeenCalled()
   })
 

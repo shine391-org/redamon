@@ -62,3 +62,20 @@ describe('GET /api/projects/[id]/export — BOLA', () => {
     expect(mockProjectFindUnique).toHaveBeenCalled()
   })
 })
+
+describe('GET /api/projects/[id]/export — failures', () => {
+  test('an export that fails answers a code, never the exception text', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockRequireEff.mockResolvedValue({ userId: 'victim' })
+    mockRequireProjectAccess.mockResolvedValue({ project: { id: 'victimProj', userId: 'victim' } })
+    mockProjectFindUnique.mockRejectedValue(Object.assign(
+      new Error('Timed out fetching a new connection: SELECT * FROM "Project" WHERE "targetDomain" = \'v.tld\''),
+      { code: 'P2024', name: 'PrismaClientKnownRequestError' },
+    ))
+    const res = await GET(new NextRequest('http://x/api/projects/victimProj/export'), params('victimProj'))
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Export failed', code: 'P2024' })
+    expect(JSON.stringify(body)).not.toContain('v.tld')
+  })
+})

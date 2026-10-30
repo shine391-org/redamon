@@ -159,15 +159,16 @@ async def generate_report_narratives(
 
     except json.JSONDecodeError as e:
         logger.error(f"Report summarizer: invalid JSON from LLM: {type(e).__name__}: {e}")
-        return _empty_narratives()
+        return {**_empty_narratives(), "narratives_failed": "unreadable_answer"}
     except Exception as e:
         # A refused key or unknown model is the person's to fix, so it reaches
         # the endpoint and opens the model picker; empty narratives would hide it.
-        from llm_builder import is_model_unavailable_error
+        from llm_builder import is_model_unavailable_error, provider_error_details
         if is_model_unavailable_error(e):
             raise
         logger.error(f"Report summarizer error: {type(e).__name__}: {e}")
-        return _empty_narratives()
+        # The report is still built, without narratives; the marker says why.
+        return {**_empty_narratives(), "narratives_failed": "model_call_failed", **provider_error_details(e)}
 
 
 def _condense_for_llm(data: dict) -> dict:

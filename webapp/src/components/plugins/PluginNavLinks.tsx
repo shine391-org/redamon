@@ -2,14 +2,25 @@
 
 import Link from 'next/link'
 import { usePluginContributions } from '@/hooks/usePluginContributions'
+import { errorMessage } from '@/lib/apiError'
 import { PluginBadge } from './PluginBadge'
 import { PluginIcon } from './pluginIcons'
 import styles from './PluginNavLinks.module.css'
 
 /** The plugins' own pages, listed on the Plugins page (nav entries never go in the global header). */
 export function PluginNavLinks() {
-  const { data } = usePluginContributions()
+  const { data, error, refetch } = usePluginContributions()
   const withNav = (data ?? []).filter((c) => c.nav)
+  if (!data && error) {
+    return (
+      <div className={styles.loadError} role="status" data-testid="plugin-nav-error">
+        <span>{errorMessage(error, 'Plugin items could not be loaded')}</span>
+        <button type="button" className="secondaryButton" onClick={() => void refetch()}>
+          Retry
+        </button>
+      </div>
+    )
+  }
   if (withNav.length === 0) return null
   return (
     <section className={styles.section} aria-label="Plugin pages">

@@ -1,9 +1,9 @@
-"""Shared plumbing for the Jev hooks that have no LLM twin: the agent call and shadow mode.
+"""Shared plumbing for the Jev hooks that have no LLM twin: the agent call and the decision records.
 
-A hook in SHADOW asks Jev, ACTS on the deterministic path, and records how Jev's
-answer compares with it, so a person can decide from real runs whether to let it
-act. Each hook module holds its own `ROLLOUT` constant; flipping one to ACT is a
-separate change, made after reviewing the agreement data.
+Each hook module holds its own `ROLLOUT` constant. A hook in ACT acts on Jev's
+answer, with the deterministic result as the fallback; one in SHADOW asks Jev but
+acts on the deterministic path. Either way every decision is recorded next to the
+deterministic answer, so the agreement stays measurable on real runs.
 
 Where the shadow lines go. Recon stdout streams into the recon drawer and the run
 log, so a per-item hook would flood both: per-decision lines are capped per hook

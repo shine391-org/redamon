@@ -18,7 +18,7 @@ export default function UsersPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { user: authUser, isAdmin, isLoading: authLoading } = useAuth()
-  const { data: users, isLoading } = useUsers()
+  const { data: users, isLoading, error: usersError } = useUsers()
   const createUser = useCreateUser()
   const deleteUser = useDeleteUser()
   const changePasswordMutation = useChangePassword()
@@ -232,6 +232,8 @@ export default function UsersPage() {
 
       {isLoading ? (
         <div className={styles.empty}>Loading users...</div>
+      ) : usersError ? (
+        <div className={styles.error} role="alert">{usersError.message}</div>
       ) : !users || users.length === 0 ? (
         <div className={styles.empty}>No users found</div>
       ) : (

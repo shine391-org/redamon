@@ -98,6 +98,16 @@ describe('OfflineInstallDialog', () => {
     render(<OfflineInstallDialog isOpen onSubmit={vi.fn()} onCancel={vi.fn()} />)
     pick(0, 'echo.tar.gz', ARCHIVE)
     pick(1, 'catalog.json', 'not json')
-    await waitFor(() => expect(screen.getByText(/not a plugin catalog/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('The catalog file is not JSON, so it is not a plugin catalog.')).toBeTruthy())
+  })
+
+  // Plain HTTP on a host other than localhost (a redamon-http deploy): no WebCrypto at all.
+  test('a page without WebCrypto says it needs HTTPS, not that the catalog is wrong', async () => {
+    vi.stubGlobal('crypto', { getRandomValues: webcrypto.getRandomValues.bind(webcrypto) })
+    render(<OfflineInstallDialog isOpen onSubmit={vi.fn()} onCancel={vi.fn()} />)
+    pick(0, 'echo.tar.gz', ARCHIVE)
+    pick(1, 'catalog.json', catalog(SHA))
+    await waitFor(() => expect(screen.getByText(/not served over HTTPS \(or localhost\)/)).toBeTruthy())
+    expect(screen.queryByText(/not a plugin catalog/)).toBeNull()
   })
 })

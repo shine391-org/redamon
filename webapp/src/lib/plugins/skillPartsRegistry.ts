@@ -1,4 +1,5 @@
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { upstreamFailure } from '@/lib/routeErrors'
 import { now } from './clock'
 
 /**
@@ -44,17 +45,37 @@ export interface PartsValidation {
 
 export type RegistryErrorCode = 'agent_unreachable' | 'agent_outdated' | 'unknown_skill'
 
+/**
+ * Why `agent_unreachable`: the agent's HTTP status when it answered with an error, else the
+ * errno (or `timeout`) of a request that got no answer. Kept beside the message, which the
+ * Gateway hands to plugins unchanged.
+ */
+export interface RegistryFailure {
+  upstreamStatus?: number
+  reason?: string
+}
+
 export class SkillPartsRegistryError extends Error {
   constructor(
     readonly code: RegistryErrorCode,
     message: string,
+    readonly failure: RegistryFailure = {},
   ) {
     super(message)
     this.name = 'SkillPartsRegistryError'
   }
 }
 
-const unreachable = () => new SkillPartsRegistryError('agent_unreachable', "The agent service isn't running")
+const unreachable = (failure: RegistryFailure = {}) =>
+  new SkillPartsRegistryError('agent_unreachable', "The agent service isn't running", failure)
+
+/** The failure in words for a person: an agent that answered with an error is not "not running". */
+export function registryFailureText(e: SkillPartsRegistryError): string {
+  if (e.code !== 'agent_unreachable') return e.message
+  if (e.failure.upstreamStatus) return `The agent service answered HTTP ${e.failure.upstreamStatus}`
+  if (e.failure.reason === 'timeout') return 'The agent service did not answer in time'
+  return `The agent service could not be reached${e.failure.reason ? ` (${e.failure.reason})` : ''}`
+}
 const outdated = () => new SkillPartsRegistryError('agent_outdated', 'The agent is older than the webapp: rebuild it')
 
 let cache: { at: number; skills: Map<string, RegistrySkill> } | null = null
@@ -70,8 +91,10 @@ async function call(path: string, init: RequestInit): Promise<{ status: number; 
     res = await agentFetch(path, init, { timeoutMs: TIMEOUT_MS })
   } catch (e) {
     if (e instanceof AgentUnreachableError) {
-      console.warn(`[plugins] skill parts: the agent could not be reached (${path})`)
-      throw unreachable()
+      const { body } = upstreamFailure('agent', e.cause_, '')
+      const reason = body.code === 'agent_timeout' ? 'timeout' : body.cause
+      console.warn(`[plugins] skill parts: the agent could not be reached (${path}${reason ? `, ${reason}` : ''})`)
+      throw unreachable(reason ? { reason } : {})
     }
     throw e
   }
@@ -121,7 +144,7 @@ async function registry(): Promise<Map<string, RegistrySkill>> {
   if (status === 404) throw outdated()
   if (status < 200 || status >= 300) {
     console.warn(`[plugins] skill parts: the agent answered HTTP ${status}`)
-    throw unreachable()
+    throw unreachable({ upstreamStatus: status })
   }
   const skills = parseRegistry(body)
   if (!skills) {
@@ -151,7 +174,7 @@ export async function validateSkillParts(skillId: string, parts: Record<string, 
   }
   if (status < 200 || status >= 300) {
     console.warn(`[plugins] skill parts validate: the agent answered HTTP ${status}`)
-    throw unreachable()
+    throw unreachable({ upstreamStatus: status })
   }
   if (!isObj(body) || typeof body.ok !== 'boolean' || !isObj(body.parts) || !isObj(body.skill)) throw outdated()
   return body as unknown as PartsValidation
@@ -176,7 +199,7 @@ export async function validatePlainText(text: string, baseText: string, maxChars
   if (status === 404) throw outdated()
   if (status < 200 || status >= 300) {
     console.warn(`[plugins] text validate: the agent answered HTTP ${status}`)
-    throw unreachable()
+    throw unreachable({ upstreamStatus: status })
   }
   if (!isObj(body) || typeof body.ok !== 'boolean' || !Array.isArray(body.errors)) throw outdated()
   return { ok: body.ok, errors: body.errors.filter((e): e is string => typeof e === 'string') }

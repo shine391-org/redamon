@@ -26,16 +26,48 @@ describe('useLocalJudgeModel', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/api/ai-attack-surface/p1/judge-model')
   })
 
-  test('the orchestrator down is unavailable, never a guessed model', async () => {
-    fetchMock.mockResolvedValue({ ok: false, status: 503, json: async () => ({ model: null }) })
+  test('the orchestrator down is unavailable with its reason and status, never a guessed model', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      model: null, error: 'The local judge model is unavailable',
+      code: 'orchestrator_unreachable', reason: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+    }), { status: 503 }))
     const { result } = renderHook(() => useLocalJudgeModel('p1'))
-    await waitFor(() => expect(result.current).toEqual({ status: 'unavailable' }))
+    await waitFor(() => expect(result.current).toEqual({
+      status: 'unavailable',
+      reason: 'orchestrator_unreachable',
+      error: 'The local judge model is unavailable (orchestrator_unreachable · HTTP 503)',
+    }))
   })
 
-  test('a network failure is unavailable', async () => {
+  test('a failed orchestrator answer keeps its upstream status', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      model: null, error: 'The local judge model is unavailable',
+      code: 'orchestrator_error', reason: 'orchestrator_error', upstreamStatus: 500,
+    }), { status: 503 }))
+    const { result } = renderHook(() => useLocalJudgeModel('p1'))
+    await waitFor(() => expect(result.current).toMatchObject({
+      status: 'unavailable',
+      reason: 'orchestrator_error',
+      error: 'The local judge model is unavailable (orchestrator_error · HTTP 503 · upstream HTTP 500)',
+    }))
+  })
+
+  test('an answer without a model is no_model', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      model: null, error: 'The local judge model is unavailable', code: 'no_model', reason: 'no_model',
+    }), { status: 503 }))
+    const { result } = renderHook(() => useLocalJudgeModel('p1'))
+    await waitFor(() => expect(result.current).toMatchObject({ status: 'unavailable', reason: 'no_model' }))
+  })
+
+  test('a network failure is unavailable, reason network_error', async () => {
     fetchMock.mockRejectedValue(new TypeError('fetch failed'))
     const { result } = renderHook(() => useLocalJudgeModel('p1'))
-    await waitFor(() => expect(result.current).toEqual({ status: 'unavailable' }))
+    await waitFor(() => expect(result.current).toEqual({
+      status: 'unavailable',
+      reason: 'network_error',
+      error: 'The local judge model is unavailable (network_error)',
+    }))
   })
 
   test('no project, no request', () => {

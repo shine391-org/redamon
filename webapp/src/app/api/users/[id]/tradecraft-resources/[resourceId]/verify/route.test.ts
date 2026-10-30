@@ -245,14 +245,44 @@ describe('verify route persists agent response', () => {
     expect(args.data.lastVerifiedAt).toBeInstanceOf(Date)
   })
 
-  test('agent 5xx response writes lastError and returns same status', async () => {
+  test('agent 5xx response writes a safe lastError and answers 502 with the agent status', async () => {
     mockFindFirst.mockResolvedValueOnce(EXISTING_WITH_MODEL)
-    installFetchStub({ error: 'boom' }, /*ok=*/false)
+    installFetchStub({ error: 'LLM not configured: Error code: 401 - key sk-live-abc invalid' }, /*ok=*/false)
     const r = await route.POST(makePost() as never, PARAMS() as never)
-    expect(r.status).toBe(503)
+    expect(r.status).toBe(502)
+    expect(await r.json()).toEqual({
+      error: 'The agent could not verify this resource', code: 'agent_error', upstreamStatus: 503,
+    })
     expect(mockUpdate).toHaveBeenCalledTimes(1)
     const args = mockUpdate.mock.calls[0]?.[0] as { data: Record<string, unknown> }
-    expect(String(args.data.lastError)).toMatch(/verify failed/i)
+    // The list renders lastError; the agent's own text can quote a provider key.
+    expect(args.data.lastError).toBe('verify failed (agent_error, agent HTTP 503)')
+  })
+
+  test('an agent that never answered: 503 with the errno, and the row says why', async () => {
+    mockFindFirst.mockResolvedValueOnce(EXISTING_WITH_MODEL)
+    const err = new TypeError('fetch failed')
+    ;(err as TypeError & { cause?: unknown }).cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+    global.fetch = vi.fn(async () => { throw err }) as typeof fetch
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const r = await route.POST(makePost() as never, PARAMS() as never)
+    expect(r.status).toBe(503)
+    expect(await r.json()).toEqual({
+      error: 'Failed to verify tradecraft resource', code: 'agent_unreachable', cause: 'ECONNREFUSED',
+    })
+    const args = mockUpdate.mock.calls[0]?.[0] as { data: Record<string, unknown> }
+    expect(args.data.lastError).toBe('verify failed (agent_unreachable, ECONNREFUSED)')
+  })
+
+  test('a verify that timed out: 504, and the row says so', async () => {
+    mockFindFirst.mockResolvedValueOnce(EXISTING_WITH_MODEL)
+    global.fetch = vi.fn(async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError') }) as typeof fetch
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const r = await route.POST(makePost() as never, PARAMS() as never)
+    expect(r.status).toBe(504)
+    expect((await r.json()).code).toBe('agent_timeout')
+    const args = mockUpdate.mock.calls[0]?.[0] as { data: Record<string, unknown> }
+    expect(args.data.lastError).toBe('verify failed (agent_timeout)')
   })
 
   test('resource not found returns 404', async () => {

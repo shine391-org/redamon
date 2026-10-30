@@ -122,7 +122,7 @@ describe('loading and error states', () => {
     vi.stubGlobal('fetch', mockFetch({ tokensStatus: 500 }))
     render(<McpTokensTab userId="owner" />)
 
-    await waitFor(() => expect(screen.getByText(/request failed \(500\)/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Could not load tokens \(HTTP 500\)/)).toBeTruthy())
     expect(screen.getByText('Retry')).toBeTruthy()
     expect(screen.queryByText(/No MCP access tokens yet/)).toBeNull()
   })
@@ -288,8 +288,18 @@ describe('the create form', () => {
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'ci agent' } })
     fireEvent.click(screen.getByText('Create token'))
 
-    await waitFor(() => expect(screen.getByText('Password is incorrect')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Password is incorrect (HTTP 401)')).toBeTruthy())
     expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('ci agent')
+  })
+
+  test('a create the database refused names its code and status', async () => {
+    vi.stubGlobal('fetch', mockFetch({ createStatus: 500, create: { error: 'Could not create the token', code: 'P2024' } }))
+    await openForm()
+
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'ci agent' } })
+    fireEvent.click(screen.getByText('Create token'))
+
+    await waitFor(() => expect(screen.getByText('Could not create the token (P2024 · HTTP 500)')).toBeTruthy())
   })
 
   test('a double-click cannot mint two tokens', async () => {

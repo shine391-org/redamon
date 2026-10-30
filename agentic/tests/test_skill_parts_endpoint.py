@@ -82,7 +82,7 @@ def test_master_key_lists_every_skill(api):
     assert res.status_code == 200, res.text
     skills = res.json()["skills"]
     assert [s["id"] for s in skills] == list(skill_parts.skill_ids())
-    assert sum(len(s["parts"]) for s in skills) == 47
+    assert sum(len(s["parts"]) for s in skills) == 58
 
 
 @pytest.mark.parametrize("key", [SCANNER, "", "wrong"])

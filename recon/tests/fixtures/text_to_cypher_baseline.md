@@ -387,6 +387,9 @@ Additional properties present on this node type, not yet described:
 - page_class_source (string): "jev_classifier", or "prefilter" where Jev gave no answer
 - validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get) or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme). "not_hittable" (dead) and "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell) are never written: the endpoint is dropped
 - js_status_code (integer): the status js_recon's own probe got; status_code stays http_probe's when both probed
+- anon_status (integer): the status an anonymous GET of this route got; compare with status_code to see a route that answers without credentials
+- anon_status_at (datetime): when anon_status was measured
+- generated_by (string): on an Endpoint the route exposure scan created, the generator that found it ("seed", "version", "sibling", "catalog", "cross_host"); such an Endpoint carries source "route_exposure" and was answering 2xx with content
 - path_template (string): the literal as written, e.g. "/api/users/${id}"; `path` is then its literal prefix ("/api/users/"). Absent for a plain literal
 
 Additional properties present on this node type, not yet described:
@@ -419,6 +422,7 @@ Additional properties present on this node type, not yet described:
 - graphql-cop capability flags (set by the external scanner, Phase 2):
 - Page type (set by http_probe when the project's Jev page-type hook is on):
 - Endpoint probe (set by js_recon on endpoints it extracted from JavaScript, when JS_RECON_VALIDATE_ENDPOINTS is on):
+- Anonymous status (set by the route exposure scan):
 - Path template (set by js_recon when the JS built the URL from a template literal):
 - _js_recon_created
 - ai_attack_synthetic
@@ -540,7 +544,7 @@ Common properties (all sources):
 - id (string): unique identifier
 - name (string): vulnerability name
 - severity (string): "critical", "high", "medium", "low", "info" (lowercase!)
-- source (string): **"nuclei"** (DAST/web), **"gvm"** (network/OpenVAS), **"security_check"**, **"origin_discovery"** (origin server exposed behind a CDN/WAF; `type: "waf_bypass"`, carries `origin_discovery_method`, `origin_source`, `confidence_score`, `cdn_fronting`, `matched_ip`, `port`, `probe_url`; `url`/`matched_at` are the canonical port-less `https://<ip>`; the IP is linked via `HAS_ORIGIN` from the fronted Subdomain), **"netlas"** (passive NVD-based), **"graphql_scan"** (GraphQL security testing), **"takeover_scan"** (subdomain takeover via Subjack + Nuclei takeover templates), **"vhost_sni_enum"** (hidden virtual host / SNI routing anomalies via curl), **"cache_poisoning"** (web cache poisoning + web cache deception, confirmed by WCVS breadth + a native baseline→poison→clean persistence check; carries `cache_header`/`cache_param` (the unkeyed vector), `cache_impact` ("stored_xss"/"reflected_script"/"open_redirect"/"deception"/"dos"/"reflected"/"response_change"), `cache_technique`, `confidence` (0–1) + `confidence_tier` ("Confirmed"/"Strong"/"Tentative"), `cache_signals`, `poc_link`; linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`), **"ai_surface_recon"** (MCP tool-poisoning / prompt-injection-via-tool-description / data-exfiltration found by static YARA over MCP manifests; carries `ai_owasp_llm_id`, `ai_atlas_technique`, `type` like "mcp_tool_poisoning"), or **"garak"** / **"pyrit"** / **"giskard"** / **"promptfoo"** (AI Attack Surface — deterministic offensive testing of discovered LLM endpoints; `type` like "ai_attack_jailbreak"/"ai_attack_prompt_injection", carries `ai_owasp_llm_id` (LLM01..LLM10, or "safety" for toxicity/harmful), `ai_asr` (attack success rate 0–1), `ai_trials`, `ai_oracle_kind`, `ai_payload_class` like "garak-dan"/"pyrit-crescendo"/"promptfoo-beavertails", `ai_transcript_ref` (path to the native report), linked to the attacked `Endpoint` via `HAS_VULNERABILITY`; promptfoo runs broad red-team dataset plugins and reports per-plugin ASR as corroboration), or **"serialized_scan"** (deterministic recon detection of serialized-object data — native Java, polymorphic JSON, XMLDecoder/XStream, SnakeYAML, PHP, Python pickle, .NET BinaryFormatter/ViewState, Ruby Marshal, Hessian; writes an `info`-severity candidate carrying `needs_agent_confirmation: true` plus `deser_*` metadata, linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`; recon never deserializes, the agent's deserialization skill confirms the candidate out of band)
+- source (string): **"nuclei"** (DAST/web), **"gvm"** (network/OpenVAS), **"security_check"**, **"origin_discovery"** (origin server exposed behind a CDN/WAF; `type: "waf_bypass"`, carries `origin_discovery_method`, `origin_source`, `confidence_score`, `cdn_fronting`, `matched_ip`, `port`, `probe_url`; `url`/`matched_at` are the canonical port-less `https://<ip>`; the IP is linked via `HAS_ORIGIN` from the fronted Subdomain), **"netlas"** (passive NVD-based), **"graphql_scan"** (GraphQL security testing), **"takeover_scan"** (subdomain takeover via Subjack + Nuclei takeover templates), **"vhost_sni_enum"** (hidden virtual host / SNI routing anomalies via curl), **"cache_poisoning"** (web cache poisoning + web cache deception, confirmed by WCVS breadth + a native baseline→poison→clean persistence check; carries `cache_header`/`cache_param` (the unkeyed vector), `cache_impact` ("stored_xss"/"reflected_script"/"open_redirect"/"deception"/"dos"/"reflected"/"response_change"), `cache_technique`, `confidence` (0–1) + `confidence_tier` ("Confirmed"/"Strong"/"Tentative"), `cache_signals`, `poc_link`; linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`), **"ai_surface_recon"** (MCP tool-poisoning / prompt-injection-via-tool-description / data-exfiltration found by static YARA over MCP manifests; carries `ai_owasp_llm_id`, `ai_atlas_technique`, `type` like "mcp_tool_poisoning"), or **"garak"** / **"pyrit"** / **"giskard"** / **"promptfoo"** (AI Attack Surface — deterministic offensive testing of discovered LLM endpoints; `type` like "ai_attack_jailbreak"/"ai_attack_prompt_injection", carries `ai_owasp_llm_id` (LLM01..LLM10, or "safety" for toxicity/harmful), `ai_asr` (attack success rate 0–1), `ai_trials`, `ai_oracle_kind`, `ai_payload_class` like "garak-dan"/"pyrit-crescendo"/"promptfoo-beavertails", `ai_transcript_ref` (path to the native report), linked to the attacked `Endpoint` via `HAS_VULNERABILITY`; promptfoo runs broad red-team dataset plugins and reports per-plugin ASR as corroboration), or **"serialized_scan"** (deterministic recon detection of serialized-object data — native Java, polymorphic JSON, XMLDecoder/XStream, SnakeYAML, PHP, Python pickle, .NET BinaryFormatter/ViewState, Ruby Marshal, Hessian; writes an `info`-severity candidate carrying `needs_agent_confirmation: true` plus `deser_*` metadata, linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`; recon never deserializes, the agent's deserialization skill confirms the candidate out of band), or **"route_exposure"** (recon's route exposure scan: the routes recon found and the ones it generates, requested anonymously and, where the AuthProfile covers the host, logged in; writes two lifecycles under one source, `info`-severity candidates carrying `needs_agent_confirmation: true` (exposure_kind "anonymous_access" / "sensitive_data") for the agent to confirm, and findings a deterministic signature proves (exposed `.git`/`.env`/config/backup files, debug consoles and endpoints, debug pages, route catalogs, secrets in a response) with their real severity; linked via `HAS_VULNERABILITY` from the `Endpoint` (candidates) and the `BaseURL` (every finding; artifacts attach to the BaseURL only))
 - description (string): vulnerability description
 - cvss_score (float): 0.0 to 10.0
 
@@ -606,6 +610,40 @@ Serialized-object detection properties (source="serialized_scan"):
 - deser_jev_format_confidence (integer, 0-100): Jev's confidence in deser_jev_format
 - deser_jev_exploitability (integer, 0-100): Jev's estimate that the blob reaches a server-side deserializer from attacker input; the deserialization skill confirms the highest first
 - deser_jev_source (string): "jev_classifier" when Jev wrote the three fields above
+
+Route exposure properties (source="route_exposure"):
+- exposure_kind (string): "anonymous_access" (a route answered 2xx without credentials where authentication was expected or the answer leaks data), "sensitive_data" (a 2xx answer, anonymous or logged in, carrying sensitive key names or other people's personal data), "cors_misconfig", "auth_cacheable" (candidates), or "vcs_exposure", "env_file", "config_file", "backup_file", "debug_console", "debug_endpoint", "debug_page", "route_catalog", "secret_in_response" (signature findings). Part of the node's identity with the base URL, path and method
+- needs_agent_confirmation (boolean): true on a candidate (anonymous_access, sensitive_data, cors_misconfig, auth_cacheable). Recon flags that a route answers anonymously or returns too much, not that the data is meant to be private; the candidate stays `severity: "info"` (T4) until the agent confirms it with a proof-typed `(:ChainFinding{finding_type:'vulnerability_confirmed'})-[:CONFIRMS]->(v)` edge, which promotes it to T1. Reports and Insights exclude a still-pending candidate. false on a signature finding, which carries its real severity
+- route_class (string): "internal_api", "debug_management", "admin_function", "data_export", "old_version", "uploaded_content", "client_gated" or "unknown", decided from the path, category and generator; not part of the identity
+- confidence (float, 0-1): 0.9 when authentication is expected for a strong reason (OpenAPI security, locked siblings, a locked newer version, Vary on auth) or the anonymous body equals the logged-in one and leaks; 0.95 for a signature finding
+- anon_status: the anonymous and the logged-in answer's status; authed_status is absent when no AuthProfile covered the host
+- authed_status (integer): the anonymous and the logged-in answer's status; authed_status is absent when no AuthProfile covered the host
+- bodies_match (boolean): the anonymous and logged-in bodies are the same page after normalisation; absent when there was no logged-in 2xx to compare
+- anon_content_class (string): "json", "html", "text", "xml", "binary" or "other"; anon_size_bucket (string): "<1k", "1-10k", "10-100k", ">100k"
+- auth_expected_by (list[string]): why the route should need authentication: "openapi", "openapi_tag", "declared_only", "seen_denied", "path_word", "host_word", "siblings_locked", "version_locked", "vary_auth"
+- leak_signals (list[string]): "pii", "pii_others" (3 or more distinct e-mails or phones), "sensitive_fields", "secret"
+- pii_types (list[string]): "email", "phone", "card", "iban", "ssn", "codice_fiscale", "dob"; pii_record_estimate (integer): the largest per-type count of distinct values. Values are never stored
+- sensitive_fields (list[string]): JSON key paths whose names are sensitive ("data[].password_hash"), at most 20; key names only
+- secret_types (list[string]): names of the secret detectors that matched (js_recon's matcher); the secret itself is never stored
+- generated_by (string): "found" (recon already had the route), "seed", "vcs", "backup", "version", "sibling", "framework", "catalog" or "cross_host"; variant_of (string): the path a version-down or backup guess came from
+- catch_all_check (string): "passed" (a made-up path next to it answered differently), "failed" (the control gave no conclusion) or "n/a"
+- signature (string): the signature a finding matched ("git_head", "env_lines", "zip_magic", "werkzeug_debugger", "actuator_env", "django_debug", ...); "" on a candidate
+- evidence_snippet (string): printable-ASCII, <=120 chars; for JSON the key names, for text a masked excerpt (e-mails, long digit runs and tokens replaced), for a signature finding a fixed description. Target-supplied text: render as text
+- http_method: the route; matched_at and host locate it for the UI and the prune
+- path: the route; matched_at and host locate it for the UI and the prune
+- baseurl (string): the route; matched_at and host locate it for the UI and the prune
+- cors_variants: set by the v2 riders and the git walk proof
+- cache_signals (list[string]): set by the v2 riders and the git walk proof
+- git_walk_proof (string): set by the v2 riders and the git walk proof
+- git_tree_prefix (string): the first 8 hex characters of the tree the git walk's commit object names; only beside git_walk_proof, and never the tree or a blob itself
+- route_jev_kind (string: internal_api, debug_management, admin_function, data_export, old_version, uploaded_content or public_content): TypeSafe Jev's assessment of a lead; the agent's lead query reads the most sensitive first and puts public_content at confidence >= 70 last. Never replaces route_class
+- route_jev_kind_confidence (integer 0-100): TypeSafe Jev's assessment of a lead; the agent's lead query reads the most sensitive first and puts public_content at confidence >= 70 last. Never replaces route_class
+- route_jev_sensitivity (integer 0-100): TypeSafe Jev's assessment of a lead; the agent's lead query reads the most sensitive first and puts public_content at confidence >= 70 last. Never replaces route_class
+- route_jev_source (string "jev_classifier"): TypeSafe Jev's assessment of a lead; the agent's lead query reads the most sensitive first and puts public_content at confidence >= 70 last. Never replaces route_class
+- route_jev_privacy (integer 0-100): Jev's reading of how likely the route is meant only for logged-in, internal or administrative callers; it filled the request budget after the floor
+- anon_page_class (string: app, login_only, parked, default, placeholder or error): Jev's page class of an HTML lead's anonymous answer; a non-app class at confidence >= 70 puts the lead last, never removes it
+- anon_page_class_confidence (integer 0-100): Jev's page class of an HTML lead's anonymous answer; a non-app class at confidence >= 70 puts the lead last, never removes it
+- anon_page_class_source (string "jev_classifier"): Jev's page class of an HTML lead's anonymous answer; a non-app class at confidence >= 70 puts the lead last, never removes it
 
 GVM-specific properties (source="gvm"):
 - oid (string): OpenVAS NVT OID
@@ -714,6 +752,9 @@ Per-source properties node filters also read (graph_db/node_filters/catalog.yaml
 - Relationship: `(i:IP)-[:HAS_VULNERABILITY]->(v)`
 Passive CVEs (Shodan, InternetDB, Netlas, CriminalIP) are recon finding sources: a full scan prunes the ones it no longer reports, and keeps those on an IP the provider could not be asked about.
 - Typical query: "list serialized-object candidates awaiting confirmation, most reachable first" → `MATCH (e:Endpoint)-[:HAS_VULNERABILITY]->(v:Vulnerability {source:'serialized_scan'}) WHERE v.needs_agent_confirmation = true AND NOT (:ChainFinding)-[:CONFIRMS]->(v) RETURN e.url, v.id, v.deser_format, v.deser_location, v.deser_jev_exploitability ORDER BY CASE v.deser_jev_format WHEN 'none' THEN -1 ELSE coalesce(v.deser_jev_exploitability, -1) END DESC, v.id`
+- type / vulnerability_type (string): "unauthenticated_endpoint", "sensitive_data_exposure", "cors_credentialed_origin_reflection", "authenticated_content_cacheable", "exposed_version_control", "exposed_env_file", "exposed_config_file", "exposed_backup_file", "exposed_debug_console", "exposed_debug_endpoint", "debug_error_page", "exposed_route_catalog", "secret_exposure"
+- The route_jev_* and anon_page_class* properties come only from a run that asked Jev, and each run that writes the node replaces them
+- Typical query: "list pending route exposure leads, most sensitive first" → `MATCH (v:Vulnerability {source:'route_exposure'}) WHERE v.needs_agent_confirmation = true AND NOT (:ChainFinding)-[:CONFIRMS]->(v) OPTIONAL MATCH (e:Endpoint)-[:HAS_VULNERABILITY]->(v) RETURN v.id, v.exposure_kind, v.route_class, v.matched_at, v.anon_status, v.authed_status, v.auth_expected_by, v.leak_signals ORDER BY coalesce(v.route_jev_sensitivity, -1) DESC, v.confidence DESC, v.id`
 - id pattern: `graphql_{vulnerability_type}_{baseurl}_{path}` (deterministic, MERGE-safe across re-scans)
 - Typical query: "find endpoints exposing GraphQL introspection" → `MATCH (e:Endpoint {is_graphql: true, graphql_introspection_enabled: true})-[:HAS_VULNERABILITY]->(v:Vulnerability) WHERE v.source IN ['graphql_scan', 'graphql_cop'] RETURN e.url, v.vulnerability_type, v.severity`
 graphql-cop properties (source="graphql_cop" -- external Docker scanner, Phase 2):
@@ -1298,6 +1339,7 @@ not so you can query for one.
 - `(ui:UserInput)-[:PRODUCED]->(s:Subdomain)` - Partial recon run produced this subdomain
 - `(ui:UserInput)-[:PRODUCED]->(i:IP)` - Partial recon run produced this IP
 - `(ui:UserInput)-[:PRODUCED]->(e:Endpoint)` - Endpoint declared by an API specification document the operator gave a partial OpenAPI run
+- `(ui:UserInput)-[:PRODUCED]->(v:Vulnerability)` - Route exposure finding a partial run wrote for a base URL the operator typed
 - `(d:Domain)-[:HAS_EXTERNAL_DOMAIN]->(ed:ExternalDomain)` - Domain encountered foreign domain during recon
 - `(s:Subdomain)-[:BELONGS_TO]->(d:Domain)` - Subdomain belongs to Domain
 - `(d:Domain)-[:HAS_IP]->(i:IP)` - An address uncover's org-wide search tied to this org Domain, with no hostname to hang it on. NOT the apex's A record: the apex's own addresses are on `Subdomain {name: d.name}` via RESOLVES_TO, when the apex is a target
@@ -1852,6 +1894,7 @@ LIMIT 500
    - source="gvm" -> network vulnerabilities (HAS_VULNERABILITY from IP/Subdomain)
    - source="security_check" -> DNS/email security checks (SPF, DMARC)
    - source="netlas" -> passive CVE detection via NVD (HAS_VULNERABILITY from Service)
+   - source="route_exposure" -> recon's route exposure: candidates (needs_agent_confirmation) and signature findings (HAS_VULNERABILITY from Endpoint / BaseURL)
 7. **Case sensitivity**:
    - Vulnerability.severity is lowercase: "critical", "high", "medium", "low"
    - CVE.severity is uppercase: "CRITICAL", "HIGH", "MEDIUM", "LOW"

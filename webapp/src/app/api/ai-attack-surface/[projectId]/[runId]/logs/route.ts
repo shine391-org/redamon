@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -8,22 +9,29 @@ interface RouteParams {
   params: Promise<{ projectId: string; runId: string }>
 }
 
+const FAILED = 'Failed to connect to AI Gauntlet log stream'
+
 // GET /api/ai-attack-surface/{projectId}/{runId}/logs - proxy the SSE stream.
 export async function GET(request: NextRequest, { params }: RouteParams) {
   const { projectId, runId } = await params
   const __denied = await guardProject(projectId)
   if (__denied) return __denied
 
-  const response = await orchestratorFetch(
-    `${RECON_ORCHESTRATOR_URL}/ai-attack-surface/${projectId}/${runId}/logs`,
-    { headers: { Accept: 'text/event-stream' }, signal: request.signal },
-  )
+  let response: Response
+  try {
+    response = await orchestratorFetch(
+      `${RECON_ORCHESTRATOR_URL}/ai-attack-surface/${projectId}/${runId}/logs`,
+      { headers: { Accept: 'text/event-stream' }, signal: request.signal },
+    )
+  } catch (err) {
+    // The browser closed the stream before the orchestrator answered: nobody is
+    // left to read an error, and it is not an orchestrator failure to log.
+    if (request.signal?.aborted) return new Response(null, { status: 499 })
+    return upstreamFailureResponse('orchestrator', err, FAILED)
+  }
 
   if (!response.ok) {
-    return new Response(
-      JSON.stringify({ error: 'Failed to connect to AI Gauntlet log stream' }),
-      { status: response.status, headers: { 'Content-Type': 'application/json' } },
-    )
+    return upstreamErrorResponse('orchestrator', response, FAILED, { forwardText: true })
   }
 
   return new Response(response.body, {

@@ -2,12 +2,13 @@
  * Every limit a Rules of Engagement upload is held to, in one place, so the
  * routes that enforce them and the UI text that describes them cannot disagree.
  *
- * The file cap sits under Next's request-body cap rather than raising it: every
- * request through middleware (which covers /api) is buffered up to
- * `experimental.proxyClientMaxBodySize`, 10 MB by default, and a body over it is
- * TRUNCATED rather than refused (next/dist/server/body-streams.js). A larger
- * limit here would be unreachable, and a truncated PDF fails as "corrupt" with no
- * hint that size was the cause.
+ * The file cap must stay under Next's request-body cap: every request through
+ * middleware (which covers /api) is buffered up to
+ * `experimental.proxyClientMaxBodySize` (60 MB in next.config.ts, the same as
+ * nginx's client_max_body_size 60m), and a body over it is TRUNCATED rather than
+ * refused (next/dist/server/body-streams.js). A limit above it would be
+ * unreachable, and a truncated PDF fails as "corrupt" with no hint that size was
+ * the cause. The 9 MB cap below sits well under it.
  */
 
 export const MAX_FILE_SIZE = 9 * 1024 * 1024

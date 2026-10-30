@@ -108,7 +108,21 @@ describe('POST /attack-skills/batch', () => {
     h.batch.mockRejectedValue(new Error('Invalid value: SECRET-SKILL-TEXT'))
     const res = await post({ items: ITEMS })
     expect(res.status).toBe(500)
-    expect(await res.json()).toEqual({ error: 'Failed to upload the skills' })
+    expect(await res.json()).toEqual({ error: 'Failed to upload the skills', code: 'internal_error' })
+    expect(JSON.stringify(log.mock.calls)).not.toContain('SECRET-SKILL-TEXT')
+    log.mockRestore()
+  })
+
+  test('a database failure answers its Prisma code, and still logs no item text', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.batch.mockRejectedValue(Object.assign(new Error('Transaction failed: SECRET-SKILL-TEXT'), {
+      name: 'PrismaClientKnownRequestError', code: 'P2028',
+    }))
+    const res = await post({ items: ITEMS })
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(JSON.parse(text)).toEqual({ error: 'Failed to upload the skills', code: 'P2028' })
+    expect(text).not.toContain('SECRET-SKILL-TEXT')
     expect(JSON.stringify(log.mock.calls)).not.toContain('SECRET-SKILL-TEXT')
     log.mockRestore()
   })

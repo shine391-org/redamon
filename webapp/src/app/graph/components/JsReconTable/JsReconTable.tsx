@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useMemo, useRef, memo } from 'react'
 import { Loader2, AlertTriangle, Copy, Check } from 'lucide-react'
 import { ExternalLink } from '@/components/ui'
 import { copyText } from '@/lib/copyText'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './JsReconTable.module.css'
 import { ColumnFilterButton, ActiveFilterChips } from '../ColumnFilterPanel'
 import { useRedZoneFilters, type RedZoneFilterColumn } from '../RedZoneTables/useRedZoneFilters'
@@ -305,12 +306,12 @@ export const JsReconTable = memo(function JsReconTable({
     try {
       const res = await fetch(`/api/js-recon/${projectId}/download${fresh ? '?fresh=1' : ''}`)
       if (res.status === 404) { setError('No JS Recon data. Run a recon scan with JS Recon enabled.'); return }
-      if (!res.ok) throw new Error('Failed to fetch')
+      if (!res.ok) throw await readApiError(res, 'Failed to load JS Recon data')
       const json = await res.json()
       setData(json)
       onDataLoaded?.(json)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load')
+      setError(toApiError(e, 'Failed to load JS Recon data').message)
     } finally {
       setIsLoading(false)
     }

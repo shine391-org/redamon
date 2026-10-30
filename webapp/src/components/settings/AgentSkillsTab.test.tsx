@@ -242,12 +242,12 @@ describe('quarantine', () => {
   })
 
   test('a refused Release shows the server error', async () => {
-    h.responders['/release'] = () => json(403, { error: 'Only the owner can release a skill.' })
+    h.responders['/release'] = () => json(403, { error: 'Only the owner can release a skill.', code: 'owner_only' })
     draw([q()])
     const banner = within(await screen.findByTestId('user-skill-sk1')).getByRole('status')
     fireEvent.click(within(banner).getByRole('button', { name: 'Release' }))
     fireEvent.click(await screen.findByRole('button', { name: 'I have read it, release' }))
-    expect(await screen.findByText('Only the owner can release a skill.')).toBeInTheDocument()
+    expect(await screen.findByText('Only the owner can release a skill. (owner_only · HTTP 403)')).toBeInTheDocument()
   })
 
   test('Delete in the banner deletes the skill after the confirmation', async () => {
@@ -421,13 +421,26 @@ describe('while the list loads, or after it failed', () => {
     expect(uploadBatchButton()).toBeEnabled()
   })
 
-  test('a failed list keeps them disabled with the reason, and says so in place of the empty state', async () => {
-    h.responders['/attack-skills'] = (req) => (req.method === 'GET' && /\/attack-skills$/.test(req.url) ? json(500, { error: 'x' }) : undefined)
+  test('a failed list keeps them disabled with the reason and its cause, in place of the empty state', async () => {
+    h.responders['/attack-skills'] = (req) => (req.method === 'GET' && /\/attack-skills$/.test(req.url)
+      ? json(500, { error: 'Failed to fetch attack skills', code: 'P1001' }) : undefined)
     draw([])
-    expect(await screen.findByText('Your skills could not be loaded. Reload the page.')).toBeInTheDocument()
+    expect(await screen.findByText('Your skills could not be loaded (P1001 · HTTP 500). Reload the page.')).toBeInTheDocument()
     expect(screen.queryByText(/No custom skills uploaded yet/)).toBeNull()
     expect(uploadSkillButton()).toBeDisabled()
-    expect(uploadBatchButton()).toHaveAttribute('title', 'Your skills could not be loaded. Reload the page to upload.')
+    expect(uploadBatchButton()).toHaveAttribute('title', 'Your skills could not be loaded (P1001 · HTTP 500). Reload the page to upload.')
+  })
+
+  test('a list that got no answer says network_error', async () => {
+    const fetchStub = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const real = fetchStub.getMockImplementation() as (url: string, init?: RequestInit) => Promise<Response>
+    fetchStub.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/users/alice/attack-skills') throw new TypeError('Failed to fetch')
+      return real(url, init)
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    draw([])
+    expect(await screen.findByText('Your skills could not be loaded (network_error). Reload the page.')).toBeInTheDocument()
   })
 
   test('a failed refetch keeps the old list and disables upload', async () => {
@@ -438,6 +451,50 @@ describe('while the list loads, or after it failed', () => {
     act(() => postUserSkillsChanged({}))
     await waitFor(() => expect(uploadSkillButton()).toBeDisabled())
     expect(screen.getByTestId('user-skill-sk1')).toBeInTheDocument()
+  })
+})
+
+describe('failures say why', () => {
+  test('a refused delete shows the server error with its Prisma code and status', async () => {
+    h.responders['/attack-skills/sk1'] = (req) => (req.method === 'DELETE'
+      ? json(500, { error: 'Failed to delete attack skill', code: 'P2034' }) : undefined)
+    draw([skill()])
+    await screen.findByTestId('user-skill-sk1')
+    fireEvent.click(within(card('sk1')).getByTitle('Delete'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm' }))
+    expect(await screen.findByText('Failed to delete attack skill (P2034 · HTTP 500)')).toBeInTheDocument()
+  })
+
+  test('a refused save that is not a name problem shows the server error with its code', async () => {
+    h.responders['/attack-skills/sk1'] = (req) => (req.method === 'PUT'
+      ? json(500, { error: 'Failed to update attack skill', code: 'P2028' }) : undefined)
+    draw([skill()])
+    await screen.findByTestId('user-skill-sk1')
+    fireEvent.click(within(card('sk1')).getByTitle('Edit name and description'))
+    await screen.findByLabelText('Name')
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('Failed to update attack skill (P2028 · HTTP 500)')).toBeInTheDocument()
+  })
+
+  test('a download that fails says so, with the status (it used to do nothing)', async () => {
+    h.responders['/attack-skills/sk1'] = (req) => (req.method === 'GET'
+      ? json(404, { error: 'Skill not found' }) : undefined)
+    draw([skill()])
+    await screen.findByTestId('user-skill-sk1')
+    fireEvent.click(within(card('sk1')).getByTitle('Download'))
+    expect(await screen.findByText('Skill not found (HTTP 404)')).toBeInTheDocument()
+  })
+
+  test('a name check that fails says why, and that the save checks again', async () => {
+    h.responders['/name-check'] = (req) => (req.method === 'GET'
+      ? json(500, { error: 'Failed to check the name', code: 'P1001' }) : undefined)
+    draw([skill()])
+    await screen.findByTestId('user-skill-sk1')
+    fireEvent.click(within(card('sk1')).getByTitle('Edit name and description'))
+    fireEvent.change(await screen.findByLabelText('Name'), { target: { value: 'Recon checklist' } })
+    expect(await screen.findByText(
+      'The name could not be checked (P1001 · HTTP 500); it is checked again when you save.',
+    )).toBeInTheDocument()
   })
 })
 
@@ -505,12 +562,33 @@ describe('community import', () => {
     await waitFor(() => expect(listGets().length).toBe(before + 1))
   })
 
-  test('a failed import shows the server error', async () => {
-    h.responders['/import-community'] = () => json(502, { error: 'Failed to fetch community skills catalog from agent service' })
+  test('a failed import shows the server error with its code and both statuses', async () => {
+    h.responders['/import-community'] = () => json(502, {
+      error: 'Failed to fetch community skills catalog from agent service', code: 'agent_error', upstreamStatus: 500,
+    })
     draw([skill()])
     await screen.findByTestId('user-skill-sk1')
     fireEvent.click(screen.getByRole('button', { name: /Import from Community/ }))
-    expect(await screen.findByText('Failed to fetch community skills catalog from agent service')).toBeInTheDocument()
+    expect(await screen.findByText(
+      'Failed to fetch community skills catalog from agent service (agent_error · HTTP 502 · upstream HTTP 500)',
+    )).toBeInTheDocument()
+  })
+
+  test("a proxy's HTML error page is read as such, with its status (it used to show nothing)", async () => {
+    h.responders['/import-community'] = () => new Response('<html>504 Gateway Time-out</html>', { status: 504 })
+    draw([skill()])
+    await screen.findByTestId('user-skill-sk1')
+    fireEvent.click(screen.getByRole('button', { name: /Import from Community/ }))
+    expect(await screen.findByText('Failed to import community skills (non_json_response · HTTP 504)')).toBeInTheDocument()
+  })
+
+  test('an import that got no answer says so', async () => {
+    h.responders['/import-community'] = () => { throw new TypeError('Failed to fetch') }
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    draw([skill()])
+    await screen.findByTestId('user-skill-sk1')
+    fireEvent.click(screen.getByRole('button', { name: /Import from Community/ }))
+    expect(await screen.findByText('Failed to import community skills (network_error)')).toBeInTheDocument()
   })
 })
 

@@ -317,3 +317,38 @@ describe('NodeDrawer ownership line (plan 11.4)', () => {
     expect(screen.queryByTestId('drawer-ownership')).toBeNull()
   })
 })
+
+describe('NodeDrawer route exposure block', () => {
+  const lead: GraphNode = {
+    id: '7', type: 'Vulnerability', name: 'unauthenticated_endpoint',
+    properties: { source: 'route_exposure', exposure_kind: 'anonymous_access', needs_agent_confirmation: true,
+      route_class: 'internal_api', anon_status: 200, auth_expected_by: ['siblings_locked'] },
+  }
+
+  it('labels a lead and reads its CONFIRMS edge from the loaded graph', () => {
+    renderDrawer({ node: lead, graphData: { projectId: 'p', nodes: [lead], links: [] } })
+    const block = screen.getByTestId('route-exposure-section')
+    expect(block).toHaveTextContent('Answers without a login')
+    expect(block).toHaveTextContent('Internal API')
+    expect(block).toHaveTextContent('neighbouring routes need a login')
+    expect(block).toHaveTextContent('waiting for the agent')
+    cleanup()
+
+    const cf: GraphNode = { id: '9', type: 'ChainFinding', name: 'proof', properties: {} }
+    renderDrawer({ node: lead, graphData: { projectId: 'p', nodes: [lead, cf],
+      links: [{ source: '9', target: '7', type: 'CONFIRMS' }] } })
+    expect(screen.getByTestId('route-exposure-section')).toHaveTextContent('Confirmed by the agent')
+  })
+
+  it('an Endpoint the scan measured shows its anonymous answer', () => {
+    const ep: GraphNode = { id: '5', type: 'Endpoint', name: '/api/users/me',
+      properties: { anon_status: 200, status_code: 401 } }
+    renderDrawer({ node: ep })
+    expect(screen.getByTestId('route-exposure-section')).toHaveTextContent("200 (recon's probe saw 401)")
+  })
+
+  it('another node has no route exposure block', () => {
+    renderDrawer()
+    expect(screen.queryByTestId('route-exposure-section')).toBeNull()
+  })
+})

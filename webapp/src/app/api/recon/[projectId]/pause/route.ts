@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -14,26 +15,24 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const __denied = await guardProject(projectId)
     if (__denied) return __denied
 
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/pause`, {
-      method: 'POST',
-    })
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/pause`, {
+        method: 'POST',
+      })
+    } catch (err) {
+      return upstreamFailureResponse('orchestrator', err, 'Failed to pause recon')
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.detail || 'Failed to pause recon' },
-        { status: response.status }
-      )
+      // The orchestrator's refusals ("no running recon") are its own sentences.
+      return upstreamErrorResponse('orchestrator', response, 'Failed to pause recon', { forwardText: true })
     }
 
     const data = await response.json()
     return NextResponse.json(data)
 
   } catch (error) {
-    console.error('Error pausing recon:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to pause recon', { log: 'Error pausing recon' })
   }
 }

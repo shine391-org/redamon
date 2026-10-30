@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { GithubHuntState, GithubHuntStatus } from '@/lib/recon-types'
-import type { ScanStartError } from '@/lib/scanStartError'
+import { readScanStartError, scanStartNetworkError, type ScanStartError } from '@/lib/scanStartError'
+import { ApiError, readApiError, toApiError } from '@/lib/apiError'
 
 interface UseGithubHuntStatusOptions {
   projectId: string | null
@@ -23,6 +24,15 @@ interface UseGithubHuntStatusReturn {
   pauseGithubHunt: () => Promise<GithubHuntState | null>
   resumeGithubHunt: () => Promise<GithubHuntState | null>
   getLastStartError: () => ScanStartError | null
+  /** Why the last status poll failed ("<scan> status unavailable (code · HTTP n)"); null once one succeeds. */
+  statusError: string | null
+  /** Why the last start failed, with its code and status; null once a start begins. */
+  startError: string | null
+  /**
+   * Why the most recent stop/pause/resume failed ("reason (code · HTTP n)"), readable
+   * right after the call resolves to null; the `error` state only lands on the next render.
+   */
+  getLastActionError: () => string | null
 }
 
 const DEFAULT_POLLING_INTERVAL = 5000
@@ -39,6 +49,8 @@ export function useGithubHuntStatus({
   const [state, setState] = useState<GithubHuntState | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [startError, setStartError] = useState<string | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
 
   const previousStatusRef = useRef<GithubHuntStatus | null>(null)
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
@@ -47,6 +59,7 @@ export function useGithubHuntStatus({
   // the request resolves -- a poll landing mid-freeze would revert the button.
   const transitionRef = useRef(false)
   const lastStartErrorRef = useRef<ScanStartError | null>(null)
+  const lastActionErrorRef = useRef<string | null>(null)
 
   const onStatusChangeRef = useRef(onStatusChange)
   const onCompleteRef = useRef(onComplete)
@@ -64,14 +77,12 @@ export function useGithubHuntStatus({
 
     try {
       const response = await fetch(`/api/github-hunt/${projectId}/status`)
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to fetch GitHub hunt status')
-      }
+      if (!response.ok) throw await readApiError(response, 'GitHub Hunt status unavailable')
 
       const data: GithubHuntState = await response.json()
       setState(data)
       setError(null)
+      setStatusError(null)
 
       if (previousStatusRef.current !== data.status) {
         onStatusChangeRef.current?.(data.status)
@@ -86,8 +97,11 @@ export function useGithubHuntStatus({
       }
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      setError(errorMessage)
+      // The last known state stays: an orchestrator that did not answer says
+      // nothing about whether the scan is still running.
+      const message = toApiError(err, 'GitHub Hunt status unavailable').message
+      setError(message)
+      setStatusError(message)
     }
   }, [projectId])
 
@@ -96,6 +110,7 @@ export function useGithubHuntStatus({
 
     setIsLoading(true)
     setError(null)
+    setStartError(null)
     lastStartErrorRef.current = null
 
     try {
@@ -104,9 +119,8 @@ export function useGithubHuntStatus({
       })
 
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        lastStartErrorRef.current = { message: data.error || 'Failed to start GitHub Secret Hunt', limit: data.limit, status: response.status }
-        throw new Error(data.error || 'Failed to start GitHub Secret Hunt')
+        lastStartErrorRef.current = await readScanStartError(response, 'Failed to start GitHub Secret Hunt')
+        throw new Error(lastStartErrorRef.current.message)
       }
 
       const data: GithubHuntState = await response.json()
@@ -115,13 +129,17 @@ export function useGithubHuntStatus({
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      if (!lastStartErrorRef.current) lastStartErrorRef.current = { message: errorMessage }
-      setError(errorMessage)
-      onErrorRef.current?.(errorMessage)
+      const startErr = lastStartErrorRef.current ?? scanStartNetworkError(err, 'Failed to start GitHub Secret Hunt')
+      lastStartErrorRef.current = startErr
+      const failure = new ApiError({
+        reason: startErr.message, code: startErr.code, status: startErr.status ?? 0, upstreamStatus: startErr.upstreamStatus,
+      })
+      setError(failure.message)
+      setStartError(failure.message)
+      onErrorRef.current?.(failure.message)
       // Re-throw so the caller's catch fires (Scan Queue Phase 0.3): this hook
       // used to swallow the failure and return null, so the user saw nothing.
-      throw err instanceof Error ? err : new Error(errorMessage)
+      throw failure
 
     } finally {
       setIsLoading(false)
@@ -129,11 +147,13 @@ export function useGithubHuntStatus({
   }, [projectId])
 
   const getLastStartError = useCallback(() => lastStartErrorRef.current, [])
+  const getLastActionError = useCallback(() => lastActionErrorRef.current, [])
 
   const stopGithubHunt = useCallback(async (): Promise<GithubHuntState | null> => {
     if (!projectId) return null
 
     setIsLoading(true)
+    lastActionErrorRef.current = null
     transitionRef.current = true
     setState(prev => prev ? { ...prev, status: 'stopping' as GithubHuntState['status'] } : prev)
 
@@ -142,17 +162,15 @@ export function useGithubHuntStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to stop GitHub Secret Hunt')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to stop GitHub Secret Hunt')
 
       const data: GithubHuntState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to stop GitHub Secret Hunt').message
+      lastActionErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -166,6 +184,7 @@ export function useGithubHuntStatus({
     if (!projectId) return null
 
     setIsLoading(true)
+    lastActionErrorRef.current = null
     transitionRef.current = true
     setState(prev => prev ? { ...prev, status: 'pausing' as GithubHuntState['status'] } : prev)
 
@@ -174,17 +193,15 @@ export function useGithubHuntStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to pause GitHub hunt')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to pause GitHub hunt')
 
       const data: GithubHuntState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to pause GitHub hunt').message
+      lastActionErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -198,23 +215,22 @@ export function useGithubHuntStatus({
     if (!projectId) return null
 
     setIsLoading(true)
+    lastActionErrorRef.current = null
 
     try {
       const response = await fetch(`/api/github-hunt/${projectId}/resume`, {
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to resume GitHub hunt')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to resume GitHub hunt')
 
       const data: GithubHuntState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to resume GitHub hunt').message
+      lastActionErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -265,6 +281,9 @@ export function useGithubHuntStatus({
     pauseGithubHunt,
     resumeGithubHunt,
     getLastStartError,
+    statusError,
+    startError,
+    getLastActionError,
   }
 }
 

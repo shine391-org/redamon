@@ -4,6 +4,7 @@ import { useState, FormEvent } from 'react'
 import { useRouter } from 'next/navigation'
 import Image from 'next/image'
 import { useVersionCheck } from '@/hooks/useVersionCheck'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './page.module.css'
 
 export default function LoginPage() {
@@ -27,16 +28,19 @@ export default function LoginPage() {
       })
 
       if (!res.ok) {
-        const data = await res.json()
-        setError(data.error || 'Login failed')
+        // nginx answers a sign-in burst (429) and a restarting webapp (502) with
+        // an HTML page, so the status and Retry-After are all there is to show.
+        const err = await readApiError(res, 'Login failed')
+        const retryAfter = Number(res.headers?.get('Retry-After'))
+        setError(retryAfter > 0 ? `${err.message}. Retry in ${retryAfter} s.` : err.message)
         setLoading(false)
         return
       }
 
       // Force full page reload to pick up the new cookie in middleware
       window.location.href = '/graph'
-    } catch {
-      setError('Unable to connect to the server')
+    } catch (err) {
+      setError(toApiError(err, 'Unable to connect to the server').message)
       setLoading(false)
     }
   }

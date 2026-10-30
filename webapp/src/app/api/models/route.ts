@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { internalKeyHeaders } from '@/lib/agentAuth'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser } from '@/lib/access'
 import { isChatProvider } from '@/lib/llmProviderKinds'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8090'
+// The agent asks every provider at once, each with its own 15-20 s budget; a slow
+// Bedrock listing can outlast agentFetch's 30 s default.
+const MODELS_TIMEOUT_MS = 60_000
 
 // POST /api/models { userId? } - Fetch available AI models from all configured providers.
 // Body-based (not query-string) so plaintext apiKey values never appear in access logs.
@@ -24,28 +27,29 @@ export async function POST(request: NextRequest) {
       providers = rows.filter(isChatProvider)
     }
 
-    const res = await fetch(`${AGENT_API_URL}/models`, {
-      method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ providers: providers.length > 0 ? providers : null }),
-      cache: 'no-store',
-    })
+    let res: Response
+    try {
+      res = await agentFetch('/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providers: providers.length > 0 ? providers : null }),
+        cache: 'no-store',
+      }, { timeoutMs: MODELS_TIMEOUT_MS })
+    } catch (error) {
+      if (error instanceof AgentUnreachableError) {
+        return upstreamFailureResponse('agent', error.cause_, 'Failed to connect to agent API')
+      }
+      throw error
+    }
 
     if (!res.ok) {
-      console.error('Failed to fetch models from agent API:', await res.text())
-      return NextResponse.json(
-        { error: 'Failed to fetch models from agent API' },
-        { status: 503 }
-      )
+      console.error('Failed to fetch models from agent API:', await res.clone().text().catch(() => ''))
+      return upstreamErrorResponse('agent', res, 'Failed to fetch models from agent API', { status: 503 })
     }
 
     const data = await res.json()
     return NextResponse.json(data)
   } catch (error) {
-    console.error('Failed to connect to agent API for models:', error)
-    return NextResponse.json(
-      { error: 'Failed to connect to agent API' },
-      { status: 503 }
-    )
+    return internalError(error, 'Failed to load the models')
   }
 }

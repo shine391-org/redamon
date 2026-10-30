@@ -28,6 +28,8 @@ import {
   effectiveBodyPolicy, adoptCanonical,
 } from '@/components/traffic/captureSettingsForm'
 import styles from '@/components/settings/Settings.module.css'
+import { failureText, saveWarningLines } from '@/components/settings/failureText'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 // ── Egress-guard toggles (mirror scanners/capture_proxy/egress.py). All default true (block).
 type EgressToggleKey =
@@ -103,6 +105,8 @@ function activeBodyPreset(rules: Record<string, string> | undefined): string | n
   return hit ? hit.name : null
 }
 
+const LOAD_FAILED = "Couldn't load the TrafficMind settings"
+
 const label13 = { display: 'flex', flexDirection: 'column' as const, gap: 4, color: 'var(--text-secondary)', fontSize: 13 }
 const row13 = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, color: 'var(--text-secondary)', fontSize: 13 }
 
@@ -113,6 +117,10 @@ export function TrafficMindSettingsModal({ isOpen, onClose, userId }: {
   const alerts = useAlertModal()
   const [s, setS] = useState<CaptureSettings>(DEFAULT_CAPTURE)
   const [saving, setSaving] = useState(false)
+  // Apply stays off until a load succeeds: diffing edits against the defaults
+  // would send fields the person never touched and overwrite the saved values.
+  const [loaded, setLoaded] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   // Last server-synced truth. Edits diff against this; Apply reconciles to it.
   const saved = useRef<CaptureSettings>({ ...DEFAULT_CAPTURE })
 
@@ -122,8 +130,15 @@ export function TrafficMindSettingsModal({ isOpen, onClose, userId }: {
     if (!userId) return
     try {
       const resp = await fetch(`/api/users/${userId}/settings`)
-      if (resp.ok) { const c = pickCapture(await resp.json()); saved.current = c; setS(c) }
-    } catch { /* keep defaults */ }
+      if (!resp.ok) throw await readApiError(resp, LOAD_FAILED)
+      const c = pickCapture(await resp.json())
+      saved.current = c
+      setS(c)
+      setLoaded(true)
+      setLoadError(null)
+    } catch (e) {
+      setLoadError(failureText(LOAD_FAILED, e))
+    }
   }, [userId])
 
   // Re-sync from the server every time the dialog opens, discarding any stale
@@ -140,7 +155,7 @@ export function TrafficMindSettingsModal({ isOpen, onClose, userId }: {
   // On success adopt the server's canonical values (reflecting any clamping) for
   // the submitted fields, preserving any field the user re-edited mid-save.
   const applyChanges = useCallback(async () => {
-    if (!userId) return
+    if (!userId || !loaded) return
     const patch = diffCapture(saved.current, s)
     const keys = Object.keys(patch) as (keyof CaptureSettings)[]
     if (keys.length === 0) return
@@ -150,17 +165,25 @@ export function TrafficMindSettingsModal({ isOpen, onClose, userId }: {
       const resp = await fetch(`/api/users/${userId}/settings`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
       })
-      if (!resp.ok) throw new Error('save failed')
-      const canonical = pickCapture(await resp.json())
+      if (!resp.ok) throw await readApiError(resp, 'the server gave no reason')
+      const body = await resp.json()
+      const canonical = pickCapture(body)
       saved.current = canonical
       setS((prev) => adoptCanonical(prev, submitted, canonical, keys))
+      // A non-admin's capture fields are dropped by the route with a 200.
+      if (Array.isArray(body.ignoredFields) && body.ignoredFields.length > 0) {
+        toast.error('Not saved - TrafficMind settings are admin-only')
+        return
+      }
       toast.success('TrafficMind settings applied')
-    } catch {
-      toast.error('Not saved - TrafficMind settings are admin-only')
+      const warnings = saveWarningLines(body)
+      if (warnings.length) toast.warning(warnings.join('\n'), 'Saved, but not applied')
+    } catch (e) {
+      toast.error(`Not saved - ${toApiError(e, 'the request failed').message}`)
     } finally {
       setSaving(false)
     }
-  }, [userId, s, toast])
+  }, [userId, loaded, s, toast])
 
   // Revert every pending edit back to server truth.
   const revert = useCallback(() => setS(saved.current), [])
@@ -387,14 +410,21 @@ export function TrafficMindSettingsModal({ isOpen, onClose, userId }: {
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 12, borderTop: '1px solid var(--border-default)', paddingTop: 14, marginTop: 6 }}>
-          <span style={{ marginRight: 'auto', fontSize: 12, color: dirty ? 'var(--warning, #e5a54d)' : 'var(--text-tertiary)' }}>
-            {dirty ? '● Unsaved changes' : 'All changes saved'}
-          </span>
+          {loadError ? (
+            <span role="alert" style={{ marginRight: 'auto', fontSize: 12, color: 'var(--status-error-text)' }}>
+              {loadError}. Apply is off until they load.{' '}
+              <button className="textButton" onClick={load} type="button">Retry</button>
+            </span>
+          ) : (
+            <span style={{ marginRight: 'auto', fontSize: 12, color: dirty ? 'var(--warning, #e5a54d)' : 'var(--text-tertiary)' }}>
+              {dirty ? '● Unsaved changes' : 'All changes saved'}
+            </span>
+          )}
           {dirty && (
             <button className="secondaryButton" onClick={revert} type="button" disabled={saving}>Revert</button>
           )}
           <button className="secondaryButton" onClick={requestClose} type="button">Close</button>
-          <button className="primaryButton" onClick={applyChanges} type="button" disabled={!dirty || saving}>
+          <button className="primaryButton" onClick={applyChanges} type="button" disabled={!loaded || !dirty || saving}>
             {saving ? 'Applying…' : 'Apply'}
           </button>
         </div>

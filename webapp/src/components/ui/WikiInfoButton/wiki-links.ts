@@ -77,6 +77,7 @@ export const TOOL_WIKI: Record<string, { page: string; anchor?: string }> = {
   VhostSni:           { page: 'VHost-and-SNI-Enumeration' },
   Tlsx:               { page: 'TLS-Certificate-Grab' },
   WebCachePoison:     { page: 'Web-Cache-Poisoning' },
+  RouteExposure:      { page: 'Route-Exposure-Scan' },
 
   // CVE & MITRE
   CveLookup:          { page: 'Project-Settings-Reference', anchor: 'cve-enrichment' },

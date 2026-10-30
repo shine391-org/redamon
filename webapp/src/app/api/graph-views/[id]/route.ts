@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectScopedResource } from '@/lib/access'
 
@@ -35,11 +36,7 @@ export async function PUT(
 
     return NextResponse.json(view)
   } catch (error) {
-    console.error('Failed to update graph view:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to update graph view' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update graph view')
   }
 }
 
@@ -56,10 +53,6 @@ export async function DELETE(
     await prisma.graphView.delete({ where: { id } })
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error('Failed to delete graph view:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to delete graph view' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete graph view')
   }
 }

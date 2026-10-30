@@ -9,6 +9,7 @@ import {
   validateTrufflehogConfig,
   TRUFFLEHOG_CREDENTIAL_FIELDS,
 } from '@/lib/trufflehogSources'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string }>
@@ -26,39 +27,45 @@ const CREDENTIAL_SELECT = Object.fromEntries(
  * the names of the ones that are empty.
  */
 export async function GET(request: NextRequest, { params }: RouteParams) {
-  const { projectId } = await params
-  const __denied = await guardProject(projectId)
-  if (__denied) return __denied
+  // Without the catch a DB error is Next's empty 500, which the card reads as
+  // "no sources configured".
+  try {
+    const { projectId } = await params
+    const __denied = await guardProject(projectId)
+    if (__denied) return __denied
 
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { userId: true },
-  })
-  if (!project) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { userId: true },
+    })
+    if (!project) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
 
-  const [profiles, settings] = await Promise.all([
-    prisma.trufflehogScanProfile.findMany({
-      where: { projectId },
-      orderBy: { createdAt: 'asc' },
-    }),
-    prisma.userSettings.findUnique({
-      where: { userId: project.userId },
-      select: CREDENTIAL_SELECT,
-    }),
-  ])
+    const [profiles, settings] = await Promise.all([
+      prisma.trufflehogScanProfile.findMany({
+        where: { projectId },
+        orderBy: { createdAt: 'asc' },
+      }),
+      prisma.userSettings.findUnique({
+        where: { userId: project.userId },
+        select: CREDENTIAL_SELECT,
+      }),
+    ])
 
-  return NextResponse.json({
-    profiles: profiles.map(p => {
-      const config = (p.config ?? {}) as Record<string, unknown>
-      return {
-        ...p,
-        validationErrors: validateTrufflehogConfig(p.source, config),
-        missingCredentials: resolveMissingCredentials(
-          p.source, config, settings as Record<string, unknown> | null,
-        ).map(c => ({ settingsKey: c.settingsKey, label: c.label })),
-      }
-    }),
-  })
+    return NextResponse.json({
+      profiles: profiles.map(p => {
+        const config = (p.config ?? {}) as Record<string, unknown>
+        return {
+          ...p,
+          validationErrors: validateTrufflehogConfig(p.source, config),
+          missingCredentials: resolveMissingCredentials(
+            p.source, config, settings as Record<string, unknown> | null,
+          ).map(c => ({ settingsKey: c.settingsKey, label: c.label })),
+        }
+      }),
+    })
+  } catch (error) {
+    return internalError(error, 'Failed to list sources', { log: 'Error listing TruffleHog profiles' })
+  }
 }
 
 /**
@@ -121,10 +128,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       throw e
     }
   } catch (error) {
-    console.error('Error creating TruffleHog profile:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to add the source', { log: 'Error creating TruffleHog profile' })
   }
 }

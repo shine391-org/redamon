@@ -1,4 +1,6 @@
 import { useState, useCallback, useEffect } from 'react'
+import { useAlertModal } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 export const API_KEY_INFO: Record<string, { field: string; label: string; hint: string; url: string }> = {
   web_search: { field: 'tavilyApiKey', label: 'Tavily', hint: 'Enables web_search tool for CVE research and exploit lookups', url: 'https://app.tavily.com/home' },
@@ -10,6 +12,7 @@ export const API_KEY_INFO: Record<string, { field: string; label: string; hint: 
 }
 
 export function useApiKeyModal(userId: string) {
+  const { alertError } = useAlertModal()
   const [missingApiKeys, setMissingApiKeys] = useState<Set<string>>(new Set())
   const [apiKeyModal, setApiKeyModal] = useState<string | null>(null)
   const [apiKeyValue, setApiKeyValue] = useState('')
@@ -59,14 +62,16 @@ export function useApiKeyModal(userId: string) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [info.field]: apiKeyValue.trim() }),
       })
-      if (resp.ok) {
-        closeApiKeyModal()
-        fetchApiKeyStatus()
-      }
-    } catch { /* silent */ } finally {
+      if (!resp.ok) throw await readApiError(resp, `Could not save the ${info.label} key`)
+      closeApiKeyModal()
+      fetchApiKeyStatus()
+    } catch (err) {
+      // The modal stays open with the key typed in, so a retry needs no retyping.
+      alertError(toApiError(err, `Could not save the ${info.label} key`).message, 'API key not saved')
+    } finally {
       setApiKeySaving(false)
     }
-  }, [userId, apiKeyModal, apiKeyValue, closeApiKeyModal, fetchApiKeyStatus])
+  }, [userId, apiKeyModal, apiKeyValue, closeApiKeyModal, fetchApiKeyStatus, alertError])
 
   return {
     missingApiKeys,

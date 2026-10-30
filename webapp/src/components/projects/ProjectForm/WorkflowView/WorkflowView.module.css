@@ -265,6 +265,17 @@
   color: #475569;
 }
 
+.badgeNew {
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #22c55e;
+  color: #fff;
+}
+
 /* Node count badge (on data nodes) */
 
 .nodeCountBadge {

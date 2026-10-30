@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
-import { internalKeyHeaders } from '@/lib/agentAuth'
-
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { agentErrorResponse, callAgent } from '../../agentProxy'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
 
-export async function POST(request: NextRequest) {
+const FAILED = 'Failed to build archive'
+
+export const POST = withRouteErrors(FAILED, async (request: NextRequest) => {
   let body: { projectId?: string; paths?: string[]; format?: string; archiveName?: string }
   try {
     body = await request.json()
@@ -20,33 +21,24 @@ export async function POST(request: NextRequest) {
   const __denied = await guardProject(body.projectId || '')
   if (__denied) return __denied
 
-  try {
-    const resp = await fetch(`${AGENT_API_URL}/workspace/bulk-archive`, {
-      method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(body),
-    })
-    if (!resp.ok) {
-      const text = await resp.text()
-      return NextResponse.json({ error: text }, { status: resp.status })
-    }
-    const buffer = await resp.arrayBuffer()
-    const contentDisposition = resp.headers.get('Content-Disposition') || ''
-    const contentType = resp.headers.get('Content-Type') || 'application/octet-stream'
-    return new NextResponse(buffer, {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Content-Disposition': contentDisposition,
-        'Content-Length': String(buffer.byteLength),
-        'Cache-Control': 'no-cache',
-      },
-    })
-  } catch (error) {
-    console.error('workspace/bulk-archive proxy error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to build archive' },
-      { status: 502 }
-    )
-  }
-}
+  const call = await callAgent('/workspace/bulk-archive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, FAILED, { timeoutMs: 60_000 })
+  if (!call.ok) return call.response
+  const resp = call.res
+  if (!resp.ok) return agentErrorResponse(resp, FAILED)
+  const buffer = await resp.arrayBuffer()
+  const contentDisposition = resp.headers.get('Content-Disposition') || ''
+  const contentType = resp.headers.get('Content-Type') || 'application/octet-stream'
+  return new NextResponse(buffer, {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Disposition': contentDisposition,
+      'Content-Length': String(buffer.byteLength),
+      'Cache-Control': 'no-cache',
+    },
+  })
+})

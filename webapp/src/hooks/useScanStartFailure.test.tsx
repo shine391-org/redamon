@@ -39,6 +39,21 @@ test('a permanent failure shows a single error, no confirm', async () => {
   expect(h.alertError).toHaveBeenCalled()
 })
 
+test('a permanent failure names its code and status, so a report carries the cause', async () => {
+  await hook().handleStartFailure('gvm', { message: 'Failed to start GVM scan', status: 503, code: 'orchestrator_unreachable' })
+  expect(h.alertError).toHaveBeenCalledWith('Failed to start GVM scan (orchestrator_unreachable · HTTP 503)', 'Could not start scan')
+})
+
+test('a start that got no answer says so', async () => {
+  await hook().handleStartFailure('full_recon', { message: 'Failed to start recon', status: 0, code: 'network_error' })
+  expect(h.alertError).toHaveBeenCalledWith('Failed to start recon (network_error)', 'Could not start scan')
+})
+
+test('a permanent orchestrator code is never offered the queue', async () => {
+  await hook().handleStartFailure('gvm', { message: 'spawn failed', status: 503, code: 'spawn_failed' })
+  expect(h.confirm).not.toHaveBeenCalled()
+})
+
 test('a temporary failure offers the queue and enqueues on confirm', async () => {
   h.confirm.mockResolvedValue(true)
   const out = await hook().handleStartFailure('full_recon', { message: 'no mem', status: 429, limit: { limitType: 'ram' } }, { mode: 'new' })
@@ -63,8 +78,15 @@ test('ai_attack with an inline api_key is Cancel-only (never queued)', async () 
 
 test('an enqueue failure surfaces an error', async () => {
   h.confirm.mockResolvedValue(true)
-  global.fetch = vi.fn().mockResolvedValue({ ok: false, json: async () => ({ error: 'nope' }) }) as unknown as typeof fetch
+  global.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500, json: async () => ({ error: 'nope', code: 'P2024' }) }) as unknown as typeof fetch
   const out = await hook().handleStartFailure('full_recon', { message: 'no mem', status: 429, limit: { limitType: 'ram' } })
   expect(out).toBe('shown')
-  expect(h.alertError).toHaveBeenCalled()
+  expect(h.alertError).toHaveBeenCalledWith('nope (P2024 · HTTP 500)')
+})
+
+test('an enqueue that got no answer says so', async () => {
+  h.confirm.mockResolvedValue(true)
+  global.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch')) as unknown as typeof fetch
+  await hook().handleStartFailure('full_recon', { message: 'no mem', status: 429, limit: { limitType: 'ram' } })
+  expect(h.alertError).toHaveBeenCalledWith('Could not add this scan to the queue. (network_error)')
 })

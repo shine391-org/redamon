@@ -6,9 +6,10 @@ import { Modal } from '@/components/ui/Modal/Modal'
 import { useAlertModal, useToast } from '@/components/ui'
 import { PluginBadge } from '@/components/plugins/PluginBadge'
 import { TextDiff } from '@/components/plugins/host/TextDiff'
+import { errorMessage, fetchJson } from '@/lib/apiError'
 import { BUILTIN_SKILLS } from '@/lib/plugins/builtinSkills'
 import type { ScopeVersions, VersionRow, VersionsModel } from '@/lib/plugins/versionsModel'
-import { OverrideApiError, deleteChangeSet, fetchVersions, resetSkill } from './overridesClient'
+import { deleteChangeSet, fetchVersions, resetSkill } from './overridesClient'
 import { dormantCopy } from './dormantCopy'
 import { UserSkillVersionsSection } from './UserSkillVersionsSection'
 import { useUserSkillsChanged } from '@/lib/userSkillsChannel'
@@ -61,6 +62,8 @@ export function SkillVersionsModal({
   const [viewing, setViewing] = useState<string | null>(null)
   // null until read: a skill opened from the chat is not "deleted" just because the list is late.
   const [ownList, setOwnList] = useState<{ id: string; name: string }[] | null>(null)
+  // A list that failed is not an empty one: the open skill is not "deleted" because of it.
+  const [ownError, setOwnError] = useState<string | null>(null)
   const ownSkills = ownList ?? []
   const userSkillId = skill?.startsWith(USER_PREFIX) ? skill.slice(USER_PREFIX.length) : null
 
@@ -75,10 +78,17 @@ export function SkillVersionsModal({
       return
     }
     let cancelled = false
-    fetch(`/api/users/${encodeURIComponent(scopeOwnerId)}/attack-skills`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then((rows: { id: string; name: string }[]) => { if (!cancelled) setOwnList(Array.isArray(rows) ? rows : []) })
-      .catch(() => { if (!cancelled) setOwnList([]) })
+    fetchJson<{ id: string; name: string }[]>(`/api/users/${encodeURIComponent(scopeOwnerId)}/attack-skills`, undefined, 'Your skills could not be loaded')
+      .then((rows) => {
+        if (cancelled) return
+        setOwnError(null)
+        setOwnList(Array.isArray(rows) ? rows : [])
+      })
+      .catch((e) => {
+        if (cancelled) return
+        setOwnError(errorMessage(e, 'Your skills could not be loaded'))
+        setOwnList([])
+      })
     return () => { cancelled = true }
   }, [scopeOwnerId, ownGeneration])
 
@@ -86,7 +96,7 @@ export function SkillVersionsModal({
     if (!skill || skill.startsWith(USER_PREFIX)) return
     setModel(null)
     setError(null)
-    fetchVersions(skill, projectId).then(setModel, (e) => setError(e instanceof Error ? e.message : 'Could not load the versions.'))
+    fetchVersions(skill, projectId).then(setModel, (e) => setError(errorMessage(e, 'Could not load the versions.')))
   }, [skill, projectId])
   useEffect(() => load(), [load])
 
@@ -98,7 +108,7 @@ export function SkillVersionsModal({
         toast.success(ok)
         load()
       } catch (e) {
-        toast.error(e instanceof OverrideApiError ? e.message : 'The action failed.')
+        toast.error(errorMessage(e, 'The action failed.'))
       } finally {
         setBusy(false)
       }
@@ -152,7 +162,7 @@ export function SkillVersionsModal({
             {(ownSkills.length > 0 || userSkillId) && (
               <optgroup label="Your skills">
                 {userSkillId && !ownSkills.some((s) => s.id === userSkillId) && (
-                  <option value={skill}>{ownList === null ? 'Loading…' : 'A deleted skill'}</option>
+                  <option value={skill}>{ownList === null ? 'Loading…' : ownError ? 'Your skills could not be loaded' : 'A deleted skill'}</option>
                 )}
                 {ownSkills.map((s) => (
                   <option key={s.id} value={`${USER_PREFIX}${s.id}`}>
@@ -180,8 +190,11 @@ export function SkillVersionsModal({
           </div>
         )}
         {!userSkillId && error && <div className={styles.error} role="alert">{error}</div>}
+        {ownError && <div className={styles.error} role="alert" data-testid="own-skills-error">{ownError}</div>}
         {!userSkillId && model?.registryError && (
-          <div className={styles.note}>The agent could not be read, so the factory text is not shown here.</div>
+          <div className={styles.note}>
+            The agent could not be read{model.registryErrorText ? ` (${model.registryErrorText})` : ''}, so the factory text is not shown here.
+          </div>
         )}
 
         {!userSkillId && model?.scopes.map((scope) => (

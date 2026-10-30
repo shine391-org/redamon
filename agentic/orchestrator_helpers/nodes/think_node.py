@@ -31,7 +31,9 @@ from orchestrator_helpers.agent_context import get_agent_context
 from orchestrator_helpers.json_utils import json_dumps_safe, normalize_content
 from orchestrator_helpers.parsing import try_parse_llm_decision
 from orchestrator_helpers.config import get_identifiers, is_session_config_complete
+from orchestrator_helpers.finding_guard import unrecorded_confirmations, unrecorded_note
 from orchestrator_helpers.llm_retry import retry_llm_call
+from orchestrator_helpers.llm_retry import llm_error_reason
 from orchestrator_helpers.productivity import (
     audit_productivity_claim,
     axis_key,
@@ -758,6 +760,10 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             "not 'confirmation'.\n"
         )
 
+    _unrecorded = state.get("_unrecorded_confirmation")
+    if _unrecorded:
+        system_prompt += unrecorded_note(_unrecorded)
+
     # CHECK: Is there a pending tool output to analyze?
     pending_step = state.get("_current_step")
     has_pending_output = (
@@ -975,7 +981,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 thought="",
                 reasoning="LLM call failed after transient-error retries",
                 action="complete",
-                completion_reason=f"llm_error: {exc}",
+                completion_reason=llm_error_reason(exc),
                 updated_todo_list=[],
             )
             break
@@ -1251,6 +1257,11 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         updates["_current_plan"] = None  # Clear any stale plan
         updates["_current_fireteam_plan"] = None
 
+    # Recomputed at every analysis, so the note shows once and clears at the next
+    # analysis that records a chain finding or names no confirmation.
+    if has_pending_output or has_pending_plan_outputs:
+        updates["_unrecorded_confirmation"] = unrecorded_confirmations(decision.output_analysis)
+
     # Process output analysis if we had pending tool output
     if has_pending_output:
         step_iteration = pending_step.get("iteration", iteration)
@@ -1447,6 +1458,8 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     iteration=step_iteration,
                     related_cves=cf.related_cves, related_ips=cf.related_ips,
                     related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                    skill=state.get("attack_path_type", ""),
+                    route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                     agent_id=_ctx["agent_id"],
                     source_agent=_ctx["agent_name"],
                     fireteam_id=_ctx["fireteam_id"],
@@ -1808,6 +1821,8 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     iteration=plan_iteration,
                     related_cves=cf.related_cves, related_ips=cf.related_ips,
                     related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                    skill=state.get("attack_path_type", ""),
+                    route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                     agent_id=_ctx["agent_id"],
                     source_agent=_ctx["agent_name"],
                     fireteam_id=_ctx["fireteam_id"],

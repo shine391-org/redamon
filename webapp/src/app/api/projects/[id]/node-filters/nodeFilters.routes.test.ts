@@ -386,6 +386,30 @@ describe('apply', () => {
     })
   })
 
+  test("an agent refusal shows its own sentence, FastAPI's detail included, with the agent status", async () => {
+    h.agentFetch.mockResolvedValue(new Response(JSON.stringify({ detail: 'Unauthorized' }), { status: 401 }))
+    const res = await apply({ target: 'current', versionId: 'v7', revision: 3 })
+    expect(res.status).toBe(401)
+    expect(await res.json()).toEqual({ error: 'Unauthorized', code: 'agent_error', upstreamStatus: 401 })
+    expect(h.runUpdateMany.mock.calls.at(-1)![0].data).toMatchObject({ status: 'failed', error: 'Unauthorized' })
+  })
+
+  test('an agent crash is 502 with the agent status, the run failed', async () => {
+    h.agentFetch.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+    const res = await apply({ target: 'current', versionId: 'v7', revision: 3 })
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({ error: 'The agent refused the apply.', code: 'agent_error', upstreamStatus: 500 })
+    expect(h.runUpdateMany.mock.calls.at(-1)![0].data).toMatchObject({ status: 'failed', error: 'the agent answered 500' })
+  })
+
+  test('an unreachable agent keeps its explanation and adds the code', async () => {
+    const { AgentUnreachableError } = await import('@/lib/agentFetch')
+    h.agentFetch.mockRejectedValue(new AgentUnreachableError('Cannot reach the RedAmon agent service'))
+    const res = await apply({ target: 'current', versionId: 'v7', revision: 3 })
+    expect(res.status).toBe(503)
+    expect(await res.json()).toMatchObject({ error: 'Cannot reach the RedAmon agent service', code: 'agent_unreachable' })
+  })
+
   test('New scans only arms, and touches neither the graph nor the agent', async () => {
     const res = await apply({ target: 'scans', revision: 3 })
     expect(res.status).toBe(200)

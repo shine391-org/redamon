@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { getSession } from '@/lib/session'
+import { internalError } from '@/lib/routeErrors'
 
 export async function GET() {
   try {
@@ -20,10 +21,6 @@ export async function GET() {
 
     return NextResponse.json(user)
   } catch (error) {
-    console.error('Auth me error:', error)
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Internal server error', { log: 'Auth me error' })
   }
 }

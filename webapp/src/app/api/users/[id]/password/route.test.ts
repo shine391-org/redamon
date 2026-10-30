@@ -140,3 +140,13 @@ describe('a refused password change revokes nothing', () => {
     expect(h.transaction).not.toHaveBeenCalled()
   })
 })
+
+describe('a password change the database refused', () => {
+  test('answers the fixed sentence with its Prisma code', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.transaction.mockRejectedValue(Object.assign(new Error('Transaction already closed'), { code: 'P2028' }))
+    const res = await PUT(req({ newPassword: 'brand-new', currentPassword: 'old' }), params('owner'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to change password', code: 'P2028' })
+  })
+})

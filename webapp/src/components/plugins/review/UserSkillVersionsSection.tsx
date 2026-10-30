@@ -6,7 +6,8 @@ import { useAlertModal, useToast } from '@/components/ui'
 import { PluginBadge } from '@/components/plugins/PluginBadge'
 import type { UserSkillVersionsModel } from '@/lib/plugins/userSkillVersionsModel'
 import { postUserSkillsChanged } from '@/lib/userSkillsChannel'
-import { OverrideApiError, deleteChangeSet, deleteUserSkill, fetchUserSkillVersions } from './overridesClient'
+import { errorMessage } from '@/lib/apiError'
+import { deleteChangeSet, deleteUserSkill, fetchUserSkillVersions } from './overridesClient'
 import styles from './SkillVersionsModal.module.css'
 
 const STATUS: Record<string, string> = {
@@ -41,7 +42,7 @@ export function UserSkillVersionsSection({
   const load = useCallback(() => {
     setModel(null)
     setError(null)
-    fetchUserSkillVersions(skillId, projectId).then(setModel, (e) => setError(e instanceof Error ? e.message : 'Could not load the versions.'))
+    fetchUserSkillVersions(skillId, projectId).then(setModel, (e) => setError(errorMessage(e, 'Could not load the versions.')))
   }, [skillId, projectId])
   useEffect(() => load(), [load])
 
@@ -51,7 +52,7 @@ export function UserSkillVersionsSection({
       await fn()
       toast.success(ok)
     } catch (e) {
-      toast.error(e instanceof OverrideApiError ? e.message : 'The action failed.')
+      toast.error(errorMessage(e, 'The action failed.'))
     } finally {
       // Also after a failure part way: what was deleted before it is gone for every window.
       postUserSkillsChanged({})

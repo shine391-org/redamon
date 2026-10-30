@@ -96,7 +96,8 @@ describe('PluginDetailsDrawer', () => {
     expect(data).toMatch(/1,234 of 10,000 rows/)
     expect(data).toMatch(/2\.5 MB of 50\.0 MB/)
     expect(screen.getByTestId('plugin-overrides').textContent).toMatch(/2 approved skill versions, not applied/)
-    expect((screen.getByRole('link', { name: /export data/i }) as HTMLAnchorElement).getAttribute('href')).toBe('/api/plugins/echo/export')
+    // Fetched by the page, so a refusal is shown instead of being saved as the export.
+    expect(screen.getByRole('button', { name: /export data/i })).toBeTruthy()
   })
 
   test('while an operation runs the rollback button waits', async () => {

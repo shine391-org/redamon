@@ -10,6 +10,7 @@ import type { TrufflehogProfileSummary } from '@/hooks/useTrufflehogRuns'
 import { projectSettingsHref, type ProjectSectionAnchor } from '@/lib/projectSettingsLinks'
 import { Modal, WikiInfoButton } from '@/components/ui'
 import type { GithubHuntStatus, TrufflehogStatus, SupplyChainStatus } from '@/lib/recon-types'
+import { ScanStatusWarning } from '@/components/scans/ScanStatusWarning'
 import { useSupplyChainConfig } from './useSupplyChainConfig'
 import { SupplyChainOrgBatchButton } from './SupplyChainOrgBatchButton'
 import styles from './OtherScansModal.module.css'
@@ -32,7 +33,13 @@ interface OtherScansModalProps {
   onDownloadGithubHuntJSON?: () => void
   onToggleGithubHuntLogs?: () => void
   githubHuntStatus?: GithubHuntStatus
+  /** The run's own failure reason (state.error), shown on the badge of a failed run. */
+  githubHuntError?: string | null
+  /** Why the status could not be read; the badge then shows the last known one. */
+  githubHuntStatusError?: string | null
   hasGithubHuntData?: boolean
+  /** Set when the data check itself failed, so the disabled download does not claim "no data". */
+  githubHuntDataError?: string | null
   isGithubHuntLogsOpen?: boolean
   // TruffleHog — run-keyed: one row per configured SOURCE, each with its own
   // status, Start, Stop and Logs. A single project-level set of controls could
@@ -43,9 +50,13 @@ interface OtherScansModalProps {
   onToggleTrufflehogLogs?: (source: string) => void
   /** One entry per configured source, from /api/trufflehog/{id}/profiles. */
   trufflehogProfiles?: TrufflehogProfileSummary[]
+  /** Why the source list could not be read: then "no sources" would be a false answer. */
+  trufflehogProfilesError?: string | null
   /** Live run state keyed by source, from /api/trufflehog/{id}/all. */
-  trufflehogRunsBySource?: Record<string, { status: TrufflehogStatus; target?: string } | undefined>
+  trufflehogRunsBySource?: Record<string, { status: TrufflehogStatus; target?: string; error?: string | null } | undefined>
+  trufflehogStatusError?: string | null
   hasTrufflehogData?: boolean
+  trufflehogDataError?: string | null
   /** Which source's log drawer is open, if any. */
   openTrufflehogLogsSource?: string | null
 
@@ -57,7 +68,10 @@ interface OtherScansModalProps {
   onDownloadSupplyChainJSON?: () => void
   onToggleSupplyChainLogs?: () => void
   supplyChainStatus?: SupplyChainStatus
+  supplyChainError?: string | null
+  supplyChainStatusError?: string | null
   hasSupplyChainData?: boolean
+  supplyChainDataError?: string | null
   isSupplyChainLogsOpen?: boolean
   /** Needed to read the configured scan input and to link into project settings.
    *  Without it every card renders read-only. */
@@ -68,7 +82,7 @@ interface OtherScansModalProps {
   onOpenProjectSettings?: (anchor: ProjectSectionAnchor) => void
 }
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({ status, error }: { status: string; error?: string | null }) {
   const styleMap: Record<string, string> = {
     idle: styles.statusIdle,
     starting: styles.statusRunning,
@@ -79,7 +93,10 @@ function StatusBadge({ status }: { status: string }) {
     error: styles.statusError,
   }
   return (
-    <span className={`${styles.statusBadge} ${styleMap[status] || styles.statusIdle}`}>
+    <span
+      className={`${styles.statusBadge} ${styleMap[status] || styles.statusIdle}`}
+      title={status === 'error' && error ? error : undefined}
+    >
       {status}
     </span>
   )
@@ -107,7 +124,10 @@ export function OtherScansModal({
   onDownloadGithubHuntJSON,
   onToggleGithubHuntLogs,
   githubHuntStatus = 'idle',
+  githubHuntError = null,
+  githubHuntStatusError = null,
   hasGithubHuntData = false,
+  githubHuntDataError = null,
   isGithubHuntLogsOpen = false,
   // TruffleHog
   onStartTrufflehog,
@@ -115,8 +135,11 @@ export function OtherScansModal({
   onDownloadTrufflehogJSON,
   onToggleTrufflehogLogs,
   trufflehogProfiles = [],
+  trufflehogProfilesError = null,
   trufflehogRunsBySource = {},
+  trufflehogStatusError = null,
   hasTrufflehogData = false,
+  trufflehogDataError = null,
   openTrufflehogLogsSource = null,
 
   // Supply Chain (L1)
@@ -127,7 +150,10 @@ export function OtherScansModal({
   onDownloadSupplyChainJSON,
   onToggleSupplyChainLogs,
   supplyChainStatus = 'idle',
+  supplyChainError = null,
+  supplyChainStatusError = null,
   hasSupplyChainData = false,
+  supplyChainDataError = null,
   isSupplyChainLogsOpen = false,
   projectId,
   onOpenProjectSettings,
@@ -219,7 +245,8 @@ export function OtherScansModal({
             <Github size={18} className={styles.cardIcon} />
             <h3 className={styles.cardTitle}>GitHub Secret Hunt</h3>
             <WikiInfoButton target="Github" title="GitHub Secret Hunting wiki" />
-            <StatusBadge status={githubHuntStatus} />
+            <StatusBadge status={githubHuntStatus} error={githubHuntError} />
+            <ScanStatusWarning errors={[githubHuntStatusError]} />
           </div>
           <p className={styles.cardDescription}>
             Search GitHub repositories for exposed secrets, API keys, and credentials related to your target domain.
@@ -292,7 +319,7 @@ export function OtherScansModal({
               className={styles.downloadButton}
               onClick={onDownloadGithubHuntJSON}
               disabled={!hasGithubHuntData || isGHActive || viewingPastVersion}
-              title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasGithubHuntData ? 'Download JSON' : 'No data available'}
+              title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasGithubHuntData ? 'Download JSON' : githubHuntDataError || 'No data available'}
             >
               <Download size={12} />
               <span>Download</span>
@@ -318,8 +345,8 @@ export function OtherScansModal({
             <Search size={18} className={styles.cardIcon} />
             <h3 className={styles.cardTitle}>Secret Multiscanner</h3>
             <WikiInfoButton target="Trufflehog" title="Secret Multiscanner wiki" />
-            <span className={styles.newBadge}>NEW</span>
             <StatusBadge status={trufflehogCardStatus} />
+            <ScanStatusWarning errors={[trufflehogStatusError]} />
           </div>
           <p className={styles.cardDescription}>
             Deep secret scanning with 700+ detectors across git hosts, container registries,
@@ -329,8 +356,13 @@ export function OtherScansModal({
           {/* Scrolls on its own: any number of sources can be added, and the
               card must not push the modal past the viewport. */}
           <div className={styles.sourceList}>
+          {trufflehogProfilesError && (
+            <p className={styles.cardDescription} role="alert" style={{ color: 'var(--status-error)' }}>
+              {trufflehogProfilesError}
+            </p>
+          )}
           {trufflehogProfiles.length === 0 ? (
-            <p className={styles.cardDescription} style={{ opacity: 0.75 }}>
+            trufflehogProfilesError ? null : <p className={styles.cardDescription} style={{ opacity: 0.75 }}>
               No sources configured.{' '}
               {projectId && (
                 <Link
@@ -373,7 +405,7 @@ export function OtherScansModal({
                       <span className={styles.sourceTarget} title={run.target}>{run.target}</span>
                     )}
                   </span>
-                  <StatusBadge status={status} />
+                  <StatusBadge status={status} error={run?.error} />
 
                   <button
                     className={styles.startButton}
@@ -442,7 +474,7 @@ export function OtherScansModal({
               className={styles.downloadButton}
               onClick={onDownloadTrufflehogJSON}
               disabled={!hasTrufflehogData || isTHActive || viewingPastVersion}
-              title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasTrufflehogData ? 'Download JSON' : 'No data available'}
+              title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasTrufflehogData ? 'Download JSON' : trufflehogDataError || 'No data available'}
             >
               <Download size={12} />
               <span>Download</span>
@@ -471,7 +503,8 @@ export function OtherScansModal({
             <PackageSearch size={18} className={styles.cardIcon} />
             <h3 className={styles.cardTitle}>Supply Chain Scanner</h3>
             <WikiInfoButton target="SupplyChainScan" title="Supply-Chain Scanning wiki" />
-            <StatusBadge status={supplyChainStatus} />
+            <StatusBadge status={supplyChainStatus} error={supplyChainError} />
+            <ScanStatusWarning errors={[supplyChainStatusError]} />
           </div>
           <p className={styles.cardDescription}>
             Audit an SBOM / lockfile, or a GitHub repository, against the offline OSV database for
@@ -485,7 +518,9 @@ export function OtherScansModal({
             </p>
           ) : (
             <p className={styles.cardDescription} style={{ opacity: 0.75 }}>
-              {supplyChain.loading ? 'Loading the configured input...' : <>No input configured.{' '}
+              {supplyChain.loading ? 'Loading the configured input...'
+                : supplyChain.error ? <span role="alert">{supplyChain.error}</span>
+                : <>No input configured.{' '}
                 {supplyChainSettingsLink} to make it startable here.</>}
             </p>
           )}
@@ -530,7 +565,7 @@ export function OtherScansModal({
             </button>
             <button className={styles.downloadButton} onClick={onDownloadSupplyChainJSON}
               disabled={!hasSupplyChainData || isSCActive || viewingPastVersion}
-              title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasSupplyChainData ? 'Download JSON' : 'No data available'}>
+              title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasSupplyChainData ? 'Download JSON' : supplyChainDataError || 'No data available'}>
               <Download size={12} /><span>Download</span>
             </button>
 

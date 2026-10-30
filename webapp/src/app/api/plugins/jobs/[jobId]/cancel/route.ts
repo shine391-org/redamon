@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { requireEffectiveUser } from '@/lib/access'
 import { readJsonBody } from '@/lib/jsonBody'
 import { cancelJobRow, findUserJob, isTerminal, jobView, refreshJob } from '@/lib/plugins/jobs'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import { cancelJob } from '@/lib/plugins/runnerClient'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 
@@ -14,8 +15,11 @@ import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export async function POST(request: NextRequest, { params }: { params: Promise<{ jobId: string }> }) {
-  if (!sameOrigin(request)) return crossOriginResponse()
+export const POST = pluginRoute('job cancel', 'The job could not be cancelled; see the webapp log.', async (
+  request: NextRequest,
+  { params }: { params: Promise<{ jobId: string }> },
+) => {
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await requireEffectiveUser()
@@ -34,4 +38,4 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
   }
   return NextResponse.json(jobView(cancelled))
-}
+})

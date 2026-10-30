@@ -15,6 +15,7 @@ import {
 } from '@/lib/scanSchedule'
 import { fetchScanEnvelope } from '@/lib/scanEnvelope'
 import { scopeStartProblem } from '@/lib/scopeGroups'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -25,7 +26,7 @@ interface RouteParams {
 // finished queue jobs) is capped, then merged and re-capped newest-first.
 const JOB_HISTORY_LIMIT = 1000
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to list schedules', async (_request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -118,15 +119,11 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       { headers: { 'Cache-Control': 'private, no-cache' } }
     )
   } catch (error) {
-    console.error('[scanTimeline] schedule list failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to list schedules' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list schedules', { log: '[scanTimeline] schedule list failed' })
   }
-}
+})
 
-export async function POST(request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Failed to create the schedule', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -234,10 +231,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       },
     })
   } catch (error) {
-    console.error('[scanTimeline] schedule create failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to create the schedule' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create the schedule', { log: '[scanTimeline] schedule create failed' })
   }
-}
+})

@@ -6,6 +6,7 @@ import { notMuted } from '@/lib/graphMute'
 import { reportCountable } from '@/lib/triage/reportable'
 import { DECLARED_ONLY } from '@/lib/declaredOnly'
 import { corroborateAttackFindings, type RawAttackRow } from '@/lib/report/aiAttackFindings'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number | null {
   if (val == null) return null
@@ -185,9 +186,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Red-zone aiRisk error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' }, { status: 500 })
+    return internalError(error, 'Query failed', { log: 'Red-zone aiRisk error' })
   } finally {
     await session.close()
   }

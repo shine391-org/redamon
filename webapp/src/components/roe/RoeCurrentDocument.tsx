@@ -8,6 +8,7 @@ import { useState } from 'react'
 import { Download, FileText, History, Trash2 } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { downloadRoeFile } from './roeClient'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 interface Revision {
   id: string
@@ -29,15 +30,20 @@ export function RoeCurrentDocument({ projectId, documentName, appliedAt, onRemov
   const [error, setError] = useState<string | null>(null)
   const [revisions, setRevisions] = useState<Revision[] | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyError, setHistoryError] = useState<string | null>(null)
 
   const openHistory = async () => {
     setHistoryOpen(true)
     setRevisions(null)
+    setHistoryError(null)
     try {
       const res = await fetch(`/api/projects/${projectId}/roe/revisions`)
-      const body = res.ok ? await res.json() : { revisions: [] }
+      if (!res.ok) throw await readApiError(res, 'Could not load the RoE history')
+      const body = await res.json()
       setRevisions(Array.isArray(body.revisions) ? body.revisions : [])
-    } catch {
+    } catch (e) {
+      // An unread history must not read as "no earlier document".
+      setHistoryError(toApiError(e, 'Could not load the RoE history').message)
       setRevisions([])
     }
   }
@@ -77,8 +83,11 @@ export function RoeCurrentDocument({ projectId, documentName, appliedAt, onRemov
       {error && <span role="alert" style={{ fontSize: 11, color: 'var(--form-danger)' }}>{error}</span>}
 
       <Modal isOpen={historyOpen} onClose={() => setHistoryOpen(false)} title="Superseded RoE documents" size="default">
+        {error && <p role="alert" style={{ fontSize: 11, color: 'var(--form-danger)' }}>{error}</p>}
         {revisions === null ? (
           <p>Loading…</p>
+        ) : historyError ? (
+          <p role="alert" style={{ color: 'var(--form-danger)' }}>{historyError}</p>
         ) : revisions.length === 0 ? (
           <p>No earlier document. A replaced or removed document is kept here (the newest ten).</p>
         ) : (

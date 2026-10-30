@@ -17,6 +17,18 @@ export function CatalogStatus({ catalog }: { catalog: CatalogView }) {
         <div className="alertContent">
           <div className="alertTitle">{ERROR_LABEL[catalog.state]}</div>
           {catalog.message && <div className="alertMessage">{catalog.message}</div>}
+          {catalog.detail && (
+            <div className="alertMessage" data-testid="catalog-detail">
+              {catalog.detail}
+            </div>
+          )}
+          {catalog.details && catalog.details.length > 0 && (
+            <ul className="alertMessage" data-testid="catalog-details">
+              {catalog.details.map((d, i) => (
+                <li key={i}>{d}</li>
+              ))}
+            </ul>
+          )}
         </div>
       </div>
     )

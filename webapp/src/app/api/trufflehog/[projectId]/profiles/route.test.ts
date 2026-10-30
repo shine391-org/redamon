@@ -204,3 +204,40 @@ describe('PATCH / DELETE /profiles/[profileId]', () => {
     expect(h.findFirst).not.toHaveBeenCalled()
   })
 })
+
+describe('a DB failure', () => {
+  // A Prisma message can quote the row it was writing: the config holds bucket
+  // names, org names and image references, all target data.
+  const dbError = () => Object.assign(
+    new Error('Invalid `prisma.trufflehogScanProfile` invocation: config { bucket: "s3://acme-secrets" }'),
+    { name: 'PrismaClientKnownRequestError', code: 'P2024' },
+  )
+
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  test('GET answers {error, code} instead of an empty 500 read as "no sources"', async () => {
+    h.findMany.mockRejectedValue(dbError())
+    const res = await list.GET(req(), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to list sources', code: 'P2024' })
+  })
+
+  test.each([
+    ['POST', () => { h.create.mockRejectedValue(dbError()); return list.POST(req({ source: 'docker' }), params) }, 'Failed to add the source'],
+    ['PATCH', () => { h.update.mockRejectedValue(dbError()); return item.PATCH(req({ label: 'x' }), itemParams) }, 'Failed to save the source'],
+    ['DELETE', () => { h.del.mockRejectedValue(dbError()); return item.DELETE(req(), itemParams) }, 'Failed to delete the source'],
+  ])('%s answers the Prisma code, never the message', async (_method, call, message) => {
+    const res = await call()
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: message, code: 'P2024' })
+    expect(JSON.stringify(body)).not.toContain('acme')
+  })
+
+  test('the unique-index race is still a 409, not a 500', async () => {
+    h.create.mockRejectedValue(new h.P2002())
+    expect((await list.POST(req({ source: 'docker' }), params)).status).toBe(409)
+  })
+})

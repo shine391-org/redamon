@@ -11,7 +11,7 @@ export async function GET() {
   if (reconResult.status === 'rejected') {
     console.error('Failed to fetch defaults from recon orchestrator:', reconResult.reason)
     return NextResponse.json(
-      { error: 'Failed to fetch defaults from recon backend' },
+      { error: 'Failed to fetch defaults from recon backend', code: 'recon_defaults_unavailable' },
       { status: 503 }
     )
   }

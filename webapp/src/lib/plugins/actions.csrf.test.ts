@@ -47,7 +47,11 @@ const post = async (opts: Parameters<typeof actionRequest>[3]) =>
   answer(await runAction(actionRequest('echo', 'echo', { params: {} }, opts), actionParams('echo', 'echo')))
 
 test.each(['http://evil.example', 'http://localhost:3001', 'null'])('Origin %s: 403 cross_origin, the runner never called', async (origin) => {
-  expect(await post({ origin })).toEqual({ status: 403, body: { error: 'Cross-origin request refused.', code: 'cross_origin' } })
+  const res = await post({ origin })
+  expect(res).toMatchObject({ status: 403, body: { code: 'cross_origin' } })
+  // The refusal names the comparison that failed, with the page's origin.
+  expect(res.body.error).toMatch(/^Cross-origin request refused: /)
+  expect(res.body.error).toContain(origin === 'null' ? 'the Origin header "null" is not an origin' : `the page's host ${new URL(origin).host} is not the host`)
   expect(runner.actionCalls).toEqual([])
 })
 

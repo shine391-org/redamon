@@ -3,6 +3,7 @@ import { guardProject } from '@/lib/access'
 import prisma from '@/lib/prisma'
 import { Prisma } from '@prisma/client'
 import { getTrufflehogSource, rejectTrufflehogSecretFields } from '@/lib/trufflehogSources'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string; profileId: string }>
@@ -48,11 +49,7 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ profile: updated })
   } catch (error) {
-    console.error('Error updating TruffleHog profile:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to save the source', { log: 'Error updating TruffleHog profile' })
   }
 }
 
@@ -71,10 +68,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     await prisma.trufflehogScanProfile.delete({ where: { id: profileId } })
     return NextResponse.json({ ok: true })
   } catch (error) {
-    console.error('Error deleting TruffleHog profile:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to delete the source', { log: 'Error deleting TruffleHog profile' })
   }
 }

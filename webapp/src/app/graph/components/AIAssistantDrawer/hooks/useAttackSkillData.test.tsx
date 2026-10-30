@@ -99,9 +99,27 @@ test('a failed read keeps the last data', async () => {
   const hook = await mount()
   const before = hook.result.current.skillData
   vi.stubGlobal('fetch', vi.fn(async () => json(500, {})))
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
   act(() => hook.result.current.refetch())
   await settle()
   expect(hook.result.current.skillData).toBe(before)
+  vi.restoreAllMocks()
+})
+
+test('a failed read says why in `error`, and a good one clears it', async () => {
+  const hook = await mount()
+  expect(hook.result.current.error).toBeNull()
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.endsWith('/attack-skills/available')
+    ? json(500, { error: 'Failed to fetch available attack skills', code: 'P1001' })
+    : json(200, h.project))))
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  act(() => hook.result.current.refetch())
+  await waitFor(() => expect(hook.result.current.error?.message).toBe('Failed to fetch available attack skills (P1001 · HTTP 500)'))
+  expect(warn).toHaveBeenCalled()
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.endsWith('/attack-skills/available') ? json(200, h.avail) : json(200, h.project))))
+  act(() => hook.result.current.refetch())
+  await waitFor(() => expect(hook.result.current.error).toBeNull())
+  vi.restoreAllMocks()
 })
 
 test('no user or project: nothing is fetched', async () => {

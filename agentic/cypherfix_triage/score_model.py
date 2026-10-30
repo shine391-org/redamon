@@ -485,6 +485,27 @@ JS_RECON_CLASSES = {
     "cloud_storage": FindingClass("exposure", 0.3, 0.4, caps_impact=True),
 }
 
+#: route_exposure `vulnerability_type` (stored as `type`) -> class. The scorer
+#: reads a fixed projection that carries `type`, never `exposure_kind`. No key
+#: here may equal a SECURITY_CHECK_CLASSES key: `_class_for` routes by type
+#: before source for every other writer. `secret_exposure` is classed by its
+#: first secret detector instead (classify_secret).
+ROUTE_EXPOSURE_CLASSES = {
+    "unauthenticated_endpoint": FindingClass("unauthenticated_access", 0.5, 0.75),
+    "sensitive_data_exposure": FindingClass("data_exposure", 0.5, 0.75),
+    "cors_credentialed_origin_reflection": FindingClass("misconfig", 0.4, 0.5, caps_impact=True),
+    "authenticated_content_cacheable": FindingClass("data_exposure", 0.4, 0.5, caps_impact=True),
+    "exposed_version_control": FindingClass("source_disclosure", 0.7, 0.75),
+    "exposed_env_file": FindingClass("credential_exposure", 0.7, 0.75),
+    "exposed_config_file": FindingClass("info_disclosure", 0.5, 0.5),
+    "exposed_backup_file": FindingClass("source_disclosure", 0.6, 0.75),
+    # the likelihood EXPLOITABLE_CLASSES gives rce: an open console runs code
+    "exposed_debug_console": FindingClass("rce", 0.7, 0.75),
+    "exposed_debug_endpoint": FindingClass("info_disclosure", 0.5, 0.75),
+    "debug_error_page": FindingClass("info_disclosure", 0.3, 0.3, caps_impact=True),
+    "exposed_route_catalog": FindingClass("info_disclosure", 0.3, 0.3, caps_impact=True),
+}
+
 #: Directly exploitable classes. Reaching one of these, CONFIRMED, is the 0.7
 #: row of the L table.
 EXPLOITABLE_CLASSES = frozenset({
@@ -570,6 +591,10 @@ CONFIDENCE_BY_SOURCE = {
     # exploitable. Low on purpose so the info gate's T4 floor keeps it low until
     # the agent's proof-typed CONFIRMS edge promotes it (never an accidental 0.75).
     "serialized_scan": 0.4,
+    # route exposure: its findings are signature-proven (a .git HEAD, an env
+    # file, a debug console), like nuclei's. Its pending leads are written info,
+    # so the info gate keeps them at T4 until a proof-typed CONFIRMS edge.
+    "route_exposure": 0.75,
     "guarddog": 0.25,
     # never-validated secrets
     "github_hunt": 0.6,
@@ -1782,6 +1807,11 @@ def _class_for(finding: dict) -> FindingClass:
     source = _lower(finding.get("source"))
     label = str(finding.get("label") or "")
 
+    # Before the type-first gate below: no other writer MERGEs a route_exposure
+    # node, so the reason that gate exists does not apply to it.
+    if source == "route_exposure":
+        return _route_exposure_class(finding)
+
     # By type before source: origin_discovery MERGEs the same waf_bypass node as
     # security_check and `source` is set on create only, so routing by source
     # made the class depend on which writer got there first.
@@ -1811,6 +1841,14 @@ def _class_for(finding: dict) -> FindingClass:
         return FindingClass("misconfig", 0.3, 0.3, caps_impact=True)
 
     return CLASS_DEFAULT
+
+
+def _route_exposure_class(finding: dict) -> FindingClass:
+    kind = _lower(finding.get("type"))
+    if kind == "secret_exposure":
+        detectors = _as_list(finding.get("secret_types"))
+        return classify_secret(detectors[0] if detectors else None)
+    return ROUTE_EXPOSURE_CLASSES.get(kind, CLASS_DEFAULT)
 
 
 def _secret_class(finding: dict) -> FindingClass:

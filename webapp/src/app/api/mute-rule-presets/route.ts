@@ -16,12 +16,13 @@ import { readJsonBody } from '@/lib/jsonBody'
 import { coerceDoc } from '@/lib/nodeFilters/model'
 import { parsePresetText, presetSummary } from '@/lib/nodeFilters/presets'
 import { allErrors, validateNodeFilters } from '@/lib/nodeFilters/validate'
+import { withRouteErrors } from '@/lib/routeErrors'
 
 const ROW_SELECT = {
   id: true, name: true, description: true, mode: true, rules: true, createdAt: true, updatedAt: true,
 } as const
 
-export async function GET() {
+export const GET = withRouteErrors('Failed to load the presets', async () => {
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
   const rows = await prisma.userMuteRulesPreset.findMany({
@@ -30,9 +31,9 @@ export async function GET() {
     select: ROW_SELECT,
   })
   return NextResponse.json(rows.map(presetSummary))
-}
+})
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteErrors('Failed to save the preset', async (request: NextRequest) => {
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await requireEffectiveUser()
@@ -60,4 +61,4 @@ export async function POST(request: NextRequest) {
     select: ROW_SELECT,
   })
   return NextResponse.json(presetSummary(row), { status: 201 })
-}
+})

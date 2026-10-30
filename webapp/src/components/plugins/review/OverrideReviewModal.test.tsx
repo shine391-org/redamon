@@ -146,7 +146,45 @@ describe('what it shows', () => {
   })
 })
 
+describe('why the agent cannot check an approval', () => {
+  test("an agent that answered with an error is not called unreachable: its status is shown", async () => {
+    draw(model({ registryError: 'agent_unreachable', registryErrorText: 'The agent service answered HTTP 500' }))
+    expect(await screen.findByText('The agent service answered HTTP 500; this cannot be approved now.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Approve/ })).toBeDisabled()
+  })
+
+  test('an older model without the text keeps the old sentence', async () => {
+    draw(model({ registryError: 'agent_unreachable' }))
+    expect(await screen.findByText('The agent cannot be reached; this cannot be approved now.')).toBeInTheDocument()
+  })
+})
+
 describe('deciding', () => {
+  test('an over-limit approval lists every error, not only the first', async () => {
+    draw()
+    h.responders['/approve'] = () => new Response(JSON.stringify({
+      code: 'over_limit',
+      error: 'Part workflow is over 20000 characters.',
+      errors: ['Part workflow is over 20000 characters.', 'The whole skill is over 60000 characters.'],
+    }), { status: 422 })
+    fireEvent.click(await screen.findByRole('button', { name: /^Approve/ }))
+    fireEvent.click(screen.getAllByRole('button', { name: /Approve/ }).pop()!)
+    const list = await screen.findByTestId('approve-errors')
+    expect(within(list).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+      'Part workflow is over 20000 characters.',
+      'The whole skill is over 60000 characters.',
+    ])
+    expect(await screen.findByText('Part workflow is over 20000 characters. (over_limit · HTTP 422)')).toBeInTheDocument()
+  })
+
+  test("a failed approval names the code and status (Next's empty 500 included)", async () => {
+    draw()
+    h.responders['/approve'] = () => new Response('', { status: 500 })
+    fireEvent.click(await screen.findByRole('button', { name: /^Approve/ }))
+    fireEvent.click(screen.getAllByRole('button', { name: /Approve/ }).pop()!)
+    expect(await screen.findByText('The request failed (empty_response · HTTP 500)')).toBeInTheDocument()
+  })
+
   test('Approve asks for confirmation naming "next message or resume", then POSTs with the scope owner', async () => {
     const { onDecided } = draw()
     fireEvent.click(await screen.findByRole('button', { name: /^Approve/ }))

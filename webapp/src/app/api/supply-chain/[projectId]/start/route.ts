@@ -6,6 +6,7 @@ import { currentRoeTextSha256 } from '@/lib/engagement'
 import prisma from '@/lib/prisma'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
+import { internalError, readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
 import { assertGraphNotActivating } from '@/lib/activationLock'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
@@ -64,20 +65,30 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     // Read before the start, so a RoE replaced mid-start cannot misattribute the run.
     const roeTextSha256 = await currentRoeTextSha256(projectId)
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/supply-chain/${projectId}/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        project_id: projectId,
-        user_id: project.userId,
-        webapp_api_url: WEBAPP_URL,
-      }),
-    })
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/supply-chain/${projectId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          user_id: project.userId,
+          webapp_api_url: WEBAPP_URL,
+        }),
+      })
+    } catch (error) {
+      return upstreamFailureResponse('orchestrator', error, 'Failed to start Supply-Chain scan')
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      const { error, limit } = normalizeOrchestratorStartError(errorData, 'Failed to start Supply-Chain scan')
-      return NextResponse.json({ error, ...(limit ? { limit } : {}) }, { status: response.status })
+      // A body that is not JSON (uvicorn's plain-text 500) still says which
+      // status the orchestrator answered.
+      const body = await readUpstreamBody(response)
+      const { error, limit, code } = normalizeOrchestratorStartError(body.json ?? {}, 'Failed to start Supply-Chain scan')
+      return NextResponse.json(
+        { error, code: code ?? body.code ?? 'orchestrator_error', upstreamStatus: response.status, ...(limit ? { limit } : {}) },
+        { status: response.status },
+      )
     }
 
     // The scan is live now: give it a history row. Only full recon used to get
@@ -89,10 +100,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(await response.json())
   } catch (error) {
-    console.error('Error starting Supply-Chain scan:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to start Supply-Chain scan', { log: 'Error starting Supply-Chain scan' })
   }
 }

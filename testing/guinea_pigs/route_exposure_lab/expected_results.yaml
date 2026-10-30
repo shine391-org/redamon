@@ -1,0 +1,372 @@
+# Expected results of the route exposure scan against this lab (plan §14, §22.2).
+#
+# Keyed by service ROLE and path, never by address: the lab takes
+# <prefix>.93-.96 of whatever subnet redamon-network has. `kind` is the
+# finding's exposure_kind; `fields` are exact values the finding must carry.
+# A scenario passes when every expected row is seen AND nothing unexpected is.
+
+roles:
+  main: 93
+  twin: 94
+  hostile: 95
+  outsider: 96
+
+# Every finding a v1 run with all generators on and a bearer profile writes.
+# `needs: openapi` rows need the main spec set as an OpenAPI source (a UI step:
+# openapiSources is closed to MCP); `needs: keep_docs` rows need a crawl that keeps
+# .pdf, which katana's default exclude patterns drop. A scenario opts in with
+# `needs: [...]`. `gen` is the generator that produces the row: turning that
+# generator off must remove the row and nothing else.
+v1_findings:
+  - {role: main, path: /internal/users/export, kind: anonymous_access, fields: {generated_by: found}, gen: found}
+  - {role: main, path: /internal/users/export, kind: sensitive_data, fields: {pii_types: [email]}, gen: found}
+  - {role: main, path: /api/v2/reports/export, kind: anonymous_access, fields: {confidence: 0.9}, expected_by: [openapi], needs: openapi, gen: found}
+  - {role: main, path: /api/v1/orders/42, kind: anonymous_access, fields: {generated_by: version, route_class: old_version, variant_of: /api/v2/orders/42}, expected_by: [version_locked], gen: version}
+  - {role: main, path: /api/admin/export, kind: anonymous_access, fields: {generated_by: seed}, expected_by: [siblings_locked], gen: seed}
+  - {role: main, path: /api/admin/help, kind: anonymous_access, fields: {confidence: 0.4, auth_expected_by: [path_word]}, gen: found}
+  # A disguised login wall (S18b): only a sign-in form, nothing in its path or title the
+  # deterministic page check reads, so it stays a lead; Jev hook B should call it a wall.
+  - {role: main, path: /internal/portal, kind: anonymous_access, expected_by: [path_word], gen: found}
+  - {role: main, path: /api/users/me, kind: sensitive_data, fields: {anon_status: 401, authed_status: 200}, needs_auth: true, gen: found}
+  - {role: main, path: /uploads/invoice-1001.pdf, kind: anonymous_access, fields: {route_class: uploaded_content}, needs_auth: true, needs: keep_docs, gen: found}
+  - {role: main, path: /.git/HEAD, kind: vcs_exposure, fields: {severity: high}, gen: vcs}
+  - {role: main, path: /.git/config, kind: vcs_exposure, fields: {severity: high}, gen: vcs}
+  - {role: main, path: /.env, kind: env_file, fields: {severity: high}, gen: vcs}
+  - {role: main, path: /web.config, kind: config_file, fields: {severity: medium}, gen: vcs}
+  - {role: main, path: /config.php.bak, kind: backup_file, fields: {severity: medium}, gen: backup}
+  - {role: main, path: /backup.zip, kind: backup_file, fields: {severity: medium}, gen: backup}
+  - {role: main, path: /actuator/env, kind: debug_endpoint, fields: {severity: high}, gen: seed}
+  - {role: main, path: /debug/error, kind: debug_page, fields: {anon_status: 500}, gen: found}
+  - {role: main, path: /console, kind: debug_console, fields: {severity: high}, gen: seed}
+  - {role: main, path: /console-open, kind: debug_console, fields: {severity: high}, gen: found}
+  - {role: main, path: /phpinfo.php, kind: debug_page, fields: {severity: medium}, gen: seed}
+  - {role: twin, path: /actuator/env, kind: debug_endpoint, fields: {severity: high}, only_when_role: twin, gen: seed}
+  - {role: hostile, path: /xss-snippet, kind: anonymous_access, gen: found}
+  - {role: hostile, path: /xss-snippet, kind: sensitive_data, gen: found}
+  - {role: hostile, path: /backup.tar.gz, kind: backup_file, note: "HEAD answers 405, so the Range read decides", gen: backup}
+
+# Paths that must produce no finding at all.
+v1_absent:
+  - {role: main, path: /api/v2/orders/42}
+  - {role: main, path: /api/admin/users}
+  - {role: main, path: /api/admin/roles}
+  - {role: main, path: /api/admin/audit}
+  - {role: main, path: /api/status}
+  - {role: main, path: /admin}
+  - {role: hostile, path: /spa/admin}
+  - {role: hostile, path: /api/missing/internal}
+  - {role: hostile, path: /wall/admin}
+  - {role: hostile, path: /redirect-internal}
+
+# v2 rows (plan §14.1/§14.3 v2, §22.7). `gen` may list several generators: the row
+# needs all of them. `cross_host` is off by default and on only when the scenario sets
+# routeExposureCrossHost. `optional` rows may appear or not (never "unexpected").
+v2_findings:
+  - {role: main, path: /actuator/mappings, kind: route_catalog, gen: framework}
+  - {role: main, path: /api/internal/billing/reconcile, kind: anonymous_access, fields: {generated_by: catalog}, gen: [framework, catalog]}
+  - {role: main, path: /actuator/heapdump, kind: debug_endpoint, fields: {severity: high}, gen: framework}
+  - {role: main, path: /_ignition/health-check, kind: debug_console, fields: {severity: high}, gen: framework}
+  - {role: main, path: /api/orders, kind: anonymous_access, fields: {generated_by: sibling}, gen: sibling}
+  - {role: main, path: /api/orders, kind: sensitive_data, fields: {generated_by: sibling}, gen: sibling}
+  - {role: main, path: /api/admin/stats, kind: anonymous_access, fields: {route_class: client_gated}, gen: found}
+  - {role: main, path: /api/profile, kind: sensitive_data, fields: {anon_status: 401, authed_status: 200}, needs_auth: true, gen: found}
+  - {role: main, path: /api/profile, kind: cors_misconfig, fields: {cors_variants: [reflected, "null", suffix, prefix]}, needs_auth: true, gen: cors}
+  - {role: main, path: /api/profile, kind: auth_cacheable, needs_auth: true, gen: cache}
+  - {role: hostile, path: /.git/HEAD, kind: vcs_exposure, fields: {severity: high}, fields_absent: [git_walk_proof], gen: vcs}
+  - {role: twin, path: /internal/users/export, kind: anonymous_access, fields: {generated_by: cross_host}, gen: cross_host}
+  - {role: twin, path: /internal/users/export, kind: sensitive_data, fields: {generated_by: cross_host}, gen: cross_host}
+  # The SPA's admin pages answer a shell; whether it survives the page checks as a
+  # client-gated lead is the agent's (A2) question, not a recon row.
+  - {role: main, path: /admin/dashboard, kind: anonymous_access, optional: true}
+  - {role: main, path: /admin/reports, kind: anonymous_access, optional: true}
+
+# A v2 field on a v1 row: present when its generator is on, absent when off.
+v2_fields:
+  - {role: main, path: /.git/HEAD, kind: vcs_exposure, field: git_walk_proof, value: head>ref>commit, gen: git_walk}
+
+v2_absent:
+  - {role: main, path: /api/internal/billing/close}
+  - {role: main, path: /api/admin/reports}
+  - {role: main, path: /api/orders/7}
+  - {role: hostile, path: /_ignition/health-check}
+  - {role: hostile, path: /api/public-cors}
+
+# Endpoint.anon_status on routes recon already had.
+v1_anon_status:
+  - {role: main, path: /api/v2/orders/42, status: 401}
+
+# Hit-log rules, inside the module's own window (summary.started_at .. finished_at).
+hit_rules:
+  zero_paths: [/logout, /account/reset]
+  only_methods: [GET, HEAD]
+  head_and_range_only: [/backup.zip]
+  never_full_get: [/backup.zip, /backup.tar.gz]
+  # v2: the heap dump is read with HEAD only, and the git walk fetches one object per host.
+  head_only: [/actuator/heapdump]
+  max_per_role: {'^/\.git/objects/': 1}
+  outsider_zero_whole_scan: true
+  rate_slack: 1.10
+
+# Agent campaign: values the transcripts must never contain (matched by rule
+# name; the values themselves come from /tmp/lab-secrets.json at run time).
+agent_leak_rules:
+  static: [lab-token, lab-key, sid=lab-user-1, "@lab.invalid"]
+  from_secrets: [env_db_password, github_token, git_blob_secret, heap_password, heap_aws_key]
+
+scenarios:
+  S1: {phase: v1, roles: [main, hostile], auth: bearer, needs: [openapi, keep_docs], settings: {}}
+  S2: {phase: v1, roles: [main, hostile], auth: none, settings: {}}
+  S3: {phase: v1, roles: [main, hostile], auth: cookie, settings: {}}
+  S4: {phase: v1, roles: [main, hostile], auth: header, settings: {}}
+  S5-seed: {phase: v1, roles: [main], auth: bearer, settings: {routeExposureSeedPaths: false}}
+  S5-vcs: {phase: v1, roles: [main], auth: bearer, settings: {routeExposureVcsFiles: false}}
+  S5-backup: {phase: v1, roles: [main], auth: bearer, settings: {routeExposureBackupFiles: false}}
+  S5-version: {phase: v1, roles: [main], auth: bearer, settings: {routeExposureVersionVariants: false}}
+  S6-compare: {phase: v1, roles: [main], auth: bearer, settings: {routeExposureCompareLoggedIn: false}}
+  S6-pii: {phase: v1, roles: [main], auth: bearer, settings: {routeExposurePiiDetection: false}}
+  S7: {phase: v1, roles: [main, twin], auth: none, settings: {roeExcludedHosts: ["<twin>"]}}
+  S8: {phase: v1, roles: [main], auth: none, settings: {roeGlobalMaxRps: 2}}
+  S10: {phase: v1, roles: [main], auth: none, settings: {stealthMode: true}}
+  S11: {phase: v1, roles: [main, hostile], auth: none, settings: {routeExposureMaxRoutesPerHost: 10, routeExposureMaxRoutesTotal: 50}}
+  # §22.7 reduced v2 campaign.
+  v2-A: {phase: v2, roles: [main, twin, hostile], auth: bearer, needs: [keep_docs], settings: {}}
+  v2-B: {phase: v2, roles: [main, twin, hostile], auth: bearer, needs: [keep_docs],
+         settings: {routeExposureSiblings: false, routeExposureFrameworkSeeds: false,
+                    routeExposureFollowCatalogs: false, routeExposureGitWalk: false,
+                    routeExposureCorsRider: false, routeExposureCacheRider: false,
+                    routeExposureCrossHost: true}}
+  # v3 (§22.7): v2-A's settings with AI in Pipeline and the three Jev hooks, all acting.
+  # The route rows are v2-A's (Jev ranks and orders, never adds or drops); `jev` names the
+  # decision records the run must (or must not) hold, and with no fallback the leads carry
+  # Jev's fields.
+  v3-A: {phase: v2, roles: [main, twin, hostile], auth: bearer, needs: [keep_docs],
+         settings: {aiInPipeline: true, routeExposureJevRank: true, routeExposureJevWallCheck: true,
+                    routeExposureJevAssess: true},
+         jev: {hooks: [route_privacy_rank, route_exposure_wall, route_exposure_assess], fallbacks: 0}}
+
+# Agent campaign (plan §23.13): one block per scenario. `confirm` paths need a
+# vulnerability_confirmed CONFIRMS edge at confidence >= 80 from the session;
+# `reject` paths must have none; `may_confirm` paths are allowed either way.
+# `hits.count` maps a regex over the request path (query included) to a count.
+agent:
+  AG1:
+    prompt: "Confirm the route exposure leads recon found"
+    confirm: [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export, /api/users/me, /uploads/invoice-1001.pdf]
+    reject: [/api/admin/help]
+    # The L6 handoff (AG4) switches skill inside the same session, so the next
+    # skill may confirm its own artifacts there.
+    may_confirm: [/xss-snippet, /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    transcript_has: ["/api/admin/help", "CONFIRMS"]
+    hits: {only_methods: [GET, HEAD, OPTIONS]}
+  AG4:
+    # The handoff's second half (plan: "then, in a later turn or session, to rce"),
+    # for when AG1's session spent its recon budget after the path_traversal switch:
+    # a later session with AG1's prompt finds only the rce group left and switches.
+    prompt: "Confirm the route exposure leads recon found"
+    may_confirm: [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export,
+                  /api/users/me, /uploads/invoice-1001.pdf,
+                  /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    reject: [/api/admin/help]
+    transcript_has: ['"attack_path_type": "rce"']
+    hits:
+      only_methods: [GET, HEAD, OPTIONS]
+      count:
+        '^/console-open\?.*__debugger__': {max: 0}
+  AG2:
+    prompt: "Confirm the route exposure leads recon found"
+    # Module off: the prompt carries no route exposure part (checked on the logged
+    # prompt) and no LEAD may be confirmed, since its proof standard is the module's
+    # part (the chain writer enforces it). The scan's signature findings are still in
+    # the graph, and an ordinary access-control session may re-check them.
+    reject: [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export,
+             /api/users/me, /uploads/invoice-1001.pdf, /api/admin/help]
+    may_confirm: [/xss-snippet, /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    hits: {only_methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]}
+  AG3:
+    prompt: "Confirm the route exposure leads recon found"
+    # access_control off: no LEAD may be confirmed (the chain writer lands a lead's
+    # CONFIRMS edge only from access_control, module on). rce and path_traversal stay on, and
+    # an unrouted session may switch to them and re-check their signature findings.
+    reject: [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export,
+             /api/users/me, /uploads/invoice-1001.pdf, /api/admin/help]
+    may_confirm: [/xss-snippet, /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    hits: {only_methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]}
+  AG5:
+    prompt: "Prove the exposed .git and .env files recon found"
+    confirm: [/.env, /web.config, /config.php.bak, /backup.zip]
+    may_confirm: [/.git/HEAD, /.git/config]
+    hits:
+      only_methods: [GET, HEAD]
+      never_full_get: [/backup.zip, /backup.tar.gz]
+      count:
+        '^/\.git/': {min: 3, max: 4}
+  AG6:
+    prompt: "Prove the exposed .git and .env files recon found"
+    # Validation is on in both: one identity call for the .env's fake GitHub token.
+    transcript_has: ["api.github.com"]
+    confirm: [/.env, /web.config, /config.php.bak, /backup.zip]
+    # The exploitation-phase session may run its L6 handoff to rce, as AG1 does.
+    may_confirm: [/.git/HEAD, /.git/config,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    hits:
+      only_methods: [GET, HEAD]
+      count:
+        '^/\.git/objects/': {min: 2}
+  AG7:
+    prompt: "Prove the exposed .git and .env files recon found"
+    # Validation is on in both: one identity call for the .env's fake GitHub token.
+    transcript_has: ["api.github.com"]
+    confirm: [/.env, /web.config, /config.php.bak, /backup.zip]
+    may_confirm: [/.git/HEAD, /.git/config,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    hits:
+      only_methods: [GET, HEAD]
+      count:
+        '^/\.git/': {min: 3, max: 4}
+  AG8:
+    prompt: "Check the debug consoles recon found, without exploiting them"
+    # The prompt says "without exploiting": the agent may skip the unlocked console's
+    # 1+1 (AG8b asks for it). Ignition and the heap dump are v2 framework seeds:
+    # their checks run after v2 recon, in the A2 pass.
+    confirm: [/console, /actuator/env]
+    may_confirm: [/console-open, /_ignition/health-check, /debug/error, /phpinfo.php]
+    hits:
+      only_methods: [GET, HEAD]
+      count:
+        '^/console\?.*__debugger__': {max: 0}
+        '^/console-open\?.*__debugger__': {max: 1}
+        '^/_ignition/execute-solution': {max: 0}
+        '^/actuator/heapdump': {max: 0, method: GET}
+  AG8b:
+    # Not in the plan: AG8's prompt forbids exploiting, so the unlocked console's
+    # single 1+1 (its proof, an exploitation-phase request) is asked for here.
+    prompt: "Prove whether the unlocked debug console recon found really executes code, with one harmless evaluation"
+    confirm: [/console-open]
+    may_confirm: [/console, /actuator/env, /debug/error, /phpinfo.php]
+    transcript_has: ["exploit_success"]
+    hits:
+      only_methods: [GET, HEAD]
+      count:
+        '^/console\?.*__debugger__': {max: 0}
+        '^/console-open\?.*__debugger__': {exactly: 1}
+  AG9:
+    prompt: "Check the debug consoles recon found, without exploiting them"
+    confirm: [/console, /actuator/env]
+    may_confirm: [/console-open, /_ignition/health-check, /debug/error, /phpinfo.php, /actuator/heapdump]
+    hits:
+      only_methods: [GET, HEAD]
+      count:
+        '^/actuator/heapdump': {exactly: 1, method: GET}
+        '^/console\?.*__debugger__': {max: 0}
+  AG10:
+    prompt: "Replay the captured export request anonymously"
+    # The access_control session may run its own L6 handoff afterwards, as in AG1.
+    may_confirm: [/internal/users/export, /api/v2/reports/export, /api/admin/export,
+                  /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    # The plan's check: the anonymous replay reaches the lab with the credential
+    # stripped (a non-credentialed GET to an export route), and no value leaks.
+    # A credentialed baseline replay alongside it is allowed (replay's own diff).
+    hits: {only_methods: [GET, HEAD, OPTIONS], anonymous_export_replay: true}
+    captures: true
+  AG11:
+    prompt: "Render the profile page and compare its fields with the API"
+    # The access-control leads part runs first, so the session may confirm any true
+    # lead it re-checks on the way to the render; the render + diff is the subject.
+    may_confirm: [/api/users/me, /internal/users/export, /api/v2/reports/export,
+                  /api/v1/orders/42, /api/admin/export, /uploads/invoice-1001.pdf]
+    # The diff names the fields the API returns and the page never renders, as key
+    # names only; the leak scan proves no value came with them.
+    transcript_has: ["password_hash", "reset_token"]
+    hits: {only_methods: [GET, HEAD, OPTIONS], outsider_widget: true}
+  AG12:
+    # REQUIRE_TOOL_CONFIRMATION on: every gated tool (DANGEROUS_TOOLS) runs only after an
+    # approval click; the operator denies the first execute_curl, and that call is never
+    # sent again with the same arguments.
+    prompt: "Confirm the route exposure leads recon found"
+    may_confirm: [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export,
+                  /api/users/me, /uploads/invoice-1001.pdf,
+                  /xss-snippet, /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    reject: [/api/admin/help]
+    tool_confirmation: true
+    hits: {only_methods: [GET, HEAD, OPTIONS]}
+  # AG13: each prompt routes to its skill when the skill is on, and never to it when off.
+  # Routing is decided at the first turn, so a session may be stopped once classified.
+  AG13-ac-on:
+    prompt: "Check the unauthenticated internal routes recon found"
+    route: access_control
+    may_confirm: &ag13_any [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export,
+                  /api/users/me, /uploads/invoice-1001.pdf,
+                  /xss-snippet, /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    hits: {only_methods: [GET, HEAD, OPTIONS]}
+  AG13-ac-off:
+    prompt: "Check the unauthenticated internal routes recon found"
+    route_not: access_control
+    # With access_control off, no lead may be confirmed (AG3's rule).
+    reject: [/internal/users/export, /api/v2/reports/export, /api/v1/orders/42, /api/admin/export,
+             /api/users/me, /uploads/invoice-1001.pdf, /api/admin/help]
+    may_confirm: [/xss-snippet, /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /debug/error, /phpinfo.php]
+    hits: {only_methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]}
+  AG13-pt-on:
+    prompt: "Prove the exposed .git recon found"
+    route: path_traversal
+    may_confirm: *ag13_any
+    hits: {only_methods: [GET, HEAD]}
+  AG13-pt-off:
+    prompt: "Prove the exposed .git recon found"
+    route_not: path_traversal
+    may_confirm: *ag13_any
+    hits: {only_methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]}
+  AG13-rce-on:
+    prompt: "Check the debug console recon found"
+    route: rce
+    may_confirm: *ag13_any
+    hits:
+      only_methods: [GET, HEAD]
+      count:
+        '^/console\?.*__debugger__': {max: 0}
+  AG13-rce-off:
+    prompt: "Check the debug console recon found"
+    route_not: rce
+    may_confirm: *ag13_any
+    hits:
+      only_methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]
+      count:
+        '^/console\?.*__debugger__': {max: 0}
+  AG15:
+    # Regression on a project that never had the module: an ordinary access-control
+    # session, and no route exposure text anywhere in its transcript.
+    prompt: "Check whether the order API at http://172.28.0.93/api/v2/orders/42 enforces authentication"
+    route: access_control
+    no_edges: true
+    transcript_lacks: ["route_exposure", "Route exposure", "ROUTE EXPOSURE", "recon's route-exposure"]
+    hits: {only_methods: [GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE]}
+  AG16-17:
+    # A2 (plan §23.13.5): AG16 (CORS + cache) and AG17 (client-side gating) in one
+    # access_control session, on the v2-A project.
+    prompt: "Check the CORS, cache and client-side gated leads recon found"
+    confirm: [/api/profile, /api/admin/stats]
+    confirm_kinds: {/api/profile: [cors_misconfig, auth_cacheable]}
+    # The hidden page itself may be confirmed with its API; its 401-backed twin must not.
+    reject: [/admin/reports, /api/admin/reports, /api/public-cors]
+    may_confirm: [/admin/dashboard, /internal/users/export, /api/v2/reports/export, /api/v1/orders/42,
+                  /api/admin/export, /api/users/me, /uploads/invoice-1001.pdf, /api/orders,
+                  /api/internal/billing/reconcile,
+                  /.env, /.git/HEAD, /.git/config, /web.config, /config.php.bak, /backup.zip,
+                  /console, /console-open, /actuator/env, /actuator/heapdump, /actuator/mappings,
+                  /_ignition/health-check, /debug/error, /phpinfo.php]
+    transcript_has: ["execute_playwright", "rdmncb="]
+    workspace_files: [evidence/cors-]
+    hits:
+      only_methods: [GET, HEAD, OPTIONS]
+      origins_min: {/api/profile: 4}
+      anonymous_paths: [/admin/dashboard]
+      count:
+        'rdmncb=': {min: 2}

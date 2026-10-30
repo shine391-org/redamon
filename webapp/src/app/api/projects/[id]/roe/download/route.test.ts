@@ -113,3 +113,16 @@ describe('headers', () => {
     expect(downloadContentType(null)).toBe('application/octet-stream')
   })
 })
+
+test('a database failure answers the fixed sentence and the Prisma code', async () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  mockGetEffectiveUser.mockResolvedValue({ userId: 'owner' })
+  mockFindUnique.mockImplementation((args: { select?: Record<string, boolean> }) =>
+    args?.select?.userId
+      ? Promise.resolve({ id: 'proj-Y', userId: 'owner' })
+      : Promise.reject(Object.assign(new Error('Timed out fetching a new connection'), { code: 'P2024' })),
+  )
+  const res = await get()
+  expect(res.status).toBe(500)
+  expect(await res.json()).toEqual({ error: 'Failed to download RoE document', code: 'P2024' })
+})

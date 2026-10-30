@@ -17,27 +17,59 @@
  */
 import prisma from '@/lib/prisma'
 import { agentFetch } from '@/lib/agentFetch'
+import { upstreamFailure } from '@/lib/routeErrors'
 
 export type AgentSessionState = 'running' | 'idle' | 'unverified'
 
 const LIVE_CHECK_TIMEOUT_MS = 5_000
 
-/** Session ids the agent holds a running task for, or null when it could not say. */
-async function liveSessionIds(projectId: string): Promise<Set<string> | null> {
+/**
+ * Why the agent could not say which sessions are live: `agent_unreachable` or
+ * `agent_timeout` (with the errno as `cause`) when it never answered, `agent_error` with
+ * its HTTP status when it answered with an error, `agent_bad_answer` when the answer had no
+ * session list. Codes and a status only, safe to show.
+ */
+export interface LiveCheckFailure {
+  code: 'agent_unreachable' | 'agent_timeout' | 'agent_error' | 'agent_bad_answer'
+  upstreamStatus?: number
+  cause?: string
+}
+
+async function liveSessions(projectId: string): Promise<{ ids: Set<string> } | { failure: LiveCheckFailure }> {
+  let res: Response
   try {
-    const res = await agentFetch(
+    res = await agentFetch(
       `/agent-sessions/live?project_id=${encodeURIComponent(projectId)}`,
       { method: 'GET' },
       { timeoutMs: LIVE_CHECK_TIMEOUT_MS },
     )
-    if (!res.ok) return null
-    const ids = (await res.json())?.session_ids
-    if (!Array.isArray(ids)) return null
-    return new Set(ids.filter((id): id is string => typeof id === 'string'))
   } catch (err) {
     console.error('[agentSessions] live-session check failed (treating a set flag as running):', err)
-    return null
+    // AgentUnreachableError keeps the fetch failure, with its errno, in `cause_`.
+    const { body } = upstreamFailure('agent', (err as { cause_?: unknown } | null)?.cause_ ?? err, '')
+    return { failure: { code: body.code as LiveCheckFailure['code'], ...(body.cause ? { cause: body.cause } : {}) } }
   }
+  if (!res.ok) {
+    console.warn(`[agentSessions] live-session check: the agent answered HTTP ${res.status} (treating a set flag as running)`)
+    return { failure: { code: 'agent_error', upstreamStatus: res.status } }
+  }
+  let ids: unknown
+  try {
+    ids = (await res.json())?.session_ids
+  } catch {
+    ids = undefined
+  }
+  if (!Array.isArray(ids)) {
+    console.warn('[agentSessions] live-session check: the agent answered without a session list (treating a set flag as running)')
+    return { failure: { code: 'agent_bad_answer', upstreamStatus: res.status } }
+  }
+  return { ids: new Set(ids.filter((id): id is string => typeof id === 'string')) }
+}
+
+/** Session ids the agent holds a running task for, or null when it could not say. */
+async function liveSessionIds(projectId: string): Promise<Set<string> | null> {
+  const live = await liveSessions(projectId)
+  return 'ids' in live ? live.ids : null
 }
 
 /**
@@ -77,24 +109,33 @@ export async function checkAgentSessions(projectId: string): Promise<AgentSessio
  * stale and cleared, conditionally, as checkAgentSessions does. A flag that changed
  * between the read and the clear may be a run that just started: it counts as running.
  */
-export async function sessionRunningState(conversation: {
+export async function sessionRunningState(conversation: SessionRow): Promise<boolean | 'unverified'> {
+  return (await sessionRunningCheck(conversation)).running
+}
+
+interface SessionRow {
   id: string
   projectId: string
   sessionId: string
   agentRunning: boolean
   updatedAt: Date
-}): Promise<boolean | 'unverified'> {
-  const live = await liveSessionIds(conversation.projectId)
-  if (!live) return 'unverified'
-  if (live.has(conversation.sessionId)) return true
-  if (!conversation.agentRunning) return false
+}
+
+/** `sessionRunningState`, plus why the agent could not be asked when it is 'unverified'. */
+export async function sessionRunningCheck(
+  conversation: SessionRow,
+): Promise<{ running: boolean | 'unverified'; failure?: LiveCheckFailure }> {
+  const live = await liveSessions(conversation.projectId)
+  if (!('ids' in live)) return { running: 'unverified', failure: live.failure }
+  if (live.ids.has(conversation.sessionId)) return { running: true }
+  if (!conversation.agentRunning) return { running: false }
   const res = await prisma.conversation.updateMany({
     where: { id: conversation.id, agentRunning: true, updatedAt: conversation.updatedAt },
     data: { agentRunning: false },
   })
-  if (res.count === 0) return true
+  if (res.count === 0) return { running: true }
   console.warn(`[agentSessions] cleared a stale agentRunning flag on session ${conversation.sessionId}`)
-  return false
+  return { running: false }
 }
 
 /** The phrase describeLiveGraphWriters and the MCP busy messages use, or null when idle. */

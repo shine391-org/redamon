@@ -66,7 +66,7 @@ import yaml
 
 root = sys.argv[1]
 doc = yaml.safe_load(open(os.path.join(root, "docker-compose.yml")))
-project = doc.get("name") or os.path.basename(root).lower()
+project = os.environ.get("COMPOSE_PROJECT_NAME") or doc.get("name") or os.path.basename(root).lower()
 tracked = [f for f in subprocess.run(["git", "-C", root, "ls-files"], capture_output=True,
                                      text=True, check=True).stdout.split("\n") if f]
 BUILD_NAMES = re.compile(r"(Dockerfile|requirements[^/]*|constraints[^/]*|entrypoint[^/]*|package(-lock)?\.json)$")
@@ -118,7 +118,7 @@ for svc, spec in doc["services"].items():
         if host.startswith("./"):
             print(f"BIND\t{svc}\t{os.path.normpath(host)}")
 PYEOF
-listing="$(python3 -c "$PY" "$REPO_ROOT")" || { fail "could not read the compose build graph"; listing=""; }
+listing="$(COMPOSE_PROJECT_NAME="$(compose_project_name)" python3 -c "$PY" "$REPO_ROOT")" || { fail "could not read the compose build graph"; listing=""; }
 
 declare -A image_of=()
 binds=()

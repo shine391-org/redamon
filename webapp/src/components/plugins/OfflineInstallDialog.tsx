@@ -32,7 +32,21 @@ interface OfflineInstallDialogProps {
   onCancel: () => void
 }
 
+/** WebCrypto exists only in a secure context: HTTPS, or localhost. */
+class NoWebCryptoError extends Error {}
+
+/** One catch covers reading both files and hashing; each failure says which it was. */
+function inspectFailure(e: unknown): string {
+  if (e instanceof NoWebCryptoError) {
+    return 'This page is not served over HTTPS (or localhost), so the browser cannot hash the archive to find it in the catalog. Open RedAmon over HTTPS to install from file.'
+  }
+  if (e instanceof SyntaxError) return 'The catalog file is not JSON, so it is not a plugin catalog.'
+  const name = e instanceof Error && e.name !== 'Error' ? e.name : null
+  return `The catalog file is not a plugin catalog${name ? ` (${name})` : ''}.`
+}
+
 async function sha256Hex(file: File): Promise<string> {
+  if (typeof crypto === 'undefined' || !crypto.subtle) throw new NoWebCryptoError()
   // Copied into this realm's typed array: jsdom (the tests) hands out ArrayBuffers WebCrypto refuses.
   const digest = await crypto.subtle.digest('SHA-256', Uint8Array.from(new Uint8Array(await file.arrayBuffer())))
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -106,8 +120,8 @@ export function OfflineInstallDialog({ isOpen, busy = false, installed = {}, res
         }
       }
       if (!next) why = 'This catalog does not list this archive.'
-    } catch {
-      why = 'The catalog file is not a plugin catalog.'
+    } catch (e) {
+      why = inspectFailure(e)
     }
     if (turn !== latest.current) return
     setFound(next)

@@ -11,10 +11,10 @@
  * Run: npx vitest run src/hooks/useAgentWebSocket.test.tsx
  */
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
-import { renderHook, act, waitFor } from '@testing-library/react'
+import { renderHook, act, waitFor, cleanup } from '@testing-library/react'
 import { ConnectionStatus } from '@/lib/websocket-types'
 
-vi.mock('./agentWsUrl', () => ({ buildAgentWsUrl: () => 'ws://agent.test/ws/agent' }))
+vi.mock('./agentWsUrl', () => ({ buildAgentWsUrl: () => 'ws://agent.test/ws/agent?probe=1' }))
 
 import { useAgentWebSocket } from './useAgentWebSocket'
 
@@ -34,8 +34,9 @@ class FakeSocket {
     FakeSocket.instances.push(this)
   }
   send(data: string) { this.sent.push(data) }
-  close() { /* the hook detaches handlers before calling this */ }
-  fireClose(code: number) { this.onclose?.({ code, reason: '', wasClean: false } as CloseEvent) }
+  closed = false
+  close() { this.closed = true /* the hook detaches handlers before calling this */ }
+  fireClose(code: number, reason = '') { this.onclose?.({ code, reason, wasClean: false } as CloseEvent) }
 }
 
 const config = {
@@ -248,5 +249,124 @@ describe('useAgentWebSocket outbox is per session', () => {
     const s2 = FakeSocket.instances[1]
     await openAndConnect(s2)
     expect(sentTypes(s2)).not.toContain('stop')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// G-1 / G-2 / G-43: the drawer is told why the socket is not connected.
+// ---------------------------------------------------------------------------
+
+function stubMint(status: number, body: unknown) {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), {
+    status, headers: { 'Content-Type': 'application/json' },
+  })))
+}
+
+describe('useAgentWebSocket says why it is not connected', () => {
+  // A hook left mounted keeps reconnecting into the next test's sockets.
+  afterEach(() => { cleanup() })
+
+  test('a refused ticket mint stops with its own reason, not the auth hint, and sends no init', async () => {
+    stubMint(409, { error: 'A version activation is in progress for this project - the graph is being swapped. Try again once it finishes.' })
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+
+    await waitFor(() => expect(result.current.status).toBe(ConnectionStatus.FAILED))
+    expect(result.current.error?.message).toBe(
+      'Could not get a ticket for the agent connection: A version activation is in progress for this project - the graph is being swapped. Try again once it finishes. (HTTP 409)',
+    )
+    expect(result.current.error?.message).not.toContain('redamon.sh update')
+    expect(sock.sent).toHaveLength(0)
+    expect(sock.closed).toBe(true)
+    await new Promise(r => setTimeout(r, 40))
+    expect(FakeSocket.instances).toHaveLength(1)
+  })
+
+  test('an expired session at mint time says 401', async () => {
+    stubMint(401, { error: 'Unauthorized' })
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    await act(async () => { FakeSocket.instances[0].onopen?.() })
+    await waitFor(() => expect(result.current.error?.message).toBe(
+      'Could not get a ticket for the agent connection: Unauthorized (HTTP 401)',
+    ))
+  })
+
+  test('the update hint appears only when a ticket secret is really missing', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+    await waitFor(() => expect(sock.sent).toHaveLength(1))   // a ticket was minted and sent
+    act(() => { sock.fireClose(1008, 'Invalid or missing ticket') })
+    expect(result.current.error?.message).toContain('the agent rejected the session ticket (close 1008: Invalid or missing ticket)')
+    expect(result.current.error?.message).not.toContain('redamon.sh update')
+  })
+
+  test('an agent without the secret says so, with the update hint', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+    await waitFor(() => expect(sock.sent).toHaveLength(1))
+    act(() => { sock.fireClose(1008, 'ticket auth not configured') })
+    expect(result.current.error?.message).toBe(
+      'Agent WebSocket authentication failed: the agent has no AGENT_WS_TICKET_SECRET. Run ./redamon.sh update, then restart the agent.',
+    )
+  })
+
+  test('the close code and reason are kept while reconnecting, and the URL has no query', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    expect(result.current.url).toBe('ws://agent.test/ws/agent')
+    act(() => { FakeSocket.instances[0].fireClose(1011, 'Orchestrator not initialized') })
+    expect(result.current.status).toBe(ConnectionStatus.RECONNECTING)
+    expect(result.current.lastClose).toEqual({ code: 1011, reason: 'Orchestrator not initialized' })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    expect(result.current.lastClose).toEqual({ code: 1011, reason: 'Orchestrator not initialized' })
+  })
+
+  test('giving up names the last close and the URL', async () => {
+    const { result } = renderHook(() => useAgentWebSocket({ ...config, maxReconnectAttempts: 1 }))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    act(() => { FakeSocket.instances[0].fireClose(1013, 'Server busy (low memory) - retry shortly') })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    act(() => { FakeSocket.instances[1].fireClose(1013, 'Server busy (low memory) - retry shortly') })
+    expect(result.current.status).toBe(ConnectionStatus.FAILED)
+    expect(result.current.error?.message).toBe(
+      'Max reconnection attempts reached (last close 1013: Server busy (low memory) - retry shortly) · ws://agent.test/ws/agent',
+    )
+  })
+
+  test('a connect clears the kept close', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    act(() => { FakeSocket.instances[0].fireClose(1006) })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    await openAndConnect(FakeSocket.instances[1])
+    expect(result.current.lastClose).toBeNull()
+  })
+
+  test('decisions report whether they were sent instead of vanishing', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    let sent: boolean[] = []
+    act(() => {
+      sent = [
+        result.current.sendApproval('approve'),
+        result.current.sendAnswer('yes'),
+        result.current.sendToolConfirmation('approve'),
+        result.current.sendFireteamMemberConfirmation('w', 'm', 'approve'),
+      ]
+    })
+    expect(sent).toEqual([false, false, false, false])
+    await openAndConnect(FakeSocket.instances[0])
+    // Not queued: nothing replays after the connect.
+    expect(sentTypes(FakeSocket.instances[0])).toEqual(['init'])
+    act(() => { sent = [result.current.sendApproval('approve')] })
+    expect(sent).toEqual([true])
+    expect(sentTypes(FakeSocket.instances[0])).toEqual(['init', 'approval'])
   })
 })

@@ -4,6 +4,7 @@ import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { reportCountable } from '@/lib/triage/reportable'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -109,11 +110,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Red-zone paramMatrix error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Red-zone paramMatrix error' })
   } finally {
     await session.close()
   }

@@ -276,6 +276,8 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 
     // --- Security checks: all enabled ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: true,
     securityCheckDirectIpHttp: true,
     securityCheckDirectIpHttps: true,

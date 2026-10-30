@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { readFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
@@ -57,11 +58,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     })
 
   } catch (error) {
-    console.error('Error downloading recon data:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to read the recon data', { log: 'Error downloading recon data' })
   }
 }
 

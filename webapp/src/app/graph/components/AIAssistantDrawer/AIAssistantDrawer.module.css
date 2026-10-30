@@ -627,6 +627,33 @@
   row-gap: var(--space-1);
 }
 
+.connectionDetail {
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--status-error, #ef4444);
+  overflow-wrap: anywhere;
+}
+
+.connectionDetailMuted {
+  color: var(--text-tertiary);
+}
+
+.skillDataNotice {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px var(--space-3, 12px);
+  font-size: 10px;
+  color: var(--status-warning, #f59e0b);
+  overflow-wrap: anywhere;
+}
+
+.decisionNotConnected {
+  margin: 0 var(--space-3, 12px) var(--space-2, 8px);
+  font-size: 11px;
+  color: var(--status-error, #ef4444);
+}
+
 .sessionCode {
   font-size: 10px;
   font-family: var(--font-mono, monospace);

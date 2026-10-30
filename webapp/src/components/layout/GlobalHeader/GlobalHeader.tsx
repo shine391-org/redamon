@@ -30,7 +30,7 @@ export function GlobalHeader() {
     // their project). Only the TrafficMind *settings* (egress guard, master
     // switch) are admin-only, gated in Global Settings.
     { label: 'TrafficMind', href: '/traffic', icon: <Network size={14} /> },
-    { label: 'Plugins', href: '/plugins', icon: <Puzzle size={14} />, isNew: true },
+    { label: 'Plugins', href: '/plugins', icon: <Puzzle size={14} /> },
     { label: 'Reports', href: '/reports', icon: <FileText size={14} /> },
   ]
 

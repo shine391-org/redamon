@@ -31,6 +31,31 @@ def serialize_for_json(obj):
 logger = logging.getLogger(__name__)
 
 
+def _error_details(exc: BaseException) -> dict:
+    """What an ERROR frame may say about an exception: its class and, for a
+    provider error, the HTTP status the provider answered. Never its text: a
+    provider message can quote part of a key or the prompt, a Neo4j one the
+    Cypher with target data. The text goes to the log."""
+    from llm_builder import provider_error_details
+    return provider_error_details(exc)
+
+
+def _invalid_fields(exc: ValidationError) -> list:
+    """The paths of the fields a client frame got wrong, never their values."""
+    paths = {".".join(str(part) for part in err.get("loc", ())) for err in exc.errors()}
+    return sorted(p for p in paths if p)[:10]
+
+
+def _invalid_frame(message: str, exc: ValidationError, recoverable: bool) -> dict:
+    fields = _invalid_fields(exc)
+    return {
+        "message": f"{message}: {', '.join(fields)}" if fields else message,
+        "code": "invalid_frame",
+        "fields": fields,
+        "recoverable": recoverable,
+    }
+
+
 def _governed_max_sessions():
     """Concurrent agent-session ceiling byte-budgeted to available RAM, or None to
     not cap. Each session holds a full agent state (~measured envelope), so this
@@ -582,6 +607,7 @@ class StreamingCallback:
         # Ordered persistence queue — messages are saved one-at-a-time in FIFO order
         self._persist_queue: asyncio.Queue = asyncio.Queue()
         self._persist_worker_task: Optional[asyncio.Task] = None
+        self._persist_failure_reported = False
 
     def _ensure_persist_worker(self):
         """Lazily start the background persist worker."""
@@ -600,7 +626,7 @@ class StreamingCallback:
             else:
                 msg_type, data, agent_id_key, fireteam_id_key = item
             try:
-                await save_chat_message(
+                failure = await save_chat_message(
                     session_id=self._session_id,
                     msg_type=msg_type,
                     data=data,
@@ -611,8 +637,27 @@ class StreamingCallback:
                 )
             except Exception as e:
                 logger.warning(f"Persist worker error: {e}")
+                failure = {"error_class": type(e).__name__}
+            try:
+                if isinstance(failure, dict) and not self._persist_failure_reported:
+                    self._persist_failure_reported = True
+                    await self._report_persist_failure(failure)
             finally:
                 self._persist_queue.task_done()
+
+    async def _report_persist_failure(self, failure: dict):
+        """Say once per run that the chat is not being saved. The live stream is
+        still complete; a reload would show a timeline with holes in it."""
+        try:
+            await self.connection.send_message(MessageType.ERROR, {
+                "message": "The chat is not being saved: messages from this run "
+                           "may be missing after a reload",
+                "code": "persist_failed",
+                "recoverable": True,
+                **failure,
+            })
+        except Exception:
+            logger.debug("persist_failed notice not sent", exc_info=True)
 
     async def drain_persist_queue(self):
         """Wait for all pending persist messages to be saved, then stop the worker."""
@@ -1162,9 +1207,14 @@ class StreamingCallback:
         """Called after each execution step"""
         await self.connection.send_message(MessageType.EXECUTION_STEP, step)
 
-    async def on_error(self, error_message: str, recoverable: bool = True):
-        """Called when error occurs"""
+    async def on_error(self, error_message: str, recoverable: bool = True,
+                       code: str = "", **details):
+        """Called when error occurs. `code` and `details` (an exception class, a
+        provider HTTP status, a model id) say why; never an exception's text."""
         payload = {"message": error_message, "recoverable": recoverable}
+        if code:
+            payload["code"] = code
+        payload.update(details)
         await self.connection.send_message(MessageType.ERROR, payload)
         self._persist("error", payload)
 
@@ -1241,10 +1291,13 @@ class WebSocketHandler:
             session_id = init_msg.session_id
             verified = False
 
-            async def _reject_ticket(reason: str):
+            # The reasons are fixed text, safe to show; the drawer tells a
+            # missing secret from a rejected ticket by the code.
+            async def _reject_ticket(reason: str, code: str):
                 logger.warning("Rejected /ws/agent init: %s", reason)
                 await connection.send_message(MessageType.ERROR, {
-                    "message": "WebSocket authentication failed",
+                    "message": f"WebSocket authentication failed: {reason}",
+                    "code": code,
                     "recoverable": False,
                 })
                 try:
@@ -1254,12 +1307,12 @@ class WebSocketHandler:
 
             if not secret:
                 # Fail closed: no secret configured means we cannot attest identity.
-                await _reject_ticket("ticket auth not configured")
+                await _reject_ticket("ticket auth not configured", "ws_ticket_not_configured")
                 return
 
             claims = verify_ws_ticket(init_msg.ticket, secret)
             if claims is None:
-                await _reject_ticket("Invalid or missing ticket")
+                await _reject_ticket("Invalid or missing ticket", "ws_ticket_invalid")
                 return
             # Identity comes from the verified ticket, not the client body.
             user_id = str(claims["sub"])
@@ -1328,10 +1381,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid init message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid initialization message",
-                "recoverable": False
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid initialization message", e, False))
 
     async def _finish_run(self, connection: WebSocketConnection, callback: 'StreamingCallback'):
         """Release a finished run: task registration first, then persistence.
@@ -1361,6 +1412,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated. Send init message first.",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1390,10 +1442,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid query message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid query format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid query format", e, True))
 
     async def _run_orchestrator_query(self, connection: WebSocketConnection, question: str, callback):
         """Background coroutine that runs the orchestrator invocation."""
@@ -1414,7 +1464,9 @@ class WebSocketHandler:
             logger.error(f"Error processing query: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing query: {str(e)}",
+                    "message": "Error processing query",
+                    "code": "query_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
@@ -1430,6 +1482,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1456,10 +1509,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid approval message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid approval format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid approval format", e, True))
 
     async def _run_orchestrator_approval(self, connection: WebSocketConnection, approval_msg: ApprovalMessage, callback):
         """Background coroutine that runs approval resumption."""
@@ -1480,7 +1531,9 @@ class WebSocketHandler:
             logger.error(f"Error processing approval: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing approval: {str(e)}",
+                    "message": "Error processing approval",
+                    "code": "approval_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
@@ -1496,6 +1549,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1521,10 +1575,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid answer message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid answer format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid answer format", e, True))
 
     async def _run_orchestrator_answer(self, connection: WebSocketConnection, answer: str, callback):
         """Background coroutine that runs answer resumption."""
@@ -1544,7 +1596,9 @@ class WebSocketHandler:
             logger.error(f"Error processing answer: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing answer: {str(e)}",
+                    "message": "Error processing answer",
+                    "code": "answer_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
@@ -1563,15 +1617,14 @@ class WebSocketHandler:
             msg = FireteamMemberConfirmationMessage(**payload)
         except ValidationError as e:
             logger.error(f"Invalid fireteam_member_confirmation payload: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid fireteam member confirmation payload",
-                "recoverable": True,
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid fireteam member confirmation payload", e, True))
             return
 
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False,
             })
             return
@@ -1612,6 +1665,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1638,10 +1692,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid tool confirmation message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid tool confirmation format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid tool confirmation format", e, True))
 
     async def _run_orchestrator_tool_confirmation(self, connection: WebSocketConnection, confirmation_msg: ToolConfirmationMessage, callback):
         """Background coroutine that runs tool confirmation resumption."""
@@ -1662,7 +1714,9 @@ class WebSocketHandler:
             logger.error(f"Error processing tool confirmation: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing tool confirmation: {str(e)}",
+                    "message": "Error processing tool confirmation",
+                    "code": "tool_confirmation_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
@@ -1678,6 +1732,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1694,10 +1749,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid guidance message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid guidance format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid guidance format", e, True))
 
     async def handle_skill_inject(self, connection: WebSocketConnection, payload: dict):
         """Handle skill injection -- push skill content as a guidance message."""
@@ -1705,6 +1758,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1736,7 +1790,9 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Skill inject failed: {e}")
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Failed to inject skill: {str(e)}",
+                "message": "Failed to inject skill",
+                "code": "skill_inject_failed",
+                **_error_details(e),
                 "recoverable": True
             })
 
@@ -1749,6 +1805,7 @@ class WebSocketHandler:
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False
             })
             return
@@ -1804,6 +1861,7 @@ class WebSocketHandler:
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False,
             })
             return
@@ -1811,10 +1869,8 @@ class WebSocketHandler:
             msg = ToolStopMessage(**payload)
         except ValidationError as e:
             logger.error(f"Invalid tool_stop message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid tool_stop payload",
-                "recoverable": True,
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid tool_stop payload", e, True))
             return
 
         session_key = connection.get_key()
@@ -1839,6 +1895,7 @@ class WebSocketHandler:
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False
             })
             return
@@ -1880,7 +1937,9 @@ class WebSocketHandler:
             logger.error(f"Error resuming execution: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error resuming execution: {str(e)}",
+                    "message": "Error resuming execution",
+                    "code": "resume_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
@@ -1941,7 +2000,9 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error handling message: {e}")
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Internal error: {str(e)}",
+                "message": "Internal error",
+                "code": "internal_error",
+                **_error_details(e),
                 "recoverable": True
             })
 
@@ -1992,7 +2053,9 @@ async def websocket_endpoint(
         logger.error(f"WebSocket error: {e}")
         try:
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Fatal error: {str(e)}",
+                "message": "Fatal error",
+                "code": "fatal_error",
+                **_error_details(e),
                 "recoverable": False
             })
         except:

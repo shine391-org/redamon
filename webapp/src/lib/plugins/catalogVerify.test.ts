@@ -351,6 +351,22 @@ describe('sources and caching', () => {
     expect(e.message).toMatch(/404/)
   })
 
+  test('unreachable names the file that failed; another error is named by its code, never its message', async () => {
+    const { FetchRemoteError } = await import('./fetchRemote')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const sigMissing = async (url: string) => {
+      if (url.endsWith('.sig')) throw new FetchRemoteError('http_error', 'The plugin download answered HTTP 404.', url, 404)
+      return { bytes: catalogOf(1).bytes } as never
+    }
+    const e = await refused(loadCatalog({ source: 'official' }, { fetch: sigMissing, officialKeys: officialKeys(), noCache: true }))
+    expect(e.message).toBe('The plugin catalog could not be downloaded (catalog.json.sig): The plugin download answered HTTP 404.')
+    const odd = async () => {
+      throw Object.assign(new Error('token=abc123 in some library text'), { code: 'ECONNRESET' })
+    }
+    const e2 = await refused(loadCatalog({ source: 'official' }, { fetch: odd, officialKeys: officialKeys(), noCache: true }))
+    expect(e2.message).toBe('The plugin catalog could not be downloaded (catalog.json): ECONNRESET')
+  })
+
   test('the default fetch is the guarded fetchRemote (an http catalog URL is refused)', async () => {
     const server = await startFakeServer({ '/catalog.json': { body: catalogOf(1).bytes } })
     process.env.PLUGINS_CATALOG_URL = `${server.baseUrl}/catalog.json`

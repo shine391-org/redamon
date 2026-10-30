@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.5.0] - 2026-10-29
+
+Route exposure findings the agent can confirm, skills up to 500 KB, and errors that say why.
+
+### Added
+
+- **Route exposure scan** (recon, GROUP 6 Phase A, off by default). It requests the routes recon found, plus internal, admin and debug paths, `.git`/`.env`/`web.config` files, backup copies and older API versions, anonymously and, where the authentication profile covers the host, logged in. It writes leads for the agent (a route open without credentials where authentication was expected, or a response carrying sensitive fields or other people's personal data) and findings a signature proves (exposed version control, env, config and backup files, debug consoles and endpoints, debug pages, route catalogs, secrets). GET and HEAD only, never a state-changing path, personal data stored as kinds and a count. Leads stay out of reports until the agent confirms them; findings are classed and grouped on the Priority Board; a Route Exposure tab joins the Red Zone; partial recon supports it.
+  - **Upgrade.** `docker compose exec webapp npx prisma db push`, rebuild `agent` and `webapp`, restart `recon-orchestrator`.
+- **Route exposure finds more, and checks two browser holes.** Siblings of each API route (`/export`, `/all`, `/list`, the collection, an inserted `admin` or `internal`), framework paths from the host's detected technologies (Spring actuator, Laravel Ignition, Django and Rails debug routes; a heap dump only with HEAD), one follow-up round over the routes an open catalog lists (actuator mappings, an OpenAPI document, the Rails route table), an optional cross-host round (off by default), and a bounded `.git` walk to its commit object that proves a real repository without fetching a file. On a personalised logged-in answer it checks for a credentialed CORS reflection (four hostile origins) and for logged-in content a shared cache would serve (`cors_misconfig` and `auth_cacheable` leads), and it tags an API hidden only by the browser's router as `client_gated`. Seven switches, all on except cross-host.
+  - **Upgrade.** `docker compose exec webapp npx prisma db push`, rebuild `agent` and `webapp`, restart `recon-orchestrator`.
+- **The agent works the route exposure scan's results.** While the scan is on, three existing skills gain steps, with no new skill to enable: Access Control confirms or rejects each lead with an anonymous and a logged-in request, Path Traversal proves the exposed files, and RCE proves the debug consoles without exploiting them. Each proof is recorded against the finding's id and moves it to T1. Bodies stay in files in the Kali sandbox, so no value reaches the conversation. Three switches, off by default and also gated by the Rules of Engagement: reconstruct an exposed `.git`, validate the secrets found in exposed files, analyse an exposed heap dump. With Access Control off, the scan's settings show a "Half a cycle" alert.
+- **The agent proves the browser leads.** Access Control confirms a CORS lead with the logged-in request once per hostile origin and a proof-of-concept page written to the sandbox, never served; a cache lead with a unique cache-buster read logged in, then anonymously; a client-gated API by rendering, without the session, the hidden pages recon read from the same bundle, then the anonymous and logged-in pair. A page whose API answers 401 is correct and rejected.
+- **Jev steers the route exposure scan.** Three Jev-only hooks, off by default and gated by AI in Pipeline. Jev's reading of whether a route is meant only for logged-in or internal callers fills the request budget after the always-requested routes. Its page class of an HTML lead moves a disguised login wall or error page to the end. Its kind and sensitivity of each lead (from evidence only, never a value) set the order the agent confirms them in, most sensitive first. The answers are saved on each finding (`route_jev_privacy`, `anon_page_class`, `route_jev_kind`, `route_jev_sensitivity`). They rank and order only: no lead or always-requested route is dropped, the route class is never rewritten, and without a Jev answer the scan runs exactly as before. Each answer is also recorded beside the scan's own decision under `jev_shadow`.
+- **proxy_brain anonymous mode.** `replay`, `batch`, `fuzz` and the browser take `anonymous=True`, which strips every credential the authentication profile adds (and every redacted header); each response says whether it was sent `anonymous` or with the `session`. The logged-in browser now sends credentials to the pinned host only, never to third-party sub-resources.
+
+### Changed
+
+- **Agent and chat skills up to 500 KB** (was 50 KB). A skill near the limit is about 125k tokens of the agent's prompt. Rebuild `agent` and `webapp`.
+- **Errors say why.** A failure shows its cause as a code and HTTP status, for example "Failed to load users (P2024 · HTTP 500)", never the raw exception text, and a scan's status reads "unavailable" instead of a false "idle". Rebuild `agent` and `webapp`, restart `recon-orchestrator`.
+- **Uploads up to 60 MB**, as nginx allows (Next.js cut them at 10 MB). A project import is capped at 55 MB; FFuf and JS recon uploads need a saved project.
+- **Access Control and Path Traversal keep values out of the conversation and leave accounts alone, on every project.** Both skills now prove a finding with derived facts (status, size, key names, counts, hash prefixes) and keep a body, a secret or a cookie in a file in the Kali sandbox, unless the Rules of Engagement allow full access to sensitive data. In no phase do they request a logout, password-reset or account-deletion route, and they filter those words out of a fuzzing wordlist; in the informational phase they send read-only requests, and in the exploitation phase a write touches only an object the tester owns. Before, the Rules of Engagement said "do not display sensitive data" without saying how to prove a finding that way, and a session printed records, a password and a session cookie.
+  - **Upgrade.** Rebuild `agent`.
+
+### Fixed
+
+- **A lead is confirmed only by Access Control.** With Access Control off, another skill could confirm the route exposure scan's leads on a plain 200 answer, a public-by-design route included, and move them to T1; their confirmation now lands only from Access Control, and only while the scan is on, since its proof standard is the scan's part of that skill. Rebuild `agent`.
+- **JS Recon reads an internal target's own bundles.** Its download refused every private address, so a scan of an internal engagement never read the target's JavaScript. The run's own hosts now follow the pipeline's address rule; any other host, and any redirect off the run, keeps the strict one, and cloud metadata stays refused.
+- **Partial route exposure tags client-gated APIs too.** A partial run rebuilt its input from the graph without the pairing between a bundle's router pages and the APIs it calls, so the same API came out `admin_function` there and `client_gated` in a full run.
+- **Lost agent confirmations.** A proof the model wrote next to its output analysis instead of inside it was dropped without a trace; it is now recorded. Rebuild `agent`.
+- **Settings numbers.** Emptying a numeric setting and leaving the field restores its default, instead of saving 0 (which the save refused for most fields, and which meant "off" for some).
+- **Red Zone tables on a phone.** The toolbar wraps, so the Markdown export and the Filters menu are reachable on a narrow screen.
+- **Partial recon in IP mode.** A typed URL on one of the project's own addresses is accepted; the modal refused every typed URL as out of scope.
+- **Global Settings could erase stored API keys** when the page failed to load; Save now waits for a successful load.
+- **False successes.** GVM pause/stop, deleting a report, chat skill or provider, TrafficMind apply, MCP save and AI Gauntlet stop report their failures; the AI drawer stops after five reconnects, and a failed activation check releases its lock.
+- **CVE lookup: fewer wrong CVEs, more right ones.** `HTTP/3` was looked up as a product called "http" and got CVSS 10 CVEs from 2001, and plugin CVEs landed on WordPress and TYPO3. A CVE now counts only when NVD lists the product as vulnerable at the detected version; the 20 kept are the most severe, not the oldest; nmap services also match by their CPE; an unscored CVE no longer aborts the lookup. The next full recon scan replaces the old links.
+
+### Security
+
+- **Wordlists and MCP tokens.** The wordlist routes now check that the project is the caller's (any signed-in user could read or delete another user's wordlists), and deleting an MCP server no longer returns the saved tokens unmasked.
+
 ## [7.4.0] - 2026-10-27
 
 Fewer false positives, honest coverage, and scans that stop, pause and resume as they should.

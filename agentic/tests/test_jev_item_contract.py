@@ -121,3 +121,55 @@ def test_a_serialized_blob_carries_evidence_only():
     assert set(api.SerializedBlobItem.model_fields) == {"snippet", "transport", "location", "encoding_layers"}
     assert set(jev_hooks._blob_state({"snippet": "x", "magic": "04 08 (Ruby Marshal)"})) == \
         {"snippet", "transport", "observed_in", "location", "encoding_layers"}
+
+
+def _literal(model, field):
+    annotation = model.model_fields[field].annotation
+    args = typing.get_args(annotation)
+    if args and typing.get_origin(args[0]) is typing.Literal:   # List[Literal[...]]
+        args = typing.get_args(args[0])
+    return set(args)
+
+
+def _max_length(model, field):
+    return next(m.max_length for m in model.model_fields[field].metadata if hasattr(m, "max_length"))
+
+
+def test_the_route_privacy_bounds_and_closed_sets_match():
+    import api
+    assert _recon_constant("route_privacy_rank", "MAX_ROUTES_PER_SCAN") == jev_hooks.ROUTE_PRIVACY_MAX \
+        == _max_length(api.RoutePrivacyRankRequest, "routes")
+    assert _recon_constant("route_privacy_rank", "MAX_PATH_CHARS") <= _max_length(api.RoutePrivacyItem, "path")
+    assert set(_recon_constant("route_privacy_rank", "ROUTE_CATEGORIES")) == _literal(api.RoutePrivacyItem, "category")
+    assert set(_recon_constant("route_privacy_rank", "METHODS")) == _literal(api.RoutePrivacyItem, "method")
+
+
+def test_the_route_exposure_kinds_are_the_same_closed_set():
+    """A kind recon does not know fails validation on every answer."""
+    assert _recon_constant("route_exposure_assess", "KINDS") == jev_hooks.ROUTE_EXPOSURE_KINDS
+
+
+def test_the_route_candidate_bounds_and_closed_sets_match():
+    import api
+    item = api.RouteCandidateItem
+    assert _recon_constant("route_exposure_assess", "BATCH_SIZE") \
+        <= _max_length(api.RouteExposureAssessRequest, "candidates")
+    assert _recon_constant("route_exposure_assess", "MAX_PATH_CHARS") <= _max_length(item, "path")
+    assert _recon_constant("route_exposure_assess", "MAX_KEY_PATHS") <= _max_length(item, "key_paths")
+    assert _recon_constant("route_exposure_assess", "MAX_KEY_CHARS") <= 80
+    for recon_name, field in (("CONTENT_CLASSES", "content_class"), ("SIZE_BUCKETS", "size_bucket"),
+                              ("DET_SIGNALS", "det_signals"), ("AUTH_HINTS", "auth_expected_by"),
+                              ("GENERATORS", "generated_by")):
+        assert set(_recon_constant("route_exposure_assess", recon_name)) == _literal(item, field), recon_name
+    assert len(_recon_constant("route_exposure_assess", "DET_SIGNALS")) <= _max_length(item, "det_signals")
+    assert len(_recon_constant("route_exposure_assess", "AUTH_HINTS")) <= _max_length(item, "auth_expected_by")
+
+
+def test_a_route_candidate_carries_evidence_only():
+    """No route_class and no signature: Jev's kind would be the classifier read back,
+    and the agreement shadow mode records would measure nothing."""
+    import api
+    assert set(api.RouteCandidateItem.model_fields) == {
+        "path", "method", "anon_status", "authed_status", "content_class", "size_bucket", "bodies_match",
+        "key_paths", "max_array_len", "det_signals", "auth_expected_by", "generated_by"}
+    assert api.RouteCandidateItem.model_config.get("extra") == "forbid"

@@ -17,7 +17,7 @@ vi.mock('@/lib/prisma', () => ({ default: new Proxy({}, { get: (_t, k) => h.db[k
 vi.mock('@/lib/audit', () => ({ writeAudit: async (e: Record<string, unknown>) => void h.audits.push(e) }))
 
 import { createFakePrisma, type FakePrisma } from '@/lib/plugins/__testing__/fakePrisma'
-import { UserSkillError } from './userSkills'
+import { MAX_CONTENT_SIZE, UserSkillError } from './userSkills'
 import {
   USER_SKILL_SELECT,
   auditActorFor,
@@ -171,9 +171,9 @@ describe('createUserSkill', () => {
     expect(e.code).toBe('content_required')
   })
 
-  test('content of exactly 50 KB passes, one character more is content_too_large', async () => {
-    await createUserSkill({ userId: 'alice', name: 'Fits', content: 'x'.repeat(50 * 1024) }, ALICE)
-    const e = await refusal(createUserSkill({ userId: 'alice', name: 'Too big', content: 'x'.repeat(50 * 1024 + 1) }, ALICE))
+  test('content of exactly MAX_CONTENT_SIZE passes, one character more is content_too_large', async () => {
+    await createUserSkill({ userId: 'alice', name: 'Fits', content: 'x'.repeat(MAX_CONTENT_SIZE) }, ALICE)
+    const e = await refusal(createUserSkill({ userId: 'alice', name: 'Too big', content: 'x'.repeat(MAX_CONTENT_SIZE + 1) }, ALICE))
     expect(e.status).toBe(400)
     expect(e.code).toBe('content_too_large')
   })
@@ -288,8 +288,8 @@ describe('updateUserSkill', () => {
     expect(db.rows('userAttackSkill').find((r) => r.id === 'mine')!.content).toBe('Original text')
   })
 
-  test('content over 50 KB is refused', async () => {
-    expect((await refusal(updateUserSkill({ userId: 'alice', skillId: 'mine', content: 'x'.repeat(50 * 1024 + 1) }, ALICE))).code)
+  test('content over MAX_CONTENT_SIZE is refused', async () => {
+    expect((await refusal(updateUserSkill({ userId: 'alice', skillId: 'mine', content: 'x'.repeat(MAX_CONTENT_SIZE + 1) }, ALICE))).code)
       .toBe('content_too_large')
   })
 

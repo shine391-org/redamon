@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { graphError } from '../../graph/graphErrors'
 import { getGraphSession } from '../../graph/neo4j'
 import { formatGraphRecords } from '../../graph/format'
 import { injectProjectFilter, findUnscopedNodePattern, namesMutedLabel, hasVariableLengthPath, findDisallowedCall } from './injectProjectFilter'
@@ -90,10 +91,8 @@ export async function POST(request: NextRequest) {
       await session.close()
     }
   } catch (error) {
-    console.error('Graph view execute error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query execution failed' },
-      { status: 500 }
-    )
+    // The Neo4j message quotes the query and the values it matched; its status
+    // code (Neo.ClientError.Statement.SyntaxError) says what went wrong.
+    return graphError(error, 'Query execution failed', 'Graph view execute error')
   }
 }

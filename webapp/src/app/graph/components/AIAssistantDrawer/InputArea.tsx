@@ -3,6 +3,7 @@
 import React, { KeyboardEvent, useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Send, Loader2, Square, Play, Zap, X, Download, Upload } from 'lucide-react'
 import { useAlertModal } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './AIAssistantDrawer.module.css'
 import type { ActiveSkill } from './hooks/useSendHandlers'
 
@@ -55,6 +56,26 @@ function groupByCategory(skills: ChatSkillSummary[]): GroupedSkill[] {
     .map(([category, skills]) => ({ category, skills }))
 }
 
+const SKIP_TEXT: Record<string, string> = {
+  duplicate: 'already exist',
+  limit: 'over the 50-skill limit',
+  fetchFailed: 'could not be fetched',
+  tooLarge: 'too large',
+  invalid: 'empty',
+  saveFailed: 'could not be saved',
+}
+
+/** "Imported N skills, M skipped (2 already exist, 1 could not be saved)". */
+function chatImportSummary(data: { imported?: number; skipped?: number; skippedBy?: Record<string, number> }): string {
+  const imported = data.imported ?? 0
+  const head = `Imported ${imported} skill${imported !== 1 ? 's' : ''}`
+  if (!data.skipped) return head
+  const reasons = Object.entries(data.skippedBy ?? {})
+    .filter(([, n]) => n > 0)
+    .map(([why, n]) => `${n} ${SKIP_TEXT[why] ?? why}`)
+  return `${head}, ${data.skipped} skipped${reasons.length ? ` (${reasons.join(', ')})` : ''}`
+}
+
 export function InputArea({
   inputRef,
   inputValue,
@@ -77,9 +98,11 @@ export function InputArea({
   onSkillActivate,
   userResizedRef,
 }: InputAreaProps) {
-  const { alert: showAlert } = useAlertModal()
+  const { alert: showAlert, alertError } = useAlertModal()
   const [skills, setSkills] = useState<ChatSkillSummary[]>([])
   const [skillsFetched, setSkillsFetched] = useState(false)
+  // Shown in place of "No Chat Skills yet": a failed read is not an empty list.
+  const [skillsError, setSkillsError] = useState<string | null>(null)
   const [showSkillPicker, setShowSkillPicker] = useState(false)
   const [showAutocomplete, setShowAutocomplete] = useState(false)
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -94,15 +117,21 @@ export function InputArea({
     if (!userId || skillsFetched) return
     let cancelled = false
     fetch(`/api/users/${userId}/chat-skills`)
-      .then((res: Response) => res.ok ? res.json() : [])
+      .then(async (res: Response) => {
+        if (!res.ok) throw await readApiError(res, 'Chat Skills could not be loaded')
+        return res.json()
+      })
       .then((data: ChatSkillSummary[]) => {
         if (!cancelled) {
           setSkills(data)
+          setSkillsError(null)
           setSkillsFetched(true)
         }
       })
-      .catch(() => {
-        if (!cancelled) setSkillsFetched(true)
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setSkillsError(toApiError(err, 'Chat Skills could not be loaded').message)
+        setSkillsFetched(true)
       })
     return () => { cancelled = true }
   }, [userId, skillsFetched])
@@ -172,15 +201,17 @@ export function InputArea({
     setImporting(true)
     try {
       const res = await fetch(`/api/users/${userId}/chat-skills/import-community`, { method: 'POST' })
-      if (res.ok) {
-        const data = await res.json()
-        // Refresh skills list
-        setSkillsFetched(false)
-        showAlert(`Imported ${data.imported} skill${data.imported !== 1 ? 's' : ''}${data.skipped ? `, ${data.skipped} skipped (already exist)` : ''}`)
-      }
-    } catch { /* silent */ }
+      if (!res.ok) throw await readApiError(res, 'Failed to import community chat skills')
+      // Skills may have landed even when the answer cannot be read.
+      setSkillsFetched(false)
+      const data = await res.json().catch(() => null)
+      if (data) showAlert(chatImportSummary(data))
+      else alertError(`Failed to read the import's answer (invalid_json · HTTP ${res.status}). Check your Chat Skills list.`)
+    } catch (err) {
+      alertError(toApiError(err, 'Failed to import community chat skills').message)
+    }
     setImporting(false)
-  }, [userId, importing])
+  }, [userId, importing, showAlert, alertError])
 
   // Upload .md file
   const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -197,15 +228,16 @@ export function InputArea({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name, content, category: 'general' }),
         })
-        if (res.ok) {
-          setSkillsFetched(false) // refresh
-        }
-      } catch { /* silent */ }
+        if (!res.ok) throw await readApiError(res, 'Failed to upload the chat skill')
+        setSkillsFetched(false) // refresh
+      } catch (err) {
+        alertError(toApiError(err, 'Failed to upload the chat skill').message)
+      }
       setUploading(false)
     }
     reader.readAsText(file)
     e.target.value = '' // reset for re-upload
-  }, [userId])
+  }, [userId, alertError])
 
   // Select a skill: activate it, and remove the /skill... portion from input (keep surrounding text)
   const selectSkill = useCallback((skill: ChatSkillSummary) => {
@@ -321,7 +353,7 @@ export function InputArea({
         {flat.length === 0 ? (
           <div className={styles.skillDropdownEmpty}>
             {skills.length === 0
-              ? 'No Chat Skills yet. Import from community or upload a .md file above.'
+              ? skillsError ?? 'No Chat Skills yet. Import from community or upload a .md file above.'
               : 'No matching skills'}
           </div>
         ) : (

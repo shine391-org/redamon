@@ -1206,3 +1206,112 @@ zip:///uploads/<hash>.zip%23payload.php
 When a similar pattern matches your target, cite the precedent in the finding
 evidence -- it sharpens the report and helps the remediation team find a fix.
 """
+
+
+# Route-exposure parts: they load only when recon's route exposure scan is on
+# (ROUTE_EXPOSURE_ENABLED), after this skill's other parts, so a project without
+# the module gets a byte-identical prompt. PATH_TRAVERSAL_EXPOSED_FILES is a
+# TEMPLATE whose only placeholders are its own two status words.
+from .route_exposure_shared import (  # noqa: E402
+    RECORD_CONTRACT as _RECORD_CONTRACT,
+    SAFETY_RULES as _SAFETY_RULES,
+    VALUES_IN_FILES as _VALUES_IN_FILES,
+    candidate_query as _candidate_query,
+    escape as _escape,
+)
+
+PATH_TRAVERSAL_EXPOSED_FILES = _escape("""
+## EXPOSED FILES RECON FOUND (.git, .env, config, backups, secrets)
+
+A traversal REACHES a file; a file the web root serves directly is still this
+skill's when recon flagged it. Recon's route exposure scan wrote these as findings a
+signature proves (`needs_agent_confirmation=false`); your job is the minimal proof of
+each, recorded against its id. Values stay in kali files, always.
+
+**Pull them**, version control first:
+""" + _candidate_query(["vcs_exposure", "env_file", "config_file", "backup_file", "secret_in_response"],
+                       pending=False) + """
+A request about exposed files covers every finding this pull returns, whichever kinds
+it names: prove each one, not only the `.git` or `.env` the request mentions.
+
+**Minimal proofs** (always allowed):
+
+| Kind | Recipe | Proof |
+| --- | --- | --- |
+| vcs_exposure (.git) | execute_curl `/.git/HEAD` and `/.git/config` into files, read the ref from HEAD, curl `/.git/<ref>`, curl that ONE loose object `/.git/objects/xx/...`; an execute_code script inflates it with `zlib.decompressobj().decompress(data, 65536)`. HEAD and config alone prove nothing (any static page can say `ref:` or `[core]`), and one walk proves every vcs_exposure finding of that base URL: record each finding's id with it | the inflated header starts `commit `; print the tree hash prefix only |
+| vcs_exposure (.svn / .hg) | curl `/.svn/wc.db` with `Range: bytes=0-15`, or `/.hg/requires` | the SQLite magic or the known header |
+| env_file, config_file | curl the file into /tmp (256 KiB at most, else a Range); the script counts KEY=value lines, matches secret shapes by detector name, prints names and counts | two or more KEY=value lines (env), `<configuration>` (config) |
+| backup_file | HEAD, then `Range: bytes=0-1023`; the script reads the magic | an archive, SQL or PHP-source magic, different from the original file's answer |
+| secret_in_response | fetch the route into a file; the script re-runs the shape match | the same detector names as the finding's secret_types |
+
+Record each with `vulnerability_confirmed` and its id. A credential you saw is a
+SEPARATE `credential_found` entry with NO ids (its value never written anywhere).
+
+**Settings for this part:**
+- git reconstruction: {git_reconstruct}
+- secret validation: {validate_secrets}
+
+When git reconstruction is ENABLED: proving an exposed `.git` includes reconstructing
+it this run. After the minimal `.git` proof, request `transition_phase` to exploitation
+for the reconstruct step below; do not complete the session while the reconstruction is
+still pending. When git reconstruction is DISABLED: do not download repository objects
+beyond the four above (HEAD, config, the ref, one object). When secret validation is ENABLED:
+once a file's proof is recorded, validate every secret-shaped key it holds with the
+part below, one identity call per key, before you complete. When it is DISABLED: do
+not call any third-party API with a found secret.
+
+In EVERY phase, the exploitation phase included, for these artifacts: never `git clone`,
+`wget -r` or otherwise walk or mirror an exposed `.git` (the reconstruct step, when it
+is enabled, is the only repository fetch), and never download a backup archive in
+full: HEAD and `Range` reads only.
+""" + _VALUES_IN_FILES + _RECORD_CONTRACT + _SAFETY_RULES).replace(
+    "{{git_reconstruct}}", "{git_reconstruct}").replace("{{validate_secrets}}", "{validate_secrets}")
+
+PATH_TRAVERSAL_GIT_RECONSTRUCT = """
+## RECONSTRUCT AN EXPOSED .git (enabled: switch on and data exfiltration allowed by the RoE)
+
+EXPLOITATION phase. From the informational phase, record the minimal proofs first,
+then request `transition_phase` to exploitation naming this step, and run it once the
+operator approves; do not complete the session with it still pending. Everything
+stays in kali under `/tmp/rex-git-<id>/`.
+
+1. Start a background job with job_spawn, `tool_name: execute_code`: a Python script
+   that walks refs, then commits, trees and blobs from `<base>/.git/`, inflating each
+   object with `zlib.decompressobj().decompress(data, 65536)`, and writes the tree to
+   `/tmp/rex-git-<id>/`. Bounds: 500 objects, 20 MiB in total, 240 s of wall clock
+   (inside the sandbox's own subprocess timeout; do not claim a longer budget). Cap
+   the object count to finish, and say so when the cap was hit.
+2. kali_shell: `betterleaks dir /tmp/rex-git-<id> --report-format json --report-path /tmp/rex-git-<id>.leaks.json`
+3. One execute_code step prints the counts by rule only, then
+   `shutil.rmtree('/tmp/rex-git-<id>')`, removes the report, and prints
+   `os.listdir('/tmp')` filtered to `rex-git-<id>` to PROVE the deletion (fs_list
+   cannot see kali's /tmp).
+4. Evidence: the object count, the file count, the secret counts by rule, and the
+   head commit's hash prefix. Nothing else.
+
+The reconstructed tree is never printed: no file and no line of it reaches this
+conversation, not even to review the source. A review script prints file names,
+sizes and the counts of named patterns only, before the tree is deleted.
+
+There is no git-dumper in the sandbox, and never `git clone` the URL: a
+misconfigured `.git` does not serve `info/refs`, so it fails anyway.
+"""
+
+PATH_TRAVERSAL_VALIDATE_SECRETS = """
+## VALIDATE A SECRET FROM AN EXPOSED FILE (enabled by its switch)
+
+One execute_code script reads the secret from the kali file it was written to,
+never from this conversation, and calls only an identity endpoint:
+
+| Provider (detector) | Call | Valid when |
+| --- | --- | --- |
+| AWS access key | `boto3.client('sts').get_caller_identity()` | no error; print the account id's hash prefix |
+| GitHub token | `GET https://api.github.com/user` | 200; print the login's hash prefix |
+| GitLab token | `GET https://gitlab.com/api/v4/user` | 200 |
+| Slack token | `POST https://slack.com/api/auth.test` | `"ok": true` |
+| anything else | none | "not validated" |
+
+The script prints the provider, valid or invalid, and the hash prefix. Record a valid
+key as `credential_found` with NO ids. Say in your final answer that a canary token
+alerts its owner when it is used.
+"""

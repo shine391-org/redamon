@@ -81,6 +81,8 @@ export function GraphViews({
     createView,
     generateCypher,
     executeCypher,
+    actionError,
+    clearActionError,
   } = useGraphViews(projectId)
 
   const [nlQuery, setNlQuery] = useState('')
@@ -154,6 +156,7 @@ export function GraphViews({
 
   const handleSave = useCallback(async () => {
     if (!generatedCypher || !viewName.trim()) return
+    clearActionError()
     setSaving(true)
     const result = await createView(viewName.trim(), nlQuery.trim(), generatedCypher)
     setSaving(false)
@@ -166,10 +169,11 @@ export function GraphViews({
       setSelectedNode(null)
       onFilterCreated?.()
     }
-  }, [generatedCypher, viewName, nlQuery, createView, onFilterCreated])
+  }, [generatedCypher, viewName, nlQuery, createView, onFilterCreated, clearActionError])
 
   const handleSaveAndSelect = useCallback(async () => {
     if (!generatedCypher || !viewName.trim()) return
+    clearActionError()
     setSaving(true)
     const result = await createView(viewName.trim(), nlQuery.trim(), generatedCypher)
     setSaving(false)
@@ -182,7 +186,7 @@ export function GraphViews({
       setSelectedNode(null)
       onFilterCreatedAndSelect?.(result.id)
     }
-  }, [generatedCypher, viewName, nlQuery, createView, onFilterCreatedAndSelect])
+  }, [generatedCypher, viewName, nlQuery, createView, onFilterCreatedAndSelect, clearActionError])
 
   const handleDiscard = useCallback(() => {
     setNlQuery('')
@@ -340,6 +344,11 @@ export function GraphViews({
                     Discard
                   </button>
                 </div>
+                {actionError && (
+                  <div className={styles.errorBanner} role="alert">
+                    <span>The surface was not saved: {actionError}</span>
+                  </div>
+                )}
               </>
             )}
           </div>

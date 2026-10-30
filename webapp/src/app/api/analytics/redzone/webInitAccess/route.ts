@@ -6,6 +6,7 @@ import { notMuted } from '@/lib/graphMute'
 import { reportCountable } from '@/lib/triage/reportable'
 import { DECLARED_ONLY } from '@/lib/declaredOnly'
 import { deriveWebInitGrade, WEB_INIT_HEADER_CHECKS } from '@/app/graph/components/RedZoneTables/webInitGrade'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -149,11 +150,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ rows, meta: { totalRows: rows.length } })
   } catch (error) {
-    console.error('Red-zone webInitAccess error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Red-zone webInitAccess error' })
   } finally {
     await session.close()
   }

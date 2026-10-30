@@ -2,7 +2,7 @@
 
 import { memo, useState, useRef, useEffect, useCallback } from 'react'
 import Link from 'next/link'
-import { CalendarClock, GitCompare, Waypoints, Table2, Terminal, Shield, Search, Download, Loader2, SquareTerminal, Filter, Plus, Trash2, X, ChevronDown, Code, Target, Zap, Flag, Key, Server, Boxes, LockKeyhole, Bug, Network, Mail, ShieldAlert, Package, PackageSearch, History, Layers, Bot, Radiation, Swords, Droplets, ListOrdered, EyeOff, SlidersHorizontal } from 'lucide-react'
+import { CalendarClock, GitCompare, Waypoints, Table2, Terminal, Shield, Search, Download, Loader2, SquareTerminal, Filter, Plus, Trash2, X, ChevronDown, Code, Target, Zap, Flag, Key, Server, Boxes, LockKeyhole, Bug, Network, Mail, ShieldAlert, Package, PackageSearch, History, Layers, Bot, Radiation, Swords, Droplets, DoorOpen, ListOrdered, EyeOff, SlidersHorizontal } from 'lucide-react'
 import { Toggle } from '@/components/ui'
 import { AUTO_2D_THRESHOLD } from '../GraphCanvas'
 import styles from './ViewTabs.module.css'
@@ -30,6 +30,7 @@ export type TableViewMode =
   | 'supplyChainSca'
   | 'dnsDrift'
   | 'webCachePoison'
+  | 'routeExposure'
   | 'reconDelta'
   | 'scanSchedule'
   | 'triage'
@@ -57,6 +58,7 @@ const TABLE_MODE_LABELS: Record<TableViewMode, string> = {
   supplyChainSca: 'Supply-Chain SCA',
   dnsDrift: 'DNS Drift',
   webCachePoison: 'Web Cache Poisoning',
+  routeExposure: 'Route Exposure',
   reconDelta: 'Recon Delta',
   scanSchedule: 'Scans',
   triage: 'Priority Board',
@@ -474,6 +476,7 @@ export const ViewTabs = memo(function ViewTabs({
                 : mode === 'supplyChainSca' ? PackageSearch
                 : mode === 'dnsDrift' ? History
                 : mode === 'webCachePoison' ? Droplets
+                : mode === 'routeExposure' ? DoorOpen
                 : mode === 'muted' ? EyeOff
                 : Table2
               return <Icon size={14} />
@@ -557,6 +560,13 @@ export const ViewTabs = memo(function ViewTabs({
               >
                 <Key size={12} /> Secrets & Credentials
                 <UnseenBadge count={unseenCounts?.secrets} />
+              </button>
+              <button
+                className={`${styles.tableDropdownItem} ${tableViewMode === 'routeExposure' ? styles.tableDropdownItemActive : ''}`}
+                onClick={() => { onTableViewModeChange?.('routeExposure'); setTableMenuOpen(false); onViewChange('table') }}
+              >
+                <DoorOpen size={12} /> Route Exposure
+                <UnseenBadge count={unseenCounts?.routeExposure} />
               </button>
               <button
                 className={`${styles.tableDropdownItem} ${tableViewMode === 'netInitAccess' ? styles.tableDropdownItemActive : ''}`}

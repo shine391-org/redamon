@@ -220,6 +220,35 @@ describe('GET /api/plugins', () => {
     expect(body.plugins[0].inCatalog).toBeNull()
   })
 
+  test("an admin sees why the catalog is not used: the check's own sentence and the first schema errors", async () => {
+    h.session = { userId: 'user-admin', role: 'admin' }
+    h.catalogError = new CatalogError(
+      'catalog_unreachable',
+      'The plugin catalog could not be downloaded (catalog.json.sig): The plugin download answered HTTP 404.',
+      undefined,
+      'http_error',
+    )
+    expect((await list()).body.catalog).toMatchObject({
+      state: 'unreachable',
+      detail: 'The plugin catalog could not be downloaded (catalog.json.sig): The plugin download answered HTTP 404.',
+    })
+    const paths = Array.from({ length: 8 }, (_, i) => `/plugins/${i}/releases/0/sha256: must match pattern`)
+    h.catalogError = new CatalogError('schema_invalid', 'The signed catalog does not match the catalog schema.', paths)
+    const c = (await list()).body.catalog
+    expect(c.detail).toBe('The signed catalog does not match the catalog schema.')
+    expect(c.details).toEqual(paths.slice(0, 5))
+    h.catalogError = new CatalogError('unknown_key', 'The catalog is signed with key "rotated-2025", which this RedAmon does not trust.')
+    expect((await list()).body.catalog.detail).toContain('"rotated-2025"')
+  })
+
+  test('a standard user gets the advice without the detail', async () => {
+    h.catalogError = new CatalogError('schema_invalid', 'The signed catalog does not match the catalog schema.', ['/plugins/0: x'])
+    const c = (await list()).body.catalog
+    expect(c.message).toMatch(/not a valid catalog/)
+    expect('detail' in c).toBe(false)
+    expect('details' in c).toBe(false)
+  })
+
   test('an extra-key catalog is flagged; the view carries no expiry', async () => {
     h.catalog = catalog([echo()], { official: false, warnings: ['extra_key'] })
     const c = (await list()).body.catalog

@@ -94,6 +94,44 @@ describe('report narratives', () => {
     expect(res.status).toBe(201)
     expect(mockHtml.mock.calls[0][1]).toBeNull()
     expect(mockCreate.mock.calls[0][0].data.hasNarratives).toBe(false)
+    // ...and says so, so the page can warn instead of announcing a full report (G-23).
+    expect((await res.json()).narrativesSkipped).toBe('agent_unreachable')
+  })
+
+  test('a failed model call is a report without narratives, with the reason and the provider facts', async () => {
+    mockAgentFetch.mockResolvedValue(new Response(JSON.stringify({
+      executiveSummary: '', model_used: 'gpt-5', narratives_failed: 'model_call_failed',
+      error_class: 'RateLimitError', provider_status: 429,
+    }), { status: 200 }))
+    const res = await POST(req(), params)
+    expect(res.status).toBe(201)
+    expect(mockHtml.mock.calls[0][1]).toBeNull()
+    expect(mockCreate.mock.calls[0][0].data.hasNarratives).toBe(false)
+    expect((await res.json()).narrativesSkipped).toBe('model_call_failed · RateLimitError · provider HTTP 429')
+  })
+
+  test('an unreadable model answer is reported as such, and a malformed marker is ignored', async () => {
+    mockAgentFetch.mockResolvedValue(new Response(JSON.stringify({
+      executiveSummary: '', model_used: 'gpt-5', narratives_failed: 'unreadable_answer',
+    }), { status: 200 }))
+    expect((await (await POST(req(), params)).json()).narrativesSkipped).toBe('unreadable_answer')
+    mockAgentFetch.mockResolvedValue(new Response(JSON.stringify({
+      executiveSummary: 'ok', model_used: 'gpt-5', narratives_failed: 'Not A Code',
+    }), { status: 200 }))
+    expect((await (await POST(req(), params)).json()).narrativesSkipped).toBeUndefined()
+  })
+
+  test('a report with narratives carries no skipped flag', async () => {
+    const res = await POST(req(), params)
+    expect((await res.json()).narrativesSkipped).toBeUndefined()
+  })
+
+  test('a failure after the agent answers a fixed text and a code, not the raw message (P-29)', async () => {
+    mockGather.mockRejectedValue(Object.assign(new Error("Neo4j: MATCH (d:Domain {name:'target.example'})"),
+      { code: 'Neo.ClientError.Statement.SyntaxError' }))
+    const res = await POST(req(), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Report generation failed', code: 'Neo.ClientError.Statement.SyntaxError' })
   })
 
   test('model_unavailable is shown, not swallowed', async () => {

@@ -1,6 +1,7 @@
 'use client'
 
 import { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react'
+import { type ApiError, readApiError, toApiError } from '@/lib/apiError'
 
 export interface AuthUser {
   id: string
@@ -13,6 +14,11 @@ interface AuthContextValue {
   user: AuthUser | null
   isLoading: boolean
   isAdmin: boolean
+  /**
+   * Why the session could not be read when the cause was not "signed out": a
+   * 5xx (database down) or no answer. Null for a 401, which is a plain sign-out.
+   */
+  sessionError: ApiError | null
   login: (email: string, password: string) => Promise<{ error?: string }>
   logout: () => Promise<void>
 }
@@ -22,6 +28,7 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [sessionError, setSessionError] = useState<ApiError | null>(null)
   const hydrated = useRef(false)
 
   // Hydrate session once on mount
@@ -30,11 +37,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     hydrated.current = true
 
     fetch('/api/auth/me')
-      .then(res => (res.ok ? res.json() : null))
+      .then(async res => {
+        if (res.ok) return res.json()
+        if (res.status >= 500) setSessionError(await readApiError(res, 'Could not read your session'))
+        return null
+      })
       .then(data => {
         if (data?.id) setUser(data)
       })
-      .catch(() => {})
+      .catch(err => setSessionError(toApiError(err, 'Could not read your session')))
       .finally(() => setIsLoading(false))
   }, [])
 
@@ -46,8 +57,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     })
 
     if (!res.ok) {
-      const data = await res.json()
-      return { error: data.error || 'Login failed' }
+      return { error: (await readApiError(res, 'Login failed')).message }
     }
 
     const data = await res.json()
@@ -67,6 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         user,
         isLoading,
         isAdmin: user?.role === 'admin',
+        sessionError,
         login,
         logout,
       }}

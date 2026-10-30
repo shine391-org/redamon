@@ -1,7 +1,8 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { ScanStartError } from '@/lib/scanStartError'
+import { readScanStartError, scanStartNetworkError, type ScanStartError } from '@/lib/scanStartError'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import type { TrufflehogState, TrufflehogStatus } from '@/lib/recon-types'
 
 /**
@@ -41,11 +42,17 @@ interface UseTrufflehogRunsReturn {
   isAnyRunning: boolean
   isLoading: boolean
   error: string | null
+  /** Why the last run poll failed ("Secret Multiscanner status unavailable (code · HTTP n)"); null once one succeeds. */
+  statusError: string | null
+  /** Why the source list could not be read; the list on screen is then the last one that loaded. */
+  profilesError: string | null
   startTrufflehog: (source: string) => Promise<TrufflehogState | null>
   stopTrufflehog: (source: string) => Promise<TrufflehogState | null>
   refetch: () => Promise<void>
   refetchProfiles: () => Promise<void>
   getLastStartError: () => ScanStartError | null
+  /** Why the most recent stop failed ("reason (code · HTTP n)"), readable right after it resolves to null. */
+  getLastActionError: () => string | null
 }
 
 const DEFAULT_POLLING_INTERVAL = 5000
@@ -64,9 +71,12 @@ export function useTrufflehogRuns({
   const [profiles, setProfiles] = useState<TrufflehogProfileSummary[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [profilesError, setProfilesError] = useState<string | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
 
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
   const lastStartErrorRef = useRef<ScanStartError | null>(null)
+  const lastActionErrorRef = useRef<string | null>(null)
   const previousStatusesRef = useRef<Record<string, TrufflehogStatus>>({})
   const onRunCompleteRef = useRef(onRunComplete)
   const onRunErrorRef = useRef(onRunError)
@@ -80,14 +90,12 @@ export function useTrufflehogRuns({
     if (!projectId) return
     try {
       const response = await fetch(`/api/trufflehog/${projectId}/all`)
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        throw new Error(data.error || 'Failed to fetch Secret Multiscanner runs')
-      }
+      if (!response.ok) throw await readApiError(response, 'Secret Multiscanner status unavailable')
       const data = await response.json()
       const next: TrufflehogState[] = Array.isArray(data?.runs) ? data.runs : []
       setRuns(next)
       setError(null)
+      setStatusError(null)
 
       for (const run of next) {
         const key = run.source || run.run_id || ''
@@ -99,7 +107,11 @@ export function useTrufflehogRuns({
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error')
+      // The runs on screen stay: an orchestrator that did not answer says nothing
+      // about whether they are still running.
+      const message = toApiError(err, 'Secret Multiscanner status unavailable').message
+      setError(message)
+      setStatusError(message)
     }
   }, [projectId])
 
@@ -107,11 +119,14 @@ export function useTrufflehogRuns({
     if (!projectId) return
     try {
       const response = await fetch(`/api/trufflehog/${projectId}/profiles`)
-      if (!response.ok) return
+      if (!response.ok) throw await readApiError(response, 'Could not load the Secret Multiscanner sources')
       const data = await response.json()
       setProfiles(Array.isArray(data?.profiles) ? data.profiles : [])
-    } catch {
-      // A failed profile list must not blank the runs already on screen.
+      setProfilesError(null)
+    } catch (err) {
+      // A failed profile list must not blank the runs already on screen, nor
+      // read as "no sources configured".
+      setProfilesError(toApiError(err, 'Could not load the Secret Multiscanner sources').message)
     }
   }, [projectId])
 
@@ -125,18 +140,21 @@ export function useTrufflehogRuns({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source }),
       })
-      const data = await response.json().catch(() => ({}))
       if (!response.ok) {
         // Carries the governor's structured limit payload so the caller can
         // offer the queue instead of just showing an error.
-        const message = data?.error || 'Failed to start Secret Multiscanner scan'
-        lastStartErrorRef.current = { status: response.status, message, limit: data?.limit }
-        throw new Error(message)
+        lastStartErrorRef.current = await readScanStartError(response, 'Failed to start Secret Multiscanner scan')
+        throw new Error(lastStartErrorRef.current.message)
       }
+      const data = await response.json().catch(() => ({}))
       await fetchRuns()
       return data as TrufflehogState
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error')
+      const startErr = lastStartErrorRef.current ?? scanStartNetworkError(err, 'Failed to start Secret Multiscanner scan')
+      lastStartErrorRef.current = startErr
+      setError(formatApiError({
+        reason: startErr.message, code: startErr.code, status: startErr.status ?? 0, upstreamStatus: startErr.upstreamStatus,
+      }))
       return null
     } finally {
       setIsLoading(false)
@@ -145,19 +163,19 @@ export function useTrufflehogRuns({
 
   const stopTrufflehog = useCallback(async (source: string): Promise<TrufflehogState | null> => {
     if (!projectId) return null
+    lastActionErrorRef.current = null
     try {
       const response = await fetch(
         `/api/trufflehog/${projectId}/${encodeURIComponent(source)}/stop`, { method: 'POST' },
       )
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        throw new Error(data.error || 'Failed to stop Secret Multiscanner scan')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to stop Secret Multiscanner scan')
       const data = await response.json()
       await fetchRuns()
       return data as TrufflehogState
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error')
+      const message = toApiError(err, 'Failed to stop Secret Multiscanner scan').message
+      lastActionErrorRef.current = message
+      setError(message)
       return null
     }
   }, [projectId, fetchRuns])
@@ -196,10 +214,13 @@ export function useTrufflehogRuns({
     isAnyRunning,
     isLoading,
     error,
+    statusError,
+    profilesError,
     startTrufflehog,
     stopTrufflehog,
     refetch: fetchRuns,
     refetchProfiles: fetchProfiles,
     getLastStartError: () => lastStartErrorRef.current,
+    getLastActionError: () => lastActionErrorRef.current,
   }
 }

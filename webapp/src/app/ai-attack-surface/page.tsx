@@ -28,6 +28,12 @@ function Chip({ chip, dim }: { chip: ChipKey; dim?: boolean }) {
   )
 }
 
+/** Which of the judge model's three failures this was: no model, a failed answer, or none. */
+function judgeUnavailableText(judge: { reason?: string; error?: string }): string {
+  if (judge.reason === 'no_model') return 'The orchestrator did not report its judge model.'
+  return `The judge model could not be read: ${judge.error ?? 'the request failed'}.`
+}
+
 function sevColor(sev: string): string {
   return { critical: '#dc2626', high: '#ef4444', medium: '#f59e0b', low: '#3b82f6', info: '#9ca3af' }[sev] || '#9ca3af'
 }
@@ -205,8 +211,14 @@ export default function AiAttackSurfacePage() {
           <h1 className={styles.title}><Swords size={22} /> AI Gauntlet</h1>
           <p className={styles.subtitle}>
             Deterministic offensive testing of the AI surface recon discovered.
-            <span className={styles.discovered}> {s.targets.length} LLM endpoint(s) discovered</span>
+            <span className={styles.discovered}>
+              {s.targetsError && s.targets.length === 0
+                ? ' LLM endpoints could not be loaded'
+                : ` ${s.targets.length} LLM endpoint(s) discovered`}
+            </span>
           </p>
+          {/* No run to show it on after a reload: an unknown state must not read as "nothing running". */}
+          {s.statusError && !s.run && <p className={styles.err} role="alert">{s.statusError}</p>}
         </div>
         <div className={styles.headerActions}>
           <WikiInfoButton
@@ -305,7 +317,8 @@ export default function AiAttackSurfacePage() {
           <section className={styles.block}>
             <h3 className={styles.blockTitle}>1. Targets</h3>
             {s.loadingTargets && <p className={styles.muted}>Loading…</p>}
-            {!s.loadingTargets && s.targets.length === 0 && (
+            {!s.loadingTargets && s.targetsError && <p className={styles.err} role="alert">{s.targetsError}</p>}
+            {!s.loadingTargets && !s.targetsError && s.targets.length === 0 && (
               <p className={styles.muted}>No llm-chat/completion endpoints in this project. Run AI Surface Recon first.</p>
             )}
             {s.targets.map((t) => {
@@ -422,7 +435,7 @@ export default function AiAttackSurfacePage() {
                      disabled={judge.status === 'loading'}
                      placeholder={judge.status === 'loading' ? 'Loading…' : judge.status === 'unavailable' ? 'Local LLM unavailable' : undefined}
                      title={judge.status === 'unavailable'
-                       ? 'The orchestrator did not report its judge model. Type one, or leave it empty to run without a judge.'
+                       ? `${judgeUnavailableText(judge)} Type one, or leave it empty to run without a judge.`
                        : 'Local Ollama judge model (the orchestrator\'s LOCAL_LLM_MODEL)'}
                      onChange={(e) => setJudgeOverride(e.target.value)} /></label>
               {openCard.style === 'multi-turn' && (
@@ -542,6 +555,9 @@ export default function AiAttackSurfacePage() {
               <div className={styles.status}>
                 Status: <strong>{s.run.status}</strong>
                 {s.phase.name && <> · Phase {s.phase.num}/4: {s.phase.name}</>}
+                {s.run.error && <> · <span className={styles.err}>{s.run.error}</span></>}
+                {s.statusError && <> · <span className={styles.err} role="alert">{s.statusError}</span></>}
+                {running && s.streamError && <> · <span className={styles.err}>{s.streamError}</span></>}
               </div>
             )}
             {s.logs.length > 0 && (
@@ -558,7 +574,8 @@ export default function AiAttackSurfacePage() {
       {/* Findings table */}
       <div className={styles.findings}>
         <h2 className={styles.detailTitle}>Findings ({s.findings.length})</h2>
-        {s.findings.length === 0 && <p className={styles.muted}>No AI Gauntlet findings yet.</p>}
+        {s.findingsError && <p className={styles.err} role="alert">{s.findingsError}</p>}
+        {!s.findingsError && s.findings.length === 0 && <p className={styles.muted}>No AI Gauntlet findings yet.</p>}
         <Link href="/graph?table=aiRisk&sheet=testedVulns" className={`${styles.showFindings} ${styles.findingsCta}`}>
           <Table2 size={14} /> Show findings in Red Zone
         </Link>

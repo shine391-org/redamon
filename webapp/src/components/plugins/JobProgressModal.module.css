@@ -134,3 +134,11 @@
   color: var(--text-secondary);
   overflow-wrap: anywhere;
 }
+
+/* The failure's code, small beside its message: what a bug report quotes. */
+.jobCode {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  opacity: 0.8;
+}

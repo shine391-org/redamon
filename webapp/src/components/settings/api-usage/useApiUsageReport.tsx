@@ -12,6 +12,8 @@ import { useAlertModal, useToast } from '@/components/ui'
 import { buildInventory, inventoryChanges, savedKeySummary, type LlmInventoryRow, type TrackedField } from '@/lib/apiUsage/inventory'
 import type { ApiUsageReportV1, UserActivity } from '@/lib/apiUsage/types'
 import { formatDateTime, scanKindText } from './format'
+import { formatApiError, readApiError, toApiError, type ApiError } from '@/lib/apiError'
+import { failureText } from '../failureText'
 
 export interface ApiUsageMeta {
   enabled: boolean
@@ -107,17 +109,25 @@ export function useApiUsageReport(args: UseApiUsageReportArgs) {
     inputsRef.current = { values, extraKeyCounts, llmRows, llmLabel }
   }, [values, extraKeyCounts, llmRows, llmLabel])
   const trackedRef = useRef<TrackedField[] | undefined>(undefined)
+  // Why the last refresh returned null, for the message that refuses to run on it.
+  const refreshErrorRef = useRef<ApiError | null>(null)
 
   const refresh = useCallback(async (): Promise<ApiUsageMeta | null> => {
     if (!url) return null
+    const fallback = 'Could not load the saved report state'
     try {
       const res = await fetch(url, { cache: 'no-store' })
-      if (!res.ok) return null
+      if (!res.ok) {
+        refreshErrorRef.current = await readApiError(res, fallback)
+        return null
+      }
       const data = (await res.json()) as ApiUsageMeta
       trackedRef.current = data.tracked
+      refreshErrorRef.current = null
       if (mounted.current) setMeta(data)
       return data
-    } catch {
+    } catch (err) {
+      refreshErrorRef.current = toApiError(err, fallback)
       return null
     }
   }, [url])
@@ -253,7 +263,12 @@ export function useApiUsageReport(args: UseApiUsageReportArgs) {
           await alert('Your session expired. The check may still finish and be saved: log in and open Last report.', 'Session expired')
           return
         }
-        await alertError(`The check failed (HTTP ${res.status}). The saved report is unchanged.`)
+        // `error` is itself a code for the route's refusals (`run_failed`); a catch-all sends `code`.
+        await alertError(`${formatApiError({
+          reason: 'The check failed',
+          code: typeof data.code === 'string' ? data.code : /^[a-z_]+$/.test(error) ? error : undefined,
+          status: res.status,
+        })}. The saved report is unchanged.`)
     }
   }, [url, refresh, alert, alertError, toast])
 
@@ -295,7 +310,7 @@ export function useApiUsageReport(args: UseApiUsageReportArgs) {
     }
     const fresh = await refresh()
     if (!fresh) {
-      await alertError('Could not load the saved report state, so nothing was checked. Try again.')
+      await alertError(`${failureText('Could not load the saved report state', refreshErrorRef.current)}, so nothing was checked. Try again.`)
       return
     }
     if (!fresh.enabled) {

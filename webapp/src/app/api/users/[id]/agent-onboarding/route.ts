@@ -22,6 +22,7 @@ import { validateScopes } from '@/lib/mcpAuth'
 import { validateProfile } from '@/lib/mcp/profiles'
 import { listAdvertisedTools } from '@/lib/mcp/apiReference'
 import { renderOnboardingPack, type OnboardingOptions } from '@/lib/mcp/onboarding'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -55,7 +56,7 @@ function resolveServerUrl(raw: unknown): { serverUrl: string | undefined } | { e
   return { serverUrl: parsed.origin }
 }
 
-export async function POST(request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Could not generate the onboarding pack', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const denied = await requireUserAccess(request, id)
   if (denied) return denied
@@ -109,7 +110,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       { headers: { 'Cache-Control': 'no-store' } }
     )
   } catch (error) {
-    console.error('[agent-onboarding] generation failed:', error)
-    return NextResponse.json({ error: 'Could not generate the onboarding pack' }, { status: 500 })
+    return internalError(error, 'Could not generate the onboarding pack', { log: '[agent-onboarding] generation failed' })
   }
-}
+})

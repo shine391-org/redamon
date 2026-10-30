@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 
@@ -41,11 +42,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(conversations)
   } catch (error) {
-    console.error('Failed to fetch conversations:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch conversations' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch conversations')
   }
 }
 
@@ -74,10 +71,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(conversation, { status: 201 })
   } catch (error) {
-    console.error('Failed to create conversation:', error)
-    return NextResponse.json(
-      { error: 'Failed to create conversation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create conversation')
   }
 }

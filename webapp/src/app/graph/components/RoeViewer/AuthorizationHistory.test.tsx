@@ -53,6 +53,14 @@ describe('row 10: a failed fetch is not "no records"', () => {
     expect(screen.queryByText(/No record of what authorized/)).toBeNull()
   })
 
+  test('the failure names its code and status, keeping the panel\'s own sentence', async () => {
+    respond({ error: 'Failed to list engagement authorizations', code: 'P1001' }, false, 500)
+    render(<AuthorizationHistory projectId="p1" engagementKind="third_party" />)
+    await waitFor(() => {
+      expect(screen.getByText(/Could not read the authorization records \(P1001 · HTTP 500\)\. This is not the same/)).toBeTruthy()
+    })
+  })
+
   test('a rejected fetch shows the same retry copy', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
     render(<AuthorizationHistory projectId="p1" engagementKind="third_party" />)

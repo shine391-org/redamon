@@ -1071,6 +1071,11 @@ class AgentState(TypedDict):
     deep_think_result: Optional[str]
     _need_deep_think: bool  # LLM self-requested Deep Think for next iteration
 
+    # Actionable lines that read as a confirmation to record, from an analysis
+    # that recorded no chain finding (orchestrator_helpers/finding_guard.py);
+    # the next prompt says they recorded nothing.
+    _unrecorded_confirmation: Optional[List[str]]
+
     # Productivity scoring v2 — dynamic, multi-signal loop detection.
     # `_deep_think_cooldown_until` suppresses redundant Deep Thinks for N
     # iterations after one fires (override on self-request or critical score).
@@ -1314,6 +1319,7 @@ def create_initial_state(
         # Deep Think
         "deep_think_result": None,
         "_need_deep_think": False,
+        "_unrecorded_confirmation": None,
         # Productivity scoring v2
         "_deep_think_cooldown_until": 0,
         "_iterations_since_state_grew": 0,

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Loader2, Activity } from 'lucide-react'
 import { useAlertModal } from '@/components/ui'
 import { usePaged, Pager } from './pagination'
+import { readApiError, toApiError, type ApiError } from '@/lib/apiError'
 import styles from './ScanScheduleTable.module.css'
 
 export interface QueueJob {
@@ -83,11 +84,11 @@ export function ScanQueuePanel({ projectId }: { projectId: string | null }) {
   const refresh = useCallback(async () => {
     try {
       const res = await fetch('/api/system/jobs')
-      if (!res.ok) { setError('Could not load scan activity.'); return }
+      if (!res.ok) { setError((await readApiError(res, 'Could not load scan activity.')).message); return }
       setData(await res.json())
       setError(null)
-    } catch {
-      setError('Could not load scan activity.')
+    } catch (err) {
+      setError(toApiError(err, 'Could not load scan activity.').message)
     }
   }, [])
 
@@ -101,10 +102,11 @@ export function ScanQueuePanel({ projectId }: { projectId: string | null }) {
   const act = useCallback(async (id: string, action: 'cancel' | 'reconfirm') => {
     setBusyId(id)
     try {
+      const failure = `Could not ${action} the job.`
       let res = await fetch(`/api/job-queue/${id}/${action}`, { method: 'POST' })
-      let body = res.ok ? null : await res.json().catch(() => ({}))
+      let refusal: ApiError | null = res.ok ? null : await readApiError(res, failure)
       // An AI attack launch needs the RoE confirmed again once settings changed.
-      if (!res.ok && body?.code === 'roe_confirmation_required') {
+      if (refusal?.code === 'roe_confirmation_required') {
         const ok = await confirm(
           'The project settings changed since this AI attack scan was queued. Confirm that its targets are ' +
           'within the current Rules of Engagement and that you authorise the launch.',
@@ -120,15 +122,15 @@ export function ScanQueuePanel({ projectId }: { projectId: string | null }) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ roeConfirmed: true }),
         })
-        body = res.ok ? null : await res.json().catch(() => ({}))
+        refusal = res.ok ? null : await readApiError(res, failure)
       }
-      if (!res.ok) {
-        setError(body?.error || `Could not ${action} the job.`)
+      if (refusal) {
+        setError(refusal.message)
       } else {
         await refresh()
       }
-    } catch {
-      setError(`Could not ${action} the job.`)
+    } catch (err) {
+      setError(toApiError(err, `Could not ${action} the job.`).message)
     } finally {
       setBusyId(null)
     }

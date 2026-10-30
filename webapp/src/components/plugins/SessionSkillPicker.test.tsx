@@ -83,7 +83,8 @@ describe('loading and failure', () => {
   test('a failure shows the server message and Retry fetches again', async () => {
     const fetchMock = stub({ status: 500, body: { error: 'The database is busy.' } }, ok({ skills: [user()], suggested: 'user_skill:sk1' }))
     draw()
-    expect(await screen.findByText(/The database is busy\./)).toBeInTheDocument()
+    // The server's sentence, then the status, so a screenshot says which failure it was.
+    expect(await screen.findByText('The database is busy. (HTTP 500)', { exact: false })).toBeInTheDocument()
     expect(start()).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: /Retry/ }))
     expect(await screen.findByText('My SQLi flow v2')).toBeInTheDocument()
@@ -91,17 +92,17 @@ describe('loading and failure', () => {
     expect(start()).toBeEnabled()
   })
 
-  test('a network failure shows the generic message with Retry', async () => {
+  test('a network failure says no answer came, with Retry', async () => {
     stub('network-error')
     draw()
-    expect(await screen.findByText('The skills of this session could not be read.')).toBeInTheDocument()
+    expect(await screen.findByText('The skills of this session could not be read (network_error)', { exact: false })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument()
   })
 
   test('an answer without a skills list is a failure, not an empty list', async () => {
     stub({ status: 200, body: { running: false } })
     draw()
-    expect(await screen.findByText('The skills of this session could not be read.')).toBeInTheDocument()
+    expect(await screen.findByText('The skills of this session could not be read (invalid_answer · HTTP 200)', { exact: false })).toBeInTheDocument()
     expect(screen.queryByText(/This session used no skill/)).toBeNull()
   })
 })
@@ -130,9 +131,9 @@ describe('the plugin is not available', () => {
   })
 
   test('another failure does not invalidate the gear menu list', async () => {
-    stub({ status: 500, body: { error: 'boom' } })
+    stub({ status: 500, body: { error: 'boom', code: 'P2024' } })
     const { invalidate } = draw()
-    await screen.findByText('boom')
+    await screen.findByText('boom (P2024 · HTTP 500)', { exact: false })
     expect(invalidate).not.toHaveBeenCalled()
   })
 })
@@ -233,6 +234,16 @@ describe('the agent is running', () => {
     await waitFor(() => expect(start()).toBeEnabled())
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(screen.queryByText(/could not confirm/)).toBeNull()
+  })
+
+  test("'unverified' names why the agent could not say: its errno, or its HTTP status", async () => {
+    stub(ok({ running: 'unverified', agentCheck: { code: 'agent_unreachable', cause: 'ECONNREFUSED' }, skills: [user()], suggested: 'user_skill:sk1' }))
+    draw()
+    expect(await screen.findByText(/could not confirm that the agent has stopped in this session \(agent_unreachable · ECONNREFUSED\)\./)).toBeInTheDocument()
+    cleanup()
+    stub(ok({ running: 'unverified', agentCheck: { code: 'agent_error', upstreamStatus: 500 }, skills: [user()], suggested: 'user_skill:sk1' }))
+    draw()
+    expect(await screen.findByText(/could not confirm that the agent has stopped in this session \(agent_error · agent HTTP 500\)\./)).toBeInTheDocument()
   })
 
   test('running:false shows no notice', async () => {

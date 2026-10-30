@@ -508,7 +508,7 @@ Use this table as a quick comparison. Every cell is a real value in today's code
 |---|---|---|---|---|---|---|
 | OpenAI | `openai` | `ChatOpenAI` | `https://api.openai.com/v1` | (none - bare id) | `Authorization: Bearer` | `/v1/models`, filter `gpt-*`, `o1-*`, `o3-*`, `o4-*` |
 | Anthropic | `anthropic` | `ChatAnthropic` | `https://api.anthropic.com` | `claude-*` (bare) | `x-api-key`, `anthropic-version` | `/v1/models?limit=100` |
-| OpenRouter | `openrouter` | `ChatOpenAI` | `https://openrouter.ai/api/v1` | `openrouter/` | `Authorization: Bearer` + `HTTP-Referer: https://redamon.dev`, `X-Title: RedAmon Agent` | public `/api/v1/models`, filter text I/O |
+| OpenRouter | `openrouter` | `ChatOpenAI` | `https://openrouter.ai/api/v1` | `openrouter/` | `Authorization: Bearer` + `HTTP-Referer: https://www.redamon.org`, `X-Title: RedAmon Agent` | public `/api/v1/models`, filter text I/O |
 | DeepSeek | `deepseek` | `ChatOpenAI` | `https://api.deepseek.com/v1` | `deepseek/` | `Authorization: Bearer` | `/v1/models` + fallback list |
 | Google Gemini | `gemini` | `ChatGoogleGenerativeAI` | `https://generativelanguage.googleapis.com` | `gemini/` | `?key=` query param | `/v1beta/models`, filter `models/gemini-*` with `generateContent` |
 | GLM (Zhipu) | `glm` | `ChatOpenAI` | `https://open.bigmodel.cn/api/paas/v4` | `glm/` | `Authorization: Bearer` | OpenAI-compat `/models` + fallback |

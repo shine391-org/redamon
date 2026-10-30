@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireProjectScopedResource } from '@/lib/access'
@@ -61,11 +62,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(remediation)
   } catch (error) {
-    console.error('Failed to fetch remediation:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch remediation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch remediation')
   }
 }
 
@@ -110,7 +107,6 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(remediation)
   } catch (error: unknown) {
-    console.error('Failed to update remediation:', error)
 
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
@@ -119,10 +115,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to update remediation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update remediation', { log: 'Update remediation' })
   }
 }
 
@@ -140,7 +133,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true })
   } catch (error: unknown) {
-    console.error('Failed to delete remediation:', error)
 
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
@@ -149,9 +141,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to delete remediation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete remediation', { log: 'Delete remediation' })
   }
 }

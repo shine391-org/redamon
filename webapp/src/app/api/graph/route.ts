@@ -5,8 +5,12 @@ import { getCached, setCached, invalidateCache } from './cache'
 import { truncateGraph } from './truncate'
 import { GRAPH_PERF_DEBUG } from './config'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { graphError } from './graphErrors'
 
-export async function GET(request: NextRequest) {
+// The ownership checks run before the query's try; a Prisma failure there
+// would otherwise be Next's empty-bodied 500.
+export const GET = withRouteErrors('The graph could not be loaded', async (request: NextRequest) => {
   const searchParams = request.nextUrl.searchParams
   const projectId = searchParams.get('projectId')
 
@@ -120,15 +124,11 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Graph query error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return graphError(error, 'The graph query failed', 'Graph query error')
   }
-}
+})
 
-export async function DELETE(request: NextRequest) {
+export const DELETE = withRouteErrors('The node could not be deleted', async (request: NextRequest) => {
   const searchParams = request.nextUrl.searchParams
   const nodeId = searchParams.get('nodeId')
   const projectId = searchParams.get('projectId')
@@ -176,14 +176,10 @@ export async function DELETE(request: NextRequest) {
 
     return NextResponse.json({ success: true, deleted })
   } catch (error) {
-    console.error('Graph delete error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Delete failed' },
-      { status: 500 }
-    )
+    return graphError(error, 'Delete failed', 'Graph delete error')
   } finally {
     await session.close()
   }
-}
+})
 
 // getNodeName and serializeProperties are now in ./format.ts

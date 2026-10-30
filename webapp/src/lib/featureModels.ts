@@ -13,6 +13,7 @@ import {
   isFeatureId,
   isPluginFeatureId,
   modelAllowedForFeature,
+  providerFacts,
   readFeatureModelCode,
   type FeatureId,
   type FeatureModelCode,
@@ -91,13 +92,14 @@ export function parseFeatureModelsPatch(
 export function featureModelErrorResponse(
   code: FeatureModelCode,
   featureId: FeatureId | PluginFeatureId,
-  opts: { model?: string; error?: string } = {},
+  opts: { model?: string; error?: string; agentBody?: unknown } = {},
 ): NextResponse {
   const body: FeatureModelErrorBody = {
     error: opts.error ?? featureModelMessage(code, opts.model),
     code,
     featureId,
     ...(opts.model ? { model: opts.model } : {}),
+    ...providerFacts(opts.agentBody),
   }
   return NextResponse.json(body, { status: FEATURE_MODEL_STATUS[code] })
 }
@@ -143,5 +145,5 @@ export function agentCodedError(
   if (status >= 200 && status < 300) return null
   const code = readFeatureModelCode(body)
   if (!code || !AGENT_PASSTHROUGH_CODES.has(code)) return null
-  return featureModelErrorResponse(code, featureId, code === 'model_unavailable' ? { model: sentModel } : {})
+  return featureModelErrorResponse(code, featureId, { ...(code === 'model_unavailable' ? { model: sentModel } : {}), agentBody: body })
 }

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { RedZoneTableResponse, RedZoneTableSlug } from './types'
 import { useMuteNodeContext } from '../MuteNode'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 export function useRedZoneTable<T>(slug: RedZoneTableSlug, projectId: string | null) {
   const [data, setData] = useState<RedZoneTableResponse<T> | null>(null)
@@ -18,14 +19,11 @@ export function useRedZoneTable<T>(slug: RedZoneTableSlug, projectId: string | n
     setError(null)
     try {
       const res = await fetch(`/api/analytics/redzone/${slug}?projectId=${encodeURIComponent(projectId)}`)
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
-        throw new Error(body.error || `HTTP ${res.status}`)
-      }
+      if (!res.ok) throw await readApiError(res, 'Failed to load')
       const json = (await res.json()) as RedZoneTableResponse<T>
       setData(json)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load')
+      setError(toApiError(e, 'Failed to load').message)
     } finally {
       setIsLoading(false)
     }

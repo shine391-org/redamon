@@ -280,3 +280,13 @@ describe('a deployment with the sandbox off teaches no sandbox tool', () => {
     for (const name of sandboxTools) expect(data.available).toContain(name)
   })
 })
+
+describe('a failure outside the generation itself', () => {
+  test('a session check that throws answers a sentence and a code, not an empty 500', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.requireUserAccess.mockRejectedValue(Object.assign(new Error("Can't reach database server"), { code: 'P1001' }))
+    const res = await POST(req(valid()), params())
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not generate the onboarding pack', code: 'P1001' })
+  })
+})

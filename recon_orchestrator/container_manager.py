@@ -138,6 +138,29 @@ def join_host_path(host_path: str, *names: str) -> str:
     return p
 
 
+def container_exit_reason(exit_code, oom_killed=False) -> str:
+    """The ``state.error`` of a scan container that exited non-zero.
+
+    The bare exit code is all the webapp can show of a scanner's death, and 137
+    reads like any other crash. Docker sets ``State.OOMKilled`` when the kernel's
+    OOM killer took the container; without that flag 137 is still a SIGKILL,
+    which on these hosts is most often memory too (a host-level OOM kill, or a
+    ``docker kill``), so it is named as likely rather than certain.
+    """
+    reason = f"Container exited with code {exit_code}"
+    if oom_killed:
+        return f"{reason}: killed (out of memory)"
+    if exit_code == 137:
+        return f"{reason}: killed (SIGKILL, likely out of memory)"
+    return reason
+
+
+def _exit_reason_of(container) -> str:
+    """``container_exit_reason`` from a container's already-fetched ``attrs``."""
+    state = (getattr(container, "attrs", None) or {}).get("State", {}) or {}
+    return container_exit_reason(state.get("ExitCode", -1), state.get("OOMKilled") is True)
+
+
 # Maximum number of concurrent partial recon runs per project
 MAX_PARALLEL_PARTIAL_RECONS = 12
 
@@ -1033,7 +1056,7 @@ class ContainerManager:
                             state.completed_at = datetime.now(timezone.utc)
                         else:
                             state.status = ReconStatus.ERROR
-                            state.error = f"Container exited with code {exit_code}"
+                            state.error = _exit_reason_of(container)
                             state.completed_at = datetime.now(timezone.utc)
 
                         # Auto-cleanup: remove finished container
@@ -2283,7 +2306,7 @@ class ContainerManager:
                     state.completed_at = datetime.now(timezone.utc)
                 else:
                     state.status = PartialReconStatus.ERROR
-                    state.error = f"Container exited with code {exit_code}"
+                    state.error = _exit_reason_of(container)
                     state.completed_at = datetime.now(timezone.utc)
                 try:
                     container.remove()
@@ -2754,7 +2777,7 @@ class ContainerManager:
                     state.status = AiAttackSurfaceStatus.COMPLETED
                 else:
                     state.status = AiAttackSurfaceStatus.ERROR
-                    state.error = f"Container exited with code {exit_code}"
+                    state.error = _exit_reason_of(container)
                 state.completed_at = datetime.now(timezone.utc)
                 # Job ended on its own -> free the shared judge lease.
                 self._release_llm(state)
@@ -3185,7 +3208,7 @@ class ContainerManager:
                             state.completed_at = datetime.now(timezone.utc)
                         else:
                             state.status = GvmStatus.ERROR
-                            state.error = f"Container exited with code {exit_code}"
+                            state.error = _exit_reason_of(container)
                             state.completed_at = datetime.now(timezone.utc)
 
                         try:
@@ -3722,7 +3745,7 @@ class ContainerManager:
                             state.completed_at = datetime.now(timezone.utc)
                         else:
                             state.status = GithubHuntStatus.ERROR
-                            state.error = f"Container exited with code {exit_code}"
+                            state.error = _exit_reason_of(container)
                             state.completed_at = datetime.now(timezone.utc)
 
                         # Both branches: a non-zero exit still leaves whatever the
@@ -4361,7 +4384,7 @@ class ContainerManager:
                             state.completed_at = datetime.now(timezone.utc)
                         else:
                             state.status = TrufflehogStatus.ERROR
-                            state.error = f"Container exited with code {exit_code}"
+                            state.error = _exit_reason_of(container)
                             state.completed_at = datetime.now(timezone.utc)
 
                         # The CLEAN half of the split: the dirty container held no
@@ -5146,7 +5169,7 @@ exit $RC
                             state.status = SupplyChainStatus.COMPLETED
                         else:
                             state.status = SupplyChainStatus.ERROR
-                            state.error = f"Container exited with code {exit_code}"
+                            state.error = _exit_reason_of(container)
                         state.completed_at = datetime.now(timezone.utc)
                         try:
                             container.remove()

@@ -135,6 +135,13 @@ class TestListPartialReconsEndpoint:
 
 class TestStartPartialReconEndpoint:
 
+    @pytest.fixture(autouse=True)
+    def _project(self, monkeypatch):
+        # The scope pre-flight is unconditional (it reads the project's roots from the
+        # webapp), so the start needs a webapp URL; the project it would fetch is this.
+        monkeypatch.setattr(api, "_fetch_project_for_preflight",
+                            lambda pid: {"targetDomain": "example.com", "subdomainList": []})
+
     @pytest.mark.asyncio
     async def test_spawns_container_and_returns_running(self, wired_manager, mock_docker_client):
         """End-to-end POST: image exists, containers.run (executor-wrapped via
@@ -146,7 +153,7 @@ class TestStartPartialReconEndpoint:
         mock_docker_client.containers.run.return_value = spawned
 
         req = PartialReconStartRequest(
-            project_id="p", user_id="u", webapp_api_url="",  # empty => skip RoE/webapp calls
+            project_id="p", user_id="u", webapp_api_url="http://localhost:3000",
             tool_id="SubdomainDiscovery", graph_inputs={"domain": "example.com"},
         )
         state = await api.start_partial_recon("p", req)
@@ -178,7 +185,7 @@ class TestStartPartialReconEndpoint:
                 ticks += 1
 
         req = PartialReconStartRequest(
-            project_id="p2", user_id="u", webapp_api_url="",
+            project_id="p2", user_id="u", webapp_api_url="http://localhost:3000",
             tool_id="Naabu", graph_inputs={"domain": "example.com"},
         )
         hb = asyncio.create_task(heartbeat())

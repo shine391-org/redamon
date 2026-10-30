@@ -12,6 +12,7 @@ import {
   daysFromIso,
 } from '@/app/graph/components/RedZoneTables/dnsParsers'
 import { orgDomain } from '@/lib/publicSuffix'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -152,11 +153,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ rows, meta: { totalRows: rows.length } })
   } catch (error) {
-    console.error('Red-zone dnsEmail error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Red-zone dnsEmail error' })
   } finally {
     await session.close()
   }

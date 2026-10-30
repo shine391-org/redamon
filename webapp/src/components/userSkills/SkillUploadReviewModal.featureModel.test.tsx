@@ -190,3 +190,52 @@ describe('Generate with AI in the upload dialog', () => {
     expect(button).toHaveAttribute('title', 'Every name and description is filled')
   })
 })
+
+describe('when Generate or the name check fails, the dialog says why', () => {
+  test("an agent crash names the webapp's and the agent's status", async () => {
+    stubGateFetch({ skill_metadata: 'claude-haiku-4-5' }, route(() => jsonResponse(502, {
+      error: 'The agent failed while handling this request. The details are in the agent log.', upstreamStatus: 500,
+    })))
+    draw([plain(1)])
+    fireEvent.click(generateButton())
+    expect(await screen.findByText(
+      'The agent failed while handling this request. The details are in the agent log. (HTTP 502 · upstream HTTP 500)',
+    )).toBeInTheDocument()
+  })
+
+  test("a route failure keeps the route's own sentence and code", async () => {
+    stubGateFetch({ skill_metadata: 'claude-haiku-4-5' }, route(() => jsonResponse(500, {
+      error: 'Failed to generate the names and descriptions', code: 'P2024',
+    })))
+    draw([plain(1)])
+    fireEvent.click(generateButton())
+    expect(await screen.findByText('Failed to generate the names and descriptions (P2024 · HTTP 500)')).toBeInTheDocument()
+  })
+
+  test('a proxy page in between is read with its status', async () => {
+    stubGateFetch({ skill_metadata: 'claude-haiku-4-5' }, route(() => new Response('<html>504</html>', { status: 504 })))
+    draw([plain(1)])
+    fireEvent.click(generateButton())
+    expect(await screen.findByText('The AI could not write the missing fields (non_json_response · HTTP 504)')).toBeInTheDocument()
+  })
+
+  test('no answer at all keeps its text and adds network_error', async () => {
+    stubGateFetch({ skill_metadata: 'claude-haiku-4-5' }, (url, init) => {
+      if (url === GENERATE_URL) throw new TypeError('Failed to fetch')
+      return route(filled)(url, init)
+    })
+    draw([plain(1)])
+    fireEvent.click(generateButton())
+    expect(await screen.findByText('The AI could not be reached. Try again in a moment. (network_error)')).toBeInTheDocument()
+  })
+
+  test("a failed name check shows the check's code and status on the row", async () => {
+    stubGateFetch({ skill_metadata: 'claude-haiku-4-5' }, (url, init) => (url === NAME_CHECK_URL
+      ? jsonResponse(500, { error: 'Failed to check the names', code: 'P1001' })
+      : route(filled)(url, init)))
+    draw([{ name: 'named.md', text: '---\nname: Named\n---\n# Body' }])
+    expect(await screen.findByText(
+      'The name could not be checked (P1001 · HTTP 500); it is checked again when you save.',
+    )).toBeInTheDocument()
+  })
+})

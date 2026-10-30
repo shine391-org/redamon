@@ -4,6 +4,8 @@ import { Scale, ArrowUpCircle } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 import { DISCLAIMER_GITHUB_URL } from '@/lib/disclaimerVersion'
 import { useVersionCheck } from '@/hooks/useVersionCheck'
+import { usePreferencePersistError } from '@/hooks/useUserPreferences'
+import { useErrorToast } from '@/hooks/useErrorToast'
 import { SystemMeter } from '@/components/system/SystemMeter'
 import styles from './Footer.module.css'
 
@@ -11,6 +13,8 @@ export function Footer() {
   const currentYear = new Date().getFullYear()
   const { currentVersion, latestVersion, updateAvailable } = useVersionCheck()
   const router = useRouter()
+  // Mounted on every page, unlike the tables and the graph that write preferences.
+  useErrorToast(usePreferencePersistError(), 'Preference not saved')
 
   return (
     <footer className={styles.footer}>

@@ -15,6 +15,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -48,10 +49,6 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ authorizations })
   } catch (error) {
-    console.error('Error listing engagement authorizations:', error)
-    return NextResponse.json(
-      { error: 'Failed to list engagement authorizations' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list engagement authorizations', { log: 'Error listing engagement authorizations' })
   }
 }

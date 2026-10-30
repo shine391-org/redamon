@@ -13,6 +13,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { SCOPE_SELECT, currentScanRoots } from '@/lib/scanCoverage'
 import { resolveVersionSelector, isCurrentSelector } from '@/lib/scanVersionAccess'
@@ -32,7 +33,7 @@ interface SideDescriptor {
   isCurrent: boolean
 }
 
-export async function GET(request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to compute the delta', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
 
   const eff = await requireEffectiveUser()
@@ -119,10 +120,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       { headers: { 'Cache-Control': 'private, no-cache' } }
     )
   } catch (error) {
-    console.error('[scanTimeline] delta failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to compute the delta' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to compute the delta', { log: '[scanTimeline] delta failed' })
   }
-}
+})

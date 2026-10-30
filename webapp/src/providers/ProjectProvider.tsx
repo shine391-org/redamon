@@ -4,6 +4,7 @@ import { createContext, useContext, useState, useEffect, useCallback, ReactNode 
 import { useSearchParams, useRouter, usePathname } from 'next/navigation'
 import { useAuth } from './AuthProvider'
 import { type ProjectSummary, toProjectSummary } from '@/lib/projectSummary'
+import { type ApiError, readApiError, toApiError } from '@/lib/apiError'
 
 export type { ProjectSummary } from '@/lib/projectSummary'
 
@@ -14,6 +15,12 @@ interface ProjectContextValue {
   userId: string | null
   setUserId: (id: string | null) => void
   isLoading: boolean
+  /**
+   * Why the last user switch was refused (the effective user stayed the admin's
+   * own). This provider sits above the toast layer, so a component under it
+   * shows the message.
+   */
+  userSwitchError: ApiError | null
 }
 
 const ProjectContext = createContext<ProjectContextValue | null>(null)
@@ -25,6 +32,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [currentProject, setCurrentProjectState] = useState<ProjectSummary | null>(null)
   const [userId, setUserIdState] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [userSwitchError, setUserSwitchError] = useState<ApiError | null>(null)
   // Gates data loads until the server-side act-as cookie has been reconciled with
   // the restored (localStorage) impersonation selection, so an admin's first load
   // after a refresh never fetches with a stale/absent cookie (which would 404
@@ -94,14 +102,18 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     // Load project
     if (projectIdToLoad) {
       fetch(`/api/projects/${projectIdToLoad}`)
-        .then(res => res.ok ? res.json() : null)
+        .then(async res => {
+          if (res.ok) return res.json()
+          // Only a 404 says the project is gone. An outage (500, 503) must not
+          // wipe the saved selection, or every restart forgets the project.
+          if (res.status === 404) localStorage.removeItem(STORAGE_KEY_PROJECT)
+          else console.error((await readApiError(res, 'Could not load the saved project')).message)
+          return null
+        })
         .then(project => {
           if (project) {
             setCurrentProjectState(toProjectSummary(project))
             localStorage.setItem(STORAGE_KEY_PROJECT, project.id)
-          } else {
-            // Remove stale project ID from localStorage if project no longer exists
-            localStorage.removeItem(STORAGE_KEY_PROJECT)
           }
         })
         .catch(console.error)
@@ -161,14 +173,25 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
           // target must never become the effective id.
           if (!resp.ok) {
             impersonated = false
+            setUserSwitchError(await readApiError(resp, 'Could not switch user'))
             localStorage.removeItem(STORAGE_KEY_USER)
             await fetch('/api/auth/act-as', { method: 'DELETE' }).catch(() => {})
+          } else {
+            setUserSwitchError(null)
           }
         } else {
           await fetch('/api/auth/act-as', { method: 'DELETE' })
+          setUserSwitchError(null)
         }
       } catch (e) {
         console.error('act-as sync failed', e)
+        // No answer means no act-as cookie either: stay on the admin's own id,
+        // as for a refused target, instead of a half-switched session.
+        if (impersonated) {
+          impersonated = false
+          localStorage.removeItem(STORAGE_KEY_USER)
+          setUserSwitchError(toApiError(e, 'Could not switch user'))
+        }
       }
       setUserIdState(impersonated ? id : (authUser?.id ?? null))
     })()
@@ -182,6 +205,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       userId,
       setUserId,
       isLoading,
+      userSwitchError,
     }}>
       {children}
     </ProjectContext.Provider>

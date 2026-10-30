@@ -31,6 +31,9 @@ import { jevImportWarnings } from '@/lib/reconSettings/jevEngine'
 import { PROJECT_EXPORT_EXCLUDED, isPluginArchivePath } from '@/lib/projectExport/pluginExclusion'
 import { validateSerializedScanChange } from '@/lib/reconSettings/serializedScanGate'
 import { skillToggleWarnings, trimImportedSkillToggles } from '@/lib/userSkills'
+import { declaredBodyTooLarge } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
+import { DEFAULT_IMPORT_MAX_UPLOAD_BYTES } from './limits'
 
 const MUTEABLE_LABELS = new Set<string>(MUTEABLE_FINDING_LABELS)
 
@@ -153,31 +156,50 @@ export async function POST(request: NextRequest) {
     if (eff instanceof NextResponse) return eff
     const userId = eff.userId
 
+    // D10: zip-bomb defense. Cap the upload size, the total DECLARED uncompressed
+    // size, and the entry count BEFORE decompressing any entry, so a small crafted
+    // archive cannot inflate to tens of GB and OOM-kill the webapp (mem_limit 1g).
+    // Caps are sized generously off the real export shape (tens of MB uncompressed)
+    // and env-overridable; an upload cap raised past Next's body cap is unreachable.
+    const MAX_UPLOAD_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UPLOAD_BYTES || '', 10) || DEFAULT_IMPORT_MAX_UPLOAD_BYTES
+    const MAX_UNCOMPRESSED_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UNCOMPRESSED_BYTES || '', 10) || 500 * 1024 * 1024
+    const MAX_ENTRIES = parseInt(process.env.PROJECT_IMPORT_MAX_ENTRIES || '', 10) || 5000
+
+    const lengthProblem = declaredBodyTooLarge(request, MAX_UPLOAD_BYTES)
+    if (lengthProblem) return lengthProblem
+
     // Parse uploaded ZIP
-    const formData = await request.formData()
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch {
+      return NextResponse.json(
+        { error: 'The upload could not be read as multipart form data.', code: 'invalid_multipart' },
+        { status: 400 }
+      )
+    }
     const file = formData.get('file') as File | null
     if (!file) {
       return NextResponse.json({ error: 'No file uploaded' }, { status: 400 })
     }
 
-    // D10: zip-bomb defense. Cap the upload size, the total DECLARED uncompressed
-    // size, and the entry count BEFORE decompressing any entry, so a small crafted
-    // archive cannot inflate to tens of GB and OOM-kill the webapp (mem_limit 1g).
-    // Caps are sized generously off the real export shape (tens of MB uncompressed)
-    // and env-overridable.
-    const MAX_UPLOAD_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UPLOAD_BYTES || '', 10) || 100 * 1024 * 1024
-    const MAX_UNCOMPRESSED_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UNCOMPRESSED_BYTES || '', 10) || 500 * 1024 * 1024
-    const MAX_ENTRIES = parseInt(process.env.PROJECT_IMPORT_MAX_ENTRIES || '', 10) || 5000
-
     if (file.size > MAX_UPLOAD_BYTES) {
       return NextResponse.json(
-        { error: `Upload too large (${file.size} bytes; max ${MAX_UPLOAD_BYTES})` },
+        { error: `Upload too large (${file.size} bytes; max ${MAX_UPLOAD_BYTES})`, code: 'file_too_large', limitBytes: MAX_UPLOAD_BYTES },
         { status: 413 }
       )
     }
 
     const arrayBuffer = await file.arrayBuffer()
-    const zip = await JSZip.loadAsync(arrayBuffer)
+    let zip: JSZip
+    try {
+      zip = await JSZip.loadAsync(arrayBuffer)
+    } catch {
+      return NextResponse.json(
+        { error: 'The file is not a readable ZIP archive. Select a RedAmon export ZIP.', code: 'invalid_zip' },
+        { status: 400 }
+      )
+    }
 
     // Enforce entry-count + total declared uncompressed size from the central
     // directory (available without decompressing).
@@ -856,10 +878,6 @@ export async function POST(request: NextRequest) {
       excludedReason: 'Plugin skill versions and plugin data are not imported.',
     })
   } catch (error) {
-    console.error('Import failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Import failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Import failed')
   }
 }

@@ -213,10 +213,27 @@ describe('jobs/complete and jobs/progress', () => {
     ['succeeded without a result object', { status: 'succeeded', result: [1] }],
     ['failed without an error', { status: 'failed' }],
     ['an error without a code', { status: 'failed', error: { message: 'm' } }],
-  ])('%s: 400 invalid_report, the job unchanged', async (_n, report) => {
+  ])('%s: 400 invalid_report, and the job fails with the refusal instead of waiting out its deadline', async (_n, report) => {
     const { body } = await start()
-    expect((await answer(await jobComplete(gatewayRequest('jobs/complete', report, { token: tokenOf() })))).status).toBe(400)
-    expect((await read(body.jobId as string)).body.status).toBe('running')
+    expect(await answer(await jobComplete(gatewayRequest('jobs/complete', report, { token: tokenOf() })))).toMatchObject({
+      status: 400,
+      body: { code: 'invalid_report' },
+    })
+    // The runner does not retry a 4xx, so without this the job would read as timed out.
+    expect((await read(body.jobId as string)).body).toMatchObject({
+      status: 'failed',
+      error: { code: 'report_refused:invalid_report', message: expect.stringContaining('HTTP 400') },
+    })
+  })
+
+  test('a result over the body limit: 413, and the job fails as report_refused:body_too_large', async () => {
+    const { body } = await start()
+    const big = { status: 'succeeded', result: { text: 'x'.repeat(8 * 1024 * 1024 + 1) } }
+    expect(await answer(await jobComplete(gatewayRequest('jobs/complete', big, { token: tokenOf() })))).toMatchObject({
+      status: 413,
+      body: { code: 'body_too_large' },
+    })
+    expect((await read(body.jobId as string)).body).toMatchObject({ status: 'failed', error: { code: 'report_refused:body_too_large' } })
   })
 
   test.each<[string, Record<string, unknown>]>([

@@ -4,6 +4,7 @@ import { useState, useCallback } from 'react'
 import { Loader2, Pin, PinOff, Trash2, Pencil, Play, Save, Check, X } from 'lucide-react'
 import { Modal, useAlertModal, useToast, WikiInfoButton } from '@/components/ui'
 import type { ReconStatus } from '@/lib/recon-types'
+import { readApiError, toApiError, type ApiError } from '@/lib/apiError'
 import type { ScanVersionSummary } from '../../hooks/useScanVersions'
 import styles from './VersionManager.module.css'
 import { UpdatedAtCell } from '../RedZoneTables/updatedAt'
@@ -47,6 +48,14 @@ function formatDate(iso: string): string {
   return Number.isNaN(d.getTime()) ? '-' : d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
 }
 
+/**
+ * A lost answer or a gateway timeout says nothing about whether the server
+ * finished: an activation in particular can still be swapping the graph.
+ */
+function outcomeUnknown(err: ApiError): boolean {
+  return err.status === 0 || err.status === 502 || err.status === 504
+}
+
 function formatBytes(n: number): string {
   if (!n) return '-'
   if (n < 1024) return `${n} B`
@@ -84,19 +93,29 @@ export function VersionManager({
   const call = useCallback(async (
     path: string,
     init: RequestInit,
-    failure: string
+    failure: string,
+    unknownOutcome?: string,
   ): Promise<Record<string, unknown> | null> => {
-    const res = await fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
-      ...init,
-    })
-    const body = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      alertError(String(body.error || failure), failure)
-      return null
+    let err: ApiError
+    try {
+      const res = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...init,
+      })
+      if (res.ok) return await res.json().catch(() => ({}))
+      err = await readApiError(res, failure)
+    } catch (thrown) {
+      err = toApiError(thrown, failure)
     }
-    return body
-  }, [alertError])
+    if (unknownOutcome && outcomeUnknown(err)) {
+      // The list may already show the result; reload it before the person retries.
+      onChanged()
+      alertError(`${err.message}\n\n${unknownOutcome}`, failure)
+    } else {
+      alertError(err.message, failure)
+    }
+    return null
+  }, [alertError, onChanged])
 
   const startRename = (v: ScanVersionSummary) => {
     setEditingId(v.id)
@@ -170,7 +189,9 @@ export function VersionManager({
       const ok = await call(
         `/api/projects/${projectId}/versions/${v.id}/activate`,
         { method: 'POST', body: '{}' },
-        'Could not activate the version'
+        'Could not activate the version',
+        'No answer came back, so the activation may still be running or may already have finished. ' +
+          'Check the list, refreshed now, before activating again.',
       )
       if (ok) {
         toast.info(`“${v.label}” is now the active version`)

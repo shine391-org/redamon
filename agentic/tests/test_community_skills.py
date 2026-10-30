@@ -66,7 +66,7 @@ _CANONICAL_SKILLS = {
 # any future legacy imports still have a stable reference.
 _LEGACY_SKILLS: set[str] = set()
 
-_FILE_SIZE_CAP_BYTES = 50_000  # webapp/.../attack-skills/route.ts enforces this
+_FILE_SIZE_CAP_BYTES = 500 * 1024  # MAX_CONTENT_SIZE in webapp/src/lib/userSkills.ts
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _REAL_AGENT_TOOLS = {
     "query_graph", "kali_shell", "execute_curl", "execute_code",
@@ -118,7 +118,7 @@ class TestCommunitySkillsMinimal(unittest.TestCase):
                 self.assertRegex(path.stem, _NAME_PATTERN,
                                  f"Skill id '{path.stem}' must be lowercase snake_case")
 
-    def test_size_under_50kb(self):
+    def test_size_under_import_cap(self):
         for path in self.skill_files:
             size = path.stat().st_size
             with self.subTest(skill=path.stem):

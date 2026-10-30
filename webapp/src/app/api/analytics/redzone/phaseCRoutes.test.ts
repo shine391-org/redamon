@@ -64,10 +64,11 @@ describe('phase C: shared contract', () => {
     ['threatIntel', threatIntelRoute.GET],
     ['supplyChain', supplyChainRoute.GET],
     ['dnsDrift',    dnsDriftRoute.GET],
-  ])('%s returns 500 on Neo4j failure', async (_, handler) => {
+  ])('%s returns 500 on Neo4j failure, with a fixed message and no raw text', async (_, handler) => {
     shouldThrow = new Error('neo4j down')
     const res = await handler(makeRequest('p1'))
     expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Query failed', code: 'internal_error' })
   })
 
   test.each([

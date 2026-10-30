@@ -3,6 +3,7 @@ import { guardProject } from '@/lib/access'
 import { getEffectiveUser } from '@/lib/session'
 import { parseScanMode, type ScanMode } from '@/lib/scanTimeline'
 import { startFullScan } from '@/lib/startFullScan'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string }>
@@ -49,6 +50,12 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
           ...(result.snapshotFailed ? { snapshotFailed: true } : {}),
           ...(result.activationInProgress ? { activationInProgress: true } : {}),
           ...(result.busy ? { busy: result.busy } : {}),
+          ...(result.code ? { code: result.code } : {}),
+          ...(result.startOutcome ? { startOutcome: result.startOutcome } : {}),
+          ...(result.invalidEntries ? { invalidEntries: result.invalidEntries } : {}),
+          ...(result.upstreamStatus ? { upstreamStatus: result.upstreamStatus } : {}),
+          ...(result.cause ? { cause: result.cause } : {}),
+          ...(result.scanJobId ? { scanJobId: result.scanJobId } : {}),
         },
         { status: result.status }
       )
@@ -67,10 +74,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     })
 
   } catch (error) {
-    console.error('Error starting recon:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to start recon', { log: 'Error starting recon' })
   }
 }

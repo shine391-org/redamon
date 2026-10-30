@@ -2,6 +2,8 @@
 
 import { useState, useCallback, useMemo } from 'react'
 import { useRemediations } from '@/hooks'
+import { useAlertModal } from '@/components/ui'
+import { errorMessage } from '@/lib/apiError'
 import { useProjectById } from '@/hooks/useProjects'
 import type { UseCypherFixTriageWSReturn } from '@/hooks/useCypherFixTriageWS'
 import { EmptyState } from './EmptyState/EmptyState'
@@ -45,8 +47,8 @@ export function CypherFixTab({
     isLoading,
     error,
     refetch,
-    updateRemediation,
-    deleteRemediation,
+    updateRemediationAsync,
+    deleteRemediationAsync,
   } = useRemediations({
     projectId,
     severity: severityFilter,
@@ -87,18 +89,32 @@ export function CypherFixTab({
     setSubView('detail')
   }, [])
 
-  const handleDismiss = useCallback((id: string) => {
-    updateRemediation({ id, data: { status: 'dismissed' } })
-  }, [updateRemediation])
+  const { alertError } = useAlertModal()
 
-  const handleDelete = useCallback((id: string) => {
-    deleteRemediation(id)
+  const handleDismiss = useCallback(async (id: string) => {
+    try {
+      await updateRemediationAsync({ id, data: { status: 'dismissed' } })
+    } catch (e) {
+      await alertError(errorMessage(e, 'The remediation could not be dismissed'), 'Dismiss')
+    }
+  }, [updateRemediationAsync, alertError])
+
+  const handleDelete = useCallback(async (id: string) => {
+    try {
+      await deleteRemediationAsync(id)
+    } catch (e) {
+      // Stay on the remediation: going back looked like the delete worked.
+      await alertError(errorMessage(e, 'The remediation could not be deleted'), 'Delete')
+      return
+    }
     if (selectedRemediation?.id === id) {
       handleBackToDashboard()
     }
-  }, [deleteRemediation, selectedRemediation, handleBackToDashboard])
+  }, [deleteRemediationAsync, selectedRemediation, handleBackToDashboard, alertError])
 
-  const showEmpty = !isLoading && remediations.length === 0 && !severityFilter && !statusFilter
+  // A failed load is not an empty project: the dashboard shows the error
+  // rather than offering to start triage over remediations that exist.
+  const showEmpty = !isLoading && !error && remediations.length === 0 && !severityFilter && !statusFilter
 
   const running = triage.status === 'running'
   // A live run this page is not showing in the panel: one re-attached after a

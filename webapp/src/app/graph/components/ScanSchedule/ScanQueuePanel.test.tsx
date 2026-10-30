@@ -175,9 +175,28 @@ describe('ScanQueuePanel', () => {
   })
 
   test('a failing load says so instead of rendering an empty queue silently', async () => {
-    fetchMock.mockResolvedValue({ ok: false, status: 500, json: async () => ({ error: 'boom' }) })
+    fetchMock.mockResolvedValue({
+      ok: false, status: 500, json: async () => ({ error: 'Could not load scan activity', code: 'P1001' }),
+    })
     render(<ScanQueuePanel projectId="p1" />)
-    await waitFor(() => expect(screen.getByText(/Could not load scan activity/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Could not load scan activity (P1001 · HTTP 500)')).toBeTruthy())
+  })
+
+  test('a load that got no answer says so, with the code', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    render(<ScanQueuePanel projectId="p1" />)
+    await waitFor(() => expect(screen.getByText('Could not load scan activity. (network_error)')).toBeTruthy())
+  })
+
+  test('a cancel answered by a proxy error page shows its status', async () => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (
+      init?.method === 'POST'
+        ? { ok: false, status: 502, text: async () => '<html>Bad Gateway</html>' }
+        : { ok: true, json: async () => payload({ queued: [job({})] }) }
+    ))
+    render(<ScanQueuePanel projectId="p1" />)
+    fireEvent.click(await screen.findByText('Cancel'))
+    await waitFor(() => expect(screen.getByText('Could not cancel the job. (non_json_response · HTTP 502)')).toBeTruthy())
   })
 })
 

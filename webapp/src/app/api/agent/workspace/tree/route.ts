@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { agentErrorResponse, callAgent } from '../../agentProxy'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+const FAILED = 'Failed to fetch tree'
 
-export async function GET(request: NextRequest) {
+export const GET = withRouteErrors(FAILED, async (request: NextRequest) => {
   const projectId = request.nextUrl.searchParams.get('projectId')
   const __denied = await guardProject(projectId || '')
   if (__denied) return __denied
@@ -16,19 +17,12 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'projectId required' }, { status: 400 })
   }
 
-  try {
-    const url = `${AGENT_API_URL}/workspace/tree?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(path)}&maxDepth=${maxDepth}&maxEntries=${maxEntries}`
-    const resp = await fetch(url, { cache: 'no-store', headers: internalKeyHeaders() })
-    if (!resp.ok) {
-      const text = await resp.text()
-      return NextResponse.json({ error: text }, { status: resp.status })
-    }
-    return NextResponse.json(await resp.json())
-  } catch (error) {
-    console.error('workspace/tree proxy error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to fetch tree' },
-      { status: 502 }
-    )
-  }
-}
+  const call = await callAgent(
+    `/workspace/tree?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(path)}&maxDepth=${encodeURIComponent(maxDepth)}&maxEntries=${encodeURIComponent(maxEntries)}`,
+    { cache: 'no-store' },
+    FAILED,
+  )
+  if (!call.ok) return call.response
+  if (!call.res.ok) return agentErrorResponse(call.res, FAILED)
+  return NextResponse.json(await call.res.json())
+})

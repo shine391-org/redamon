@@ -41,7 +41,7 @@ function req(server: unknown, userId?: string): NextRequest {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.stubGlobal('fetch', mockFetch)
-  mockFetch.mockResolvedValue({ status: 200, json: async () => ({ ok: true, discovered_tools: [] }) })
+  mockFetch.mockImplementation(async () => new Response(JSON.stringify({ ok: true, discovered_tools: [] }), { status: 200 }))
 })
 
 describe('POST /api/mcp/test — ownership + secret echo', () => {

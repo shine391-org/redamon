@@ -93,7 +93,7 @@ export const KEPT_WHEN_ABSENT: ReadonlySet<string> = new Set([
   'agentOpenaiModel', 'aiPipelineModel',
   'ffufAiUseJev', 'nucleiTagsAiUseJev', 'wafAiUseJev', 'takeoverAiUseJev',
   'ffufJevBasePaths', 'httpxJevPageType', 'resourceEnumJevToolHealth', 'hakrawlerJevSeedOrder',
-  'serializedScanJevRank',
+  'serializedScanJevRank', 'routeExposureJevRank', 'routeExposureJevWallCheck', 'routeExposureJevAssess',
 ])
 
 export type Lookup = { found: true; value: unknown } | { found: false }

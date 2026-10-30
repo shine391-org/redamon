@@ -27,6 +27,7 @@ import { computeSkillTextOverrides } from '@/lib/plugins/overrideDelivery'
 import { userSkillsForAgent } from '@/lib/userSkillAgentPayload'
 import type { ResolvedPart } from '@/lib/plugins/overrides'
 import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
+import { internalError } from '@/lib/routeErrors'
 
 // Path to output directories (fallback for local deletion)
 const RECON_OUTPUT_PATH = process.env.RECON_OUTPUT_PATH || '/home/samuele/Progetti didattici/RedAmon/recon/output'
@@ -186,16 +187,15 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ ...projectWithoutBinary, ...skillOverridesField })
   } catch (error) {
-    console.error('Failed to fetch project:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch project' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch project')
   }
 }
 
 // PUT /api/projects/[id] - Update project params
 export async function PUT(request: NextRequest, { params }: RouteParams) {
+  // Whether the row was written when something threw: the steps after the write
+  // (audit, Domain seeding, recording scope) can fail with the save already in.
+  let stage: 'before_write' | 'after_write' = 'before_write'
   try {
     const { id } = await params
 
@@ -205,7 +205,12 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     const access = await requireProjectAccess(eff, id)
     if (access instanceof NextResponse) return access
 
-    const body = await request.json()
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return NextResponse.json({ error: 'The request body is not valid JSON.', code: 'invalid_json' }, { status: 400 })
+    }
 
     // Remove fields that shouldn't be updated directly. authProfile comes back in
     // the whole-row PUT the form sends; it is a relation written only by its own
@@ -502,6 +507,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       if (count === 0) {
         return NextResponse.json({ error: STALE_SAVE_MESSAGE }, { status: 409 })
       }
+      stage = 'after_write'
       project = await prisma.project.findUnique({ where: { id } })
       if (!project) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     } else {
@@ -510,6 +516,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         data: updateData
       })
     }
+    stage = 'after_write'
 
     // The UI's own audit row. Without it a person reverting an MCP agent's
     // change left no trace, while the agent's change did.
@@ -558,19 +565,19 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     const { roeDocumentData: _binary, ...projectWithoutBinary } = project
     return NextResponse.json({ ...projectWithoutBinary, scopeGroups: resolveScopeGroups(project).groups })
   } catch (error: unknown) {
-    console.error('Failed to update project:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
+      console.error('Failed to update project:', error)
       return NextResponse.json(
         { error: 'Project not found' },
         { status: 404 }
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to update project' },
-      { status: 500 }
-    )
+    return stage === 'after_write'
+      ? internalError(error, 'The project was saved, but a step after the save failed', {
+          log: 'Failed to update project', extra: { stage },
+        })
+      : internalError(error, 'Failed to update project', { extra: { stage } })
   }
 }
 
@@ -688,6 +695,7 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
             'Could not archive this project\'s engagement authorization records, so it was ' +
             'not deleted. The record of what authorized an engagement must outlive the ' +
             'engagement. Retry, or contact an administrator.',
+          code: 'authorization_archive_failed',
         },
         { status: 500 }
       )
@@ -766,18 +774,14 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true })
   } catch (error: unknown) {
-    console.error('Failed to delete project:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
+      console.error('Failed to delete project:', error)
       return NextResponse.json(
         { error: 'Project not found' },
         { status: 404 }
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to delete project' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete project')
   }
 }

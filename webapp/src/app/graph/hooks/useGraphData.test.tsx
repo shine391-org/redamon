@@ -73,6 +73,28 @@ describe('useGraphData', () => {
     expect(String(result.current.error)).toMatch(/no stored snapshot/)
   })
 
+  test('a live read failure carries the route reason, its code and the status (G-9)', async () => {
+    fetchMock.mockResolvedValue(new Response(
+      JSON.stringify({ error: 'The graph query failed', code: 'ServiceUnavailable' }), { status: 500 }))
+    const { result } = renderHook(() => useGraphData('p1'), { wrapper })
+    await waitFor(() => expect(result.current.error).toBeTruthy())
+    expect(result.current.error?.message).toBe('The graph query failed (ServiceUnavailable · HTTP 500)')
+  })
+
+  test('a proxy page or an empty 500 still names the status', async () => {
+    fetchMock.mockResolvedValue(new Response('', { status: 502 }))
+    const { result } = renderHook(() => useGraphData('p1'), { wrapper })
+    await waitFor(() => expect(result.current.error).toBeTruthy())
+    expect(result.current.error?.message).toBe('Failed to fetch graph data (empty_response · HTTP 502)')
+  })
+
+  test('no answer at all is a network error', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    const { result } = renderHook(() => useGraphData('p1'), { wrapper })
+    await waitFor(() => expect(result.current.error).toBeTruthy())
+    expect(result.current.error?.message).toBe('Failed to fetch graph data (network_error)')
+  })
+
   test('nothing is fetched without a project', () => {
     renderHook(() => useGraphData(null), { wrapper })
     expect(fetchMock).not.toHaveBeenCalled()

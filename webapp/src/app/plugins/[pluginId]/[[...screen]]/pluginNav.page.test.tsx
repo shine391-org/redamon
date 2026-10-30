@@ -26,6 +26,7 @@ import { createFakePrisma, type FakePrisma } from '@/lib/plugins/__testing__/fak
 import { stashInputs } from '@/components/plugins/host/screenHandoff'
 import { screenPathFromSegments, screenUrl } from '@/lib/plugins/navPaths'
 import PluginNavPage from './page'
+import PluginNavError from './error'
 
 let dir: string
 let db: FakePrisma
@@ -78,6 +79,8 @@ beforeAll(async () => {
     await fs.writeFile(path.join(v, file), JSON.stringify(body))
   }
   await fs.writeFile(path.join(v, 'ui/broken.json'), '{ not json')
+  // A path that exists but cannot be read as a file (EISDIR), like EACCES or EIO would.
+  await fs.mkdir(path.join(v, 'ui/folder.json'), { recursive: true })
 })
 afterAll(async () => {
   await fs.rm(dir, { recursive: true, force: true })
@@ -126,10 +129,27 @@ describe('what is drawn', () => {
 
   test('a listed screen missing on disk, or not JSON, shows an error naming the plugin', async () => {
     await open('echo', ['missing'])
-    expect(screen.getByRole('alert').textContent).toMatch(/Echo/)
+    expect(screen.getByRole('alert').textContent).toMatch(/Echo.*the screen file is missing/)
     cleanup()
     await open('echo', ['broken'])
-    expect(screen.getByRole('alert').textContent).toMatch(/Echo/)
+    expect(screen.getByRole('alert').textContent).toMatch(/Echo.*the screen file is not JSON/)
+  })
+
+  test('a screen that exists but cannot be read names its errno instead of calling it missing', async () => {
+    reseed(row({}, { ...manifest, screens: [...manifest.screens, 'ui/folder.json'] }))
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await open('echo', ['folder'])
+    expect(screen.getByRole('alert').textContent).toMatch(/the screen file could not be read \(EISDIR\)/)
+    expect(screen.getByRole('alert').textContent).not.toMatch(/missing/)
+  })
+
+  test('a server failure shows the error reference that matches the webapp log', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const reset = vi.fn()
+    render(<PluginNavError error={Object.assign(new Error('An error occurred in the Server Components render.'), { digest: '2817394650' })} reset={reset} />)
+    expect(screen.getByRole('alert').textContent).toContain('This plugin page could not be loaded (error reference 2817394650; the webapp log has the details).')
+    screen.getByRole('button', { name: 'Try again' }).click()
+    expect(reset).toHaveBeenCalled()
   })
 })
 

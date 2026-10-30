@@ -19,7 +19,7 @@ import { findLiveTriageRun, mcpRunBudget, MCP_RUNS_PER_DAY } from '@/lib/triageR
 import { isActivationInProgress } from '@/lib/activationLock'
 import { describeLiveGraphWriters } from '@/lib/graphWriters'
 import { readFeatureModel } from '@/lib/featureModels'
-import { agentTriage, type TriageChannel, type TriageTenant } from '@/lib/triage/actions'
+import { agentTriage, TriageActionError, type TriageChannel, type TriageTenant } from '@/lib/triage/actions'
 import { MAX_REVIEW_BUDGET } from '@/lib/triage/limits'
 import { isChatProvider } from '@/lib/llmProviderKinds'
 
@@ -51,6 +51,12 @@ export interface TriagePreflight {
     progress: number; tokenPrefix: string | null
   } | null
   blockedReason: string | null
+  /**
+   * Why the graph counts could not be read (`agent_unreachable`,
+   * `agent_failed`), or null. The counts are then zeros that mean "unknown",
+   * which the dialog must not present as "nothing to do".
+   */
+  countsUnavailable: string | null
   /** What a live run holds up while it works. */
   blocking: string[]
   defaultRepo: string
@@ -106,11 +112,13 @@ export async function computePreflight(
   // blocking the run: the numbers are guidance, not a guard.
   let counts = { in_scope: 0, never_triaged: 0, open_findings: 0, reviewable: 0,
                  last_triaged_at: null as string | null, reviews_kept: 0, external_reviews: 0 }
+  let countsUnavailable: string | null = null
   try {
     const body = await agentTriage('preflight', caller, {}, { channel })
     counts = { ...counts, ...(body as Partial<typeof counts>) }
-  } catch {
-    // leave the zeros
+  } catch (err) {
+    countsUnavailable = err instanceof TriageActionError ? err.code : 'agent_failed'
+    console.error('[triage] preflight counts unavailable:', err)
   }
 
   const byStatus = new Map(
@@ -182,6 +190,7 @@ export async function computePreflight(
           progress: liveRun.progress ?? 0, tokenPrefix }
       : null,
     blockedReason,
+    countsUnavailable,
     blocking: liveRun ? RUN_BLOCKS : [],
     defaultRepo: project.cypherfixDefaultRepo || '',
     mcpRunsToday: mcp ? mcp.runsToday : null,

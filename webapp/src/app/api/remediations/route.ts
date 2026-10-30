@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
@@ -52,11 +53,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(remediations)
   } catch (error) {
-    console.error('Failed to fetch remediations:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch remediations' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch remediations')
   }
 }
 
@@ -86,10 +83,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(remediation, { status: 201 })
   } catch (error) {
-    console.error('Failed to create remediation:', error)
-    return NextResponse.json(
-      { error: 'Failed to create remediation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create remediation')
   }
 }

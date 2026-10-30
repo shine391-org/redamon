@@ -151,3 +151,13 @@ describe('POST /api/auth/login', () => {
     expect(res.status).toBe(401)
   })
 })
+
+describe('POST /api/auth/login — the database is down', () => {
+  test('a 500 that names the Prisma code, so a DB outage reads apart from a pool timeout', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockUserFindUnique.mockRejectedValue(Object.assign(new Error("Can't reach database server at db:5432"), { code: 'P1001' }))
+    const res = await POST(req({ email: 'a@b.c', password: 'pw' }))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Internal server error', code: 'P1001' })
+  })
+})

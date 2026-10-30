@@ -12,6 +12,7 @@ import {
 import { nameProblem, normalizeName } from '@/lib/userSkillNames'
 import { requireOwnBrowserRequest } from '@/lib/userSkillRouteGuard'
 import { USER_SKILL_AUDIT_TARGET, auditActorFor, contentSha256 } from '@/lib/userSkillWrites'
+import { withRouteErrors } from '@/lib/routeErrors'
 
 // Above the agent's own 150 s cap (agentic/skill_metadata.py REQUEST_TIMEOUT_S), below undici's 300 s.
 const AGENT_TIMEOUT_MS = 180_000
@@ -79,7 +80,7 @@ function revalidate(asked: RequestedItem, raw: unknown): AnsweredItem {
  * descriptions" model on their own keys; never saves anything, and never sends a file that holds
  * a key or token.
  */
-export async function POST(request: NextRequest, { params }: RouteParams) {
+async function generateMetadata(request: NextRequest, { params }: RouteParams): Promise<Response> {
   const { id } = await params
   const eff = await requireOwnBrowserRequest(request, id)
   if (eff instanceof NextResponse) return eff
@@ -162,3 +163,5 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   }
   return NextResponse.json({ items, modelUsed: model })
 }
+
+export const POST = withRouteErrors('Failed to generate the names and descriptions', generateMetadata)

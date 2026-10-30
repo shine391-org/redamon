@@ -53,7 +53,7 @@ describe('limits', () => {
   test('the bounds the plan fixes (D10, 0.B.1)', () => {
     expect(MAX_SKILLS_PER_USER).toBe(1000)
     expect(MAX_ENABLED_USER_SKILLS_PER_PROJECT).toBe(20)
-    expect(MAX_CONTENT_SIZE).toBe(50 * 1024)
+    expect(MAX_CONTENT_SIZE).toBe(500 * 1024)
     expect(NAME_MAX_CHARS).toBe(100)
     expect(DESCRIPTION_MAX_CHARS).toBe(500)
   })

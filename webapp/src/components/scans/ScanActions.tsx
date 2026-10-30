@@ -2,6 +2,8 @@
 
 import { Download, Loader2, Shield, Github, Pause, Square } from 'lucide-react'
 import type { ScanControls } from '@/hooks/useScanControls'
+import { useToast } from '@/components/ui'
+import { ScanStatusWarning } from './ScanStatusWarning'
 import styles from '@/app/graph/components/GraphToolbar/GraphToolbar.module.css'
 
 /**
@@ -29,13 +31,14 @@ export function ScanActions({
   stealthMode?: boolean
 }) {
   const { gvm, githubHunt, trufflehog } = scans
+  const toast = useToast()
   const blocked = Boolean(disabledReason)
 
   // The graph toolbar's GVM preconditions, kept in the same order so the two
   // surfaces agree on WHY the button is off, not just that it is.
   const gvmBlockedReason =
     disabledReason ? disabledReason
-    : !gvm.isAvailable ? 'GVM is not installed. Run ./redamon.sh install --gvm to enable vulnerability scanning'
+    : !gvm.isAvailable ? gvm.unavailableReason
     : stealthMode && !gvm.isPaused ? 'GVM scanning is disabled in Stealth Mode (generates ~50,000 active probes per target)'
     : !scans.hasReconData && !gvm.isPaused ? 'Run recon first'
     : ''
@@ -46,9 +49,9 @@ export function ScanActions({
         <button
           type="button"
           className={styles.downloadButton}
-          onClick={scans.downloadReconJSON}
+          onClick={() => void scans.downloadReconJSON().then(error => { if (error) toast.error(error) })}
           disabled={!scans.hasReconData || blocked}
-          title={disabledReason || (scans.hasReconData ? 'Download Recon JSON' : 'No data available')}
+          title={disabledReason || (scans.hasReconData ? 'Download Recon JSON' : scans.reconDataError || 'No data available')}
         >
           <Download size={14} />
         </button>
@@ -58,7 +61,7 @@ export function ScanActions({
         <button
           type="button"
           className={`${styles.gvmButton} ${gvm.isActive ? styles.gvmButtonActive : ''}`}
-          onClick={() => void (gvm.isPaused ? gvm.resumeGvm() : gvm.startGvm())}
+          onClick={() => void (gvm.isPaused ? gvm.resumeGvm() : gvm.start())}
           disabled={Boolean(gvmBlockedReason) || gvm.isRunning}
           title={
             gvmBlockedReason ||
@@ -107,7 +110,7 @@ export function ScanActions({
           className={styles.downloadButton}
           onClick={gvm.download}
           disabled={!gvm.hasData || gvm.isRunning || blocked}
-          title={disabledReason || (gvm.hasData ? 'Download GVM JSON' : 'No data available')}
+          title={disabledReason || (gvm.hasData ? 'Download GVM JSON' : gvm.dataError || 'No data available')}
         >
           <Download size={14} />
         </button>
@@ -126,6 +129,8 @@ export function ScanActions({
           <span>{(githubHunt.isBusy || trufflehog.isRunning) ? 'Scanning...' : 'Other Scans'}</span>
         </button>
       </div>
+
+      <ScanStatusWarning errors={scans.statusErrors} />
     </>
   )
 }

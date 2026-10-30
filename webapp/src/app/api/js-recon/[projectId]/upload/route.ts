@@ -4,6 +4,8 @@ import prisma from '@/lib/prisma'
 import { mkdir, readdir, stat, unlink } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
+import { declaredBodyTooLarge } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
 
 const JS_RECON_UPLOAD_PATH = process.env.JS_RECON_UPLOAD_PATH || '/data/js-recon-uploads'
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10 MB
@@ -36,7 +38,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: 'Invalid project ID' }, { status: 400 })
     }
 
-    // Skip DB lookup -- project may not exist yet (pre-generated ID during creation)
     const projectDir = path.join(JS_RECON_UPLOAD_PATH, projectId)
     if (!existsSync(projectDir)) {
       return NextResponse.json({ files: [] })
@@ -63,8 +64,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ files })
   } catch (error) {
-    console.error('Error listing JS Recon uploads:', error)
-    return NextResponse.json({ error: 'Failed to list files' }, { status: 500 })
+    return internalError(error, 'Failed to list files', { log: 'Error listing JS Recon uploads' })
   }
 }
 
@@ -80,10 +80,20 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: 'Invalid project ID' }, { status: 400 })
     }
 
-    // Skip DB lookup -- project may not exist yet (pre-generated ID during creation).
-    // The projectId format validation above is sufficient for directory creation.
+    // The id becomes a directory name; the format check above is what makes that safe.
 
-    const formData = await request.formData()
+    const lengthProblem = declaredBodyTooLarge(request, MAX_FILE_SIZE)
+    if (lengthProblem) return lengthProblem
+
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch {
+      return NextResponse.json(
+        { error: 'The upload could not be read as multipart form data.', code: 'invalid_multipart' },
+        { status: 400 }
+      )
+    }
     const file = formData.get('file') as File | null
 
     if (!file) {
@@ -92,7 +102,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     if (file.size > MAX_FILE_SIZE) {
       return NextResponse.json(
-        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB` },
+        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB`, code: 'file_too_large', limitBytes: MAX_FILE_SIZE },
         { status: 400 }
       )
     }
@@ -122,9 +132,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const buffer = Buffer.from(await file.arrayBuffer())
     await writeFileFs(filePath, buffer)
 
-    // Update jsReconUploadedFiles in the project (skip if project doesn't exist yet -- during creation).
-    // Its new updatedAt goes back to the settings form, whose save is a
-    // compare-and-swap on it.
+    // Record the file in jsReconUploadedFiles. Its new updatedAt goes back to the
+    // settings form, whose save is a compare-and-swap on it.
     let projectUpdatedAt: Date | null = null
     try {
       const currentFiles = (await prisma.project.findUnique({
@@ -141,7 +150,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         projectUpdatedAt = updated.updatedAt
       }
     } catch {
-      // Project may not exist yet (pre-generated ID during creation) -- file is on disk, DB update will happen on save
+      // Best-effort: the guard above found the project, so this fails only on a
+      // database error or a delete in between, and the file stays on disk unrecorded.
     }
 
     return NextResponse.json({
@@ -149,8 +159,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       projectUpdatedAt,
     })
   } catch (error) {
-    console.error('Error uploading JS file:', error)
-    return NextResponse.json({ error: 'Failed to upload file' }, { status: 500 })
+    return internalError(error, 'Failed to upload file', { log: 'Error uploading JS file' })
   }
 }
 
@@ -194,7 +203,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ deleted: safeName, projectUpdatedAt: updated.updatedAt })
   } catch (error) {
-    console.error('Error deleting JS file:', error)
-    return NextResponse.json({ error: 'Failed to delete file' }, { status: 500 })
+    return internalError(error, 'Failed to delete file', { log: 'Error deleting JS file' })
   }
 }

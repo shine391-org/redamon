@@ -261,6 +261,8 @@ Pentesters with full authorization on an engagement where stealth is irrelevant.
 
     // --- Security Checks: all enabled ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: true,
     securityCheckDirectIpHttp: true,
     securityCheckDirectIpHttps: true,

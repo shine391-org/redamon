@@ -76,6 +76,8 @@ def _builder_queries(builder):
     # cache poisoning and the GraphQL scanner (which takes the POST ones).
     (graph_builders._build_graphql_data_from_graph, ["OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)"]),
     (graph_builders._build_serialized_data_from_graph, ["collect(DISTINCT {name: p.name, sample_values"]),
+    # the route exposure scan: every route it reads it requests with GET.
+    (graph_builders._build_route_exposure_data_from_graph, ["openapi_security AS openapi_security"]),
 ])
 def test_graph_builders_leave_declared_only_non_get_endpoints_out(builder, markers):
     queries = _builder_queries(builder)

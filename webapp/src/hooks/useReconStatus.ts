@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ReconState, ReconStatus } from '@/lib/recon-types'
-import type { ScanStartError, ScanStartLimit } from '@/lib/scanStartError'
+import { readScanStartError, scanStartNetworkError, type ScanStartError, type ScanStartLimit } from '@/lib/scanStartError'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 
 interface UseReconStatusOptions {
   projectId: string | null
@@ -41,6 +42,11 @@ interface UseReconStatusReturn {
   // The same for the most recent failed resumeRecon(): a resume outside the RoE
   // time window is refused (403) and the scan stays paused.
   getLastResumeError: () => string | null
+}
+
+/** The text of a failed start, with the code and status that say why. */
+function startErrorText(err: ScanStartError): string {
+  return formatApiError({ reason: err.message, code: err.code, status: err.status ?? 0, upstreamStatus: err.upstreamStatus })
 }
 
 const DEFAULT_POLLING_INTERVAL = 5000 // 5 seconds when running
@@ -84,10 +90,7 @@ export function useReconStatus({
 
     try {
       const response = await fetch(`/api/recon/${projectId}/status`)
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to fetch status')
-      }
+      if (!response.ok) throw await readApiError(response, 'Recon status unavailable')
 
       const data: ReconState = await response.json()
       setState(data)
@@ -107,8 +110,8 @@ export function useReconStatus({
       }
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      setError(errorMessage)
+      // The last known state stays: a failed read says nothing about the scan.
+      setError(toApiError(err, 'Recon status unavailable').message)
     }
   }, [projectId]) // Only depends on projectId now
 
@@ -127,12 +130,11 @@ export function useReconStatus({
       })
 
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        // Capture structured limit info (Part 5) and the HTTP status before
-        // throwing, so the caller can show a tailored modal and classify the
-        // failure as temporary (queueable) or permanent.
-        lastStartErrorRef.current = { message: data.error || 'Failed to start recon', limit: data.limit, status: response.status }
-        throw new Error(data.error || 'Failed to start recon')
+        // Capture structured limit info (Part 5), the HTTP status and the code
+        // before throwing, so the caller can show a tailored modal and classify
+        // the failure as temporary (queueable) or permanent.
+        lastStartErrorRef.current = await readScanStartError(response, 'Failed to start recon')
+        throw new Error(lastStartErrorRef.current.message)
       }
 
       const data: ReconState = await response.json()
@@ -141,8 +143,8 @@ export function useReconStatus({
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      if (!lastStartErrorRef.current) lastStartErrorRef.current = { message: errorMessage }
+      if (!lastStartErrorRef.current) lastStartErrorRef.current = scanStartNetworkError(err, 'Failed to start recon')
+      const errorMessage = startErrorText(lastStartErrorRef.current)
       setError(errorMessage)
       onErrorRef.current?.(errorMessage)
       return null
@@ -167,17 +169,14 @@ export function useReconStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to stop recon')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to stop recon')
 
       const data: ReconState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to stop recon').message
       setError(errorMessage)
       return null
 
@@ -199,17 +198,14 @@ export function useReconStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to pause recon')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to pause recon')
 
       const data: ReconState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to pause recon').message
       setError(errorMessage)
       return null
 
@@ -230,17 +226,14 @@ export function useReconStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        throw new Error(data.error || 'Failed to resume recon')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to resume recon')
 
       const data: ReconState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to resume recon').message
       lastResumeErrorRef.current = errorMessage
       setError(errorMessage)
       return null

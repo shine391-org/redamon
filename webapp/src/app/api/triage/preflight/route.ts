@@ -22,8 +22,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireProjectOwner } from '@/lib/triageClient'
 import { featureModelErrorResponse } from '@/lib/featureModels'
 import { computePreflight } from '@/lib/triage/preflight'
+import { withRouteErrors } from '@/lib/routeErrors'
 
-export async function GET(request: NextRequest) {
+// A Prisma or lock-table failure used to escape as Next's empty-bodied 500,
+// which the dialog could only report as "could not be checked".
+export const GET = withRouteErrors('The project could not be checked.', async (request: NextRequest) => {
   const projectId = request.nextUrl.searchParams.get('projectId')
   const caller = await requireProjectOwner(projectId)
   if (caller instanceof NextResponse) return caller
@@ -32,4 +35,4 @@ export async function GET(request: NextRequest) {
   if (!preflight) return NextResponse.json({ error: 'Not found' }, { status: 404 })
   if (preflight.modelRequired) return featureModelErrorResponse('model_required', 'triage')
   return NextResponse.json(preflight)
-}
+})

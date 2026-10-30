@@ -7,6 +7,7 @@ import type { LucideIcon } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { useAlertModal, useToast, WikiInfoButton } from '@/components/ui'
+import { fetchJson, readApiError, toApiError } from '@/lib/apiError'
 import { RECON_PRESETS, type ReconPreset } from '@/lib/recon-presets'
 import { matchesTargetFilter, type TargetFilter } from '@/lib/recon-presets/targeting'
 import { GeneratePresetModal } from './GeneratePresetModal'
@@ -146,6 +147,7 @@ export function ReconPresetModal({
   // --- My Presets state ---
   const [userPresets, setUserPresets] = useState<PresetListItem[]>([])
   const [isLoadingPresets, setIsLoadingPresets] = useState(false)
+  const [presetsError, setPresetsError] = useState<string | null>(null)
   // The preset (built-in or user) whose load is in progress, confirmation included.
   const [loadingPresetId, setLoadingPresetId] = useState<string | null>(null)
   const [deletingPresetId, setDeletingPresetId] = useState<string | null>(null)
@@ -154,16 +156,21 @@ export function ReconPresetModal({
   // --- Generate modal ---
   const [isGenerateModalOpen, setIsGenerateModalOpen] = useState(false)
 
+  // A failed read says so in place of the list: an empty list would read as "no presets".
+  const loadUserPresets = () =>
+    fetchJson<PresetListItem[]>(`/api/presets?userId=${userId}`, undefined, 'Failed to load presets')
+      .then((list) => {
+        setUserPresets(list)
+        setPresetsError(null)
+      })
+      .catch((err) => setPresetsError(toApiError(err, 'Failed to load presets').message))
+
   // Fetch user presets when switching to "user" view
   useEffect(() => {
     if (!isOpen || activeView !== 'user' || !userId) return
 
     setIsLoadingPresets(true)
-    fetch(`/api/presets?userId=${userId}`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then(setUserPresets)
-      .catch(() => toast.error('Failed to load presets'))
-      .finally(() => setIsLoadingPresets(false))
+    loadUserPresets().finally(() => setIsLoadingPresets(false))
   }, [isOpen, activeView, userId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Close on Escape
@@ -216,25 +223,19 @@ export function ReconPresetModal({
       const res = await fetch(`/api/presets/${preset.id}?userId=${userId}`, {
         method: 'DELETE',
       })
-      if (!res.ok) throw new Error('Failed to delete preset')
+      if (!res.ok) throw await readApiError(res, 'Failed to delete preset')
 
       setUserPresets((prev) => prev.filter((p) => p.id !== preset.id))
       toast.success(`Preset "${preset.name}" deleted`, 'Preset Deleted')
-    } catch {
-      toast.error('Failed to delete preset')
+    } catch (err) {
+      toast.error(toApiError(err, 'Failed to delete preset').message)
     } finally {
       setDeletingPresetId(null)
     }
   }
 
   const handlePresetSaved = () => {
-    // Refresh user presets list after a new one is saved
-    if (userId) {
-      fetch(`/api/presets?userId=${userId}`)
-        .then((r) => (r.ok ? r.json() : []))
-        .then(setUserPresets)
-        .catch(() => {})
-    }
+    if (userId) void loadUserPresets()
   }
 
   if (!isOpen) return null
@@ -394,6 +395,10 @@ export function ReconPresetModal({
             {isLoadingPresets ? (
               <div className={styles.emptyState}>
                 <Loader2 size={20} className={styles.spinner} />
+              </div>
+            ) : presetsError ? (
+              <div className={styles.emptyState} role="alert">
+                <p>{presetsError}</p>
               </div>
             ) : userPresets.length === 0 ? (
               <div className={styles.emptyState}>

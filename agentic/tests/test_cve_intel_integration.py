@@ -564,10 +564,20 @@ class TestPdcpApiKeyPlumbing(unittest.TestCase):
             content = f.read()
         # PUT whitelist
         self.assertIn("'pdcpApiKey'", content)
-        # GET masking
-        self.assertIn('maskSecret(settings.pdcpApiKey)', content)
-        # Rotation allowlist (so the rotation modal actually persists)
-        self.assertIn("'pdcp'", content)
+        # GET masking: every column in SECRET_FIELDS goes through maskSecrets
+        secret_fields = re.search(r"const SECRET_FIELDS = \[([\s\S]*?)\]", content)
+        self.assertIsNotNone(secret_fields, "the route's SECRET_FIELDS list is gone")
+        self.assertIn("'pdcpApiKey'", secret_fields.group(1))
+        self.assertIn('maskSecrets(settings)', content)
+        # Rotation allowlist (so the rotation modal actually persists): the PUT reads
+        # the shared list since d03f53ed, which must name pdcp
+        self.assertIn("from '@/lib/rotationTools'", content)
+        self.assertIn('ROTATION_TOOL_NAMES', content)
+        self.assertRegex(self._rotation_tools(), r"tool: 'pdcp', field: 'pdcpApiKey'")
+
+    def _rotation_tools(self) -> str:
+        with open(os.path.join(_repo_root, 'webapp', 'src', 'lib', 'rotationTools.ts')) as f:
+            return f.read()
 
     def test_settings_page_has_pdcp_secretfield(self):
         page = os.path.join(
@@ -620,8 +630,9 @@ class TestPdcpApiKeyPlumbing(unittest.TestCase):
         with open(tpl, 'r') as f:
             content = f.read()
         self.assertIn("'pdcpApiKey'", content)
-        # Rotation tool list also includes 'pdcp'
-        self.assertRegex(content, r"ALLOWED_ROTATION_TOOLS\s*=\s*\[[\s\S]*?'pdcp'")
+        # Rotation entries come from the shared list, which must name pdcp
+        self.assertIn("from './rotationTools'", content)
+        self.assertRegex(self._rotation_tools(), r"tool: 'pdcp', field: 'pdcpApiKey'")
 
     # ---- Anti-regression: no env var leakage in the deployment surface ----
 

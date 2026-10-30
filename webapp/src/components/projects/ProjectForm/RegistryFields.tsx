@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import type { Project } from '@prisma/client'
 
 import { field, type RegistryField } from '@/lib/reconSettings/registry'
@@ -105,6 +106,10 @@ function OneField({
 }) {
   const row = data as unknown as Record<string, unknown>
   const value = row[name]
+  // An emptied number box keeps its draft while the person types and takes the
+  // registry default on blur. Writing 0 at once refused the save on every field
+  // whose minimum is above 0, and silently meant "disabled" where 0 means that.
+  const [draft, setDraft] = useState<string | null>(null)
   const label = humanise(name, spec.tool)
   const id = `registry-field-${name}`
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -157,11 +162,21 @@ function OneField({
         className="textInput"
         step={step}
         {...(spec.bounds ? { min: spec.bounds.min, max: spec.bounds.max } : {})}
-        value={Number(value ?? 0)}
+        value={draft ?? Number(value ?? 0)}
         readOnly={readOnly}
         onChange={e => {
           const n = spec.type === 'float' ? parseFloat(e.target.value) : parseInt(e.target.value, 10)
-          set(Number.isFinite(n) ? n : 0)
+          if (Number.isFinite(n)) {
+            setDraft(null)
+            set(n)
+          } else {
+            setDraft(e.target.value)
+          }
+        }}
+        onBlur={() => {
+          if (draft === null) return
+          setDraft(null)
+          if (spec.has_default) set(spec.default)
         }}
       />
     )

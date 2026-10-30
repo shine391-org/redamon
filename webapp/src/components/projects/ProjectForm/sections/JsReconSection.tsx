@@ -8,6 +8,7 @@ import styles from '../ProjectForm.module.css'
 import { NodeInfoTooltip } from '../NodeInfoTooltip'
 import { RegistryFields } from '../RegistryFields'
 import { announceProjectWrite } from '@/lib/projectVersion'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -270,13 +271,18 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
   const [customFiles, setCustomFiles] = useState<CustomFileState>({})
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  // The manual JS upload's own error: uploadError renders inside the custom
+  // files panel, which is usually collapsed.
+  const [jsFileError, setJsFileError] = useState<string | null>(null)
   const [guideModal, setGuideModal] = useState<string | null>(null)
   const [validationError, setValidationError] = useState<string | null>(null)
   const jsFileRef = useRef<HTMLInputElement>(null)
   const customFileRefs = useRef<Record<string, HTMLInputElement | null>>({})
 
   const isEditMode = mode === 'edit' && projectId
-  const canUpload = !!projectId  // uploads work in both create and edit mode when projectId exists
+  // The upload routes need a saved project they can check ownership of, so a
+  // create-mode form, whose id is only pre-generated, cannot upload yet.
+  const canUpload = !!projectId && mode === 'edit'
 
   const fetchUploadedFiles = useCallback(async () => {
     if (!canUpload) return
@@ -310,20 +316,19 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
   const handleJsFileUpload = async (file: File) => {
     if (!canUpload) return
     setIsUploading(true)
-    setUploadError(null)
+    setJsFileError(null)
     try {
       const formData = new FormData()
       formData.append('file', file)
       const res = await fetch(`/api/js-recon/${projectId}/upload`, { method: 'POST', body: formData })
       if (!res.ok) {
-        const data = await res.json()
-        setUploadError(data.error || 'Upload failed')
+        setJsFileError(`${file.name}: ${(await readApiError(res, 'Upload failed')).message}`)
         return
       }
       announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
       await fetchUploadedFiles()
-    } catch {
-      setUploadError('Upload failed')
+    } catch (err) {
+      setJsFileError(`${file.name}: ${toApiError(err, 'Upload failed').message}`)
     } finally {
       setIsUploading(false)
       if (jsFileRef.current) jsFileRef.current.value = ''
@@ -332,11 +337,15 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
 
   const handleJsFileDelete = async (filename: string) => {
     if (!canUpload) return
+    setJsFileError(null)
     try {
       const res = await fetch(`/api/js-recon/${projectId}/upload?name=${encodeURIComponent(filename)}`, { method: 'DELETE' })
       if (res.ok) announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
+      else setJsFileError((await readApiError(res, `Could not delete ${filename}`)).message)
       await fetchUploadedFiles()
-    } catch { /* ignore */ }
+    } catch (err) {
+      setJsFileError(toApiError(err, `Could not delete ${filename}`).message)
+    }
   }
 
   const handleCustomFileUpload = async (fileType: string, file: File) => {
@@ -370,14 +379,13 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
       formData.append('type', fileType)
       const res = await fetch(`/api/js-recon/${projectId}/custom-files`, { method: 'POST', body: formData })
       if (!res.ok) {
-        const data = await res.json()
-        setUploadError(data.error || 'Upload failed')
+        setUploadError((await readApiError(res, 'Upload failed')).message)
         return
       }
       announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
       await fetchCustomFiles()
-    } catch {
-      setUploadError('Upload failed')
+    } catch (err) {
+      setUploadError(toApiError(err, 'Upload failed').message)
     } finally {
       setIsUploading(false)
       const ref = customFileRefs.current[fileType]
@@ -387,11 +395,15 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
 
   const handleCustomFileDelete = async (fileType: string) => {
     if (!canUpload) return
+    setUploadError(null)
     try {
       const res = await fetch(`/api/js-recon/${projectId}/custom-files?type=${fileType}`, { method: 'DELETE' })
       if (res.ok) announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
+      else setUploadError((await readApiError(res, 'Could not delete the file')).message)
       await fetchCustomFiles()
-    } catch { /* ignore */ }
+    } catch (err) {
+      setUploadError(toApiError(err, 'Could not delete the file').message)
+    }
   }
 
   return (
@@ -710,6 +722,13 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
                 )}
               </div>
 
+              {!canUpload && (
+                <p className={styles.fieldHint}>
+                  Save the project first; then you can upload JS files for analysis (max 10MB each) and custom
+                  extension files.
+                </p>
+              )}
+
               {/* Custom Extension Files */}
               {canUpload && (
                 <div className={styles.subSection}>
@@ -823,6 +842,7 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
                     {isUploading ? <Loader2 size={13} className={styles.spin} /> : <Upload size={13} />}
                     {isUploading ? ' Uploading...' : ' Upload JS Files'}
                   </button>
+                  {jsFileError && <p className={styles.inlineError}>{jsFileError}</p>}
 
                   {uploadedFiles.length > 0 && (
                     <div className={styles.itemList}>

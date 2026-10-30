@@ -5,6 +5,7 @@ import { Loader2, PackageSearch } from 'lucide-react'
 import { useToast } from '@/components/ui'
 import { useAlertModal } from '@/components/ui/AlertModal/AlertModal'
 import { GITHUB_DOT_COM } from '@/lib/github/ownerTarget'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './OtherScansModal.module.css'
 
 interface Props {
@@ -43,18 +44,18 @@ export function SupplyChainOrgBatchButton({ projectId, org, disabled, blockedRea
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ org: target }),
       })
-      const data = await res.json().catch(() => ({}))
       if (!res.ok) {
-        await alertError(data.error || 'Could not start the org batch.', 'Supply-chain org batch')
+        await alertError((await readApiError(res, 'Could not start the org batch.')).message, 'Supply-chain org batch')
         return
       }
+      const data = await res.json().catch(() => ({}))
       toast.success(
         `Queued ${data.totalItems} repo scan${data.totalItems === 1 ? '' : 's'} for ` +
         `${data.org || target} on ${data.host || GITHUB_DOT_COM}. ` +
         'They run as capacity frees up - follow them in Scans -> Scan queue.'
       )
-    } catch {
-      await alertError('Could not start the org batch.', 'Supply-chain org batch')
+    } catch (err) {
+      await alertError(toApiError(err, 'Could not start the org batch.').message, 'Supply-chain org batch')
     } finally {
       setBusy(false)
     }

@@ -18,6 +18,8 @@ from prompt_safety import UNTRUSTED_OUTPUT_GUIDANCE, wrap_untrusted, wrap_untrus
 
 # Equals the webapp's SKILL_METADATA_ITEMS_PER_REQUEST.
 MAX_ITEMS = 5
+# Equals the webapp's MAX_CONTENT_SIZE (UTF-16 units; len() of an all-BMP str matches).
+CONTENT_MAX_CHARS = 500 * 1024
 CONTENT_HEAD_CHARS = 12_000
 OUTLINE_MAX_LINES = 80
 NAME_MAX = 100

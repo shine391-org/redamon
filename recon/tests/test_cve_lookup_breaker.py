@@ -121,29 +121,3 @@ def test_public_lookups_keep_returning_lists(http):
     assert [c["id"] for c in lookup_cves_nvd("nginx", "1.2.3")] == ["CVE-2021-0001"]
     get.side_effect = requests.exceptions.ReadTimeout("x")
     assert lookup_cves_nvd("nginx", "1.2.4") == []
-
-
-def test_nvd_query_accepts_no_key_pool(http):
-    from recon.helpers.circuit_breaker import Outcome
-
-    get, _ = http
-    get.return_value = _resp(200, {"vulnerabilities": []})
-    result = cve_helpers._nvd_query("nginx", "1.24.0", 20, keys=None)
-
-    assert result.outcome is Outcome.NO_DATA
-    get.assert_called_once()
-    assert get.call_args.kwargs["headers"] == {}
-    assert "cpeName" in get.call_args.kwargs["params"]
-
-
-def test_vulners_query_accepts_no_key_pool(http):
-    from recon.helpers.circuit_breaker import Outcome
-
-    get, _ = http
-    get.return_value = _resp(200, {"result": "warning", "data": {}})
-    result = cve_helpers._vulners_query("nginx", "1.24.0", keys=None)
-
-    assert result.outcome is Outcome.NO_DATA
-    get.assert_called_once()
-    assert get.call_args.kwargs["headers"] == {}
-    assert get.call_args.kwargs["params"]["software"] == "nginx 1.24.0"

@@ -1,6 +1,7 @@
 'use client'
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { fetchJson, fetchOk } from '@/lib/apiError'
 
 export interface User {
   id: string
@@ -27,72 +28,44 @@ export interface UserWithProjects extends User {
 
 // Fetch all users
 async function fetchUsers(): Promise<User[]> {
-  const response = await fetch('/api/users')
-  if (!response.ok) {
-    throw new Error('Failed to fetch users')
-  }
-  return response.json()
+  return fetchJson<User[]>('/api/users', undefined, 'Failed to fetch users')
 }
 
 // Fetch a single user by ID
 async function fetchUser(userId: string): Promise<UserWithProjects> {
-  const response = await fetch(`/api/users/${userId}`)
-  if (!response.ok) {
-    throw new Error('Failed to fetch user')
-  }
-  return response.json()
+  return fetchJson<UserWithProjects>(`/api/users/${userId}`, undefined, 'Failed to fetch user')
 }
 
 // Create a new user
 async function createUser(data: { name: string; email: string; password?: string; role?: string }): Promise<User> {
-  const response = await fetch('/api/users', {
+  return fetchJson<User>('/api/users', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
-  })
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to create user')
-  }
-  return response.json()
+  }, 'Failed to create user')
 }
 
 // Update a user
 async function updateUser(userId: string, data: Partial<{ name: string; email: string; role: string }>): Promise<User> {
-  const response = await fetch(`/api/users/${userId}`, {
+  return fetchJson<User>(`/api/users/${userId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
-  })
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to update user')
-  }
-  return response.json()
+  }, 'Failed to update user')
 }
 
 // Delete a user
 async function deleteUser(userId: string): Promise<void> {
-  const response = await fetch(`/api/users/${userId}`, {
-    method: 'DELETE'
-  })
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to delete user')
-  }
+  await fetchOk(`/api/users/${userId}`, { method: 'DELETE' }, 'Failed to delete user')
 }
 
 // Change user password
 async function changePassword(userId: string, data: { newPassword: string; currentPassword?: string }): Promise<void> {
-  const response = await fetch(`/api/users/${userId}/password`, {
+  await fetchOk(`/api/users/${userId}/password`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
-  })
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to change password')
-  }
+  }, 'Failed to change password')
 }
 
 // Hook to fetch all users

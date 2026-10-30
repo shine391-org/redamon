@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireConversationAccessBySession } from '@/lib/access'
@@ -99,10 +100,6 @@ export async function POST(
 
     return NextResponse.json({ count: created.count, conversationId: conversation.id }, { status: 201 })
   } catch (error) {
-    console.error('Failed to save messages by session:', error)
-    return NextResponse.json(
-      { error: 'Failed to save messages' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to save messages', { log: 'Failed to save messages by session' })
   }
 }

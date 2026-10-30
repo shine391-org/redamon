@@ -102,3 +102,47 @@ describe('responses', () => {
     expect((await res.json()).activationInProgress).toBe(true)
   })
 })
+
+describe('a refused start says why', () => {
+  test('the orchestrator code, outcome and job reference reach the browser', async () => {
+    h.start.mockResolvedValue({
+      ok: false, status: 504, startOutcome: 'unknown', code: 'orchestrator_timeout', scanJobId: 'job9',
+      error: 'The orchestrator did not answer, so it is unknown whether the scan started.',
+    })
+    const res = await POST(post({ mode: 'new' }), params)
+    expect(res.status).toBe(504)
+    expect(await res.json()).toEqual({
+      error: 'The orchestrator did not answer, so it is unknown whether the scan started.',
+      code: 'orchestrator_timeout', startOutcome: 'unknown', scanJobId: 'job9',
+    })
+  })
+
+  test('a scope refusal keeps its invalid entries and an unreachable one its errno', async () => {
+    h.start.mockResolvedValueOnce({
+      ok: false, status: 422, code: 'scope_invalid', error: 'bad scope',
+      invalidEntries: [{ value: 'alpha.test', reason: 'public suffix' }],
+    })
+    const scope = await (await POST(post({ mode: 'new' }), params)).json()
+    expect(scope).toMatchObject({ code: 'scope_invalid', invalidEntries: [{ value: 'alpha.test' }] })
+
+    h.start.mockResolvedValueOnce({
+      ok: false, status: 503, code: 'orchestrator_unreachable', cause: 'ECONNREFUSED', error: 'not reached',
+    })
+    expect(await (await POST(post({ mode: 'new' }), params)).json())
+      .toMatchObject({ code: 'orchestrator_unreachable', cause: 'ECONNREFUSED' })
+  })
+
+  test('an answered orchestrator error carries its status', async () => {
+    h.start.mockResolvedValue({ ok: false, status: 500, upstreamStatus: 500, error: 'Failed to start recon' })
+    expect(await (await POST(post({ mode: 'new' }), params)).json())
+      .toMatchObject({ error: 'Failed to start recon', upstreamStatus: 500 })
+  })
+
+  test('an unexpected throw answers a fixed sentence and a code, never the exception text', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.start.mockRejectedValue(Object.assign(new Error('relation "scan_jobs" with secret value'), { code: 'P2024' }))
+    const res = await POST(post({ mode: 'new' }), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to start recon', code: 'P2024' })
+  })
+})

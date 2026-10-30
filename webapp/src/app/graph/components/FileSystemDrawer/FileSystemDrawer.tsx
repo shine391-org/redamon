@@ -25,6 +25,7 @@ import {
 } from 'lucide-react'
 import { Drawer } from '@/components/ui/Drawer'
 import { useAlertModal, WikiInfoButton } from '@/components/ui'
+import { errorMessage, fetchJson, readApiError, toApiError } from '@/lib/apiError'
 import styles from './FileSystemDrawer.module.css'
 
 // =============================================================================
@@ -70,6 +71,8 @@ export interface FileSystemDrawerProps {
 // Protected default subdirs - these cannot be renamed or deleted. Mirrors
 // PROTECTED_SUBDIRS in agentic/workspace_fs.py (backend also enforces).
 const PROTECTED_SUBDIRS = new Set(['notes', 'tool-outputs', 'jobs', 'uploads'])
+// A bulk delete's alert names this many failed entries with their cause.
+const BULK_FAILURES_SHOWN = 5
 
 const WIDTH_STORAGE_KEY = 'redamon-filesystem-drawer-width'
 const DEFAULT_WIDTH_PX = 494
@@ -268,14 +271,12 @@ export function FileSystemDrawer({
     }
     try {
       const url = `/api/agent/workspace/list?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(path)}`
-      const resp = await fetch(url, { cache: 'no-store' })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      const data = await fetchJson<{ entries?: Entry[] }>(url, { cache: 'no-store' }, 'Failed to list workspace')
       setEntries(data.entries || [])
       if (silent) setEntriesError(null)
     } catch (e) {
       if (!silent) {
-        setEntriesError(e instanceof Error ? e.message : 'Failed to load')
+        setEntriesError(errorMessage(e, 'Failed to load'))
         setEntries([])
       }
     } finally {
@@ -291,14 +292,12 @@ export function FileSystemDrawer({
     }
     try {
       const url = `/api/agent/workspace/jobs?projectId=${encodeURIComponent(projectId)}`
-      const resp = await fetch(url, { cache: 'no-store' })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      const data = await fetchJson<{ jobs?: JobRow[] }>(url, { cache: 'no-store' }, 'Failed to fetch jobs')
       setJobs(data.jobs || [])
       if (silent) setJobsError(null)
     } catch (e) {
       if (!silent) {
-        setJobsError(e instanceof Error ? e.message : 'Failed to load')
+        setJobsError(errorMessage(e, 'Failed to load'))
         setJobs([])
       }
     } finally {
@@ -374,7 +373,7 @@ export function FileSystemDrawer({
       return
     }
     try {
-      const resp = await fetch('/api/agent/workspace/rename', {
+      await fetchJson('/api/agent/workspace/rename', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -382,14 +381,11 @@ export function FileSystemDrawer({
           path: entry.path,
           newName: renameValue,
         }),
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      }, 'rename failed')
       setRenamingPath(null)
       fetchEntries(currentPath)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'rename failed'
-      alertError(msg, 'Rename failed')
+      alertError(errorMessage(e, 'rename failed'), 'Rename failed')
     }
   }, [projectId, renameValue, currentPath, fetchEntries, alertError])
 
@@ -403,13 +399,10 @@ export function FileSystemDrawer({
   const performDelete = useCallback(async (entry: Entry) => {
     try {
       const url = `/api/agent/workspace/delete?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(entry.path)}&recursive=${entry.isDir}`
-      const resp = await fetch(url, { method: 'DELETE' })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      await fetchJson(url, { method: 'DELETE' }, 'delete failed')
       fetchEntries(currentPath)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'delete failed'
-      alertError(msg, 'Delete failed')
+      alertError(errorMessage(e, 'delete failed'), 'Delete failed')
     } finally {
       setDeletePending(null)
     }
@@ -433,18 +426,15 @@ export function FileSystemDrawer({
     }
     const fullPath = currentPath === '.' || currentPath === '' ? name : `${currentPath}/${name}`
     try {
-      const resp = await fetch('/api/agent/workspace/mkdir', {
+      await fetchJson('/api/agent/workspace/mkdir', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectId, path: fullPath }),
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      }, 'mkdir failed')
       setMkdirInput(null)
       fetchEntries(currentPath)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'mkdir failed'
-      alertError(msg, 'Create folder failed')
+      alertError(errorMessage(e, 'mkdir failed'), 'Create folder failed')
     }
   }, [mkdirInput, projectId, currentPath, fetchEntries, alertWarning, alertError])
 
@@ -467,12 +457,10 @@ export function FileSystemDrawer({
         setOverwritePending({ file, destDir })
         return
       }
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      if (!resp.ok) throw await readApiError(resp, 'upload failed')
       fetchEntries(currentPath)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'upload failed'
-      alertError(msg, 'Upload failed')
+      alertError(toApiError(e, 'upload failed').message, 'Upload failed')
     } finally {
       setUploadingCount((n) => Math.max(0, n - 1))
     }
@@ -527,9 +515,7 @@ export function FileSystemDrawer({
     setPreviewError(null)
     try {
       const url = `/api/agent/workspace/preview?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(entry.path)}`
-      const resp = await fetch(url, { cache: 'no-store' })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      const data = await fetchJson<Record<string, any>>(url, { cache: 'no-store' }, 'preview failed')
       setPreviewing({
         path: entry.path,
         content: data.content,
@@ -539,7 +525,7 @@ export function FileSystemDrawer({
         size: data.size,
       })
     } catch (e) {
-      setPreviewError(e instanceof Error ? e.message : 'preview failed')
+      setPreviewError(errorMessage(e, 'preview failed'))
     } finally {
       setPreviewLoading(false)
     }
@@ -558,12 +544,9 @@ export function FileSystemDrawer({
     setPropertiesError(null)
     try {
       const url = `/api/agent/workspace/properties?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(entry.path)}`
-      const resp = await fetch(url, { cache: 'no-store' })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
-      setPropertiesFor(data)
+      setPropertiesFor(await fetchJson(url, { cache: 'no-store' }, 'fetch failed'))
     } catch (e) {
-      setPropertiesError(e instanceof Error ? e.message : 'fetch failed')
+      setPropertiesError(errorMessage(e, 'fetch failed'))
     } finally {
       setPropertiesLoading(false)
     }
@@ -617,21 +600,27 @@ export function FileSystemDrawer({
 
   const performBulkDelete = useCallback(async (toDelete: Entry[]) => {
     setBulkActionLoading(true)
-    let errors = 0
+    const failures: string[] = []
     for (const e of toDelete) {
       try {
         const url = `/api/agent/workspace/delete?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(e.path)}&recursive=${e.isDir}`
-        const resp = await fetch(url, { method: 'DELETE' })
-        if (!resp.ok) errors++
-      } catch {
-        errors++
+        await fetchJson(url, { method: 'DELETE' }, 'delete failed')
+      } catch (err) {
+        failures.push(`${e.path}: ${errorMessage(err, 'delete failed')}`)
       }
     }
     setBulkActionLoading(false)
     setBulkDeletePending(null)
     setSelectedPaths(new Set())
     fetchEntries(currentPath)
-    if (errors > 0) alertError(`${errors} entries failed to delete; see browser console.`, 'Bulk delete')
+    if (failures.length > 0) {
+      const shown = failures.slice(0, BULK_FAILURES_SHOWN)
+      const more = failures.length - shown.length
+      alertError(
+        `${failures.length} entries failed to delete:\n${shown.join('\n')}${more > 0 ? `\n…and ${more} more` : ''}`,
+        'Bulk delete',
+      )
+    }
   }, [projectId, currentPath, fetchEntries, alertError])
 
   const handleBulkDownload = useCallback(async () => {
@@ -649,10 +638,7 @@ export function FileSystemDrawer({
           archiveName: paths.length === 1 ? paths[0].split('/').pop() || 'bundle' : 'bundle',
         }),
       })
-      if (!resp.ok) {
-        const text = await resp.text()
-        throw new Error(text || `HTTP ${resp.status}`)
-      }
+      if (!resp.ok) throw await readApiError(resp, 'Could not build the archive')
       // Stream the blob to an anchor download
       const blob = await resp.blob()
       const cd = resp.headers.get('Content-Disposition') || ''
@@ -667,7 +653,7 @@ export function FileSystemDrawer({
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
     } catch (e) {
-      alertError(e instanceof Error ? e.message : 'unknown', 'Bulk download failed')
+      alertError(toApiError(e, 'Could not build the archive').message, 'Bulk download failed')
     } finally {
       setBulkActionLoading(false)
     }
@@ -709,20 +695,17 @@ export function FileSystemDrawer({
     )
     if (!ok) return
     try {
-      const resp = await fetch('/api/agent/workspace/reset', {
+      await fetchJson('/api/agent/workspace/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ projectId }),
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      }, 'reset failed')
       setSelectedPaths(new Set())
       setFilterText('')
       setCurrentPath('.')
       fetchEntries('.')
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'reset failed'
-      alertError(msg, 'Clean all failed')
+      alertError(errorMessage(e, 'reset failed'), 'Clean all failed')
     }
   }, [projectId, fetchEntries, dangerConfirm, alertError])
 
@@ -734,13 +717,10 @@ export function FileSystemDrawer({
     if (!ok) return
     try {
       const url = `/api/agent/workspace/jobs/${encodeURIComponent(job.job_id)}/cancel?projectId=${encodeURIComponent(projectId)}`
-      const resp = await fetch(url, { method: 'POST' })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      await fetchJson(url, { method: 'POST' }, 'cancel failed')
       fetchJobs()
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'cancel failed'
-      alertError(msg, 'Cancel failed')
+      alertError(errorMessage(e, 'cancel failed'), 'Cancel failed')
     }
   }, [projectId, fetchJobs, dangerConfirm, alertError])
 

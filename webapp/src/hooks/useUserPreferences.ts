@@ -2,15 +2,18 @@
 
 import { useCallback, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { type ApiError, readApiError, toApiError } from '@/lib/apiError'
 
 export type UiPreferences = Record<string, unknown>
 
 const QUERY_KEY = ['user-preferences'] as const
+// Its own root, so invalidating the preferences never touches it.
+const PERSIST_ERROR_KEY = ['user-preferences-persist-error'] as const
 const DEBOUNCE_MS = 400
 
 async function fetchPrefs(): Promise<UiPreferences> {
   const res = await fetch('/api/user/preferences')
-  if (!res.ok) throw new Error(`Failed to load preferences (${res.status})`)
+  if (!res.ok) throw await readApiError(res, 'Failed to load preferences')
   const data = await res.json()
   return (data ?? {}) as UiPreferences
 }
@@ -21,8 +24,23 @@ async function patchPref(featureKey: string, value: unknown): Promise<UiPreferen
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ featureKey, value }),
   })
-  if (!res.ok) throw new Error(`Failed to update preference (${res.status})`)
+  if (!res.ok) throw await readApiError(res, 'Failed to update preference')
   return (await res.json()) as UiPreferences
+}
+
+/**
+ * Why the last preference write failed (its value was rolled back), or null.
+ * Shared by every instance through the cache, because the hook that wrote is
+ * rarely the one that shows the failure; reading it starts no request.
+ */
+export function usePreferencePersistError(): ApiError | null {
+  return useQuery<ApiError | null>({
+    queryKey: PERSIST_ERROR_KEY,
+    queryFn: () => null,
+    enabled: false,
+    initialData: null,
+    staleTime: Infinity,
+  }).data ?? null
 }
 
 export function useUserPreferences() {
@@ -38,6 +56,8 @@ export function useUserPreferences() {
   })
 
   const prefs: UiPreferences = (query.data ?? {}) as UiPreferences
+
+  const persistError = usePreferencePersistError()
 
   const updatePref = useCallback(
     (featureKey: string, valueOrUpdater: unknown | ((prev: unknown) => unknown)) => {
@@ -78,8 +98,10 @@ export function useUserPreferences() {
             // was sent beats blanking a setting the user just made.
             [featureKey]: serverValue === undefined ? valueToSend : serverValue,
           }))
+          queryClient.setQueryData(PERSIST_ERROR_KEY, null)
         } catch (error) {
           console.error(`Failed to persist preference "${featureKey}":`, error)
+          queryClient.setQueryData(PERSIST_ERROR_KEY, toApiError(error, 'Failed to update preference'))
           // Rollback only if no newer write is queued for this featureKey.
           // (A subsequent updatePref call would have repopulated pendingValuesRef.)
           if (pendingValuesRef.current.has(featureKey)) return
@@ -133,7 +155,11 @@ export function useUserPreferences() {
     }
   }, [flushPending])
 
-  return { prefs, isLoading: query.isLoading, error: query.error, updatePref }
+  return {
+    prefs, isLoading: query.isLoading, error: query.error, updatePref,
+    /** Why the last preference write failed (its value was rolled back); null once one succeeds. */
+    persistError,
+  }
 }
 
 // ---- Feature-specific helpers ---------------------------------------------

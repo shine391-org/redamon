@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { MsfSession, MsfJob, NonMsfSession, SessionInteractResult } from '@/lib/websocket-types'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 interface UseActiveSessionsOptions {
   enabled?: boolean
@@ -17,7 +18,9 @@ interface UseActiveSessionsReturn {
   error: string | null
   totalCount: number
   interactWithSession: (sessionId: number, command: string) => Promise<SessionInteractResult>
+  /** Rejects with an ApiError when the kill failed; the row is back in the list by then. */
   killSession: (sessionId: number) => Promise<void>
+  /** Rejects with an ApiError when the kill failed; the row is back in the list by then. */
   killJob: (jobId: number) => Promise<void>
   refetch: () => Promise<void>
 }
@@ -44,7 +47,7 @@ export function useActiveSessions({
     try {
       const resp = await fetch('/api/agent/sessions', { cache: 'no-store' })
       if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`)
+        throw await readApiError(resp, 'Failed to fetch sessions')
       }
       const data = await resp.json()
       const liveSessions: MsfSession[] = data.sessions || []
@@ -64,7 +67,7 @@ export function useActiveSessions({
       setError(null)
     } catch (err) {
       // Don't clear sessions on transient errors - keep showing last known state
-      setError(err instanceof Error ? err.message : 'Failed to fetch sessions')
+      setError(toApiError(err, 'Failed to fetch sessions').message)
     }
   }, [])
 
@@ -76,37 +79,43 @@ export function useActiveSessions({
         body: JSON.stringify({ command }),
       })
       if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`)
+        throw await readApiError(resp, 'Failed to interact with session')
       }
       return await resp.json()
     } catch (err) {
-      return { busy: false, output: `[ERROR] ${err instanceof Error ? err.message : 'Unknown error'}` }
+      return { busy: false, output: `[ERROR] ${toApiError(err, 'Failed to interact with session').message}` }
     }
   }, [])
 
+  // A failed kill puts the row back (the session is still alive) and rejects,
+  // so the caller can say why; it used to stay hidden from every later poll.
   const killSession = useCallback(async (sessionId: number) => {
     // Mark as killed immediately so polls don't re-add it
     killedSessionsRef.current.add(sessionId)
     setSessions(prev => prev.filter(s => s.id !== sessionId))
     try {
-      await fetch(`/api/agent/sessions/${sessionId}/kill`, { method: 'POST' })
-    } catch {
-      // Optimistic removal stays - will self-correct if session is still alive
+      const resp = await fetch(`/api/agent/sessions/${sessionId}/kill`, { method: 'POST' })
+      if (!resp.ok) throw await readApiError(resp, `Failed to kill session ${sessionId}`)
+    } catch (err) {
       killedSessionsRef.current.delete(sessionId)
+      await fetchSessions()
+      throw toApiError(err, `Failed to kill session ${sessionId}`)
     }
-  }, [])
+  }, [fetchSessions])
 
   const killJob = useCallback(async (jobId: number) => {
     // Mark as killed immediately so polls don't re-add it
     killedJobsRef.current.add(jobId)
     setJobs(prev => prev.filter(j => j.id !== jobId))
     try {
-      await fetch(`/api/agent/jobs/${jobId}/kill`, { method: 'POST' })
-    } catch {
-      // Optimistic removal stays - will self-correct if job is still alive
+      const resp = await fetch(`/api/agent/jobs/${jobId}/kill`, { method: 'POST' })
+      if (!resp.ok) throw await readApiError(resp, `Failed to kill job ${jobId}`)
+    } catch (err) {
       killedJobsRef.current.delete(jobId)
+      await fetchSessions()
+      throw toApiError(err, `Failed to kill job ${jobId}`)
     }
-  }, [])
+  }, [fetchSessions])
 
   // Initial fetch
   useEffect(() => {

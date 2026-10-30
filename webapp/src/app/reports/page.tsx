@@ -7,6 +7,7 @@ import { useProjects } from '@/hooks/useProjects'
 import { useProject } from '@/providers/ProjectProvider'
 import { projectTargetLabel } from '@/lib/projectSummary'
 import { useToast, WikiInfoButton } from '@/components/ui'
+import { errorMessage, readApiError, toApiError } from '@/lib/apiError'
 import { FeatureModelLine } from '@/components/shared/FeatureModelGate'
 import styles from './page.module.css'
 
@@ -25,6 +26,13 @@ function formatDate(iso: string): string {
   } catch { return iso }
 }
 
+/** Why a report has no narratives, from the route's `narrativesSkipped` code. */
+function skippedReason(code: string): string {
+  if (code.startsWith('agent_')) return 'the agent could not be reached'
+  if (code.startsWith('unreadable_answer')) return "the model's answer could not be read"
+  return 'the model call failed'
+}
+
 function riskClass(label?: string): string {
   switch (label?.toLowerCase()) {
     case 'critical': return styles.riskCritical
@@ -39,8 +47,8 @@ export default function ReportsPage() {
   const { userId } = useProject()
   const toast = useToast()
   const {
-    reports, isLoading, generate, isGenerating, generateError,
-    deleteReport, isDeleting,
+    reports, isLoading, error: listError, generate, isGenerating, generateError,
+    deleteReportAsync, isDeleting,
   } = useAllReports()
 
   const { data: projects } = useProjects(userId || undefined)
@@ -51,28 +59,34 @@ export default function ReportsPage() {
     if (!selectedProjectId) return
     try {
       // null: the user cancelled the model prompt, so nothing started.
-      if (await generate(selectedProjectId)) toast.info('Report generation started')
-    } catch {
-      toast.error('Failed to generate report')
-      // error available via generateError
+      const report = await generate(selectedProjectId)
+      if (!report) return
+      if (report.narrativesSkipped) {
+        toast.warning(`Report generated without AI narratives: ${skippedReason(report.narrativesSkipped)} (${report.narrativesSkipped}).`)
+      } else {
+        toast.info('Report generation started')
+      }
+    } catch (e) {
+      // The same text stays on the page as generateError.
+      toast.error(errorMessage(e, 'Failed to generate report'))
     }
   }, [generate, selectedProjectId, toast])
 
   const handleDelete = useCallback(async (projectId: string, reportId: string) => {
     try {
-      await deleteReport({ projectId, reportId })
+      await deleteReportAsync({ projectId, reportId })
       toast.success('Report deleted')
-    } catch {
-      toast.error('Failed to delete report')
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to delete report'))
     }
     setDeleteConfirm(null)
-  }, [deleteReport, toast])
+  }, [deleteReportAsync, toast])
 
   const handleDownload = useCallback(async (report: ReportMeta) => {
     try {
       const url = `/api/projects/${report.projectId}/reports/${report.id}`
       const res = await fetch(url)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      if (!res.ok) throw await readApiError(res, 'Failed to download report')
       const blob = await res.blob()
       const a = document.createElement('a')
       a.href = URL.createObjectURL(blob)
@@ -80,8 +94,8 @@ export default function ReportsPage() {
       a.click()
       URL.revokeObjectURL(a.href)
       toast.success('Report downloaded')
-    } catch {
-      toast.error('Failed to download report')
+    } catch (e) {
+      toast.error(toApiError(e, 'Failed to download report').message)
     }
   }, [toast])
 
@@ -151,6 +165,12 @@ export default function ReportsPage() {
         <div className={styles.empty}>
           <Loader2 size={20} className={styles.spin} />
           <span>Loading reports...</span>
+        </div>
+      ) : listError && reports.length === 0 ? (
+        // A failed list is not an empty one: "No reports generated yet" hid it.
+        <div className={styles.error} role="alert">
+          <AlertCircle size={13} />
+          <span>Failed to load reports: {errorMessage(listError, 'Failed to fetch reports')}</span>
         </div>
       ) : reports.length === 0 ? (
         <div className={styles.empty}>

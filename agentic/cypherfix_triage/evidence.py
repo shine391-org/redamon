@@ -314,7 +314,8 @@ def _build(finding: dict, clean: bool) -> str:
 #:   signature bundle, and a false_positive review could wrongly flip a candidate
 #:   the agent has not yet confirmed. The agent's proof-typed CONFIRMS edge is the
 #:   intended promotion path, not the built-in reviewer.
-SKIP_REVIEW_SOURCES = frozenset({"security_check", "osv", "retirejs", "serialized_scan"})
+SKIP_REVIEW_SOURCES = frozenset({"security_check", "osv", "retirejs", "serialized_scan",
+                                 "route_exposure"})
 
 
 def person_decided(status, source) -> bool:

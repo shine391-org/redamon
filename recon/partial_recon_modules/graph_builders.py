@@ -1472,3 +1472,159 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                 })
 
     return recon_data
+
+
+def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str,
+                                          settings: dict = None, domain_groups: list = None) -> dict:
+    """Build recon_data for the route exposure scan from the existing graph.
+
+    The scanner reads four sections (recon/route_exposure/harvest.py): the
+    probed base URLs with their page class and technologies (http_probe.by_url),
+    the enumerated routes with their methods, category, sources and OpenAPI
+    metadata (resource_enum.by_base_url), JS recon's endpoints with the bundle
+    each came from (js_recon.endpoints), and the run's scope (subdomains,
+    metadata). A declared-only route that is not GET or HEAD is never read: a
+    GET consumer must not request it. Scope is graph_url_scope, as for the
+    other builders; ``subdomains`` is left for the caller, which adds the typed
+    URLs' hosts through _scope_partial_urls.
+    """
+    from graph_db import Neo4jClient
+
+    from recon.partial_recon_modules.helpers import _should_include_root_domain
+
+    if settings is None:
+        from recon.project_settings import get_settings
+        settings = get_settings()
+    roots = _as_roots(domains)
+    include_root_domain = _should_include_root_domain(settings)
+    recon_data = {
+        "domain": roots[0] if roots else "",
+        "domains": roots,
+        "subdomains": [],
+        "http_probe": {"by_url": {}},
+        "resource_enum": {"by_base_url": {}},
+        "metadata": {
+            "include_root_domain": include_root_domain,
+            "expanded_ips": list(settings.get("TARGET_IPS") or []) if settings.get("IP_MODE") else [],
+            "roe": {
+                "ROE_ENABLED": settings.get("ROE_ENABLED", False),
+                "ROE_EXCLUDED_HOSTS": settings.get("ROE_EXCLUDED_HOSTS", []) or [],
+            },
+        },
+    }
+    if not roots:
+        return recon_data
+
+    by_url = recon_data["http_probe"]["by_url"]
+    by_base = recon_data["resource_enum"]["by_base_url"]
+
+    with Neo4jClient() as graph_client:
+        if not graph_client.verify_connection():
+            print("[!][Partial Recon] Neo4j not reachable, cannot fetch graph inputs")
+            return recon_data
+
+        with graph_client.driver.session() as session:
+            keep = graph_url_scope(session, user_id, project_id, roots, domain_groups,
+                                   include_root_domain=include_root_domain)
+            result = session.run(
+                """
+                MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
+                """ + _PROBED_ENDPOINT + """
+                RETURN b.url AS url, b.host AS host,
+                       coalesce(b.status_code, probe.status_code) AS status_code,
+                       probe.page_class AS page_class
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                url = record["url"]
+                if not url or not keep(url_host(url, record["host"] or "")):
+                    continue
+                by_url[url] = {
+                    "url": url,
+                    "host": record["host"] or url_host(url),
+                    "status_code": int(record["status_code"]) if record["status_code"] is not None else 200,
+                    "page_class": _field(record, "page_class") or "",
+                    "technologies": [],
+                }
+            for url, techs in _graph_url_technologies(session, user_id, project_id,
+                                                      urls=list(by_url) or None).items():
+                if url in by_url:
+                    by_url[url]["technologies"] = techs
+
+            result = session.run(
+                """
+                MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
+                RETURN b.url AS base, b.host AS host, e.path AS path,
+                       coalesce(e.method, 'GET') AS method, e.category AS category,
+                       coalesce(e.sources, CASE WHEN e.source IS NULL THEN [] ELSE [e.source] END) AS sources,
+                       e.source AS creator,
+                       e.openapi_security AS openapi_security, e.openapi_tags AS openapi_tags,
+                       e.openapi_declared_only AS declared_only, e.status_code AS discovery_status
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                base = record["base"]
+                if not base or not keep(url_host(base, record["host"] or "")):
+                    continue
+                sources = [s for s in (record["sources"] or []) if isinstance(s, str)]
+                # A route the scan itself generated and wrote is not recon's input: a
+                # full run never reads it. Read back, it became a found route, lost its
+                # generated_by and variant_of (an old API version stopped being
+                # version_locked) and seeded variants of its own. The generators make it
+                # again from the same inputs. The creator is checked too, because the
+                # scan's enrichment sets sources to ['route_exposure'] on a crawler's
+                # route that had none.
+                if (_field(record, "creator") == "route_exposure"
+                        and all(s == "route_exposure" for s in sources)):
+                    continue
+                endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
+                entry = endpoints.setdefault(record["path"], {
+                    "methods": [], "category": record["category"] or "other",
+                    "sources": sources,
+                    "declared_only": record["declared_only"] is True,
+                })
+                method = str(record["method"] or "GET").upper()
+                if method not in entry["methods"]:
+                    entry["methods"].append(method)
+                security = record["openapi_security"]
+                if security is not None and method in ("GET", "HEAD"):
+                    entry.setdefault("openapi", {})[method] = {
+                        "security": list(security), "tags": list(record["openapi_tags"] or [])}
+                status = record["discovery_status"]
+                # A discovery tool's 401/403 is the seen_denied hint.
+                if isinstance(status, int) and status in (401, 403):
+                    entry["status_code"] = status
+
+            # JS recon's endpoints, rebuilt as its endpoint list with the bundle each
+            # came from: harvest tags an API client_gated when the bundle defining a
+            # router route calls it, and only the bundle -> endpoint edges keep that
+            # pairing in the graph.
+            js_endpoints = recon_data.setdefault("js_recon", {}).setdefault("endpoints", [])
+            result = session.run(
+                """
+                MATCH (f:JsReconFinding {user_id: $uid, project_id: $pid, finding_type: 'js_file'})
+                      -[:HAS_ENDPOINT]->(e:Endpoint)
+                WHERE NOT f:Muted AND e.path IS NOT NULL AND e.endpoint_type IS NOT NULL
+                RETURN f.source_url AS source_js, e.baseurl AS base, e.path AS path,
+                       coalesce(e.method, 'GET') AS method, e.endpoint_type AS kind,
+                       e.category AS category, e.path_template AS template
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                base = record["base"]
+                if (record["kind"] not in ("route", "rest") or not isinstance(base, str)
+                        or not base.startswith(("http://", "https://")) or not keep(url_host(base))):
+                    continue
+                js_endpoints.append({
+                    "type": record["kind"], "path": record["path"], "method": record["method"],
+                    "category": record["category"] or "endpoint",
+                    "resolved_url": base.rstrip("/") + record["path"],
+                    "source_js": record["source_js"] or "",
+                    "parameterized": record["template"] is not None,
+                })
+
+    return recon_data

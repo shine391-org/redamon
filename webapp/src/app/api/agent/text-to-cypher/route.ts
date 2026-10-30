@@ -10,9 +10,26 @@
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+// Up to three generations, each with its own provider retries: as long as the
+// raw fetch this replaced waited for headers.
+const GENERATE_TIMEOUT_MS = 300_000
+const PROVIDER_CLASS = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
+const GENERATE_FAILED = 'Could not generate a query for that question.'
+
+/** The provider facts the agent adds to a failed model call: class name and integer status only. */
+function providerFacts(json: Record<string, unknown> | null): Record<string, unknown> {
+  if (!json) return {}
+  const cls = json.error_class
+  const status = json.provider_status
+  return {
+    ...(typeof cls === 'string' && PROVIDER_CLASS.test(cls) ? { errorClass: cls } : {}),
+    ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+      ? { providerStatus: status } : {}),
+  }
+}
 
 export async function POST(request: NextRequest) {
   const eff = await requireEffectiveUser()
@@ -30,9 +47,9 @@ export async function POST(request: NextRequest) {
   if (access instanceof NextResponse) return access
 
   try {
-    const resp = await fetch(`${AGENT_API_URL}/text-to-cypher`, {
+    const resp = await agentFetch('/text-to-cypher', {
       method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...body,
         // The session decides whose projects and whose LLM key are used, never
@@ -40,20 +57,30 @@ export async function POST(request: NextRequest) {
         user_id: eff.userId,
         project_id: access.project.id,
       }),
-    })
+    }, { timeoutMs: GENERATE_TIMEOUT_MS })
 
     if (!resp.ok) {
-      // The upstream body can carry a model name, a Cypher fragment or a
-      // provider error; keep it in the server log and return a stable string.
-      const detail = await resp.text().catch(() => '')
-      console.error(`[text-to-cypher] agent returned ${resp.status}: ${detail}`)
+      // Only a JSON `error`/`detail` is forwarded: every one the agent writes on
+      // this path is a literal sentence (agentic/tests/test_text_to_cypher_auth.py
+      // pins it), such as "No LLM configured..." or the daily-cap 429. A plain-text
+      // body can be a stack or a Cypher fragment, so it stays in the log.
+      const upstream = await readUpstreamBody(resp)
+      if (!upstream.text) console.error(`[text-to-cypher] agent returned ${resp.status} without a readable error`)
       return NextResponse.json(
-        { error: 'Could not generate a query for that question.' },
-        { status: resp.status }
+        {
+          error: upstream.text ?? GENERATE_FAILED,
+          ...(upstream.code ? { code: upstream.code } : {}),
+          upstreamStatus: resp.status,
+          ...providerFacts(upstream.json),
+        },
+        { status: resp.status >= 500 ? 502 : resp.status }
       )
     }
     return NextResponse.json(await resp.json())
   } catch (error) {
+    if (error instanceof AgentUnreachableError) {
+      return upstreamFailureResponse('agent', error.cause_, 'Could not reach the query generator.')
+    }
     console.error('Text-to-cypher proxy error:', error)
     return NextResponse.json({ error: 'Could not reach the query generator.' }, { status: 502 })
   }

@@ -7,6 +7,7 @@ import type { Project } from '@prisma/client'
 import styles from '../ProjectForm.module.css'
 import { AUTH_TYPES, type AuthProfileMetadata } from '@/lib/authProfile'
 import { RecordingModal } from '@/components/traffic/RecordingModal'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -36,13 +37,15 @@ export function AuthenticationSection({ projectId, mode }: AuthenticationSection
   const [reconEnabled, setReconEnabled] = useState(true)
   const [agentEnabled, setAgentEnabled] = useState(true)
   const [dirty, setDirty] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     if (!projectId) return
     setLoading(true)
+    setLoadError(null)
     try {
       const res = await fetch(`/api/projects/${projectId}/auth-profile`)
-      if (!res.ok) return
+      if (!res.ok) throw await readApiError(res, 'Could not load the auth profile')
       const { authProfile } = await res.json()
       setMeta(authProfile)
       setAuthType(authProfile?.authType ?? 'none')
@@ -52,8 +55,9 @@ export function AuthenticationSection({ projectId, mode }: AuthenticationSection
       setAgentEnabled(authProfile?.agentEnabled !== false)
       setAuthValue('')
       setDirty(false)
-    } catch {
-      /* leave the section in its empty state */
+    } catch (err) {
+      // The empty state below would otherwise read as "no profile set".
+      setLoadError(toApiError(err, 'Could not load the auth profile').message)
     } finally {
       setLoading(false)
     }
@@ -77,13 +81,13 @@ export function AuthenticationSection({ projectId, mode }: AuthenticationSection
       const res = await fetch(`/api/projects/${projectId}/auth-profile`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       })
+      if (!res.ok) { alertError((await readApiError(res, 'Failed to save the auth profile')).message); return }
       const json = await res.json()
-      if (!res.ok) { alertError(json.error || 'Failed to save the auth profile'); return }
       setMeta(json.authProfile)
       setAuthValue('')
       setDirty(false)
-    } catch {
-      alertError('Failed to save the auth profile')
+    } catch (err) {
+      alertError(toApiError(err, 'Failed to save the auth profile').message)
     } finally {
       setSaving(false)
     }
@@ -91,11 +95,16 @@ export function AuthenticationSection({ projectId, mode }: AuthenticationSection
 
   const clearValue = async () => {
     if (!projectId) return
-    const res = await fetch(`/api/projects/${projectId}/auth-profile`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clearValue: true, authType: 'none' }),
-    })
-    if (res.ok) { setMeta((await res.json()).authProfile); setAuthType('none'); setAuthValue(''); setDirty(false) }
+    try {
+      const res = await fetch(`/api/projects/${projectId}/auth-profile`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clearValue: true, authType: 'none' }),
+      })
+      if (!res.ok) { alertError((await readApiError(res, 'Failed to clear the stored value')).message); return }
+      setMeta((await res.json()).authProfile); setAuthType('none'); setAuthValue(''); setDirty(false)
+    } catch (err) {
+      alertError(toApiError(err, 'Failed to clear the stored value').message)
+    }
   }
 
   // The consumer gates apply immediately (they are not secret and not part of the
@@ -109,11 +118,11 @@ export function AuthenticationSection({ projectId, mode }: AuthenticationSection
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [which]: v }),
       })
-      if (!res.ok) { setter(!v); alertError('Failed to update the toggle'); return }
+      if (!res.ok) { setter(!v); alertError((await readApiError(res, 'Failed to update the toggle')).message); return }
       setMeta((await res.json()).authProfile)
-    } catch {
+    } catch (err) {
       setter(!v)
-      alertError('Failed to update the toggle')
+      alertError(toApiError(err, 'Failed to update the toggle').message)
     }
   }
 
@@ -151,6 +160,7 @@ export function AuthenticationSection({ projectId, mode }: AuthenticationSection
             <p className={styles.fieldHint}>Save the project first, then configure its authenticated session.</p>
           ) : (
             <>
+              {loadError && <p className={styles.inlineError} role="alert">{loadError}</p>}
               <div className={styles.subSection}>
                 <h3 className={styles.subSectionTitle}>Apply this identity to</h3>
                 <div className={styles.toggleRow}>

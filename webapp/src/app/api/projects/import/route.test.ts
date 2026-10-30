@@ -73,3 +73,45 @@ describe('POST /api/projects/import (D10 caps)', () => {
     expect((await res.json()).error).toMatch(/manifest/i)
   })
 })
+
+describe('POST /api/projects/import (failures name their cause)', () => {
+  test('a declared body over the cap is 413 body_too_large with the limit, before the body is read', async () => {
+    vi.stubEnv('PROJECT_IMPORT_MAX_UPLOAD_BYTES', '')
+    const req = new NextRequest('http://localhost:3000/api/projects/import', {
+      method: 'POST',
+      body: 'never read',
+      headers: { 'content-type': 'multipart/form-data; boundary=x', 'content-length': String(80 * 1024 * 1024) },
+    })
+    const formData = vi.spyOn(req, 'formData')
+    const res = await POST(req)
+    expect(res.status).toBe(413)
+    expect(await res.json()).toEqual({
+      error: 'The upload is larger than 55 MB.', code: 'body_too_large', limitBytes: 55 * 1024 * 1024,
+    })
+    expect(formData).not.toHaveBeenCalled()
+  })
+
+  test('the default cap fits under the 60 MB request-body cap with room for the envelope', async () => {
+    const { DEFAULT_IMPORT_MAX_UPLOAD_BYTES } = await import('./limits')
+    const { MULTIPART_ENVELOPE_BYTES } = await import('@/lib/roe/upload')
+    expect(DEFAULT_IMPORT_MAX_UPLOAD_BYTES + MULTIPART_ENVELOPE_BYTES).toBeLessThan(60 * 1024 * 1024)
+  })
+
+  test('a file that is not a zip is a 400 invalid_zip', async () => {
+    const res = await POST(formReq(new File(['not a zip'], 'x.zip', { type: 'application/zip' })))
+    expect(res.status).toBe(400)
+    expect((await res.json()).code).toBe('invalid_zip')
+  })
+
+  test('an unexpected failure answers a code, never the exception text', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const zip = new JSZip()
+    zip.file('manifest.json', '{"version": 1, "projectName": "secret-target.example"')
+    const buf = await zip.generateAsync({ type: 'uint8array' })
+    const res = await POST(formReq(new File([buf as BlobPart], 'bad.zip', { type: 'application/zip' })))
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Import failed', code: 'SyntaxError' })
+    expect(JSON.stringify(body)).not.toContain('secret-target')
+  })
+})

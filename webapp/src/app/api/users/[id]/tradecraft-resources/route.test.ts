@@ -290,3 +290,51 @@ describe('POST general validation (regression)', () => {
     expect(body.error).toMatch(/private|http/i)
   })
 })
+
+describe('POST: a database failure answers its code', () => {
+  test('a create the database refused is a 500 with its Prisma code, not just a sentence', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockTradecraftCreate.mockRejectedValue(Object.assign(new Error('value too long for column "name"'), { code: 'P2000' }))
+    const r = await route.POST(
+      makeRequest({ name: 'HackTricks', url: 'https://book.hacktricks.wiki', llmModel: 'gpt-4o' }, '?skipVerify=true') as never,
+      PARAMS as never,
+    )
+    expect(r.status).toBe(500)
+    expect(await r.json()).toEqual({ error: 'Failed to create tradecraft resource', code: 'P2000' })
+  })
+})
+
+describe('POST: the background verify stores a safe lastError', () => {
+  const CREATED = {
+    id: 'res-11', name: 'HT', slug: 'ht', url: 'https://book.hacktricks.wiki',
+    llmModel: 'gpt-4o', githubTokenOverride: '', enabled: true, resourceType: 'agentic-crawl',
+  }
+  const create = () => route.POST(
+    makeRequest({ name: 'HT', url: 'https://book.hacktricks.wiki', llmModel: 'gpt-4o' }) as never,
+    PARAMS as never,
+  )
+  const lastErrors = () => mockTradecraftUpdate.mock.calls
+    .map(c => (c[0] as { data: { lastError?: string } }).data.lastError)
+    .filter((v): v is string => v !== undefined)
+
+  test('an agent error answer: its code and status, never its text', async () => {
+    mockTradecraftCreate.mockResolvedValue(CREATED)
+    global.fetch = vi.fn(async () => new Response(
+      JSON.stringify({ error: 'LLM not configured: Error code: 401 - key sk-live-abc invalid' }), { status: 503 },
+    )) as typeof fetch
+    expect((await create()).status).toBe(201)
+    await flushMicrotasks()
+    expect(lastErrors()).toEqual(['verify failed (agent_error, agent HTTP 503)'])
+  })
+
+  test('an agent that never answered: the errno, not "TypeError: fetch failed"', async () => {
+    mockTradecraftCreate.mockResolvedValue(CREATED)
+    const err = new TypeError('fetch failed')
+    ;(err as TypeError & { cause?: unknown }).cause = Object.assign(new Error('getaddrinfo ENOTFOUND agent'), { code: 'ENOTFOUND' })
+    global.fetch = vi.fn(async () => { throw err }) as typeof fetch
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect((await create()).status).toBe(201)
+    await flushMicrotasks()
+    expect(lastErrors()).toEqual(['verify failed (agent_unreachable, ENOTFOUND)'])
+  })
+})

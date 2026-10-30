@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 
 // GET /api/projects/[id]/roe/revisions - The superseded RoE documents, newest first.
 // Metadata only: the bytes come from .../revisions/[revId]/download.
@@ -25,7 +26,6 @@ export async function GET(
     })
     return NextResponse.json({ revisions })
   } catch (error) {
-    console.error('RoE revisions error:', error)
-    return NextResponse.json({ error: 'Failed to list RoE revisions' }, { status: 500 })
+    return internalError(error, 'Failed to list RoE revisions', { log: 'RoE revisions error' })
   }
 }

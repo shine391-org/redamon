@@ -25,6 +25,7 @@ vi.mock('@/lib/session', () => ({
 vi.mock('@/lib/audit', () => ({ writeAudit: async (e: Record<string, unknown>) => void h.audits.push(e) }))
 
 import { createFakePrisma, type FakePrisma } from '@/lib/plugins/__testing__/fakePrisma'
+import { MAX_CONTENT_SIZE } from '@/lib/userSkills'
 import { POST } from './route'
 
 let db: FakePrisma
@@ -44,7 +45,9 @@ const skills = () => db.rows('userAttackSkill').filter((r) => r.userId === 'alic
 function wire(catalog: Entry[], details: Record<string, Detail>, { catalogOk = true } = {}) {
   mockFetch.mockImplementation(async (url: string) => {
     if (/\/community-skills$/.test(url)) {
-      return catalogOk ? { ok: true, json: async () => ({ skills: catalog }) } : { ok: false, json: async () => ({}) }
+      return catalogOk
+        ? new Response(JSON.stringify({ skills: catalog }), { status: 200 })
+        : new Response('Internal Server Error', { status: 500 })
     }
     const id = decodeURIComponent(url.split('/').pop() as string)
     const d = details[id]
@@ -78,10 +81,10 @@ describe('POST attack-skills/import-community', () => {
     expect(db.rawCalls.some((c) => c.sql.includes('pg_advisory_xact_lock') && c.values[0] === 'user_attack_skills:alice')).toBe(true)
   })
 
-  test('content over 50 KB is skipped as tooLarge', async () => {
+  test('content over MAX_CONTENT_SIZE is skipped as tooLarge', async () => {
     wire(
       [{ id: 'big', name: 'Big' }, { id: 'ok', name: 'Ok' }],
-      { big: { content: 'X'.repeat(51 * 1024) }, ok: { content: 'small' } },
+      { big: { content: 'X'.repeat(MAX_CONTENT_SIZE + 1) }, ok: { content: 'small' } },
     )
     const { body } = await run()
     expect(body.imported).toBe(1)
@@ -181,7 +184,7 @@ describe('POST attack-skills/import-community', () => {
         { id: 'dup', name: 'dup' }, { id: 'big', name: 'Big' }, { id: 'down', name: 'Down' },
         { id: 'empty', name: 'Empty' }, { id: 'ok', name: 'Ok' },
       ],
-      { dup: { content: 'x' }, big: { content: 'x'.repeat(50 * 1024 + 1) }, down: 'http_error', empty: { content: '' }, ok: { content: 'x' } },
+      { dup: { content: 'x' }, big: { content: 'x'.repeat(MAX_CONTENT_SIZE + 1) }, down: 'http_error', empty: { content: '' }, ok: { content: 'x' } },
     )
     const { body } = await run()
     expect(body.skippedBy).toEqual({ duplicate: 1, limit: 0, fetchFailed: 1, tooLarge: 1, invalid: 1 })
@@ -221,10 +224,59 @@ describe('POST attack-skills/import-community', () => {
     expect(h.audits).toEqual([expect.objectContaining({ actorId: 'admin1', after: expect.objectContaining({ onBehalfOf: 'alice' }) })])
   })
 
-  test('the catalog unreachable is 502 and nothing is created', async () => {
+  test('the catalog failing is 502 with the agent status, and nothing is created', async () => {
     wire([], {}, { catalogOk: false })
-    expect((await run()).status).toBe(502)
+    const { status, body } = await run()
+    expect(status).toBe(502)
+    expect(body).toEqual({
+      error: 'Failed to fetch community skills catalog from agent service',
+      code: 'agent_error',
+      upstreamStatus: 500,
+    })
     expect(skills()).toHaveLength(0)
+  })
+
+  test('an agent that never answers is 503 agent_unreachable with the errno, and nothing is created', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockFetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 172.18.0.5:8080'), { code: 'ECONNREFUSED' }),
+    }))
+    const { status, body } = await run()
+    expect(status).toBe(503)
+    expect(body).toEqual({
+      error: 'Failed to fetch community skills catalog from agent service',
+      code: 'agent_unreachable',
+      cause: 'ECONNREFUSED',
+    })
+    expect(skills()).toHaveLength(0)
+    vi.restoreAllMocks()
+  })
+
+  test('the catalog is read from the agent with the internal key', async () => {
+    wire([], {})
+    await run()
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit]
+    expect(url).toMatch(/\/community-skills$/)
+    expect(init.headers).toHaveProperty('x-internal-key')
+  })
+
+  test('a database failure is 500 with its Prisma code, never its message', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    wire([{ id: 'a', name: 'A' }], { a: { content: 'x' } })
+    h.db = new Proxy(db as unknown as Record<string, unknown>, {
+      get: (t, k) => (k === '$transaction'
+        ? async () => { throw Object.assign(new Error('Transaction API error: SELECT secret'), { code: 'P2028' }) }
+        : t[k as string]),
+    })
+    const res = await POST(
+      new NextRequest('http://localhost:3000/api/users/alice/attack-skills/import-community', { method: 'POST' }),
+      { params: Promise.resolve({ id: 'alice' }) },
+    )
+    const text = await res.text()
+    expect(res.status).toBe(500)
+    expect(JSON.parse(text)).toEqual({ error: 'Failed to import community attack skills', code: 'P2028' })
+    expect(text).not.toContain('SELECT')
+    vi.restoreAllMocks()
   })
 
   test('a cross-user caller is refused before any fetch, and nothing is created', async () => {

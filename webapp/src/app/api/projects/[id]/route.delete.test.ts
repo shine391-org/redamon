@@ -79,8 +79,32 @@ describe('the record of what authorized an engagement outlives the engagement', 
     h.archiveTransaction.mockRejectedValue(new Error('archive table missing'))
     const res = await DELETE(del(), params('p1'))
     expect(res.status).toBe(500)
-    expect((await res.json()).error).toMatch(/must outlive/)
+    const body = await res.json()
+    expect(body.error).toMatch(/must outlive/)
+    expect(body.code).toBe('authorization_archive_failed')
     expect(h.projectDelete).not.toHaveBeenCalled()
+  })
+})
+
+describe('a delete that fails says why without quoting the error', () => {
+  test('a database failure answers the fixed sentence and the Prisma code', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.projectDelete.mockRejectedValue(Object.assign(
+      new Error('Timed out fetching a new connection: DELETE FROM "Project" WHERE id = \'p1\''),
+      { code: 'P2024', name: 'PrismaClientKnownRequestError' },
+    ))
+    const res = await DELETE(del(), params('p1'))
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to delete project', code: 'P2024' })
+    expect(JSON.stringify(body)).not.toContain('DELETE FROM')
+  })
+
+  test('a row that is already gone is a 404', async () => {
+    h.projectDelete.mockRejectedValue(Object.assign(new Error('not found'), { code: 'P2025' }))
+    const res = await DELETE(del(), params('p1'))
+    expect(res.status).toBe(404)
+    expect((await res.json()).error).toBe('Project not found')
   })
 })
 

@@ -144,7 +144,7 @@ def test_six_items_are_a_400_with_model_used(api):
 @pytest.mark.parametrize("bad", [
     {"want_name": False, "want_description": False},
     {"content": "   "},
-    {"content": "x" * (50 * 1024 + 1)},
+    {"content": "x" * (500 * 1024 + 1)},
     {"key": "k" * 65},
 ])
 def test_an_unusable_item_is_a_400_with_model_used(api, bad):
@@ -375,3 +375,14 @@ def test_the_webapp_waits_longer_than_the_agent_and_less_than_undici():
     assert match, "the generate-metadata route names no AGENT_TIMEOUT_MS"
     webapp_ms = int(match.group(1).replace("_", ""))
     assert skill_metadata.REQUEST_TIMEOUT_S * 1000 < webapp_ms < 300_000
+
+
+def test_the_content_cap_equals_the_webapp_one():
+    """A file the upload dialog accepts must not be refused by Generate with AI."""
+    import skill_metadata
+    user_skills = REPO_ROOT / "webapp" / "src" / "lib" / "userSkills.ts"
+    if not user_skills.exists():
+        pytest.skip("the webapp userSkills.ts is not in this checkout")
+    match = re.search(r"MAX_CONTENT_SIZE\s*=\s*(\d+)\s*\*\s*1024\b", user_skills.read_text(encoding="utf-8"))
+    assert match, "userSkills.ts names no MAX_CONTENT_SIZE = N * 1024"
+    assert skill_metadata.CONTENT_MAX_CHARS == int(match.group(1)) * 1024

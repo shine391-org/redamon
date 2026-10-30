@@ -39,6 +39,7 @@ export type RedZoneTableSlug =
   | 'supplyChainSca'
   | 'dnsDrift'
   | 'webCachePoison'
+  | 'routeExposure'
 
 export interface RedZoneTableResponse<T> {
   rows: T[]

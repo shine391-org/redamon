@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { withRouteErrors } from '@/lib/routeErrors'
 import { requireProjectOwner, callGraphTriage } from '@/lib/triageClient'
 import { readJsonBody } from '@/lib/jsonBody'
 import { invalidateCache } from '@/app/api/graph/cache'
@@ -24,7 +25,9 @@ import { activationBusy, activationBusyResponse } from '@/lib/activationLock'
  * page was open" the Priority Board handles. An already-muted node is left as it
  * was (`already: true`), and a version activation in progress answers 409 too.
  */
-export async function POST(request: NextRequest) {
+// Ownership and the activation lock read Postgres before any try; a failure
+// there would otherwise be Next's empty-bodied 500.
+export const POST = withRouteErrors('The finding could not be muted.', async (request: NextRequest) => {
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const { projectId, graphId } = parsed.body as { projectId?: string; graphId?: unknown }
@@ -49,4 +52,4 @@ export async function POST(request: NextRequest) {
   // leave it now, not then.
   if (res.ok) invalidateCache(caller.projectId)
   return res
-}
+})

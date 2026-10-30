@@ -4,6 +4,7 @@ import { promises as fs } from 'fs'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { resolveTranscriptPath, transcriptContentType, transcriptDisposition } from '@/lib/aiAttackTranscript'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string }>
@@ -65,11 +66,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       },
     })
   } catch (error) {
-    console.error('AI Attack Surface transcript error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to read transcript' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to read transcript', { log: 'AI Attack Surface transcript error' })
   } finally {
     await session.close()
   }

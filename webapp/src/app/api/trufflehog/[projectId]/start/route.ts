@@ -5,6 +5,7 @@ import { recordScanStart } from '@/lib/scanTimeline'
 import { currentRoeTextSha256 } from '@/lib/engagement'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
+import { internalError, readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
 import { assertGraphNotActivating } from '@/lib/activationLock'
 import { resolveTrufflehogStart } from '@/lib/trufflehogStart'
 
@@ -51,23 +52,33 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     // Read before the start, so a RoE replaced mid-start cannot misattribute the run.
     const roeTextSha256 = await currentRoeTextSha256(projectId)
-    const response = await orchestratorFetch(
-      `${RECON_ORCHESTRATOR_URL}/trufflehog/${projectId}/start`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(resolved.body),
-      },
-    )
+    let response: Response
+    try {
+      response = await orchestratorFetch(
+        `${RECON_ORCHESTRATOR_URL}/trufflehog/${projectId}/start`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(resolved.body),
+        },
+      )
+    } catch (error) {
+      return upstreamFailureResponse('orchestrator', error, 'Failed to start Secret Multiscanner scan')
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
       // Governor rejections carry a structured object detail; normalize to a
       // string message (+ limit) so it is never rendered as a raw React child.
-      const { error, limit } = normalizeOrchestratorStartError(
-        errorData, 'Failed to start Secret Multiscanner scan',
+      // A body that is not JSON (uvicorn's plain-text 500) still says which
+      // status the orchestrator answered.
+      const upstream = await readUpstreamBody(response)
+      const { error, limit, code } = normalizeOrchestratorStartError(
+        upstream.json ?? {}, 'Failed to start Secret Multiscanner scan',
       )
-      return NextResponse.json({ error, ...(limit ? { limit } : {}) }, { status: response.status })
+      return NextResponse.json(
+        { error, code: code ?? upstream.code ?? 'orchestrator_error', upstreamStatus: response.status, ...(limit ? { limit } : {}) },
+        { status: response.status },
+      )
     }
 
     // runId is the source: without it the reconcile closes only the newest of N
@@ -83,10 +94,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(await response.json())
   } catch (error) {
-    console.error('Error starting TruffleHog scan:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to start Secret Multiscanner scan', { log: 'Error starting TruffleHog scan' })
   }
 }

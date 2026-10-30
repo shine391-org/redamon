@@ -14,7 +14,8 @@ import { ExternalLink, Loader2, RotateCw } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { ModelPicker } from '@/components/shared/ModelPicker'
 import { useProject } from '@/providers/ProjectProvider'
-import type { ModelOption } from '@/app/graph/components/AIAssistantDrawer/modelUtils'
+import { fetchJson, formatApiError, toApiError } from '@/lib/apiError'
+import { fetchModelOptions, type ModelsByProvider } from './modelOptions'
 import {
   GATE_CODES,
   featureModelMessage,
@@ -63,7 +64,7 @@ const allowedFor = (featureId: GateFeatureId) => (id: string) =>
 // Client calls shared by the gate and the Models by feature section
 // ---------------------------------------------------------------------------
 
-export type ModelsByProvider = Record<string, ModelOption[]>
+export { fetchModelOptions, type ModelsByProvider }
 
 function stringMap(raw: unknown): Record<string, string> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
@@ -72,26 +73,10 @@ function stringMap(raw: unknown): Record<string, string> {
   )
 }
 
-/** The user's selectable models, grouped by provider (the /api/models answer). */
-export async function fetchModelOptions(userId: string): Promise<ModelsByProvider> {
-  const res = await fetch('/api/models', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userId }),
-    cache: 'no-store',
-  })
-  if (!res.ok) throw new Error(`/api/models answered ${res.status}`)
-  const data = await res.json()
-  if (!data || typeof data !== 'object' || Array.isArray(data) || data.error) {
-    throw new Error('/api/models returned no model list')
-  }
-  return data as ModelsByProvider
-}
-
+/** Throws an ApiError whose message carries the code and HTTP status of the failed read. */
 export async function fetchSavedFeatureModels(userId: string): Promise<Record<string, string>> {
-  const res = await fetch(`/api/users/${encodeURIComponent(userId)}/settings`)
-  if (!res.ok) throw new Error(`Could not read your settings (${res.status})`)
-  const data = await res.json()
+  const data = await fetchJson<{ featureModels?: unknown } | null>(
+    `/api/users/${encodeURIComponent(userId)}/settings`, undefined, 'Could not read your settings')
   return stringMap(data?.featureModels)
 }
 
@@ -163,6 +148,7 @@ export function FeatureModelGate({
   const feature = featureText(featureId, { label, description })
   const [models, setModels] = useState<ModelsByProvider>({})
   const [loadState, setLoadState] = useState<LoadState>('loading')
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [picked, setPicked] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -170,6 +156,7 @@ export function FeatureModelGate({
 
   const load = useCallback(async () => {
     if (!userId) {
+      setLoadError(null)
       setLoadState('error')
       return
     }
@@ -177,7 +164,8 @@ export function FeatureModelGate({
     try {
       setModels(await fetchModelOptions(userId))
       setLoadState('ready')
-    } catch {
+    } catch (err) {
+      setLoadError(toApiError(err, 'Failed to load models').message)
       setLoadState('error')
     }
   }, [userId])
@@ -232,6 +220,7 @@ export function FeatureModelGate({
       {loadState === 'error' && (
         <div className={styles.emptyBox}>
           <span>Couldn&apos;t load your models.</span>
+          {loadError && <span role="alert">{loadError}</span>}
           <div className={styles.inlineActions}>
             <button type="button" className="secondaryButton" onClick={() => void load()}>
               <RotateCw size={12} /> Check again
@@ -409,15 +398,19 @@ export function FeatureModelGateProvider({ children }: { children: ReactNode }) 
 
   const ensureFeatureModel = useCallback(async (featureId: GateFeatureId, opts: EnsureFeatureModelOptions = {}) => {
     if (!userId) return null
+    let message = opts.message
     if (!opts.force) {
       try {
         const saved = (await fetchSavedFeatureModels(userId))[featureId]
         if (saved) return saved
-      } catch {
-        // Unreadable settings: asking is better than blocking the action.
+      } catch (err) {
+        // Unreadable settings: asking is better than blocking the action, but the gate
+        // says why it asks, or it reads as if no model had ever been saved.
+        const read = toApiError(err, 'Could not read your settings')
+        message ??= `${formatApiError({ ...read, reason: "Couldn't read your saved model" })}. Choose one to continue.`
       }
     }
-    return openGate(featureId, opts.message, { label: opts.label, description: opts.description })
+    return openGate(featureId, message, { label: opts.label, description: opts.description })
   }, [userId, openGate])
 
   const fetchWithFeatureModel = useCallback(async (
@@ -469,7 +462,7 @@ export function FeatureModelGateProvider({ children }: { children: ReactNode }) 
 // "Model: X · Change", shown next to the button that runs a feature
 // ---------------------------------------------------------------------------
 
-type LineState = { kind: 'loading' } | { kind: 'error' } | { kind: 'ready'; model: string }
+type LineState = { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready'; model: string }
 
 /**
  * The saved model of a feature, with a link that reopens the gate to change
@@ -496,7 +489,7 @@ export function FeatureModelLine({
     let live = true
     fetchSavedFeatureModels(userId)
       .then(map => { if (live) setState({ kind: 'ready', model: map[featureId] ?? '' }) })
-      .catch(() => { if (live) setState({ kind: 'error' }) })
+      .catch(err => { if (live) setState({ kind: 'error', message: toApiError(err, 'Could not read your settings').message }) })
     return () => { live = false }
   }, [userId, featureId, savedVersion])
 
@@ -508,7 +501,7 @@ export function FeatureModelLine({
   return (
     <span className={`${styles.line} ${className ?? ''}`} data-feature-model={featureId}>
       <span>{label}:</span>
-      <span className={styles.lineValue} title={model || undefined}>{shown}</span>
+      <span className={styles.lineValue} title={state.kind === 'error' ? state.message : model || undefined}>{shown}</span>
       <span aria-hidden="true">·</span>
       <button
         type="button"

@@ -87,7 +87,6 @@ from recon.helpers.isolated_result import TopLevelKeys
 # Every top-level key run_vuln_scan writes; the security checks nest inside
 # vuln_scan. technology_cves exists only when the CVE lookup ran.
 _VULN_SCAN_RESULT_KEYS = ("vuln_scan", "technology_cves")
-VULN_SCAN_TOP_LEVEL_KEYS = _VULN_SCAN_RESULT_KEYS[1:]
 
 
 def _nuclei_watch_stats(line: str, label: str, state: dict) -> None:

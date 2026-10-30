@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; reportId: string }>
@@ -47,11 +48,9 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       },
     })
   } catch (error) {
-    console.error('Download report failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Download failed' },
-      { status: 500 }
-    )
+    // An fs message names the report's path on the server; its errno (EACCES,
+    // EISDIR) says the same thing without it.
+    return internalError(error, 'Download failed', { log: 'Download report failed' })
   }
 }
 
@@ -82,10 +81,6 @@ export async function DELETE(_request: NextRequest, { params }: RouteParams) {
 
     return new Response(null, { status: 204 })
   } catch (error) {
-    console.error('Delete report failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Delete failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Delete failed', { log: 'Delete report failed' })
   }
 }

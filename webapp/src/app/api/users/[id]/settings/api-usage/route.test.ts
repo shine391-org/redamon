@@ -171,6 +171,14 @@ describe('GET', () => {
     expect(body.tracked).toEqual([{ field: 'shodanApiKey', probeId: 'shodan', label: 'Shodan', role: 'key', rotationTool: 'shodan' }])
   })
 
+  test('a database failure -> 500 with its code, never its message', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.reportFind.mockRejectedValue(Object.assign(new Error("Can't reach database server at db:5432"), { code: 'P1001' }))
+    const res = await get()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to load the API usage report', code: 'P1001' })
+  })
+
   test('returns the saved report, and "run by" when an admin ran it while acting', async () => {
     h.reportFind.mockResolvedValue({ report: report(), updatedById: ADMIN, finishedAt: new Date() })
     h.userFind.mockResolvedValue({ id: ADMIN, name: 'Ada Admin' })
@@ -403,7 +411,9 @@ describe('POST run and save', () => {
     h.runJobs.mockRejectedValue(new Error(`exploded with ${FIXTURE_KEY}`))
     const res = await post({})
     expect(res.status).toBe(500)
-    expect(await res.text()).not.toContain(FIXTURE_KEY)
+    const text = await res.text()
+    expect(text).not.toContain(FIXTURE_KEY)
+    expect(JSON.parse(text)).toEqual({ error: 'run_failed', code: 'run_failed' })
     expect(h.reportUpsert).not.toHaveBeenCalled()
     h.runJobs.mockResolvedValue(report())
     expect((await post({})).status).toBe(200)

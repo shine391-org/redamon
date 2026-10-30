@@ -74,3 +74,24 @@ describe('revisions', () => {
     expect((await download('other-project-rev')).status).toBe(404)
   })
 })
+
+describe('a database failure names its code', () => {
+  const prismaError = () => Object.assign(new Error('Can\'t reach database server at `db:5432`'), {
+    code: 'P1001', name: 'PrismaClientInitializationError',
+  })
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}) })
+
+  test('the list', async () => {
+    h.revisionFindMany.mockRejectedValue(prismaError())
+    const res = await list()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to list RoE revisions', code: 'P1001' })
+  })
+
+  test('a revision download', async () => {
+    h.revisionFindFirst.mockRejectedValue(prismaError())
+    const res = await download()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to download the RoE revision', code: 'P1001' })
+  })
+})

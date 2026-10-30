@@ -75,6 +75,13 @@ def _normalize_chain_findings(output_analysis: dict) -> None:
     for f in findings:
         if not isinstance(f, dict):
             continue
+        # One id given as a bare string, or a null text field, would fail the
+        # whole decision's validation, not just this entry.
+        if isinstance(f.get("related_finding_ids"), str):
+            f["related_finding_ids"] = [f["related_finding_ids"]]
+        for key in ("title", "evidence"):
+            if key in f and f[key] is None:
+                f[key] = ""
         # Map alternative field names the LLM may use
         if "type" in f and "finding_type" not in f:
             f["finding_type"] = f.pop("type")
@@ -84,9 +91,14 @@ def _normalize_chain_findings(output_analysis: dict) -> None:
             f["title"] = f.pop("description")
         if "name" in f and "title" not in f:
             f["title"] = f.pop("name")
-        # Skip findings with no meaningful title
-        if not f.get("title", "").strip() and not f.get("evidence", "").strip():
-            continue
+        # Skip findings with no meaningful title, unless the entry names the
+        # recon finding(s) it proves: then the ids ARE the finding, and dropping
+        # the entry silently lost proven leads in the route exposure campaign.
+        if not str(f.get("title") or "").strip() and not str(f.get("evidence") or "").strip():
+            ids = [i for i in (f.get("related_finding_ids") or []) if isinstance(i, str) and i.strip()]
+            if not ids:
+                continue
+            f["title"] = f"{f.get('finding_type') or 'finding'}: {', '.join(ids)}"
         # Normalize finding_type to lowercase
         if "finding_type" in f:
             f["finding_type"] = str(f["finding_type"]).lower().strip()
@@ -220,6 +232,18 @@ def try_parse_llm_decision(response_text: str) -> Tuple[Optional[LLMDecision], O
                 "extracted_info" in data["output_analysis"]):
             extracted = data["output_analysis"]["extracted_info"]
             _normalize_extracted_info(extracted)
+
+        # chain_findings is a field OF output_analysis, but a model analysing a
+        # single tool's output often puts it beside output_analysis (the prompt's
+        # example for that case shows it as a separate fragment). LLMDecision
+        # ignores unknown top-level keys, so every finding there vanished
+        # silently, confirmations included: move it rather than drop it.
+        top_findings = data.pop("chain_findings", None)
+        if isinstance(top_findings, list) and top_findings:
+            if not isinstance(data.get("output_analysis"), dict):
+                data["output_analysis"] = {}
+            nested = data["output_analysis"].get("chain_findings")
+            data["output_analysis"]["chain_findings"] = (nested if isinstance(nested, list) else []) + top_findings
 
         # Normalize chain_findings in output_analysis
         if data.get("output_analysis") and isinstance(data["output_analysis"], dict):

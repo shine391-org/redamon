@@ -42,9 +42,9 @@ from recon.helpers.js_recon.urls import accept_js_response, is_js_content_type, 
 from recon.helpers.ai_signal_catalog import match_ai_sdk
 
 try:
-    from recon.main_recon_modules.ip_filter import is_url_safe_to_probe
+    from recon.main_recon_modules.ip_filter import is_address_safe_to_scan, is_url_safe_to_probe
 except ImportError:  # spawned-container path where CWD is on sys.path
-    from ip_filter import is_url_safe_to_probe
+    from ip_filter import is_address_safe_to_scan, is_url_safe_to_probe
 
 
 # =============================================================================
@@ -101,7 +101,7 @@ def _safe_redirect_get(url, *, timeout, headers, max_redirects=5):
     """
     current = url
     for _hop in range(max_redirects + 1):
-        if not is_url_safe_to_probe(current):
+        if not _download_allowed(current):
             print(f"[!][JsRecon] {current} -- blocked (SSRF guard)")
             return None
         resp = requests.get(current, timeout=timeout, headers=headers, allow_redirects=False)
@@ -114,6 +114,43 @@ def _safe_redirect_get(url, *, timeout, headers, max_redirects=5):
         return resp
     print(f"[!][JsRecon] {url} -- too many redirects")
     return None
+
+
+# The run's own hosts for a JS download; set for the duration of run_js_recon
+# like _JS_SCOPE. Outside a run every URL takes the attacker-influenced rule.
+_OWN_HOSTS = None
+
+
+def _download_allowed(url) -> bool:
+    """A file on one of the run's own hosts follows the pipeline's address rule,
+    so an internal target's bundles are read as katana and httpx already read
+    them; any other host (a CDN, a redirect hop off the run) must pass the
+    attacker-influenced URL rule, which refuses every private address."""
+    own = _OWN_HOSTS
+    if own is not None:
+        try:
+            scheme = urlparse(url).scheme.lower()
+        except ValueError:
+            return False
+        host = _host_of(url)
+        if scheme in ('http', 'https') and host in own.hosts:
+            return is_address_safe_to_scan(host, own.operator_hosts, own.operator_networks)
+    return is_url_safe_to_probe(url)
+
+
+class _OwnHosts(NamedTuple):
+    hosts: frozenset = frozenset()
+    operator_hosts: frozenset = frozenset()
+    operator_networks: tuple = ()
+
+
+def _own_hosts(combined_result: dict, settings: dict) -> _OwnHosts:
+    from recon.helpers.openapi.discovery import operator_targets
+    by_url = (combined_result.get('http_probe') or {}).get('by_url') or {}
+    reached = [{'url': str(e.get('url') or u)} for u, e in by_url.items() if isinstance(e, dict)]
+    hosts = _endpoint_probe_scope(combined_result, reached, settings).hosts
+    op_hosts, op_nets = operator_targets(settings or {})
+    return _OwnHosts(frozenset(hosts), frozenset(op_hosts), tuple(op_nets))
 
 
 # Framework JS paths that Katana typically excludes but contain app code
@@ -1562,9 +1599,14 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
     # supply-chain stage reads it (via 'work_dir' below) as this run's JS only.
     work_dir = Path(f'/tmp/redamon/js_recon_{uuid.uuid4().hex[:12]}')
 
-    global _JS_SCOPE
+    global _JS_SCOPE, _OWN_HOSTS
     from recon.helpers import circuit_breaker as _cb
     _JS_SCOPE = _cb.scope((), label="JsRecon", unit="host(s)")
+    try:
+        _OWN_HOSTS = _own_hosts(combined_result, settings)
+    except Exception as e:  # noqa: BLE001 - every download then takes the strict rule
+        print(f"[!][JsRecon] Run hosts unavailable ({type(e).__name__}); private hosts are not fetched")
+        _OWN_HOSTS = None
 
     print("\n" + "=" * 60)
     print("[*][JsRecon] JS Recon Scanner -- Starting")
@@ -1838,6 +1880,7 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         except Exception:  # noqa: BLE001
             pass
         _JS_SCOPE = None
+        _OWN_HOSTS = None
         # Cleanup temp files. NOT when supply-chain recon is enabled: GROUP 5.5
         # runs after us and needs these exact bytes for the retire.js pass (it
         # must never re-fetch - that would add target traffic and an SSRF

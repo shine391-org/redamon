@@ -606,10 +606,133 @@ async def serialized_classify(key: str, blobs: list) -> dict:
     return {"labels": labels, "model": JEV_MODEL}
 
 
+# ---------------------------------------------------------------------------
+# Route exposure: route privacy rank
+# ---------------------------------------------------------------------------
+
+#: Routes per request body; recon asks about its highest prior scores first.
+ROUTE_PRIVACY_MAX = 400
+ROUTE_PATH_CHARS = 200
+
+
+def _route_state(route: dict) -> dict:
+    return {
+        "path": wrap_untrusted(_clip(route.get("path"), ROUTE_PATH_CHARS), label="TARGET_PATH"),
+        "method": route.get("method", "GET"),
+        "category": route.get("category", "other"),
+        "openapi_secured": bool(route.get("openapi_secured")),
+        "declared_only": bool(route.get("declared_only")),
+        "js_only": bool(route.get("js_only")),
+        "host_internal": bool(route.get("host_internal")),
+    }
+
+
+async def route_privacy_rank(key: str, routes: list) -> dict:
+    """Score each route for privacy: `{"scores": [noul per route], "model"}`.
+
+    Ranking only: recon spends its request budget floor first, so the answer can
+    reorder what fills the rest, never drop a floor route or add one. The flags
+    are recon's own closed values; the path is target text, named by index.
+    """
+    routes = list(routes)[:ROUTE_PRIVACY_MAX]
+    items = {f"route_{i}": _route_state(r) for i, r in enumerate(routes)}
+    questions = {
+        f"route_{i}": {f"route_{i}": _noul(
+            f"Is the route in item route_{i} meant only for logged-in, internal or administrative "
+            f"callers, rather than for the public? openapi_secured means the site's own API "
+            f"description requires credentials for it; declared_only means only that description "
+            f"names it; js_only means only the site's JavaScript names it; host_internal means the "
+            f"host name itself reads as internal.",
+            true="Meant for logged-in, internal or administrative callers",
+            false="Public content or a public API")}
+        for i in range(len(routes))
+    }
+    answers = await _ask_items(key, {}, items, questions) if routes else {}
+    return {"scores": [answers[f"route_{i}"]["noul"] for i in range(len(routes))],
+            "model": JEV_MODEL}
+
+
+# ---------------------------------------------------------------------------
+# Route exposure: lead assessment
+# ---------------------------------------------------------------------------
+
+#: recon's KINDS (route_exposure_assess.py); test_jev_item_contract.py holds them
+#: equal, or recon would reject every label naming a kind it does not know.
+ROUTE_EXPOSURE_KINDS = ("internal_api", "debug_management", "admin_function", "data_export",
+                        "old_version", "uploaded_content", "public_content")
+
+_ROUTE_KIND_GUIDE = (
+    "internal_api = an API for the application's own back office or other services, not its "
+    "public clients; debug_management = a debugging, monitoring or management interface "
+    "(health, metrics, environment, heap or thread dumps, a debug console); "
+    "admin_function = an administrative page or API; data_export = a bulk export, report or "
+    "download of records; old_version = an older version of an API or page left reachable; "
+    "uploaded_content = a file a user uploaded; public_content = content meant for anyone"
+)
+
+_ROUTE_KEY_CHARS = 4_000
+
+
+def _candidate_state(candidate: dict) -> dict:
+    """One lead's evidence: recon's closed values plain, target-derived text wrapped."""
+    return {
+        "path": wrap_untrusted(_clip(candidate.get("path"), ROUTE_PATH_CHARS), label="TARGET_PATH"),
+        "method": candidate.get("method", "GET"),
+        "anon_status": candidate.get("anon_status", 0),
+        "authed_status": candidate.get("authed_status"),
+        "content_class": candidate.get("content_class", "other"),
+        "size_bucket": candidate.get("size_bucket", "<1k"),
+        "bodies_match": candidate.get("bodies_match"),
+        "key_paths": wrap_untrusted(_clip(json.dumps(candidate.get("key_paths") or []), _ROUTE_KEY_CHARS),
+                                    label="TARGET_KEYS"),
+        "max_array_len": candidate.get("max_array_len", 0),
+        "det_signals": list(candidate.get("det_signals") or []),
+        "auth_expected_by": list(candidate.get("auth_expected_by") or []),
+        "generated_by": candidate.get("generated_by", "found"),
+    }
+
+
+async def route_exposure_assess(key: str, candidates: list) -> dict:
+    """Assess each lead: `{"labels": [{"kind", "kind_confidence", "sensitivity"}], "model"}`.
+
+    One request per lead, sequential and all-or-nothing, like `serialized_classify`:
+    rich items blur when several share one state. Two questions per lead: which kind
+    of route it is (a choice over the closed set, with its own confidence) and
+    whether what it returns without credentials is sensitive (a noul). Recon only
+    orders and annotates with these; it never drops a lead or rewrites its class.
+    """
+    questions = {
+        "kind": {
+            "type": "choice",
+            "instructions": ("Which kind of route is the one in the state? " + _ROUTE_KIND_GUIDE + "."),
+            "criteria": {kind: None for kind in ROUTE_EXPOSURE_KINDS},
+        },
+        "sensitive": _noul(
+            "What the route in the state returns to a caller who sent no credentials is "
+            "sensitive: personal data about people other than the caller, credentials or keys, "
+            "internal records, or administrative data. anon_status is the status it answered "
+            "without credentials and authed_status the status with them; bodies_match says "
+            "whether both answers were the same; key_paths are the names of the fields in the "
+            "answer (never their values); det_signals are what a pattern scan found in it.",
+            true="Sensitive data reachable without credentials",
+            false="Public or harmless content"),
+    }
+    labels = []
+    for candidate in candidates:
+        answers = await _ask(key, {"route": _candidate_state(candidate)}, questions)
+        labels.append({
+            "kind": answers["kind"]["choice"],
+            "kind_confidence": round(answers["kind"]["confidence"] * 100),
+            "sensitivity": round(answers["sensitive"]["noul"] * 100),
+        })
+    return {"labels": labels, "model": JEV_MODEL}
+
+
 __all__ = [
     "JevError", "JEV_MAX_QUESTIONS_PER_CALL", "FFUF_JEV_CATALOG",
     "ffuf_extensions", "nuclei_tags", "waf_classify", "takeover_classify",
     "FFUF_BASE_PATHS_MAX", "PAGE_CLASSES", "TOOL_HEALTH_TOOLS", "CRAWL_SEED_HOSTS_MAX",
     "SERIALIZED_FORMATS", "SERIALIZED_TRANSPORTS", "SERIALIZED_LAYERS",
     "ffuf_base_paths", "page_type", "tool_health", "crawl_seed_order", "serialized_classify",
+    "ROUTE_PRIVACY_MAX", "ROUTE_EXPOSURE_KINDS", "route_privacy_rank", "route_exposure_assess",
 ]

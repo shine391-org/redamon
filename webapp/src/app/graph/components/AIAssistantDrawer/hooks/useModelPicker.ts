@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { formatApiError, toApiError } from '@/lib/apiError'
+import { MODELS_LOAD_FAILED, fetchModelOptions } from '@/components/shared/modelOptions'
 import type { ModelOption } from '../modelUtils'
 
 export function useModelPicker(userId: string, onModelChange?: (modelId: string) => void) {
@@ -6,7 +8,8 @@ export function useModelPicker(userId: string, onModelChange?: (modelId: string)
   const [modelSearch, setModelSearch] = useState('')
   const [allModels, setAllModels] = useState<Record<string, ModelOption[]>>({})
   const [modelsLoading, setModelsLoading] = useState(false)
-  const [modelsError, setModelsError] = useState(false)
+  // Null, or the failure with its cause, e.g. "Failed to load models (agent_unreachable · HTTP 503)".
+  const [modelsError, setModelsError] = useState<string | null>(null)
   const modelSearchRef = useRef<HTMLInputElement>(null)
 
   // Fetch models when modal opens
@@ -14,26 +17,12 @@ export function useModelPicker(userId: string, onModelChange?: (modelId: string)
     if (!showModelModal) return
     let cancelled = false
     setModelsLoading(true)
-    setModelsError(false)
-    fetch('/api/models', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(userId ? { userId } : {}),
-      cache: 'no-store',
-    })
-      .then(r => {
-        if (!r.ok) throw new Error('Failed to fetch')
-        return r.json()
+    setModelsError(null)
+    fetchModelOptions(userId)
+      .then(data => { if (!cancelled) setAllModels(data) })
+      .catch(err => {
+        if (!cancelled) setModelsError(formatApiError({ ...toApiError(err, MODELS_LOAD_FAILED), reason: MODELS_LOAD_FAILED }))
       })
-      .then(data => {
-        if (cancelled) return
-        if (data && typeof data === 'object' && !data.error) {
-          setAllModels(data)
-        } else {
-          setModelsError(true)
-        }
-      })
-      .catch(() => { if (!cancelled) setModelsError(true) })
       .finally(() => { if (!cancelled) setModelsLoading(false) })
     return () => { cancelled = true }
   }, [showModelModal, userId])

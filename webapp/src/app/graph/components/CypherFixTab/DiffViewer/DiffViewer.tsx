@@ -68,6 +68,9 @@ export function DiffViewer({
   const isProcessing = codefix.status === 'running'
   const isStopping = codefix.status === 'stopping'
   const isIdle = codefix.status === 'disconnected' || codefix.status === 'connected'
+  const lastEntry = codefix.activityLog[codefix.activityLog.length - 1]
+  const showConnectionError = codefix.status === 'error' && codefix.errorCode !== 'model_required'
+    && !!codefix.error && !(lastEntry?.type === 'error' && lastEntry.message === codefix.error)
 
   return (
     <div className={styles.viewer}>
@@ -128,6 +131,17 @@ export function DiffViewer({
             onAcceptBlock={handleAccept}
             onRejectBlock={handleReject}
           />
+        )}
+
+        {/* A refused ticket or a closed socket is not an agent event, so the
+            log does not show it; an agent's own error is its last entry. */}
+        {showConnectionError && (
+          <div className={styles.idleState}>
+            <p role="alert">{codefix.error}</p>
+            <button className={styles.startBtn} onClick={() => void handleStart()}>
+              Try again
+            </button>
+          </div>
         )}
 
         {codefix.status === 'error' && codefix.errorCode === 'model_required' && (

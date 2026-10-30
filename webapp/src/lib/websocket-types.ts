@@ -492,6 +492,15 @@ export interface ExecutionStepPayload {
 export interface ErrorPayload {
   message: string
   recoverable: boolean
+  /** Why, as a fixed code: llm_setup_failed, ws_ticket_invalid, invalid_frame, persist_failed. */
+  code?: string
+  /** The exception class, never its text (it can quote provider errors or keys). */
+  error_class?: string
+  /** The model provider's HTTP status, when the failure came from it. */
+  provider_status?: number
+  http_status?: number
+  /** The invalid frame's field paths, never their values. */
+  fields?: string[]
 }
 
 export interface TaskCompletePayload {

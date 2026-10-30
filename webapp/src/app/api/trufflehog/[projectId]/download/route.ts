@@ -4,6 +4,7 @@ import prisma from '@/lib/prisma'
 import { readFile, readdir } from 'fs/promises'
 import path from 'path'
 import { TRUFFLEHOG_SOURCE_IDS } from '@/lib/trufflehogSources'
+import { internalError } from '@/lib/routeErrors'
 
 // Path to TruffleHog output directory (mounted volume or local path)
 const TRUFFLEHOG_OUTPUT_PATH = process.env.TRUFFLEHOG_OUTPUT_PATH || '/data/trufflehog-output'
@@ -99,11 +100,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       },
     })
   } catch (error) {
-    console.error('Error downloading TruffleHog data:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to download Secret Multiscanner data', { log: 'Error downloading TruffleHog data' })
   }
 }
 
@@ -116,7 +113,9 @@ export async function HEAD(request: NextRequest, { params }: RouteParams) {
 
     const files = await findRunFiles(projectId)
     return new NextResponse(null, { status: files.length > 0 ? 200 : 404 })
-  } catch {
+  } catch (error) {
+    // A HEAD answer has no body, so the cause only reaches the log.
+    console.error('Error checking TruffleHog data:', error)
     return new NextResponse(null, { status: 500 })
   }
 }

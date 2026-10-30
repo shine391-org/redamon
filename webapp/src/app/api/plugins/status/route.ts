@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { requireEffectiveUser } from '@/lib/access'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import { PLUGIN_PLATFORM_VERSION } from '@/lib/plugins/platformVersion'
 import { RunnerError, RunnerUnavailableError, runnerHealth } from '@/lib/plugins/runnerClient'
 
@@ -11,7 +12,7 @@ import { RunnerError, RunnerUnavailableError, runnerHealth } from '@/lib/plugins
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export async function GET() {
+export const GET = pluginRoute('status', 'The plugin status could not be read; see the webapp log.', async () => {
   const user = await requireEffectiveUser()
   if (user instanceof NextResponse) return user
 
@@ -20,10 +21,17 @@ export async function GET() {
     const h = await runnerHealth()
     runner = { reachable: true, platformVersion: h.platformVersion, state: h.state, workers: h.workers.length }
   } catch (e) {
+    // The reason and the proxy's code tell a timeout from a refused connection or a full
+    // proxy; a runner that answered with an error carries its status.
     if (e instanceof RunnerUnavailableError) {
-      runner = { reachable: false, error: e.reason === 'not_configured' ? 'runner_not_configured' : e.code }
+      runner = {
+        reachable: false,
+        error: e.reason === 'not_configured' ? 'runner_not_configured' : e.code,
+        reason: e.reason,
+        ...(e.proxyCode ? { proxyCode: e.proxyCode } : {}),
+      }
     } else if (e instanceof RunnerError) {
-      runner = { reachable: false, error: e.code }
+      runner = { reachable: false, error: e.code, upstreamStatus: e.status }
     } else {
       throw e
     }
@@ -33,4 +41,4 @@ export async function GET() {
     { platformVersion: PLUGIN_PLATFORM_VERSION, runner },
     { headers: { 'Cache-Control': 'no-store' } },
   )
-}
+})

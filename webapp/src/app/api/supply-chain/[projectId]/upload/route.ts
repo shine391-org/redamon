@@ -4,6 +4,7 @@ import prisma from '@/lib/prisma'
 import { mkdir, writeFile, readdir, stat, unlink } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
+import { internalError } from '@/lib/routeErrors'
 
 // Shared with the supply-chain scan container (named volume supply_chain_uploads).
 const SUPPLY_CHAIN_UPLOAD_PATH = process.env.SUPPLY_CHAIN_UPLOAD_PATH || '/data/supply-chain-uploads'
@@ -46,8 +47,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     }
     return NextResponse.json({ files })
   } catch (error) {
-    console.error('Error listing Supply-Chain uploads:', error)
-    return NextResponse.json({ error: 'Failed to list files' }, { status: 500 })
+    return internalError(error, 'Failed to list files', { log: 'Error listing Supply-Chain uploads' })
   }
 }
 
@@ -128,17 +128,15 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     } catch (err) {
       const code = (err as { code?: string })?.code
       if (code !== 'P2025') {
-        console.error('Uploaded SBOM but failed to record it as the scan input:', err)
-        return NextResponse.json(
-          { error: 'File saved but could not be set as the scan input. Try again.' },
-          { status: 500 })
+        return internalError(err, 'File saved but could not be set as the scan input. Try again.', {
+          log: 'Uploaded SBOM but failed to record it as the scan input',
+        })
       }
     }
 
     return NextResponse.json({ success: true, filename, replaced, projectUpdatedAt })
   } catch (error) {
-    console.error('Error uploading SBOM:', error)
-    return NextResponse.json({ error: 'Failed to upload file' }, { status: 500 })
+    return internalError(error, 'Failed to upload file', { log: 'Error uploading SBOM' })
   }
 }
 
@@ -157,7 +155,10 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     const projectDir = path.join(SUPPLY_CHAIN_UPLOAD_PATH, projectId)
     const filePath = path.join(projectDir, filename)
-    if (existsSync(filePath)) await unlink(filePath)
+    if (existsSync(filePath)) {
+      // Gone between the check and the unlink is the state the caller asked for.
+      await unlink(filePath).catch((err: NodeJS.ErrnoException) => { if (err?.code !== 'ENOENT') throw err })
+    }
     let projectUpdatedAt: Date | null = null
     try {
       const current = await prisma.project.findUnique({ where: { id: projectId }, select: { supplyChainSbomFile: true } })
@@ -171,9 +172,18 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
         })
         projectUpdatedAt = updated.updatedAt
       }
-    } catch { /* skip */ }
+    } catch (err) {
+      // The file is gone but the project may still name it as the scan input,
+      // so a Start would fail on a missing file: that is not a success. A row
+      // deleted meanwhile (P2025) has no input left to clear.
+      if ((err as { code?: string })?.code !== 'P2025') {
+        return internalError(err, 'File removed but could not be cleared as the scan input. Try again.', {
+          log: 'Deleted SBOM but failed to clear it as the scan input',
+        })
+      }
+    }
     return NextResponse.json({ success: true, projectUpdatedAt })
   } catch (error) {
-    return NextResponse.json({ error: 'Failed to delete file' }, { status: 500 })
+    return internalError(error, 'Failed to delete file', { log: 'Error deleting Supply-Chain upload' })
   }
 }

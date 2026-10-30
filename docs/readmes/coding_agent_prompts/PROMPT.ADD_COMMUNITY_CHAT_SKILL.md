@@ -64,7 +64,7 @@ Key differences from Agent Skills:
 - **YAML frontmatter is required** for a good UX. [skill_loader.py:29-50](../../../agentic/orchestrator_helpers/skill_loader.py) parses `---`-delimited frontmatter. Without it, `name` falls back to `file_stem.replace("_", " ").title()` and `description` is empty.
 - **The skill ID is the path under `agentic/skills/` WITHOUT the extension**, with `/` as separator. `agentic/skills/active_directory/ad_kill_chain.md` has ID `active_directory/ad_kill_chain`. This is what `/skill <name>` matches against (partial, case-insensitive match via the frontend autocomplete at [InputArea.tsx](../../../webapp/src/app/graph/components/AIAssistantDrawer/InputArea.tsx)).
 - **Path traversal is blocked.** `load_skill_content()` at [skill_loader.py:95-118](../../../agentic/orchestrator_helpers/skill_loader.py) resolves the path and refuses anything outside the skills directory.
-- **Content size cap is 50 KB.** Enforced at the chat-skills POST route, same as agent skills.
+- **Content size cap is 500 KB** (`MAX_CHAT_SKILL_CONTENT_SIZE` in [webapp/src/lib/userSkills.ts](../../../webapp/src/lib/userSkills.ts)), enforced by the chat-skills POST, PUT and community-import routes.
 - **Max 50 skills per user.** If importing a large catalog, communicate the cap.
 - **No Prisma migration needed.** `UserChatSkill` already exists at [webapp/prisma/schema.prisma:941-954](../../../webapp/prisma/schema.prisma).
 - **No em dashes anywhere.** Use hyphens or rephrase. Enforced project-wide.
@@ -230,7 +230,7 @@ No rebuild. The file is live as soon as you save it (`./agentic/skills` is volum
 | `/skill <name>` does not match | The autocomplete does partial, case-insensitive match on the skill's `name` field (not the ID). If the `name` frontmatter differs from the filename, use the `name` |
 | Skill appears in Global Settings but not in chat picker | The chat picker fetches `GET /api/users/:id/chat-skills` on drawer mount. Refresh the page |
 | Import from Community returns `total: 0` | webapp cannot reach `AGENT_API_URL` (check webapp env + `docker compose logs webapp`) |
-| "Too large" error | Content exceeds 50 KB |
+| "Too large" error | Content exceeds 500 KB |
 | "Maximum of 50 skills" error | User is at cap |
 
 ### Re-importing when you update a shipped skill
@@ -250,7 +250,7 @@ Flag this to the user when shipping a skill update.
 - [ ] YAML frontmatter with `name:` and `description:` on lines 1-4 (opened and closed with `---`)
 - [ ] Content is reference-style (flags, tables, patterns), not a phase-structured workflow
 - [ ] Commands reference real agent tools when relevant
-- [ ] File is under 50 KB
+- [ ] File is under 500 KB
 - [ ] No em dashes anywhere
 - [ ] (Optional, if shipping publicly) [redamon.wiki/Chat-Skills.md](../../../redamon.wiki/Chat-Skills.md) catalog table updated
 - [ ] `GET /skills` returns the new entry with correct `name`, `description`, `category` (no rebuild, directory is volume-mounted)

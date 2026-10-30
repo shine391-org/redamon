@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { parseAuthProfileInput, toAuthProfileMetadata } from '@/lib/authProfile'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -19,12 +20,16 @@ async function authorize(id: string) {
 }
 
 export async function GET(_request: NextRequest, { params }: RouteParams) {
-  const { id } = await params
-  const denied = await authorize(id)
-  if (denied instanceof NextResponse) return denied
+  try {
+    const { id } = await params
+    const denied = await authorize(id)
+    if (denied instanceof NextResponse) return denied
 
-  const profile = await prisma.projectAuthProfile.findUnique({ where: { projectId: id } })
-  return NextResponse.json({ authProfile: toAuthProfileMetadata(profile) })
+    const profile = await prisma.projectAuthProfile.findUnique({ where: { projectId: id } })
+    return NextResponse.json({ authProfile: toAuthProfileMetadata(profile) })
+  } catch (error) {
+    return internalError(error, 'Failed to load auth profile')
+  }
 }
 
 export async function PUT(request: NextRequest, { params }: RouteParams) {
@@ -64,16 +69,19 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ authProfile: toAuthProfileMetadata(profile) })
   } catch (error) {
-    console.error('Failed to save auth profile:', error)
-    return NextResponse.json({ error: 'Failed to save auth profile' }, { status: 500 })
+    return internalError(error, 'Failed to save auth profile')
   }
 }
 
 export async function DELETE(_request: NextRequest, { params }: RouteParams) {
-  const { id } = await params
-  const denied = await authorize(id)
-  if (denied instanceof NextResponse) return denied
+  try {
+    const { id } = await params
+    const denied = await authorize(id)
+    if (denied instanceof NextResponse) return denied
 
-  await prisma.projectAuthProfile.deleteMany({ where: { projectId: id } })
-  return NextResponse.json({ authProfile: null })
+    await prisma.projectAuthProfile.deleteMany({ where: { projectId: id } })
+    return NextResponse.json({ authProfile: null })
+  } catch (error) {
+    return internalError(error, 'Failed to delete auth profile')
+  }
 }

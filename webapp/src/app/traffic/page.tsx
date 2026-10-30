@@ -10,6 +10,7 @@ import { TrafficCaptureStatus } from '@/components/traffic/TrafficCaptureStatus'
 import { TrafficMindSettingsModal } from '@/components/traffic/TrafficMindSettingsModal'
 import { isHttpUrl } from '@/lib/url-utils'
 import { copyText } from '@/lib/copyText'
+import { errorMessage } from '@/lib/apiError'
 import {
   useTrafficList,
   useTrafficFacets,
@@ -104,7 +105,7 @@ export default function TrafficPage() {
       const r = await del.mutateAsync({ ids: [...selected] })
       setSelected(new Set())
       toast.success(`Deleted ${r.deleted} transaction(s)`)
-    } catch { toast.error('Delete failed') }
+    } catch (err) { toast.error(errorMessage(err, 'Delete failed')) }
   }, [selected, dangerConfirm, del, toast])
 
   const handleDeleteAllMatching = useCallback(async () => {
@@ -114,7 +115,7 @@ export default function TrafficPage() {
       const r = await del.mutateAsync({ filter: trafficFilterPayload(filters) })
       setSelected(new Set())
       toast.success(`Deleted ${r.deleted} transaction(s)`)
-    } catch { toast.error('Delete failed') }
+    } catch (err) { toast.error(errorMessage(err, 'Delete failed')) }
   }, [filters, dangerConfirm, del, toast])
 
   // Any filter change resets to the first page.
@@ -295,6 +296,11 @@ export default function TrafficPage() {
             Clear ({activeFilterCount})
           </button>
         )}
+        {facets.isError && (
+          <span className={styles.facetsError} role="status">
+            Filter options unavailable: {errorMessage(facets.error, 'Failed to load facets')}
+          </span>
+        )}
       </div>
 
       {/* Table */}
@@ -397,7 +403,12 @@ export default function TrafficPage() {
         </table>
 
         {list.isLoading && <div className={styles.loading}>Loading…</div>}
-        {!list.isLoading && rows.length === 0 && (
+        {list.isError && (
+          <div className={styles.listError} role="alert">
+            Could not load traffic: {errorMessage(list.error, 'Failed to list traffic')}
+          </div>
+        )}
+        {!list.isLoading && !list.isError && rows.length === 0 && (
           <div className={styles.empty}>
             No captured traffic yet. Enable capture on the project and run a recon scan.
           </div>
@@ -428,6 +439,11 @@ export default function TrafficPage() {
         title="Transaction detail"
       >
         {detail.isLoading && <div className={styles.loading}>Loading…</div>}
+        {detail.isError && (
+          <div className={styles.listError} role="alert">
+            Could not load this transaction: {errorMessage(detail.error, 'Failed to load transaction')}
+          </div>
+        )}
         {detail.data && (
           <div className={styles.detail}>
             <div className={styles.detailSection}>

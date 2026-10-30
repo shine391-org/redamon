@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   audit: [] as Record<string, unknown>[],
   stageError: null as Error | null,
   commitError: null as Error | null,
+  healthError: null as Error | null,
 }))
 vi.mock('@/lib/prisma', () => ({ default: new Proxy({}, { get: (_t, k) => h.db[k as string] }) }))
 vi.mock('@/lib/audit', () => ({ writeAudit: vi.fn(async (e: Record<string, unknown>) => void h.audit.push(e)) }))
@@ -27,6 +28,16 @@ vi.mock('./installChecks', async (orig) => {
     checkAndStage: async (...a: Parameters<typeof m.checkAndStage>) => {
       if (h.stageError) throw h.stageError
       return m.checkAndStage(...a)
+    },
+  }
+})
+vi.mock('./runnerClient', async (orig) => {
+  const m = (await orig()) as typeof import('./runnerClient')
+  return {
+    ...m,
+    runnerHealth: async (...a: Parameters<typeof m.runnerHealth>) => {
+      if (h.healthError) throw h.healthError
+      return m.runnerHealth(...a)
     },
   }
 })
@@ -57,6 +68,7 @@ beforeEach(async () => {
   h.audit = []
   h.stageError = null
   h.commitError = null
+  h.healthError = null
   setNowForTests(() => NOW)
   for (const m of ['warn', 'error', 'log'] as const) vi.spyOn(console, m).mockImplementation(() => {})
   db.seed('user', [{ id: ADMIN, email: 'admin@example.com', role: 'admin' }])
@@ -128,6 +140,36 @@ describe('a failure before the commit ends the operation at once', () => {
     expect([e.status, e.code]).toEqual([500, 'install_failed'])
     expect(row()).toMatchObject({ status: 'available', operationId: null })
     expect(await exists(versionPath('echo', '1.0.0'))).toBe(false)
+  })
+})
+
+describe("a failure's own text never reaches the answer", () => {
+  test('an error before the commit is named by its code, not its message (a path, a query)', async () => {
+    h.commitError = Object.assign(new Error('EACCES: permission denied, rename /data/plugins/echo/.staging/op-1'), { code: 'EACCES' })
+    const e = await refusal(installEcho())
+    expect(e.message).toBe('The install failed before it was committed (EACCES).')
+    expect(String(row().lastError)).not.toContain('/data/plugins')
+  })
+})
+
+describe('a failure after the commit says the operation took effect', () => {
+  const poolTimeout = () => Object.assign(new Error('Timed out fetching a connection: SELECT * FROM "PluginInstall"'), { name: 'PrismaClientKnownRequestError', code: 'P2024' })
+
+  test('install: 500 with committed, never reported as a failed install', async () => {
+    h.healthError = poolTimeout()
+    const e = await refusal(installEcho())
+    expect(e).toMatchObject({ status: 500, code: 'P2024', extra: { committed: true } })
+    expect(e.message).toBe('The install of echo 1.0.0 took effect, but a step after it failed (P2024); the page shows its state now. The webapp log has the details.')
+    expect(row()).toMatchObject({ activeVersion: '1.0.0' })
+  })
+
+  test('update: the same', async () => {
+    await installEcho()
+    h.healthError = poolTimeout()
+    const e = await refusal(updateEcho('1.0.1'))
+    expect(e).toMatchObject({ status: 500, code: 'P2024', extra: { committed: true } })
+    expect(e.message).toMatch(/^The update of echo to 1\.0\.1 took effect/)
+    expect(row()).toMatchObject({ activeVersion: '1.0.1' })
   })
 })
 

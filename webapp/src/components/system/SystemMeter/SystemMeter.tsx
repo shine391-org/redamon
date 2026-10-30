@@ -26,8 +26,15 @@ function Meter({ label, pct, value, detail, tone }: { label: string; pct: number
  * which subtracts memory reserved by running scans) is in the tooltip.
  */
 export function SystemMeter() {
-  const { data } = useSystemStats()
-  if (!data?.mem) return null
+  const { data, error } = useSystemStats()
+  if (!data?.mem) {
+    // Say the stats are missing and why, instead of the meters just vanishing.
+    return error ? (
+      <div className={styles.wrap} title={error.message} aria-label={error.message} role="status">
+        <span className={styles.label}>RAM/CPU unavailable</span>
+      </div>
+    ) : null
+  }
 
   const m = data.mem
   const total = m.host_total || 1

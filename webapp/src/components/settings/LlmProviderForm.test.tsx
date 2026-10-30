@@ -137,8 +137,23 @@ describe('LlmProviderForm save errors', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Enable reasoning effort' }))
     fireEvent.click(screen.getByRole('button', { name: 'Update Provider' }))
 
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith('User not found. Log out and back in.'))
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith('User not found. Log out and back in. (HTTP 404)'))
     expect(onSave).not.toHaveBeenCalled()
+  })
+
+  test('a server failure shows its code beside the route\'s sentence', async () => {
+    mockFetch({
+      provider: {
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'Failed to update LLM provider', code: 'P2000' }),
+      },
+    })
+    render(<LlmProviderForm userId="user-1" provider={PROVIDER} onSave={vi.fn()} onCancel={vi.fn()} />)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable reasoning effort' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Update Provider' }))
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to update LLM provider (P2000 · HTTP 500)'))
   })
 
   test('a non-JSON error body still yields a message with the status code', async () => {
@@ -146,6 +161,8 @@ describe('LlmProviderForm save errors', () => {
       provider: {
         ok: false,
         status: 502,
+        // A proxy's error page, as nginx sends it while the webapp restarts.
+        text: async () => '<html><body>502 Bad Gateway</body></html>',
         json: async () => { throw new SyntaxError('Unexpected token <') },
       },
     })
@@ -156,7 +173,67 @@ describe('LlmProviderForm save errors', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Enable reasoning effort' }))
     fireEvent.click(screen.getByRole('button', { name: 'Update Provider' }))
 
-    await waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to save provider (HTTP 502)'))
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to save provider (non_json_response · HTTP 502)'))
+  })
+})
+
+describe('LlmProviderForm Test Connection failures', () => {
+  beforeEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    toastSuccess.mockReset()
+    toastError.mockReset()
+  })
+  afterEach(cleanup)
+
+  async function runTest() {
+    render(<LlmProviderForm userId="user-1" provider={PROVIDER} onSave={vi.fn()} onCancel={vi.fn()} />)
+    const button = screen.getByRole('button', { name: 'Test Connection' })
+    await waitFor(() => expect(button).toBeEnabled())
+    fireEvent.click(button)
+  }
+
+  test('the agent failing (not the provider) shows the route\'s code and both statuses', async () => {
+    mockFetch({
+      provider: {
+        ok: false,
+        status: 502,
+        json: async () => ({
+          success: false, error: 'The agent could not test this provider', code: 'agent_error', upstreamStatus: 401,
+        }),
+      },
+    })
+    await runTest()
+    expect(await screen.findByText('The agent could not test this provider (agent_error · HTTP 502 · upstream HTTP 401)'))
+      .toBeInTheDocument()
+  })
+
+  test('a non-JSON answer names its status instead of a SyntaxError', async () => {
+    mockFetch({
+      provider: {
+        ok: false,
+        status: 504,
+        text: async () => '<html>504 Gateway Time-out</html>',
+        json: async () => { throw new SyntaxError('Unexpected token <') },
+      },
+    })
+    await runTest()
+    expect(await screen.findByText('The provider test failed (non_json_response · HTTP 504)')).toBeInTheDocument()
+    expect(screen.queryByText(/SyntaxError/)).not.toBeInTheDocument()
+  })
+
+  test('a test the agent ran keeps the provider\'s own answer', async () => {
+    mockFetch({
+      provider: { ok: true, status: 200, json: async () => ({ success: false, error: 'Error code: 401 - invalid api key' }) },
+    })
+    await runTest()
+    expect(await screen.findByText('Error code: 401 - invalid api key')).toBeInTheDocument()
+  })
+
+  test('a failed test with no reason still says it failed', async () => {
+    mockFetch({ provider: { ok: true, status: 200, json: async () => ({ success: false }) } })
+    await runTest()
+    expect(await screen.findByText('The provider test failed')).toBeInTheDocument()
   })
 })
 

@@ -3,6 +3,7 @@ import prisma from '@/lib/prisma'
 import { hashPassword, verifyPassword } from '@/lib/auth'
 import { getSession } from '@/lib/session'
 import { writeAudit } from '@/lib/audit'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -93,10 +94,6 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true, revokedMcpTokens: revoked.count })
   } catch (error) {
-    console.error('Failed to change password:', error)
-    return NextResponse.json(
-      { error: 'Failed to change password' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to change password')
   }
 }

@@ -578,17 +578,19 @@ ENTRYPOINT ["/opt/entrypoint.sh"]
 # device mapped in via compose + the container's existing NET_ADMIN), agents
 # staged for Linux/Windows footholds. Verified against the project's own
 # checksums file at build time.
-RUN cd /tmp \
+RUN arch=$(dpkg --print-architecture) \
+    && windows_arch=amd64 \
+    && cd /tmp \
     && retry curl -fsSL -O https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_0.9.2_checksums.txt \
-       -O https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_proxy_0.9.2_linux_amd64.tar.gz \
-       -O https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_agent_0.9.2_windows_amd64.zip \
-       -O https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_agent_0.9.2_linux_amd64.tar.gz \
-    && grep -E "(proxy_0.9.2_linux_amd64|agent_0.9.2_(windows|linux)_amd64)" ligolo-ng_0.9.2_checksums.txt | sha256sum -c - \
-    && tar xzf ligolo-ng_proxy_0.9.2_linux_amd64.tar.gz proxy \
+       -O "https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_proxy_0.9.2_linux_${arch}.tar.gz" \
+       -O "https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_agent_0.9.2_windows_${windows_arch}.zip" \
+       -O "https://github.com/nicocha30/ligolo-ng/releases/download/v0.9.2/ligolo-ng_agent_0.9.2_linux_${arch}.tar.gz" \
+    && grep -E "(proxy_0.9.2_linux_${arch}|agent_0.9.2_windows_${windows_arch}|agent_0.9.2_linux_${arch})" ligolo-ng_0.9.2_checksums.txt | sha256sum -c - \
+    && tar xzf "ligolo-ng_proxy_0.9.2_linux_${arch}.tar.gz" proxy \
     && install -m755 proxy /usr/local/bin/ligolo-proxy \
-    && tar xzf ligolo-ng_agent_0.9.2_linux_amd64.tar.gz agent \
+    && tar xzf "ligolo-ng_agent_0.9.2_linux_${arch}.tar.gz" agent \
     && install -m755 agent /opt/tools/linux/ligolo-agent \
-    && unzip -o -q ligolo-ng_agent_0.9.2_windows_amd64.zip -d /tmp/wagent \
+    && unzip -o -q "ligolo-ng_agent_0.9.2_windows_${windows_arch}.zip" -d /tmp/wagent \
     && install -m755 /tmp/wagent/agent.exe /opt/tools/windows/ligolo-agent.exe \
     && rm -rf /tmp/*
 

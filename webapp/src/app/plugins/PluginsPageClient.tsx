@@ -12,10 +12,32 @@ import { PluginNavLinks } from '@/components/plugins/PluginNavLinks'
 import { RunnerStatusBanner } from '@/components/plugins/RunnerStatusBanner'
 import { UninstallDialog } from '@/components/plugins/UninstallDialog'
 import { PluginApiError, usePluginAction, usePluginsPage } from '@/hooks/usePlugins'
+import { errorMessage } from '@/lib/apiError'
 import type { PluginEntry } from '@/lib/plugins/pageModel'
 import styles from './page.module.css'
 
 const CATALOG_REPO_URL = 'https://github.com/samugit83/redamon-plugins'
+// The install checks' details derive from the plugin's manifest: a few, each already capped.
+const DETAILS_SHOWN = 5
+
+/**
+ * The alert for a failed lifecycle call. Only a JSON 4xx is a refusal: with no answer, or a
+ * proxy's page instead of ours, the operation may still finish (reconcile reclaims its
+ * lease), and one that says `committed` took effect.
+ */
+export function operationFailure(err: PluginApiError): { title: string; message: string } {
+  const details = err.details?.length ? `\n${err.details.slice(0, DETAILS_SHOWN).map((d) => `• ${d}`).join('\n')}` : ''
+  if (err.body?.committed === true) return { title: 'The plugin operation took effect, with an error', message: err.message }
+  const unread = err.status === 0 || err.code === 'non_json_response' || err.code === 'empty_response'
+  if (unread && err.status !== 413) {
+    return {
+      title: 'The outcome of the plugin operation is unknown',
+      message: `${err.message}\nIt may still be running; the page refreshes to show its state.`,
+    }
+  }
+  if (err.status >= 500) return { title: 'The plugin operation failed', message: `${err.message}${details}` }
+  return { title: 'The plugin operation was refused', message: `${err.message}${details}` }
+}
 
 type Dialog =
   | { kind: 'install'; entry: PluginEntry; restoreCount: number }
@@ -25,7 +47,7 @@ type Dialog =
   | null
 
 export function PluginsPageClient() {
-  const { data, isLoading, isError, refetch } = usePluginsPage()
+  const { data, isLoading, isError, error, refetch } = usePluginsPage()
   const action = usePluginAction()
   const { confirm, alertError } = useAlertModal()
   const [dialog, setDialog] = useState<Dialog>(null)
@@ -35,13 +57,14 @@ export function PluginsPageClient() {
     try {
       return await action.mutateAsync({ path, body, form })
     } catch (e) {
-      const err = e as PluginApiError
+      const err = e instanceof PluginApiError ? e : new PluginApiError(errorMessage(e, 'The plugin operation failed'), 'client_error', 0)
       // A reinstall that finds approved versions: ask, then try again with the answer.
       if (err.code === 'restore_choice_required' && (dialog?.kind === 'install' || dialog?.kind === 'offline')) {
         setDialog({ ...dialog, restoreCount: Number(err.details?.[0] ?? 1) })
         return null
       }
-      await alertError(err.message, 'The plugin operation was refused')
+      const { title, message } = operationFailure(err)
+      await alertError(message, title)
       return null
     }
   }
@@ -91,6 +114,7 @@ export function PluginsPageClient() {
         <div className="alert alertError">
           <div className="alertContent">
             <div className="alertTitle">The Plugins page could not be loaded.</div>
+            {error && <div className="alertMessage">{errorMessage(error, 'The Plugins page could not be loaded')}</div>}
             <button type="button" className="secondaryButton" onClick={() => refetch()}>
               Try again
             </button>

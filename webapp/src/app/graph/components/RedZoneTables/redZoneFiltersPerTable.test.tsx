@@ -34,6 +34,7 @@ import { SharedInfraTable } from './SharedInfraTable'
 import { TakeoverTable } from './TakeoverTable'
 import { ThreatIntelTable } from './ThreatIntelTable'
 import { WebCachePoisonTable } from './WebCachePoisonTable'
+import { RouteExposureTable } from './RouteExposureTable'
 import { WebInitAccessTable } from './WebInitAccessTable'
 import { AiSurfaceTable, AiRiskTable } from './AiTables'
 import { SupplyChainScaTable } from './SupplyChainScaTable'
@@ -89,6 +90,7 @@ const CASES: Case[] = [
   { name: 'Kill Chain', Component: KillChainTable, endpoint: 'killChain', scope: 'redzone:killChain', header: 'Subdomain', key: 'subdomain' },
   { name: 'Net Initial Access', Component: NetInitAccessTable, endpoint: 'netInitAccess', scope: 'redzone:netInitAccess', header: 'IP', key: 'ipAddress' },
   { name: 'Param Matrix', Component: ParamMatrixTable, endpoint: 'paramMatrix', scope: 'redzone:paramMatrix', header: 'Parameter', key: 'paramName' },
+  { name: 'Route Exposure', Component: RouteExposureTable, endpoint: 'routeExposure', scope: 'redzone:routeExposure', header: 'Path', key: 'path' },
   { name: 'Secrets', Component: SecretsTable, endpoint: 'secrets', scope: 'redzone:secrets', header: 'Origin', key: 'origin' },
   { name: 'Shared Infra', Component: SharedInfraTable, endpoint: 'sharedInfra', scope: 'redzone:sharedInfra', header: 'Type', key: 'clusterType' },
   { name: 'Takeover', Component: TakeoverTable, endpoint: 'takeover', scope: 'redzone:takeover', header: 'Hostname', key: 'hostname',

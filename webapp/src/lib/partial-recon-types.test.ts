@@ -114,6 +114,10 @@ describe('PARTIAL_RECON_SUPPORTED_TOOLS', () => {
     expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('WebCachePoison')).toBe(true)
   })
 
+  test('contains RouteExposure', () => {
+    expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('RouteExposure')).toBe(true)
+  })
+
   test('contains EndpointAiClassifier', () => {
     expect(PARTIAL_RECON_SUPPORTED_TOOLS.has('EndpointAiClassifier')).toBe(true)
   })

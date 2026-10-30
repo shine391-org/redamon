@@ -10,6 +10,8 @@ interface ApprovalDialogProps {
   approvalRequest: ApprovalRequestPayload | null
   modificationText: string
   isLoading: boolean
+  /** False while the socket is down: a decision then could not reach the agent. */
+  isConnected?: boolean
   setModificationText: (v: string) => void
   handleApproval: (decision: 'approve' | 'modify' | 'abort') => void
 }
@@ -19,10 +21,12 @@ export function ApprovalDialog({
   approvalRequest,
   modificationText,
   isLoading,
+  isConnected = true,
   setModificationText,
   handleApproval,
 }: ApprovalDialogProps) {
   if (!awaitingApproval || !approvalRequest) return null
+  const blocked = isLoading || !isConnected
 
   return (
     <div className={styles.approvalDialog}>
@@ -78,25 +82,30 @@ export function ApprovalDialog({
           onChange={(e) => setModificationText(e.target.value)}
         />
       </div>
+      {!isConnected && (
+        <p className={styles.decisionNotConnected} role="status">
+          Not connected to the agent: your decision cannot be sent until the connection is back.
+        </p>
+      )}
       <div className={styles.approvalActions}>
         <button
           className={`${styles.approvalButton} ${styles.approvalButtonApprove}`}
           onClick={() => handleApproval('approve')}
-          disabled={isLoading}
+          disabled={blocked}
         >
           Approve
         </button>
         <button
           className={`${styles.approvalButton} ${styles.approvalButtonModify}`}
           onClick={() => handleApproval('modify')}
-          disabled={isLoading || !modificationText.trim()}
+          disabled={blocked || !modificationText.trim()}
         >
           Modify
         </button>
         <button
           className={`${styles.approvalButton} ${styles.approvalButtonAbort}`}
           onClick={() => handleApproval('abort')}
-          disabled={isLoading}
+          disabled={blocked}
         >
           Abort
         </button>

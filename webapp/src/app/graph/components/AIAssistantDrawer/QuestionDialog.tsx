@@ -15,6 +15,8 @@ interface QuestionDialogProps {
   answerText: string
   selectedOptions: string[]
   isLoading: boolean
+  /** False while the socket is down: an answer then could not reach the agent. */
+  isConnected?: boolean
   setAnswerText: (v: string) => void
   setSelectedOptions: (v: string[]) => void
   handleAnswer: () => void
@@ -26,6 +28,7 @@ export function QuestionDialog({
   answerText,
   selectedOptions,
   isLoading,
+  isConnected = true,
   setAnswerText,
   setSelectedOptions,
   handleAnswer,
@@ -123,11 +126,16 @@ export function QuestionDialog({
           </div>
         )}
       </div>
+      {!isConnected && (
+        <p className={styles.decisionNotConnected} role="status">
+          Not connected to the agent: your answer cannot be sent until the connection is back.
+        </p>
+      )}
       <div className={styles.questionActions}>
         <button
           className={`${styles.answerButton} ${styles.answerButtonSubmit}`}
           onClick={handleAnswer}
-          disabled={isLoading || (questionRequest.format === 'text' ? !answerText.trim() : selectedOptions.length === 0)}
+          disabled={isLoading || !isConnected || (questionRequest.format === 'text' ? !answerText.trim() : selectedOptions.length === 0)}
         >
           Submit Answer
         </button>

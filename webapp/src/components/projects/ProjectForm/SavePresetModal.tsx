@@ -5,6 +5,7 @@ import { Loader2 } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { extractPresetSettings, PRESET_FIELD_KEYS } from '@/lib/project-preset-utils'
 import { useToast, WikiInfoButton } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './ProjectForm.module.css'
 
 interface SavePresetModalProps {
@@ -45,15 +46,12 @@ export function SavePresetModal({ isOpen, onClose, formData, userId }: SavePrese
         body: JSON.stringify({ userId, name, description, settings }),
       })
 
-      if (!res.ok) {
-        const data = await res.json()
-        throw new Error(data.error || 'Failed to save preset')
-      }
+      if (!res.ok) throw await readApiError(res, 'Failed to save preset')
 
       toast.success(`Preset "${name.trim()}" saved`, 'Preset Saved')
       onClose()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to save preset')
+      toast.error(toApiError(error, 'Failed to save preset').message)
     } finally {
       setIsSaving(false)
     }

@@ -4,7 +4,7 @@ import { ownsScope } from './changeSetAccess'
 import { skillDisplayName } from './overrideOps'
 import * as ov from './overrides'
 import { dormantReason, findInstall, type DormantReason } from './registry'
-import { SkillPartsRegistryError, clearSkillPartsCache, registrySkill } from './skillPartsRegistry'
+import { SkillPartsRegistryError, clearSkillPartsCache, registryFailureText, registrySkill } from './skillPartsRegistry'
 
 /**
  * What the core versions modal shows for one built-in skill (design §6 SkillVersionsModal):
@@ -47,6 +47,8 @@ export interface VersionsModel {
   /** Factory text per part now, for the read-only "View" diff; null if the agent can't answer. */
   factoryText: Record<string, string> | null
   registryError: 'agent_unreachable' | 'agent_outdated' | null
+  /** With a registryError: why, in words (the agent's HTTP status, or the errno of no answer). */
+  registryErrorText?: string
   scopes: ScopeVersions[]
 }
 
@@ -113,13 +115,16 @@ export async function buildVersionsModel(effectiveUserId: string, group: string,
 
   let factoryText: Record<string, string> | null = null
   let registryError: VersionsModel['registryError'] = null
+  let registryErrorText: string | null = null
   try {
     clearSkillPartsCache()
     const skill = await registrySkill(group)
     factoryText = skill ? Object.fromEntries(skill.parts.map((p) => [p.partId, p.text])) : null
   } catch (e) {
-    if (e instanceof SkillPartsRegistryError && (e.code === 'agent_unreachable' || e.code === 'agent_outdated')) registryError = e.code
-    else throw e
+    if (e instanceof SkillPartsRegistryError && (e.code === 'agent_unreachable' || e.code === 'agent_outdated')) {
+      registryError = e.code
+      registryErrorText = registryFailureText(e)
+    } else throw e
   }
 
   const env = { agentSupportsSeam: registryError !== 'agent_outdated' }
@@ -129,5 +134,12 @@ export async function buildVersionsModel(effectiveUserId: string, group: string,
     scopes.push(await scopeVersions({ type: 'project', id: projectId }, group, env, names))
   }
 
-  return { skillId: group, skillDisplayName: skillDisplayName(group), factoryText, registryError, scopes }
+  return {
+    skillId: group,
+    skillDisplayName: skillDisplayName(group),
+    factoryText,
+    registryError,
+    ...(registryErrorText ? { registryErrorText } : {}),
+    scopes,
+  }
 }

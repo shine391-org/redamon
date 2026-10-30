@@ -12,6 +12,7 @@ import {
   type ModelsByProvider,
 } from '@/components/shared/FeatureModelGate'
 import { getDisplayName } from '@/app/graph/components/AIAssistantDrawer/modelUtils'
+import { ApiError, fetchJson, formatApiError, toApiError } from '@/lib/apiError'
 import { LLM_FEATURES, isPluginFeatureId, modelAllowedForFeature, type PluginFeatureId } from '@/lib/llmFeatures'
 import styles from './FeatureModelsSection.module.css'
 
@@ -31,20 +32,21 @@ interface PluginFeature {
   description: string
 }
 
-// A failed list means no plugin tile and nothing else changes; the core features never
-// wait on it.
-async function fetchPluginFeatures(): Promise<PluginFeature[]> {
+const PLUGINS_FAILED = 'Plugin items could not be loaded'
+
+// A failed list means no plugin tile and a one-line notice; the core features never wait
+// on it.
+async function fetchPluginFeatures(): Promise<{ features: PluginFeature[]; error: ApiError | null }> {
   try {
-    const res = await fetch('/api/plugins/llm-features', { cache: 'no-store' })
-    if (!res.ok) return []
-    const data: unknown = await res.json()
-    if (!Array.isArray(data)) return []
-    return data.filter(
+    const data = await fetchJson<unknown>('/api/plugins/llm-features', { cache: 'no-store' }, PLUGINS_FAILED)
+    if (!Array.isArray(data)) return { features: [], error: null }
+    const features = data.filter(
       (f): f is PluginFeature =>
         !!f && isPluginFeatureId(f.featureId) && typeof f.label === 'string' && typeof f.description === 'string',
     )
-  } catch {
-    return []
+    return { features, error: null }
+  } catch (err) {
+    return { features: [], error: toApiError(err, PLUGINS_FAILED) }
   }
 }
 
@@ -75,25 +77,37 @@ export function FeatureModelsSection({ userId, providersCount, providersLoading 
   const toast = useToast()
   const [saved, setSaved] = useState<Record<string, string>>({})
   const [savedState, setSavedState] = useState<LoadState>('loading')
+  const [savedError, setSavedError] = useState<ApiError | null>(null)
   const [models, setModels] = useState<ModelsByProvider>({})
   const [modelsState, setModelsState] = useState<LoadState>('loading')
+  const [modelsError, setModelsError] = useState<ApiError | null>(null)
   const [savingId, setSavingId] = useState<string | null>(null)
   const [plugins, setPlugins] = useState<PluginFeature[]>([])
+  const [pluginsError, setPluginsError] = useState<ApiError | null>(null)
+  const [pluginsGeneration, setPluginsGeneration] = useState(0)
   const noProviders = !providersLoading && providersCount === 0
 
   useEffect(() => {
     if (!userId) return
     let live = true
-    void fetchPluginFeatures().then(list => { if (live) setPlugins(list) })
+    void fetchPluginFeatures().then(({ features, error }) => {
+      if (!live) return
+      setPlugins(features)
+      setPluginsError(error)
+    })
     return () => { live = false }
-  }, [userId])
+  }, [userId, pluginsGeneration])
 
   useEffect(() => {
     if (!userId) return
     let live = true
     fetchSavedFeatureModels(userId)
       .then(map => { if (live) { setSaved(map); setSavedState('ready') } })
-      .catch(() => { if (live) setSavedState('error') })
+      .catch(err => {
+        if (!live) return
+        setSavedError(toApiError(err, 'Could not read your settings'))
+        setSavedState('error')
+      })
     return () => { live = false }
   }, [userId])
 
@@ -103,7 +117,8 @@ export function FeatureModelsSection({ userId, providersCount, providersLoading 
     try {
       setModels(await fetchModelOptions(userId))
       setModelsState('ready')
-    } catch {
+    } catch (err) {
+      setModelsError(toApiError(err, 'Failed to load models'))
       setModelsState('error')
     }
   }, [userId])
@@ -173,7 +188,15 @@ export function FeatureModelsSection({ userId, providersCount, providersLoading 
       ) : (
         <>
           {savedState === 'error' && (
-            <div className={styles.notice} role="alert">Couldn&apos;t read your saved models. Reload the page to try again.</div>
+            <div className={styles.notice} role="alert">
+              {savedError ? formatApiError({ ...savedError, reason: "Couldn't read your saved models" }) : "Couldn't read your saved models"}.
+              {' '}Reload the page to try again.
+            </div>
+          )}
+          {modelsState === 'error' && modelsError && (
+            <div className={styles.notice} role="alert">
+              {formatApiError({ ...modelsError, reason: "Couldn't load your models" })}. Retry on any feature below.
+            </div>
           )}
           <div className={styles.grid}>
             {tiles.map(feature => {
@@ -239,6 +262,14 @@ export function FeatureModelsSection({ userId, providersCount, providersLoading 
               )
             })}
           </div>
+          {pluginsError && (
+            <div className={styles.notice} role="alert">
+              {formatApiError({ ...pluginsError, reason: PLUGINS_FAILED })} ·{' '}
+              <button type="button" className="textButton" onClick={() => setPluginsGeneration(g => g + 1)}>
+                <RotateCw size={11} /> Retry
+              </button>
+            </div>
+          )}
         </>
       )}
     </section>

@@ -318,10 +318,31 @@ describe('POST /api/users/[id]/llm-providers - the one-token rule holds under co
     expect(res.status).toBe(500)
   })
 
+  test('a database failure answers its Prisma code, never the message', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockGetSession.mockResolvedValue({ userId: 'victim', role: 'user' })
+    mockCreate.mockRejectedValue(Object.assign(new Error('value too long for column "apiKey" = sk-live'), { code: 'P2000' }))
+    const res = await POST(postReq('victim', NEW_PROVIDER), params('victim'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to create LLM provider', code: 'P2000' })
+  })
+
   test('a chat provider pays for no transaction', async () => {
     mockGetSession.mockResolvedValue({ userId: 'victim', role: 'user' })
     const res = await POST(postReq('victim', NEW_PROVIDER), params('victim'))
     expect(res.status).toBe(201)
     expect(mockTransaction).not.toHaveBeenCalled()
+  })
+})
+
+describe('GET /api/users/[id]/llm-providers — failure', () => {
+  test('a database failure answers its code, so the list says why it is empty', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockGetSession.mockResolvedValue({ userId: 'victim', role: 'user' })
+    mockIsInternal.mockReturnValue(false)
+    mockFindMany.mockRejectedValue(Object.assign(new Error("Can't reach database server at db:5432"), { code: 'P1001' }))
+    const res = await GET(req('http://x/api/users/victim/llm-providers'), params('victim'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to fetch LLM providers', code: 'P1001' })
   })
 })

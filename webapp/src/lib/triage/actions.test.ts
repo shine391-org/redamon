@@ -161,6 +161,34 @@ describe('recordVerdict', () => {
   })
 })
 
+describe('what a failure reports (G-8)', () => {
+  test('an agent failure carries the agent status, code and class, never its text', async () => {
+    h.fetch.mockResolvedValueOnce(answer({
+      error: 'The triage operation failed. The details are in the agent log.',
+      code: 'internal_error', error_class: 'ServiceUnavailable',
+    }, 500))
+    const err = await refusal(listFindings(T, { channel: 'app' }))
+    expect(err.code).toBe('agent_failed')
+    expect(err.message).toBe('The findings service failed.')
+    expect(err.details).toEqual({ upstreamStatus: 500, agentCode: 'internal_error', errorClass: 'ServiceUnavailable' })
+  })
+
+  test('a deployment without INTERNAL_API_KEY keeps the agent sentence that says what to do', async () => {
+    const text = 'INTERNAL_API_KEY is not configured; triage operations are disabled. Generate the secret via redamon.sh.'
+    h.fetch.mockResolvedValueOnce(answer({ error: text, code: 'not_configured' }, 503))
+    const err = await refusal(listFindings(T, { channel: 'app' }))
+    expect(err.message).toBe(text)
+    expect(err.details).toMatchObject({ upstreamStatus: 503, agentCode: 'not_configured' })
+  })
+
+  test('an unreachable agent names the errno', async () => {
+    h.fetch.mockRejectedValueOnce(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }))
+    const err = await refusal(listFindings(T, { channel: 'app' }))
+    expect(err.code).toBe('agent_unreachable')
+    expect(err.details).toEqual({ cause: 'ECONNREFUSED' })
+  })
+})
+
 describe('submitReview', () => {
   const input = {
     findingId: 'v1', evidenceHash: 'a'.repeat(40), verdict: 'doubtful',

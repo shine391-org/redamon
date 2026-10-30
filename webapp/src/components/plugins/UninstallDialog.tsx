@@ -2,6 +2,8 @@
 
 import { useState } from 'react'
 import { Modal } from '@/components/ui'
+import { errorMessage } from '@/lib/apiError'
+import { downloadPluginExport } from './exportDownload'
 import styles from './plugins.module.css'
 
 interface UninstallDialogProps {
@@ -24,7 +26,23 @@ export function UninstallDialog({ isOpen, pluginId, pluginName, busy = false, ke
   // Mounted when it opens, so "keep" is selected and nothing is typed each time.
   const [mode, setMode] = useState<'keep' | 'purge'>(keptOnly ? 'purge' : 'keep')
   const [exported, setExported] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
   const [typed, setTyped] = useState('')
+
+  // Only an export that really downloaded counts: the server refuses a purge without one.
+  const exportData = async () => {
+    setExporting(true)
+    setExportError(null)
+    try {
+      await downloadPluginExport(pluginId)
+      setExported(true)
+    } catch (e) {
+      setExportError(errorMessage(e, 'The export could not be downloaded'))
+    } finally {
+      setExporting(false)
+    }
+  }
 
   const ready = mode === 'keep' || (exported && typed === pluginId)
   return (
@@ -77,9 +95,14 @@ export function UninstallDialog({ isOpen, pluginId, pluginName, busy = false, ke
       )}
       {mode === 'purge' && (
         <div className={styles.choice}>
-          <a href={`/api/plugins/${pluginId}/export`} download onClick={() => setExported(true)} className="textButton">
-            Download the export of its data first
-          </a>
+          <button type="button" className="textButton" onClick={() => void exportData()} disabled={exporting}>
+            {exported ? 'Export downloaded; download it again' : 'Download the export of its data first'}
+          </button>
+          {exportError && (
+            <span className={styles.error} role="alert">
+              {exportError}
+            </span>
+          )}
           <span className="formHint">Text that plugins proposed for people&apos;s own skills is not included.</span>
           <label className="formLabel" htmlFor="uninstall-confirm">
             Type {pluginId} to confirm

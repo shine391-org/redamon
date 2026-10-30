@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess, ownerScope } from '@/lib/access'
 
 // GET /api/traffic/[projectId]/facets - distinct values for the filter dropdowns
@@ -56,7 +57,6 @@ export async function GET(
       sessions: sessions.map(s => s.sessionId).filter(Boolean),
     })
   } catch (error) {
-    console.error('Failed to load traffic facets:', error)
-    return NextResponse.json({ error: 'Failed to load facets' }, { status: 500 })
+    return internalError(error, 'Failed to load facets', { log: 'Failed to load traffic facets' })
   }
 }

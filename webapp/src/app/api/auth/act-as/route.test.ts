@@ -113,3 +113,23 @@ describe('DELETE /api/auth/act-as', () => {
     expect(res.headers.get('set-cookie') || '').toMatch(/Max-Age=0/i)
   })
 })
+
+describe('act-as — a failure inside the handler', () => {
+  test('POST answers a sentence and a code instead of an empty-bodied 500', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockRequireAdmin.mockResolvedValue({ userId: 'admin-1', role: 'admin' })
+    mockUserFindUnique.mockRejectedValue(Object.assign(new Error("Can't reach database server"), { code: 'P1001' }))
+    const res = await POST(req({ targetUserId: 'user-X' }))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not switch user', code: 'P1001' })
+  })
+
+  test('DELETE answers a sentence and a code too', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockRequireAdmin.mockResolvedValue({ userId: 'admin-1', role: 'admin' })
+    mockWriteActAsAudit.mockRejectedValueOnce(Object.assign(new Error('Timed out'), { code: 'P2024' }))
+    const res = await DELETE(new NextRequest('http://localhost:3000/api/auth/act-as', { method: 'DELETE' }))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not stop switching user', code: 'P2024' })
+  })
+})

@@ -7,6 +7,7 @@ import { type ProjectRoots, admitsPartialHost } from '@/lib/partialReconScope'
 import { type ScopeGroup, groupLabel } from '@/lib/scopeGroups'
 import { isValidDomain } from '@/lib/validation'
 import { announceProjectWrite } from '@/lib/projectVersion'
+import { errorMessage, fetchJson, formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import type { GraphInputs, PartialReconParams, UserTargets } from '@/lib/recon-types'
 import { useOpenApiSourceLabels } from '@/hooks/useOpenApiSourceLabels'
 import { publicDocumentUrl, type OpenApiSourceRow } from '@/lib/openapiSourceStatus'
@@ -27,6 +28,8 @@ interface PartialReconModalProps {
   userId?: string
   /** OpenAPI: the project's configured documents, listed with their last status. */
   openapiSources?: unknown
+  /** IP mode only: the project's addresses, the only hosts a typed URL may name. */
+  ipTargets?: string[] | null
 }
 
 // --- API key requirements per tool ---
@@ -82,6 +85,12 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
     'BinaryFormatter / ViewState, Ruby Marshal, Hessian). It never deserializes and sends no traffic of its own. ' +
     'Targets are loaded from the graph (BaseURLs + Endpoints). You can also provide custom URLs below. ' +
     'Each hit is merged as an info-severity Vulnerability candidate (source=serialized_scan) the agent confirms out of band.',
+  RouteExposure:
+    'Requests the routes in the graph (BaseURLs + Endpoints) and routes it generates (internal, admin and ' +
+    'debug paths, .git and .env files, backup copies, older API versions), without credentials and, where ' +
+    'your authentication profile covers the host, logged in. GET and HEAD only; state-changing paths are never ' +
+    'requested. You can also provide custom URLs below. Results are merged as Vulnerability nodes ' +
+    '(source=route_exposure): leads the agent confirms, and findings a signature proves.',
   SubdomainDiscovery:
     'Discovers subdomains using 5 tools in parallel (crt.sh, HackerTarget, Subfinder, Amass, Knockpy), ' +
     'filters wildcards with Puredns, then resolves full DNS records (A, AAAA, MX, NS, TXT, SOA, CNAME) for each. ' +
@@ -300,12 +309,19 @@ function describeScope(scope: ProjectRoots): string {
 
 // A typed host must pass the same rule the orchestrator and the recon container
 // apply (§4.6): strictly under an enumerated scan root, one of a listed group's
-// hosts, or a scan root itself only when Root is on.
-function validateUrl(value: string, scope: ProjectRoots): string | null {
+// hosts, or a scan root itself only when Root is on. In IP mode the run's root is
+// the `ip-targets.<id>` placeholder, so the rule is theirs for IP mode instead:
+// the host is one of the project's addresses (filter_partial_user_input).
+function validateUrl(value: string, scope: ProjectRoots, ipTargets: ReadonlySet<string> | null): string | null {
   try {
     const url = new URL(value)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return `URL must use http or https: ${value}`
     if (!url.hostname) return `URL has no hostname: ${value}`
+    if (ipTargets) {
+      // URL keeps an IPv6 host's brackets; the server's urlsplit drops them.
+      const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+      return ipTargets.has(host) ? null : `${host} is not one of this project's target IPs`
+    }
     if (scope.roots.length && !admitsPartialHost(scope, url.hostname)) {
       return `${url.hostname} is out of scope for this run (${describeScope(scope)})`
     }
@@ -403,11 +419,14 @@ export function PartialReconModal({
   isStarting = false,
   userId,
   openapiSources,
+  ipTargets,
 }: PartialReconModalProps) {
   const [graphInputs, setGraphInputs] = useState<GraphInputs | null>(null)
   // The saved project's scope groups: what the orchestrator judges typed input by.
   const [scopeGroups, setScopeGroups] = useState<ScopeGroup[] | null>(null)
   const [loadingInputs, setLoadingInputs] = useState(false)
+  // Set when the graph could not be read: the counts are then unknown, not zero.
+  const [graphReadError, setGraphReadError] = useState<string | null>(null)
   const [userSettings, setUserSettings] = useState<Record<string, string> | null>(null)
   const [customSubdomains, setCustomSubdomains] = useState('')
   const [customIps, setCustomIps] = useState('')
@@ -469,14 +488,20 @@ export function PartialReconModal({
       .then(res => (res.ok ? res.json() : null))
       .then(project => setScopeGroups(Array.isArray(project?.scopeGroups) ? project.scopeGroups : null))
       .catch(() => setScopeGroups(null))
-    fetch(`/api/recon/${projectId}/graph-inputs/${toolId}`)
-      .then(res => res.ok ? res.json() : null)
-      .then((data: GraphInputs | null) => {
+    setGraphReadError(null)
+    fetchJson<(GraphInputs & { degraded?: string; code?: string }) | null>(
+      `/api/recon/${projectId}/graph-inputs/${toolId}`, undefined, 'Could not read the graph',
+    )
+      .then((data) => {
         setGraphInputs(data || fallback)
+        if (data?.degraded === 'graph_unavailable') {
+          setGraphReadError(formatApiError({ reason: 'Could not read the graph', code: data.code, status: 0 }))
+        }
         setLoadingInputs(false)
       })
-      .catch(() => {
+      .catch((err) => {
         setGraphInputs(fallback)
+        setGraphReadError(errorMessage(err, 'Could not read the graph'))
         setLoadingInputs(false)
       })
     // Fetch existing uploaded JS files for JsRecon
@@ -507,8 +532,7 @@ export function PartialReconModal({
       formData.append('file', file)
       const res = await fetch(`/api/js-recon/${projectId}/upload`, { method: 'POST', body: formData })
       if (!res.ok) {
-        const data = await res.json()
-        setUploadError(data.error || 'Upload failed')
+        setUploadError((await readApiError(res, 'Upload failed')).message)
         return
       }
       announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
@@ -517,8 +541,8 @@ export function PartialReconModal({
         const data = await listRes.json()
         setUploadedJsFiles(data.files || [])
       }
-    } catch {
-      setUploadError('Upload failed')
+    } catch (err) {
+      setUploadError(toApiError(err, 'Upload failed').message)
     } finally {
       setIsUploading(false)
       if (jsFileInputRef.current) jsFileInputRef.current.value = ''
@@ -527,15 +551,19 @@ export function PartialReconModal({
 
   const handleJsFileDelete = useCallback(async (filename: string) => {
     if (!projectId) return
+    setUploadError(null)
     try {
       const res = await fetch(`/api/js-recon/${projectId}/upload?name=${encodeURIComponent(filename)}`, { method: 'DELETE' })
       if (res.ok) announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
+      else setUploadError((await readApiError(res, 'Could not delete the file')).message)
       const listRes = await fetch(`/api/js-recon/${projectId}/upload`)
       if (listRes.ok) {
         const data = await listRes.json()
         setUploadedJsFiles(data.files || [])
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      setUploadError(toApiError(err, 'Could not delete the file').message)
+    }
   }, [projectId])
 
   // The roots this run covers. A route that predates multi-root runs sent only `domain`.
@@ -595,15 +623,16 @@ export function PartialReconModal({
   const isVhostSni = toolId === 'VhostSni'
   const isWebCachePoison = toolId === 'WebCachePoison'
   const isSerializedScan = toolId === 'SerializedScan'
+  const isRouteExposure = toolId === 'RouteExposure'
   const isOriginDiscovery = toolId === 'OriginDiscovery'
-  const hasUserInputs = isPortScanner || isNmap || isTlsx || isHttpx || isResourceEnum || isArjun || isGau || isParamSpider || isSecurityChecks || isShodan || isOsintEnrichment || isGraphql || isSubdomainTakeover || isVhostSni || isWebCachePoison || isSerializedScan || isOriginDiscovery
+  const hasUserInputs = isPortScanner || isNmap || isTlsx || isHttpx || isResourceEnum || isArjun || isGau || isParamSpider || isSecurityChecks || isShodan || isOsintEnrichment || isGraphql || isSubdomainTakeover || isVhostSni || isWebCachePoison || isSerializedScan || isRouteExposure || isOriginDiscovery
   const hasIpInput = isPortScanner || isNmap || isTlsx || isHttpx || isSecurityChecks || isShodan || isOsintEnrichment || isVhostSni
   const hasSubdomainInput = toolId === 'Naabu' || isHttpx || isGau || isParamSpider || isSecurityChecks || isSubdomainTakeover || isVhostSni || isOriginDiscovery
   const hasPortInput = isNmap || isTlsx || isHttpx
   // GraphqlScan / WebCachePoison SECTION_INPUT_MAP = [BaseURL, Endpoint]. Per
   // PROMPT.ADD_PARTIAL_RECON.md, BaseURL-accepting tools get a URL textarea;
   // Endpoint is graph-only (never manually entered).
-  const hasUrlInput = isResourceEnum || isArjun || isSecurityChecks || isGraphql || isWebCachePoison || isSerializedScan
+  const hasUrlInput = isResourceEnum || isArjun || isSecurityChecks || isGraphql || isWebCachePoison || isSerializedScan || isRouteExposure
 
   // Subdomain validation
   const subdomainValidation = useMemo(
@@ -624,9 +653,13 @@ export function PartialReconModal({
   )
 
   // URL validation (resource enum tools: Katana, Hakrawler) -- must be in project scope
+  const ipTargetSet = useMemo(
+    () => ipTargets ? new Set(ipTargets.map(ip => ip.trim().toLowerCase())) : null,
+    [ipTargets],
+  )
   const urlValidation = useMemo(
-    () => validateLines(customUrls, v => validateUrl(v, partialScope)),
-    [customUrls, partialScope],
+    () => validateLines(customUrls, v => validateUrl(v, partialScope, ipTargetSet)),
+    [customUrls, partialScope, ipTargetSet],
   )
 
   const hasValidationErrors = (hasSubdomainInput && subdomainValidation.errors.length > 0)
@@ -748,6 +781,7 @@ export function PartialReconModal({
     || (isGraphql && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0)
     || (isWebCachePoison && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0)
     || (isSerializedScan && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0)
+    || (isRouteExposure && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0)
     || (toolId === 'ZapAjaxSpider' && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0)
     || (isResourceEnum && !isNuclei && toolId !== 'JsRecon' && toolId !== 'ZapAjaxSpider' && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0)
     || (isArjun && !loadingInputs && (graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0)
@@ -765,6 +799,7 @@ export function PartialReconModal({
   const resourceEnumNoUrls = isResourceEnum && !includeGraphTargets && !customUrls.trim() && !hasJsUploads
   const webCachePoisonNoUrls = isWebCachePoison && !includeGraphTargets && !customUrls.trim()
   const serializedScanNoUrls = isSerializedScan && !includeGraphTargets && !customUrls.trim()
+  const routeExposureNoUrls = isRouteExposure && !includeGraphTargets && !customUrls.trim()
   const zapAjaxSpiderNoUrls = toolId === 'ZapAjaxSpider' && !loadingInputs && !customUrls.trim() && (!includeGraphTargets || ((graphInputs?.existing_baseurls_count ?? 0) === 0 && (graphInputs?.existing_endpoints_count ?? 0) === 0))
   const arjunNoUrls = isArjun && !includeGraphTargets && !customUrls.trim()
   const securityChecksNoUrls = isSecurityChecks && !includeGraphTargets && !customUrls.trim() && !customSubdomains.trim() && !customIps.trim()
@@ -789,6 +824,8 @@ export function PartialReconModal({
     : isWebCachePoison
     ? `(${graphInputs?.existing_baseurls_count ?? 0} BaseURLs, ${graphInputs?.existing_endpoints_count ?? 0} Endpoints)`
     : isSerializedScan
+    ? `(${graphInputs?.existing_baseurls_count ?? 0} BaseURLs, ${graphInputs?.existing_endpoints_count ?? 0} Endpoints)`
+    : isRouteExposure
     ? `(${graphInputs?.existing_baseurls_count ?? 0} BaseURLs, ${graphInputs?.existing_endpoints_count ?? 0} Endpoints)`
     : isResourceEnum
     ? `(${graphInputs?.existing_baseurls_count ?? 0} BaseURLs)`
@@ -899,6 +936,11 @@ export function PartialReconModal({
             partial recon is off until then.
           </div>
         )}
+        {!loadingInputs && graphReadError && (
+          <div style={legacyGraphStyle} role="alert" data-testid="partial-recon-graph-unreadable">
+            {graphReadError}. The graph counts below are unknown, not zero.
+          </div>
+        )}
         {!loadingInputs && staleDomains.length > 0 && (
           <div style={noteStyle} data-testid="partial-recon-stale">
             <strong>{staleDomains.join(', ')}</strong>: no longer a scan root of this project, not scanned; the next full recon removes {staleDomains.length === 1 ? 'it' : 'them'}.
@@ -965,7 +1007,7 @@ export function PartialReconModal({
         )}
 
         {/* No targets warning */}
-        {hasNoGraphTargets && includeGraphTargets && hasNoCustomTargets && (
+        {hasNoGraphTargets && includeGraphTargets && hasNoCustomTargets && !graphReadError && (
           <div style={{
             fontSize: '11px', color: '#facc15', lineHeight: '1.5', padding: '8px 12px', borderRadius: '6px',
             backgroundColor: 'rgba(234, 179, 8, 0.08)', border: '1px solid rgba(234, 179, 8, 0.2)',
@@ -984,6 +1026,8 @@ export function PartialReconModal({
               ? 'No BaseURLs found in graph. Run HTTP Probing (Httpx) first to discover live URLs, or provide custom URLs below.'
               : isArjun
               ? 'No BaseURLs or Endpoints found in graph. Run Resource Enumeration (Katana/Hakrawler) first, or provide custom URLs below.'
+              : isRouteExposure
+              ? 'No BaseURLs or Endpoints found in graph. Run HTTP Probing (Httpx) and Resource Enumeration first, or provide custom URLs below.'
               : isSecurityChecks
               ? 'No IPs, subdomains, or BaseURLs found in graph. Run Subdomain Discovery and HTTP Probing first to populate the graph.'
               : toolId === 'Shodan'
@@ -1067,6 +1111,14 @@ export function PartialReconModal({
             backgroundColor: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.2)',
           }}>
             The serialized object scan reads targets from the graph. Provide custom URLs below or enable graph targets (existing BaseURLs + Endpoints from crawling).
+          </div>
+        )}
+        {routeExposureNoUrls && !noTargetsToScan && (
+          <div style={{
+            fontSize: '11px', color: '#f87171', lineHeight: '1.5', padding: '8px 12px', borderRadius: '6px',
+            backgroundColor: 'rgba(239, 68, 68, 0.08)', border: '1px solid rgba(239, 68, 68, 0.2)',
+          }}>
+            Route Exposure needs routes to request. Provide custom URLs below or enable graph targets (existing BaseURLs + Endpoints from crawling).
           </div>
         )}
         {securityChecksNoUrls && !noTargetsToScan && (
@@ -1258,6 +1310,8 @@ export function PartialReconModal({
                 ? 'GraphQL endpoint URLs (e.g. /graphql, /api/graphql). Bypasses auto-discovery and tests these directly via introspection + graphql-cop checks.'
                 : isWebCachePoison
                 ? 'Full URLs (http/https) to test for cache poisoning. Only cacheable URLs are probed; tests use benign canaries in isolated cache buckets.'
+                : isRouteExposure
+                ? 'Full URLs (http/https). Each is requested with GET, without credentials and logged in, together with the routes generated next to it.'
                 : 'Full URLs (http/https). Will be crawled to discover endpoints and parameters.'}</div>
             )}
 
@@ -1456,14 +1510,14 @@ export function PartialReconModal({
           <button
             type="button"
             onClick={handleRun}
-            disabled={!runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || ipAttributionNoIps || originDiscoveryNoFronted || oldModelGraph}
+            disabled={!runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || routeExposureNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || ipAttributionNoIps || originDiscoveryNoFronted || oldModelGraph}
             style={{
               padding: '8px 16px', borderRadius: '6px', border: 'none',
               backgroundColor: '#3b82f6', color: '#fff',
-              cursor: !runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || originDiscoveryNoFronted || oldModelGraph ? 'not-allowed' : 'pointer',
+              cursor: !runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || routeExposureNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || originDiscoveryNoFronted || oldModelGraph ? 'not-allowed' : 'pointer',
               fontSize: '13px',
               display: 'flex', alignItems: 'center', gap: '6px',
-              opacity: !runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || originDiscoveryNoFronted || oldModelGraph ? 0.5 : 1,
+              opacity: !runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || routeExposureNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || originDiscoveryNoFronted || oldModelGraph ? 0.5 : 1,
             }}
           >
             {isStarting ? <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> : <Play size={14} />}

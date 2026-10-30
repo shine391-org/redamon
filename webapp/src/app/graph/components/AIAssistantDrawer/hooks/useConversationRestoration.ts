@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import type { Conversation } from '@/hooks/useConversations'
+import { ApiError } from '@/lib/apiError'
 import type { TodoItem } from '@/lib/websocket-types'
 import type { ChatItem, Message, FileDownloadItem, Phase } from '../types'
 import type { ThinkingItem, ToolExecutionItem, PlanWaveItem, DeepThinkItem, FireteamItem } from '../AgentTimeline'
@@ -8,12 +9,17 @@ import { foldLatsRestoreMarkers } from './latsChatState'
 import { reconcileTimeline } from './timelineReconcile'
 import { settleRunningTools } from './toolCardState'
 import { saveProjectSession, getProjectSession } from '../sessionMemory'
+import { agentErrorText } from './agentErrorText'
 
 interface ConversationRestorationDeps {
   // From useConversations
   loadConversation: (id: string) => Promise<any>
-  deleteConversation: (id: string) => Promise<void>
-  fetchConversations: () => Promise<Conversation[] | undefined>
+  /** False when the delete failed: the chat on screen is then kept. */
+  deleteConversation: (id: string) => Promise<boolean | void>
+  /** The ApiError when the list could not be read. */
+  fetchConversations: () => Promise<Conversation[] | ApiError | undefined>
+  /** Shows a failure the person would otherwise not see (a toast). */
+  notifyError?: (message: string) => void
   // Props
   onSwitchSession?: (sessionId: string) => void
   onRefetchGraph?: () => void
@@ -63,7 +69,7 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
     awaitingApprovalRef, awaitingQuestionRef, awaitingToolConfirmationRef,
     pendingApprovalToolId, pendingApprovalWaveId,
     setActiveSkill, updateConvMeta,
-    handleNewChat,
+    handleNewChat, notifyError,
   } = deps
 
   const [conversationId, setConversationId] = useState<string | null>(null)
@@ -287,7 +293,7 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
           id: msg.id,
           role: 'assistant',
           content: 'An error occurred while processing your request.',
-          error: data.message,
+          error: agentErrorText(data),
           timestamp: new Date(msg.createdAt),
         } as Message
       } else if (msg.type === 'task_complete') {
@@ -1076,7 +1082,9 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
   }, [handleNewChat])
 
   const handleDeleteConversation = useCallback(async (id: string) => {
-    await deleteConversation(id)
+    // A failed delete leaves the conversation in place; clearing the chat would
+    // only hide it until the next poll brings it back.
+    if ((await deleteConversation(id)) === false) return
     onRefetchGraph?.()
     if (id === conversationId) {
       pendingResyncConvRef.current = null
@@ -1092,6 +1100,9 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
     const savedId = getProjectSession(projectId)
     if (savedId) {
       const list = await fetchConversations()
+      if (list instanceof ApiError) {
+        notifyError?.(`Could not reopen your last session: ${list.message}`)
+      }
       const match = Array.isArray(list) ? list.find((c) => c.id === savedId) : undefined
       if (match) {
         await handleSelectConversation(match)
@@ -1099,7 +1110,7 @@ export function useConversationRestoration(deps: ConversationRestorationDeps) {
       }
     }
     handleNewChat()
-  }, [projectId, fetchConversations, handleSelectConversation, handleNewChat])
+  }, [projectId, fetchConversations, handleSelectConversation, handleNewChat, notifyError])
 
   return {
     conversationId,

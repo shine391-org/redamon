@@ -72,6 +72,16 @@ describe('the version marker', () => {
     expect(out.status).toBe(502)
     expect(out.body.code).toBeUndefined()
     expect(out.body.error).toBe('The agent failed while handling this request. The details are in the agent log.')
+    expect(out.body.upstreamStatus).toBe(500)
+  })
+
+  test("a proxy's HTML 504 in front of the agent keeps its own status, told apart from a crash", async () => {
+    mockAgentFetch.mockResolvedValue(new Response('<html>504 Gateway Time-out</html>', { status: 504 }))
+    const out = await codeOf(await callFeatureAgent(CALL))
+    expect(out).toEqual({
+      status: 502,
+      body: { error: 'The agent failed while handling this request. The details are in the agent log.', upstreamStatus: 504 },
+    })
   })
 
   test('a 401 is a key mismatch, not outdated', async () => {
@@ -80,6 +90,7 @@ describe('the version marker', () => {
     expect(out.status).toBe(502)
     expect(out.body.code).toBeUndefined()
     expect(out.body.error).toContain('INTERNAL_API_KEY')
+    expect(out.body.upstreamStatus).toBe(401)
   })
 
   test('a 429 is a rate limit, not outdated', async () => {
@@ -94,6 +105,7 @@ describe('the version marker', () => {
     const out = await codeOf(await callFeatureAgent(CALL))
     expect(out.status).toBe(502)
     expect(out.body.code).toBeUndefined()
+    expect(out.body.upstreamStatus).toBe(422)
   })
 
   test('a 404 is outdated only when the endpoint itself is new', async () => {
@@ -141,6 +153,22 @@ describe('coded answers', () => {
     const out = await codeOf(await callFeatureAgent(CALL))
     expect(out).toMatchObject({ status: 502, body: { error: 'The model call failed. Try again in a moment.' } })
     expect(out.body.code).toBeUndefined()
+  })
+
+  test("the provider's class and status reach the client, on the coded and the uncoded path", async () => {
+    answer(503, { code: 'model_unavailable', error: 'x', model_used: 'gpt-5', error_class: 'AuthenticationError', provider_status: 401 })
+    expect((await codeOf(await callFeatureAgent(CALL))).body)
+      .toMatchObject({ code: 'model_unavailable', errorClass: 'AuthenticationError', providerStatus: 401 })
+    answer(502, { error: 'The model call failed.', model_used: 'gpt-5', error_class: 'RateLimitError', provider_status: 429 })
+    expect((await codeOf(await callFeatureAgent(CALL))).body)
+      .toEqual({ error: 'The model call failed.', errorClass: 'RateLimitError', providerStatus: 429 })
+  })
+
+  test('provider facts that are not a class name and an HTTP status are dropped', async () => {
+    answer(502, { error: 'x', model_used: 'gpt-5', error_class: 'sk-live <b>', provider_status: 7 })
+    const body = (await codeOf(await callFeatureAgent(CALL))).body
+    expect(body.errorClass).toBeUndefined()
+    expect(body.providerStatus).toBeUndefined()
   })
 })
 

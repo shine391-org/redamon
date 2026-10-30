@@ -2655,12 +2655,16 @@ _prompt_and_create_admin() {
             exit 1
         fi
     else
-        read -rp "  Admin name: " a_name </dev/tty
-        read -rp "  Admin email: " a_email </dev/tty
+        # -e on every prompt (issue #210): readline turns an arrow key, pressed
+        # early or to fix a typo, into line editing. Without it the raw escape
+        # bytes land in the value, and an email or a password holding them
+        # never matches at the browser login.
+        read -erp "  Admin name: " a_name </dev/tty
+        read -erp "  Admin email: " a_email </dev/tty
         while true; do
-            read -srp "  Admin password: " a_pass </dev/tty
+            read -esrp "  Admin password: " a_pass </dev/tty
             echo ""
-            read -srp "  Confirm password: " a_pass2 </dev/tty
+            read -esrp "  Confirm password: " a_pass2 </dev/tty
             echo ""
             if [[ "$a_pass" != "$a_pass2" ]]; then
                 warn "Passwords do not match. Try again."
@@ -2724,10 +2728,10 @@ cmd_create_admin() {
 
 cmd_reset_password() {
     echo ""
-    read -rp "  User email: " EMAIL </dev/tty
-    read -srp "  New password: " NEW_PASS </dev/tty
+    read -erp "  User email: " EMAIL </dev/tty
+    read -esrp "  New password: " NEW_PASS </dev/tty
     echo ""
-    read -srp "  Confirm password: " CONFIRM </dev/tty
+    read -esrp "  Confirm password: " CONFIRM </dev/tty
     echo ""
 
     if [[ "$NEW_PASS" != "$CONFIRM" ]]; then
@@ -3185,7 +3189,7 @@ _kb_choose_profile() {
     echo "==========================================================" >&2
     echo ""                                                            >&2
 
-    read -rp "  Run full ingestion now? [y/N] " full_ingest </dev/tty
+    read -erp "  Run full ingestion now? [y/N] " full_ingest </dev/tty
 
     if [[ "$full_ingest" =~ ^[Yy]$ ]]; then
         info "Full ingestion selected. This will take a while..." >&2
@@ -4431,7 +4435,7 @@ cmd_clean() {
     warn "This will remove all RedAmon containers and images."
     warn "Your data (databases, reports, scan results) will be preserved in Docker volumes."
     echo ""
-    read -rp "Continue? [y/N] " confirm
+    read -erp "Continue? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         info "Cancelled."
         return
@@ -4461,7 +4465,7 @@ cmd_purge() {
     echo ""
     echo -e "${RED}${BOLD}This action cannot be undone.${NC}"
     echo ""
-    read -rp "Type 'yes' to confirm: " confirm
+    read -erp "Type 'yes' to confirm: " confirm
     if [[ "$confirm" != "yes" ]]; then
         info "Cancelled."
         return

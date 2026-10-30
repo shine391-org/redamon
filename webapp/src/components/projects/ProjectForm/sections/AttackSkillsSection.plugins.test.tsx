@@ -123,6 +123,33 @@ describe('chips and controls', () => {
   })
 })
 
+describe('a failed load', () => {
+  test('says why the plugin versions are missing and retries on request', async () => {
+    let summaryCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('/overrides/summary')) {
+        summaryCalls++
+        return new Response(JSON.stringify({ error: 'The plugin operation failed', code: 'P1001' }), { status: 500 })
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    }))
+    const updateField = vi.fn()
+    const data = { attackSkillConfig: { builtIn: { ssrf: true }, user: {} }, hydraEnabled: false } as unknown as FormData
+    render(
+      <ToastProvider>
+        <AlertProvider>
+          <AttackSkillsSection data={data} updateField={updateField} projectId="p1" />
+        </AlertProvider>
+      </ToastProvider>,
+    )
+    const note = await screen.findByText(/P1001 · HTTP 500/)
+    expect(note.closest('[role="alert"]')).not.toBeNull()
+    const before = summaryCalls
+    fireEvent.click(within(note.closest('[role="alert"]') as HTMLElement).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(summaryCalls).toBeGreaterThan(before))
+  })
+})
+
 describe('create mode', () => {
   test('no plugin controls without a projectId (create mode)', async () => {
     h.summary = summaryWith(APPLIED)
