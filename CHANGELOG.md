@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.5.1] - 2026-11-01
+
+Three agent features that never ran now do: the downgrade note, the RoE timing warnings and the end-of-task message.
+
+JS Recon runs TruffleHog beside its own secret rules, on by default for new projects, and reports fewer false secrets.
+
+### Added
+
+- **Four JS Recon secret rules:** AWS session keys (`ASIA…`), Stripe webhook signing secrets (`whsec_…`), credentials in a URL (`scheme://user:password@host`; placeholder passwords stay silent) and JDBC URLs that carry a password.
+- **JS Recon runs TruffleHog beside its own rules** (on by default for new projects; JS Recon, Key Validation, "TruffleHog"). TruffleHog 3.96.0 scans local copies of the JavaScript JS Recon analyses (bundles, source-map originals, uploads) in a hardened container with no network, or with only its own bridge when key validation is on; it never fetches from the target. One finding per key: a key both engines find keeps JS Recon's identity (mutes and verdicts stay attached) and is marked "also found by TruffleHog"; a key only TruffleHog finds is a new Secret (`detection_method: trufflehog`), located in its file, its context masked. TruffleHog checks a key with its provider only when key validation is on, and only ever confirms one: its "could not confirm" is `unknown`, never `rejected`. Detectors whose check would connect to a host named in the JavaScript, or send the key to a third party, never run (33 of them, reviewed for this version). A run that did not complete is named in the host's coverage reason and keeps its own earlier findings. The JS Recon table shows Detection, Line and the other names a key matched; the Red Zone labels TruffleHog rows; the Priority Board evidence says who found a key. `./redamon.sh purge` also removes the sidecar's leftover copies. Where TruffleHog ran, Travis CI Token reports only the tokens TruffleHog confirmed (it fired on clean library code; TruffleHog detects 99.5% of real-format tokens); with TruffleHog off or failed it reports as before. JS Recon's own key validators all stay: they are the only source of `rejected`, and the Firebase and Google Maps checks test what a key opens.
+  - **Existing projects keep it off.** `./redamon.sh update` adds the setting switched off to every project that already exists (the webapp adds the column before its schema push), and only projects created afterwards start with it on. To turn it on for every project that runs JS Recon: `UPDATE projects SET js_recon_trufflehog_enabled = true WHERE js_recon_enabled = true;`
+  - **Upgrade.** `./redamon.sh update` rebuilds `webapp`, `agent`, the docker broker and the recon, vuln-scanner and GitHub hunter images, and restarts `recon-orchestrator`. The engine runs `redamon-trufflehog:latest`, the Secret Multiscanner's image; if it is missing, `./redamon.sh up` builds it.
+
+### Changed
+
+- **A Rules of Engagement document can only turn JS Recon key validation off.** Validation sends every key JS Recon (and, when on, TruffleHog) finds to its provider; a document may forbid that, never require it, and turning it back on by hand counts as relaxing a safety control (during an RoE replace it pauses enabled schedules, and a third-party engagement needs authorization).
+
+### Fixed
+
+- **The agent learns when its progress claim is downgraded.** When the model counted a step as progress but the output was empty or a repeat, the verdict was downgraded and the reason saved for the next turn's prompt, but it never got there. It now does, for the agent and for fireteam members. Rebuild `agent`.
+- **RoE timing warnings reach the agent.** Outside the engagement dates or the testing window, the agent is meant to be told so, and told not to test once the engagement has ended; the warning never reached its prompt, which showed the dates but not that they had passed. It now does, checked on every message instead of only the first of a session, so a session that runs past its window or its end date is warned too. Rebuild `agent`.
+- **The chat says when a task is complete.** The `task_complete` event was never sent, so the closing message, the last graph refresh and the transcript's completion entry were missing. Rebuild `agent`.
+- **A test catches the next one.** All three were values LangGraph drops without an error because the agent's state schema did not declare them (one was also written into a copy of the state). A unit test now checks every key an agent node writes against its graph's schema, and flags a node that writes into its own input.
+- **JS Recon reports fewer false secrets.** A generic `apiKey` / `token` / `secret` / `password` match that holds a provider's key is that provider's finding, not a second one (its name moves to the provider finding's alternate names). A `BEGIN … PRIVATE KEY` marker reports only with key data after it, so library templates and parser branches no longer read as critical keys; a certificate is info; a `YC…` webpack chunk id is a Yandex AWS key only with "yandex" just before it; `re_` and `dapi` inside an identifier or a hash are no Resend or Databricks key; a generic match whose value is a bare UUID is low. The GitHub secret hunter applies the same key-data and keyword checks. Surviving findings keep their ids, so mutes, verdicts and fix items stay attached; the findings that disappear are removed at the next scan, and muted or judged ones are kept as stale.
+  - **Upgrade.** Rebuild the GitHub hunter image: `./redamon.sh update`.
+
 ## [7.5.0] - 2026-10-29
 
 Route exposure findings the agent can confirm, skills up to 500 KB, and errors that say why.

@@ -1,4 +1,4 @@
-# PRIVATE INVENTORY — fix/internal-v7.5.0-integration
+# PRIVATE INVENTORY — fix/internal-v7.5.1-integration
 
 File này là checklist sync upstream. Không push nhánh chứa file này lên repo công khai.
 
@@ -33,3 +33,7 @@ docker-compose.kali-local.yml, docker-compose.yml.bak.* (.git/info/exclude đã 
 
 ## Sau này (V2 / Đợt 5)
 implant_* MCP, aitm engine, RoE engine v2, audit hook — cập nhật section này khi thêm.
+
+## Tích hợp upstream 7.5.1
+- Thêm JS Recon TruffleHog và các sửa state agent theo upstream `b13da9cb`; giữ nguyên patch riêng.
+- Sinh lại settings registry từ YAML đã merge; giữ test upstream xác nhận Plugins không còn badge New.

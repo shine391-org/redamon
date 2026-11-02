@@ -183,6 +183,7 @@ describe('GlobalHeader – structure', () => {
 /* ------------------------------------------------------------------ */
 
 describe('GlobalHeader – Plugins button', () => {
+  // The accessible name includes the "New!" badge text, so match the prefix.
   const pluginsLink = () => screen.queryByRole('link', { name: /^plugins/i })
 
   test('"Plugins" with the Puzzle icon, linking to /plugins', () => {
@@ -191,6 +192,12 @@ describe('GlobalHeader – Plugins button', () => {
     expect(link.getAttribute('href')).toBe('/plugins')
     expect(link.querySelector('svg.lucide-puzzle')).not.toBeNull()
     expect(link.className).toContain('coreNavItem')
+  })
+
+  test('no longer carries the "New!" badge', () => {
+    // db045488 moved the badge to the Route Exposure workflow node.
+    render(<GlobalHeader />)
+    expect(pluginsLink()!.querySelector('span[class*="newBadge"]')).toBeNull()
   })
 
   test('in the core nav group, directly before Reports', () => {
