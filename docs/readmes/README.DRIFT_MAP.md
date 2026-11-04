@@ -330,6 +330,8 @@ tools and wordlist paths**.
 | Provider API hosts, 5 copies | `llm_setup.py`, `model_providers.py`, `defaultBaseUrlFor` (`presets/generate/route.ts:85`), `webapp/src/lib/apiUsage/providers/llm/*.ts`, `llmProviderPresets.ts` (20 URLs) | NONE | Agree today |
 | Model-prefix routing, 3 copies | `parse_model_provider` (`llm_setup.py`), `resolveModel` (`presets/generate/route.ts:54-79`, lacks the legacy `openai_compat/` prefix, unverified effect), `formatModelDisplay` (`phaseConfig.ts:14`, display only) | PART | A model chat accepts is misrouted by preset generation |
 | Provider-type facts | `NON_CHAT_PROVIDER_TYPES` (`agentic/llm_builder.py:38`, `webapp/src/lib/llmProviderKinds.ts`); `CUSTOM_PROVIDER_TYPES` (`llm_builder.py:41`) names `bedrock_custom`, `ollama_local`, which no webapp code creates | NONE | A new non-chat provider counted as a chat LLM on one side |
+| Agent in the Loop identity: prefix `loop/`, id `loop/mcp`, label, the switch's accepted values, step `contractVersion` | `agentic/agent_in_the_loop/__init__.py` <-> `webapp/src/lib/agentInTheLoop.ts`, `LOOP_CONTRACT_VERSION` (`webapp/src/lib/mcp/loopSkill.ts`) | TEST (`agentInTheLoop.twins.test.ts` reads the Python constants) | |
+| Who refuses a `loop/` model outside a chat run | `refuse_loop_model` in `agentic/llm_builder.py` and the `api.py` builders; `excludeLoop` / `projectModelProblem` / `loopModelRefusal` in the webapp | PART (`test_loop_out_of_session.py`, `agentInTheLoop.refusals.test.ts`); a NEW builder is unguarded (the `agent-in-the-loop` skill) | A builder that forgets the check waits for a driver that never comes, or routes `loop/mcp` to OpenAI after a revert |
 | Feature-model ids | `FEATURE_IDS` (`agentic/feature_models.py:16`) <-> `webapp/src/lib/llmFeatures.ts`, 9 each | TEST (`test_feature_models.py`) | |
 | Local judge model | `qwen2.5:7b` in `local_llm_manager.py:52`, `scanners/ai_attack_surface_scan/{project_settings,adapters/*}.py`, `docker-compose.yml:687`; the UI reads it from the orchestrator (`/local-llm/status` via `/api/ai-attack-surface/[projectId]/judge-model`) | NONE for the scanner copies | |
 
@@ -500,8 +502,8 @@ relationships) and `graph_db/schema_keys.py` (uniqueness keys, 45 labels).
 
 ### 4.8 Inbound MCP server and API docs
 
-Well guarded: `MCP-API-Reference.md` is rendered from the live `tools/list` (48
-tools, 17 scopes), the onboarding pack must cover every tool, every scope sits in
+Well guarded: `MCP-API-Reference.md` is rendered from the live `tools/list` (51
+tools with both switches on, 18 scopes), the onboarding pack must cover every tool, every scope sits in
 exactly one group, and the server's own agent-facing strings are checked against
 the live surface.
 
@@ -512,6 +514,8 @@ the live surface.
 | Scope labels and blurbs | `webapp/src/lib/mcp/scopeCopy.ts` | TEST |
 | Canonical banner bytes | `CANONICAL_BANNER` (`apiReference.ts`) == `DevergoLabs/scripts/add-wiki-canonical.mjs` | the byte-compare fails if they differ |
 | User MCP manifest schema | `webapp/src/lib/mcp/schema.ts` <-> `agentic/mcp_registry.py:49-105` | NONE (TS is stricter) |
+| Loop status names and the `loop_status` frame | `agentic/websocket_api.py` (`LOOP_STATUS`, `_loop_note`) <-> `websocket-types.ts` (`LoopStatusPayload`), `hooks/loopStatus.ts` | message type: TEST (the WebSocket parity test); the state names: NONE |
+| Loop tools withdrawn with the switch | `LOOP_TOOL_NAMES` (`webapp/src/lib/mcp/loopTools.ts`); every MCP test that stubs `MCP_KALI_EXEC_ENABLED` also stubs `AGENT_IN_THE_LOOP_ENABLED` | TEST (`loopTools.test.ts`); the stub pairing: NONE (the `mcp-server-tools` skill) |
 | Kali exec wait cap 60 | `webapp/src/lib/mcp/kaliTools.ts:87` <-> `agentic/api.py:5083` | NONE |
 | OpenAPI | `docs/readmes/README.OPENAPI.md`, `route.openapi.test.ts` files | PART |
 
@@ -560,7 +564,7 @@ and the webapp build cannot import across its root. So shared facts are copied.
 | Proof types / proof bar 70-80; passive CVE sources | `triage_mixin.py:308-319`, `fact_queries.py:125-128`, `score_model.py:1135-1141`; `recon/helpers/finding_sources.py:22`, `score_model.py:616`, `osint_mixin.py:81` | types NONE, bar TEST; sources TEST (skips without `recon/`) |
 | Mute selector / severity rank | `agentic/multi_mute/{kind,pool}.py` <-> Cypher in the triage mixin | TEST (contract JSON) |
 | Diagnostic failure classes (5) | `productivity.py:250` <-> `error_class.py:203` | NONE |
-| Auth headers, project file roots, chat-skill caps, baddns modules, workspace protected dirs | `webapp/src/lib/authProfile.ts` <-> `recon/helpers/auth_profile.py`; `reconSettings/validators.ts:69-79` <-> `recon/project_settings.py:988-998`; `chat-skills/route.ts:32-57` <-> `import-community/route.ts:9-11`; `TakeoverSection.tsx:27` <-> `takeover_helpers.py:378`; `workspace_fs.py:68` <-> `FileSystemDrawer.tsx:72` | PART / NONE (each agrees today) |
+| Auth headers, project file roots, chat-skill caps, baddns modules, workspace protected dirs | `webapp/src/lib/authProfile.ts` <-> `recon/helpers/auth_profile.py`; `reconSettings/validators.ts:69-79` <-> `recon/project_settings.py:988-998`; `chat-skills/route.ts:32-57` <-> `import-community/route.ts:9-11`; `TakeoverSection.tsx:27` <-> `takeover_helpers.py:378`; `workspace_fs.py:68` <-> `FileSystemDrawer.tsx:99` | PART / NONE (each agrees today) |
 | Neo4j-to-JSON coercion | `agentic/api.py:3667` <-> `mcp/servers/redagraph.py:86` | NONE |
 | Internal routes Python calls on the webapp | `INTERNAL_ALLOWLIST` (28 patterns) and `SCANNER_ALLOWLIST` (3) in `webapp/src/middleware.ts` <-> 32 distinct method+route pairs called with `X-Internal-Key` (all match today) | TEST (`middleware.internalCallers.test.ts`, computed from the callers). Enforcement is **log-only** unless `INTERNAL_KEY_ALLOWLIST_ENFORCE=true` |
 

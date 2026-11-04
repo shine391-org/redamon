@@ -245,6 +245,19 @@ class TestSitemapXmlRecursion(unittest.TestCase):
             urls = run_async(_fetch_sitemap_xml("https://x.com/sitemap.xml"))
         self.assertEqual(urls, [])
 
+    def test_sitemap_titles_strip_only_the_html_suffix(self):
+        # rstrip(".html") strips a character SET: install.html became "Insta".
+        from orchestrator_helpers.tradecraft_lookup import _build_sitemap_mkdocs
+        locs = ["https://docs.example.test/install.html", "https://docs.example.test/ssh",
+                "https://docs.example.test/html-basics.html"]
+
+        async def fake_sitemap(url, max_depth=2):
+            return list(locs)
+
+        with mock.patch("orchestrator_helpers.tradecraft_lookup._fetch_sitemap_xml", fake_sitemap):
+            out = run_async(_build_sitemap_mkdocs("https://docs.example.test"))
+        self.assertEqual([e["title"] for e in out["nav"]], ["Install", "Ssh", "Html Basics"])
+
 
 # =========================================================================
 # Prompt-injection envelope safety
@@ -521,7 +534,7 @@ class TestAgenticCrawlBounds(unittest.TestCase):
         # empty so the loop falls back to the slow Playwright stub and the
         # 2-second budget actually has time to bite.
         async def fake_http(url, timeout=15):
-            return ""
+            return "", url
 
         with mock.patch("orchestrator_helpers.tradecraft_crawl._http_fetch", fake_http):
             result = run_async(agentic_crawl(

@@ -72,6 +72,30 @@ def _build_guardrail_error(user_id, project_id, session_id, target_desc, error) 
     }
 
 
+LOOP_GUARDRAIL_NO_ANSWER = "Scope Guardrail: your external agent did not answer"
+
+
+def _build_guardrail_loop_failure(user_id, project_id, session_id, target_desc, exc) -> dict:
+    """The guardrail step of an Agent in the Loop run got no answer: still blocked."""
+    return {
+        "messages": [AIMessage(content=(
+            f"**{LOOP_GUARDRAIL_NO_ANSWER}**\n\n"
+            f"The scope check for `{target_desc}` is answered by your external agent "
+            f"(Agent in the Loop), and it did not answer ({exc.code}). Start Claude Code "
+            f"or Codex with the Agent in the Loop skill, say \"Drive my RedAmon session\", "
+            f"and send your message again.\n\n"
+            f"The agent uses a fail-closed policy: it will not proceed until the guardrail "
+            f"can verify the target."
+        ))],
+        "task_complete": True,
+        "completion_reason": LOOP_GUARDRAIL_NO_ANSWER,
+        "_guardrail_blocked": True,
+        "user_id": user_id,
+        "project_id": project_id,
+        "session_id": session_id,
+    }
+
+
 async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | None:
     """Run LLM-based guardrail check on the project's target scope.
 
@@ -127,6 +151,12 @@ async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | N
             return _build_guardrail_block(user_id, project_id, session_id, target_desc, reason)
 
     except Exception as e:
+        if getattr(e, "no_retry", False):
+            logger.error(
+                f"[{user_id}/{project_id}/{session_id}] Scope guardrail step not answered "
+                f"(fail closed): {type(e).__name__}"
+            )
+            return _build_guardrail_loop_failure(user_id, project_id, session_id, target_desc, e)
         # FAIL CLOSED — agent must not proceed if it cannot verify the target
         logger.error(
             f"[{user_id}/{project_id}/{session_id}] Scope guardrail error (fail closed): {e}"
@@ -231,12 +261,18 @@ async def _scope_gate(state, llm, user_id, project_id, session_id) -> tuple[dict
     return None, updates
 
 
-def _roe_timing_warnings(now_utc: datetime) -> list[str]:
-    """Why ``now_utc`` falls outside the engagement dates or the testing window."""
+def _roe_timing_warnings(now_utc: datetime, get=None) -> list[str]:
+    """Why ``now_utc`` falls outside the engagement dates or the testing window.
+
+    ``get(key, default)`` reads the settings: this session's by default. The
+    workspace mirror passes its own project's dict, because outside a session
+    ``get_setting`` reads whichever project loaded last.
+    """
+    read = get or get_setting
     warnings = []
 
-    start_date = get_setting('ROE_ENGAGEMENT_START_DATE', '')
-    end_date = get_setting('ROE_ENGAGEMENT_END_DATE', '')
+    start_date = read('ROE_ENGAGEMENT_START_DATE', '')
+    end_date = read('ROE_ENGAGEMENT_END_DATE', '')
     if start_date:
         try:
             if now_utc.date() < datetime.strptime(start_date, '%Y-%m-%d').date():
@@ -250,14 +286,14 @@ def _roe_timing_warnings(now_utc: datetime) -> list[str]:
         except ValueError:
             pass
 
-    if get_setting('ROE_TIME_WINDOW_ENABLED', False):
-        tz_name = get_setting('ROE_TIME_WINDOW_TIMEZONE', 'UTC')
+    if read('ROE_TIME_WINDOW_ENABLED', False):
+        tz_name = read('ROE_TIME_WINDOW_TIMEZONE', 'UTC')
         try:
             now_local = now_utc.astimezone(zoneinfo.ZoneInfo(tz_name))
             day_name = now_local.strftime('%A').lower()
-            allowed_days = get_setting('ROE_TIME_WINDOW_DAYS', [])
-            start_time = get_setting('ROE_TIME_WINDOW_START_TIME', '09:00')
-            end_time = get_setting('ROE_TIME_WINDOW_END_TIME', '18:00')
+            allowed_days = read('ROE_TIME_WINDOW_DAYS', [])
+            start_time = read('ROE_TIME_WINDOW_START_TIME', '09:00')
+            end_time = read('ROE_TIME_WINDOW_END_TIME', '18:00')
 
             if day_name not in allowed_days:
                 warnings.append(f"Current day ({day_name.capitalize()}) is outside the allowed testing window.")

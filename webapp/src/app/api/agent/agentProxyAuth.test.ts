@@ -15,16 +15,23 @@ import { NextRequest } from 'next/server'
 
 vi.mock('@/lib/access', () => ({
   guardProject: vi.fn(async () => null),
+  requireProjectAccess: vi.fn(async () => ({ project: { id: 'p1', userId: 'u1' } })),
   requireEffectiveUser: vi.fn(async () => ({ userId: 'u1' })),
   requireConversationAccess: vi.fn(async () => ({ conversation: { id: 'c1', userId: 'u1', projectId: 'p1' } })),
 }))
 vi.mock('@/lib/prisma', () => ({
   default: {
+    userSettings: { findUnique: vi.fn(async () => ({ githubAccessToken: '' })) },
     conversation: {
       findUnique: vi.fn(async () => ({ sessionId: 's1', userId: 'u1', projectId: 'p1' })),
       delete: vi.fn(async () => ({})),
     },
   },
+}))
+vi.mock('@/lib/audit', () => ({ writeAudit: vi.fn(async () => {}) }))
+vi.mock('@/lib/session', () => ({
+  getSession: vi.fn(async () => ({ userId: 'u1', role: 'user' })),
+  getEffectiveUser: vi.fn(async () => ({ userId: 'u1' })),
 }))
 vi.mock('../graph/neo4j', () => ({
   getGraphSession: () => ({ run: vi.fn(async () => ({ records: [] })), close: vi.fn(async () => {}) }),
@@ -43,6 +50,14 @@ import * as wsMkdir from './workspace/mkdir/route'
 import * as wsBulkArchive from './workspace/bulk-archive/route'
 import * as wsUpload from './workspace/upload/route'
 import * as wsJobCancel from './workspace/jobs/[jobId]/cancel/route'
+import * as wsJobStatus from './workspace/jobs/[jobId]/route'
+import * as wsUploadCreate from './workspace/upload-sessions/route'
+import * as wsUploadChunk from './workspace/upload-sessions/[uploadId]/chunk/route'
+import * as wsUploadCommit from './workspace/upload-sessions/[uploadId]/commit/route'
+import * as wsUploadAbort from './workspace/upload-sessions/[uploadId]/route'
+import * as wsImport from './workspace/import-url/route'
+import * as wsImportResolve from './workspace/import-url/resolve/route'
+import * as wsImportResync from './workspace/import-url/resync/route'
 import * as sessions from './sessions/route'
 import * as sessionInteract from './sessions/[id]/interact/route'
 import * as sessionKill from './sessions/[id]/kill/route'
@@ -88,6 +103,40 @@ const CASES: Case[] = [
     agentPath: '/workspace/jobs/j1/cancel',
     call: () => wsJobCancel.POST(new NextRequest(`${BASE}/x?projectId=p1`, { method: 'POST' }), { params: Promise.resolve({ jobId: 'j1' }) }),
   },
+  {
+    name: 'workspace job status',
+    agentPath: `/workspace/jobs/${'a'.repeat(32)}?projectId=p1`,
+    call: () => wsJobStatus.GET(new NextRequest(`${BASE}/x?projectId=p1`), { params: Promise.resolve({ jobId: 'a'.repeat(32) }) }),
+  },
+  {
+    name: 'workspace upload-session create',
+    agentPath: '/workspace/upload-sessions',
+    call: () => wsUploadCreate.POST(json('/x', { projectId: 'p1', name: 'a', size: 1, kind: 'file' })),
+  },
+  {
+    name: 'workspace upload-session chunk',
+    agentPath: `/workspace/upload-sessions/${'f'.repeat(32)}/chunk`,
+    call: () => wsUploadChunk.PUT(new NextRequest(`${BASE}/x?projectId=p1&offset=0`, { method: 'PUT', body: new Uint8Array([1]) }),
+      { params: Promise.resolve({ uploadId: 'f'.repeat(32) }) }),
+  },
+  {
+    name: 'workspace upload-session commit',
+    agentPath: `/workspace/upload-sessions/${'f'.repeat(32)}/commit`,
+    call: () => wsUploadCommit.POST(json('/x', { projectId: 'p1' }), { params: Promise.resolve({ uploadId: 'f'.repeat(32) }) }),
+  },
+  {
+    name: 'workspace upload-session abort',
+    agentPath: `/workspace/upload-sessions/${'f'.repeat(32)}?projectId=p1`,
+    call: () => wsUploadAbort.DELETE(new NextRequest(`${BASE}/x?projectId=p1`, { method: 'DELETE' }),
+      { params: Promise.resolve({ uploadId: 'f'.repeat(32) }) }),
+  },
+  { name: 'workspace import-url resolve', agentPath: '/workspace/import-url/resolve',
+    call: () => wsImportResolve.POST(json('/x', { projectId: 'p1', url: 'https://github.com/o/r' })) },
+  { name: 'workspace import-url', agentPath: '/workspace/import-url',
+    call: () => wsImport.POST(json('/x', { projectId: 'p1', url: 'https://github.com/o/r' })) },
+  // Its first agent call reads the folder's import record (the mock has none).
+  { name: 'workspace import-url resync', agentPath: '/workspace/properties',
+    call: () => wsImportResync.POST(json('/x', { projectId: 'p1', path: 'uploads/r' })) },
   { name: 'sessions list', agentPath: '/sessions', call: () => sessions.GET() },
   { name: 'session interact', agentPath: '/sessions/1/interact', call: () => sessionInteract.POST(json('/x', { command: 'id' }), idParams('1')) },
   { name: 'session kill', agentPath: '/sessions/1/kill', call: () => sessionKill.POST(new NextRequest(`${BASE}/x`, { method: 'POST' }), idParams('1')) },

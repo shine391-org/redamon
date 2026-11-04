@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { archiveProjectAuthorizations } from '@/lib/engagementArchive'
 import prisma from '@/lib/prisma'
+import { agentFetch } from '@/lib/agentFetch'
 import { Prisma } from '@prisma/client'
 import { unlink } from 'fs/promises'
 import { existsSync } from 'fs'
@@ -10,6 +11,7 @@ import { batchGroupFiles } from '@/lib/reconOutputFiles'
 import { clearProjectGraph } from '@/lib/graphRestore'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { isInternalRequest, isScannerRequest } from '@/lib/session'
+import { purgeProjectWorkspace } from '@/lib/workspacePurge'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { toAuthProfileMetadata } from '@/lib/authProfile'
 import { callGraphTriage } from '@/lib/triageClient'
@@ -28,6 +30,7 @@ import { userSkillsForAgent } from '@/lib/userSkillAgentPayload'
 import type { ResolvedPart } from '@/lib/plugins/overrides'
 import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
 import { internalError } from '@/lib/routeErrors'
+import { projectModelProblem } from '@/lib/agentInTheLoop'
 
 // Path to output directories (fallback for local deletion)
 const RECON_OUTPUT_PATH = process.env.RECON_OUTPUT_PATH || '/home/samuele/Progetti didattici/RedAmon/recon/output'
@@ -251,6 +254,10 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     const openapiError = validateOpenApiSettings(updateData)
     if (openapiError) {
       return NextResponse.json({ error: openapiError }, { status: 400 })
+    }
+    const loopProblem = projectModelProblem(updateData)
+    if (loopProblem) {
+      return NextResponse.json({ error: loopProblem, code: 'loop_model_not_allowed' }, { status: 400 })
     }
     if ('openapiSources' in updateData) {
       updateData.openapiSources = normalizeOpenApiSourceIds(updateData.openapiSources)
@@ -607,6 +614,30 @@ async function stopPartialRecons(projectId: string): Promise<void> {
 }
 
 // DELETE /api/projects/[id] - Delete project and all associated data
+/** Stop every live chat run of a project, best-effort (never throws). */
+async function stopProjectChatRuns(projectId: string): Promise<void> {
+  let running: { userId: string; sessionId: string }[] = []
+  try {
+    running = await prisma.conversation.findMany({
+      where: { projectId, agentRunning: true },
+      select: { userId: true, sessionId: true },
+    })
+  } catch (e) {
+    console.warn('Could not read the running chats before project delete:', e)
+    return
+  }
+  const results = await Promise.allSettled(running.map(c => agentFetch('/agent-session/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: c.userId, project_id: projectId, session_id: c.sessionId }),
+  })))
+  results.forEach((r, i) => {
+    if (r.status === 'rejected' || !r.value.ok) {
+      console.warn(`Could not stop chat ${running[i].sessionId} before project delete (continuing)`)
+    }
+  })
+}
+
 export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
@@ -654,6 +685,12 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     } catch (e) {
       console.warn('Could not stop a triage run before project delete:', e)
     }
+    // A running chat of this project is an orphan once the row is gone, whatever
+    // its model, and an Agent in the Loop run would keep offering its steps to
+    // the owner's agent. Stopped the way a conversation delete stops its run.
+    // The conversations cascade with the project, so they are read first.
+    // Best-effort: a stop that fails must not block the delete.
+    await stopProjectChatRuns(id)
     // Best-effort stop of each PROJECT-LEVEL scan container. ai_attack runs are
     // keyed by run-id, not project, so they are not stopped here; they finish on
     // their own and their orphaned nodes are swept by the graph read-path
@@ -709,6 +746,10 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     await prisma.project.delete({
       where: { id }
     })
+
+    // 1a. The agent workspace (only once the row is gone: the agent acts only on
+    //     a project the web app answers 404 for).
+    await purgeProjectWorkspace(id)
 
     // 1b. GC captured body blobs this project exclusively owned (ref-counted).
     if (capturedBodyRefs.length > 0) {

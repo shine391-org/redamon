@@ -516,6 +516,8 @@ CYPHER_GENERATION_TIMEOUT_DEFAULT = 120.0
 # restarted, pinning the database the graph screen and every scan share. Same
 # bound as /graph/exec (api.py _GRAPH_EXEC_DEFAULT_TIMEOUT_MS).
 GRAPH_QUERY_TX_TIMEOUT_S = 120.0
+# neo4j.READ_ACCESS, spelled out so this module does not import the driver.
+READ_SESSION = {"default_access_mode": "READ"}
 
 
 def _cypher_generation_timeout() -> float:
@@ -752,24 +754,29 @@ Cypher Query:"""
         # Prefer the per-session LLM (task-isolated) so concurrent projects run
         # text-to-Cypher on their OWN model; fall back to the manager's llm.
         from orchestrator_helpers.llm_retry import retry_llm_call
+        from agent_in_the_loop import is_loop_llm
+        from agent_in_the_loop.purpose import llm_purpose
         llm = current_llm.get() or self.llm
-        call = retry_llm_call(
-            llm,
-            prompt,
-            label="query_graph text-to-cypher",
-        )
-        timeout = _cypher_generation_timeout()
-        if timeout:
-            try:
-                response = await asyncio.wait_for(call, timeout)
-            except asyncio.TimeoutError:
-                raise CypherGenerationTimeout(
-                    f"Cypher generation exceeded {timeout:g}s "
-                    f"(CYPHER_GENERATION_TIMEOUT). The configured model is too "
-                    f"slow for this question; simplify it or switch model."
-                )
-        else:
-            response = await call
+        with llm_purpose("cypher"):
+            call = retry_llm_call(
+                llm,
+                prompt,
+                label="query_graph text-to-cypher",
+            )
+            # An Agent in the Loop step has its own deadline (LOOP_STEP_DEADLINE_S):
+            # a person's agent may well need more than two minutes.
+            timeout = 0 if is_loop_llm(llm) else _cypher_generation_timeout()
+            if timeout:
+                try:
+                    response = await asyncio.wait_for(call, timeout)
+                except asyncio.TimeoutError:
+                    raise CypherGenerationTimeout(
+                        f"Cypher generation exceeded {timeout:g}s "
+                        f"(CYPHER_GENERATION_TIMEOUT). The configured model is too "
+                        f"slow for this question; simplify it or switch model."
+                    )
+            else:
+                response = await call
         from orchestrator_helpers.json_utils import normalize_content
         return self._extract_cypher_from_response(normalize_content(response.content))
 
@@ -867,7 +874,12 @@ Cypher Query:"""
                             params={
                                 "tenant_user_id": user_id,
                                 "tenant_project_id": project_id
-                            }
+                            },
+                            # The database refuses a write the regex guard missed
+                            # (e.g. an escaped keyword in a string literal), as
+                            # the inbound graph endpoint does. The query may come
+                            # from an outside process (Agent in the Loop).
+                            session_params=READ_SESSION,
                         )
 
                         if not result:
@@ -884,6 +896,11 @@ Cypher Query:"""
                         return f"Error querying graph: {e}"
 
                     except Exception as e:
+                        if getattr(e, "no_retry", False):
+                            # Terminal too: an Agent in the Loop step that was not
+                            # answered (or was declined) is not asked again.
+                            logger.error(f"[{user_id}/{project_id}] Cypher step not answered: {type(e).__name__}")
+                            return f"Error querying graph: {e}"
                         error_msg = str(e)
                         logger.warning(f"[{user_id}/{project_id}] Query attempt {attempt + 1} failed: {error_msg}")
                         last_error = error_msg
@@ -2482,12 +2499,36 @@ class PhaseAwareToolExecutor:
         # Fallback: convert to string
         return str(output)
 
+    @staticmethod
+    def _fs_busy_error(tool_name: str, args: dict) -> Optional[str]:
+        """The refusal for a write into a folder a running import is replacing,
+        or None. Checked here, at the one chokepoint every agent path reaches
+        (single tool, plan wave, fireteam member), not in each fs_* function."""
+        write_args = workspace_fs.FS_TOOL_WRITE_ARGS.get(tool_name)
+        project_id = current_project_id.get()
+        if not write_args or not project_id:
+            return None
+        for name in write_args:
+            path = args.get(name)
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                workspace_fs.check_not_busy(project_id, path)
+            except Exception as e:
+                job_id = getattr(e, "detail", "") or "unknown"
+                return (f"{path} is being replaced by a running import (job {job_id}); "
+                        f"retry when it finishes.")
+        return None
+
     async def _dispatch_fs_tool(self, tool_name: str, tool_args: dict) -> dict:
         """In-process workspace filesystem tool dispatch."""
         coro = workspace_fs.DISPATCH.get(tool_name)
         if coro is None:
             return {"success": False, "output": None, "error": f"unknown fs tool: {tool_name}"}
         args = tool_args if isinstance(tool_args, dict) else {}
+        busy_error = self._fs_busy_error(tool_name, args)
+        if busy_error:
+            return {"success": False, "output": None, "error": busy_error}
         try:
             output = await coro(**args)
         except TypeError as e:

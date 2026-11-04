@@ -36,6 +36,10 @@ from llm_guard import (master_key_is_weak, require_configured_master_auth,
                        require_internal_auth, require_internal_auth_only,
                        require_master_internal_auth)
 from logging_config import setup_logging
+from agent_in_the_loop import is_loop_llm, is_loop_model, loop_enabled
+from agent_in_the_loop.broker import get_broker
+from agent_in_the_loop.errors import LoopModelNotSupportedHere
+from agent_in_the_loop.routes import router as loop_router
 from orchestrator import AgentOrchestrator
 from orchestrator_helpers import normalize_content
 from plugin_api import router as plugin_router
@@ -46,6 +50,11 @@ from websocket_api import WebSocketManager, websocket_endpoint, MessageType
 import workspace_fs
 import job_runner
 import ws_job_emitter
+from workspace_import import downloads as _ws_downloads
+from workspace_import import staging as _ws_staging
+from workspace_import import upload_sessions as _ws_upload_sessions
+from workspace_import.errors import ImportFailure, error_body
+from workspace_import.http_routes import reset_project_imports, router as workspace_import_router
 
 # Initialize logging with file rotation
 setup_logging(log_level=logging.INFO, log_to_console=True, log_to_file=True)
@@ -94,6 +103,12 @@ async def lifespan(app: FastAPI):
     reg = job_runner.get_registry()
     reg.recover_on_boot()
 
+    # No upload or import survives a restart. First put back any folder a
+    # Re-sync was swapping when the process died, then empty the staging area.
+    _ws_staging.recover_swaps()
+    _ws_staging.sweep_all()
+    idle_upload_sweeper = asyncio.create_task(_ws_upload_sessions.sweep_idle_forever())
+
     # Wire the JobRegistry to push job_update events through the WS manager
     # so the frontend drawer sees status changes in real time. The emitter
     # lives in ws_job_emitter.py so it stays unit-testable without the
@@ -127,6 +142,7 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Shutting down RedAmon Agent API...")
+    idle_upload_sweeper.cancel()
     if orchestrator:
         await orchestrator.close()
 
@@ -173,6 +189,10 @@ async def _request_validation_error(request, exc: RequestValidationError):
 
 # Plugin platform: the overridable built-in skill parts and their validator.
 app.include_router(plugin_router)
+# Workspace folder/archive upload sessions and URL imports.
+app.include_router(workspace_import_router)
+# Agent in the Loop: drivers claim and answer model-call steps (via the webapp).
+app.include_router(loop_router)
 
 
 # =============================================================================
@@ -189,6 +209,9 @@ class HealthResponse(BaseModel):
     fireteam_enabled: bool = False
     persistent_checkpointer: bool = False
     active_waves: int = 0
+    # Only the switch: /health is unauthenticated and the agent port is
+    # published, so loop activity counts live on the master-key /loop/stats.
+    loop_enabled: bool = False
 
 
 # =============================================================================
@@ -239,15 +262,16 @@ async def check_target_guardrail(body: GuardrailRequest):
     if not orchestrator or not orchestrator._initialized:
         return {"allowed": True, "reason": "Agent not initialized, guardrail skipped"}
 
-    # Ensure LLM is set up
-    if not orchestrator.llm:
+    # Ensure LLM is set up. An Agent in the Loop adapter counts as no LLM: it
+    # answers only inside a chat run, and this check has no driver.
+    if not orchestrator.llm or is_loop_llm(orchestrator.llm):
         if body.project_id:
             try:
                 orchestrator._apply_project_settings(body.project_id)
             except Exception as e:
                 logger.warning(f"Guardrail: failed to load project settings: {e}")
         # Still no LLM? Bootstrap with default model + user's API keys from DB
-        if not orchestrator.llm:
+        if not orchestrator.llm or is_loop_llm(orchestrator.llm):
             try:
                 from orchestrator_helpers.llm_setup import setup_llm, _resolve_provider_key
                 import requests as _requests
@@ -298,6 +322,8 @@ async def check_target_guardrail(body: GuardrailRequest):
             except Exception as e:
                 logger.warning(f"Guardrail: failed to bootstrap default LLM: {e}")
                 return {"allowed": True, "reason": "LLM not configured, guardrail skipped"}
+    if is_loop_llm(orchestrator.llm):
+        return {"allowed": True, "reason": "LLM not configured, guardrail skipped"}
 
     try:
         result = await check_target_allowed(
@@ -517,8 +543,17 @@ def _feature_request_error(model: str, user_id: Optional[str]) -> Optional[JSONR
     return None
 
 
+def _loop_model_refusal(model: str) -> JSONResponse:
+    """400 for a loop model on a path with no chat run (no driver can answer)."""
+    from agent_in_the_loop.errors import LoopModelNotSupportedHere
+    return _feature_error(LoopModelNotSupportedHere.code, model, 400,
+                          LoopModelNotSupportedHere.message)
+
+
 async def _build_feature_llm(feature: str, model: str, user_id: str):
     """(llm, None), or (None, the coded JSONResponse to return)."""
+    if is_loop_model(model):
+        return None, _loop_model_refusal(model)
     try:
         providers = await asyncio.to_thread(fetch_user_providers, user_id)
     except ProvidersUnreachable as exc:
@@ -635,7 +670,9 @@ def _build_llm_with_model_for_user(model_name: str, user_id: Optional[str]):
     import os
     import requests as requests_mod
     from orchestrator_helpers.llm_setup import setup_llm, _resolve_provider_key
+    from agent_in_the_loop.errors import refuse_loop_model
 
+    refuse_loop_model(model_name)
     user_providers: list = []
     if user_id:
         webapp_url = os.environ.get('WEBAPP_URL', 'http://webapp:3000')
@@ -701,6 +738,8 @@ async def llm_ffuf_extensions(body: FfufExtensionsRequest):
 
     try:
         llm = _build_llm_with_model_for_user(body.model, body.user_id)
+    except LoopModelNotSupportedHere:
+        return _loop_model_refusal(body.model)
     except Exception as e:
         logger.error(f"ffuf-extensions: cannot set up LLM: {e}")
         return JSONResponse(content={"error": f"LLM not configured: {e}"}, status_code=503)
@@ -800,6 +839,8 @@ async def llm_nuclei_tags(body: NucleiTagsRequest):
 
     try:
         llm = _build_llm_with_model_for_user(body.model, body.user_id)
+    except LoopModelNotSupportedHere:
+        return _loop_model_refusal(body.model)
     except Exception as e:
         logger.error(f"nuclei-tags: cannot set up LLM: {e}")
         return JSONResponse(content={"error": f"LLM not configured: {e}"}, status_code=503)
@@ -912,6 +953,8 @@ async def llm_waf_classify(body: WafClassifyRequest):
 
     try:
         llm = _build_llm_with_model_for_user(body.model, body.user_id)
+    except LoopModelNotSupportedHere:
+        return _loop_model_refusal(body.model)
     except Exception as e:
         logger.error(f"waf-classify: cannot set up LLM: {e}")
         return JSONResponse(content={"error": f"LLM not configured: {e}"}, status_code=503)
@@ -1040,6 +1083,8 @@ async def llm_nuclei_fp_filter(body: NucleiFpFilterRequest):
 
     try:
         llm = _build_llm_with_model_for_user(body.model, body.user_id)
+    except LoopModelNotSupportedHere:
+        return _loop_model_refusal(body.model)
     except Exception as e:
         logger.error(f"nuclei-fp-filter: cannot set up LLM: {e}")
         return JSONResponse(content={"error": f"LLM not configured: {e}"}, status_code=503)
@@ -1173,6 +1218,8 @@ async def llm_takeover_classify(body: TakeoverClassifyRequest):
 
     try:
         llm = _build_llm_with_model_for_user(body.model, body.user_id)
+    except LoopModelNotSupportedHere:
+        return _loop_model_refusal(body.model)
     except Exception as e:
         logger.error(f"takeover-classify: cannot set up LLM: {e}")
         return JSONResponse(content={"error": f"LLM not configured: {e}"}, status_code=503)
@@ -1614,7 +1661,13 @@ async def live_agent_sessions(project_id: str):
     """
     if not ws_manager:
         return JSONResponse(content={"error": "agent not ready"}, status_code=503)
-    return {"project_id": project_id, "session_ids": ws_manager.live_session_ids(project_id)}
+    answer = {"project_id": project_id, "session_ids": ws_manager.live_session_ids(project_id)}
+    # Agent in the Loop runs only: what the run waits for, so a refused preset
+    # or scan can say "waiting for the external agent" (states, never ids of steps).
+    loop_states = get_broker().loop_states_for_project(project_id)
+    if loop_states:
+        answer["loop_states"] = loop_states
+    return answer
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
@@ -1651,6 +1704,7 @@ async def health():
         fireteam_enabled=bool(get_setting("FIRETEAM_ENABLED", False)),
         persistent_checkpointer=bool(get_setting("PERSISTENT_CHECKPOINTER", False)),
         active_waves=active_waves,
+        loop_enabled=loop_enabled(),
     )
 
 
@@ -1716,6 +1770,8 @@ def _build_llm_for_user(user_id: Optional[str]):
     model_name = (get_settings() or {}).get(
         'OPENAI_MODEL', DEFAULT_AGENT_SETTINGS.get('OPENAI_MODEL', 'claude-opus-4-6')
     )
+    if is_loop_model(model_name):
+        raise LoopModelNotSupportedHere()
     user_providers: list = []
     if user_id:
         webapp_url = os.environ.get('WEBAPP_URL', 'http://webapp:3000')
@@ -1811,10 +1867,12 @@ async def tradecraft_verify(body: TradecraftVerifyRequest):
     try:
         if body.model:
             llm = _build_llm_with_model_for_user(body.model, body.user_id)
-        elif orchestrator.llm is not None:
+        elif orchestrator.llm is not None and not is_loop_llm(orchestrator.llm):
             llm = orchestrator.llm
         else:
             llm = _build_llm_for_user(body.user_id)
+    except LoopModelNotSupportedHere:
+        return _loop_model_refusal(body.model or "")
     except Exception as e:
         logger.error(f"tradecraft verify: cannot set up LLM: {e}")
         return JSONResponse(
@@ -2595,13 +2653,19 @@ async def download_file(
 async def workspace_list(
     projectId: str = Query(..., description="Project UUID"),
     path: str = Query(".", description="Subdir relative to /workspace/<projectId>/"),
+    limit: int = Query(2000, ge=1, le=10000, description="Entries returned at most"),
 ):
-    """Directory listing as structured JSON for the drawer Files tab."""
+    """Directory listing as structured JSON for the drawer Files tab.
+
+    Capped: the drawer polls this every 5 s and an imported folder can hold
+    tens of thousands of entries. `total` and `truncated` say what was left out.
+    """
     if not projectId:
         return JSONResponse(content={"error": "projectId required"}, status_code=400)
     try:
-        entries = workspace_fs.list_dir_for_project(projectId, path)
-        return {"projectId": projectId, "path": path, "entries": entries}
+        entries, total = workspace_fs.list_dir_page(projectId, path, limit)
+        return {"projectId": projectId, "path": path, "entries": entries,
+                "total": total, "truncated": total > len(entries)}
     except ValueError as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
@@ -2636,25 +2700,21 @@ async def workspace_download(
     projectId: str = Query(...),
     path: str = Query(...),
 ):
-    """Stream file bytes directly from the bind-mount (no kali_shell round-trip)."""
+    """Stream file bytes directly from the bind-mount (no kali_shell round-trip).
+
+    Streams the descriptor that was checked (open_download_for_project), never
+    a path reopened later, and always as an attachment with nosniff.
+    """
     if not projectId:
         return Response(content="projectId required", status_code=400)
     try:
-        content_bytes, mime = workspace_fs.download_for_project(projectId, path)
+        fd, size, mime, filename = workspace_fs.open_download_for_project(projectId, path)
     except ValueError as e:
         return Response(content=str(e), status_code=400)
     except Exception as e:
         logger.error(f"/workspace/download failed: {e}")
         return Response(content=str(e), status_code=500)
-    filename = os.path.basename(path) or "download"
-    return Response(
-        content=content_bytes,
-        media_type=mime,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(content_bytes)),
-        },
-    )
+    return _ws_downloads.stream_fd(fd, size, mime, filename)
 
 
 class WorkspaceRenameRequest(BaseModel):
@@ -2672,6 +2732,8 @@ async def workspace_rename(req: WorkspaceRenameRequest):
     try:
         new_path = workspace_fs.rename_for_project(req.projectId, req.path, req.newName)
         return {"projectId": req.projectId, "path": new_path}
+    except ImportFailure as e:
+        return JSONResponse(content=error_body(e.code, jobId=e.detail), status_code=e.status)
     except ValueError as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
@@ -2692,6 +2754,8 @@ async def workspace_delete(
     try:
         workspace_fs.delete_for_project(projectId, path, recursive)
         return {"projectId": projectId, "path": path, "deleted": True}
+    except ImportFailure as e:
+        return JSONResponse(content=error_body(e.code, jobId=e.detail), status_code=e.status)
     except ValueError as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
@@ -2710,6 +2774,8 @@ async def workspace_reset(req: WorkspaceResetRequest):
     if not req.projectId:
         return JSONResponse(content={"error": "projectId required"}, status_code=400)
     try:
+        workspace_fs._validate_project_id(req.projectId)
+        await reset_project_imports(req.projectId)
         summary = workspace_fs.reset_for_project(req.projectId)
         return {"projectId": req.projectId, **summary}
     except ValueError as e:
@@ -2767,6 +2833,8 @@ async def workspace_upload(
             projectId, path, file_bytes, file.filename or "uploaded", overwrite=overwrite,
         )
         return {"projectId": projectId, "path": new_path, "size": len(file_bytes)}
+    except ImportFailure as e:
+        return JSONResponse(content=error_body(e.code, jobId=e.detail), status_code=e.status)
     except FileExistsError as e:
         return JSONResponse(
             content={"error": str(e), "code": "exists"}, status_code=409,
@@ -2792,6 +2860,8 @@ async def workspace_mkdir(req: WorkspaceMkdirRequest):
     try:
         new_path = workspace_fs.mkdir_for_project(req.projectId, req.path)
         return {"projectId": req.projectId, "path": new_path}
+    except ImportFailure as e:
+        return JSONResponse(content=error_body(e.code, jobId=e.detail), status_code=e.status)
     except ValueError as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
@@ -2817,22 +2887,18 @@ async def workspace_bulk_archive(req: WorkspaceBulkArchiveRequest):
     if not req.projectId:
         return Response(content="projectId required", status_code=400)
     try:
-        archive_bytes, filename = workspace_fs.bulk_archive_for_project(
-            req.projectId, req.paths, format=req.format, archive_name=req.archiveName,
+        resolved, filename = workspace_fs.prepare_bulk_archive(
+            req.projectId, req.paths, req.format, req.archiveName,
         )
     except ValueError as e:
         return Response(content=str(e), status_code=400)
     except Exception as e:
         logger.error(f"/workspace/bulk-archive failed: {e}")
         return Response(content=str(e), status_code=500)
-    mime = "application/gzip" if req.format == "tar.gz" else "application/zip"
-    return Response(
-        content=archive_bytes,
-        media_type=mime,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(archive_bytes)),
-        },
+    return await _ws_downloads.archive_response(
+        req.projectId, resolved,
+        lambda f: workspace_fs.write_bulk_archive(f, resolved, req.format),
+        filename, req.format,
     )
 
 
@@ -2847,22 +2913,16 @@ async def workspace_archive_download(
     if not projectId:
         return Response(content="projectId required", status_code=400)
     try:
-        archive_bytes, filename = workspace_fs.archive_dir_for_project(
-            projectId, path, format=format,
-        )
+        src, name, filename = workspace_fs.prepare_dir_archive(projectId, path, format)
     except ValueError as e:
         return Response(content=str(e), status_code=400)
     except Exception as e:
         logger.error(f"/workspace/archive-download failed: {e}")
         return Response(content=str(e), status_code=500)
-    mime = "application/gzip" if format == "tar.gz" else "application/zip"
-    return Response(
-        content=archive_bytes,
-        media_type=mime,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(archive_bytes)),
-        },
+    return await _ws_downloads.archive_response(
+        projectId, [src],
+        lambda f: workspace_fs.write_dir_archive(f, src, name, format),
+        filename, format,
     )
 
 
@@ -3206,6 +3266,12 @@ class TextToCypherRequest(BaseModel):
 # factored here so the tenant scoping and the retry policy cannot drift apart.
 
 
+LOOP_OUT_OF_SESSION_CYPHER = (
+    "This project's agent model is Agent in the Loop, which answers only inside a "
+    "chat. Natural-language graph queries need a provider model; raw Cypher still works."
+)
+
+
 class _CypherSetupError(Exception):
     """Carries the (status, safe message) to answer with, plus safe extra fields
     (a code, the provider's class and HTTP status) for the body."""
@@ -3258,6 +3324,10 @@ async def _build_cypher_manager(user_id: str, project_id: str):
             model_name = settings['OPENAI_MODEL']
     except Exception as e:
         logger.warning(f"text-to-cypher: failed to fetch project settings: {e}")
+    if is_loop_model(model_name):
+        # No chat run, so no driver can answer the generation step.
+        raise _CypherSetupError(409, LOOP_OUT_OF_SESSION_CYPHER,
+                                {"code": "loop_model_out_of_session"})
 
     user_providers = []
     try:

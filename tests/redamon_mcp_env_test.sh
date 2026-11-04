@@ -41,11 +41,11 @@ for var in MCP_SERVER_ENABLED MCP_TOKEN_RETENTION_DAYS MCP_RATE_READ_PER_MIN \
 done
 
 echo
-echo "== the flag defaults OFF =="
-if grep -qE '^[[:space:]]+MCP_SERVER_ENABLED: \$\{MCP_SERVER_ENABLED:-false\}' <<<"$WEBAPP_BLOCK"; then
-    ok "compose default is false"
+echo "== the flag defaults ON =="
+if grep -qE '^[[:space:]]+MCP_SERVER_ENABLED: \$\{MCP_SERVER_ENABLED:-true\}' <<<"$WEBAPP_BLOCK"; then
+    ok "compose default is true"
 else
-    bad "compose default is false" "not :-false" ':${MCP_SERVER_ENABLED:-false}'
+    bad "compose default is true" "not :-true" ':${MCP_SERVER_ENABLED:-true}'
 fi
 # The tuning knobs pass through EMPTY so unset keeps the code default, never a
 # compose-invented one that would drift from the documented fallback.
@@ -58,32 +58,103 @@ for var in MCP_TOKEN_RETENTION_DAYS MCP_LLM_DAILY_BUDGET MCP_RATE_READ_PER_MIN; 
 done
 
 echo
-echo "== ensure_auth_secrets writes the switch explicitly =="
-D="$(mktemp -d)"
-( cd "$REPO_ROOT" && ENVDIR="$D" bash -c '
-    set -uo pipefail
-    source ./redamon.sh
-    set +e
-    info(){ :; }; warn(){ :; }; error(){ :; }; success(){ :; }
-    SCRIPT_DIR="$ENVDIR"
-    ensure_auth_secrets
-' >/dev/null 2>&1 )
-hasF "$D/.env" "MCP_SERVER_ENABLED=false" "the switch is written, and written OFF"
-eq "written exactly once" "$(grep -c '^MCP_SERVER_ENABLED=' "$D/.env")" "1"
+echo "== ensure_auth_secrets: both switches ON, an update turns an old false on ONCE =="
+MARK='MCP_AND_LOOP_DEFAULT_ON_APPLIED=1'
+run_secrets() {   # run_secrets <dir>   (HOME is <dir>/home: no real ~/.redamon-deploy leaks in)
+    mkdir -p "$1/home"
+    ( cd "$REPO_ROOT" && ENVDIR="$1" HOME="$1/home" bash -c '
+        set -uo pipefail
+        source ./redamon.sh
+        set +e
+        info(){ :; }; warn(){ :; }; error(){ :; }; success(){ :; }
+        SCRIPT_DIR="$ENVDIR"
+        ensure_auth_secrets
+    ' >/dev/null 2>&1 )
+}
+val() { grep "^$2=" "$1/.env" | cut -d= -f2; }
 
-# A second run must not duplicate it, nor re-disable an operator's opt-in.
-sed -i 's/^MCP_SERVER_ENABLED=false/MCP_SERVER_ENABLED=true/' "$D/.env"
-( cd "$REPO_ROOT" && ENVDIR="$D" bash -c '
+# A fresh install.
+D="$(mktemp -d)"
+run_secrets "$D"
+eq "fresh install: MCP server on" "$(val "$D" MCP_SERVER_ENABLED)" "true"
+eq "fresh install: Agent in the Loop on" "$(val "$D" AGENT_IN_THE_LOOP_ENABLED)" "true"
+eq "written exactly once" "$(grep -c '^MCP_SERVER_ENABLED=' "$D/.env")" "1"
+eq "loop switch written exactly once" "$(grep -c '^AGENT_IN_THE_LOOP_ENABLED=' "$D/.env")" "1"
+eq "the marker is written once" "$(grep -cxF "$MARK" "$D/.env")" "1"
+# The operator turns both off after that: a later run keeps their choice.
+sed -i 's/^MCP_SERVER_ENABLED=true/MCP_SERVER_ENABLED=false/; s/^AGENT_IN_THE_LOOP_ENABLED=true/AGENT_IN_THE_LOOP_ENABLED=false/' "$D/.env"
+run_secrets "$D"
+eq "an operator's later off is kept (MCP)" "$(val "$D" MCP_SERVER_ENABLED)" "false"
+eq "an operator's later off is kept (loop)" "$(val "$D" AGENT_IN_THE_LOOP_ENABLED)" "false"
+eq "still one marker" "$(grep -cxF "$MARK" "$D/.env")" "1"
+rm -rf "$D"
+
+# An install from an earlier release: MCP_SERVER_ENABLED=false written by redamon.sh, no marker.
+D="$(mktemp -d)"
+printf 'MCP_SERVER_ENABLED=false\nOTHER=1\n' > "$D/.env"
+run_secrets "$D"
+eq "update: an old false is turned on" "$(val "$D" MCP_SERVER_ENABLED)" "true"
+eq "update: the loop switch is added on" "$(val "$D" AGENT_IN_THE_LOOP_ENABLED)" "true"
+eq "update: one MCP line" "$(grep -c '^MCP_SERVER_ENABLED=' "$D/.env")" "1"
+hasF "$D/.env" "OTHER=1" "update: the rest of .env is kept"
+run_secrets "$D"
+eq "a second update changes nothing" "$(val "$D" MCP_SERVER_ENABLED)$(grep -cxF "$MARK" "$D/.env")" "true1"
+rm -rf "$D"
+
+# A single-host deploy (it seeds MCP_ALLOWED_ORIGIN) keeps its own MCP default.
+D="$(mktemp -d)"
+printf 'MCP_SERVER_ENABLED=false\nMCP_ALLOWED_ORIGIN=https://redamon.example.org\n' > "$D/.env"
+run_secrets "$D"
+eq "deployed host: MCP server stays off" "$(val "$D" MCP_SERVER_ENABLED)" "false"
+eq "deployed host: loop switch on (inert while MCP is off)" "$(val "$D" AGENT_IN_THE_LOOP_ENABLED)" "true"
+rm -rf "$D"
+D="$(mktemp -d)"
+printf 'MCP_ALLOWED_ORIGIN=https://redamon.example.org\n' > "$D/.env"
+run_secrets "$D"
+eq "deployed host without the line: written off" "$(val "$D" MCP_SERVER_ENABLED)" "false"
+rm -rf "$D"
+# deploy.sh's own mark is enough on its own.
+D="$(mktemp -d)"
+printf 'MCP_SERVER_ENABLED=false\nREDAMON_SINGLE_HOST_DEPLOY=true\n' > "$D/.env"
+run_secrets "$D"
+eq "deploy mark: MCP server stays off" "$(val "$D" MCP_SERVER_ENABLED)" "false"
+rm -rf "$D"
+# A server deployed before either key was seeded still has deploy.sh's overlay copy.
+D="$(mktemp -d)"
+printf 'MCP_SERVER_ENABLED=false\n' > "$D/.env"
+mkdir -p "$D/home/.redamon-deploy" && : > "$D/home/.redamon-deploy/docker-compose.prod.yml"
+run_secrets "$D"
+eq "deployed host known only by ~/.redamon-deploy: MCP server stays off" "$(val "$D" MCP_SERVER_ENABLED)" "false"
+eq "deployed host known only by ~/.redamon-deploy: loop switch on" "$(val "$D" AGENT_IN_THE_LOOP_ENABLED)" "true"
+rm -rf "$D"
+# Keeping it off is said, never silent (a local .env with MCP_ALLOWED_ORIGIN set by hand).
+D="$(mktemp -d)"
+printf 'MCP_SERVER_ENABLED=false\nMCP_ALLOWED_ORIGIN=https://redamon.example.org\n' > "$D/.env"
+mkdir -p "$D/home"
+NOTE="$( cd "$REPO_ROOT" && ENVDIR="$D" HOME="$D/home" bash -c '
     set -uo pipefail
     source ./redamon.sh
     set +e
-    info(){ :; }; warn(){ :; }; error(){ :; }; success(){ :; }
+    info(){ echo "INFO $*"; }; warn(){ :; }; error(){ :; }; success(){ :; }
     SCRIPT_DIR="$ENVDIR"
     ensure_auth_secrets
-' >/dev/null 2>&1 )
-eq "still exactly one entry" "$(grep -c '^MCP_SERVER_ENABLED=' "$D/.env")" "1"
-hasF "$D/.env" "MCP_SERVER_ENABLED=true" "an operator's opt-in is not reverted"
+' 2>/dev/null | grep -c 'MCP_SERVER_ENABLED stays false')"
+eq "the operator is told why the MCP server stays off" "$NOTE" "1"
 rm -rf "$D"
+
+echo
+echo "== the Agent in the Loop switch reaches both services, default ON =="
+AGENT_BLOCK="$(awk '/^  agent:/{f=1} f&&/^  [a-z_-]+:$/&&!/^  agent:/{f=0} f' "$COMPOSE")"
+for blk in AGENT_BLOCK WEBAPP_BLOCK; do
+    if grep -qE '^[[:space:]]+AGENT_IN_THE_LOOP_ENABLED: \$\{AGENT_IN_THE_LOOP_ENABLED:-true\}' <<<"${!blk}"; then
+        ok "${blk%_BLOCK} gets AGENT_IN_THE_LOOP_ENABLED, default true"
+    else
+        bad "${blk%_BLOCK} gets AGENT_IN_THE_LOOP_ENABLED" "absent or not :-true" ':${AGENT_IN_THE_LOOP_ENABLED:-true}'
+    fi
+done
+grep -qE '^[[:space:]]+MCP_RATE_LOOP_PER_MIN: ' <<<"$WEBAPP_BLOCK" \
+    && ok "MCP_RATE_LOOP_PER_MIN reaches the webapp" \
+    || bad "MCP_RATE_LOOP_PER_MIN reaches the webapp" "absent" "present"
 
 echo
 echo "== the preflight refuses to enable MCP on a fail-open agent =="

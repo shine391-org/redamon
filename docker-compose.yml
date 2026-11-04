@@ -884,6 +884,32 @@ services:
       # D10: fs_extract zip/tar/gz decompression caps (generous safe defaults).
       FS_EXTRACT_MAX_ENTRIES: ${FS_EXTRACT_MAX_ENTRIES:-5000}
       FS_EXTRACT_MAX_TOTAL_BYTES: ${FS_EXTRACT_MAX_TOTAL_BYTES:-524288000}
+      # Workspace folder/archive uploads and URL imports (README.DEV §8).
+      WORKSPACE_IMPORT_MAX_BYTES: ${WORKSPACE_IMPORT_MAX_BYTES:-2147483648}
+      WORKSPACE_IMPORT_MAX_ENTRIES: ${WORKSPACE_IMPORT_MAX_ENTRIES:-50000}
+      WORKSPACE_IMPORT_MIN_FREE_BYTES: ${WORKSPACE_IMPORT_MIN_FREE_BYTES:-1073741824}
+      WORKSPACE_IMPORT_MAX_JOBS: ${WORKSPACE_IMPORT_MAX_JOBS:-4}
+      WORKSPACE_IMPORT_WORKERS: ${WORKSPACE_IMPORT_WORKERS:-2}
+      # Must stay well under the 60 MB request cap of the Next proxy and nginx.
+      WORKSPACE_UPLOAD_CHUNK_BYTES: ${WORKSPACE_UPLOAD_CHUNK_BYTES:-8388608}
+      WORKSPACE_UPLOAD_SESSION_IDLE_SEC: ${WORKSPACE_UPLOAD_SESSION_IDLE_SEC:-3600}
+      # Kill switch for import-from-URL (any value but true/1/yes turns it off).
+      WORKSPACE_URL_IMPORT_ENABLED: ${WORKSPACE_URL_IMPORT_ENABLED:-true}
+      # The scan dispatcher's disk floor: imports never take the disk below it.
+      JOB_QUEUE_MIN_FREE_DISK: ${JOB_QUEUE_MIN_FREE_DISK:-10737418240}
+      # Agent in the Loop: an external MCP client answers the model calls of a
+      # chat run (agentic/agent_in_the_loop). On by default; the webapp reads
+      # the same switch. The tunables are bounded in code (a bad value warns).
+      AGENT_IN_THE_LOOP_ENABLED: ${AGENT_IN_THE_LOOP_ENABLED:-true}
+      LOOP_STEP_DEADLINE_S: ${LOOP_STEP_DEADLINE_S:-900}
+      LOOP_LEASE_S: ${LOOP_LEASE_S:-90}
+      LOOP_WAIT_MAX_S: ${LOOP_WAIT_MAX_S:-55}
+      LOOP_PAGE_CHARS: ${LOOP_PAGE_CHARS:-40000}
+      LOOP_ANSWER_MAX_CHARS: ${LOOP_ANSWER_MAX_CHARS:-262144}
+      LOOP_MAX_OPEN_STEPS_PER_USER: ${LOOP_MAX_OPEN_STEPS_PER_USER:-16}
+      LOOP_NO_DRIVER_GRACE_S: ${LOOP_NO_DRIVER_GRACE_S:-300}
+      LOOP_DRIVER_SEEN_S: ${LOOP_DRIVER_SEEN_S:-60}
+      LOOP_STATE_TTL_S: ${LOOP_STATE_TTL_S:-3600}
       # MCP tool servers (internal docker network)
       MCP_NETWORK_RECON_URL: http://kali-sandbox:8000/sse
       MCP_NUCLEI_URL: http://kali-sandbox:8002/sse
@@ -1114,14 +1140,15 @@ services:
       SCAN_SCHEDULE_MIN_INTERVAL_MINUTES: ${SCAN_SCHEDULE_MIN_INTERVAL_MINUTES:-}
       SCAN_SCHEDULE_ASSUMED_RUN_MINUTES: ${SCAN_SCHEDULE_ASSUMED_RUN_MINUTES:-}
       # Inbound MCP server (/api/mcp-server): an external AI agent connecting IN
-      # and acting as one RedAmon user. DEFAULT OFF - a new authenticated inbound
-      # surface must be switched on deliberately, never inherited by upgrading.
-      # redamon.sh refuses to enable it while INTERNAL_API_KEY is unset or
+      # and acting as one RedAmon user. DEFAULT ON, so Agent in the Loop and the
+      # MCP tools work out of the box; nothing answers until a person mints a
+      # token. redamon.sh writes it into .env (an update turns an old false on
+      # once). The single-host deploy keeps its own default OFF. redamon.sh refuses to enable it while INTERNAL_API_KEY is unset or
       # `changeme`, because the agent's auth (and so the whole graph-isolation
       # story) fails open in that state and its port is on 0.0.0.0 in this file.
       # Every knob below passes through EMPTY so unset keeps the safe code
       # default; they are wired HERE because the webapp has NO env_file.
-      MCP_SERVER_ENABLED: ${MCP_SERVER_ENABLED:-false}
+      MCP_SERVER_ENABLED: ${MCP_SERVER_ENABLED:-true}
       MCP_TOKEN_RETENTION_DAYS: ${MCP_TOKEN_RETENTION_DAYS:-}
       MCP_RATE_READ_PER_MIN: ${MCP_RATE_READ_PER_MIN:-}
       MCP_RATE_QUERY_PER_MIN: ${MCP_RATE_QUERY_PER_MIN:-}
@@ -1134,11 +1161,15 @@ services:
       MCP_DISABLED_TOOLS: ${MCP_DISABLED_TOOLS:-}
       MCP_LLM_DAILY_BUDGET: ${MCP_LLM_DAILY_BUDGET:-}
       # Sandbox commands (kali_exec). DEFAULT ON, and still independent of
-      # MCP_SERVER_ENABLED: the server stays off until enabled, and a token needs
-      # the kali:exec permission before any command runs. Set false to withdraw
+      # MCP_SERVER_ENABLED: a token needs the kali:exec permission before any
+      # command runs. Set false to withdraw
       # the sandbox from every token on this deployment.
       MCP_KALI_EXEC_ENABLED: ${MCP_KALI_EXEC_ENABLED:-true}
       MCP_RATE_EXEC_PER_MIN: ${MCP_RATE_EXEC_PER_MIN:-}
+      # Agent in the Loop (loop_* tools). ON by default, and inert unless
+      # MCP_SERVER_ENABLED is on too. Must match the agent's value.
+      AGENT_IN_THE_LOOP_ENABLED: ${AGENT_IN_THE_LOOP_ENABLED:-true}
+      MCP_RATE_LOOP_PER_MIN: ${MCP_RATE_LOOP_PER_MIN:-120}
       # The deployment's own public origin, WITH the port when non-default.
       # Empty locally: the route then falls back to deriving it from the request,
       # which is correct when nothing sits in front of the app.
