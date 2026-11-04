@@ -65,11 +65,11 @@ class FakeCallback:
     async def on_phase(self, phase, description, progress=0):
         self.phases.append(phase)
 
-    async def on_error(self, message, recoverable=True, code=""):
-        self.errors.append({"message": message, "code": code})
+    async def on_error(self, message, recoverable=True, code="", **details):
+        self.errors.append({"message": message, "code": code, **details})
 
-    async def on_complete(self, total, by_severity, by_type, summary):
-        self.completed = {"total": total, "summary": summary}
+    async def on_complete(self, total, by_severity, by_type, summary, **notices):
+        self.completed = {"total": total, "summary": summary, **notices}
 
     async def on_finding(self, finding):
         pass
@@ -674,6 +674,80 @@ class TestAReviewLastsUntilTheEvidenceChanges(unittest.TestCase):
         v1 = {r["id"]: r for r in later.written}["v1"]
         self.assertEqual(v1["score"], v1["math_score"])
         self.assertEqual(v1["decided_by"], "rules")
+
+
+class _RateLimited(Exception):
+    status_code = 429
+
+
+class _RefusingLLM:
+    """A provider that answers every review call with an error."""
+
+    def __init__(self, error):
+        self.error = error
+
+    async def ainvoke(self, _messages):
+        raise self.error
+
+
+class TestAFailedReviewIsReported(unittest.TestCase):
+    """G-6: a run whose reviews all failed used to complete looking clean."""
+
+    def test_the_complete_event_counts_failed_batches_with_the_provider_status(self):
+        h = Harness(llm=_RefusingLLM(_RateLimited("quota for key sk-live-123")))
+        h.run(dict(REVIEW_SETTINGS))
+        self.assertEqual(h.client.finished["status"], "completed")
+        self.assertGreaterEqual(h.callback.completed["review_failed"], 1)
+        self.assertEqual(h.callback.completed["provider_status"], 429)
+        self.assertEqual(h.callback.completed["error_class"], "_RateLimited")
+        self.assertNotIn("sk-live-123", json.dumps(h.callback.completed))
+        self.assertEqual(h.client.finished["summary"]["review_failed"],
+                         h.callback.completed["review_failed"])
+
+    def test_a_model_that_could_not_be_set_up_is_reported(self):
+        h = Harness(llm=None)
+        h.orch.llm_setup_failure = {"error_class": "ValueError"}
+        h.run(dict(REVIEW_SETTINGS))
+        self.assertEqual(h.callback.completed["review_unavailable"], 1)
+        self.assertEqual(h.callback.completed["error_class"], "ValueError")
+
+    def test_a_run_with_no_review_expected_carries_no_notice(self):
+        h = Harness(llm=None)
+        h.run(dict(NO_MODEL))
+        self.assertNotIn("review_failed", h.callback.completed)
+        self.assertNotIn("review_unavailable", h.callback.completed)
+
+    def test_a_clean_review_carries_no_notice(self):
+        h = Harness(llm=FakeLLM(_doubtful_v1))
+        h.run(dict(REVIEW_SETTINGS))
+        self.assertNotIn("review_failed", h.callback.completed)
+
+
+class TestARefusalSaysWhy(unittest.TestCase):
+    """G-33/G-49: the webapp's own refusal and the code reach the tab."""
+
+    def test_an_authorize_refusal_carries_the_webapp_reason_and_status(self):
+        refusal = TriageRunAborted(
+            "busy", "authorize_failed",
+            public_reason="A triage run is already in progress for this project.",
+            details={"upstream_status": 409})
+        h = Harness(run_client=FakeRunClient(authorize_error=refusal))
+        h.run()
+        error = h.callback.errors[0]
+        self.assertEqual(error["code"], "authorize_failed")
+        self.assertEqual(error["upstream_status"], 409)
+        self.assertTrue(error["message"].startswith(
+            "The triage run could not be authorised and did not start."))
+        self.assertIn("already in progress", error["message"])
+
+    def test_a_lost_run_has_its_own_sentence(self):
+        h = Harness(run_client=FakeRunClient(
+            publish_error=TriageRunAborted("stale", "agent_lost")))
+        h.run()
+        error = h.callback.errors[0]
+        self.assertEqual(error["code"], "agent_lost")
+        self.assertIn("stopped checking in", error["message"])
+        self.assertNotIn("Something went wrong", error["message"])
 
 
 class TestExternalReviews(unittest.TestCase):

@@ -1,8 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError, safeErrorCode, upstreamFailure } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { getGraphSession } from '../../graph/neo4j'
 import { requireEffectiveUser, requireConversationAccess } from '@/lib/access'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+
+/** A cleanup step that failed while the conversation itself was deleted. */
+interface DeleteWarning {
+  step: 'agent_stop' | 'graph_cleanup'
+  code: string
+  /** The agent's HTTP status, when it answered. */
+  status?: number
+}
 
 // GET /api/conversations/[id] - Get conversation with all messages
 export async function GET(
@@ -35,11 +44,7 @@ export async function GET(
 
     return NextResponse.json(conversation)
   } catch (error) {
-    console.error('Failed to fetch conversation:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch conversation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch conversation')
   }
 }
 
@@ -73,11 +78,7 @@ export async function PATCH(
 
     return NextResponse.json(conversation)
   } catch (error) {
-    console.error('Failed to update conversation:', error)
-    return NextResponse.json(
-      { error: 'Failed to update conversation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update conversation')
   }
 }
 
@@ -109,19 +110,29 @@ export async function DELETE(
     // re-MERGEing its AttackChain into Neo4j, so the graph repopulated moments
     // after we cleared it (and it kept burning LLM tokens). Cancelling the task
     // before the graph/DB delete makes the cleanup stick. Best-effort.
+    // Each failed step is reported with the success: the agent may still be
+    // running, or chain nodes may remain in the graph.
+    const warnings: DeleteWarning[] = []
     try {
-      const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://agent:8080'
-      await fetch(`${AGENT_API_URL}/agent-session/stop`, {
+      const stop = await agentFetch('/agent-session/stop', {
         method: 'POST',
-        headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_id: conversation.userId,
           project_id: conversation.projectId,
           session_id: conversation.sessionId,
         }),
       })
+      if (!stop.ok) {
+        console.error(`Failed to stop agent session before delete (continuing): HTTP ${stop.status}`)
+        warnings.push({ step: 'agent_stop', code: 'agent_error', status: stop.status })
+      }
     } catch (stopError) {
       console.error('Failed to stop agent session before delete (continuing):', stopError)
+      const code = stopError instanceof AgentUnreachableError
+        ? upstreamFailure('agent', stopError.cause_, '').body.code
+        : safeErrorCode(stopError)
+      warnings.push({ step: 'agent_stop', code })
     }
 
     // Delete attack chain nodes from Neo4j (fire-and-forget - don't block on failure)
@@ -146,17 +157,14 @@ export async function DELETE(
       }
     } catch (neo4jError) {
       console.error('Failed to delete attack chain nodes from Neo4j (continuing):', neo4jError)
+      warnings.push({ step: 'graph_cleanup', code: safeErrorCode(neo4jError) })
     }
 
     // Delete conversation + cascaded messages from Postgres
     await prisma.conversation.delete({ where: { id } })
 
-    return NextResponse.json({ success: true })
+    return NextResponse.json(warnings.length ? { success: true, warnings } : { success: true })
   } catch (error) {
-    console.error('Failed to delete conversation:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete conversation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete conversation')
   }
 }

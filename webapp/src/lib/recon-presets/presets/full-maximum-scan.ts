@@ -226,6 +226,8 @@ Pentesters running a final comprehensive sweep on a target they have full author
     jsReconConcurrency: 15,
     jsReconValidateKeys: true,
     jsReconValidationTimeout: 10,
+    jsReconTrufflehogEnabled: true,
+    jsReconTrufflehogResults: ['verified', 'unknown', 'unverified'],
     jsReconExtractEndpoints: true,
     jsReconRegexPatterns: true,
     jsReconSourceMaps: true,
@@ -330,6 +332,8 @@ Pentesters running a final comprehensive sweep on a target they have full author
 
     // --- All 28 security checks ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: true,
     securityCheckDirectIpHttp: true,
     securityCheckDirectIpHttps: true,

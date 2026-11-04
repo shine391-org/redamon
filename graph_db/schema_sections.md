@@ -281,6 +281,10 @@ Additional properties present on this node type, not yet described:
 - Endpoint probe (set by js_recon on endpoints it extracted from JavaScript, when JS_RECON_VALIDATE_ENDPOINTS is on):
   - validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get) or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme). "not_hittable" (dead) and "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell) are never written: the endpoint is dropped
   - js_status_code (integer): the status js_recon's own probe got; status_code stays http_probe's when both probed
+- Anonymous status (set by the route exposure scan):
+  - anon_status (integer): the status an anonymous GET of this route got; compare with status_code to see a route that answers without credentials
+  - anon_status_at (datetime): when anon_status was measured
+  - generated_by (string): on an Endpoint the route exposure scan created, the generator that found it ("seed", "version", "sibling", "catalog", "cross_host"); such an Endpoint carries source "route_exposure" and was answering 2xx with content
 - Path template (set by js_recon when the JS built the URL from a template literal):
   - path_template (string): the literal as written, e.g. "/api/users/${id}"; `path` is then its literal prefix ("/api/users/"). Absent for a plain literal
 Additional properties present on this node type, not yet described:
@@ -384,7 +388,9 @@ JS Recon secret properties (source="js_recon" only):
 - key_type (string): the matching pattern's category
 - confidence (string): high, medium, low
 - validation_status (string): validated (the provider accepted it), rejected (the provider refused it), unknown (no verdict: a timeout, a 429 or 5xx, a 403, a skipped call), format_invalid, format_validated, incomplete, unvalidated (no validator for it), skipped. Nodes written before these states hold invalid or error
-- detection_method (string): "regex"
+- detection_method (string): "regex", or "trufflehog" for a key only TruffleHog found (JS Recon's TruffleHog engine, off by default)
+- line_number (integer): the line of the file the key is on (a minified bundle is one line); absent on a TruffleHog hit it decoded (base64 in `atob()`, unicode escapes) and on nodes written before it existed
+- alternate_names (list of strings): other rules that matched the same key, e.g. a generic rule whose match held this key, and `TruffleHog:<Detector>` when TruffleHog found it too. Absent on nodes written before it existed
 - context (string): the code around the match, at most 400 characters, with this key and every other secret-shaped value in it shown redacted
 - public_client_key (boolean): true for a key that is public by design (a browser key, a publishable key, a DSN, a write-only analytics key); written at severity info. Absent on nodes written before it existed: readers then also treat a secret_type in the public-client list as public
 
@@ -419,7 +425,7 @@ Common properties (all sources):
 - id (string): unique identifier
 - name (string): vulnerability name
 - severity (string): "critical", "high", "medium", "low", "info" (lowercase!)
-- source (string): **"nuclei"** (DAST/web), **"gvm"** (network/OpenVAS), **"security_check"**, **"origin_discovery"** (origin server exposed behind a CDN/WAF; `type: "waf_bypass"`, carries `origin_discovery_method`, `origin_source`, `confidence_score`, `cdn_fronting`, `matched_ip`, `port`, `probe_url`; `url`/`matched_at` are the canonical port-less `https://<ip>`; the IP is linked via `HAS_ORIGIN` from the fronted Subdomain), **"netlas"** (passive NVD-based), **"graphql_scan"** (GraphQL security testing), **"takeover_scan"** (subdomain takeover via Subjack + Nuclei takeover templates), **"vhost_sni_enum"** (hidden virtual host / SNI routing anomalies via curl), **"cache_poisoning"** (web cache poisoning + web cache deception, confirmed by WCVS breadth + a native baseline→poison→clean persistence check; carries `cache_header`/`cache_param` (the unkeyed vector), `cache_impact` ("stored_xss"/"reflected_script"/"open_redirect"/"deception"/"dos"/"reflected"/"response_change"), `cache_technique`, `confidence` (0–1) + `confidence_tier` ("Confirmed"/"Strong"/"Tentative"), `cache_signals`, `poc_link`; linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`), **"ai_surface_recon"** (MCP tool-poisoning / prompt-injection-via-tool-description / data-exfiltration found by static YARA over MCP manifests; carries `ai_owasp_llm_id`, `ai_atlas_technique`, `type` like "mcp_tool_poisoning"), or **"garak"** / **"pyrit"** / **"giskard"** / **"promptfoo"** (AI Attack Surface — deterministic offensive testing of discovered LLM endpoints; `type` like "ai_attack_jailbreak"/"ai_attack_prompt_injection", carries `ai_owasp_llm_id` (LLM01..LLM10, or "safety" for toxicity/harmful), `ai_asr` (attack success rate 0–1), `ai_trials`, `ai_oracle_kind`, `ai_payload_class` like "garak-dan"/"pyrit-crescendo"/"promptfoo-beavertails", `ai_transcript_ref` (path to the native report), linked to the attacked `Endpoint` via `HAS_VULNERABILITY`; promptfoo runs broad red-team dataset plugins and reports per-plugin ASR as corroboration), or **"serialized_scan"** (deterministic recon detection of serialized-object data — native Java, polymorphic JSON, XMLDecoder/XStream, SnakeYAML, PHP, Python pickle, .NET BinaryFormatter/ViewState, Ruby Marshal, Hessian; writes an `info`-severity candidate carrying `needs_agent_confirmation: true` plus `deser_*` metadata, linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`; recon never deserializes, the agent's deserialization skill confirms the candidate out of band)
+- source (string): **"nuclei"** (DAST/web), **"gvm"** (network/OpenVAS), **"security_check"**, **"origin_discovery"** (origin server exposed behind a CDN/WAF; `type: "waf_bypass"`, carries `origin_discovery_method`, `origin_source`, `confidence_score`, `cdn_fronting`, `matched_ip`, `port`, `probe_url`; `url`/`matched_at` are the canonical port-less `https://<ip>`; the IP is linked via `HAS_ORIGIN` from the fronted Subdomain), **"netlas"** (passive NVD-based), **"graphql_scan"** (GraphQL security testing), **"takeover_scan"** (subdomain takeover via Subjack + Nuclei takeover templates), **"vhost_sni_enum"** (hidden virtual host / SNI routing anomalies via curl), **"cache_poisoning"** (web cache poisoning + web cache deception, confirmed by WCVS breadth + a native baseline→poison→clean persistence check; carries `cache_header`/`cache_param` (the unkeyed vector), `cache_impact` ("stored_xss"/"reflected_script"/"open_redirect"/"deception"/"dos"/"reflected"/"response_change"), `cache_technique`, `confidence` (0–1) + `confidence_tier` ("Confirmed"/"Strong"/"Tentative"), `cache_signals`, `poc_link`; linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`), **"ai_surface_recon"** (MCP tool-poisoning / prompt-injection-via-tool-description / data-exfiltration found by static YARA over MCP manifests; carries `ai_owasp_llm_id`, `ai_atlas_technique`, `type` like "mcp_tool_poisoning"), or **"garak"** / **"pyrit"** / **"giskard"** / **"promptfoo"** (AI Attack Surface — deterministic offensive testing of discovered LLM endpoints; `type` like "ai_attack_jailbreak"/"ai_attack_prompt_injection", carries `ai_owasp_llm_id` (LLM01..LLM10, or "safety" for toxicity/harmful), `ai_asr` (attack success rate 0–1), `ai_trials`, `ai_oracle_kind`, `ai_payload_class` like "garak-dan"/"pyrit-crescendo"/"promptfoo-beavertails", `ai_transcript_ref` (path to the native report), linked to the attacked `Endpoint` via `HAS_VULNERABILITY`; promptfoo runs broad red-team dataset plugins and reports per-plugin ASR as corroboration), or **"serialized_scan"** (deterministic recon detection of serialized-object data — native Java, polymorphic JSON, XMLDecoder/XStream, SnakeYAML, PHP, Python pickle, .NET BinaryFormatter/ViewState, Ruby Marshal, Hessian; writes an `info`-severity candidate carrying `needs_agent_confirmation: true` plus `deser_*` metadata, linked to the affected `Endpoint`/`BaseURL` via `HAS_VULNERABILITY`; recon never deserializes, the agent's deserialization skill confirms the candidate out of band), or **"route_exposure"** (recon's route exposure scan: the routes recon found and the ones it generates, requested anonymously and, where the AuthProfile covers the host, logged in; writes two lifecycles under one source, `info`-severity candidates carrying `needs_agent_confirmation: true` (exposure_kind "anonymous_access" / "sensitive_data") for the agent to confirm, and findings a deterministic signature proves (exposed `.git`/`.env`/config/backup files, debug consoles and endpoints, debug pages, route catalogs, secrets in a response) with their real severity; linked via `HAS_VULNERABILITY` from the `Endpoint` (candidates) and the `BaseURL` (every finding; artifacts attach to the BaseURL only))
 - description (string): vulnerability description
 - cvss_score (float): 0.0 to 10.0
 
@@ -477,6 +483,33 @@ Serialized-object detection properties (source="serialized_scan"):
 - deser_jev_exploitability (integer, 0-100): Jev's estimate that the blob reaches a server-side deserializer from attacker input; the deserialization skill confirms the highest first
 - deser_jev_source (string): "jev_classifier" when Jev wrote the three fields above
 - Typical query: "list serialized-object candidates awaiting confirmation, most reachable first" → `MATCH (e:Endpoint)-[:HAS_VULNERABILITY]->(v:Vulnerability {source:'serialized_scan'}) WHERE v.needs_agent_confirmation = true AND NOT (:ChainFinding)-[:CONFIRMS]->(v) RETURN e.url, v.id, v.deser_format, v.deser_location, v.deser_jev_exploitability ORDER BY CASE v.deser_jev_format WHEN 'none' THEN -1 ELSE coalesce(v.deser_jev_exploitability, -1) END DESC, v.id`
+
+Route exposure properties (source="route_exposure"):
+- exposure_kind (string): "anonymous_access" (a route answered 2xx without credentials where authentication was expected or the answer leaks data), "sensitive_data" (a 2xx answer, anonymous or logged in, carrying sensitive key names or other people's personal data), "cors_misconfig", "auth_cacheable" (candidates), or "vcs_exposure", "env_file", "config_file", "backup_file", "debug_console", "debug_endpoint", "debug_page", "route_catalog", "secret_in_response" (signature findings). Part of the node's identity with the base URL, path and method
+- type / vulnerability_type (string): "unauthenticated_endpoint", "sensitive_data_exposure", "cors_credentialed_origin_reflection", "authenticated_content_cacheable", "exposed_version_control", "exposed_env_file", "exposed_config_file", "exposed_backup_file", "exposed_debug_console", "exposed_debug_endpoint", "debug_error_page", "exposed_route_catalog", "secret_exposure"
+- needs_agent_confirmation (boolean): true on a candidate (anonymous_access, sensitive_data, cors_misconfig, auth_cacheable). Recon flags that a route answers anonymously or returns too much, not that the data is meant to be private; the candidate stays `severity: "info"` (T4) until the agent confirms it with a proof-typed `(:ChainFinding{finding_type:'vulnerability_confirmed'})-[:CONFIRMS]->(v)` edge, which promotes it to T1. Reports and Insights exclude a still-pending candidate. false on a signature finding, which carries its real severity
+- route_class (string): "internal_api", "debug_management", "admin_function", "data_export", "old_version", "uploaded_content", "client_gated" or "unknown", decided from the path, category and generator; not part of the identity
+- confidence (float, 0-1): 0.9 when authentication is expected for a strong reason (OpenAPI security, locked siblings, a locked newer version, Vary on auth) or the anonymous body equals the logged-in one and leaks; 0.95 for a signature finding
+- anon_status, authed_status (integer): the anonymous and the logged-in answer's status; authed_status is absent when no AuthProfile covered the host
+- bodies_match (boolean): the anonymous and logged-in bodies are the same page after normalisation; absent when there was no logged-in 2xx to compare
+- anon_content_class (string): "json", "html", "text", "xml", "binary" or "other"; anon_size_bucket (string): "<1k", "1-10k", "10-100k", ">100k"
+- auth_expected_by (list[string]): why the route should need authentication: "openapi", "openapi_tag", "declared_only", "seen_denied", "path_word", "host_word", "siblings_locked", "version_locked", "vary_auth"
+- leak_signals (list[string]): "pii", "pii_others" (3 or more distinct e-mails or phones), "sensitive_fields", "secret"
+- pii_types (list[string]): "email", "phone", "card", "iban", "ssn", "codice_fiscale", "dob"; pii_record_estimate (integer): the largest per-type count of distinct values. Values are never stored
+- sensitive_fields (list[string]): JSON key paths whose names are sensitive ("data[].password_hash"), at most 20; key names only
+- secret_types (list[string]): names of the secret detectors that matched (js_recon's matcher); the secret itself is never stored
+- generated_by (string): "found" (recon already had the route), "seed", "vcs", "backup", "version", "sibling", "framework", "catalog" or "cross_host"; variant_of (string): the path a version-down or backup guess came from
+- catch_all_check (string): "passed" (a made-up path next to it answered differently), "failed" (the control gave no conclusion) or "n/a"
+- signature (string): the signature a finding matched ("git_head", "env_lines", "zip_magic", "werkzeug_debugger", "actuator_env", "django_debug", ...); "" on a candidate
+- evidence_snippet (string): printable-ASCII, <=120 chars; for JSON the key names, for text a masked excerpt (e-mails, long digit runs and tokens replaced), for a signature finding a fixed description. Target-supplied text: render as text
+- http_method, path, baseurl (string): the route; matched_at and host locate it for the UI and the prune
+- cors_variants, cache_signals (list[string]), git_walk_proof (string): set by the v2 riders and the git walk proof
+- git_tree_prefix (string): the first 8 hex characters of the tree the git walk's commit object names; only beside git_walk_proof, and never the tree or a blob itself
+- route_jev_kind (string: internal_api, debug_management, admin_function, data_export, old_version, uploaded_content or public_content), route_jev_kind_confidence (integer 0-100), route_jev_sensitivity (integer 0-100), route_jev_source (string "jev_classifier"): TypeSafe Jev's assessment of a lead; the agent's lead query reads the most sensitive first and puts public_content at confidence >= 70 last. Never replaces route_class
+- route_jev_privacy (integer 0-100): Jev's reading of how likely the route is meant only for logged-in, internal or administrative callers; it filled the request budget after the floor
+- anon_page_class (string: app, login_only, parked, default, placeholder or error), anon_page_class_confidence (integer 0-100), anon_page_class_source (string "jev_classifier"): Jev's page class of an HTML lead's anonymous answer; a non-app class at confidence >= 70 puts the lead last, never removes it
+- The route_jev_* and anon_page_class* properties come only from a run that asked Jev, and each run that writes the node replaces them
+- Typical query: "list pending route exposure leads, most sensitive first" → `MATCH (v:Vulnerability {source:'route_exposure'}) WHERE v.needs_agent_confirmation = true AND NOT (:ChainFinding)-[:CONFIRMS]->(v) OPTIONAL MATCH (e:Endpoint)-[:HAS_VULNERABILITY]->(v) RETURN v.id, v.exposure_kind, v.route_class, v.matched_at, v.anon_status, v.authed_status, v.auth_expected_by, v.leak_signals ORDER BY coalesce(v.route_jev_sensitivity, -1) DESC, v.confidence DESC, v.id`
 
 GVM-specific properties (source="gvm"):
 - oid (string): OpenVAS NVT OID
@@ -969,9 +1002,9 @@ Graph hierarchy: Domain/BaseURL -> JS file node -> findings/secrets/endpoints
 
 Note: JS Recon also creates Secret nodes with source='js_recon' and extra fields:
 - validation_status (string): validated, rejected, unknown, format_invalid, format_validated, incomplete, unvalidated, skipped (legacy: invalid, error)
-- validation_info (string): JSON with validation details (scope, account info)
+- validation_info (string): JSON with validation details (scope, account info); with TruffleHog on, a `trufflehog` object (detector, verified, error_class, allowlisted extra), never a key value. `checked_by: "trufflehog"` marks a status TruffleHog decided, which is only ever `validated` or `unknown`
 - confidence (string): high, medium, low
-- detection_method (string): regex (or "ai_sdk_catalogue" when matched by Phase 6)
+- detection_method (string): regex, trufflehog (found by TruffleHog only), or "ai_sdk_catalogue" when matched by Phase 6
 - key_type (string): category of secret (cloud, payment, auth, etc.)
 - ai_provider (string, optional): set when the secret matches an AI provider
    key shape via Phase 6 AI SDK detection (e.g. "OpenAI SDK constructor",
@@ -1136,6 +1169,7 @@ not so you can query for one.
 - `(ui:UserInput)-[:PRODUCED]->(s:Subdomain)` - Partial recon run produced this subdomain
 - `(ui:UserInput)-[:PRODUCED]->(i:IP)` - Partial recon run produced this IP
 - `(ui:UserInput)-[:PRODUCED]->(e:Endpoint)` - Endpoint declared by an API specification document the operator gave a partial OpenAPI run
+- `(ui:UserInput)-[:PRODUCED]->(v:Vulnerability)` - Route exposure finding a partial run wrote for a base URL the operator typed
 - `(d:Domain)-[:HAS_EXTERNAL_DOMAIN]->(ed:ExternalDomain)` - Domain encountered foreign domain during recon
 - `(s:Subdomain)-[:BELONGS_TO]->(d:Domain)` - Subdomain belongs to Domain
 - `(d:Domain)-[:HAS_IP]->(i:IP)` - An address uncover's org-wide search tied to this org Domain, with no hostname to hang it on. NOT the apex's A record: the apex's own addresses are on `Subdomain {name: d.name}` via RESOLVES_TO, when the apex is a target
@@ -1290,3 +1324,52 @@ Note: Bridge relationships are only created for tool-execution steps. Steps usin
 - `(f:ChainFinding)-[:FINDING_RELATES_CVE]->(c:CVE)` - Finding relates to CVE
 - `(f:ChainFinding)-[:CONFIRMS]->(v)` - the agent proved this recon finding (Vulnerability, Secret, MultiscannerFinding, GithubSecret, GithubSensitiveFile, JsReconFinding, MalPackageFinding or ExploitGvm); it is why that finding shows as proven on the Priority Board
 
+
+# Active Directory (BloodHound ingest) Nodes (agent tool bloodhound_ingest, post-exploitation)
+Imported from BloodHound 4 collector JSON (bloodhound-python / SharpHound) by the
+`bloodhound_ingest` agent tool. Entity nodes: the tenant triple
+(object_identifier + user_id + project_id) is the MERGE key, so re-ingesting
+the same collector files refreshes instead of duplicating.
+
+**ADUser** - A directory user principal from the collector's users file
+- object_identifier (string): BloodHound ObjectIdentifier (SID); part of the uniqueness key
+- name (string): collector principal name, e.g. `JSMITH@CORP.EXAMPLE.COM`
+- domain (string): collector domain, e.g. `CORP.EXAMPLE.COM`
+- sam (string): sAMAccountName
+- dn / description / enabled / admincount / spn (string/bool/list): selected flat collector properties
+- source (string): 'bloodhound_ingest' (provenance, first writer)
+
+**ADGroup** - A directory group; nested groups carry MEMBER_OF edges too
+- object_identifier (string): SID; part of the uniqueness key
+- name / domain / sam / dn / description / admincount: as on ADUser
+
+**ADComputer** - A machine account from the collector's computers file
+- object_identifier (string): SID; part of the uniqueness key
+- name / domain / sam / dn / os / haslaps: as on ADUser; os = operatingSystem
+
+### Active Directory (BloodHound ingest) Relationships
+- `(p)-[:MEMBER_OF]->(g:ADGroup)` - principal (ADUser/ADGroup) is a member of the group (collector MemberOf)
+- `(g:ADGroup)-[:HAS_MEMBER]->(p)` - group contains principal (collector Members; the reverse view)
+- `(u:ADUser)-[:HAS_SESSION]->(c:ADComputer)` - user had a session on the computer (collector Sessions)
+- All three carry source = 'bloodhound_ingest' on creation; MERGE on endpoint pair, idempotent per ingest.
+### Credential Nodes (agent tool mimikatz_parse, post-exploitation)
+Imported from mimikatz transcripts by the `mimikatz_parse` agent tool. Entity
+node: the tenant key (kind, username, domain, value + user_id + project_id) is
+the MERGE key, so re-parsing the same transcript refreshes instead of
+duplicating. Full secret values live ONLY here and in the workspace file —
+never in tool responses or logs.
+
+**Credential** - An auth material captured from a foothold
+- kind (string): ntlm | lm | sha1 | plaintext; part of the uniqueness key
+- username (string): principal the credential belongs to; part of the key
+- domain (string): domain of the principal (may be empty); part of the key
+- value (string): the hash/plaintext itself; part of the key
+- rid (int, optional): relative identifier when the transcript carried one
+- origin_host (string, optional): host the dump came from (kept even when the
+  graph does not know that host)
+- source (string): 'mimikatz_parse' (provenance, first writer)
+
+### Credential Relationships
+- `(c:Credential)-[:ORIGIN]->(h:Subdomain)` - the credential was dumped on that
+  host; attached only when the graph already knows the host (the tool never
+  merges anchor nodes). Carries source = 'mimikatz_parse'.

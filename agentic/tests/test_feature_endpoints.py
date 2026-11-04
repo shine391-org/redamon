@@ -189,12 +189,51 @@ def test_a_transient_failure_keeps_the_model(api, path, body, content):
     res = _post(api, path, {**body, "model": "gpt-5", "user_id": "u1"},
                 llm=_Llm(error=_Busy("overloaded")))
     if path == "/api/report/summarize":
-        # The summarizer degrades to empty narratives on a transient error.
+        # The summarizer degrades to empty narratives on a transient error, and says why.
         assert res.status_code == 200
+        assert res.json()["narratives_failed"] == "model_call_failed"
+        assert res.json()["provider_status"] == 529
+        assert res.json()["error_class"] == "_Busy"
+        assert "overloaded" not in res.text
     else:
         assert res.status_code == 502
         assert "code" not in res.json()
     assert res.json()["model_used"] == "gpt-5"
+
+
+@pytest.mark.parametrize("path,body,content", ENDPOINTS)
+def test_a_refused_key_carries_the_providers_class_and_status_never_its_text(
+        api, path, body, content):
+    res = _post(api, path, {**body, "model": "gpt-5", "user_id": "u1"},
+                llm=_Llm(error=_Refused(f"invalid api key {LEAK}")))
+    payload = res.json()
+    assert payload["provider_status"] == 401
+    assert payload["error_class"] == "_Refused"
+    assert LEAK not in res.text
+
+
+def test_an_unreadable_report_answer_is_marked_not_passed_off_as_empty(api):
+    res = _post(api, "/api/report/summarize", {"data": {"metrics": {}}, "model": "gpt-5", "user_id": "u1"},
+                llm=_Llm(content="Sure! Here are the narratives you asked for."))
+    assert res.status_code == 200
+    assert res.json()["narratives_failed"] == "unreadable_answer"
+    assert res.json()["executiveSummary"] == ""
+
+
+# The summarizer degrades to empty narratives and skill metadata answers per
+# item, so only the two endpoints that answer the failure itself are checked.
+@pytest.mark.parametrize("path,body,content",
+                         [e for e in ENDPOINTS if e[0] in ("/roe/parse", "/command-whisperer")])
+def test_a_transient_failure_says_which_status_the_provider_answered(api, path, body, content):
+    class RateLimitError(Exception):
+        status_code = 429
+
+    res = _post(api, path, {**body, "model": "gpt-5", "user_id": "u1"},
+                llm=_Llm(error=RateLimitError(f"slow down {LEAK}")))
+    assert res.status_code == 502
+    assert res.json()["provider_status"] == 429
+    assert res.json()["error_class"] == "RateLimitError"
+    assert LEAK not in res.text
 
 
 def test_the_providers_are_fetched_for_the_callers_user(api):

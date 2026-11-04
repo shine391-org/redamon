@@ -3,6 +3,7 @@
  * `TriageActionError` into the HTTP answer the Priority Board reads.
  */
 import { NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import {
   DECIDED_BY, FINDING_ID_RE, FINDING_LABELS, REVIEW_CURRENT, REVIEWED_VIA,
   TriageActionError, type BoardFilters,
@@ -13,8 +14,7 @@ export function actionErrorResponse(err: unknown): NextResponse {
     return NextResponse.json({ error: err.message, code: err.code, ...err.details },
                              { status: err.status })
   }
-  console.error('[triage] unexpected error:', err)
-  return NextResponse.json({ error: 'The triage request failed.' }, { status: 500 })
+  return internalError(err, 'The triage request failed.', { log: '[triage] unexpected error' })
 }
 
 /** A finding id and optional label, validated; or the 400 to send. */

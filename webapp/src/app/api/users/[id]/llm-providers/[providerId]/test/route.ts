@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
+import { internalError, readUpstreamBody, upstreamFailure } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; providerId: string }>
@@ -92,8 +93,20 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       { timeoutMs: hopBudgetMs(config.timeout) },
     )
 
-    const result = await agentResp.json()
-    return NextResponse.json(result, { status: agentResp.status })
+    // A test the agent ran answers `{success, error}` (200, or 400 when the
+    // provider refused), and is passed through as is. Any other body is the agent
+    // itself failing (FastAPI `{detail}` on a bad key or body, a plain-text 500);
+    // its text can quote an exception, so only its status and code go out.
+    const answered = await readUpstreamBody(agentResp)
+    if (answered.json && typeof answered.json.success === 'boolean') {
+      return NextResponse.json(answered.json, { status: agentResp.status })
+    }
+    return NextResponse.json({
+      success: false,
+      error: 'The agent could not test this provider',
+      code: answered.code ?? 'agent_error',
+      upstreamStatus: agentResp.status,
+    }, { status: 502 })
   } catch (error) {
     // The agent being down is an infrastructure outage, not a bad provider
     // config. Returning the raw `TypeError: fetch failed` here is what made
@@ -103,15 +116,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       // container logs would otherwise get the same bare 'TypeError: fetch
       // failed' stack that made #184 unreadable in the first place.
       console.error('LLM provider test: agent unreachable:', error.message, error.cause_)
-      return NextResponse.json(
-        { success: false, error: error.message },
-        { status: 503 }
-      )
+      const failure = upstreamFailure('agent', error.cause_, error.message)
+      return NextResponse.json({ success: false, ...failure.body }, { status: failure.status })
     }
-    console.error('Failed to test LLM provider:', error)
-    return NextResponse.json(
-      { success: false, error: String(error) },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to test LLM provider', { extra: { success: false } })
   }
 }

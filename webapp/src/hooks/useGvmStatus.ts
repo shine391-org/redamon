@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { GvmState, GvmStatus } from '@/lib/recon-types'
-import type { ScanStartError } from '@/lib/scanStartError'
+import { readScanStartError, scanStartNetworkError, type ScanStartError } from '@/lib/scanStartError'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 
 interface UseGvmStatusOptions {
   projectId: string | null
@@ -23,6 +24,15 @@ interface UseGvmStatusReturn {
   pauseGvm: () => Promise<GvmState | null>
   resumeGvm: () => Promise<GvmState | null>
   getLastStartError: () => ScanStartError | null
+  /** Why the last status poll failed ("<scan> status unavailable (code · HTTP n)"); null once one succeeds. */
+  statusError: string | null
+  /** Why the last start failed, with its code and status; null once a start begins. */
+  startError: string | null
+  /**
+   * Why the most recent stop/pause/resume failed ("reason (code · HTTP n)"), readable
+   * right after the call resolves to null; the `error` state only lands on the next render.
+   */
+  getLastActionError: () => string | null
 }
 
 const DEFAULT_POLLING_INTERVAL = 5000
@@ -39,6 +49,8 @@ export function useGvmStatus({
   const [state, setState] = useState<GvmState | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [startError, setStartError] = useState<string | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
 
   const previousStatusRef = useRef<GvmStatus | null>(null)
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
@@ -47,6 +59,7 @@ export function useGvmStatus({
   // the request resolves -- a poll landing mid-freeze would revert the button.
   const transitionRef = useRef(false)
   const lastStartErrorRef = useRef<ScanStartError | null>(null)
+  const lastActionErrorRef = useRef<string | null>(null)
 
   const onStatusChangeRef = useRef(onStatusChange)
   const onCompleteRef = useRef(onComplete)
@@ -64,14 +77,12 @@ export function useGvmStatus({
 
     try {
       const response = await fetch(`/api/gvm/${projectId}/status`)
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to fetch GVM status')
-      }
+      if (!response.ok) throw await readApiError(response, 'GVM status unavailable')
 
       const data: GvmState = await response.json()
       setState(data)
       setError(null)
+      setStatusError(null)
 
       if (previousStatusRef.current !== data.status) {
         onStatusChangeRef.current?.(data.status)
@@ -86,8 +97,11 @@ export function useGvmStatus({
       }
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      setError(errorMessage)
+      // The last known state stays: an orchestrator that did not answer says
+      // nothing about whether the scan is still running.
+      const message = toApiError(err, 'GVM status unavailable').message
+      setError(message)
+      setStatusError(message)
     }
   }, [projectId])
 
@@ -96,6 +110,7 @@ export function useGvmStatus({
 
     setIsLoading(true)
     setError(null)
+    setStartError(null)
     lastStartErrorRef.current = null
 
     try {
@@ -104,12 +119,11 @@ export function useGvmStatus({
       })
 
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
         // Capture limit + HTTP status so the caller can read getLastStartError()
         // and show a tailored modal (Scan Queue Phase 0.2). GVM keeps the
         // return-null contract; handleConfirmGvm reads the error branch.
-        lastStartErrorRef.current = { message: data.error || 'Failed to start GVM scan', limit: data.limit, status: response.status }
-        throw new Error(data.error || 'Failed to start GVM scan')
+        lastStartErrorRef.current = await readScanStartError(response, 'Failed to start GVM scan')
+        throw new Error(lastStartErrorRef.current.message)
       }
 
       const data: GvmState = await response.json()
@@ -118,9 +132,13 @@ export function useGvmStatus({
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      if (!lastStartErrorRef.current) lastStartErrorRef.current = { message: errorMessage }
+      const startErr = lastStartErrorRef.current ?? scanStartNetworkError(err, 'Failed to start GVM scan')
+      lastStartErrorRef.current = startErr
+      const errorMessage = formatApiError({
+        reason: startErr.message, code: startErr.code, status: startErr.status ?? 0, upstreamStatus: startErr.upstreamStatus,
+      })
       setError(errorMessage)
+      setStartError(errorMessage)
       onErrorRef.current?.(errorMessage)
       return null
 
@@ -130,11 +148,13 @@ export function useGvmStatus({
   }, [projectId])
 
   const getLastStartError = useCallback(() => lastStartErrorRef.current, [])
+  const getLastActionError = useCallback(() => lastActionErrorRef.current, [])
 
   const stopGvm = useCallback(async (): Promise<GvmState | null> => {
     if (!projectId) return null
 
     setIsLoading(true)
+    lastActionErrorRef.current = null
     transitionRef.current = true
     setState(prev => prev ? { ...prev, status: 'stopping' as GvmState['status'] } : prev)
 
@@ -143,17 +163,15 @@ export function useGvmStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to stop GVM scan')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to stop GVM scan')
 
       const data: GvmState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to stop GVM scan').message
+      lastActionErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -167,6 +185,7 @@ export function useGvmStatus({
     if (!projectId) return null
 
     setIsLoading(true)
+    lastActionErrorRef.current = null
     transitionRef.current = true
     setState(prev => prev ? { ...prev, status: 'pausing' as GvmState['status'] } : prev)
 
@@ -175,17 +194,15 @@ export function useGvmStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to pause GVM scan')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to pause GVM scan')
 
       const data: GvmState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to pause GVM scan').message
+      lastActionErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -199,23 +216,22 @@ export function useGvmStatus({
     if (!projectId) return null
 
     setIsLoading(true)
+    lastActionErrorRef.current = null
 
     try {
       const response = await fetch(`/api/gvm/${projectId}/resume`, {
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to resume GVM scan')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to resume GVM scan')
 
       const data: GvmState = await response.json()
       setState(data)
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
+      const errorMessage = toApiError(err, 'Failed to resume GVM scan').message
+      lastActionErrorRef.current = errorMessage
       setError(errorMessage)
       return null
 
@@ -266,6 +282,9 @@ export function useGvmStatus({
     pauseGvm,
     resumeGvm,
     getLastStartError,
+    statusError,
+    startError,
+    getLastActionError,
   }
 }
 

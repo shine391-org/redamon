@@ -3,9 +3,16 @@ import { readJsonBody } from '@/lib/jsonBody'
 import { getEffectiveUser, getSession } from '@/lib/session'
 import { auditPlugin } from '@/lib/plugins/audit'
 import { bodyOwnerMatches, ownsScope } from '@/lib/plugins/changeSetAccess'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
-import { SkillPartsRegistryError, clearSkillPartsCache, registrySkill, validateSkillParts } from '@/lib/plugins/skillPartsRegistry'
+import {
+  SkillPartsRegistryError,
+  clearSkillPartsCache,
+  registryFailureText,
+  registrySkill,
+  validateSkillParts,
+} from '@/lib/plugins/skillPartsRegistry'
 import { adoptUserSkillVersion } from '@/lib/plugins/userSkillAdoption'
 import { auditActorFor, userSkillErrorResponse } from '@/lib/userSkillWrites'
 
@@ -32,8 +39,11 @@ const notFound = () => NextResponse.json({ error: 'Not found', code: 'not_found'
 const refuse = (status: number, code: string, error: string, extra: Record<string, unknown> = {}) =>
   NextResponse.json({ error, code, ...extra }, { status })
 
-export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  if (!sameOrigin(request)) return crossOriginResponse()
+export const POST = pluginRoute('override approve', 'The proposal could not be approved; see the webapp log.', async (
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) => {
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await getEffectiveUser()
@@ -94,7 +104,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   } catch (e) {
     // Both agent_outdated (no endpoint) and agent_unreachable are 503: an approval RedAmon
     // cannot verify against the running agent is refused, not stored.
-    if (e instanceof SkillPartsRegistryError) return refuse(503, e.code, e.message)
+    // Whether the agent answered at all, and with which status, decides what to fix.
+    if (e instanceof SkillPartsRegistryError) {
+      const text = e.code === 'agent_unreachable' ? `${registryFailureText(e)}, so this approval cannot be checked now.` : e.message
+      return refuse(503, e.code, text, e.failure.upstreamStatus ? { upstreamStatus: e.failure.upstreamStatus } : {})
+    }
     throw e
   }
 
@@ -133,4 +147,4 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     source: 'ui',
   })
   return NextResponse.json({ revision: result.revision })
-}
+})

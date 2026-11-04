@@ -4,6 +4,8 @@ import prisma from '@/lib/prisma'
 import { mkdir, readdir, stat, unlink } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
+import { declaredBodyTooLarge } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
 
 const JS_RECON_CUSTOM_PATH = process.env.JS_RECON_CUSTOM_PATH || '/data/js-recon-custom'
 const MAX_FILE_SIZE = 2 * 1024 * 1024 // 2 MB
@@ -40,7 +42,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: 'Invalid project ID' }, { status: 400 })
     }
 
-    // Skip DB lookup -- project may not exist yet (pre-generated ID during creation)
     const projectDir = path.join(JS_RECON_CUSTOM_PATH, projectId)
     if (!existsSync(projectDir)) {
       return NextResponse.json({ files: {} })
@@ -77,8 +78,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ files })
   } catch (error) {
-    console.error('Error listing JS Recon custom files:', error)
-    return NextResponse.json({ error: 'Failed to list files' }, { status: 500 })
+    return internalError(error, 'Failed to list files', { log: 'Error listing JS Recon custom files' })
   }
 }
 
@@ -95,8 +95,18 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: 'Invalid project ID' }, { status: 400 })
     }
 
-    // Skip DB lookup -- project may not exist yet (pre-generated ID during creation).
-    const formData = await request.formData()
+    const lengthProblem = declaredBodyTooLarge(request, MAX_FILE_SIZE)
+    if (lengthProblem) return lengthProblem
+
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch {
+      return NextResponse.json(
+        { error: 'The upload could not be read as multipart form data.', code: 'invalid_multipart' },
+        { status: 400 }
+      )
+    }
     const file = formData.get('file') as File | null
     const fileType = formData.get('type') as string | null
 
@@ -113,7 +123,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     if (file.size > MAX_FILE_SIZE) {
       return NextResponse.json(
-        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB` },
+        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB`, code: 'file_too_large', limitBytes: MAX_FILE_SIZE },
         { status: 400 }
       )
     }
@@ -153,7 +163,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const filePath = path.join(typeDir, filename)
     await writeFileFs(filePath, buffer)
 
-    // Update the Prisma field with the file path (skip if project doesn't exist yet)
     const prismaField = FILE_TYPE_MAP[fileType]
     // Its new updatedAt goes back to the settings form, whose save is a
     // compare-and-swap on it.
@@ -166,7 +175,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       })
       projectUpdatedAt = updated.updatedAt
     } catch {
-      // Project may not exist yet (pre-generated ID during creation) -- file is on disk
+      // Best-effort: the guard above found the project, so this fails only on a
+      // database error or a delete in between, and the file stays on disk unrecorded.
     }
 
     return NextResponse.json({
@@ -174,8 +184,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       projectUpdatedAt,
     })
   } catch (error) {
-    console.error('Error uploading JS Recon custom file:', error)
-    return NextResponse.json({ error: 'Failed to upload file' }, { status: 500 })
+    return internalError(error, 'Failed to upload file', { log: 'Error uploading JS Recon custom file' })
   }
 }
 
@@ -223,7 +232,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ deleted: fileType, projectUpdatedAt: updated.updatedAt })
   } catch (error) {
-    console.error('Error deleting JS Recon custom file:', error)
-    return NextResponse.json({ error: 'Failed to delete file' }, { status: 500 })
+    return internalError(error, 'Failed to delete file', { log: 'Error deleting JS Recon custom file' })
   }
 }

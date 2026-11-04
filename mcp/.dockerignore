@@ -1,0 +1,7 @@
+output/
+nuclei-templates/
+.env*
+.git/
+**/__pycache__/
+**/*.pyc
+*.log

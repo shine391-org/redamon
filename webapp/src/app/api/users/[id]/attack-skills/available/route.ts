@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -97,10 +98,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       user: userSkills,
     })
   } catch (error) {
-    console.error('Failed to fetch available attack skills:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch available attack skills' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch available attack skills')
   }
 }

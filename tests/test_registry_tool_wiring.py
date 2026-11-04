@@ -146,6 +146,11 @@ def test_every_graph_label_has_a_producer():
         "ChainFinding": "agentic/orchestrator_helpers/chain_graph_writer.py",
         "ChainDecision": "agentic/orchestrator_helpers/chain_graph_writer.py",
         "ChainFailure": "agentic/orchestrator_helpers/chain_graph_writer.py",
+        # Local agent imports run outside recon sections.
+        "ADUser": "agentic/bloodhound_ingest_tool.py",
+        "ADGroup": "agentic/bloodhound_ingest_tool.py",
+        "ADComputer": "agentic/bloodhound_ingest_tool.py",
+        "Credential": "agentic/mimikatz_parse_tool.py",
         # The TruffleHog ingest, which no partial-recon section runs.
         "MultiscannerScan": "graph_db/mixins/secret_mixin.py",
         "MultiscannerFinding": "graph_db/mixins/secret_mixin.py",

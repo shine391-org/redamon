@@ -1,12 +1,16 @@
 import type { PluginInstall } from '@prisma/client'
 
-/** A lifecycle refusal with the HTTP status and code the routes answer with. */
+/**
+ * A lifecycle refusal with the HTTP status and code the routes answer with. `extra` holds
+ * safe fields for the answer, such as `committed: true` for a failure after the commit.
+ */
 export class LifecycleError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
     readonly details?: string[],
+    readonly extra?: Record<string, unknown>,
   ) {
     super(message)
     this.name = 'LifecycleError'

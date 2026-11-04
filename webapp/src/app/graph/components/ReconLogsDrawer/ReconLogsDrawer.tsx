@@ -20,6 +20,14 @@ interface ReconLogsDrawerProps {
   title?: string
   totalPhases?: number
   errorMessage?: string | null
+  /** The log stream's own failure (lost, or refused with a status); shown while the run is live. */
+  streamError?: string | null
+  /**
+   * The status hook's last failure, shown as is: its text already names what
+   * failed ("GVM status unavailable (…)", "Failed to stop recon (…)"). The
+   * status shown is then the last known one.
+   */
+  statusError?: string | null
   hidePhaseProgress?: boolean
   /** Domain batch: the OUTER progress. Phases restart at 1 for every group, so
    *  "Phase 3/6" alone reads as the scan going backwards when group 2 starts. */
@@ -42,6 +50,8 @@ export function ReconLogsDrawer({
   title = 'Reconnaissance Logs',
   totalPhases = RECON_TOTAL_PHASES,
   errorMessage,
+  streamError = null,
+  statusError = null,
   hidePhaseProgress = false,
   currentGroup = null,
   groupNumber = null,
@@ -53,6 +63,13 @@ export function ReconLogsDrawer({
   const groupPrefix = groupNumber && totalGroups
     ? `Scope group ${groupNumber}/${totalGroups}${currentGroup ? ` (scan root ${currentGroup})` : ''} - `
     : ''
+  const isLive = status === 'running' || status === 'starting' || status === 'paused'
+    || status === 'pausing' || status === 'stopping'
+  // A finished run closes its stream on purpose; only a live one has lost something.
+  const notices = [
+    statusError || null,
+    streamError && isLive ? `Log stream: ${streamError}` : null,
+  ].filter((n): n is string => !!n)
   const logsEndRef = useRef<HTMLDivElement>(null)
   const logsContainerRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
@@ -251,6 +268,13 @@ export function ReconLogsDrawer({
           </button>
         </div>
       </div>
+
+      {notices.map(notice => (
+        <div key={notice} className={styles.streamNotice} role="alert">
+          <AlertCircle size={12} />
+          <span>{notice}</span>
+        </div>
+      ))}
 
       {/* Logs container */}
       <div

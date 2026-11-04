@@ -25,6 +25,7 @@ import { setNowForTests } from './clock'
 import {
   SkillPartsRegistryError,
   clearSkillPartsCache,
+  registryFailureText,
   registrySkill,
   validateSkillParts,
 } from './skillPartsRegistry'
@@ -139,5 +140,39 @@ describe('validation', () => {
     expect(await failure(validateSkillParts('ssrf', {}))).toBe('unknown_skill')
     h.answer = async () => Response.json({ ok: 'yes' })
     expect(await failure(validateSkillParts('ssrf', {}))).toBe('agent_outdated')
+  })
+})
+
+describe('why the agent is unavailable: an answer with an error is not "not running"', () => {
+  const caught = (p: Promise<unknown>) => p.then(() => null, (e: unknown) => e as SkillPartsRegistryError)
+
+  test('the agent answered 500: its status, and words that do not claim it is down', async () => {
+    h.answer = async () => Response.json({ detail: 'boom' }, { status: 500 })
+    const e = (await caught(registrySkill('xxe')))!
+    expect(e).toMatchObject({ code: 'agent_unreachable', failure: { upstreamStatus: 500 } })
+    // The message is what the Gateway hands plugins: unchanged.
+    expect(e.message).toBe("The agent service isn't running")
+    expect(registryFailureText(e)).toBe('The agent service answered HTTP 500')
+  })
+
+  test('no answer: the errno, or that it timed out', async () => {
+    h.answer = async () => {
+      throw Object.assign(new AgentUnreachableError('down'), { cause_: Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }) })
+    }
+    const refused = (await caught(registrySkill('xxe')))!
+    expect(refused.failure).toEqual({ reason: 'ECONNREFUSED' })
+    expect(registryFailureText(refused)).toBe('The agent service could not be reached (ECONNREFUSED)')
+    h.answer = async () => {
+      throw Object.assign(new AgentUnreachableError('down'), { cause_: new DOMException('timed out', 'TimeoutError') })
+    }
+    const slow = (await caught(validateSkillParts('ssrf', {})))!
+    expect(slow.failure).toEqual({ reason: 'timeout' })
+    expect(registryFailureText(slow)).toBe('The agent service did not answer in time')
+  })
+
+  test('agent_outdated keeps its own words', async () => {
+    h.answer = async () => Response.json({ detail: 'Not Found' }, { status: 404 })
+    const e = (await caught(registrySkill('xxe')))!
+    expect(registryFailureText(e)).toBe(e.message)
   })
 })

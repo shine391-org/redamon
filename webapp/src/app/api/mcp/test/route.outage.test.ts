@@ -96,9 +96,17 @@ describe('POST /api/mcp/test — agent unreachable', () => {
     const body = await res.json()
 
     expect(res.status).toBe(502)
-    expect(body.error).toContain('proxy failed')
-    expect(body.error).not.toContain('agent container is not running')
+    expect(body.error).toBe('MCP test proxy failed')
+    expect(body.code).toBe('SyntaxError')
+    // The parser's own message quotes the body it choked on.
+    expect(JSON.stringify(body)).not.toContain('not json')
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('the outage answer carries the agent code and the errno', async () => {
+    fetchMock.mockRejectedValue(dnsFailure())
+    const body = await (await POST(req())).json()
+    expect(body).toMatchObject({ code: 'agent_unreachable', cause: 'ENOTFOUND' })
   })
 
   test('does not reach the agent when the caller is not authorized', async () => {
@@ -109,5 +117,38 @@ describe('POST /api/mcp/test — agent unreachable', () => {
 
     expect(res.status).toBe(403)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /api/mcp/test — the agent answered with an error', () => {
+  const SHAPE = { ok: false, discovered_tools: [], warnings: [], elapsed_ms: 0 }
+
+  test('a FastAPI {detail} (bad internal key) keeps the panel shape and names the status', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ detail: 'Invalid internal key' }), { status: 401 }))
+    const res = await POST(req())
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({
+      ...SHAPE, error: 'The agent could not run the MCP test', code: 'agent_error', upstreamStatus: 401,
+    })
+  })
+
+  test('a plain-text 500 keeps the panel shape instead of an empty object', async () => {
+    fetchMock.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+    const res = await POST(req())
+    expect(res.status).toBe(502)
+    expect(await res.json()).toMatchObject({ ...SHAPE, code: 'agent_error', upstreamStatus: 500 })
+  })
+
+  test('an agent exception text is not forwarded', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: 'reload failed: token ghp_secret' }), { status: 500 }))
+    const body = await (await POST(req())).json()
+    expect(JSON.stringify(body)).not.toContain('ghp_secret')
+  })
+
+  test('a test the agent ran is passed through, with any missing list filled', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: false, error: 'stdio transport requires a `command`' }), { status: 200 }))
+    const res = await POST(req())
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ...SHAPE, error: 'stdio transport requires a `command`' })
   })
 })

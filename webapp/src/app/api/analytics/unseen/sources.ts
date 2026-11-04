@@ -57,6 +57,7 @@ const ROUTE_SOURCES: Record<string, () => Promise<RouteModule>> = {
   supplyChainSca: () => import('../redzone/supplyChainSca/route'),
   dnsDrift: () => import('../redzone/dnsDrift/route'),
   webCachePoison: () => import('../redzone/webCachePoison/route'),
+  routeExposure: () => import('../redzone/routeExposure/route'),
 }
 
 export const LABEL_TABS = Object.keys(LABEL_SOURCES)

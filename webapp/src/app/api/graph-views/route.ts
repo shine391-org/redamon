@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 
@@ -20,11 +21,7 @@ export async function GET(request: NextRequest) {
     })
     return NextResponse.json(views)
   } catch (error) {
-    console.error('Failed to fetch graph views:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to fetch graph views' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch graph views')
   }
 }
 
@@ -56,10 +53,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(view, { status: 201 })
   } catch (error) {
-    console.error('Failed to create graph view:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to create graph view' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create graph view')
   }
 }

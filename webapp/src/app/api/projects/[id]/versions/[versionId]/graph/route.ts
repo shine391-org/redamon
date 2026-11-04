@@ -15,12 +15,13 @@ import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { requireVersionInProject } from '@/lib/scanVersionAccess'
 import { loadSnapshot, snapshotToGraphPayload } from '@/lib/scanSnapshot'
 import { readLiveGraph } from '@/app/api/graph/liveRead'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; versionId: string }>
 }
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to read version graph', async (_request: NextRequest, { params }: RouteParams) => {
   const { id, versionId } = await params
 
   const eff = await requireEffectiveUser()
@@ -58,10 +59,6 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       { headers: { 'Cache-Control': 'private, no-cache' } }
     )
   } catch (error) {
-    console.error('[scanTimeline] version graph read failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to read version graph' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to read version graph', { log: '[scanTimeline] version graph read failed' })
   }
-}
+})

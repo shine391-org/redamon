@@ -300,12 +300,25 @@ describe('the Import shortcut', () => {
     expect(msg.textContent).not.toMatch(/duplicate/i)
   })
 
-  test('a failed import shows the server error', async () => {
-    h.importAnswer = () => json(502, { error: 'Failed to fetch community skills catalog from agent service' })
+  test('a failed import shows the server error with its code and both statuses', async () => {
+    h.importAnswer = () => json(502, {
+      error: 'Failed to fetch community skills catalog from agent service', code: 'agent_error', upstreamStatus: 500,
+    })
     const { updateField } = draw([sk('a')])
     await screen.findByText('Skill a')
     fireEvent.click(screen.getByRole('button', { name: /Import from Community/ }))
-    expect(await screen.findByText('Failed to fetch community skills catalog from agent service')).toBeInTheDocument()
+    expect(await screen.findByText(
+      'Failed to fetch community skills catalog from agent service (agent_error · HTTP 502 · upstream HTTP 500)',
+    )).toBeInTheDocument()
+    expect(updateField).not.toHaveBeenCalled()
+  })
+
+  test("a proxy's HTML error page is read with its status, not as a broken answer", async () => {
+    h.importAnswer = () => new Response('<html>502 Bad Gateway</html>', { status: 502 })
+    const { updateField } = draw([sk('a')])
+    await screen.findByText('Skill a')
+    fireEvent.click(screen.getByRole('button', { name: /Import from Community/ }))
+    expect(await screen.findByText('Failed to import community skills (non_json_response · HTTP 502)')).toBeInTheDocument()
     expect(updateField).not.toHaveBeenCalled()
   })
 })
@@ -416,13 +429,13 @@ describe('the upload buttons and the list', () => {
     expect(button('Upload Batch')).toBeEnabled()
   })
 
-  test('a failed list keeps them disabled with the reason, in place of the empty state', async () => {
-    h.listAnswer = () => json(500, { error: 'x' })
+  test('a failed list keeps them disabled with the reason and its cause, in place of the empty state', async () => {
+    h.listAnswer = () => json(500, { error: 'Failed to fetch attack skills', code: 'P1001' })
     draw([])
-    expect(await screen.findByText('Your skills could not be loaded. Reload the page.')).toBeInTheDocument()
+    expect(await screen.findByText('Your skills could not be loaded (P1001 · HTTP 500). Reload the page.')).toBeInTheDocument()
     expect(screen.queryByText(/No user skills uploaded yet/)).toBeNull()
     expect(button('Upload Skill')).toBeDisabled()
-    expect(button('Upload Batch')).toHaveAttribute('title', 'Your skills could not be loaded. Reload the page to upload.')
+    expect(button('Upload Batch')).toHaveAttribute('title', 'Your skills could not be loaded (P1001 · HTTP 500). Reload the page to upload.')
   })
 
   test('before the user is known, and until that user\'s list arrives, they stay disabled', async () => {
@@ -449,5 +462,19 @@ describe('the upload buttons and the list', () => {
     expect(button('Upload Skill')).toHaveAttribute('title', 'Loading your skills…')
     await act(async () => { release() })
     await waitFor(() => expect(button('Upload Skill')).toBeEnabled())
+  })
+})
+
+describe('download', () => {
+  test('a download that fails says so, with the status (it used to do nothing)', async () => {
+    const fetchStub = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const real = fetchStub.getMockImplementation() as (url: string, init?: RequestInit) => Promise<Response>
+    fetchStub.mockImplementation(async (url: string, init?: RequestInit) => (
+      url === '/api/users/alice/attack-skills/a' ? json(404, { error: 'Skill not found' }) : real(url, init)
+    ))
+    draw([sk('a')])
+    await screen.findByText('Skill a')
+    fireEvent.click(screen.getByTitle('Download .md'))
+    expect(await screen.findByText('Skill not found (HTTP 404)')).toBeInTheDocument()
   })
 })

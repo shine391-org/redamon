@@ -8,6 +8,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { guardProject } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 
 export const runtime = 'nodejs'
 
@@ -42,10 +43,6 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ ok: true })
   } catch (error) {
-    console.error('[jobQueue] cancel failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Could not cancel the job', { log: '[jobQueue] cancel failed' })
   }
 }

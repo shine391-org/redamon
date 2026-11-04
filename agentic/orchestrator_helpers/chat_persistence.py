@@ -29,11 +29,15 @@ async def save_chat_message(
     *,
     agent_id_key: Optional[str] = None,
     fireteam_id_key: Optional[str] = None,
-):
+) -> Optional[dict]:
     """Save a single chat message to the conversation via session ID.
 
     agent_id_key and fireteam_id_key attribute the event to a Fireteam member.
     When both are None (root agent), the row is root-attributed.
+
+    Returns None when the row was saved, else what a person may see of the
+    failure: `{"http_status": n}` for a webapp refusal, `{"error_class": name}`
+    when the webapp was not reached. The texts stay in the log.
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -55,8 +59,11 @@ async def save_chat_message(
                 logger.warning(
                     f"Chat persistence failed ({resp.status_code}): {resp.text[:200]}"
                 )
+                return {"http_status": resp.status_code}
     except Exception as e:
         logger.warning(f"Chat persistence error: {type(e).__name__}: {e}")
+        return {"error_class": type(e).__name__}
+    return None
 
 
 async def update_conversation(

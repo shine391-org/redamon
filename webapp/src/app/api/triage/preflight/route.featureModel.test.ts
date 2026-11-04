@@ -15,9 +15,13 @@ const mockProviders = vi.fn()
 vi.mock('@/lib/triageClient', () => ({
   requireProjectOwner: async (projectId: string) => ({ userId: 'alice', projectId }),
 }))
-vi.mock('@/lib/triage/actions', () => ({
-  agentTriage: async () => ({ in_scope: 40, reviewable: 30 }),
-}))
+const mockAgentTriage = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/triage/actions', () => {
+  class TriageActionError extends Error {
+    constructor(message: string, public readonly code: string, public readonly status = 500) { super(message) }
+  }
+  return { agentTriage: (...a: unknown[]) => mockAgentTriage(...a), TriageActionError }
+})
 vi.mock('@/lib/prisma', () => ({
   default: {
     project: { findUnique: (...a: unknown[]) => mockProject(...a) },
@@ -45,6 +49,7 @@ function project(budget: number) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mockAgentTriage.mockResolvedValue({ in_scope: 40, reviewable: 30 })
   mockSettings.mockResolvedValue({ featureModels: { triage: 'gpt-5-mini' } })
   mockProviders.mockResolvedValue([{ providerType: 'openai', apiKey: 'sk' }])
 })
@@ -106,5 +111,29 @@ describe('preflight and a TypeSafe Jev token', () => {
     ])
     const body = await (await get()).json()
     expect(body.hasModelKey).toBe(true)
+  })
+})
+
+describe('a preflight that cannot be answered says why (G-31, G-32)', () => {
+  test('counts the agent could not give are flagged, not presented as zero', async () => {
+    project(25)
+    const { TriageActionError } = await import('@/lib/triage/actions')
+    mockAgentTriage.mockRejectedValue(new TriageActionError('The findings service is unavailable.', 'agent_unreachable', 503))
+    const body = await (await get()).json()
+    expect(body.countsUnavailable).toBe('agent_unreachable')
+    expect(body.inScope).toBe(0)
+  })
+
+  test('readable counts carry no flag', async () => {
+    project(25)
+    expect((await (await get()).json()).countsUnavailable).toBeNull()
+  })
+
+  test('a database failure answers a fixed text and its code, not an empty 500', async () => {
+    mockProject.mockRejectedValue(Object.assign(new Error('Cannot reach database at db:5432 for project p1'),
+      { code: 'P1001' }))
+    const res = await get()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'The project could not be checked.', code: 'P1001' })
   })
 })

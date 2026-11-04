@@ -2,6 +2,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Project } from '@prisma/client'
+import { fetchJson, fetchOk } from '@/lib/apiError'
 
 // Lighter type for project list
 export interface ProjectListItem {
@@ -35,23 +36,18 @@ export type FullProject = Project & {
   }
 }
 
+// Every fetcher throws an ApiError, whose message carries the route's code and
+// the HTTP status, so the callers' `error.message` displays name the cause.
+
 // Fetch all projects or filter by userId
 async function fetchProjects(userId?: string): Promise<ProjectListItem[]> {
   const url = userId ? `/api/projects?userId=${userId}` : '/api/projects'
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error('Failed to fetch projects')
-  }
-  return response.json()
+  return fetchJson<ProjectListItem[]>(url, undefined, 'Failed to fetch projects')
 }
 
 // Fetch a single project by ID
 async function fetchProject(projectId: string): Promise<FullProject> {
-  const response = await fetch(`/api/projects/${projectId}`)
-  if (!response.ok) {
-    throw new Error('Failed to fetch project')
-  }
-  return response.json()
+  return fetchJson<FullProject>(`/api/projects/${projectId}`, undefined, 'Failed to fetch project')
 }
 
 // Create a new project
@@ -64,54 +60,41 @@ async function createProject(data: {
 }): Promise<FullProject> {
   const { roeFile, ...projectData } = data
 
-  let response: Response
+  let init: RequestInit
   if (roeFile) {
     // Multipart: include the RoE document file
     const formData = new FormData()
     formData.append('data', JSON.stringify(projectData))
     formData.append('roeDocument', roeFile)
-    response = await fetch('/api/projects', {
+    init = {
       method: 'POST',
       body: formData,
-    })
+    }
   } else {
-    response = await fetch('/api/projects', {
+    init = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(projectData),
-    })
+    }
   }
 
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to create project')
-  }
-  return response.json()
+  return fetchJson<FullProject>('/api/projects', init, 'Failed to create project')
 }
 
 // Update a project
 async function updateProject(projectId: string, data: Partial<Project>): Promise<FullProject> {
-  const response = await fetch(`/api/projects/${projectId}`, {
+  return fetchJson<FullProject>(`/api/projects/${projectId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
-  })
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to update project')
-  }
-  return response.json()
+  }, 'Failed to update project')
 }
 
 // Delete a project
 async function deleteProject(projectId: string): Promise<void> {
-  const response = await fetch(`/api/projects/${projectId}`, {
+  await fetchOk(`/api/projects/${projectId}`, {
     method: 'DELETE'
-  })
-  if (!response.ok) {
-    const error = await response.json()
-    throw new Error(error.error || 'Failed to delete project')
-  }
+  }, 'Failed to delete project')
 }
 
 // Hook to fetch all projects

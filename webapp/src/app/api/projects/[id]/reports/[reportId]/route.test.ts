@@ -29,7 +29,7 @@ vi.mock('fs', () => ({
   unlinkSync: vi.fn(),
 }))
 
-import { GET } from './route'
+import { GET, DELETE } from './route'
 
 const params = (id: string, reportId: string) => ({ params: Promise.resolve({ id, reportId }) })
 
@@ -61,5 +61,30 @@ describe('GET report — security headers', () => {
     const res = await GET(new NextRequest('http://x'), params('p1', 'r1'))
     expect(res.status).toBe(404)
     expect(mockReadFileSync).not.toHaveBeenCalled()
+  })
+})
+
+describe('a failure says why, never with the server path (G-22, P-33)', () => {
+  test('a file read error answers its errno, not the message naming the path', async () => {
+    mockReadFileSync.mockImplementation(() => {
+      throw Object.assign(new Error("EACCES: permission denied, open '/data/reports/r.html'"), { code: 'EACCES' })
+    })
+    const res = await GET(new NextRequest('http://x'), params('p1', 'r1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Download failed', code: 'EACCES' })
+  })
+
+  test('a missing file keeps its specific 404 text', async () => {
+    mockExistsSync.mockReturnValue(false)
+    const res = await GET(new NextRequest('http://x'), params('p1', 'r1'))
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'Report file not found on disk' })
+  })
+
+  test('a failed delete answers its code', async () => {
+    mockReportFindFirst.mockRejectedValue(Object.assign(new Error('db'), { code: 'P1001' }))
+    const res = await DELETE(new NextRequest('http://x', { method: 'DELETE' }), params('p1', 'r1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Delete failed', code: 'P1001' })
   })
 })

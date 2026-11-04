@@ -190,9 +190,12 @@ def heal_llm_param_error(
 def is_transient_llm_error(exc: BaseException) -> bool:
     """Classify an LLM-call exception as transient (worth retrying) or not.
 
-    Order: type-MRO match first (cheapest, most specific), then message
-    substring, then bare HTTP status code regex.
+    Order: an explicit ``no_retry`` marker first (an Agent in the Loop step
+    already waited minutes for a person's agent), then type-MRO match, then
+    message substring, then bare HTTP status code regex.
     """
+    if getattr(exc, "no_retry", False):
+        return False
     for base in type(exc).__mro__:
         if base.__name__ in _TRANSIENT_EXC_NAMES:
             return True
@@ -200,6 +203,18 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     if any(k in err_str for k in _TRANSIENT_KEYWORDS):
         return True
     return bool(_TRANSIENT_STATUS_RE.search(err_str))
+
+
+def llm_error_reason(exc: BaseException) -> str:
+    """The ``llm_error: ...`` completion reason of a failed LLM call, which the
+    chat shows: the exception's class and the provider's HTTP status, never its
+    text, which can quote part of a key or the prompt. The log keeps the text."""
+    from llm_builder import provider_error_details
+    details = provider_error_details(exc)
+    label = details.get("error_class") or "LLM call failed"
+    if "provider_status" in details:
+        label += f" (provider HTTP {details['provider_status']})"
+    return f"llm_error: {label}"
 
 
 async def retry_llm_call(

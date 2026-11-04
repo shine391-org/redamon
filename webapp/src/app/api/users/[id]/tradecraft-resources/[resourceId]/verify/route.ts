@@ -1,13 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { internalError, readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
+import { agentAnswerLastError, thrownLastError } from '../../agentLastError'
 
 interface RouteParams {
   params: Promise<{ id: string; resourceId: string }>
 }
 
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8090'
+/** The agent crawls the site and asks an LLM for a summary: minutes, not seconds. */
+const VERIFY_TIMEOUT_MS = 240_000
 
 // POST /api/users/[id]/tradecraft-resources/[resourceId]/verify
 //   Body (optional): { force?: boolean }
@@ -36,35 +39,29 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         ? existing.githubTokenOverride
         : ((userSettings as unknown as Record<string, string> | null)?.githubAccessToken || '')
 
-    const controller = new AbortController()
-    const timeoutMs = 240_000
-    const t = setTimeout(() => controller.abort(), timeoutMs)
-
-    let agentResp: Response
-    try {
-      agentResp = await fetch(`${AGENT_API_URL}/tradecraft/verify`, {
-        method: 'POST',
-        headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({
-          url: existing.url,
-          user_id: id,
-          github_token: tokenForFetch,
-          force,
-          model: (existing as unknown as { llmModel?: string }).llmModel || '',
-        }),
-        signal: controller.signal,
-      })
-    } finally {
-      clearTimeout(t)
-    }
+    const agentResp = await agentFetch('/tradecraft/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: existing.url,
+        user_id: id,
+        github_token: tokenForFetch,
+        force,
+        model: (existing as unknown as { llmModel?: string }).llmModel || '',
+      }),
+    }, { timeoutMs: VERIFY_TIMEOUT_MS })
 
     if (!agentResp.ok) {
-      const errText = await agentResp.text()
-      const updated = await prisma.userTradecraftResource.update({
+      const failed = await readUpstreamBody(agentResp)
+      const code = failed.code ?? 'agent_error'
+      await prisma.userTradecraftResource.update({
         where: { id: resourceId },
-        data: { lastError: `verify failed (${agentResp.status}): ${errText.slice(0, 500)}` },
+        data: { lastError: agentAnswerLastError('verify', code, agentResp.status) },
       })
-      return NextResponse.json(updated, { status: agentResp.status })
+      return NextResponse.json(
+        { error: 'The agent could not verify this resource', code, upstreamStatus: agentResp.status },
+        { status: 502 },
+      )
     }
 
     const result = await agentResp.json()
@@ -82,22 +79,17 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json(updated)
   } catch (error: unknown) {
-    const e = error as { name?: string; message?: string }
-    if (e?.name === 'AbortError') {
+    if (error instanceof AgentUnreachableError) {
       try {
         // Ownership already enforced at the top of the handler.
         const { resourceId } = await params
         await prisma.userTradecraftResource.update({
           where: { id: resourceId },
-          data: { lastError: 'verify timed out (240s)' },
+          data: { lastError: thrownLastError('verify', error) },
         })
       } catch {}
-      return NextResponse.json({ error: 'verify timed out' }, { status: 504 })
+      return upstreamFailureResponse('agent', error.cause_, 'Failed to verify tradecraft resource')
     }
-    console.error('Failed to verify tradecraft resource:', error)
-    return NextResponse.json(
-      { error: 'Failed to verify tradecraft resource' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to verify tradecraft resource')
   }
 }

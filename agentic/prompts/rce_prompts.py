@@ -1257,3 +1257,80 @@ Container indicators -> attempt:
 Document the escape vector found WITHOUT executing it unless `RCE_AGGRESSIVE_PAYLOADS`
 is True.
 """
+
+
+# Route-exposure parts: they load only when recon's route exposure scan is on
+# (ROUTE_EXPOSURE_ENABLED), after this skill's other parts. The consoles part is
+# a TEMPLATE whose only placeholder is its own status word.
+from .route_exposure_shared import (  # noqa: E402
+    RECORD_CONTRACT as _RECORD_CONTRACT,
+    SAFETY_RULES as _SAFETY_RULES,
+    VALUES_IN_FILES as _VALUES_IN_FILES,
+    candidate_query as _candidate_query,
+    escape as _escape,
+)
+
+RCE_ROUTE_EXPOSURE_CONSOLES = _escape("""
+## DEBUG CONSOLES AND ENDPOINTS RECON FOUND
+
+Recon's route exposure scan proved these by signature (`needs_agent_confirmation=false`).
+Prove each console's real state and each endpoint's exposure, without exploiting it.
+
+Every request to a console or endpoint here is a GET (or the one HEAD the table names):
+the page fetch and, where allowed, the single evaluation. Never send a POST or an
+OPTIONS to any of them, not even to probe which methods it accepts: its method support
+is not part of the proof.
+
+**Pull them:**
+""" + _candidate_query(["debug_console", "debug_endpoint"], pending=False) + """
+
+| Signature | Recipe | Proof | Never |
+| --- | --- | --- | --- |
+| Werkzeug debugger | curl the console page into a file; the script reads `EVALEX` and `EVALEX_TRUSTED` from the page's script block | `EVALEX = true` with `EVALEX_TRUSTED = false` is locked (it asks for a PIN): report "PIN-protected console" (exposed; the exploit is not attempted). Unlocked (EXPLOITATION phase), `EVALEX_TRUSTED = true`: ONE GET `<console URL>?__debugger__=yes&cmd=1%2B1&frm=<frm>&s=<SECRET>` with the page's `frm` and `SECRET`; `cmd` is the bare expression `1+1`, never `print(1+1)` or any other wrapper; its answer contains `2`. `SECRET` is the page's `SECRET = "..."` script variable (beside `EVALEX`, not a form field) and `frm` is `0` on the standalone console; the script reads `SECRET` from the saved file, never prints it, and sends nothing when it is missing | guess or compute a PIN; evaluate anything but `1+1` |
+| Laravel Ignition | `GET /_ignition/health-check` | `"can_execute_commands": true`, plus the Ignition version when shown: "CVE-2021-3129 applicable" | POST `/_ignition/execute-solution`; any log-clear or phar chain |
+| Symfony profiler | `GET /_profiler/latest` into a file | the profiler token page | follow a link to phpinfo with credentials |
+| actuator env | curl `/actuator/env` into a file; the script counts property sources and the keys whose value is not masked (`******`) and looks secret | the counts | POST to `/actuator/env`, `/refresh`, `/restart`, `/shutdown`, or any jolokia URL |
+| actuator heapdump | `HEAD /actuator/heapdump` | 200, octet-stream and a size | GET it, unless heapdump analysis is ENABLED |
+| pprof / server-status | GET the index into a file | the signature | none |
+
+A Werkzeug console's lock is `EVALEX_TRUSTED` and nothing else: `__debugger__`, the
+word "console" and the PIN form's markup appear on unlocked pages too, so none of
+them means locked.
+
+The unlocked console's `1+1` is its proof, and it needs the EXPLOITATION phase: from
+the informational phase, record the other proofs first, then request
+`transition_phase` naming that one request, and send it once the operator approves.
+It is exactly ONE GET: never a POST, an OPTIONS or a retry with other parameters, and
+no method-support probe before or after it. If that one answer does not contain `2`,
+whatever its status, record the console as unlocked with the evaluation unconfirmed and
+stop there: a 400 ends the proof, it never means the request shape needs another try.
+
+Record each with `vulnerability_confirmed` and its id. The `1+1` output is a SEPARATE
+`exploit_success` entry with NO ids. Further exploitation follows this skill's own
+rules above, unchanged.
+
+**Settings for this part:**
+- heapdump analysis: {heapdump_analysis}
+
+When heapdump analysis is DISABLED: HEAD only on `/actuator/heapdump`, never a GET.
+""" + _VALUES_IN_FILES + _RECORD_CONTRACT + _SAFETY_RULES).replace(
+    "{{heapdump_analysis}}", "{heapdump_analysis}")
+
+RCE_HEAPDUMP_ANALYSIS = """
+## ANALYSE AN EXPOSED HEAP DUMP (enabled: switch on, data exfiltration allowed, sensitive data handling above "no access")
+
+EXPLOITATION phase, kali-local. From the informational phase, record the console and
+endpoint proofs first, then request `transition_phase` to exploitation naming this
+step, and run it once the operator approves; do not complete the session with it
+still pending.
+
+1. A job_spawn job, `tool_name: execute_curl`, args
+   `-s -o /tmp/rex-heap-<id>.hprof --max-filesize 536870912 '<url>'` (the 512 MiB cap
+   protects the sandbox). Exactly one GET.
+2. An execute_code script streams the file in chunks (never loading it whole), counts
+   credential shapes (password / secret / token keys, JDBC URLs, AWS-key shapes,
+   bearer tokens), prints the counts by kind only, then `os.remove`s the file and
+   prints the `/tmp` listing filtered to `rex-heap-<id>` to prove the deletion.
+3. Record the counts against the finding's id (`vulnerability_confirmed`); a
+   credential is a separate `credential_found` with NO ids and no value.
+"""

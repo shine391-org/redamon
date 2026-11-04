@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSession, requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import {
   auditActorFor, deleteUserSkill, updateUserSkill, userSkillErrorResponse,
 } from '@/lib/userSkillWrites'
@@ -26,11 +27,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(skill)
   } catch (error) {
-    console.error('Failed to fetch attack skill:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch attack skill' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch attack skill')
   }
 }
 
@@ -57,11 +54,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
   } catch (error) {
     const refused = userSkillErrorResponse(error)
     if (refused) return refused
-    console.error('Failed to update attack skill:', error)
-    return NextResponse.json(
-      { error: 'Failed to update attack skill' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update attack skill')
   }
 }
 
@@ -80,10 +73,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
   } catch (error) {
     const refused = userSkillErrorResponse(error)
     if (refused) return refused
-    console.error('Failed to delete attack skill:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete attack skill' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete attack skill')
   }
 }

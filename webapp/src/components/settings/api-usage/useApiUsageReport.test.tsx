@@ -216,6 +216,31 @@ describe('startCheck', () => {
     expect(result.current.view).toBe('closed')
   })
 
+  test('run_failed: the alert names the code and status', async () => {
+    getAnswers = [{ status: 200, body: meta() }]
+    postAnswers = [{ status: 500, body: { error: 'run_failed', code: 'run_failed' } }]
+    const { result } = setup()
+    await act(() => result.current.startCheck())
+    expect(alertError).toHaveBeenCalledWith('The check failed (run_failed · HTTP 500). The saved report is unchanged.')
+  })
+
+  test('a server failure: the alert names its Prisma code, telling it apart from run_failed', async () => {
+    getAnswers = [{ status: 200, body: meta() }]
+    postAnswers = [{ status: 500, body: { error: 'Failed to run the API usage check', code: 'P2024' } }]
+    const { result } = setup()
+    await act(() => result.current.startCheck())
+    expect(alertError).toHaveBeenCalledWith('The check failed (P2024 · HTTP 500). The saved report is unchanged.')
+  })
+
+  test('a report state that would not load: nothing is checked, and the alert says why', async () => {
+    getAnswers = [{ status: 500, body: { error: 'Failed to load the API usage report', code: 'P1001' } }]
+    const { result } = setup()
+    await act(() => result.current.startCheck())
+    expect(alertError).toHaveBeenCalledWith(
+      'Could not load the saved report state (P1001 · HTTP 500), so nothing was checked. Try again.')
+    expect(posts()).toHaveLength(0)
+  })
+
   test('401 (session expired): tells the user the check may still be saved', async () => {
     getAnswers = [{ status: 200, body: meta() }]
     postAnswers = [{ status: 401, body: { error: 'Unauthorized' } }]

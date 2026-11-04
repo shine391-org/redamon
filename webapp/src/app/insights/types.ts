@@ -148,8 +148,17 @@ export interface AttackChainsData {
   attackFlowRows: { target: string; tool: string; findingType: string; severity: string }[]
 }
 
+/** A pipeline whose state is unknown: the orchestrator did not answer, or answered with an error. */
+export interface UnreachablePipeline {
+  reachable: false
+  code: string
+  upstreamStatus?: number
+  status?: undefined
+  currentPhase?: undefined
+}
+
 export interface PipelineStatusData {
-  recon: { status: string; currentPhase?: string; startedAt?: string; completedAt?: string } | null
-  gvm: { status: string; startedAt?: string; completedAt?: string } | null
-  githubHunt: { status: string; startedAt?: string; completedAt?: string } | null
+  recon: { status: string; currentPhase?: string; startedAt?: string; completedAt?: string } | UnreachablePipeline | null
+  gvm: { status: string; startedAt?: string; completedAt?: string } | UnreachablePipeline | null
+  githubHunt: { status: string; startedAt?: string; completedAt?: string } | UnreachablePipeline | null
 }

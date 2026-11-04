@@ -9,6 +9,8 @@ import { requireEffectiveUser } from '@/lib/access'
 import { writeAudit } from '@/lib/audit'
 import { featureModelsMap, parseFeatureModelsPatch, type FeatureModelsPatch } from '@/lib/featureModels'
 import { listPluginLlmFeatures } from '@/lib/plugins/pluginLlmFeatures'
+import { internalError } from '@/lib/routeErrors'
+import { followUpWarning, type SaveWarning } from './saveWarnings'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -228,11 +230,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ ...settings, rotationConfigs })
   } catch (error) {
-    console.error('Failed to fetch user settings:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch user settings' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch user settings')
   }
 }
 
@@ -281,9 +279,14 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     // so the shared guard cannot be changed by a direct API call.
     const isServiceReq = isInternalRequest(request) || isScannerRequest(request)
     const captureAdminOK = isServiceReq || (await getSession())?.role === 'admin'
+    // Named in the answer, so a non-admin's TrafficMind save does not read as applied.
+    const ignoredFields: string[] = []
     if (!captureAdminOK) {
       for (const k of Object.keys(body)) {
-        if (k.startsWith('captureProxy') || k.startsWith('captureEgress')) delete body[k]
+        if (k.startsWith('captureProxy') || k.startsWith('captureEgress')) {
+          delete body[k]
+          ignoredFields.push(k)
+        }
       }
     }
 
@@ -402,7 +405,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     // Reconcile the capture proxy container with the desired state (plan §8.4):
     // flipping the master toggle, or changing a runtime knob while enabled, drives
     // the orchestrator capture-proxy/{start,stop}. Best-effort: a save must not
-    // fail because the orchestrator is briefly unreachable.
+    // fail because the orchestrator is briefly unreachable, but it says so in
+    // `warnings` rather than reading as applied.
+    const warnings: SaveWarning[] = []
     const captureEnabledChanged = captureEnabledProvided && captureDesiredEnabled !== (existing?.captureProxyEnabled ?? true)
     // Egress toggles + body-storage policy are applied LIVE by the proxy's config-file
     // hot-reload (DB -> /spool/.capture-config.json -> proxy, within seconds), so a
@@ -417,9 +422,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     )
     if (captureEnabledChanged || (settings.captureProxyEnabled && changedRecreateField)) {
       const orchUrl = process.env.RECON_ORCHESTRATOR_URL || 'http://recon-orchestrator:8010'
-      try {
-        if (settings.captureProxyEnabled) {
-          await orchestratorFetch(`${orchUrl}/capture-proxy/start`, {
+      const warning = settings.captureProxyEnabled
+        ? await followUpWarning('orchestrator', 'The capture proxy was not started', () =>
+          orchestratorFetch(`${orchUrl}/capture-proxy/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -446,13 +451,10 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
               egressBlockMulticast: settings.captureEgressBlockMulticast,
               egressBlockUnspecified: settings.captureEgressBlockUnspecified,
             }),
-          })
-        } else {
-          await orchestratorFetch(`${orchUrl}/capture-proxy/stop`, { method: 'POST' })
-        }
-      } catch (e) {
-        console.warn('Failed to reconcile capture proxy with orchestrator:', e)
-      }
+          }))
+        : await followUpWarning('orchestrator', 'The capture proxy was not stopped', () =>
+          orchestratorFetch(`${orchUrl}/capture-proxy/stop`, { method: 'POST' }))
+      if (warning) warnings.push(warning)
     }
 
     // Push tunnel config to kali-sandbox when the enabled state OR a tunnel
@@ -473,15 +475,13 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       const token = process.env.TUNNEL_AUTH_TOKEN
       if (token) headers['Authorization'] = `Bearer ${token}`
-      try {
-        await fetch('http://kali-sandbox:8015/tunnel/configure', {
+      const warning = await followUpWarning('kali_sandbox', 'The tunnel configuration was not applied', () =>
+        fetch('http://kali-sandbox:8015/tunnel/configure', {
           method: 'POST',
           headers,
           body: JSON.stringify(config),
-        })
-      } catch (e) {
-        console.warn('Failed to push tunnel config to kali-sandbox:', e)
-      }
+        }))
+      if (warning) warnings.push(warning)
     }
 
     // Handle rotation configs if provided
@@ -543,12 +543,12 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     }
 
     // Masked on the way out, like the GET: the browser never gets a secret back.
-    return NextResponse.json({ ...maskSecrets(settings), rotationConfigs })
+    return NextResponse.json({
+      ...maskSecrets(settings), rotationConfigs,
+      ...(warnings.length ? { warnings } : {}),
+      ...(ignoredFields.length ? { ignoredFields } : {}),
+    })
   } catch (error) {
-    console.error('Failed to update user settings:', error)
-    return NextResponse.json(
-      { error: 'Failed to update user settings' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update user settings')
   }
 }

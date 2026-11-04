@@ -129,6 +129,10 @@ Configured **per-user** in the webapp UI (`/settings`), not in `.env`.
 
 OpenAI-compatible (Ollama) providers expose an optional reasoning control in **Global Settings → LLM Providers**. The webapp persists the enabled state and selected `low`, `medium`, `high`, or `max` effort per provider. When enabled, the agent forwards the value as `reasoning_effort` through the OpenAI-compatible chat-completions API; when disabled it sends nothing, preserving the model's default. `max` is available for models that support it, while models with binary thinking may treat effort levels identically. Enabling reasoning on a model without the thinking capability makes the endpoint reject the request with a 400 (`"<model>" does not support thinking`); `retry_llm_call` self-heals this by dropping `reasoning_effort` and retrying once, so a misconfigured provider degrades gracefully instead of failing every call.
 
+**Agent in the Loop** (`loop/mcp`) is not a provider: with `AGENT_IN_THE_LOOP_ENABLED=true` it appears in the chat model picker, and every model call of a chat run becomes a step that the person's own agent (Claude Code, Codex) answers over the MCP server. It needs no provider key and works only in chat runs; every other model picker hides it and every builder outside a chat run refuses it (`loop_model_not_supported_here`). Rules for new model call sites: the `agent-in-the-loop` skill; setup: the wiki page `Agent-in-the-Loop`.
+
+Turning it off is the switch alone. Before **reverting** its code, reset every project and user row still on a `loop/` model first (the SQL block under "Turning it off for good" in [README.MCP.SERVER.md](README.MCP.SERVER.md#9-agent-in-the-loop)), or `parse_model_provider` would route `loop/mcp` to OpenAI with the user's key.
+
 ### Infrastructure
 
 | Technology | Role | Official Docs |
@@ -282,6 +286,7 @@ redamon/
 │   │   ├── guardrail.py            #     Soft (LLM) scope guardrail — prevents scanning unauthorized targets
 │   │   ├── hard_guardrail.py       #     Deterministic, non-disableable target blocklist
 │   │   ├── roe_gate.py             #     RoE + recon-budget gate every executor path asks before a tool runs
+│   │   ├── web_sources.py          #     Pure web helpers shared by Tradecraft and URL import (links, GitHub URLs, sitemaps, HTML/PDF text)
 │   │   ├── chat_persistence.py     #     Saves conversation history to PostgreSQL via webapp API
 │   │   ├── report_summarizer.py    #     Generates pentest report summaries from agent sessions
 │   │   ├── streaming.py            #     WebSocket event emission (status, thoughts, tool output)
@@ -291,6 +296,15 @@ redamon/
 │   │   ├── config.py               #     Orchestrator configuration constants
 │   │   ├── json_utils.py           #     JSON serialization helpers
 │   │   └── debug.py                #     Debug utilities
+│   ├── workspace_import/           #   Folder/archive uploads and URL imports into the Agent Workspace
+│   │   ├── extract.py              #     safe_extract: hand-written extraction, real-byte caps, no links or devices
+│   │   ├── staging.py              #     /workspace/.staging op dirs, disk-reservation ledger, boot swap recovery
+│   │   ├── place.py                #     Atomic placement: Keep both / Replace (crash-safe swap) / Fail
+│   │   ├── busy.py                 #     Paths a running import will replace; drawer and fs_* writes refuse them
+│   │   ├── executor.py             #     Bounded thread pool for import CPU/disk work (never the default pool)
+│   │   ├── downloads.py            #     Streaming file and archive downloads (attachment + nosniff)
+│   │   ├── http_routes.py          #     Master-key /workspace/* routes of the package (job status, ...)
+│   │   └── errors.py / limits.py   #     Failure codes with fixed sentences; env caps and the URL-import switch
 │   ├── cypherfix_triage/           #   Vulnerability triage agent
 │   │   ├── orchestrator.py         #     Hybrid orchestrator: static Cypher + ReAct analysis
 │   │   ├── state.py                #     TriageFinding, RemediationDraft, TriageState
@@ -1194,6 +1208,22 @@ These use Docker Compose's `${VAR:-default}` syntax. Override them in `.env` if 
 | `WEBAPP_PORT` | `3000` | Host port for the webapp |
 | `AGENT_PORT` | `8090` | Host port for the agent API (maps to internal :8080) |
 | `RECON_ORCH_PORT` | `8010` | Host port for the recon orchestrator |
+
+### Agent Workspace uploads and URL import (agent)
+
+Read by the agent with safe fallbacks: a size or count that is not a positive integer falls back to its default, so a typo can never disable a cap. Every one has a compose default; `.env` needs none of them.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKSPACE_IMPORT_MAX_BYTES` | `2147483648` (2 GiB) | Cap per upload or import: the download and the extracted total each |
+| `WORKSPACE_IMPORT_MAX_ENTRIES` | `50000` | Entries per extraction or import |
+| `WORKSPACE_IMPORT_MIN_FREE_BYTES` | `1073741824` (1 GiB) | Headroom on top of the scan floor: the free disk left after an operation must be `JOB_QUEUE_MIN_FREE_DISK` + this |
+| `JOB_QUEUE_MIN_FREE_DISK` | `10737418240` (10 GiB) | The recon scan dispatcher's disk floor, also given to the agent so imports never take the disk below it (`0` turns that floor off, as it does for the dispatcher) |
+| `WORKSPACE_IMPORT_MAX_JOBS` | `4` | Upload commits and URL imports running at once, across projects (they take no governed background-job slot) |
+| `WORKSPACE_IMPORT_WORKERS` | `2` | Threads of the import pool (extraction, hashing, archive builds); work beyond them waits as `queued` |
+| `WORKSPACE_UPLOAD_CHUNK_BYTES` | `8388608` (8 MiB) | Chunk size of an upload session; keep it well under the web app's 60 MB request cap (`proxyClientMaxBodySize` in `webapp/next.config.ts`) |
+| `WORKSPACE_UPLOAD_SESSION_IDLE_SEC` | `3600` | An upload session idle longer than this is deleted |
+| `WORKSPACE_URL_IMPORT_ENABLED` | `true` | Kill switch for import from a URL; any value but `true`/`1`/`yes` turns it off (the import routes answer 403 `import_disabled`). Folder and archive upload have no switch |
 
 > The MCP servers listen on fixed container ports (8000, 8002–8005, from `SERVERS` in
 > `mcp/servers/run_servers.py`). Their host ports, bound to `127.0.0.1`, come from

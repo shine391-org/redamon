@@ -816,12 +816,13 @@ class TestCrossFileNamingConsistency(unittest.TestCase):
         parts = s.replace('PATH_TRAVERSAL_', '').lower().split('_')
         return 'pathTraversal' + ''.join(w.capitalize() for w in parts)
 
-    def test_six_prisma_columns(self):
+    def test_eight_prisma_columns(self):
+        # Six tunables plus the two route exposure switches.
         prisma_fields = re.findall(
             r'(pathTraversal[A-Za-z]+)\s+\S+.*?@map\("(path_traversal_[a-z_]+)"\)',
             self.prisma)
-        self.assertEqual(len(prisma_fields), 6,
-                          f'expected 6 prisma columns, got {len(prisma_fields)}')
+        self.assertEqual(len(prisma_fields), 8,
+                          f'expected 8 prisma columns, got {len(prisma_fields)}')
 
     def test_python_settings_camel_round_trip(self):
         """Every AGENT_SETTING_COLUMNS entry turns SCREAMING_SNAKE -> camelCase
@@ -829,7 +830,7 @@ class TestCrossFileNamingConsistency(unittest.TestCase):
         default and the operator's saved value would never reach the agent."""
         mappings = re.findall(
             r"'(PATH_TRAVERSAL_[A-Z_]+)':\s*'([a-zA-Z]+)',", self.py)
-        self.assertEqual(len(mappings), 6, f'expected 6 mappings, got {len(mappings)}')
+        self.assertEqual(len(mappings), 8, f'expected 8 mappings, got {len(mappings)}')
         for snake, camel in mappings:
             self.assertEqual(camel, self._snake_to_camel(snake),
                               f'{snake} maps to {camel} (expected {self._snake_to_camel(snake)})')

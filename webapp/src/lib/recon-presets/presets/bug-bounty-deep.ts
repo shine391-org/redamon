@@ -185,6 +185,8 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
     jsReconConcurrency: 10,
     jsReconValidateKeys: true,
     jsReconValidationTimeout: 5,
+    jsReconTrufflehogEnabled: true,
+    jsReconTrufflehogResults: ['verified', 'unknown', 'unverified'],
     jsReconExtractEndpoints: true,
     jsReconRegexPatterns: true,
     jsReconSourceMaps: true,
@@ -276,6 +278,8 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 
     // --- Security checks: all enabled ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: true,
     securityCheckDirectIpHttp: true,
     securityCheckDirectIpHttps: true,

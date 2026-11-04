@@ -24,6 +24,7 @@ import { Loader2, ScanSearch } from 'lucide-react'
 import { useAlertModal } from '@/components/ui'
 import { useFeatureModelGate } from '@/components/shared/FeatureModelGate'
 import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { readApiError, toApiError } from '@/lib/apiError'
 import { runOrigin, type LiveTriageRun } from './TriageRunBanner'
 import styles from './TriageRunButton.module.css'
 
@@ -47,6 +48,8 @@ export interface TriagePreflight {
   lastRun: { id: string; finishedAt: string | null; model: string } | null
   liveRun: (Partial<LiveTriageRun> & { id: string; startedAt: string }) | null
   blockedReason: string | null
+  /** Why the finding counts could not be read; the zeros then mean "unknown". */
+  countsUnavailable?: string | null
   defaultRepo: string
 }
 
@@ -89,6 +92,7 @@ function formatDate(iso: string | null | undefined): string {
 export function buildDialog(pre: TriagePreflight) {
   const isFirstRun = !pre.lastRun
   const kept = reviewsKeptLine(pre)
+  const countsKnown = !pre.countsUnavailable
   return (
     <div className={styles.dialog}>
       <p>
@@ -97,13 +101,20 @@ export function buildDialog(pre: TriagePreflight) {
         <strong>CypherFix</strong>, so both pages always show the same order.
       </p>
 
+      {!countsKnown && (
+        <p className={styles.muted} role="status">
+          The finding counts could not be read ({pre.countsUnavailable}), so how many
+          findings this run covers is unknown. The run itself reads them again.
+        </p>
+      )}
+
       {isFirstRun && <p className={styles.muted}>This is the first triage for this project.</p>}
 
       <div className={styles.dialogHeading}>What it does, in order</div>
       <ol>
         <li>
-          <strong>Score.</strong> Every finding ({pre.inScope}
-          {pre.newSinceLastRun > 0 && `, of which ${pre.newSinceLastRun} are new since the last run`})
+          <strong>Score.</strong> Every finding ({countsKnown ? pre.inScope : 'count unavailable'}
+          {countsKnown && pre.newSinceLastRun > 0 && `, of which ${pre.newSinceLastRun} are new since the last run`})
           gets a 0-100 score from the facts in the graph: how likely it is to be
           real, how likely it is to be exploited, how bad it would be, and how
           reachable it is. No AI in this step.
@@ -168,7 +179,7 @@ export function buildDialog(pre: TriagePreflight) {
         change during the run are left for the next one.
       </p>
 
-      {pre.hasModelKey && (
+      {pre.hasModelKey && countsKnown && (
         <p className={styles.muted}>
           Estimated: up to {pre.estimatedAiCalls} AI call
           {pre.estimatedAiCalls === 1 ? '' : 's'}. Results appear when the run
@@ -216,9 +227,9 @@ export function TriageRunButton({
         res = await preflight()
       }
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        const code = readFeatureModelCode(body)
-        throw new Error(code ? featureModelMessage(code) : body.error || 'The project could not be checked.')
+        const err = await readApiError(res, 'The project could not be checked.')
+        const code = readFeatureModelCode(err.body)
+        throw code ? new Error(featureModelMessage(code)) : err
       }
       const pre: TriagePreflight = await res.json()
       setLastRunSeen(Boolean(pre.lastRun))
@@ -246,8 +257,10 @@ export function TriageRunButton({
       )
       if (ok) onConfirm()
     } catch (e) {
+      // A TypeError is fetch getting no answer; its "Failed to fetch" says nothing.
       await alertError(
-        e instanceof Error ? e.message : 'The project could not be checked.',
+        e instanceof Error && !(e instanceof TypeError)
+          ? e.message : toApiError(e, 'The project could not be checked.').message,
         'Triage'
       )
     } finally {

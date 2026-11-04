@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string }>
@@ -78,11 +79,9 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
     }))
     return NextResponse.json({ findings, count: findings.length })
   } catch (error) {
-    console.error('AI Attack Surface findings error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed', findings: [] },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to load AI Gauntlet findings', {
+      log: 'AI Attack Surface findings error', extra: { findings: [] },
+    })
   } finally {
     await session.close()
   }

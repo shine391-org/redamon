@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import type { Project } from '@prisma/client'
 import { useToast } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
 import { postUserSkillsChanged, useUserSkillsChanged } from '@/lib/userSkillsChannel'
 
 export type ProjectFormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
@@ -37,6 +38,8 @@ export function useSettingsModal(projectId: string) {
   const [showSettingsDropdown, setShowSettingsDropdown] = useState(false)
   const [settingsModal, setSettingsModal] = useState<'agent' | 'toolmatrix' | 'attack' | null>(null)
   const [projectFormData, setProjectFormData] = useState<ProjectFormData | null>(null)
+  // The project could not be read: the modal says so instead of spinning forever.
+  const [projectLoadError, setProjectLoadError] = useState<string | null>(null)
   const settingsDropdownRef = useRef<HTMLDivElement>(null)
   const pendingSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const latestFormDataRef = useRef(projectFormData)
@@ -107,14 +110,20 @@ export function useSettingsModal(projectId: string) {
     if (!settingsModal || !projectId) {
       flushPendingSave()
       setProjectFormData(null)
+      setProjectLoadError(null)
       return
     }
     flushPendingSave()
     setProjectFormData(null)
+    setProjectLoadError(null)
     dirtyRef.current = new Set()
     let cancelled = false
+    const failed = 'Could not load the project settings'
     fetch(`/api/projects/${projectId}`)
-      .then(res => res.ok ? res.json() : null)
+      .then(async res => {
+        if (!res.ok) throw await readApiError(res, failed)
+        return res.json()
+      })
       .then(data => {
         if (!cancelled && data) {
           const { id, userId: _u, createdAt, updatedAt, user, ...formData } = data
@@ -122,7 +131,9 @@ export function useSettingsModal(projectId: string) {
           setProjectFormData(formData)
         }
       })
-      .catch(() => {})
+      .catch(err => {
+        if (!cancelled) setProjectLoadError(toApiError(err, failed).message)
+      })
     return () => { cancelled = true }
   }, [settingsModal, projectId, flushPendingSave])
 
@@ -166,5 +177,6 @@ export function useSettingsModal(projectId: string) {
     projectFormData,
     updateProjectField,
     settingsDropdownRef,
+    projectLoadError,
   }
 }

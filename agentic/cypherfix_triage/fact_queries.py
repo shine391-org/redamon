@@ -366,6 +366,8 @@ RETURN v.id AS id, 'Vulnerability' AS label,
        v.triage_evidence_hash AS triage_evidence_hash,
        v.validation_status AS validation_status, v.validated_at AS validated_at,
        v.detection_method AS detection_method,
+       // route_exposure's secret_in_response is classed by its detector name.
+       v.secret_types AS secret_types,
        toString(v.updated_at) AS seen_updated_at,
        // Host resolution, in the order of section 3.2.6.
        // A pattern comprehension takes ONE pattern, so each candidate is its
@@ -438,6 +440,7 @@ RETURN s.id AS id, 'Secret' AS label, coalesce(s.source, 'js_recon') AS source,
        s.matched_text AS matched_text, s.context AS context,
        s.validation_status AS validation_status, s.validated_at AS validated_at,
        s.validation_info AS validation_info, s.public_client_key AS public_client_key,
+       s.detection_method AS detection_method, s.alternate_names AS alternate_names,
        s.stale_since AS stale_since, s.confidence AS confidence,
        s.triage_status AS triage_status, s.triage_source AS triage_source,
        s.triage_evidence_hash AS triage_evidence_hash,

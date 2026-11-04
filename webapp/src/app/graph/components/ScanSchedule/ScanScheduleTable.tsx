@@ -6,6 +6,7 @@ import { useAlertModal, useToast, WikiInfoButton } from '@/components/ui'
 import { ScanQueuePanel, kindLabel } from './ScanQueuePanel'
 import { usePaged, Pager } from './pagination'
 import { scopeStartProblem } from '@/lib/scopeGroups'
+import { fetchJson, toApiError } from '@/lib/apiError'
 import styles from './ScanScheduleTable.module.css'
 
 interface Schedule {
@@ -109,15 +110,15 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
       .then(p => setScopeProblem(p ? scopeStartProblem(p) : null))
       .catch(() => setScopeProblem(null))
     try {
-      const res = await fetch(`/api/projects/${projectId}/schedules`)
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(body.error || 'Failed to load schedules')
+      const body = await fetchJson<{ schedules?: Schedule[]; jobs?: Job[] }>(
+        `/api/projects/${projectId}/schedules`, undefined, 'Failed to load schedules',
+      )
       setSchedules(body.schedules ?? [])
       setJobs(body.jobs ?? [])
       // Drop any selection that no longer maps to a visible row.
       setSelected(new Set())
     } catch (err) {
-      setLoadError(err instanceof Error ? err.message : String(err))
+      setLoadError(toApiError(err, 'Failed to load schedules').message)
     } finally {
       setLoading(false)
     }
@@ -129,7 +130,7 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
     if (!projectId) return
     setCreating(true)
     try {
-      const res = await fetch(`/api/projects/${projectId}/schedules`, {
+      await fetchJson(`/api/projects/${projectId}/schedules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -140,15 +141,12 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
           ...(mode === 'interval' ? { intervalMinutes: Number(intervalMinutes) } : {}),
           ...(mode === 'cron' ? { cronExpr } : {}),
         }),
-      })
-      const body = await res.json()
-      if (!res.ok) {
-        alertError(String(body.error || 'Could not create the schedule'), 'Schedule not created')
-        return
-      }
+      }, 'Could not create the schedule')
       toast.info('Schedule created')
       setLabel('')
       load()
+    } catch (err) {
+      alertError(toApiError(err, 'Could not create the schedule').message, 'Schedule not created')
     } finally {
       setCreating(false)
     }
@@ -158,17 +156,14 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
     if (!projectId) return
     setBusyId(s.id)
     try {
-      const res = await fetch(`/api/projects/${projectId}/schedules/${s.id}`, {
+      await fetchJson(`/api/projects/${projectId}/schedules/${s.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      })
-      const body = await res.json()
-      if (!res.ok) {
-        alertError(String(body.error || 'Could not update the schedule'), 'Schedule')
-        return
-      }
+      }, 'Could not update the schedule')
       load()
+    } catch (err) {
+      alertError(toApiError(err, 'Could not update the schedule').message, 'Schedule')
     } finally {
       setBusyId(null)
     }
@@ -183,14 +178,11 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
     if (!confirmed) return
     setBusyId(s.id)
     try {
-      const res = await fetch(`/api/projects/${projectId}/schedules/${s.id}`, { method: 'DELETE' })
-      const body = await res.json()
-      if (!res.ok) {
-        alertError(String(body.error || 'Could not delete the schedule'), 'Schedule')
-        return
-      }
+      await fetchJson(`/api/projects/${projectId}/schedules/${s.id}`, { method: 'DELETE' }, 'Could not delete the schedule')
       toast.info('Schedule deleted')
       load()
+    } catch (err) {
+      alertError(toApiError(err, 'Could not delete the schedule').message, 'Schedule')
     } finally {
       setBusyId(null)
     }
@@ -223,19 +215,16 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
     if (!confirmed) return
     setClearing(true)
     try {
-      const res = await fetch(`/api/projects/${projectId}/schedules/history`, {
+      const body = await fetchJson<{ deleted?: number }>(`/api/projects/${projectId}/schedules/history`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: Array.from(selected) }),
-      })
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok) {
-        alertError(String(body.error || 'Could not clear run history'), 'Run history')
-        return
-      }
+      }, 'Could not clear run history')
       const deleted = body.deleted ?? n
       toast.info(`Deleted ${deleted} run ${deleted === 1 ? 'record' : 'records'}`)
       load()
+    } catch (err) {
+      alertError(toApiError(err, 'Could not clear run history').message, 'Run history')
     } finally {
       setClearing(false)
     }

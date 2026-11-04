@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 export type SupplyChainSource = 'upload' | 'github' | 'org'
 
@@ -14,6 +15,8 @@ export interface SupplyChainConfig {
 
 export interface SupplyChainConfigState extends SupplyChainConfig {
   loading: boolean
+  /** Why the saved input could not be read; "not configured" would then be a false answer. */
+  error: string | null
   /** The SELECTED source has a usable value. A configured repository must not
    *  make Start clickable while the upload source is the one selected. */
   ready: boolean
@@ -57,13 +60,14 @@ export function useSupplyChainConfig(
 ): SupplyChainConfigState {
   const [config, setConfig] = useState<SupplyChainConfig>(EMPTY)
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     if (!projectId || !enabled) return
     setLoading(true)
     try {
       const res = await fetch(`/api/projects/${projectId}`)
-      if (!res.ok) return
+      if (!res.ok) throw await readApiError(res, 'Could not read the scan input')
       const p = await res.json()
       const raw = String(p.supplyChainInputMode ?? 'upload')
       setConfig({
@@ -73,9 +77,11 @@ export function useSupplyChainConfig(
         repoRef: String(p.supplyChainRepoRef ?? ''),
         org: String(p.supplyChainOrgName ?? ''),
       })
-    } catch {
-      // A failed read must not break the modal: the card falls back to "not
-      // configured", which is the safe answer (Start stays disabled).
+      setError(null)
+    } catch (err) {
+      // A failed read must not break the modal: Start stays disabled (the safe
+      // answer), and the card says the read failed rather than "not configured".
+      setError(toApiError(err, 'Could not read the scan input').message)
     } finally {
       setLoading(false)
     }
@@ -86,6 +92,7 @@ export function useSupplyChainConfig(
   return {
     ...config,
     loading,
+    error,
     ready: readySource(config),
     target: describe(config),
     reload: () => { void load() },

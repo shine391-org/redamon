@@ -7,7 +7,8 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useFeatureModelGate, type FeatureModelGateApi } from '@/components/shared/FeatureModelGate'
-import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { featureModelMessage, providerFailureDetail, readFeatureModelCode } from '@/lib/llmFeatures'
+import { fetchJson, fetchOk, readApiError } from '@/lib/apiError'
 
 export interface ReportMeta {
   id: string
@@ -34,6 +35,8 @@ export interface ReportMeta {
   }
   hasNarratives: boolean
   createdAt: string
+  /** Set on a report just generated without narratives, saying why (`agent_unreachable`). */
+  narrativesSkipped?: string
   project?: {
     id: string
     name: string
@@ -50,15 +53,11 @@ const REPORTS_KEY = 'reports'
 const ALL_REPORTS_KEY = 'all-reports'
 
 async function fetchReports(projectId: string): Promise<ReportMeta[]> {
-  const res = await fetch(`/api/projects/${projectId}/reports`)
-  if (!res.ok) throw new Error('Failed to fetch reports')
-  return res.json()
+  return fetchJson<ReportMeta[]>(`/api/projects/${projectId}/reports`, undefined, 'Failed to fetch reports')
 }
 
 async function fetchAllReports(): Promise<ReportMeta[]> {
-  const res = await fetch('/api/reports')
-  if (!res.ok) throw new Error('Failed to fetch reports')
-  return res.json()
+  return fetchJson<ReportMeta[]>('/api/reports', undefined, 'Failed to fetch reports')
 }
 
 type ReportGate = Pick<FeatureModelGateApi, 'ensureFeatureModel' | 'fetchWithFeatureModel'>
@@ -74,18 +73,24 @@ async function generateReport(projectId: string, gate: ReportGate): Promise<Repo
   const res = await gate.fetchWithFeatureModel('report_narratives',
     () => fetch(`/api/projects/${projectId}/reports`, { method: 'POST' }))
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
+    const err = await readApiError(res, 'Report generation failed')
+    const body = err.body ?? {}
     const code = readFeatureModelCode(body)
-    throw new Error(code
-      ? featureModelMessage(code, typeof body.model === 'string' ? body.model : undefined)
-      : body.error || 'Report generation failed')
+    // The provider's class and status tell a refused key from a rate limit or a
+    // context overflow; the agent sends them instead of the provider's text.
+    const provider = providerFailureDetail(body)
+    if (code) {
+      const message = featureModelMessage(code, typeof body.model === 'string' ? body.model : undefined)
+      throw new Error(provider ? `${message} (${provider})` : message)
+    }
+    if (provider) throw new Error(`${err.message} [${provider}]`)
+    throw err
   }
   return res.json()
 }
 
 async function deleteReport(projectId: string, reportId: string): Promise<void> {
-  const res = await fetch(`/api/projects/${projectId}/reports/${reportId}`, { method: 'DELETE' })
-  if (!res.ok) throw new Error('Failed to delete report')
+  await fetchOk(`/api/projects/${projectId}/reports/${reportId}`, { method: 'DELETE' }, 'Failed to delete report')
 }
 
 /** Hook for project-specific reports */
@@ -124,6 +129,8 @@ export function useReports(projectId: string, enabled = true) {
     isGenerating: generateMutation.isPending,
     generateError: generateMutation.error,
     deleteReport: deleteMutation.mutate,
+    /** Rejects with the cause; `deleteReport` never throws, so a failed delete looked like success. */
+    deleteReportAsync: deleteMutation.mutateAsync,
     isDeleting: deleteMutation.isPending,
   }
 }
@@ -162,6 +169,8 @@ export function useAllReports() {
     isGenerating: generateMutation.isPending,
     generateError: generateMutation.error,
     deleteReport: deleteMutation.mutate,
+    /** Rejects with the cause; `deleteReport` never throws, so a failed delete looked like success. */
+    deleteReportAsync: deleteMutation.mutateAsync,
     isDeleting: deleteMutation.isPending,
   }
 }

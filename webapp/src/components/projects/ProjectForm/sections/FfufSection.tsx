@@ -10,6 +10,7 @@ import { FileImportButton } from '../FileImportButton'
 import { AiToggleLabel } from '../AiToggleLabel'
 import { JevEngineControl } from '../JevEngineControl'
 import { useHasJevProvider } from '@/hooks/useHasJevProvider'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -41,12 +42,15 @@ export function FfufSection({ data, updateField, projectId, mode, onRun }: FfufS
   const [customWordlists, setCustomWordlists] = useState<CustomWordlist[]>([])
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const canUpload = !!projectId
+  // The wordlist routes need a saved project they can check ownership of, so a
+  // create-mode form, whose id is only pre-generated, cannot upload yet.
+  const canUpload = !!projectId && mode === 'edit'
 
   const fetchCustomWordlists = useCallback(async () => {
-    if (!projectId) return
+    if (!canUpload) return
     try {
       const res = await fetch(`/api/projects/${projectId}/wordlists`)
       if (res.ok) {
@@ -56,7 +60,7 @@ export function FfufSection({ data, updateField, projectId, mode, onRun }: FfufS
     } catch {
       // Silently fail -- custom wordlists just won't appear
     }
-  }, [projectId])
+  }, [canUpload, projectId])
 
   useEffect(() => {
     fetchCustomWordlists()
@@ -76,19 +80,18 @@ export function FfufSection({ data, updateField, projectId, mode, onRun }: FfufS
         body: formData,
       })
 
-      const result = await res.json()
-
       if (!res.ok) {
-        setUploadError(result.error || 'Upload failed')
+        setUploadError((await readApiError(res, 'Upload failed')).message)
         return
       }
 
+      const result = await res.json()
       setCustomWordlists(result.wordlists || [])
       if (result.uploaded?.path) {
         updateField('ffufWordlist', result.uploaded.path)
       }
-    } catch {
-      setUploadError('Upload failed. Please try again.')
+    } catch (err) {
+      setUploadError(toApiError(err, 'Upload failed. Please try again.').message)
     } finally {
       setIsUploading(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -97,6 +100,7 @@ export function FfufSection({ data, updateField, projectId, mode, onRun }: FfufS
 
   const handleDelete = async (name: string) => {
     if (!projectId) return
+    setDeleteError(null)
 
     try {
       const res = await fetch(
@@ -104,17 +108,19 @@ export function FfufSection({ data, updateField, projectId, mode, onRun }: FfufS
         { method: 'DELETE' }
       )
 
-      if (res.ok) {
-        const result = await res.json()
-        setCustomWordlists(result.wordlists || [])
-
-        const deletedPath = `/app/recon/wordlists/${projectId}/${name}`
-        if (data.ffufWordlist === deletedPath) {
-          updateField('ffufWordlist', DEFAULT_WORDLIST)
-        }
+      if (!res.ok) {
+        setDeleteError((await readApiError(res, `Could not delete ${name}`)).message)
+        return
       }
-    } catch {
-      // Silently fail
+      const result = await res.json()
+      setCustomWordlists(result.wordlists || [])
+
+      const deletedPath = `/app/recon/wordlists/${projectId}/${name}`
+      if (data.ffufWordlist === deletedPath) {
+        updateField('ffufWordlist', DEFAULT_WORDLIST)
+      }
+    } catch (err) {
+      setDeleteError(toApiError(err, `Could not delete ${name}`).message)
     }
   }
 
@@ -352,6 +358,7 @@ export function FfufSection({ data, updateField, projectId, mode, onRun }: FfufS
                       </div>
                     ))}
                   </div>
+                  {deleteError && <span className={styles.inlineError}>{deleteError}</span>}
                 </div>
               )}
 

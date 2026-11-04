@@ -98,8 +98,12 @@ class TestSpaSourceMapsEndToEnd(unittest.TestCase):
         self.assertNotIn("shell.js", self.rows)
 
     def test_a_map_served_as_octet_stream_is_an_exposure_of_own_code(self):
+        # Low, not high: the map's own sources go through every detector as files of
+        # their own (7a8f242b), so a key in them is a Secret finding by itself; the
+        # exposure says the first-party source is readable.
         r = self.rows["own.js"]
-        self.assertEqual((r["finding_type"], r["severity"], r["first_party_files"]), ("source_map_exposure", "high", 1))
+        self.assertEqual((r["finding_type"], r["severity"], r["first_party_files"], r["has_sources_content"]),
+                         ("source_map_exposure", "low", 1, True))
 
     def test_a_library_only_map_is_low(self):
         r = self.rows["lib.js"]

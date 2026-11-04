@@ -52,7 +52,27 @@ DANGEROUS_TOOLS = frozenset({
     # Supply-chain L3: execute_guarddog downloads attacker-authored tarballs
     # (registry egress). execute_osv_scanner is passive/offline -> NOT dangerous.
     'execute_guarddog',
+  # Post-exploitation credential/AD import (WI-2): consumes foothold-derived
+    # collector output and imports directory data — approval per run, and the
+    # tool itself also requires acknowledged=true (defense in depth, WI-0 V2).
+    'bloodhound_ingest',
+    # Post-exploitation credential harvest (WI-3): parses foothold-derived
+    # mimikatz dumps into Credential nodes — approval per run, and the tool
+    # itself also requires acknowledged=true (defense in depth, WI-0 V2).
+    'mimikatz_parse',
 })
+
+
+def is_dangerous_call(tool_name: str | None, tool_args: Any = None) -> bool:
+    """Whether a call needs the person's confirmation: a dangerous tool, or a
+    `job_spawn` that would start one. The phase check and the RoE gate already
+    look through `job_spawn` (roe_gate._dispatched_tools); without this, any
+    dangerous tool ran unconfirmed as a background job."""
+    if tool_name in DANGEROUS_TOOLS:
+        return True
+    if tool_name == 'job_spawn' and isinstance(tool_args, dict):
+        return tool_args.get('tool_name') in DANGEROUS_TOOLS
+    return False
 
 # =============================================================================
 # FIRETEAM MUTEX GROUPS — tools with singleton state inside Kali sandbox
@@ -320,6 +340,15 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
         'shodan': ['informational', 'exploitation', 'post_exploitation'],
         'google_dork': ['informational'],
         'tradecraft_lookup': ['exploitation', 'post_exploitation'],
+      # Read-only Scan Timeline delta (Type D, WI-1). Informational only:
+        # comparing graph versions sends no traffic and performs no writes.
+        'graph_diff': ['informational'],
+        # BloodHound collector import (Type D, WI-2). Post-exploitation only:
+        # it presumes a foothold with domain credentials. Dangerous + approval.
+        'bloodhound_ingest': ['post_exploitation'],
+        # mimikatz transcript parse (Type D, WI-3). Post-exploitation only:
+        # consumes foothold-derived dumps. Dangerous + approval + acknowledged.
+        'mimikatz_parse': ['post_exploitation'],
     },
 
     # User-managed MCP servers (UI-driven, see /settings/mcp). Stored as raw
@@ -381,6 +410,7 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     'RCE_OOB_CALLBACK_ENABLED': True,         # Allow interactsh DNS/HTTP oracle for blind-RCE detection (sends probes via oast.fun)
     'RCE_DESERIALIZATION_ENABLED': True,      # Include the Java/PHP/Python/Ruby deserialization gadget workflow (ysoserial) in the RCE prompt
     'RCE_AGGRESSIVE_PAYLOADS': False,         # If True, permit Step 7: file write, persistent web shells, container/k8s escape probes. Default False = read-only proofs only.
+    'RCE_HEAPDUMP_ANALYSIS_ENABLED': False,   # Route exposure: download an exposed heap dump once, count credential shapes, delete it. Also needs RoE exfiltration + data handling.
 
     # Path Traversal / LFI / RFI Testing
     'PATH_TRAVERSAL_OOB_CALLBACK_ENABLED': True,        # Allow interactsh OOB oracle for RFI / blind-LFI detection (sends probes via oast.fun)
@@ -389,6 +419,13 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     'PATH_TRAVERSAL_PAYLOAD_REFERENCE_ENABLED': True,   # Inject the encoding / bypass / wrapper payload reference (~3 KB extra). Disable for a leaner prompt.
     'PATH_TRAVERSAL_REQUEST_TIMEOUT': 10,               # curl --max-time / --connect-timeout for traversal probes (seconds)
     'PATH_TRAVERSAL_OOB_PROVIDER': 'oast.fun',          # interactsh-client server for RFI / OOB callbacks. Override when oast.fun is blocked.
+    'PATH_TRAVERSAL_GIT_RECONSTRUCT_ENABLED': False,    # Route exposure: rebuild an exposed .git in kali, count its secrets, delete it. Also needs RoE data exfiltration.
+    'PATH_TRAVERSAL_VALIDATE_SECRETS_ENABLED': False,   # Route exposure: one identity-only provider call per secret found in an exposed file.
+
+    # Mirror of the recon module's switch (the same Prisma column): the
+    # access_control, path_traversal and rce route-exposure parts load only
+    # while the project runs it. The agent never writes it.
+    'ROUTE_EXPOSURE_ENABLED': False,
 
     # Insecure Deserialization Testing
     'DESERIALIZATION_OOB_CALLBACK_ENABLED': True,       # Allow the non-destructive interactsh OOB oracle (URLDNS / pickle-DNS) that confirms a sink deserializes attacker bytes with zero impact
@@ -568,6 +605,7 @@ AGENT_SETTING_COLUMNS: dict[str, str] = {
     'RCE_OOB_CALLBACK_ENABLED': 'rceOobCallbackEnabled',
     'RCE_DESERIALIZATION_ENABLED': 'rceDeserializationEnabled',
     'RCE_AGGRESSIVE_PAYLOADS': 'rceAggressivePayloads',
+    'RCE_HEAPDUMP_ANALYSIS_ENABLED': 'rceHeapdumpAnalysisEnabled',
     # Path Traversal / LFI / RFI
     'PATH_TRAVERSAL_OOB_CALLBACK_ENABLED': 'pathTraversalOobCallbackEnabled',
     'PATH_TRAVERSAL_PHP_WRAPPERS_ENABLED': 'pathTraversalPhpWrappersEnabled',
@@ -575,6 +613,10 @@ AGENT_SETTING_COLUMNS: dict[str, str] = {
     'PATH_TRAVERSAL_PAYLOAD_REFERENCE_ENABLED': 'pathTraversalPayloadReferenceEnabled',
     'PATH_TRAVERSAL_REQUEST_TIMEOUT': 'pathTraversalRequestTimeout',
     'PATH_TRAVERSAL_OOB_PROVIDER': 'pathTraversalOobProvider',
+    'PATH_TRAVERSAL_GIT_RECONSTRUCT_ENABLED': 'pathTraversalGitReconstructEnabled',
+    'PATH_TRAVERSAL_VALIDATE_SECRETS_ENABLED': 'pathTraversalValidateSecretsEnabled',
+    # Recon's route exposure scan (read, never written, by the agent)
+    'ROUTE_EXPOSURE_ENABLED': 'routeExposureEnabled',
     # Insecure deserialization
     'DESERIALIZATION_OOB_CALLBACK_ENABLED': 'deserializationOobCallbackEnabled',
     'DESERIALIZATION_OOB_PROVIDER': 'deserializationOobProvider',

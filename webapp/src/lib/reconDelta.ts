@@ -107,6 +107,18 @@ export const VOLATILE_PROPERTIES = new Set([
   'deser_jev_format_confidence',
   'deser_jev_exploitability',
   'deser_jev_source',
+  // The route exposure scan restamps a route's anonymous status every run, and
+  // Jev's opinions of a lead are recomputed (or absent) each time. anon_status
+  // itself is NOT volatile: a route that went from 401 to 200 is the change.
+  'anon_status_at',
+  'route_jev_kind',
+  'route_jev_kind_confidence',
+  'route_jev_sensitivity',
+  'route_jev_source',
+  'route_jev_privacy',
+  'anon_page_class',
+  'anon_page_class_confidence',
+  'anon_page_class_source',
   // Per-host coverage stamps on BaseURL: every run restamps every host it
   // looked at, and a cut that moves between runs is the scan, not the target.
   ...COVERAGE_STAMP_PROPERTIES,

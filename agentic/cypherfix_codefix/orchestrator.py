@@ -10,10 +10,11 @@ from typing import Optional
 import httpx
 
 from cypherfix_errors import safe_error
+from llm_builder import provider_error_details
 from . import sandbox_client
 from .state import CodeFixState, CodeFixSettings
 from .tools import CODEFIX_TOOLS
-from .tools.github_repo import GitHubRepoManager
+from .tools.github_repo import GitCommandError, GitHubRepoManager
 from .tools.glob_tool import github_glob
 from .tools.grep_tool import github_grep
 from .tools.read_tool import github_read
@@ -49,6 +50,38 @@ TOOL_HANDLERS = {
 
 SEQUENTIAL_TOOLS = {"github_edit", "github_write", "github_bash"}
 
+
+
+class RemediationLoadFailed(Exception):
+    """The webapp could not hand over the remediation. `details` are safe fields."""
+
+    def __init__(self, details: dict):
+        super().__init__(details)
+        self.details = details
+
+
+#: GitHub's own short error titles ("Validation Failed", "Bad credentials").
+_GITHUB_MESSAGE = re.compile(r"^[A-Za-z][A-Za-z ,.'-]{0,79}$")
+
+
+def _git_details(exc: BaseException) -> dict:
+    """What a person may see of a failed git or GitHub step.
+
+    git's exit code and a fixed cause; GitHub's HTTP status and its short error
+    title. Never the stderr or the response body: they name the remote URL, the
+    branch and, in a 422, the head owner.
+    """
+    if isinstance(exc, GitCommandError):
+        return {"git_exit_code": exc.returncode, **({"cause": exc.cause} if exc.cause else {})}
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        data = getattr(exc, "data", None)
+        message = data.get("message") if isinstance(data, dict) else None
+        out = {"github_status": status}
+        if isinstance(message, str) and _GITHUB_MESSAGE.match(message.strip()):
+            out["github_message"] = message.strip()
+        return out
+    return {"error_class": type(exc).__name__}
 
 class CodeFixOrchestrator:
     """Pure ReAct loop — the LLM is the sole controller."""
@@ -102,10 +135,18 @@ class CodeFixOrchestrator:
 
         # Load remediation
         await self.callback.on_phase("cloning_repo", "Loading remediation details...")
-        remediation = await self._load_remediation(remediation_id)
+        try:
+            remediation = await self._load_remediation(remediation_id)
+        except RemediationLoadFailed as failed:
+            await self.callback.on_error(
+                safe_error("remediation_load_failed", codefix=True),
+                recoverable=True, code="remediation_load_failed", **failed.details)
+            return
         if not remediation:
             logger.error(f"Remediation {remediation_id} not found")
-            await self.callback.on_error("Remediation not found", recoverable=False)
+            await self.callback.on_error(
+                safe_error("remediation_not_found", codefix=True), recoverable=False,
+                code="remediation_not_found")
             return
         # The internal API key bypasses the route's ownership guard, so the
         # remediation id arriving over the socket is only as trustworthy as the
@@ -115,7 +156,10 @@ class CodeFixOrchestrator:
             logger.error(
                 f"Remediation {remediation_id} belongs to another project - refused"
             )
-            await self.callback.on_error("Remediation not found", recoverable=False)
+            # The same answer as a missing one: another tenant's ids stay unconfirmed.
+            await self.callback.on_error(
+                safe_error("remediation_not_found", codefix=True), recoverable=False,
+                code="remediation_not_found")
             return
 
         self.state.remediation_title = remediation.get("title", "")
@@ -149,6 +193,7 @@ class CodeFixOrchestrator:
             return
 
         await self.callback.on_phase("cloning_repo", "Cloning repository...")
+        step = "clone"
         try:
             self.repo_manager = GitHubRepoManager(
                 token=self.state.settings.github_token,
@@ -164,6 +209,7 @@ class CodeFixOrchestrator:
             logger.info(f"Clone successful — path: {repo_path}")
 
             # Create fix branch
+            step = "create_branch"
             branch_name = f"{self.state.settings.branch_prefix}{remediation_id}"
             self.repo_manager.create_branch(branch_name)
             self.state.branch_name = branch_name
@@ -172,7 +218,7 @@ class CodeFixOrchestrator:
             logger.exception("Clone failed")
             await self.callback.on_error(
                 safe_error("clone_failed", codefix=True),
-                recoverable=False, code="clone_failed")
+                recoverable=False, code="clone_failed", step=step, **_git_details(e))
             return
 
         # Spawn the isolated build sandbox now that the worktree exists. Build
@@ -238,7 +284,7 @@ class CodeFixOrchestrator:
                     continue
                 await self.callback.on_error(
                     safe_error("llm_error", codefix=True),
-                    recoverable=False, code="llm_error")
+                    recoverable=False, code="llm_error", **provider_error_details(e))
                 break
 
             # Append assistant message (include tool_uses so _call_llm can reconstruct properly)
@@ -457,6 +503,7 @@ class CodeFixOrchestrator:
         logger.info(f"Diff blocks: {len(self.state.diff_blocks)}")
 
         if self.state.files_modified and self.repo_manager:
+            step = "commit"
             try:
                 rem_title = self.state.remediation_title or "security remediation"
                 title = f"fix: {rem_title}"
@@ -468,8 +515,10 @@ class CodeFixOrchestrator:
                 # the PR (T6/E10).
                 self.repo_manager.commit(title, list(self.state.files_modified))
                 logger.info(f"Pushing branch {self.state.branch_name}...")
+                step = "push"
                 self.repo_manager.push(self.state.branch_name)
                 logger.info("Creating pull request...")
+                step = "create_pr"
 
                 pr_data = self.repo_manager.create_pr(
                     title=title,
@@ -500,7 +549,7 @@ class CodeFixOrchestrator:
                 })
                 await self.callback.on_error(
                     safe_error("pr_failed", codefix=True),
-                    recoverable=False, code="pr_failed")
+                    recoverable=False, code="pr_failed", step=step, **_git_details(e))
                 self.state.status = "error"
                 await self.callback.on_complete(remediation_id, "error")
         else:
@@ -519,14 +568,29 @@ class CodeFixOrchestrator:
             await self.callback.on_complete(remediation_id, "no_fix")
 
     async def _load_remediation(self, remediation_id: str) -> Optional[dict]:
+        """The remediation, or None when the webapp has none with this id.
+
+        Any other failure raises `RemediationLoadFailed`: a refused key, a 500 or
+        a timeout is not a missing remediation, and reporting it as one sent the
+        operator looking for a remediation that exists.
+        """
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{WEBAPP_API_URL}/api/remediations/{remediation_id}", headers=INTERNAL_HEADERS)
-                resp.raise_for_status()
-                return resp.json()
         except Exception as e:
             logger.error(f"Failed to load remediation: {e}")
+            raise RemediationLoadFailed({"error_class": type(e).__name__}) from e
+        if resp.status_code == 404:
             return None
+        if not resp.is_success:
+            logger.error(f"Failed to load remediation: HTTP {resp.status_code}")
+            raise RemediationLoadFailed({"upstream_status": resp.status_code})
+        try:
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to load remediation: unreadable body ({type(e).__name__})")
+            raise RemediationLoadFailed({"upstream_status": resp.status_code,
+                                         "error_class": type(e).__name__}) from e
 
     async def _update_remediation(self, remediation_id: str, data: dict):
         try:

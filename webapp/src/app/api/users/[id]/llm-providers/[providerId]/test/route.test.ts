@@ -276,3 +276,52 @@ describe('POST llm-providers/[providerId]/test - TypeSafe Jev lock', () => {
     expect(sentToAgent().providerType).toBe('openai')
   })
 })
+
+describe('POST llm-providers/[providerId]/test — the agent answered with an error', () => {
+  test('a FastAPI {detail} (bad internal key) is a 502 with its status, not an empty red X', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ detail: 'Invalid internal key' }), { status: 401 }))
+    const res = await POST(post(CONFIG), params('u1', 'unsaved'))
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({
+      success: false, error: 'The agent could not test this provider', code: 'agent_error', upstreamStatus: 401,
+    })
+  })
+
+  test('a plain-text 500 is a 502 naming the status, never a SyntaxError', async () => {
+    fetchMock.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+    const res = await POST(post(CONFIG), params('u1', 'unsaved'))
+    const body = await res.json()
+    expect(res.status).toBe(502)
+    expect(body).toMatchObject({ success: false, code: 'agent_error', upstreamStatus: 500 })
+    expect(JSON.stringify(body)).not.toContain('SyntaxError')
+  })
+
+  test('the agent\'s exception text is not forwarded', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ detail: 'boom: key sk-live-123 rejected' }), { status: 500 }))
+    const body = await (await POST(post(CONFIG), params('u1', 'unsaved'))).json()
+    expect(JSON.stringify(body)).not.toContain('sk-live-123')
+  })
+
+  test('an unreachable agent also carries its code and errno', async () => {
+    fetchMock.mockRejectedValue(dnsFailure())
+    const body = await (await POST(post(CONFIG), params('u1', 'unsaved'))).json()
+    expect(body).toMatchObject({ success: false, code: 'agent_unreachable', cause: 'ENOTFOUND' })
+  })
+
+  test('a 200 the agent could not have meant (no success flag) is not shown as a result', async () => {
+    fetchMock.mockResolvedValue(new Response('<html>ok</html>', { status: 200 }))
+    const res = await POST(post(CONFIG), params('u1', 'unsaved'))
+    expect(res.status).toBe(502)
+    expect(await res.json()).toMatchObject({ success: false, code: 'agent_error', upstreamStatus: 200 })
+  })
+
+  test('a failure inside the route answers a code, never String(error)', async () => {
+    const malformed = new NextRequest('http://x/api/users/u1/llm-providers/unsaved/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{not json',
+    })
+    const res = await POST(malformed, params('u1', 'unsaved'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to test LLM provider', code: 'SyntaxError', success: false })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})

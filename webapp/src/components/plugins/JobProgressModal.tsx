@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
+import { fetchJson, formatApiError, toApiError } from '@/lib/apiError'
 import { featureModelMessage, pluginFeatureId, type FeatureModelCode } from '@/lib/llmFeatures'
 import type { FeatureModelGateApi } from '@/components/shared/FeatureModelGate'
 import { PluginBadge } from './PluginBadge'
@@ -19,6 +20,18 @@ interface JobView {
 
 const ACTIVE = new Set(['queued', 'running'])
 const GATE_CODES = new Set<string>(['model_required', 'model_unavailable'])
+// A poll that fails is asked again a few times, slower each time: a restart of the webapp or
+// a proxy blip must not end the window. A signed-out session, a refusal or a job that is not
+// there will not get better by asking again.
+const POLL_ATTEMPTS = 4
+const FINAL_POLL_STATUSES = new Set([401, 403, 404])
+const REPORT_REFUSED = 'report_refused:'
+
+/** "reason (code · HTTP n)" for anything a catch receives; the code of no answer is network_error. */
+function failureText(e: unknown, reason: string): string {
+  const err = toApiError(e, reason)
+  return formatApiError({ reason, code: err.code, status: err.status, upstreamStatus: err.upstreamStatus })
+}
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
 function elapsed(fromIso: string, nowMs: number): string {
@@ -51,6 +64,7 @@ export function JobProgressModal({
 }) {
   const [view, setView] = useState<JobView | null>(null)
   const [fatal, setFatal] = useState<string | null>(null)
+  const [cancelError, setCancelError] = useState<string | null>(null)
   const [nowMs, setNowMs] = useState(now)
   const handed = useRef(false)
   // Once the job is terminal (polled, or set by a cancel), a late in-flight poll must not
@@ -63,19 +77,27 @@ export function JobProgressModal({
   useEffect(() => {
     let live = true
     let timer: ReturnType<typeof setTimeout> | undefined
+    let failures = 0
     const tick = async () => {
+      let v: JobView
       try {
-        const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(job.jobId)}`, { cache: 'no-store' })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const v = (await res.json()) as JobView
+        v = await fetchJson<JobView>(`/api/plugins/jobs/${encodeURIComponent(job.jobId)}`, { cache: 'no-store' }, 'Lost contact with the job')
+      } catch (e) {
         if (!live || done.current) return
-        setNowMs(now())
-        setView(v)
-        if (ACTIVE.has(v.status)) timer = setTimeout(tick, pollMs)
-        else done.current = true
-      } catch {
-        if (live && !done.current) setFatal('Lost contact with the job; it may still be running.')
+        failures += 1
+        if (failures < POLL_ATTEMPTS && !FINAL_POLL_STATUSES.has(toApiError(e, '').status)) {
+          timer = setTimeout(tick, pollMs * 2 ** failures)
+          return
+        }
+        setFatal(`${failureText(e, 'Lost contact with the job')}; it may still be running.`)
+        return
       }
+      failures = 0
+      if (!live || done.current) return
+      setNowMs(now())
+      setView(v)
+      if (ACTIVE.has(v.status)) timer = setTimeout(tick, pollMs)
+      else done.current = true
     }
     void tick()
     return () => {
@@ -95,19 +117,19 @@ export function JobProgressModal({
     }
   }, [view, onReviewProposal, onClose])
 
+  // A refused or failed cancel is said under the progress, which keeps polling: the job runs on.
   const cancel = useCallback(async () => {
+    setCancelError(null)
     try {
-      const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(job.jobId)}/cancel`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      })
-      if (res.ok) {
-        done.current = true
-        setView((await res.json()) as JobView)
-      }
-    } catch {
-      setFatal('The job could not be cancelled; it may still be running.')
+      const cancelled = await fetchJson<JobView>(
+        `/api/plugins/jobs/${encodeURIComponent(job.jobId)}/cancel`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+        'The job could not be cancelled',
+      )
+      done.current = true
+      setView(cancelled)
+    } catch (e) {
+      setCancelError(`${failureText(e, 'The job could not be cancelled')}; it may still be running.`)
     }
   }, [job.jobId])
 
@@ -127,6 +149,7 @@ export function JobProgressModal({
 
   const canRetry = view?.status === 'failed' && !!gate && !!onRetry && GATE_CODES.has(view.error?.code ?? '')
   const timedOut = view?.status === 'failed' && view.error?.code === 'timeout'
+  const reportRefused = view?.status === 'failed' && !!view.error?.code?.startsWith(REPORT_REFUSED)
 
   // A plugin may report a "Stage" field like "1 of 3"; show it as step dots. Any other
   // shape just leaves the dots out, so this never depends on a plugin's exact wording.
@@ -203,6 +226,7 @@ export function JobProgressModal({
                 Elapsed <span>{elapsed(view.createdAt, nowMs)}</span>
               </div>
             )}
+            {cancelError && <div className={styles.jobError} role="alert">{cancelError}</div>}
           </>
         )}
 
@@ -215,7 +239,9 @@ export function JobProgressModal({
             {view.status === 'failed' && (
               <>
                 {timedOut && <div className={styles.jobLabel}>The action timed out.</div>}
+                {reportRefused && <div className={styles.jobLabel}>The plugin&apos;s result was refused.</div>}
                 {view.error?.message ?? 'The action failed.'}
+                {view.error?.code && <span className={styles.jobCode} data-testid="job-error-code">{view.error.code}</span>}
               </>
             )}
           </div>

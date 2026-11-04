@@ -35,8 +35,8 @@ SKILL_ID = "insecure_file_uploads"
 SKILL_PATH = _AGENTIC_DIR / "community-skills" / f"{SKILL_ID}.md"
 COMMUNITY_DIR = _AGENTIC_DIR / "community-skills"
 
-# 50KB cap enforced by webapp/src/app/api/users/[id]/attack-skills/route.ts
-MAX_CONTENT_BYTES = 50 * 1024
+# MAX_CONTENT_SIZE in webapp/src/lib/userSkills.ts
+MAX_CONTENT_BYTES = 500 * 1024
 
 # Canonical tool names from agentic/prompts/tool_registry.py top-level keys.
 # These are the only `execute_*` / `*_shell` / `query_*` / `metasploit_*`
@@ -127,12 +127,12 @@ class TestSkillFileExists(unittest.TestCase):
         text = SKILL_PATH.read_text(encoding="utf-8")
         self.assertGreater(len(text), 0)
 
-    def test_under_50kb_cap(self):
+    def test_under_import_cap(self):
         size = SKILL_PATH.stat().st_size
         self.assertLess(
             size, MAX_CONTENT_BYTES,
-            f"Skill is {size} bytes, exceeds 50KB import cap "
-            f"(webapp/src/app/api/users/[id]/attack-skills/route.ts)"
+            f"Skill is {size} bytes, exceeds 500 KB import cap "
+            f"(MAX_CONTENT_SIZE in webapp/src/lib/userSkills.ts)"
         )
 
     def test_line_count_in_canonical_range(self):

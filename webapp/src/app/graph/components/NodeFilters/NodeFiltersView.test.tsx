@@ -5,7 +5,7 @@
  * Run: npx vitest run src/app/graph/components/NodeFilters/NodeFiltersView.test.tsx
  */
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 
 const confirm = vi.fn()
@@ -328,6 +328,105 @@ describe('NodeFiltersView', () => {
       expect(String(alertError.mock.calls[0][0])).toMatch(/could not be loaded: Failed to fetch[\s\S]*Check whether/)
       expect(reads()).toBeGreaterThan(before)
       expect(toast.success).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('preset failures say why', () => {
+    async function openMenuItem(label: string) {
+      fireEvent.click(await screen.findByRole('button', { name: /Presets/ }))
+      fireEvent.click(screen.getByRole('menuitem', { name: label }))
+    }
+    function answer(match: (url: string, method: string) => boolean, body: unknown, status: number) {
+      const real = fetchMock.getMockImplementation() as (url: string, init?: RequestInit) => unknown
+      fetchMock.mockImplementation((url: string, init?: RequestInit) => (
+        match(url, init?.method ?? 'GET') ? reply(body, status) : real(url, init)
+      ))
+    }
+
+    test('a save the server could not write shows its sentence and Prisma code (it read "Save failed (500)")', async () => {
+      answer((u, m) => u.endsWith('/api/mute-rule-presets') && m === 'POST', { error: 'Failed to save the preset', code: 'P1001' }, 500)
+      view()
+      await openMenuItem('Save as preset…')
+      fireEvent.change(screen.getByPlaceholderText(/Quiet external perimeter/), { target: { value: 'My preset' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save preset' }))
+      expect(await screen.findByText('Failed to save the preset (P1001 · HTTP 500)')).toBeTruthy()
+    })
+
+    test('refused rules are all listed under the reason, past ten', async () => {
+      const errors = Array.from({ length: 12 }, (_, i) => `vuln.nuclei rule ${i + 1}: unknown field`)
+      answer((u, m) => u.endsWith('/api/mute-rule-presets') && m === 'POST', { error: 'The rules are not valid.', errors }, 400)
+      view()
+      await openMenuItem('Save as preset…')
+      fireEvent.change(screen.getByPlaceholderText(/Quiet external perimeter/), { target: { value: 'My preset' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save preset' }))
+      expect(await screen.findByText('The rules are not valid. (HTTP 400)')).toBeTruthy()
+      expect(screen.getByText('vuln.nuclei rule 12: unknown field')).toBeTruthy()
+    })
+
+    test('a list that cannot be read says why, with Retry', async () => {
+      answer((u, m) => u.endsWith('/api/mute-rule-presets') && m === 'GET', { error: 'Failed to load the presets', code: 'P1001' }, 500)
+      view()
+      await openMenuItem('Load preset…')
+      expect(await screen.findByText('Failed to load the presets (P1001 · HTTP 500)')).toBeTruthy()
+      expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy()
+    })
+
+    test('a preset that cannot be read names the status (a deleted one is a 404)', async () => {
+      confirm.mockResolvedValue(true)
+      answer(u => u.endsWith('/api/mute-rule-presets/preset1'), { error: 'Preset not found' }, 404)
+      view()
+      await openMenuItem('Load preset…')
+      fireEvent.click(await screen.findByRole('button', { name: 'Load' }))
+      await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+        'The preset "Quiet perimeter" could not be read (HTTP 404).', 'Load preset'))
+    })
+
+    test('a rename that got no answer says so in the row (it used to throw unhandled)', async () => {
+      const real = fetchMock.getMockImplementation() as (url: string, init?: RequestInit) => unknown
+      fetchMock.mockImplementation((url: string, init?: RequestInit) => (
+        url.endsWith('/api/mute-rule-presets/preset1') && init?.method === 'PATCH'
+          ? Promise.reject(new TypeError('Failed to fetch'))
+          : real(url, init)
+      ))
+      view()
+      await openMenuItem('Manage presets…')
+      fireEvent.click(await screen.findByRole('button', { name: 'Rename Quiet perimeter' }))
+      fireEvent.change(screen.getByLabelText('Preset name'), { target: { value: 'Renamed' } })
+      fireEvent.click(within(screen.getByLabelText('Preset name').closest('li')!).getByRole('button', { name: /Save/ }))
+      expect(await screen.findByText('Rename failed (network_error)')).toBeTruthy()
+    })
+
+    test('a refused rename shows the server reason with its status', async () => {
+      answer((u, m) => u.endsWith('/api/mute-rule-presets/preset1') && m === 'PATCH', { error: 'Preset not found' }, 404)
+      view()
+      await openMenuItem('Manage presets…')
+      fireEvent.click(await screen.findByRole('button', { name: 'Rename Quiet perimeter' }))
+      fireEvent.change(screen.getByLabelText('Preset name'), { target: { value: 'Renamed' } })
+      fireEvent.click(within(screen.getByLabelText('Preset name').closest('li')!).getByRole('button', { name: /Save/ }))
+      expect(await screen.findByText('Preset not found (HTTP 404)')).toBeTruthy()
+    })
+
+    test('a delete the server refused names the code and status', async () => {
+      dangerConfirm.mockResolvedValue(true)
+      answer((u, m) => u.endsWith('/api/mute-rule-presets/preset1') && m === 'DELETE', { error: 'Failed to delete the preset', code: 'P1001' }, 500)
+      view()
+      await openMenuItem('Manage presets…')
+      fireEvent.click(await screen.findByRole('button', { name: 'Delete Quiet perimeter' }))
+      await waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+        'Preset "Quiet perimeter" could not be deleted (P1001 · HTTP 500).', 'Mute rules'))
+    })
+
+    test("an apply the agent refused shows the agent's sentence with both statuses", async () => {
+      answer((u, m) => u.endsWith('/apply') && m === 'POST',
+        { error: 'INTERNAL_API_KEY is not configured; mute rules are disabled.', code: 'agent_error', upstreamStatus: 503 }, 502)
+      view()
+      fireEvent.click(await screen.findByText('Apply…'))
+      const confirmApply = await screen.findByRole('button', { name: 'Apply' })
+      await waitFor(() => expect((confirmApply as HTMLButtonElement).disabled).toBe(false))
+      fireEvent.click(confirmApply)
+      await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+        'INTERNAL_API_KEY is not configured; mute rules are disabled. (agent_error · HTTP 502 · upstream HTTP 503)',
+        'Apply mute rules'))
     })
   })
 })

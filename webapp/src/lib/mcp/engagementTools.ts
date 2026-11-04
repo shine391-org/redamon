@@ -629,6 +629,12 @@ const AI_HOOKS = [
   { hook: 'crawl_seed_order', engineField: 'hakrawlerJevSeedOrder', kind: 'enable' },
   { hook: 'serialized_assess', engineField: 'serializedScanJevRank', kind: 'enable',
     requires: 'serializedScanEnabled' },
+  { hook: 'route_privacy_rank', engineField: 'routeExposureJevRank', kind: 'enable',
+    requires: 'routeExposureEnabled' },
+  { hook: 'route_exposure_wall', engineField: 'routeExposureJevWallCheck', kind: 'enable',
+    requires: 'routeExposureEnabled' },
+  { hook: 'route_exposure_assess', engineField: 'routeExposureJevAssess', kind: 'enable',
+    requires: 'routeExposureEnabled' },
 ] as const
 
 /**

@@ -158,10 +158,51 @@ describe('destructive actions are confirmed', () => {
     render(<VersionManager {...props} />)
     fireEvent.click(within(rowFor('Scan 2')).getByText('Activate'))
     await waitFor(() => expect(alertError).toHaveBeenCalledWith(
-      'Cannot activate a version while a full recon scan is running',
+      'Cannot activate a version while a full recon scan is running (HTTP 409)',
       'Could not activate the version'
     ))
     expect(props.onActivated).not.toHaveBeenCalled()
+  })
+
+  test('a gateway timeout says the activation may still be running and reloads the list', async () => {
+    dangerConfirm.mockResolvedValue(true)
+    fetchMock.mockResolvedValue({ ok: false, status: 504, text: async () => '<html>Gateway Time-out</html>' })
+    render(<VersionManager {...props} />)
+    fireEvent.click(within(rowFor('Scan 2')).getByText('Activate'))
+    await waitFor(() => expect(alertError).toHaveBeenCalled())
+    const [message, title] = alertError.mock.calls[0]
+    expect(title).toBe('Could not activate the version')
+    expect(message).toMatch(/^Could not activate the version \(non_json_response · HTTP 504\)/)
+    expect(message).toMatch(/may still be running or may already have finished/)
+    expect(props.onChanged).toHaveBeenCalled()
+    expect(props.onActivated).not.toHaveBeenCalled()
+  })
+
+  test('a freeze failure shows the fixed reason with its code, never the exception text', async () => {
+    dangerConfirm.mockResolvedValue(true)
+    fetchMock.mockResolvedValue({
+      ok: false, status: 500,
+      json: async () => ({
+        error: 'Could not save the current graph before switching, so nothing was changed.',
+        code: 'P2024', freezeFailed: true,
+      }),
+    })
+    render(<VersionManager {...props} />)
+    fireEvent.click(within(rowFor('Scan 2')).getByText('Activate'))
+    await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+      'Could not save the current graph before switching, so nothing was changed. (P2024 · HTTP 500)',
+      'Could not activate the version'
+    ))
+    expect(props.onChanged).not.toHaveBeenCalled()
+  })
+
+  test('an activation that got no answer at all is reported, not left as an unhandled rejection', async () => {
+    dangerConfirm.mockResolvedValue(true)
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    render(<VersionManager {...props} />)
+    fireEvent.click(within(rowFor('Scan 2')).getByText('Activate'))
+    await waitFor(() => expect(alertError).toHaveBeenCalled())
+    expect(alertError.mock.calls[0][0]).toMatch(/^Could not activate the version \(network_error\)/)
   })
 
   test('delete asks first and names the bytes being dropped', async () => {
@@ -224,8 +265,23 @@ describe('non-destructive edits', () => {
     render(<VersionManager {...props} />)
     fireEvent.click(screen.getByText(/Save current graph as a version/i))
     await waitFor(() => expect(alertError).toHaveBeenCalledWith(
-      'Cannot save a version while a full recon scan is running',
+      'Cannot save a version while a full recon scan is running (HTTP 409)',
       'Could not save the current graph as a version'
     ))
+  })
+
+  test('a rename the network dropped says so instead of failing silently', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    render(<VersionManager {...props} />)
+    fireEvent.click(within(rowFor('Scan 2')).getByTitle('Rename'))
+    const input = screen.getByDisplayValue('Scan 2')
+    fireEvent.change(input, { target: { value: 'Renamed' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+      'Could not rename the version (network_error)',
+      'Could not rename the version'
+    ))
+    // Only an activation's outcome is unknown; a rename is simply not done.
+    expect(props.onChanged).not.toHaveBeenCalled()
   })
 })

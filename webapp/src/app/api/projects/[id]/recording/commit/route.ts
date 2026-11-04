@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { toAuthProfileMetadata } from '@/lib/authProfile'
 import {
@@ -89,7 +90,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       authProfile: toAuthProfileMetadata(profile),
     })
   } catch (error) {
-    console.error('Failed to commit recording:', error)
-    return NextResponse.json({ error: 'Failed to commit recording' }, { status: 500 })
+    return internalError(error, 'Failed to commit recording')
   }
 }

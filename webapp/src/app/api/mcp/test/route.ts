@@ -11,6 +11,10 @@ import prisma from '@/lib/prisma'
 import { requireUserAccess } from '@/lib/session'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 import { MASK_PREFIX, type MCPServer } from '@/lib/mcp/schema'
+import { internalError, readUpstreamBody, upstreamFailure } from '@/lib/routeErrors'
+
+/** Every answer keeps the panel's shape: McpServersTab renders these fields unconditionally. */
+const EMPTY_RESULT = { discovered_tools: [], warnings: [], elapsed_ms: 0 }
 
 export async function POST(request: NextRequest) {
   try {
@@ -69,24 +73,35 @@ export async function POST(request: NextRequest) {
       },
       { timeoutMs: 35_000 },
     )
-    const data = await upstream.json().catch(() => ({}))
-    return NextResponse.json(data, { status: upstream.status })
+    // A test the agent ran answers `{ok, error, warnings}`, whatever the MCP
+    // server did, and is passed through. Any other body is the agent itself
+    // failing (FastAPI `{detail}` on a bad internal key, a plain-text 500); its
+    // text can be an exception's own message, so only status and code go out.
+    const answered = await readUpstreamBody(upstream)
+    if (answered.json && typeof answered.json.ok === 'boolean') {
+      return NextResponse.json({ ...EMPTY_RESULT, ...answered.json }, { status: upstream.status })
+    }
+    return NextResponse.json({
+      ok: false,
+      error: 'The agent could not run the MCP test',
+      code: answered.code ?? 'agent_error',
+      upstreamStatus: upstream.status,
+      ...EMPTY_RESULT,
+    }, { status: 502 })
   } catch (error) {
     // Same reasoning as the LLM-provider test route (issue #184): an agent
     // outage must not be reported as a fault in the server the user just
-    // configured. 503, because the dependency is unavailable.
+    // configured. 503 because the dependency is unavailable, 504 when it timed out.
     if (error instanceof AgentUnreachableError) {
       console.error('MCP test: agent unreachable:', error.message, error.cause_)
+      const failure = upstreamFailure('agent', error.cause_, error.message)
       return NextResponse.json(
-        { ok: false, error: error.message, discovered_tools: [], warnings: [], elapsed_ms: 0 },
-        { status: 503 },
+        { ok: false, ...failure.body, ...EMPTY_RESULT },
+        { status: failure.status },
       )
     }
-    console.error('Failed to proxy /mcp/test:', error)
-    const message = error instanceof Error ? error.message : 'unknown error'
-    return NextResponse.json(
-      { ok: false, error: `proxy failed: ${message}`, discovered_tools: [], warnings: [], elapsed_ms: 0 },
-      { status: 502 },
-    )
+    return internalError(error, 'MCP test proxy failed', {
+      status: 502, log: 'Failed to proxy /mcp/test', extra: { ok: false, ...EMPTY_RESULT },
+    })
   }
 }

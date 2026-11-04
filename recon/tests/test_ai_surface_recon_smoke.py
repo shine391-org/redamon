@@ -92,10 +92,15 @@ def test_master_toggle_exists():
 
 # --- stealth -----------------------------------------------------------------
 def test_stealth_overrides_present():
-    ps = _read("recon/project_settings.py")
-    assert "settings['AI_SURFACE_RECON_MAX_WORKERS'] = 2" in ps
-    assert "settings['AI_SURFACE_RECON_MCP_LIST_TOOLS_ENABLED'] = False" in ps
-    assert "settings['AI_SURFACE_RECON_VECTOR_DB_READ_ENABLED'] = False" in ps
+    # The stealth profile is a registry query (881b2cc9), not lines in
+    # project_settings.py, so ask the function that applies it.
+    from recon.project_settings import DEFAULT_SETTINGS, apply_stealth_overrides
+    stealthy = apply_stealth_overrides({**DEFAULT_SETTINGS, "STEALTH_MODE": True})
+    assert stealthy["AI_SURFACE_RECON_MAX_WORKERS"] == 2
+    assert stealthy["AI_SURFACE_RECON_MCP_LIST_TOOLS_ENABLED"] is False
+    assert stealthy["AI_SURFACE_RECON_VECTOR_DB_READ_ENABLED"] is False
+    normal = apply_stealth_overrides({**DEFAULT_SETTINGS, "STEALTH_MODE": False})
+    assert normal["AI_SURFACE_RECON_MAX_WORKERS"] == DEFAULT_SETTINGS["AI_SURFACE_RECON_MAX_WORKERS"]
 
 
 # --- pipeline wiring regression ---------------------------------------------

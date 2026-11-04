@@ -34,6 +34,8 @@ import { llmInventoryHint } from '@/lib/apiUsage/inventory'
 import { FeatureModelsSection } from '@/components/settings/FeatureModelsSection'
 import { AgentSkillsTab } from '@/components/settings/AgentSkillsTab'
 import { JevProviderSection } from '@/components/settings/JevProviderSection'
+import { actionFailedText, failureText, saveWarningLines } from '@/components/settings/failureText'
+import { readApiError } from '@/lib/apiError'
 
 /** A Secret Multiscanner credential column (TRUFFLEHOG_KEY_FIELDS). */
 type TrufflehogField = `trufflehog${string}`
@@ -184,6 +186,31 @@ function getProviderLabel(providerType: string): string {
   return PROVIDER_TYPES.find(p => p.id === providerType)?.name || providerType
 }
 
+const PROVIDERS_LOAD_FAILED = "Couldn't load your providers"
+const SETTINGS_LOAD_FAILED = "Couldn't load your saved keys"
+const CHAT_SKILLS_LOAD_FAILED = "Couldn't load your chat skills"
+const TRADECRAFT_LOAD_FAILED = "Couldn't load your tradecraft resources"
+
+// MAX_SKILLS_PER_USER in the chat-skills routes; agent skills have their own, larger cap.
+const CHAT_SKILLS_PER_USER = 50
+
+type ChatSkipReason = 'duplicate' | 'limit' | 'fetchFailed' | 'tooLarge' | 'invalid' | 'saveFailed'
+
+/** The chat-skill community import's answer, with each reason a skill was skipped said apart. */
+function chatImportSummary(data: { imported?: number; message?: string; skippedBy?: Partial<Record<ChatSkipReason, number>> }): string {
+  if (data.message) return data.message
+  const by = data.skippedBy ?? {}
+  const parts = [
+    by.duplicate ? `${by.duplicate} already in your chat skills` : '',
+    by.limit ? `${by.limit} over your ${CHAT_SKILLS_PER_USER}-chat-skill limit` : '',
+    by.tooLarge ? `${by.tooLarge} too large` : '',
+    by.fetchFailed ? `${by.fetchFailed} could not be fetched` : '',
+    by.invalid ? `${by.invalid} not valid` : '',
+    by.saveFailed ? `${by.saveFailed} could not be saved` : '',
+  ].filter(Boolean)
+  return `Imported ${data.imported ?? 0} community chat skill(s)` + (parts.length ? `; skipped ${parts.join(', ')}.` : '.')
+}
+
 export default function SettingsPage() {
   const { userId } = useProject()
   const { isAdmin } = useAuth()
@@ -193,8 +220,8 @@ export default function SettingsPage() {
   // LLM Providers
   const [providers, setProviders] = useState<ProviderData[]>([])
   const [providersLoading, setProvidersLoading] = useState(true)
-  // A failed fetch must not read as "no providers" (or "no Jev token").
-  const [providersError, setProvidersError] = useState(false)
+  // A failed fetch must not read as "no providers" (or "no Jev token"); holds the cause to show.
+  const [providersError, setProvidersError] = useState<string | null>(null)
   const [showProviderForm, setShowProviderForm] = useState(false)
   const [editingProvider, setEditingProvider] = useState<ProviderData | null>(null)
   const [jevFormOpen, setJevFormOpen] = useState(false)
@@ -202,6 +229,11 @@ export default function SettingsPage() {
   // User Settings
   const [settings, setSettings] = useState<UserSettings>(EMPTY_SETTINGS)
   const [settingsLoading, setSettingsLoading] = useState(true)
+  // Save is refused until a load succeeds: the form starts empty, and the PUT
+  // keeps a stored key only when it is sent back masked, so saving a form that
+  // never loaded would write '' over every saved key.
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
+  const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [visibleFields, setVisibleFields] = useState<Record<string, boolean>>({})
@@ -220,6 +252,7 @@ export default function SettingsPage() {
   // Chat Skills
   const [chatSkills, setChatSkills] = useState<{ id: string; name: string; description?: string | null; category?: string | null; createdAt: string }[]>([])
   const [chatSkillsLoading, setChatSkillsLoading] = useState(true)
+  const [chatSkillsError, setChatSkillsError] = useState<string | null>(null)
   const [chatSkillNameModal, setChatSkillNameModal] = useState(false)
   const [pendingChatSkillContent, setPendingChatSkillContent] = useState('')
   const [pendingChatSkillName, setPendingChatSkillName] = useState('')
@@ -238,9 +271,15 @@ export default function SettingsPage() {
     if (!userId) return
     try {
       const resp = await fetch(`/api/users/${userId}/chat-skills`)
-      if (resp.ok) setChatSkills(await resp.json())
+      if (resp.ok) {
+        setChatSkills(await resp.json())
+        setChatSkillsError(null)
+      } else {
+        setChatSkillsError(failureText(CHAT_SKILLS_LOAD_FAILED, await readApiError(resp, CHAT_SKILLS_LOAD_FAILED)))
+      }
     } catch (err) {
       console.error('Failed to fetch chat skills:', err)
+      setChatSkillsError(failureText(CHAT_SKILLS_LOAD_FAILED, err))
     } finally {
       setChatSkillsLoading(false)
     }
@@ -285,12 +324,11 @@ export default function SettingsPage() {
         setPendingChatSkillCategory('general')
         toast.success('Chat skill uploaded')
       } else {
-        const err = await resp.json()
-        alertError(err.error || 'Failed to upload chat skill')
+        alertError((await readApiError(resp, 'Failed to upload chat skill')).message)
       }
     } catch (err) {
       console.error('Failed to upload chat skill:', err)
-      toast.error('Failed to upload chat skill')
+      toast.error(failureText('Failed to upload chat skill', err))
     } finally {
       setChatSkillUploading(false)
     }
@@ -310,9 +348,12 @@ export default function SettingsPage() {
         a.download = `${skillName}.md`
         a.click()
         URL.revokeObjectURL(url)
+      } else {
+        toast.error((await readApiError(resp, 'Failed to download chat skill')).message)
       }
     } catch (err) {
       console.error('Failed to download chat skill:', err)
+      toast.error(failureText('Failed to download chat skill', err))
     }
   }, [userId])
 
@@ -320,12 +361,16 @@ export default function SettingsPage() {
   const deleteChatSkill = useCallback(async (skillId: string) => {
     if (!userId || !(await showConfirm('Delete this chat skill?'))) return
     try {
-      await fetch(`/api/users/${userId}/chat-skills/${skillId}`, { method: 'DELETE' })
+      const resp = await fetch(`/api/users/${userId}/chat-skills/${skillId}`, { method: 'DELETE' })
       fetchChatSkills()
+      if (!resp.ok) {
+        toast.error((await readApiError(resp, 'Failed to delete chat skill')).message)
+        return
+      }
       toast.success('Chat skill deleted')
     } catch (err) {
       console.error('Failed to delete chat skill:', err)
-      toast.error('Failed to delete chat skill')
+      toast.error(failureText('Failed to delete chat skill', err))
     }
   }, [userId, fetchChatSkills])
 
@@ -339,9 +384,12 @@ export default function SettingsPage() {
         setEditingChatSkillId(skillId)
         setEditingChatSkillDescription(skill.description || '')
         setEditChatDescModal(true)
+      } else {
+        toast.error((await readApiError(resp, 'Failed to open the chat skill')).message)
       }
     } catch (err) {
       console.error('Failed to fetch chat skill:', err)
+      toast.error(failureText('Failed to open the chat skill', err))
     }
   }, [userId])
 
@@ -362,12 +410,11 @@ export default function SettingsPage() {
         setEditingChatSkillDescription('')
         toast.success('Chat skill description updated')
       } else {
-        const err = await resp.json()
-        alertError(err.error || 'Failed to update description')
+        alertError((await readApiError(resp, 'Failed to update description')).message)
       }
     } catch (err) {
       console.error('Failed to update chat skill description:', err)
-      toast.error('Failed to update description')
+      toast.error(failureText('Failed to update description', err))
     } finally {
       setEditChatDescSaving(false)
     }
@@ -379,15 +426,16 @@ export default function SettingsPage() {
     setImportingChatSkills(true)
     try {
       const resp = await fetch(`/api/users/${userId}/chat-skills/import-community`, { method: 'POST' })
-      const data = await resp.json()
       if (resp.ok) {
+        const data = await resp.json().catch(() => ({}))
         fetchChatSkills()
-        showAlert(data.message || `Imported ${data.imported ?? 0} community chat skill(s).`)
+        showAlert(chatImportSummary(data))
       } else {
-        alertError(data.error || 'Failed to import community chat skills')
+        alertError((await readApiError(resp, 'Failed to import community chat skills')).message)
       }
     } catch (err) {
       console.error('Failed to import community chat skills:', err)
+      alertError(failureText('Failed to import community chat skills', err))
     } finally {
       setImportingChatSkills(false)
     }
@@ -400,13 +448,13 @@ export default function SettingsPage() {
       const resp = await fetch(`/api/users/${userId}/llm-providers`)
       if (resp.ok) {
         setProviders(await resp.json())
-        setProvidersError(false)
+        setProvidersError(null)
       } else {
-        setProvidersError(true)
+        setProvidersError(failureText(PROVIDERS_LOAD_FAILED, await readApiError(resp, PROVIDERS_LOAD_FAILED)))
       }
     } catch (err) {
       console.error('Failed to fetch providers:', err)
-      setProvidersError(true)
+      setProvidersError(failureText(PROVIDERS_LOAD_FAILED, err))
     } finally {
       setProvidersLoading(false)
     }
@@ -492,13 +540,23 @@ export default function SettingsPage() {
         if (data.rotationConfigs) {
           setRotationConfigs(data.rotationConfigs)
         }
+        setSettingsLoaded(true)
+        setSettingsLoadError(null)
+      } else {
+        setSettingsLoadError(failureText(SETTINGS_LOAD_FAILED, await readApiError(resp, SETTINGS_LOAD_FAILED)))
       }
     } catch (err) {
       console.error('Failed to fetch settings:', err)
+      setSettingsLoadError(failureText(SETTINGS_LOAD_FAILED, err))
     } finally {
       setSettingsLoading(false)
     }
   }, [userId])
+
+  const retrySettings = useCallback(() => {
+    setSettingsLoading(true)
+    fetchSettings()
+  }, [fetchSettings])
 
   useEffect(() => {
     fetchProviders()
@@ -513,12 +571,16 @@ export default function SettingsPage() {
   ) => {
     if (!userId || !(await showConfirm(message))) return
     try {
-      await fetch(`/api/users/${userId}/llm-providers/${providerId}`, { method: 'DELETE' })
+      const resp = await fetch(`/api/users/${userId}/llm-providers/${providerId}`, { method: 'DELETE' })
       fetchProviders()
+      if (!resp.ok) {
+        toast.error((await readApiError(resp, 'Failed to delete provider')).message)
+        return
+      }
       toast.success('Provider deleted')
     } catch (err) {
       console.error('Failed to delete provider:', err)
-      toast.error('Failed to delete provider')
+      toast.error(failureText('Failed to delete provider', err))
     }
   }, [userId, fetchProviders])
 
@@ -526,6 +588,12 @@ export default function SettingsPage() {
   // API usage check's "Save and check") only proceeds on saved keys.
   const saveSettings = useCallback(async (): Promise<boolean> => {
     if (!userId) return false
+    if (!settingsLoaded) {
+      toast.error(settingsLoadError
+        ? `${settingsLoadError}. Nothing was saved, so your stored keys are unchanged; reload them first.`
+        : 'Your saved keys are still loading. Nothing was saved.')
+      return false
+    }
     setSettingsSaving(true)
     try {
       // Build rotation configs payload from pending state
@@ -627,19 +695,20 @@ export default function SettingsPage() {
         }
         setSettingsDirty(false)
         toast.success('Settings saved')
+        const warnings = saveWarningLines(data)
+        if (warnings.length) toast.warning(warnings.join('\n'), 'Saved, but not applied')
         return true
       }
-      const err = await resp.json().catch(() => ({}))
-      toast.error(err.error || 'Failed to save settings')
+      toast.error((await readApiError(resp, 'Failed to save settings')).message)
       return false
     } catch (err) {
       console.error('Failed to save settings:', err)
-      toast.error('Failed to save settings')
+      toast.error(failureText('Failed to save settings', err))
       return false
     } finally {
       setSettingsSaving(false)
     }
-  }, [userId, settings, rotationConfigs])
+  }, [userId, settings, rotationConfigs, settingsLoaded, settingsLoadError])
 
   const updateSetting = useCallback(<K extends keyof UserSettings>(field: K, value: UserSettings[K]) => {
     setSettings(prev => ({ ...prev, [field]: value }))
@@ -835,6 +904,7 @@ export default function SettingsPage() {
   const [tcShowForm, setTcShowForm] = useState(false)
   const [tcEditing, setTcEditing] = useState<TcResource | null>(null)
   const [tcRefreshingId, setTcRefreshingId] = useState<string | null>(null)
+  const [tcError, setTcError] = useState<string | null>(null)
   const tcPollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const fetchTcResources = useCallback(async () => {
@@ -842,8 +912,16 @@ export default function SettingsPage() {
     setTcLoading(true)
     try {
       const r = await fetch(`/api/users/${userId}/tradecraft-resources`)
-      if (r.ok) setTcResources(await r.json())
-    } catch (e) { console.error('fetchTcResources', e) }
+      if (r.ok) {
+        setTcResources(await r.json())
+        setTcError(null)
+      } else {
+        setTcError(failureText(TRADECRAFT_LOAD_FAILED, await readApiError(r, TRADECRAFT_LOAD_FAILED)))
+      }
+    } catch (e) {
+      console.error('fetchTcResources', e)
+      setTcError(failureText(TRADECRAFT_LOAD_FAILED, e))
+    }
     finally { setTcLoading(false) }
   }, [userId])
 
@@ -885,10 +963,10 @@ export default function SettingsPage() {
     if (!ok) return
     try {
       const resp = await fetch(`/api/users/${userId}/tradecraft-resources/${r.id}`, { method: 'DELETE' })
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      if (!resp.ok) throw await readApiError(resp, 'the server gave no reason')
       toast.success('Deleted')
       fetchTcResources()
-    } catch (e) { toast.error(`Delete failed: ${e instanceof Error ? e.message : String(e)}`) }
+    } catch (e) { toast.error(actionFailedText('Delete', e)) }
   }, [userId, showConfirm, toast, fetchTcResources])
 
   const tcHandleRefresh = useCallback(async (r: TcResource) => {
@@ -898,13 +976,14 @@ export default function SettingsPage() {
       const resp = await fetch(`/api/users/${userId}/tradecraft-resources/${r.id}/refresh`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
       })
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}))
-        throw new Error(data.error || `HTTP ${resp.status}`)
-      }
+      if (!resp.ok) throw await readApiError(resp, 'the server gave no reason')
       toast.success('Refreshed')
       fetchTcResources()
-    } catch (e) { toast.error(`Refresh failed: ${e instanceof Error ? e.message : String(e)}`) }
+    } catch (e) {
+      toast.error(actionFailedText('Refresh', e))
+      // A failed refresh records its cause on the row (lastError).
+      fetchTcResources()
+    }
     finally { setTcRefreshingId(null) }
   }, [userId, toast, fetchTcResources])
 
@@ -917,9 +996,9 @@ export default function SettingsPage() {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: next }),
       })
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      if (!resp.ok) throw await readApiError(resp, 'the server gave no reason')
     } catch (e) {
-      toast.error(`Toggle failed: ${e instanceof Error ? e.message : String(e)}`)
+      toast.error(actionFailedText('Toggle', e))
       fetchTcResources()
     }
   }, [userId, toast, fetchTcResources])
@@ -1015,7 +1094,7 @@ export default function SettingsPage() {
             <div className={styles.emptyState}><Loader2 size={16} className={styles.spin} /> Loading...</div>
           ) : providersError ? (
             <div className={styles.emptyState} role="alert">
-              Couldn&apos;t load your providers.{' '}
+              {providersError}.{' '}
               <button type="button" className="textButton" onClick={retryProviders}>Retry</button>
             </div>
           ) : chatProviders.length === 0 ? (
@@ -1057,7 +1136,8 @@ export default function SettingsPage() {
             userId={userId}
             provider={jevProvider}
             loading={providersLoading}
-            error={providersError}
+            error={!!providersError}
+            errorText={providersError ?? undefined}
             onRetry={retryProviders}
             formOpen={jevFormOpen}
             onOpenForm={() => setJevFormOpen(true)}
@@ -1119,6 +1199,11 @@ export default function SettingsPage() {
 
         {chatSkillsLoading ? (
           <div className={styles.emptyState}><Loader2 size={16} className={styles.spin} /> Loading...</div>
+        ) : chatSkillsError ? (
+          <div className={styles.emptyState} role="alert">
+            {chatSkillsError}.{' '}
+            <button type="button" className="textButton" onClick={fetchChatSkills}>Retry</button>
+          </div>
         ) : chatSkills.length === 0 ? (
           <div className={styles.emptyState}>No Chat Skills yet. Click Import from Community to add ready-to-use reference skills, or upload your own .md files.</div>
         ) : (
@@ -1198,6 +1283,12 @@ export default function SettingsPage() {
             onCancel={tcHandleCancel}
           />
         )}
+        {tcError && (
+          <div className={styles.emptyState} role="alert">
+            {tcError}.{' '}
+            <button type="button" className="textButton" onClick={fetchTcResources}>Retry</button>
+          </div>
+        )}
         <TradecraftResourceList
           resources={tcResources}
           loading={tcLoading}
@@ -1235,6 +1326,11 @@ export default function SettingsPage() {
         </div>
         {settingsLoading ? (
           <div className={styles.emptyState}><Loader2 size={16} className={styles.spin} /> Loading...</div>
+        ) : settingsLoadError ? (
+          <div className={styles.emptyState} role="alert">
+            {settingsLoadError}. Saving is off until they load, so nothing stored is overwritten.{' '}
+            <button type="button" className="textButton" onClick={retrySettings}>Retry</button>
+          </div>
         ) : (
           <div className={styles.settingsGrid}>
             {/* Each drawer carries its own anchor and title, so neither needs
@@ -1592,6 +1688,11 @@ export default function SettingsPage() {
         </p>
         {settingsLoading ? (
           <div className={styles.emptyState}><Loader2 size={16} className={styles.spin} /> Loading...</div>
+        ) : settingsLoadError ? (
+          <div className={styles.emptyState} role="alert">
+            {settingsLoadError}. Saving is off until they load, so nothing stored is overwritten.{' '}
+            <button type="button" className="textButton" onClick={retrySettings}>Retry</button>
+          </div>
         ) : (
           <div className={styles.settingsGrid}>
             <div className="formGroup">
@@ -1639,7 +1740,7 @@ export default function SettingsPage() {
             />
           </div>
         )}
-        {settingsDirty && !settingsSaving && (
+        {settingsDirty && !settingsSaving && settingsLoaded && (
           <div className={styles.formActions} style={{ justifyContent: 'flex-end', marginTop: '12px' }}>
             <button className="primaryButton" onClick={saveSettings} disabled={settingsSaving}>
               Save Settings

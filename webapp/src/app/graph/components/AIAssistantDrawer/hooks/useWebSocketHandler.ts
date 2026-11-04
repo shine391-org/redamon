@@ -17,10 +17,12 @@ import {
   type FireteamMemberCompletedPayload,
   type FireteamCompletedPayload,
   type FireteamMemberAwaitingConfirmationPayload,
+  type LoopStatusPayload,
 } from '@/lib/websocket-types'
 import type { ChatItem, Message, FileDownloadItem, Phase, FireteamItem, FireteamMemberPanel } from '../types'
 import type { ThinkingItem, ToolExecutionItem, PlanWaveItem, DeepThinkItem } from '../AgentTimeline'
 import { findToolCardIndex, settleRunningTools } from './toolCardState'
+import { agentErrorText, isPersistFailedNotice, type AgentErrorPayload } from './agentErrorText'
 import {
   handleFireteamDeployed,
   handleFireteamMemberStarted,
@@ -70,6 +72,8 @@ interface WebSocketHandlerDeps {
   // (TOOL_COMPLETE, FIRETEAM_TOOL_COMPLETE, TASK_COMPLETE, FIRETEAM_COMPLETED).
   // Debounced internally so concurrent wave tools coalesce into one refetch.
   onGraphMutation?: () => void
+  // Agent in the Loop: the live status of a loop run (never persisted).
+  setLoopStatus?: (status: LoopStatusPayload | null) => void
 }
 
 export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
@@ -84,7 +88,7 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
     awaitingQuestionRef, isProcessingQuestion,
     awaitingToolConfirmationRef, isProcessingToolConfirmation,
     pendingApprovalToolId, pendingApprovalWaveId,
-    onGraphMutation,
+    onGraphMutation, setLoopStatus,
   } = deps
 
   // Use a ref to avoid recreating the callback when todoList changes
@@ -114,6 +118,10 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
       case MessageType.CONNECTED:
         break
 
+      case MessageType.LOOP_STATUS:
+        setLoopStatus?.(message.payload as LoopStatusPayload)
+        break
+
       case MessageType.THINKING: {
         // Suppress `deploy_fireteam` thinking cards: the FireteamCard that
         // arrives immediately after carries the same thought+reasoning as
@@ -140,6 +148,7 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
           productivity_score: message.payload.productivity_score ?? null,
           productivity_tier: (message.payload.productivity_tier as string) ?? null,
           stall: message.payload.stall ?? null,
+          answeredBy: message.payload.answeredBy ?? null,
         }
         setChatItems(prev => [...prev, thinkingItem])
         if (!awaitingToolConfirmationRef.current && !awaitingApprovalRef.current && !awaitingQuestionRef.current) {
@@ -803,18 +812,31 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
       }
 
       case MessageType.ERROR: {
+        const payload = message.payload as AgentErrorPayload & { recoverable?: boolean }
+        // The chat stopped being saved: worth saying, but the run goes on.
+        if (isPersistFailedNotice(payload)) {
+          setChatItems(prev => [...prev, {
+            type: 'message',
+            id: `error-${Date.now()}`,
+            role: 'assistant',
+            content: 'This chat is not being saved.',
+            error: agentErrorText(payload),
+            timestamp: new Date(),
+          } as Message])
+          break
+        }
         const errorMessage: Message = {
           type: 'message',
           id: `error-${Date.now()}`,
           role: 'assistant',
           content: 'An error occurred while processing your request.',
-          error: message.payload.message,
+          error: agentErrorText(payload),
           timestamp: new Date(),
         }
         // A non-recoverable error ends the run; a recoverable one (e.g. a bad
         // client frame) can arrive mid-run and must not close live cards.
         setChatItems(prev => [
-          ...(message.payload.recoverable === false ? settleRunningTools(prev) : prev),
+          ...(payload.recoverable === false ? settleRunningTools(prev) : prev),
           errorMessage,
         ])
         setIsLoading(false)

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -13,11 +14,10 @@ export async function GET() {
       cache: 'no-store',
     })
     if (!response.ok) {
-      return NextResponse.json({ error: 'Failed to fetch system stats' }, { status: 503 })
+      return upstreamErrorResponse('orchestrator', response, 'Failed to fetch system stats', { status: 503 })
     }
     return NextResponse.json(await response.json())
   } catch (error) {
-    console.error('Failed to fetch system stats:', error)
-    return NextResponse.json({ error: 'Failed to connect to backend services' }, { status: 503 })
+    return upstreamFailureResponse('orchestrator', error, 'Failed to connect to backend services')
   }
 }

@@ -100,3 +100,56 @@ describe('useReports(projectId).generate', () => {
     expect(stub.saved).toEqual({ report_narratives: 'claude-haiku-4-5' })
   })
 })
+
+describe('what a report failure says (G-12, G-20, G-21, P-29, P-33)', () => {
+  test('a proxy 504 names its status instead of a bare "failed"', async () => {
+    stubGateFetch({ report_narratives: 'gpt-5' },
+      reportsRoute(() => new Response('<html>504 Gateway Time-out</html>', { status: 504 })))
+    const { result } = renderHook(() => useAllReports(), { wrapper })
+    await act(async () => {
+      await expect(result.current.generate('p1')).rejects.toThrow('Report generation failed (non_json_response · HTTP 504)')
+    })
+  })
+
+  test('a coded failure keeps its fixed wording and adds the provider class and status', async () => {
+    stubGateFetch({ report_narratives: 'gpt-5' }, reportsRoute(() => jsonResponse(503, {
+      error: 'x', code: 'agent_outdated', featureId: 'report_narratives',
+      errorClass: 'AuthenticationError', providerStatus: 401,
+    })))
+    const { result } = renderHook(() => useAllReports(), { wrapper })
+    await act(async () => {
+      await expect(result.current.generate('p1')).rejects.toThrow(
+        'The agent is older than the webapp: rebuild it (AuthenticationError · provider HTTP 401)')
+    })
+  })
+
+  test('a narratives failure keeps the route text, its status and the provider facts', async () => {
+    stubGateFetch({ report_narratives: 'gpt-5' }, reportsRoute(() => jsonResponse(500, {
+      error: 'Failed to generate report narratives. The details are in the agent log.',
+      error_class: 'RateLimitError', provider_status: 429,
+    })))
+    const { result } = renderHook(() => useAllReports(), { wrapper })
+    await act(async () => {
+      await expect(result.current.generate('p1')).rejects.toThrow(
+        'Failed to generate report narratives. The details are in the agent log. (HTTP 500) ' +
+        '[RateLimitError · provider HTTP 429]')
+    })
+  })
+
+  test('a failed list is an error with its code and status, not an empty list', async () => {
+    stubGateFetch({}, () => jsonResponse(500, { error: 'Failed to list reports', code: 'P1001' }))
+    const { result } = renderHook(() => useAllReports(), { wrapper })
+    await waitFor(() => expect(result.current.error?.message).toBe('Failed to list reports (P1001 · HTTP 500)'))
+  })
+
+  test('a refused delete rejects with its cause instead of resolving', async () => {
+    stubGateFetch({}, (url, init) => (init?.method === 'DELETE'
+      ? jsonResponse(500, { error: 'Delete failed', code: 'EACCES' })
+      : jsonResponse(200, [])))
+    const { result } = renderHook(() => useAllReports(), { wrapper })
+    await act(async () => {
+      await expect(result.current.deleteReportAsync({ projectId: 'p1', reportId: 'r1' }))
+        .rejects.toThrow('Delete failed (EACCES · HTTP 500)')
+    })
+  })
+})

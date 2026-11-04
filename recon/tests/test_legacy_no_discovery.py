@@ -28,7 +28,7 @@ from recon.helpers.finding_sources import RECON_FINDING_SOURCES  # noqa: E402
 
 NOT_RUN = {"shodan_api", "internetdb", "shodan", "shodan_host_lookup", "netlas", "criminalip",
            "nmap_nse", "graphql_scan", "graphql_cop", "takeover_scan", "vhost_sni_enum",
-           "cache_poisoning", "wcvs", "origin_discovery", "serialized_scan"}
+           "cache_poisoning", "wcvs", "origin_discovery", "serialized_scan", "route_exposure"}
 
 SAVED = {
     "domain": "example.com",

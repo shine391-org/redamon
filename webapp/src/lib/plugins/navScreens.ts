@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { rowContributions } from './contributions'
 import { isValidPluginId } from './ids'
 import { screenPathFromSegments } from './navPaths'
@@ -25,6 +26,14 @@ export type NavScreen = (NavHeader & { kind: 'ok'; screen: unknown }) | (NavHead
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
+/** Missing is only ENOENT: a permission or I/O error names its errno, which a missing file would hide. */
+function unreadableReason(e: unknown): string {
+  if (e instanceof SyntaxError) return 'the screen file is not JSON'
+  const code = safeErrorCode(e)
+  if (code === 'ENOENT') return 'the screen file is missing'
+  return `the screen file could not be read (${code})`
+}
+
 export async function resolveNavScreen(pluginId: string, segments: readonly string[] | undefined): Promise<NavScreen | null> {
   if (!isValidPluginId(pluginId)) return null
   const row = await findInstall(pluginId)
@@ -49,6 +58,6 @@ export async function resolveNavScreen(pluginId: string, segments: readonly stri
     return { ...header, kind: 'ok', screen: JSON.parse(await fs.readFile(file, 'utf8')) }
   } catch (e) {
     console.warn(`[plugins] nav screen plugin=${pluginId} screen=${screenPath} unreadable:`, e instanceof Error ? e.message : e)
-    return { ...header, kind: 'unreadable', reason: e instanceof SyntaxError ? 'the screen file is not JSON' : 'the screen file is missing' }
+    return { ...header, kind: 'unreadable', reason: unreadableReason(e) }
   }
 }

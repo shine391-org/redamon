@@ -19,6 +19,7 @@ import prisma from '@/lib/prisma'
 import { getEffectiveUser, getSession, isInternalRequest, isScannerRequest } from '@/lib/session'
 import { writeAudit } from '@/lib/audit'
 import { readJsonBody } from '@/lib/jsonBody'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { LLM_PROBES, PROBES } from '@/lib/apiUsage/registry'
 import { buildJobs, trackedFields, type LlmProviderRow } from '@/lib/apiUsage/credentials'
 import { runJobs } from '@/lib/apiUsage/runner'
@@ -122,7 +123,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     })
   } catch (error) {
     console.error('[api-usage] failed to load the report:', error)
-    return json({ error: 'Failed to load the API usage report' }, 500)
+    return json({ error: 'Failed to load the API usage report', code: safeErrorCode(error) }, 500)
   }
 }
 
@@ -188,7 +189,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       report = await runJobs(plan)
     } catch (e) {
       console.error(`[api-usage] run failed user=${id}:`, e instanceof Error ? e.message : 'unknown error')
-      return json({ error: 'run_failed' }, 500)
+      return json({ error: 'run_failed', code: 'run_failed' }, 500)
     }
     finishedAtMs = Date.now()
     console.info(`[api-usage] done user=${id} ms=${report.durationMs} usage=${report.counts.usage} errors=${report.counts.errors}`)
@@ -229,7 +230,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     return json(saved ? { report, saved: true } : { report, saved: false, saveError })
   } catch (error) {
     console.error('[api-usage] check failed:', error instanceof Error ? error.message : 'unknown error')
-    return json({ error: 'Failed to run the API usage check' }, 500)
+    return json({ error: 'Failed to run the API usage check', code: safeErrorCode(error) }, 500)
   } finally {
     release(id, finishedAtMs)
   }

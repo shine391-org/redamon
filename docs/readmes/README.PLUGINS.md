@@ -1082,7 +1082,7 @@ agent follows. It is defined precisely:
   allowed in the current phase, and the Rules of Engagement
   ([`build_builtin_skill_workflow`](../../agentic/prompts/__init__.py#L174)). An override
   therefore targets **one part**: `targetKey = <skillId>/<partId>`. The agent publishes the
-  list of parts that can be overridden (`GET /plugins/skill-parts`, master key; 47 parts across
+  list of parts that can be overridden (`GET /plugins/skill-parts`, master key; 53 parts across
   the 14 built-in skills, registered in [skill_parts.py](../../agentic/prompts/skill_parts.py)).
   Each entry gives the part's kind (**template** or **plain text**), its placeholder names and
   the SHA-256 of its factory text.
@@ -1188,7 +1188,7 @@ is the whole design: **approving never changes the skill**. It saves the propose
   person's to remove before they pick the skill. Session binding limits the **plugin**, not the person: an owner can write rows
   into their own sessions, but only ever about their own skills.
 - **What `override.get` answers.** One plain part, `body` (the skill's text, used verbatim:
-  no placeholders), its SHA-256, `maxChars` 51,200 (UTF-16 code units, the upload limit),
+  no placeholders), its SHA-256, `maxChars` 512,000 (UTF-16 code units, the upload limit),
   `active: null`, the pending count, and `lineage {rootName, version}`.
 - **What `override.propose` takes.** `scope: "user"` only; parts exactly `{body}`;
   `readSha256.body` **required** (the person can edit their skill at any time: 409

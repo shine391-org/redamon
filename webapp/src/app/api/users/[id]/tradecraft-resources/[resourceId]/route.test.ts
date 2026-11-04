@@ -196,3 +196,26 @@ describe('PUT strips server-managed fields (regression)', () => {
     expect(r.status).toBe(404)
   })
 })
+
+describe('a database failure answers its code', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  test('PUT (save, enable toggle)', async () => {
+    mockUpdate.mockRejectedValue(Object.assign(new Error('value too long for column'), { code: 'P2000' }))
+    const r = await route.PUT(makePut({ enabled: false }) as never, PARAMS() as never)
+    expect(r.status).toBe(500)
+    expect(await r.json()).toEqual({ error: 'Failed to update tradecraft resource', code: 'P2000' })
+  })
+
+  test('DELETE', async () => {
+    mockFindFirst.mockRejectedValue(Object.assign(new Error('Timed out fetching a new connection'), { code: 'P2024' }))
+    const r = await route.DELETE(
+      new NextRequest('http://webapp.test/api/users/user-1/tradecraft-resources/res-1', { method: 'DELETE' }) as never,
+      PARAMS() as never,
+    )
+    expect(r.status).toBe(500)
+    expect(await r.json()).toEqual({ error: 'Failed to delete tradecraft resource', code: 'P2024' })
+  })
+})

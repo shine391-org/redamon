@@ -217,10 +217,10 @@ describe('refusals after the operation started leave only lastError', () => {
 })
 
 describe('the runner', () => {
-  test('down: the plugin is installed but failed with runner_unavailable', async () => {
+  test('down: the plugin is installed but failed with runner_unavailable and why', async () => {
     await w.runner.close()
     const out = await go()
-    expect(out.plugin).toMatchObject({ status: 'failed', lastError: 'runner_unavailable', activeVersion: '1.0.0' })
+    expect(out.plugin).toMatchObject({ status: 'failed', lastError: 'runner_unavailable (unreachable)', activeVersion: '1.0.0' })
     expect(await exists(versionPath('echo', '1.0.0'))).toBe(true)
   })
 

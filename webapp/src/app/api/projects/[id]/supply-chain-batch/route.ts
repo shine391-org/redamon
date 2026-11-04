@@ -21,6 +21,7 @@ import { getEffectiveUser } from '@/lib/session'
 import { settingsFingerprint, envelopeForKind } from '@/lib/jobQueue'
 import { listOwnerRepos, isValidGitRef, GithubEnumError } from '@/lib/github/orgRepos'
 import { parseOwnerTarget, allowedGithubHosts, hostHint, GITHUB_DOT_COM } from '@/lib/github/ownerTarget'
+import { internalError } from '@/lib/routeErrors'
 
 export const runtime = 'nodejs'
 
@@ -89,8 +90,12 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         maxRepos: Math.max(1, project.supplyChainOrgMaxRepos || 50),
       })
     } catch (e) {
-      const status = e instanceof GithubEnumError && e.status ? e.status : 502
-      return NextResponse.json({ error: e instanceof Error ? e.message : 'GitHub enumeration failed' }, { status })
+      // A GithubEnumError's text is ours (token scrubbed) and names GitHub's
+      // refusal; anything else is an unexpected throw whose text stays in the log.
+      if (e instanceof GithubEnumError) {
+        return NextResponse.json({ error: e.message, code: 'github_enum_failed' }, { status: e.status || 502 })
+      }
+      return internalError(e, 'GitHub enumeration failed', { status: 502 })
     }
 
     if (repos.length === 0) {
@@ -159,10 +164,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       ok: true, batchId: result.id, totalItems: repos.length, org, host,
     }, { status: 201 })
   } catch (error) {
-    console.error('[supplyChainBatch] create failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to create the org batch', { log: '[supplyChainBatch] create failed' })
   }
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { ApiError, formatApiError, readApiError, toApiError } from '@/lib/apiError'
 
 export type NameCheckState = 'idle' | 'checking' | 'available' | 'taken' | 'invalid' | 'error'
 
@@ -8,7 +9,11 @@ export interface NameCheck {
   suggestion: string | null
   /** The server's reason code when not available (name_taken, name_too_long, name_invalid). */
   reason: string | null
+  /** Why the check itself failed, when `state` is 'error'. */
+  error?: ApiError | null
 }
+
+const CHECK_FAILED = 'The name could not be checked'
 
 const DEBOUNCE_MS = 300
 
@@ -38,10 +43,15 @@ export function useSkillNameCheck(
       if (exceptId) qs.set('exceptId', exceptId)
       try {
         const res = await fetch(`/api/users/${userId}/attack-skills/name-check?${qs}`)
+        if (!res.ok) {
+          const error = await readApiError(res, CHECK_FAILED)
+          if (!cancelled) setCheck({ state: 'error', suggestion: null, reason: null, error })
+          return
+        }
         const body = await res.json().catch(() => null)
         if (cancelled) return
-        if (!res.ok || !body) {
-          setCheck({ state: 'error', suggestion: null, reason: null })
+        if (!body) {
+          setCheck({ state: 'error', suggestion: null, reason: null, error: new ApiError({ reason: CHECK_FAILED, status: res.status, code: 'invalid_json' }) })
           return
         }
         setCheck({
@@ -49,8 +59,8 @@ export function useSkillNameCheck(
           suggestion: typeof body.suggestion === 'string' ? body.suggestion : null,
           reason: typeof body.reason === 'string' ? body.reason : null,
         })
-      } catch {
-        if (!cancelled) setCheck({ state: 'error', suggestion: null, reason: null })
+      } catch (err) {
+        if (!cancelled) setCheck({ state: 'error', suggestion: null, reason: null, error: toApiError(err, CHECK_FAILED) })
       }
     }, DEBOUNCE_MS)
     return () => {
@@ -73,7 +83,7 @@ export function nameCheckMessage(check: NameCheck): string | null {
         ? 'A skill name is at most 100 characters.'
         : 'A skill needs a name without control or invisible characters.'
     case 'error':
-      return 'The name could not be checked; it is checked again when you save.'
+      return `${check.error ? formatApiError({ ...check.error, reason: CHECK_FAILED }) : CHECK_FAILED}; it is checked again when you save.`
     default:
       return null
   }

@@ -36,6 +36,7 @@ import {
   AiSurfaceTable,
   AiRiskTable,
   WebCachePoisonTable,
+  RouteExposureTable,
 } from './components/RedZoneTables'
 import { ActiveSessions } from './components/ActiveSessions'
 import { RoeViewer } from './components/RoeViewer'
@@ -62,6 +63,7 @@ import { isOverNodeCap } from './utils/nodeCap'
 import { isGraphRenderOff, shouldFetchGraph } from './utils/renderGate'
 import { resolveEmptyGraphState } from './utils/emptyGraph'
 import { useTheme, useSession, useReconStatus, useReconSSE, useGvmStatus, useGvmSSE, useGithubHuntStatus, useGithubHuntSSE, useTrufflehogRuns, useTrufflehogSSE, useSupplyChainStatus, useSupplyChainSSE, useActiveSessions, useMultiPartialReconStatus, useMultiPartialReconSSE } from '@/hooks'
+import { useErrorToast } from '@/hooks/useErrorToast'
 import { useProjectById } from '@/hooks/useProjects'
 import { useScanStartFailure } from '@/hooks/useScanStartFailure'
 import { useDrawerOffsets } from '@/hooks/useDrawerOffsets'
@@ -74,6 +76,10 @@ import type { ScanMode } from '@/hooks/useReconStatus'
 import { OtherScansModal } from './components/OtherScansModal/OtherScansModal'
 import { parseScanModal } from '@/lib/scanModalLink'
 import { useAlertModal, useToast } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
+import {
+  downloadScanFile, fetchGvmAvailability, probeScanData, scanFailureToast, type GvmAvailability,
+} from '@/components/scans/scanErrors'
 import { useNavigationGuard } from '@/context/NavigationGuardContext'
 import styles from './page.module.css'
 import { deriveRoeEnabled } from '@/lib/engagement'
@@ -121,12 +127,21 @@ export default function GraphPage() {
   const [hasGithubHuntData, setHasGithubHuntData] = useState(false)
   const [hasTrufflehogData, setHasTrufflehogData] = useState(false)
   const [hasSupplyChainData, setHasSupplyChainData] = useState(false)
-  const [gvmAvailable, setGvmAvailable] = useState(true)
+  const [gvmAvailability, setGvmAvailability] = useState<GvmAvailability>({ available: true, reason: '' })
+  // Set when a download route's HEAD check itself failed (5xx, no answer), so the
+  // disabled button does not claim there is no data.
+  const [dataProbeErrors, setDataProbeErrors] = useState<Record<string, string | null>>({})
+  const setDataProbeError = useCallback((key: string, error: string | null) => {
+    setDataProbeErrors(prev => (prev[key] ?? null) === error ? prev : { ...prev, [key]: error })
+  }, [])
   const [isOtherScansModalOpen, setIsOtherScansModalOpen] = useState(false)
   const [hasGithubToken, setHasGithubToken] = useState(false)
   const [graphStats, setGraphStats] = useState<{ totalNodes: number; nodesByType: Record<string, number> } | null>(null)
   const [gvmStats, setGvmStats] = useState<{ totalGvmNodes: number; nodesByType: Record<string, number> } | null>(null)
   const [isGvmModalOpen, setIsGvmModalOpen] = useState(false)
+  // The confirm modal shows a start error only for a start made from this
+  // opening of it, never one left over from an earlier attempt.
+  const [gvmConfirmAttempted, setGvmConfirmAttempted] = useState(false)
   const contentRef = useRef<HTMLDivElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
 
@@ -165,17 +180,19 @@ export default function GraphPage() {
   useDrawerOffsets(bodyRef)
   // Check if GVM stack is installed
   useEffect(() => {
-    fetch('/api/gvm/available')
-      .then(res => res.json())
-      .then(data => setGvmAvailable(data.available ?? false))
-      .catch(() => setGvmAvailable(false))
+    let cancelled = false
+    void fetchGvmAvailability().then(a => { if (!cancelled) setGvmAvailability(a) })
+    return () => { cancelled = true }
   }, [])
 
   const { isDark } = useTheme()
   const { sessionId, resetSession, switchSession } = useSession()
 
   // Data filters (formerly graph views) -- used in tab selector, Graph Map, Data Table, AI drawer
-  const { views: graphViews, deleteView, executeCypher, fetchViews } = useGraphViews(projectId)
+  const { views: graphViews, deleteView, executeCypher, fetchViews, actionError: graphViewActionError } = useGraphViews(projectId)
+  // A filter deleted from the toolbar fails here, where nothing else shows the hook's error.
+  const graphViewFailure = useMemo(() => (graphViewActionError ? { message: graphViewActionError } : null), [graphViewActionError])
+  useErrorToast(graphViewFailure, 'Filter not changed')
   // A saved view naming a Domain the org model renamed is flagged, never rewritten.
   const dataFilterViews = useMemo(
     () => graphViews.map(v => ({ ...v, staleNote: staleViewNote(v.cypherQuery, currentProject?.scopeGroups ?? []) })),
@@ -276,6 +293,7 @@ export default function GraphPage() {
   const {
     state: reconState,
     isLoading: isReconLoading,
+    error: reconError,
     startRecon,
     stopRecon,
     pauseRecon,
@@ -308,7 +326,20 @@ export default function GraphPage() {
     currentVersion: activeVersion,
     activating: isActivatingVersion,
     refresh: refreshScanVersions,
+    error: scanVersionsError,
   } = useScanVersions(projectId)
+  // A failed version list leaves the switch showing no versions, which reads as
+  // a project that has none; say why, once per reason.
+  // The toast context changes with every toast, so the ref, not the deps, is
+  // what keeps this to one toast.
+  const scanVersionsErrorText = scanVersionsError ? scanVersionsError.message : null
+  const scanVersionsErrorShownRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (scanVersionsErrorText && scanVersionsErrorShownRef.current !== scanVersionsErrorText) {
+      toast.error(scanVersionsErrorText, 'Scan versions unavailable')
+    }
+    scanVersionsErrorShownRef.current = scanVersionsErrorText
+  }, [scanVersionsErrorText, toast])
   // A selection is dropped when the project changes or that version disappears
   // (deleted, or it just became the active one after an activation).
   useEffect(() => { setSelectedVersionId(null) }, [projectId])
@@ -352,6 +383,7 @@ export default function GraphPage() {
   // Execute filter Cypher when selected filter changes or when graph data refreshes
   // (so the filtered view stays in sync with live recon/agent data)
   const filterRefreshKey = data?.nodes.length ?? 0
+  const filterErrorShownRef = useRef<string | null>(null)
   useEffect(() => {
     if (!selectedFilterCypherQuery || !projectId) {
       setFilterGraphData(null)
@@ -364,7 +396,15 @@ export default function GraphPage() {
       setFilterLoading(false)
       if ('error' in result) {
         setFilterGraphData(null)
+        // The unfiltered graph is drawn while the filter stays selected, so say
+        // why; once per filter and reason, since live scans re-run it often.
+        const key = `${selectedFilterCypherQuery}\u0000${result.error}`
+        if (filterErrorShownRef.current !== key) {
+          filterErrorShownRef.current = key
+          toast.error(result.error, 'Data filter failed: showing the unfiltered graph')
+        }
       } else {
+        filterErrorShownRef.current = null
         setFilterGraphData({ nodes: result.nodes, links: result.links, projectId })
       }
     })
@@ -381,6 +421,7 @@ export default function GraphPage() {
     groupNumber,
     totalGroups,
     clearLogs,
+    error: reconStreamError,
   } = useReconSSE({
     projectId,
     enabled: reconState?.status === 'running' || reconState?.status === 'starting' || reconState?.status === 'paused' || reconState?.status === 'stopping' || reconState?.status === 'pausing',
@@ -392,6 +433,7 @@ export default function GraphPage() {
     runs: allPartialReconRuns,
     activeRuns: activePartialRecons,
     isAnyRunning: isPartialReconRunning,
+    error: partialReconError,
     stopPartialRecon,
     refetch: refetchPartialReconStatuses,
   } = useMultiPartialReconStatus({
@@ -409,6 +451,7 @@ export default function GraphPage() {
     logsMap: partialReconLogsMap,
     phaseMap: partialReconPhaseMap,
     clearLogsForRun: clearPartialReconLogsForRun,
+    error: partialReconStreamError,
   } = useMultiPartialReconSSE({
     projectId,
     activeRunId: activePartialReconRunId,
@@ -423,12 +466,14 @@ export default function GraphPage() {
   const {
     state: gvmState,
     isLoading: isGvmLoading,
-    error: gvmError,
+    statusError: gvmStatusError,
+    startError: gvmStartError,
     startGvm,
     stopGvm,
     pauseGvm,
     resumeGvm,
     getLastStartError: getGvmStartError,
+    getLastActionError: getGvmActionError,
   } = useGvmStatus({
     projectId,
     enabled: !!projectId,
@@ -442,6 +487,7 @@ export default function GraphPage() {
     currentPhase: gvmCurrentPhase,
     currentPhaseNumber: gvmCurrentPhaseNumber,
     clearLogs: clearGvmLogs,
+    error: gvmStreamError,
   } = useGvmSSE({
     projectId,
     enabled: gvmState?.status === 'running' || gvmState?.status === 'starting' || gvmState?.status === 'paused' || gvmState?.status === 'stopping' || gvmState?.status === 'pausing',
@@ -451,11 +497,13 @@ export default function GraphPage() {
   const {
     state: githubHuntState,
     isLoading: isGithubHuntLoading,
+    statusError: githubHuntStatusError,
     startGithubHunt,
     stopGithubHunt,
     pauseGithubHunt,
     resumeGithubHunt,
     getLastStartError: getGithubStartError,
+    getLastActionError: getGithubActionError,
   } = useGithubHuntStatus({
     projectId,
     enabled: !!projectId,
@@ -469,6 +517,7 @@ export default function GraphPage() {
     currentPhase: githubHuntCurrentPhase,
     currentPhaseNumber: githubHuntCurrentPhaseNumber,
     clearLogs: clearGithubHuntLogs,
+    error: githubHuntStreamError,
   } = useGithubHuntSSE({
     projectId,
     enabled: githubHuntState?.status === 'running' || githubHuntState?.status === 'starting' || githubHuntState?.status === 'paused' || githubHuntState?.status === 'stopping' || githubHuntState?.status === 'pausing',
@@ -481,9 +530,12 @@ export default function GraphPage() {
     profiles: trufflehogProfiles,
     bySource: trufflehogRunsBySource,
     isAnyRunning: isTrufflehogRunning,
+    statusError: trufflehogStatusError,
+    profilesError: trufflehogProfilesError,
     startTrufflehog,
     stopTrufflehog,
     getLastStartError: getTrufflehogStartError,
+    getLastActionError: getTrufflehogActionError,
   } = useTrufflehogRuns({
     projectId,
     enabled: !!projectId,
@@ -503,6 +555,7 @@ export default function GraphPage() {
     currentPhase: trufflehogCurrentPhase,
     currentPhaseNumber: trufflehogCurrentPhaseNumber,
     clearLogs: clearTrufflehogLogs,
+    error: trufflehogStreamError,
   } = useTrufflehogSSE({
     projectId,
     source: openTrufflehogLogsSource,
@@ -512,15 +565,18 @@ export default function GraphPage() {
   // Supply-Chain scan (L1) status + logs
   const {
     state: supplyChainState,
+    statusError: supplyChainStatusError,
     startSupplyChain,
     stopSupplyChain,
     pauseSupplyChain,
     resumeSupplyChain,
     getLastStartError: getSupplyStartError,
+    getLastActionError: getSupplyActionError,
   } = useSupplyChainStatus({ projectId, enabled: !!projectId })
   const {
     logs: supplyChainLogs,
     clearLogs: clearSupplyChainLogs,
+    error: supplyChainStreamError,
   } = useSupplyChainSSE({
     projectId,
     enabled: supplyChainState?.status === 'running' || supplyChainState?.status === 'starting' || supplyChainState?.status === 'paused' || supplyChainState?.status === 'stopping' || supplyChainState?.status === 'pausing',
@@ -950,13 +1006,10 @@ export default function GraphPage() {
   // Check if recon data exists
   const checkReconData = useCallback(async () => {
     if (!projectId) return
-    try {
-      const response = await fetch(`/api/recon/${projectId}/download`, { method: 'HEAD' })
-      setHasReconData(response.ok)
-    } catch {
-      setHasReconData(false)
-    }
-  }, [projectId])
+    const probe = await probeScanData(`/api/recon/${projectId}/download`)
+    setHasReconData(probe.has)
+    setDataProbeError('recon', probe.error)
+  }, [projectId, setDataProbeError])
 
   // Calculate graph stats when data changes
   useEffect(() => {
@@ -998,46 +1051,34 @@ export default function GraphPage() {
   // Check if GVM data exists
   const checkGvmData = useCallback(async () => {
     if (!projectId) return
-    try {
-      const response = await fetch(`/api/gvm/${projectId}/download`, { method: 'HEAD' })
-      setHasGvmData(response.ok)
-    } catch {
-      setHasGvmData(false)
-    }
-  }, [projectId])
+    const probe = await probeScanData(`/api/gvm/${projectId}/download`)
+    setHasGvmData(probe.has)
+    setDataProbeError('gvm', probe.error)
+  }, [projectId, setDataProbeError])
 
   // Check if GitHub Hunt data exists
   const checkGithubHuntData = useCallback(async () => {
     if (!projectId) return
-    try {
-      const response = await fetch(`/api/github-hunt/${projectId}/download`, { method: 'HEAD' })
-      setHasGithubHuntData(response.ok)
-    } catch {
-      setHasGithubHuntData(false)
-    }
-  }, [projectId])
+    const probe = await probeScanData(`/api/github-hunt/${projectId}/download`)
+    setHasGithubHuntData(probe.has)
+    setDataProbeError('githubHunt', probe.error)
+  }, [projectId, setDataProbeError])
 
   // Check if TruffleHog data exists
   const checkTrufflehogData = useCallback(async () => {
     if (!projectId) return
-    try {
-      const response = await fetch(`/api/trufflehog/${projectId}/download`, { method: 'HEAD' })
-      setHasTrufflehogData(response.ok)
-    } catch {
-      setHasTrufflehogData(false)
-    }
-  }, [projectId])
+    const probe = await probeScanData(`/api/trufflehog/${projectId}/download`)
+    setHasTrufflehogData(probe.has)
+    setDataProbeError('trufflehog', probe.error)
+  }, [projectId, setDataProbeError])
 
   // Check if Supply-Chain (L1) data exists
   const checkSupplyChainData = useCallback(async () => {
     if (!projectId) return
-    try {
-      const response = await fetch(`/api/supply-chain/${projectId}/download`, { method: 'HEAD' })
-      setHasSupplyChainData(response.ok)
-    } catch {
-      setHasSupplyChainData(false)
-    }
-  }, [projectId])
+    const probe = await probeScanData(`/api/supply-chain/${projectId}/download`)
+    setHasSupplyChainData(probe.has)
+    setDataProbeError('supplyChain', probe.error)
+  }, [projectId, setDataProbeError])
 
   // Check for recon/GVM/GitHub Hunt/TruffleHog/Supply-Chain data on mount and when project changes
   useEffect(() => {
@@ -1055,6 +1096,26 @@ export default function GraphPage() {
     const t = setTimeout(() => refetchFresh(), 3000)
     return () => clearTimeout(t)
   }, [refetchFresh])
+
+  // A scan that ends in error used to change only a badge (and the drawer line,
+  // if it happened to be open): say so, with the reason the orchestrator kept.
+  const seenScanStatusRef = useRef<Record<string, string | undefined>>({})
+  const trufflehogFailureKey = trufflehogRuns.map(r => `${r.source}:${r.status}`).join(',')
+  useEffect(() => {
+    const seen = seenScanStatusRef.current
+    const check = (key: string, label: string, status?: string | null, error?: string | null) => {
+      const message = scanFailureToast(label, seen[key], status, error)
+      if (message) toast.error(message)
+      seen[key] = status ?? undefined
+    }
+    check('gvm', 'GVM scan', gvmState?.status, gvmState?.error)
+    check('githubHunt', 'GitHub Secret Hunt', githubHuntState?.status, githubHuntState?.error)
+    check('supplyChain', 'Supply-Chain scan', supplyChainState?.status, supplyChainState?.error)
+    for (const run of trufflehogRuns) {
+      if (run.source) check(`trufflehog:${run.source}`, `Secret Multiscanner ${run.source} scan`, run.status, run.error)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gvmState?.status, githubHuntState?.status, supplyChainState?.status, trufflehogFailureKey, toast])
 
   // Refresh graph data when recon completes
   useEffect(() => {
@@ -1162,13 +1223,18 @@ export default function GraphPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stealthMode: newValue }),
       })
-      if (res.ok && currentProject) {
+      if (!res.ok) {
+        toast.error((await readApiError(res, 'Could not change Stealth Mode')).message)
+        return
+      }
+      if (currentProject) {
         setCurrentProject({ ...currentProject, stealthMode: newValue })
       }
     } catch (error) {
       console.error('Failed to toggle stealth mode:', error)
+      toast.error(toApiError(error, 'Could not change Stealth Mode').message)
     }
-  }, [projectId, currentProject, setCurrentProject])
+  }, [projectId, currentProject, setCurrentProject, toast])
 
   const handleModelChange = useCallback(async (modelId: string) => {
     if (!projectId) return
@@ -1178,13 +1244,18 @@ export default function GraphPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agentOpenaiModel: modelId }),
       })
-      if (res.ok && currentProject) {
+      if (!res.ok) {
+        toast.error((await readApiError(res, 'Could not change the agent model')).message)
+        return
+      }
+      if (currentProject) {
         setCurrentProject({ ...currentProject, agentOpenaiModel: modelId })
       }
     } catch (error) {
       console.error('Failed to change model:', error)
+      toast.error(toApiError(error, 'Could not change the agent model').message)
     }
-  }, [projectId, currentProject, setCurrentProject])
+  }, [projectId, currentProject, setCurrentProject, toast])
 
   const handleStartRecon = useCallback(() => {
     setIsReconModalOpen(true)
@@ -1224,7 +1295,7 @@ export default function GraphPage() {
     // saved and sent the operator here with the scan's own modal to open.
     const scanParam = parseScanModal(searchParams.get('scan'))
     if (scanParam && projectId) {
-      if (scanParam === 'gvm') setIsGvmModalOpen(true)
+      if (scanParam === 'gvm') { setGvmConfirmAttempted(false); setIsGvmModalOpen(true) }
       else setIsOtherScansModalOpen(true)
       router.replace(`/graph?project=${projectId}`)
     }
@@ -1254,8 +1325,9 @@ export default function GraphPage() {
 
   const handleDownloadJSON = useCallback(async () => {
     if (!projectId) return
-    window.open(`/api/recon/${projectId}/download`, '_blank')
-  }, [projectId])
+    const error = await downloadScanFile(`/api/recon/${projectId}/download`, `recon_${projectId}.json`)
+    if (error) toast.error(error, 'Recon JSON not downloaded')
+  }, [projectId, toast])
 
   const handleDeleteNode = useCallback(async (nodeId: string) => {
     if (!projectId) return
@@ -1268,12 +1340,17 @@ export default function GraphPage() {
       )
       return
     }
-    const res = await fetch(`/api/graph?nodeId=${nodeId}&projectId=${projectId}`, {
-      method: 'DELETE',
-    })
+    let res: Response
+    try {
+      res = await fetch(`/api/graph?nodeId=${nodeId}&projectId=${projectId}`, {
+        method: 'DELETE',
+      })
+    } catch (err) {
+      alertError(toApiError(err, 'Failed to delete node').message)
+      return
+    }
     if (!res.ok) {
-      const data = await res.json()
-      alertError(data.error || 'Failed to delete node')
+      alertError((await readApiError(res, 'Failed to delete node')).message)
       return
     }
     toast.success('Node deleted')
@@ -1298,6 +1375,7 @@ export default function GraphPage() {
       alertError(PAST_VERSION_SCAN_MSG, 'Read-only version')
       return
     }
+    setGvmConfirmAttempted(false)
     setIsGvmModalOpen(true)
   }, [isViewingPastVersion, alertError])
 
@@ -1307,6 +1385,7 @@ export default function GraphPage() {
       return
     }
     clearGvmLogs()
+    setGvmConfirmAttempted(true)
     const result = await startGvm()
     if (result) {
       setIsGvmModalOpen(false)
@@ -1409,25 +1488,79 @@ export default function GraphPage() {
     prevPartialRunStatusMapRef.current = newMap
   }, [activePartialRecons])
 
+  // Recon and partial-recon stop/pause resolve to null on failure and keep the
+  // reason only in the hook's `error`, which lands on the next render: the toast
+  // is raised there, so it carries the reason (code and status) and not a guess.
+  type FailedReconAction = { title: string; source: 'recon' | 'partial' }
+  const [failedReconActions, setFailedReconActions] = useState<FailedReconAction[]>([])
+  const reportReconFailure = useCallback((title: string, source: FailedReconAction['source']) => {
+    setFailedReconActions(prev => [...prev, { title, source }])
+  }, [])
+  useEffect(() => {
+    if (failedReconActions.length === 0) return
+    for (const failed of failedReconActions) {
+      const reason = failed.source === 'recon' ? reconError : partialReconError
+      toast.error(reason || 'No reason was given.', failed.title)
+    }
+    setFailedReconActions([])
+  }, [failedReconActions, reconError, partialReconError, toast])
+
+  // The other scan hooks keep the reason of a failed action synchronously.
+  const reportAction = useCallback((result: unknown, lastError: () => string | null, fallback: string) => {
+    if (result) return true
+    toast.error(lastError() ?? fallback)
+    return false
+  }, [toast])
+
   // Pause/Resume/Stop handlers
-  const handlePauseRecon = useCallback(async () => { await pauseRecon() }, [pauseRecon])
+  const handlePauseRecon = useCallback(async () => {
+    if (!await pauseRecon()) reportReconFailure('Recon did not pause', 'recon')
+  }, [pauseRecon, reportReconFailure])
   // A resume outside the RoE time window is refused and the scan stays paused;
-  // say so, or the button just does nothing.
+  // say so, or the button just does nothing. An outage is not a refusal, so the
+  // wording leaves the reason (with its code and status) to say which it was.
   const handleResumeRecon = useCallback(async () => {
     if (await resumeRecon()) return
-    toast.error(`Resume refused: ${getLastResumeError() ?? 'the scan could not be resumed'}. The scan stays paused.`)
+    toast.error(`Resume failed: ${getLastResumeError() ?? 'the scan could not be resumed'}. The scan stays paused.`)
   }, [resumeRecon, getLastResumeError, toast])
-  const handleStopRecon = useCallback(async () => { await stopRecon() }, [stopRecon])
-  const handlePauseGvm = useCallback(async () => { await pauseGvm(); toast.info('GVM scan paused') }, [pauseGvm, toast])
-  const handleResumeGvm = useCallback(async () => { await resumeGvm(); toast.info('GVM scan resumed') }, [resumeGvm, toast])
-  const handleStopGvm = useCallback(async () => { await stopGvm(); toast.info('GVM scan stopped') }, [stopGvm, toast])
-  const handlePauseGithubHunt = useCallback(async () => { await pauseGithubHunt() }, [pauseGithubHunt])
-  const handleResumeGithubHunt = useCallback(async () => { await resumeGithubHunt() }, [resumeGithubHunt])
-  const handleStopGithubHunt = useCallback(async () => { await stopGithubHunt() }, [stopGithubHunt])
-  const handleStopTrufflehog = useCallback(async (source: string) => { await stopTrufflehog(source) }, [stopTrufflehog])
+  const handleStopRecon = useCallback(async () => {
+    if (!await stopRecon()) reportReconFailure('Recon did not stop', 'recon')
+  }, [stopRecon, reportReconFailure])
+  const handlePauseGvm = useCallback(async () => {
+    if (reportAction(await pauseGvm(), getGvmActionError, 'Failed to pause GVM scan')) toast.info('GVM scan paused')
+  }, [pauseGvm, getGvmActionError, reportAction, toast])
+  const handleResumeGvm = useCallback(async () => {
+    if (reportAction(await resumeGvm(), getGvmActionError, 'Failed to resume GVM scan')) toast.info('GVM scan resumed')
+  }, [resumeGvm, getGvmActionError, reportAction, toast])
+  const handleStopGvm = useCallback(async () => {
+    if (reportAction(await stopGvm(), getGvmActionError, 'Failed to stop GVM scan')) toast.info('GVM scan stopped')
+  }, [stopGvm, getGvmActionError, reportAction, toast])
+  const handlePauseGithubHunt = useCallback(async () => {
+    reportAction(await pauseGithubHunt(), getGithubActionError, 'Failed to pause GitHub hunt')
+  }, [pauseGithubHunt, getGithubActionError, reportAction])
+  const handleResumeGithubHunt = useCallback(async () => {
+    reportAction(await resumeGithubHunt(), getGithubActionError, 'Failed to resume GitHub hunt')
+  }, [resumeGithubHunt, getGithubActionError, reportAction])
+  const handleStopGithubHunt = useCallback(async () => {
+    reportAction(await stopGithubHunt(), getGithubActionError, 'Failed to stop GitHub Secret Hunt')
+  }, [stopGithubHunt, getGithubActionError, reportAction])
+  const handleStopTrufflehog = useCallback(async (source: string) => {
+    reportAction(await stopTrufflehog(source), getTrufflehogActionError, 'Failed to stop Secret Multiscanner scan')
+  }, [stopTrufflehog, getTrufflehogActionError, reportAction])
+  const handlePauseSupplyChain = useCallback(async () => {
+    reportAction(await pauseSupplyChain(), getSupplyActionError, 'Failed to pause supply-chain')
+  }, [pauseSupplyChain, getSupplyActionError, reportAction])
+  const handleResumeSupplyChain = useCallback(async () => {
+    reportAction(await resumeSupplyChain(), getSupplyActionError, 'Failed to resume supply-chain')
+  }, [resumeSupplyChain, getSupplyActionError, reportAction])
+  const handleStopSupplyChain = useCallback(async () => {
+    reportAction(await stopSupplyChain(), getSupplyActionError, 'Failed to stop Supply-Chain scan')
+  }, [stopSupplyChain, getSupplyActionError, reportAction])
 
   // Partial Recon handlers
-  const handleStopPartialRecon = useCallback(async (runId: string) => { await stopPartialRecon(runId) }, [stopPartialRecon])
+  const handleStopPartialRecon = useCallback(async (runId: string) => {
+    if (!await stopPartialRecon(runId)) reportReconFailure('Partial recon did not stop', 'partial')
+  }, [stopPartialRecon, reportReconFailure])
   const handleTogglePartialReconLogs = useCallback((runId: string) => {
     setActiveLogsDrawer(prev => prev === `partialRecon:${runId}` ? null : `partialRecon:${runId}`)
   }, [])
@@ -1445,32 +1578,52 @@ export default function GraphPage() {
 
   const handleEmergencyPauseAll = useCallback(async () => {
     setIsEmergencyPausing(true)
-    const tasks: Promise<unknown>[] = []
+    // Each target answers with the reason it did not stop, or null when it did:
+    // the person pressed the emergency button and must learn which scan or agent
+    // is still running.
+    const tasks: Array<Promise<string | null>> = []
+    const viaHook = (label: string, call: Promise<unknown>, lastError: () => string | null) => tasks.push(
+      call.then(
+        result => result ? null : `${label}: ${lastError() ?? 'no reason given'}`,
+        err => `${label}: ${toApiError(err, 'request failed').message}`,
+      ),
+    )
+    let reconFailed = false
+    let partialFailed = false
     if (reconState?.status === 'running' || reconState?.status === 'starting') {
-      tasks.push(pauseRecon())
+      tasks.push(pauseRecon().then(r => { reconFailed = !r; return null }, () => { reconFailed = true; return null }))
     }
     if (gvmState?.status === 'running' || gvmState?.status === 'starting') {
-      tasks.push(pauseGvm())
+      viaHook('GVM scan', pauseGvm(), getGvmActionError)
     }
     if (githubHuntState?.status === 'running' || githubHuntState?.status === 'starting') {
-      tasks.push(pauseGithubHunt())
+      viaHook('GitHub Secret Hunt', pauseGithubHunt(), getGithubActionError)
     }
     // TruffleHog has no pause (dropped with the multi-source migration, matching
     // ai_attack): emergency stop stops each live SOURCE.
     for (const run of trufflehogRuns) {
       if (run.status === 'running' || run.status === 'starting') {
-        tasks.push(stopTrufflehog(run.source ?? ''))
+        viaHook(`Secret Multiscanner ${run.source ?? ''}`, stopTrufflehog(run.source ?? ''), getTrufflehogActionError)
       }
     }
     for (const run of activePartialRecons) {
       if (run.status === 'running' || run.status === 'starting') {
-        tasks.push(stopPartialRecon(run.run_id))
+        tasks.push(stopPartialRecon(run.run_id).then(r => { if (!r) partialFailed = true; return null }, () => { partialFailed = true; return null }))
       }
     }
     // Stop all running AI agent conversations
-    tasks.push(fetch('/api/agent/emergency-stop-all', { method: 'POST' }))
-    await Promise.allSettled(tasks)
-  }, [reconState?.status, gvmState?.status, githubHuntState?.status, trufflehogRuns, activePartialRecons, pauseRecon, pauseGvm, pauseGithubHunt, stopTrufflehog, stopPartialRecon])
+    tasks.push(fetch('/api/agent/emergency-stop-all', { method: 'POST' }).then(
+      async res => res.ok ? null : `AI agents: ${(await readApiError(res, 'Failed to stop agents')).message}`,
+      err => `AI agents: ${toApiError(err, 'Failed to stop agents').message}`,
+    ))
+    const failures = (await Promise.allSettled(tasks))
+      .map(r => r.status === 'fulfilled' ? r.value : `${toApiError(r.reason, 'request failed').message}`)
+      .filter((f): f is string => !!f)
+    if (failures.length) toast.error(failures.join('; '), 'Emergency pause: not everything stopped')
+    // The recon hooks keep their reason for the next render (see reportReconFailure).
+    if (reconFailed) reportReconFailure('Emergency pause: recon did not pause', 'recon')
+    if (partialFailed) reportReconFailure('Emergency pause: a partial recon did not stop', 'partial')
+  }, [reconState?.status, gvmState?.status, githubHuntState?.status, trufflehogRuns, activePartialRecons, pauseRecon, pauseGvm, pauseGithubHunt, stopTrufflehog, stopPartialRecon, getGvmActionError, getGithubActionError, getTrufflehogActionError, reportReconFailure, toast])
 
   // Show message if no project is selected
   if (!projectLoading && !projectId) {
@@ -1525,9 +1678,11 @@ export default function GraphPage() {
         onToggleLogs={handleToggleLogs}
         reconStatus={reconState?.status || 'idle'}
         hasReconData={hasReconData}
+        reconDataError={dataProbeErrors.recon}
         isLogsOpen={activeLogsDrawer === 'recon'}
         // GVM props
-        gvmAvailable={gvmAvailable}
+        gvmAvailable={gvmAvailability.available}
+        gvmUnavailableReason={gvmAvailability.reason}
         onStartGvm={handleStartGvm}
         onPauseGvm={handlePauseGvm}
         onResumeGvm={handleResumeGvm}
@@ -1536,7 +1691,9 @@ export default function GraphPage() {
         onToggleGvmLogs={handleToggleGvmLogs}
         gvmStatus={gvmState?.status || 'idle'}
         hasGvmData={hasGvmData}
+        gvmDataError={dataProbeErrors.gvm}
         isGvmLogsOpen={activeLogsDrawer === 'gvm'}
+        scanStatusErrors={[gvmStatusError, githubHuntStatusError, trufflehogStatusError, supplyChainStatusError]}
         // GitHub Hunt props
         onStartGithubHunt={handleStartGithubHunt}
         onPauseGithubHunt={handlePauseGithubHunt}
@@ -1595,7 +1752,10 @@ export default function GraphPage() {
         onDownloadGithubHuntJSON={handleDownloadGithubHuntJSON}
         onToggleGithubHuntLogs={handleToggleGithubHuntLogs}
         githubHuntStatus={githubHuntState?.status || 'idle'}
+        githubHuntError={githubHuntState?.error}
+        githubHuntStatusError={githubHuntStatusError}
         hasGithubHuntData={hasGithubHuntData}
+        githubHuntDataError={dataProbeErrors.githubHunt}
         isGithubHuntLogsOpen={activeLogsDrawer === 'githubHunt'}
         // TruffleHog
         onStartTrufflehog={handleStartTrufflehog}
@@ -1603,18 +1763,24 @@ export default function GraphPage() {
         onDownloadTrufflehogJSON={handleDownloadTrufflehogJSON}
         onToggleTrufflehogLogs={handleToggleTrufflehogLogs}
         trufflehogProfiles={trufflehogProfiles}
+        trufflehogProfilesError={trufflehogProfilesError}
         trufflehogRunsBySource={trufflehogRunsBySource}
+        trufflehogStatusError={trufflehogStatusError}
         hasTrufflehogData={hasTrufflehogData}
+        trufflehogDataError={dataProbeErrors.trufflehog}
         openTrufflehogLogsSource={openTrufflehogLogsSource}
         // Supply Chain (L1)
         onStartSupplyChain={handleStartSupplyChain}
-        onPauseSupplyChain={() => { void pauseSupplyChain() }}
-        onResumeSupplyChain={() => { void resumeSupplyChain() }}
-        onStopSupplyChain={() => { void stopSupplyChain() }}
+        onPauseSupplyChain={() => { void handlePauseSupplyChain() }}
+        onResumeSupplyChain={() => { void handleResumeSupplyChain() }}
+        onStopSupplyChain={() => { void handleStopSupplyChain() }}
         onDownloadSupplyChainJSON={handleDownloadSupplyChainJSON}
         onToggleSupplyChainLogs={handleToggleSupplyChainLogs}
         supplyChainStatus={supplyChainState?.status || 'idle'}
+        supplyChainError={supplyChainState?.error}
+        supplyChainStatusError={supplyChainStatusError}
         hasSupplyChainData={hasSupplyChainData}
+        supplyChainDataError={dataProbeErrors.supplyChain}
         projectId={projectId || undefined}
         isSupplyChainLogsOpen={activeLogsDrawer === 'supplyChain'}
       />
@@ -1833,6 +1999,8 @@ export default function GraphPage() {
               <DnsDriftTable projectId={projectId} />
             ) : tableViewMode === 'webCachePoison' ? (
               <WebCachePoisonTable projectId={projectId} />
+            ) : tableViewMode === 'routeExposure' ? (
+              <RouteExposureTable projectId={projectId} />
             ) : (
               <DataTable
                 data={filterGraphData ?? data}
@@ -1851,6 +2019,7 @@ export default function GraphPage() {
               nonMsfSessions={activeSessions.nonMsfSessions}
               agentBusy={activeSessions.agentBusy}
               isLoading={activeSessions.isLoading}
+              error={activeSessions.error}
               projectId={projectId || ''}
               onInteract={activeSessions.interactWithSession}
               onKillSession={activeSessions.killSession}
@@ -1879,6 +2048,8 @@ export default function GraphPage() {
         totalGroups={totalGroups}
         status={reconState?.status || 'idle'}
         errorMessage={reconState?.error}
+        statusError={reconError}
+        streamError={reconStreamError}
         onClearLogs={clearLogs}
         onPause={handlePauseRecon}
         onResume={handleResumeRecon}
@@ -1893,6 +2064,8 @@ export default function GraphPage() {
         currentPhaseNumber={gvmCurrentPhaseNumber}
         status={gvmState?.status || 'idle'}
         errorMessage={gvmState?.error}
+        statusError={gvmStatusError}
+        streamError={gvmStreamError}
         onClearLogs={clearGvmLogs}
         onPause={handlePauseGvm}
         onResume={handleResumeGvm}
@@ -1909,6 +2082,8 @@ export default function GraphPage() {
         currentPhaseNumber={githubHuntCurrentPhaseNumber}
         status={githubHuntState?.status || 'idle'}
         errorMessage={githubHuntState?.error}
+        statusError={githubHuntStatusError}
+        streamError={githubHuntStreamError}
         onClearLogs={clearGithubHuntLogs}
         onPause={handlePauseGithubHunt}
         onResume={handleResumeGithubHunt}
@@ -1925,6 +2100,8 @@ export default function GraphPage() {
         currentPhaseNumber={trufflehogCurrentPhaseNumber}
         status={openTrufflehogRun?.status || 'idle'}
         errorMessage={openTrufflehogRun?.error}
+        statusError={trufflehogStatusError}
+        streamError={trufflehogStreamError}
         onClearLogs={clearTrufflehogLogs}
         onStop={() => { if (openTrufflehogLogsSource) void handleStopTrufflehog(openTrufflehogLogsSource) }}
         title={`Secret Multiscanner Logs — ${openTrufflehogLogsSource ?? ''}`}
@@ -1939,10 +2116,12 @@ export default function GraphPage() {
         currentPhaseNumber={null}
         status={supplyChainState?.status || 'idle'}
         errorMessage={supplyChainState?.error}
+        statusError={supplyChainStatusError}
+        streamError={supplyChainStreamError}
         onClearLogs={clearSupplyChainLogs}
-        onPause={() => { void pauseSupplyChain() }}
-        onResume={() => { void resumeSupplyChain() }}
-        onStop={() => { void stopSupplyChain() }}
+        onPause={() => { void handlePauseSupplyChain() }}
+        onResume={() => { void handleResumeSupplyChain() }}
+        onStop={() => { void handleStopSupplyChain() }}
         title="Supply Chain Scanner Logs"
         totalPhases={1}
       />
@@ -1957,6 +2136,8 @@ export default function GraphPage() {
           currentPhaseNumber={partialReconPhaseMap[run.run_id]?.phaseNumber || null}
           status={(run.status as ReconStatus) || 'idle'}
           errorMessage={run.error}
+          statusError={partialReconError}
+          streamError={activePartialReconRunId === run.run_id ? partialReconStreamError : null}
           onClearLogs={() => clearPartialReconLogsForRun(run.run_id)}
           onStop={() => handleStopPartialRecon(run.run_id)}
           title={`Partial Recon: ${WORKFLOW_TOOLS.find(t => t.id === run.tool_id)?.label || 'Running'}`}
@@ -2029,7 +2210,9 @@ export default function GraphPage() {
         targetDomain={currentProject?.targetLabel || currentProject?.targetDomain || currentProject?.targetIps?.join(', ') || 'Unknown'}
         stats={gvmStats}
         isLoading={isGvmLoading}
-        error={gvmError}
+        // Only the start's own failure: the status poll and pause/stop have their
+        // own surfaces, and their errors here read as a reason not to start.
+        error={gvmConfirmAttempted ? gvmStartError : null}
       />
 
       <GitHubStarBanner hasAttackChain={(graphStats?.nodesByType?.['AttackChain'] ?? 0) > 0} />

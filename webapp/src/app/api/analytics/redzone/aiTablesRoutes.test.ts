@@ -56,11 +56,17 @@ describe('AI red-zone routes — guards', () => {
   test.each([
     ['aiSurface', aiSurface.GET],
     ['aiRisk', aiRisk.GET],
-  ])('%s returns 500 on query error', async (_name, handler) => {
-    shouldThrow = new Error('boom')
+  ])('%s returns 500 on query error with a fixed message and the Neo4j code', async (_name, handler) => {
+    // The raw Neo4j message can quote the Cypher and its target values; only
+    // the code reaches the browser.
+    shouldThrow = Object.assign(new Error('boom: MATCH (h {name:"target.example"})'), {
+      code: 'Neo.TransientError.General.DatabaseUnavailable',
+    })
     const res = await handler(req('p1'))
     expect(res.status).toBe(500)
-    expect((await res.json()).error).toBe('boom')
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Query failed', code: 'Neo.TransientError.General.DatabaseUnavailable' })
+    expect(JSON.stringify(body)).not.toContain('target.example')
   })
 
   test.each([

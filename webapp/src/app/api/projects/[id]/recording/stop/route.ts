@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { publicRecordingSession, summarizeMaterial } from '@/lib/recordingSession'
 import type { RecordingMaterial } from '@/lib/recordingSession'
@@ -37,7 +38,6 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
       summary: summarizeMaterial(stopped.pendingMaterial as RecordingMaterial | null),
     })
   } catch (error) {
-    console.error('Failed to stop recording:', error)
-    return NextResponse.json({ error: 'Failed to stop recording' }, { status: 500 })
+    return internalError(error, 'Failed to stop recording')
   }
 }

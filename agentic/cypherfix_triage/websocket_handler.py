@@ -6,7 +6,7 @@ import logging
 import uuid
 from fastapi import WebSocket, WebSocketDisconnect
 
-from cypherfix_errors import safe_error
+from cypherfix_errors import reject_websocket, safe_error
 from .orchestrator import TriageOrchestrator
 from .state import TriageState
 
@@ -46,17 +46,20 @@ class TriageStreamingCallback:
             "output_summary": output_summary[:500],
         })
 
-    async def on_complete(self, total: int, by_severity: dict, by_type: dict, summary: str):
+    async def on_complete(self, total: int, by_severity: dict, by_type: dict, summary: str,
+                          **notices):
         await self._send("triage_complete", {
             "total_remediations": total,
             "by_severity": by_severity,
             "by_type": by_type,
             "summary": summary,
+            **notices,
         })
 
-    async def on_error(self, message: str, recoverable: bool = True, code: str = ""):
+    async def on_error(self, message: str, recoverable: bool = True, code: str = "",
+                       **details):
         await self._send("error", {
-            "message": message, "recoverable": recoverable, "code": code,
+            "message": message, "recoverable": recoverable, "code": code, **details,
         })
 
     async def _send(self, msg_type: str, payload: dict):
@@ -209,17 +212,20 @@ class TriageRunCallback:
             "output_summary": output_summary[:500],
         })
 
-    async def on_complete(self, total: int, by_severity: dict, by_type: dict, summary: str):
+    async def on_complete(self, total: int, by_severity: dict, by_type: dict, summary: str,
+                          **notices):
         await self._send("triage_complete", {
             "total_remediations": total,
             "by_severity": by_severity,
             "by_type": by_type,
             "summary": summary,
+            **notices,
         })
 
-    async def on_error(self, message: str, recoverable: bool = True, code: str = ""):
+    async def on_error(self, message: str, recoverable: bool = True, code: str = "",
+                       **details):
         await self._send("error", {
-            "message": message, "recoverable": recoverable, "code": code,
+            "message": message, "recoverable": recoverable, "code": code, **details,
         })
 
     async def on_stopped(self):
@@ -377,13 +383,17 @@ def start_detached_run(user_id: str, project_id: str,
             # MCP stop has no socket of its own to answer.
             await TriageRunCallback(run).on_stopped()
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("Triage failed")
             run.status = "error"
+            # The class and the phase it died in tell one bug from another in a
+            # screenshot; the message stays in the log (it can quote target data).
             await TriageRunCallback(run).on_error(
                 safe_error("internal_error"),
                 recoverable=False,
                 code="internal_error",
+                error_class=type(exc).__name__,
+                phase=str((run.last_phase or {}).get("phase") or ""),
             )
         finally:
             # The run owns its own teardown now that it outlives the socket:
@@ -422,7 +432,7 @@ async def handle_triage_websocket(websocket: WebSocket):
     _ok, _claims, _reason = authorize_ws(_origin, _host, _ticket, cors_allowlist())
     if not _ok:
         logger.warning("Rejected /ws/cypherfix-triage: %s (origin=%r)", _reason, _origin)
-        await websocket.close(code=1008)
+        await reject_websocket(websocket, _reason)
         return
 
     await websocket.accept()

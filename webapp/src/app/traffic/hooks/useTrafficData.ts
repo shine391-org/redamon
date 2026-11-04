@@ -1,6 +1,7 @@
 'use client'
 
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
+import { fetchJson } from '@/lib/apiError'
 
 export interface TrafficRow {
   id: string
@@ -121,13 +122,11 @@ export function trafficFilterPayload(f: TrafficFilters): Record<string, string> 
 }
 
 async function deleteTraffic(projectId: string, body: { ids: string[] } | { filter: Record<string, string> }): Promise<{ deleted: number }> {
-  const res = await fetch(`/api/traffic/${projectId}`, {
+  return fetchJson<{ deleted: number }>(`/api/traffic/${projectId}`, {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  })
-  if (!res.ok) throw new Error('Delete failed')
-  return res.json()
+  }, 'Delete failed')
 }
 
 export function useDeleteTraffic(projectId: string | null) {
@@ -165,12 +164,6 @@ function buildQuery(f: TrafficFilters): string {
   return p.toString()
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`Failed to fetch ${url}`)
-  return res.json()
-}
-
 export interface TrafficListResponse {
   rows: TrafficRow[]
   total: number
@@ -181,7 +174,8 @@ export interface TrafficListResponse {
 export function useTrafficList(projectId: string | null, filters: TrafficFilters) {
   return useQuery({
     queryKey: ['traffic', 'list', projectId, filters],
-    queryFn: () => fetchJson<TrafficListResponse>(`/api/traffic/${projectId}?${buildQuery(filters)}`),
+    // The URL carries host/q/bodyq filter text (target data): the fallback never quotes it.
+    queryFn: () => fetchJson<TrafficListResponse>(`/api/traffic/${projectId}?${buildQuery(filters)}`, undefined, 'Failed to list traffic'),
     enabled: !!projectId,
     placeholderData: keepPreviousData,
     staleTime: 15_000,
@@ -198,7 +192,7 @@ export interface TrafficFacets {
 export function useTrafficFacets(projectId: string | null) {
   return useQuery({
     queryKey: ['traffic', 'facets', projectId],
-    queryFn: () => fetchJson<TrafficFacets>(`/api/traffic/${projectId}/facets`),
+    queryFn: () => fetchJson<TrafficFacets>(`/api/traffic/${projectId}/facets`, undefined, 'Failed to load facets'),
     enabled: !!projectId,
     staleTime: 60_000,
   })
@@ -207,7 +201,7 @@ export function useTrafficFacets(projectId: string | null) {
 export function useTrafficDetail(projectId: string | null, id: string | null) {
   return useQuery({
     queryKey: ['traffic', 'detail', projectId, id],
-    queryFn: () => fetchJson<TrafficDetail>(`/api/traffic/${projectId}/${id}`),
+    queryFn: () => fetchJson<TrafficDetail>(`/api/traffic/${projectId}/${id}`, undefined, 'Failed to load transaction'),
     enabled: !!projectId && !!id,
     staleTime: 60_000,
   })

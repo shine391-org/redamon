@@ -115,8 +115,10 @@ class RootThinkNodeRetryWiringTests(unittest.TestCase):
         """On retry exhaustion, the function must produce a fallback
         LLMDecision with action=complete and completion_reason starting
         with 'llm_error:' so the graph exits the iteration cleanly
-        rather than propagating an uncaught exception."""
-        self.assertIn('completion_reason=f"llm_error: {exc}"', self.src,
+        rather than propagating an uncaught exception. The reason carries
+        the exception's class and provider status, never its text
+        (llm_error_reason, tested in test_ws_error_frames.py)."""
+        self.assertIn('completion_reason=llm_error_reason(exc)', self.src,
                       "fallback decision on retry exhaustion is missing")
 
 

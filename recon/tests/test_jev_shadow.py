@@ -201,6 +201,29 @@ _HOOK_LINES = {
         "[!][CrawlOrder-Jev] Ordering failed (KeyError) - using the fallback.",
         "[!][CrawlOrder-Jev] Agent answer failed validation - using the fallback.",
     ],
+    "route_privacy_rank": [
+        "[*][RoutePrivacy-Jev] 812 routes, 400 distinct asked",
+        "[+][RoutePrivacy-Jev] 400 distinct routes ranked",
+        "[!][RoutePrivacy-Jev] Agent answer failed validation - using the fallback.",
+        "[!][RoutePrivacy-Jev] Pass failed (KeyError) - the deterministic order stands.",
+        "[!][RouteExposure] Jev ranking skipped (KeyError)",
+    ],
+    "route_exposure_wall": [
+        "[*][RouteWall-Jev] 14 lead pages, 9 distinct to ask",
+        "[!][RouteWall-Jev] Time budget of 60s reached - 5 pages left unasked",
+        "[+][RouteWall-Jev] 9 pages asked, 0 batches fell back",
+        "[!][RouteWall-Jev] Agent answer failed validation - using the fallback.",
+        "[!][RouteWall-Jev] Pass failed (KeyError) - the leads stand as found.",
+        "[!][RouteExposure] Jev wall check skipped (KeyError)",
+    ],
+    "route_exposure_assess": [
+        "[*][RouteExposure-Jev] 31 leads, 31 to ask",
+        "[!][RouteExposure-Jev] Time budget of 60s reached - 7 leads left unasked",
+        "[+][RouteExposure-Jev] 24 leads assessed, 1 batches fell back",
+        "[!][RouteExposure-Jev] Agent answer failed validation - using the fallback.",
+        "[!][RouteExposure-Jev] Pass failed (KeyError) - the leads stand as found.",
+        "[!][RouteExposure] Jev assessment skipped (KeyError)",
+    ],
 }
 
 

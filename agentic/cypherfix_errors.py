@@ -13,7 +13,7 @@ from __future__ import annotations
 
 TRIAGE_ERROR_MESSAGES = {
     "llm_error": (
-        "The AI model could not be reached. Check your Triage review model in "
+        "The AI model call failed. Check your Triage review model in "
         "Global Settings > LLM Providers > Models by feature, then run triage again."
     ),
     "model_required": (
@@ -38,11 +38,23 @@ TRIAGE_ERROR_MESSAGES = {
         "The results could not be published because the project changed while the "
         "run was working. Nothing was changed. Run triage again."
     ),
+    "agent_lost": (
+        "The results were not published because the run stopped checking in with "
+        "the webapp for too long. Nothing was changed. Run triage again."
+    ),
+    "unknown_run": (
+        "The results were not published because the webapp no longer knows this "
+        "run. Nothing was changed. Run triage again."
+    ),
+    "stopped": (
+        "The triage run was stopped before it published its results. Nothing was "
+        "changed."
+    ),
 }
 
 CODEFIX_ERROR_MESSAGES = {
     "llm_error": (
-        "The AI model could not be reached. Check your CodeFix model in Global "
+        "The AI model call failed. Check your CodeFix model in Global "
         "Settings > LLM Providers > Models by feature, then start the fix again."
     ),
     "model_required": (
@@ -52,6 +64,11 @@ CODEFIX_ERROR_MESSAGES = {
     "settings_unavailable": (
         "The project's settings could not be loaded. Nothing was changed. Try "
         "again in a moment."
+    ),
+    "remediation_not_found": "Remediation not found",
+    "remediation_load_failed": (
+        "The remediation could not be loaded from the webapp. Nothing was changed. "
+        "Try again in a moment."
     ),
     "clone_failed": (
         "The repository could not be cloned. Check the repository name, the "
@@ -70,7 +87,34 @@ CODEFIX_ERROR_MESSAGES = {
 _GENERIC = "Something went wrong. The details are in the agent log."
 
 
-def safe_error(code: str, *, codefix: bool = False) -> str:
-    """The user-facing sentence for an error code."""
+def safe_error(code: str, *, codefix: bool = False, reason: str = "") -> str:
+    """The user-facing sentence for an error code.
+
+    `reason` is appended only when OUR code wrote it (a webapp refusal such as
+    "A version activation is in progress"), never an exception's message.
+    """
     table = CODEFIX_ERROR_MESSAGES if codefix else TRIAGE_ERROR_MESSAGES
-    return table.get(code, _GENERIC)
+    message = table.get(code, _GENERIC)
+    return f"{message} {reason}" if reason else message
+
+
+#: The ws-ticket gate's reason that must not earn a socket at all.
+_CROSS_SITE = "disallowed origin"
+
+
+async def reject_websocket(websocket, reason: str) -> None:
+    """Refuse a socket the ws-ticket gate turned down, so the tab can say why.
+
+    A close before `accept()` reaches the browser as 1006 with no reason, and an
+    expired ticket then reads exactly like an agent that is down. A same-origin
+    caller is accepted and closed at once with 1008 and the gate's fixed reason
+    ("missing or invalid ticket", "ticket auth not configured"); nothing it
+    sends is read. A cross-site page is still closed before accept: it must not
+    get a socket, even a closed one.
+    """
+    if reason == _CROSS_SITE:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    # A close frame's reason is capped at 123 bytes.
+    await websocket.close(code=1008, reason=str(reason)[:120])

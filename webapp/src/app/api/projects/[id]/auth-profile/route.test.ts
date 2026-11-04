@@ -112,3 +112,34 @@ test('DELETE clears the profile', async () => {
   expect(res.status).toBe(200)
   expect(mockProfileDeleteMany).toHaveBeenCalledWith({ where: { projectId: 'proj-1' } })
 })
+
+describe('a database failure answers the Prisma code, never Next\'s empty 500', () => {
+  const prismaError = () => Object.assign(new Error(`Timed out: SELECT ... WHERE "authValue" = '${SECRET}'`), {
+    code: 'P2024', name: 'PrismaClientKnownRequestError',
+  })
+
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}) })
+
+  test('GET', async () => {
+    mockProfileFindUnique.mockRejectedValue(prismaError())
+    const res = await GET(new NextRequest('http://x'), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to load auth profile', code: 'P2024' })
+  })
+
+  test('PUT', async () => {
+    mockProfileUpsert.mockRejectedValue(prismaError())
+    const res = await PUT(put({ scopeHosts: 'a.example.test' }), params)
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to save auth profile', code: 'P2024' })
+    expect(JSON.stringify(body)).not.toContain(SECRET)
+  })
+
+  test('DELETE', async () => {
+    mockProfileDeleteMany.mockRejectedValue(prismaError())
+    const res = await DELETE(new NextRequest('http://x'), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to delete auth profile', code: 'P2024' })
+  })
+})

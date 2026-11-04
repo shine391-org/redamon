@@ -24,6 +24,8 @@ import {
   validateScopes,
 } from '@/lib/mcpAuth'
 import { validateProfile } from '@/lib/mcp/profiles'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
+import { agentInTheLoopEnabled } from '@/lib/agentInTheLoop'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -41,7 +43,7 @@ const LIST_SELECT = {
   createdAt: true,
 } as const
 
-export async function GET(request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Could not load tokens', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const denied = await requireUserAccess(request, id)
   if (denied) return denied
@@ -54,14 +56,14 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     })
     // Expired and revoked rows stay visible: "why did my agent stop working" is
     // the common support question, and hiding the answer makes it harder.
-    return NextResponse.json({ tokens })
+    // The browser cannot read the deployment's switches; the token UI needs this one.
+    return NextResponse.json({ tokens, features: { agentInTheLoop: agentInTheLoopEnabled() } })
   } catch (error) {
-    console.error('[mcp-tokens] list failed:', error)
-    return NextResponse.json({ error: 'Could not load tokens' }, { status: 500 })
+    return internalError(error, 'Could not load tokens', { log: '[mcp-tokens] list failed' })
   }
-}
+})
 
-export async function POST(request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Could not create the token', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -162,7 +164,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       { status: 201, headers: { 'Cache-Control': 'no-store' } }
     )
   } catch (error) {
-    console.error('[mcp-tokens] create failed:', error)
-    return NextResponse.json({ error: 'Could not create the token' }, { status: 500 })
+    return internalError(error, 'Could not create the token', { log: '[mcp-tokens] create failed' })
   }
-}
+})

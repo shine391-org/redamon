@@ -1,28 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { agentErrorResponse, callAgent } from '../../../agentProxy'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+const FAILED = 'Failed to kill session'
 
-export async function POST(
+export const POST = withRouteErrors(FAILED, async (
   _request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+  { params }: { params: Promise<{ id: string }> },
+) => {
   const { id } = await params
-  try {
-    const resp = await fetch(`${AGENT_API_URL}/sessions/${id}/kill`, {
-      method: 'POST',
-      headers: internalKeyHeaders(),
-    })
-    if (!resp.ok) {
-      const text = await resp.text()
-      return NextResponse.json({ error: text }, { status: resp.status })
-    }
-    return NextResponse.json(await resp.json())
-  } catch (error) {
-    console.error('Session kill proxy error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to kill session' },
-      { status: 502 }
-    )
-  }
-}
+  const call = await callAgent(`/sessions/${encodeURIComponent(id)}/kill`, { method: 'POST' }, FAILED)
+  if (!call.ok) return call.response
+  if (!call.res.ok) return agentErrorResponse(call.res, FAILED)
+  return NextResponse.json(await call.res.json())
+})

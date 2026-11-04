@@ -198,6 +198,7 @@ demanded 6 GB free, which never happens once the core services are up.
 | `full_recon` | 2 GB | container + a dozen sibling tools |
 | `partial_recon` | 768 MB | one step, few or no siblings |
 | `partial_recon:SupplyChainRecon` | 1.75 GB | tool-qualified (below): JS fetch **plus** the dirty analyzer |
+| `partial_recon:JsRecon` | 1.5 GB | tool-qualified: the JS Recon step **plus** its TruffleHog sidecar |
 | `ai_attack` | 1 GB | probe workers (the on-demand local LLM is accounted separately) |
 | `gvm` | 2.5 GB | openvas is the heaviest scanner |
 | `github_hunt` | 768 MB | clone + regex sweep |
@@ -209,9 +210,11 @@ demanded 6 GB free, which never happens once the core services are up.
 key may be `partial_recon:<tool_id>`. `scan_job_envelope()` tries the qualified key, then
 falls back to the **base kind**, then `_default`. That fallback is what makes qualifying
 *every* tool safe: a tool with no entry of its own keeps its family's cheap 768 MB rather
-than jumping to the 2 GB unknown-type figure. `SupplyChainRecon` is the only qualified
-entry today; it re-runs the JS fetch and spawns the analyzer, so the generic single-step
-envelope under-reserved it by roughly 3x.
+than jumping to the 2 GB unknown-type figure. Two tools have an entry of their own.
+`SupplyChainRecon` re-runs the JS fetch and spawns the analyzer, so the generic single-step
+envelope under-reserved it by roughly 3x. `JsRecon` starts JS Recon's TruffleHog sidecar
+beside the step when the project has it on (the sidecar peaked at 435 MB on the JS secret
+lab).
 
 > The admission kind and `_active_scan_keys()` must build the **same** key string. Book as
 > `partial_recon:SupplyChainRecon:<pid>:<run>` while the reaper reports
@@ -221,7 +224,8 @@ envelope under-reserved it by roughly 3x.
 
 There is a second table, `tool_container_envelope_bytes`, for **sibling** containers a scan
 spawns rather than scans themselves. It carries `supply_chain_analyzer` (1 GB expected
-peak, so `container_cap()` yields the 1.5 GB ceiling) plus a `_default`. The analyzer is
+peak, so `container_cap()` yields the 1.5 GB ceiling), `trufflehog_js` (JS Recon's
+TruffleHog sidecar: 768 MB expected, a 1.125 GB ceiling) plus a `_default`. The analyzer is
 sized from *this* table, not from whichever scan happens to dispatch it: an L3 GuardDog
 call has no scan anywhere near it, yet used to be capped by the L1 scan's envelope.
 
@@ -447,8 +451,14 @@ full value survives at reasonable RAM and only throttles hard when memory is gen
 - **Two admission caps that did not exist before** were added:
   - **Concurrent chat sessions** (`websocket_api._governed_max_sessions`, `MAX_AGENT_SESSIONS`
     default 20): byte-budgeted on `agent_session_envelope_bytes`. A genuinely new session is
-    refused (socket closed, `authenticated` left false) past the cap; reconnects to an
-    existing key always pass.
+    refused (socket closed with 1013, `authenticated` left false) past the cap. The cap
+    counts **open connections and live runs together**: a run whose browser tab closed keeps
+    all its memory, and Agent in the Loop runs are long (each step waits for a person's
+    agent) and often headless. A key with a live connection, or a verified key whose run is
+    still going, is a reconnect and always passes. The cap still budgets on the HOST's
+    memory while the agent container has its own `AGENT_MEM` limit, so on a large host it
+    can admit more sessions than `AGENT_MEM / 512 MB`: to run several loop sessions at
+    once, raise `AGENT_MEM` or lower `MAX_AGENT_SESSIONS`.
   - **Background jobs** (`job_runner._governed_max_jobs`, `MAX_BACKGROUND_JOBS` default 16):
     byte-budgeted on `background_job_envelope_bytes`. Count-and-insert is atomic under the
     registry lock.
@@ -737,7 +747,7 @@ All are optional; defaults live in code (empty/unset → default). Documented in
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MAX_AGENT_SESSIONS` | `20` | ceiling on concurrent agent chat/WebSocket sessions (byte-budgeted down under pressure). |
+| `MAX_AGENT_SESSIONS` | `20` | ceiling on concurrent agent chat sessions, counting open connections and live runs together (a headless run, such as an Agent in the Loop run with its tab closed, holds a slot until it ends); byte-budgeted down under pressure. |
 | `MAX_BACKGROUND_JOBS` | `16` | ceiling on concurrent background agent jobs (byte-budgeted). |
 | `TERMINAL_MAX_SESSIONS` | `5` | max concurrent kali-sandbox PTY sessions; further reduced under pressure. |
 

@@ -1,6 +1,7 @@
 'use client'
 
 import { useQuery } from '@tanstack/react-query'
+import { readApiError } from '@/lib/apiError'
 
 // Shape returned by the orchestrator GET /system/stats (Part 5).
 export interface SystemStats {
@@ -27,7 +28,7 @@ export function useSystemStats() {
     queryKey: ['system', 'stats'],
     queryFn: async () => {
       const res = await fetch('/api/system/stats', { cache: 'no-store' })
-      if (!res.ok) throw new Error('Failed to fetch system stats')
+      if (!res.ok) throw await readApiError(res, 'Failed to fetch system stats')
       return res.json()
     },
     refetchInterval: 5_000,

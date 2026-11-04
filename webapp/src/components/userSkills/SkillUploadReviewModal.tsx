@@ -7,6 +7,7 @@ import { useAlertModal, useToast } from '@/components/ui'
 import { FeatureModelLine, useFeatureModelGate } from '@/components/shared/FeatureModelGate'
 import { nameCheckMessage } from '@/components/settings/useSkillNameCheck'
 import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { ApiError, formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import { cleanSkillText } from '@/lib/skillMetadata'
 import {
   CREDENTIALS_ERROR, appendFiles, applyGenerated, applyNameChecks, applyRefusal, blockingReason, buildRows,
@@ -14,7 +15,7 @@ import {
   type BlockingReason, type DraftRow, type GeneratedItem, type PickedFile,
 } from '@/lib/skillUploadDraft'
 import {
-  DESCRIPTION_MAX_CHARS, MAX_ENABLED_USER_SKILLS_PER_PROJECT, MAX_SKILL_BATCH_BYTES, NAME_MAX_CHARS,
+  DESCRIPTION_MAX_CHARS, MAX_CONTENT_SIZE, MAX_ENABLED_USER_SKILLS_PER_PROJECT, MAX_SKILL_BATCH_BYTES, NAME_MAX_CHARS,
   SKILL_METADATA_ITEMS_PER_REQUEST, type BatchItemRefusal,
 } from '@/lib/userSkills'
 import { postUserSkillsChanged } from '@/lib/userSkillsChannel'
@@ -52,7 +53,7 @@ const PROBLEM_TEXT: Record<NonNullable<DraftRow['problem']>, string> = {
   not_markdown: 'Not a Markdown file.',
   empty: 'The file is empty.',
   not_text: 'Not a text file.',
-  too_large: "Larger than 50 KB: it can't be uploaded.",
+  too_large: `Larger than ${MAX_CONTENT_SIZE / 1024} KB: it can't be uploaded.`,
   over_skill_limit: 'Over your 1,000-skill limit: delete some skills first.',
 }
 
@@ -70,7 +71,7 @@ const COMMITTED_TEXT = 'These skills appear to have been uploaded. Check your li
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 const sizeMb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1)
 const tooLargeText = (bytes: number) =>
-  `This batch is ${sizeMb(bytes)} MB, above the 8 MB limit. Remove some files, or upload them in two batches.`
+  `This batch is ${sizeMb(bytes)} MB, above the 8 MB limit. Remove some files, or upload them in smaller batches.`
 
 function blockingTitle(reasons: BlockingReason[]): string | null {
   const count = (r: BlockingReason) => reasons.filter((x) => x === r).length
@@ -125,6 +126,8 @@ export function SkillUploadReviewModal({ mode, userId, existingCount, files, cut
   const [generating, setGenerating] = useState<{ done: number; total: number } | null>(null)
   const [banner, setBanner] = useState<string | null>(cut ? CUT_TEXT : null)
   const [committed, setCommitted] = useState(false)
+  // Why the last name check failed; every row in the 'error' state shows it.
+  const [nameCheckError, setNameCheckError] = useState<ApiError | null>(null)
   const [enableInProject, setEnableInProject] = useState(!!project && project.freeSlots > 0)
   const [previewOpen, setPreviewOpen] = useState<Record<string, boolean>>({})
   const stopRef = useRef<AbortController | null>(null)
@@ -155,8 +158,13 @@ export function SkillUploadReviewModal({ mode, userId, existingCount, files, cut
     [rows],
   )
   const onCheck = useCallback((outcome: BatchNameCheckOutcome) => {
-    if ('failed' in outcome) dispatch((all) => failNameChecks(all, outcome.keys))
-    else dispatch((all) => applyNameChecks(all, outcome.keys, outcome.results))
+    if ('failed' in outcome) {
+      setNameCheckError(outcome.error ?? null)
+      dispatch((all) => failNameChecks(all, outcome.keys))
+    } else {
+      setNameCheckError(null)
+      dispatch((all) => applyNameChecks(all, outcome.keys, outcome.results))
+    }
   }, [])
   const { checkNow } = useBatchNameCheck(userId, entries, onCheck)
 
@@ -240,17 +248,18 @@ export function SkillUploadReviewModal({ mode, userId, existingCount, files, cut
           body: JSON.stringify({ items, otherNames }),
           signal: stop.signal,
         }))
-        const body = await res.json().catch(() => ({}))
         if (!res.ok) {
-          const code = readFeatureModelCode(body)
-          setBanner(code ? featureModelMessage(code, model) : (typeof body.error === 'string' && body.error) || 'The AI could not write the missing fields.')
+          const err = await readApiError(res, 'The AI could not write the missing fields')
+          const code = readFeatureModelCode(err.body)
+          setBanner(code ? featureModelMessage(code, model) : err.message)
           break
         }
+        const body = await res.json().catch(() => ({}))
         const answers: GeneratedItem[] = Array.isArray(body.items) ? body.items : []
         dispatch((all) => applyGenerated(all, answers, typeof body.modelUsed === 'string' ? body.modelUsed : null))
       }
     } catch (e) {
-      if (!stop.signal.aborted) setBanner('The AI could not be reached. Try again in a moment.')
+      if (!stop.signal.aborted) setBanner(toApiError(e, 'The AI could not be reached. Try again in a moment.').message)
     } finally {
       stopRef.current = null
       generateBusy.current = false
@@ -345,7 +354,11 @@ export function SkillUploadReviewModal({ mode, userId, existingCount, files, cut
       setBanner(GONE_TEXT)
       return
     }
-    void alertError((typeof answer.error === 'string' && answer.error) || 'Failed to upload the skills')
+    void alertError(formatApiError({
+      reason: (typeof answer.error === 'string' && answer.error) || 'Failed to upload the skills',
+      code: typeof answer.code === 'string' ? answer.code : undefined,
+      status: res.status,
+    }))
   }, [uploadBlocked, project, enableInProject, userId, checkNow, toast, summaryToasts, onUploaded, onClose, alertError])
 
   const title = single ? 'Upload agent skill' : `Upload ${plural(rows.length, 'agent skill', 'agent skills')}`
@@ -467,6 +480,7 @@ export function SkillUploadReviewModal({ mode, userId, existingCount, files, cut
               row={row}
               single={single}
               busy={uploading || committed}
+              nameCheckError={nameCheckError}
               previewOpen={previewOpen[row.key] ?? single}
               onTogglePreview={() => setPreviewOpen((p) => ({ ...p, [row.key]: !(p[row.key] ?? single) }))}
               onInclude={(include) => update(row.key, (r) => ({
@@ -485,11 +499,12 @@ export function SkillUploadReviewModal({ mode, userId, existingCount, files, cut
 }
 
 function RowView({
-  row, single, busy, previewOpen, onTogglePreview, onInclude, onRemove, onName, onFileName, onDescription,
+  row, single, busy, nameCheckError, previewOpen, onTogglePreview, onInclude, onRemove, onName, onFileName, onDescription,
 }: {
   row: DraftRow
   single: boolean
   busy: boolean
+  nameCheckError: ApiError | null
   previewOpen: boolean
   onTogglePreview: () => void
   onInclude: (include: boolean) => void
@@ -526,7 +541,7 @@ function RowView({
     // The suggestion is its own button below, so the message is asked without it.
     const text = check.state === 'duplicate'
       ? 'Another file in this upload has the same name.'
-      : nameCheckMessage({ state: check.state, suggestion: null, reason: check.reason })
+      : nameCheckMessage({ state: check.state, suggestion: null, reason: check.reason, error: nameCheckError })
     if (text) nameStatus.push(<span key="check" className={check.state === 'error' ? styles.muted : styles.warn}>{text}</span>)
   }
   if (suggestion) {

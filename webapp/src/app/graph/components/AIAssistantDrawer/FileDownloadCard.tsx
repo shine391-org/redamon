@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react'
 import { Download, FileCode, Loader2, AlertCircle, CheckCircle } from 'lucide-react'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './FileDownloadCard.module.css'
 
 interface FileDownloadCardProps {
@@ -23,10 +24,7 @@ export function FileDownloadCard({ filepath, filename, description, source }: Fi
     try {
       const resp = await fetch(`/api/agent/files?path=${encodeURIComponent(filepath)}`)
 
-      if (!resp.ok) {
-        const text = await resp.text()
-        throw new Error(text || `Download failed (${resp.status})`)
-      }
+      if (!resp.ok) throw await readApiError(resp, 'Download failed')
 
       const blob = await resp.blob()
       const url = URL.createObjectURL(blob)
@@ -37,7 +35,7 @@ export function FileDownloadCard({ filepath, filename, description, source }: Fi
       URL.revokeObjectURL(url)
       setDownloaded(true)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Download failed')
+      setError(toApiError(err, 'Download failed').message)
     } finally {
       setDownloading(false)
     }

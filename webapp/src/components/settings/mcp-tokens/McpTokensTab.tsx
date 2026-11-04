@@ -17,6 +17,7 @@ import { Menu, MenuItem, Tooltip, useAlertModal, WikiInfoButton } from '@/compon
 import { useDirtyState } from '@/hooks/useDirtyState'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import { copyText } from '@/lib/copyText'
+import { readApiError, toApiError } from '@/lib/apiError'
 import {
   MCP_SCOPES,
   MCP_DEFAULT_EXPIRY_DAYS,
@@ -36,6 +37,7 @@ import {
 import ScopeChecklist from './ScopeChecklist'
 import AgentOnboardingModal from './AgentOnboardingModal'
 import styles from './McpTokensTab.module.css'
+import { profileOffered } from '@/lib/agentInTheLoop'
 
 interface Props {
   userId: string
@@ -133,6 +135,10 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
   const { dangerConfirm, confirm, alertError } = useAlertModal()
 
   const [tokens, setTokens] = useState<TokenRow[]>([])
+  // Agent in the Loop on this deployment (from the list answer): off, its scope
+  // and its profile are not offered.
+  const [loopOn, setLoopOn] = useState(false)
+  const profileList = PROFILE_LIST.filter(p => profileOffered(p.id, loopOn))
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -211,13 +217,14 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     setLoadError(null)
     try {
       const r = await fetch(`/api/users/${userId}/mcp-tokens`)
-      if (!r.ok) throw new Error(`request failed (${r.status})`)
+      if (!r.ok) throw await readApiError(r, 'Could not load tokens')
       const data = await r.json()
       setTokens(Array.isArray(data.tokens) ? data.tokens : [])
+      setLoopOn(data.features?.agentInTheLoop === true)
     } catch (e) {
       // Never a silent empty list: that reads as "you have no tokens" and
       // prompts a duplicate mint.
-      setLoadError(e instanceof Error ? e.message : 'Could not load tokens')
+      setLoadError(toApiError(e, 'Could not load tokens').message)
     } finally {
       setLoading(false)
     }
@@ -345,11 +352,11 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const data = await r.json().catch(() => ({}))
       if (!r.ok) {
-        if (data.passwordRequired) setServerWantsPassword(true)
+        const err = await readApiError(r, 'Could not save the token')
+        if (err.body?.passwordRequired) setServerWantsPassword(true)
         // Keep the panel populated so nothing is re-chosen.
-        setEditError(data.error || `Could not save the token (${r.status})`)
+        setEditError(err.message)
         return
       }
       const saved = { profile: editProfile, scopes: [...editScopes], name: editName }
@@ -358,7 +365,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
       await load()
       if (changedWhatThePackSays) setReExport(saved)
     } catch (e) {
-      setEditError(e instanceof Error ? e.message : 'Could not save the token')
+      setEditError(toApiError(e, 'Could not save the token').message)
     } finally {
       setSaving(false)
     }
@@ -380,19 +387,19 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
           profile: profile === 'custom' ? null : profile,
         }),
       })
-      const data = await r.json().catch(() => ({}))
       if (!r.ok) {
         // Keep the form populated so the operator does not retype everything.
-        setFormError(data.error || `Could not create the token (${r.status})`)
+        setFormError((await readApiError(r, 'Could not create the token')).message)
         return
       }
+      const data = await r.json()
       setMinted(data.plaintext)
       setMintedShape({ profile, scopes: [...scopes], name })
       setShowForm(false)
       resetForm()
       await load()
     } catch (e) {
-      setFormError(e instanceof Error ? e.message : 'Could not create the token')
+      setFormError(toApiError(e, 'Could not create the token').message)
     } finally {
       setCreating(false)
     }
@@ -411,15 +418,14 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     try {
       const r = await fetch(`/api/users/${userId}/mcp-tokens/${t.id}`, { method: 'DELETE' })
       if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        await alertError(data.error || `Delete failed (${r.status})`, 'Delete MCP Access Token')
+        await alertError((await readApiError(r, 'Delete failed')).message, 'Delete MCP Access Token')
         return
       }
       // The edit panel may be open on the row that just stopped existing.
       if (editing?.id === t.id) closeEdit()
       await load()
     } catch (e) {
-      await alertError(e instanceof Error ? e.message : 'Delete failed', 'Delete MCP Access Token')
+      await alertError(toApiError(e, 'Delete failed').message, 'Delete MCP Access Token')
     }
   }
 
@@ -590,7 +596,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
                 value={profile}
                 onChange={e => void changeProfile(e.target.value as ProfileId)}
               >
-                {PROFILE_LIST.map(p => (
+                {profileList.map(p => (
                   <option key={p.id} value={p.id}>{p.label}</option>
                 ))}
               </select>
@@ -614,7 +620,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
               </select>
             </div>
 
-            <ScopeChecklist selected={scopes} onToggle={toggleScope} profile={profile} />
+            <ScopeChecklist selected={scopes} onToggle={toggleScope} profile={profile} loopOff={!loopOn} />
 
             <div className={`formGroup ${styles.field}`}>
               <label className="formLabel" htmlFor="mcpTokenPassword">Confirm your password</label>
@@ -687,7 +693,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
                 disabled={!!editing.revokedAt}
                 onChange={e => void changeEditProfile(e.target.value as ProfileId)}
               >
-                {PROFILE_LIST.map(p => (
+                {profileList.map(p => (
                   <option key={p.id} value={p.id}>{p.label}</option>
                 ))}
               </select>
@@ -739,6 +745,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
               selected={editScopes}
               disabled={!!editing.revokedAt}
               profile={editProfile}
+              loopOff={!loopOn}
               onToggle={s => {
                 setEditScopes(prev => (prev.includes(s) ? prev.filter(x => x !== s) : [...prev, s]))
                 setServerWantsPassword(false)
@@ -836,6 +843,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
         initialProfile={onboarding?.profile ?? null}
         initialScopes={onboarding?.scopes ?? [...DEFAULT_MCP_SCOPES]}
         tokenName={onboarding?.name}
+        loopOn={loopOn}
       />
 
       {!loading && !loadError && tokens.length > 0 && (

@@ -118,11 +118,18 @@ describe('the page', () => {
     expect(screen.getByText(/platform 1\.0\.0/i)).toBeTruthy()
   })
 
-  test('the page cannot be loaded: an error with a retry', async () => {
-    pageAnswer = async () => new Response('{}', { status: 500 })
+  test('the page cannot be loaded: an error with its code and status, and a retry', async () => {
+    pageAnswer = async () => new Response(JSON.stringify({ error: 'The Plugins page could not be read; see the webapp log.', code: 'P2024' }), { status: 500 })
     show()
-    expect(await screen.findByText(/could not be loaded/i)).toBeTruthy()
+    expect(await screen.findByText('The Plugins page could not be loaded.')).toBeTruthy()
+    expect(screen.getByText('The Plugins page could not be read; see the webapp log. (P2024 · HTTP 500)')).toBeTruthy()
     expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
+  })
+
+  test("Next's empty 500 still names its status", async () => {
+    pageAnswer = async () => new Response('', { status: 500 })
+    show()
+    expect(await screen.findByText('The Plugins page could not be loaded (empty_response · HTTP 500)')).toBeTruthy()
   })
 
   test('an empty catalog with nothing installed: "No plugins available"', async () => {
@@ -338,8 +345,17 @@ describe('actions', () => {
     expect(within(dialog).queryByRole('radio')).toBeNull()
     const go = within(dialog).getByRole('button', { name: 'Delete kept data' }) as HTMLButtonElement
     expect(go.disabled).toBe(true)
-    fireEvent.click(within(dialog).getByRole('link', { name: /download the export/i }))
+    // The export is fetched by the page and saved from a blob; only a real download unlocks the purge.
+    const base = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) =>
+      url === '/api/plugins/echo/export' ? new Response('{"rows":[]}', { status: 200 }) : base(url, init),
+    )
+    URL.createObjectURL = vi.fn(() => 'blob:x')
+    URL.revokeObjectURL = vi.fn()
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    fireEvent.click(within(dialog).getByRole('button', { name: /download the export/i }))
     fireEvent.change(within(dialog).getByRole('textbox', { name: /type echo/i }), { target: { value: 'echo' } })
+    await waitFor(() => expect(go.disabled).toBe(false))
     fireEvent.click(go)
     await waitFor(() => expect(posts).toHaveLength(1))
     expect(posts[0]).toEqual({ url: '/api/plugins/echo/uninstall', body: { mode: 'purge', confirm: 'echo' } })

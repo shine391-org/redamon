@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Modal, useAlertModal } from '@/components/ui'
+import { ApiError, errorMessage, readApiError, toApiError } from '@/lib/apiError'
 
 interface RecordingSummary {
   hasCookie: boolean
@@ -21,6 +22,22 @@ interface RecordingSessionView {
 
 const PROXY_ADDR = '127.0.0.1:8888'
 
+/** A recording route's JSON, or an ApiError whose message carries the code and status (a proxy's HTML page too). */
+async function callRecording<T>(url: string, init: RequestInit | undefined, fallback: string): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(url, init)
+  } catch (err) {
+    throw toApiError(err, 'Could not reach the server')
+  }
+  if (!res.ok) throw await readApiError(res, fallback)
+  try {
+    return await res.json() as T
+  } catch {
+    throw new ApiError({ reason: fallback, status: res.status, code: 'invalid_json' })
+  }
+}
+
 export function RecordingModal({ isOpen, onClose, projectId, onSaved }: {
   isOpen: boolean
   onClose: () => void
@@ -32,6 +49,8 @@ export function RecordingModal({ isOpen, onClose, projectId, onSaved }: {
   const [session, setSession] = useState<RecordingSessionView | null>(null)
   const [summary, setSummary] = useState<RecordingSummary | null>(null)
   const [blocked, setBlocked] = useState<string | null>(null)
+  // The live counter's last poll failed: the count on screen may be behind.
+  const [stale, setStale] = useState<string | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const stopPolling = () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
@@ -39,36 +58,35 @@ export function RecordingModal({ isOpen, onClose, projectId, onSaved }: {
   const start = useCallback(async () => {
     setPhase('starting'); setBlocked(null); setSummary(null)
     try {
-      const res = await fetch(`/api/projects/${projectId}/recording/start`, { method: 'POST' })
-      const json = await res.json()
-      if (!res.ok) { setBlocked(json.error || 'Could not start recording'); setPhase('idle'); return }
+      const json = await callRecording<{ session: RecordingSessionView }>(
+        `/api/projects/${projectId}/recording/start`, { method: 'POST' }, 'Could not start recording')
       setSession(json.session)
       setPhase('recording')
-    } catch { setBlocked('Could not reach the server'); setPhase('idle') }
+    } catch (err) { setBlocked(errorMessage(err, 'Could not start recording')); setPhase('idle') }
   }, [projectId])
 
+  // Polling stops only once the stop succeeded: a refused stop leaves the
+  // recording live, and its counter must keep moving.
   const stop = useCallback(async () => {
-    stopPolling()
     try {
-      const res = await fetch(`/api/projects/${projectId}/recording/stop`, { method: 'POST' })
-      const json = await res.json()
+      const json = await callRecording<{ session: RecordingSessionView | null; summary: RecordingSummary | null }>(
+        `/api/projects/${projectId}/recording/stop`, { method: 'POST' }, 'Could not stop the recording')
+      stopPolling()
       setSession(json.session)
       setSummary(json.summary)
       setPhase('stopped')
-    } catch { alertError('Could not stop the recording') }
+    } catch (err) { alertError(errorMessage(err, 'Could not stop the recording')) }
   }, [projectId, alertError])
 
   const commit = useCallback(async (save: boolean) => {
     setPhase('saving')
     try {
-      const res = await fetch(`/api/projects/${projectId}/recording/commit`, {
+      await callRecording(`/api/projects/${projectId}/recording/commit`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ save }),
-      })
-      const json = await res.json()
-      if (!res.ok) { alertError(json.error || 'Could not save the recorded session'); setPhase('stopped'); return }
+      }, 'Could not save the recorded session')
       onSaved?.()
       onClose()
-    } catch { alertError('Could not save the recorded session'); setPhase('stopped') }
+    } catch (err) { alertError(errorMessage(err, 'Could not save the recorded session')); setPhase('stopped') }
   }, [projectId, onClose, onSaved, alertError])
 
   // Poll the live counter while recording so "nothing captured yet" is visible (G4).
@@ -76,16 +94,16 @@ export function RecordingModal({ isOpen, onClose, projectId, onSaved }: {
     if (phase !== 'recording') return
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`/api/projects/${projectId}/recording/status`)
-        if (!res.ok) return
-        const json = await res.json()
+        const json = await callRecording<{ session: RecordingSessionView | null; summary: RecordingSummary | null }>(
+          `/api/projects/${projectId}/recording/status`, undefined, 'Live counter not updating')
+        setStale(null)
         if (json.session) { setSession(json.session); setSummary(json.summary) }
-      } catch { /* transient */ }
+      } catch (err) { setStale(errorMessage(err, 'Live counter not updating')) }
     }, 3000)
     return stopPolling
   }, [phase, projectId])
 
-  useEffect(() => { if (!isOpen) { stopPolling(); setPhase('idle'); setSession(null); setSummary(null); setBlocked(null) } }, [isOpen])
+  useEffect(() => { if (!isOpen) { stopPolling(); setPhase('idle'); setSession(null); setSummary(null); setBlocked(null); setStale(null) } }, [isOpen])
 
   // Closing the modal must end the recording. Without this the session stays
   // active server-side until its 30-minute TTL: the proxy keeps tagging the
@@ -142,6 +160,7 @@ export function RecordingModal({ isOpen, onClose, projectId, onSaved }: {
             <span style={{ color: '#e0af68' }}>● Recording…</span>{' '}
             captured {session.observedCount} request(s){session.observedCount === 0 ? ', waiting for login traffic' : ''}.
             {session.lastError && <div style={{ color: '#f7768e' }}>{session.lastError}</div>}
+            {stale && <div style={{ color: 'var(--text-tertiary)', fontSize: 12 }} role="status">{stale}; the count may be behind.</div>}
           </div>
         )}
 

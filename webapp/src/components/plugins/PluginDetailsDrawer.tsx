@@ -1,9 +1,12 @@
 'use client'
 
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { RefreshCw } from 'lucide-react'
 import { Drawer } from '@/components/ui'
+import { errorMessage, fetchJson, readApiError, toApiError, type ApiError } from '@/lib/apiError'
 import type { PluginDetail } from '@/lib/plugins/pageModel'
+import { downloadPluginExport } from './exportDownload'
 import styles from './plugins.module.css'
 
 const LOG_LINES = 200
@@ -14,6 +17,23 @@ interface PluginDetailsDrawerProps {
   onClose: () => void
   onRollback: (pluginId: string, toVersion: string) => void
   busy?: boolean
+}
+
+// The codes of a runner that could not give the log; anything else (a refusal, a webapp
+// failure) is not the runner's fault and is not framed as one.
+const RUNNER_DOWN = new Set(['runner_unavailable', 'runner_misconfigured', 'runner_error'])
+
+async function readLogs(pluginId: string): Promise<{ lines: string[] } | { unavailable: ApiError }> {
+  const fallback = 'The log could not be read'
+  let res: Response
+  try {
+    res = await fetch(`/api/plugins/${pluginId}/logs?lines=${LOG_LINES}`, { cache: 'no-store' })
+  } catch (e) {
+    return { unavailable: toApiError(e, fallback) }
+  }
+  if (!res.ok) return { unavailable: await readApiError(res, fallback) }
+  const body = (await res.json().catch(() => null)) as { lines?: unknown } | null
+  return { lines: Array.isArray(body?.lines) ? (body.lines as string[]) : [] }
 }
 
 const n = (x: number) => x.toLocaleString('en-US')
@@ -27,23 +47,27 @@ const mb = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MB`
 export function PluginDetailsDrawer({ pluginId, isOpen, onClose, onRollback, busy = false }: PluginDetailsDrawerProps) {
   const detail = useQuery<PluginDetail>({
     queryKey: ['plugins', 'detail', pluginId],
-    queryFn: async () => {
-      const res = await fetch(`/api/plugins/${pluginId}`, { cache: 'no-store' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      return res.json()
-    },
+    queryFn: () => fetchJson<PluginDetail>(`/api/plugins/${pluginId}`, { cache: 'no-store' }, 'The details could not be loaded'),
     enabled: isOpen,
   })
-  const logs = useQuery<{ lines: string[] } | { unavailable: string }>({
+  const logs = useQuery<{ lines: string[] } | { unavailable: ApiError }>({
     queryKey: ['plugins', 'logs', pluginId],
-    queryFn: async () => {
-      const res = await fetch(`/api/plugins/${pluginId}/logs?lines=${LOG_LINES}`, { cache: 'no-store' })
-      const body = await res.json().catch(() => ({}))
-      if (!res.ok) return { unavailable: body?.error ?? `HTTP ${res.status}` }
-      return { lines: Array.isArray(body?.lines) ? body.lines : [] }
-    },
+    queryFn: () => readLogs(pluginId),
     enabled: isOpen,
   })
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
+  const exportData = async () => {
+    setExporting(true)
+    setExportError(null)
+    try {
+      await downloadPluginExport(pluginId)
+    } catch (e) {
+      setExportError(errorMessage(e, 'The export could not be downloaded'))
+    } finally {
+      setExporting(false)
+    }
+  }
 
   const d = detail.data
   const admin = d?.admin
@@ -52,7 +76,11 @@ export function PluginDetailsDrawer({ pluginId, isOpen, onClose, onRollback, bus
   return (
     <Drawer isOpen={isOpen} onClose={onClose} position="right" mode="overlay" width="560px" title={`${d?.plugin.displayName ?? pluginId} details`}>
       {detail.isLoading && <div className="skeleton skeletonCard" />}
-      {detail.isError && <div className={styles.error}>The details could not be loaded.</div>}
+      {detail.isError && (
+        <div className={styles.error} role="alert">
+          {errorMessage(detail.error, 'The details could not be loaded')}
+        </div>
+      )}
       {admin && (
         <div className={styles.meta}>
           {admin.lastError && (
@@ -142,9 +170,14 @@ export function PluginDetailsDrawer({ pluginId, isOpen, onClose, onRollback, bus
             ) : null}
           </section>
           <section>
-            <a className="secondaryButton" href={`/api/plugins/${pluginId}/export`} download>
+            <button type="button" className="secondaryButton" onClick={() => void exportData()} disabled={exporting}>
               Export data
-            </a>
+            </button>
+            {exportError && (
+              <p className={styles.error} role="alert">
+                {exportError}
+              </p>
+            )}
             <p className={styles.notice}>Text that plugins proposed for people&apos;s own skills is not included.</p>
           </section>
         </div>
@@ -157,7 +190,11 @@ export function PluginDetailsDrawer({ pluginId, isOpen, onClose, onRollback, bus
           </button>
         </div>
         {logs.data && 'unavailable' in logs.data ? (
-          <p className={styles.notice}>The plugin runner is unavailable, so its log cannot be read: {logs.data.unavailable}</p>
+          <p className={styles.notice} data-testid="plugin-log-unavailable">
+            {RUNNER_DOWN.has(logs.data.unavailable.code ?? '')
+              ? `The plugin runner is unavailable, so its log cannot be read: ${logs.data.unavailable.message}`
+              : logs.data.unavailable.message}
+          </p>
         ) : logs.data && logs.data.lines.length === 0 ? (
           <p className={styles.notice}>Nothing logged yet.</p>
         ) : (

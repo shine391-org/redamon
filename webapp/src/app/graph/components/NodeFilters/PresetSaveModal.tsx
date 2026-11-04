@@ -5,6 +5,7 @@ import { Loader2 } from 'lucide-react'
 import { Modal, useToast, WikiInfoButton } from '@/components/ui'
 import type { NodeFilterDoc, NodeFilterMode } from '@/lib/nodeFilters/model'
 import { PRESET_LIMITS } from '@/lib/nodeFilters/presets'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './NodeFilters.module.css'
 
 interface PresetSaveModalProps {
@@ -39,15 +40,17 @@ export function PresetSaveModal({ isOpen, onClose, mode, rules, counts }: Preset
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, description, mode, rules }),
       })
-      const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        setErrors([body.error || `Save failed (${res.status})`, ...(body.errors ?? [])])
+        const err = await readApiError(res, 'Save failed')
+        // Every rule error, as before: ApiError.details keeps only the first ten.
+        const ruleErrors = Array.isArray(err.body?.errors) ? err.body.errors as string[] : []
+        setErrors([err.message, ...ruleErrors])
         return
       }
       toast.success(`Preset "${name.trim()}" saved.`, 'Mute rules')
       onClose()
     } catch (e) {
-      setErrors([e instanceof Error ? e.message : 'Save failed'])
+      setErrors([toApiError(e, 'Save failed').message])
     } finally {
       setSaving(false)
     }

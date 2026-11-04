@@ -22,6 +22,7 @@ import { NODE_FILTER_CATALOG, enabledKinds } from '@/lib/nodeFilters/catalog'
 import type { NodeFilterDoc, NodeFilterMode } from '@/lib/nodeFilters/model'
 import type { MuteRulesPresetSummary } from '@/lib/nodeFilters/presets'
 import { countActiveRules } from '@/lib/nodeFilters/validate'
+import { formatApiError, readApiError } from '@/lib/apiError'
 import { ApplyModal } from './ApplyModal'
 import { ArmedStatus } from './ArmedStatus'
 import { KindPanel } from './KindPanel'
@@ -193,7 +194,8 @@ export function NodeFiltersView({
     try {
       const res = await fetch(`/api/mute-rule-presets/${encodeURIComponent(summary.id)}`)
       if (!res.ok) {
-        await alertError(`The preset "${summary.name}" could not be read.`, 'Load preset')
+        const err = await readApiError(res, 'could not be read')
+        await alertError(`${formatApiError({ ...err, reason: `The preset "${summary.name}" could not be read` })}.`, 'Load preset')
         return false
       }
       const preset = await res.json() as { name: string; mode: NodeFilterMode; rules: NodeFilterDoc }

@@ -18,7 +18,10 @@ const h = vi.hoisted(() => ({
 vi.mock('@/lib/prisma', () => ({ default: { project: { findUnique: (...a: unknown[]) => h.findUnique(...a) } } }))
 vi.mock('@/lib/engagement', () => ({ loadEngagement: (...a: unknown[]) => h.engagement(...a) }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
-vi.mock('@/lib/startFullScan', () => ({ startFullScan: vi.fn() }))
+vi.mock('@/lib/startFullScan', async orig => ({
+  ...(await orig<typeof import('@/lib/startFullScan')>()),
+  startFullScan: vi.fn(),
+}))
 vi.mock('@/lib/legacyGraph', async orig => ({
   ...(await orig<typeof import('@/lib/legacyGraph')>()),
   legacyGraphDomains: (...a: unknown[]) => h.legacy(...a),
@@ -102,6 +105,32 @@ describe('dispatchStart tells the queue what the start really did (plan 12.6)', 
     expect(r).toMatchObject({ ok: false, status: 503, startOutcome: 'unknown' })
     expect(classifyStartFailure(r.status, { error: r.error, startOutcome: r.startOutcome },
       { orchestratorAnswered: false }).kind).toBe('unknown')
+  })
+
+  test('a refused connection certainly started nothing, so the queue may retry it', async () => {
+    h.legacy.mockResolvedValue([])
+    const refused = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8010'), { code: 'ECONNREFUSED' }),
+    })
+    h.orchestratorFetch.mockRejectedValue(refused)
+    const r = await dispatchStart('partial_recon', 'p1', { payload: { tool_id: 'Tlsx' } })
+    expect(r).toMatchObject({ ok: false, status: 503, code: 'orchestrator_unreachable', cause: 'ECONNREFUSED' })
+    expect(r.startOutcome).toBeUndefined()
+    expect(classifyStartFailure(r.status, { error: r.error, code: r.code },
+      { orchestratorAnswered: r.startOutcome !== 'unknown' }).kind).toBe('transient')
+  })
+
+  test('a timed-out start is 504 orchestrator_timeout with an unknown outcome', async () => {
+    h.legacy.mockResolvedValue([])
+    h.orchestratorFetch.mockRejectedValue(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }))
+    const r = await dispatchStart('partial_recon', 'p1', { payload: { tool_id: 'Tlsx' } })
+    expect(r).toMatchObject({ ok: false, status: 504, code: 'orchestrator_timeout', startOutcome: 'unknown' })
+  })
+
+  test('a non-full refusal carries the orchestrator status', async () => {
+    h.orchestratorFetch.mockResolvedValue({ ok: false, status: 502, json: async () => { throw new SyntaxError('html') } })
+    const r = await dispatchStart('github_hunt', 'p1')
+    expect(r).toMatchObject({ ok: false, status: 502, upstreamStatus: 502, error: 'Failed to start GitHub Secret Hunt' })
   })
 
   test('a non-full refusal forwards the orchestrator body code', async () => {

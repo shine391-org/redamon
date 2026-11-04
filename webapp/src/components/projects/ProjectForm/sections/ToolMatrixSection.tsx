@@ -6,6 +6,8 @@ import type { Project } from '@prisma/client'
 import { useProject } from '@/providers/ProjectProvider'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { WikiInfoButton } from '@/components/ui/WikiInfoButton'
+import { failureText } from '@/components/settings/failureText'
+import { readApiError } from '@/lib/apiError'
 import styles from '../ProjectForm.module.css'
 
 const ALL_PHASES = ['informational', 'exploitation', 'post_exploitation'] as const
@@ -100,6 +102,8 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
   const [isOpen, setIsOpen] = useState(true)
   const { userId } = useProject()
   const [missingKeys, setMissingKeys] = useState<Set<string>>(new Set())
+  // A failed read must not mark a tool as missing its key: that is a guess.
+  const [keyStatusError, setKeyStatusError] = useState<string | null>(null)
   const [userMcpServers, setUserMcpServers] = useState<ManifestServer[]>([])
 
   // Source the user MCP list from the DATABASE (the user's saved
@@ -125,14 +129,21 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
   const [keyValue, setKeyValue] = useState('')
   const [keyVisible, setKeyVisible] = useState(false)
   const [keySaving, setKeySaving] = useState(false)
+  const [keyError, setKeyError] = useState<string | null>(null)
 
   // Fetch API key status from global settings
   const fetchKeyStatus = useCallback(() => {
     if (!userId) return
+    const SETTINGS_FAILED = "Couldn't check which API keys are set"
     fetch(`/api/users/${userId}/settings`)
-      .then(r => r.ok ? r.json() : null)
+      .then(async r => {
+        if (r.ok) return r.json()
+        setKeyStatusError(failureText(SETTINGS_FAILED, await readApiError(r, SETTINGS_FAILED)))
+        return null
+      })
       .then(settings => {
         if (!settings) return
+        setKeyStatusError(null)
         const missing = new Set<string>()
         if (!settings.tavilyApiKey) missing.add('web_search')
         if (!settings.shodanApiKey) missing.add('shodan')
@@ -141,17 +152,24 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
         if (!settings.urlscanApiKey) missing.add('execute_gau')
         if (!settings.pdcpApiKey) missing.add('cve_intel')
         // tradecraft_lookup: warn when zero enabled resources are configured
+        const TRADECRAFT_FAILED = "Couldn't check your tradecraft resources"
         fetch(`/api/users/${userId}/tradecraft-resources`)
-          .then(r2 => r2.ok ? r2.json() : [])
+          .then(async r2 => {
+            if (r2.ok) return r2.json()
+            throw await readApiError(r2, TRADECRAFT_FAILED)
+          })
           .then((arr: Array<{ enabled?: boolean }>) => {
             const enabledCount = (arr || []).filter(r => r.enabled !== false).length
             const next = new Set(missing)
             if (enabledCount === 0) next.add('tradecraft_lookup')
             setMissingKeys(next)
           })
-          .catch(() => setMissingKeys(missing))
+          .catch(err => {
+            setMissingKeys(missing)
+            setKeyStatusError(failureText(TRADECRAFT_FAILED, err))
+          })
       })
-      .catch(() => {})
+      .catch(err => setKeyStatusError(failureText(SETTINGS_FAILED, err)))
   }, [userId])
 
   useEffect(() => { fetchKeyStatus() }, [fetchKeyStatus])
@@ -165,12 +183,14 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
     setKeyModal(toolId)
     setKeyValue('')
     setKeyVisible(false)
+    setKeyError(null)
   }
 
   const closeKeyModal = () => {
     setKeyModal(null)
     setKeyValue('')
     setKeyVisible(false)
+    setKeyError(null)
   }
 
   const saveApiKey = async () => {
@@ -178,6 +198,7 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
     const info = TOOL_KEY_INFO[keyModal]
     if (!info) return
     setKeySaving(true)
+    setKeyError(null)
     try {
       const resp = await fetch(`/api/users/${userId}/settings`, {
         method: 'PUT',
@@ -187,9 +208,11 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
       if (resp.ok) {
         closeKeyModal()
         fetchKeyStatus()
+      } else {
+        setKeyError((await readApiError(resp, 'The key was not saved')).message)
       }
-    } catch {
-      // silent
+    } catch (err) {
+      setKeyError(failureText('The key was not saved', err))
     } finally {
       setKeySaving(false)
     }
@@ -216,6 +239,11 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
           <p className={styles.sectionDescription}>
             Controls which tools the agent can use in each phase. Check the phases where each tool should be available.
           </p>
+          {keyStatusError && (
+            <p className={styles.sectionDescription} role="alert">
+              <AlertTriangle size={12} /> {keyStatusError}, so a tool may be shown without its missing-key warning.
+            </p>
+          )}
           <div className={styles.toolPhaseGrid}>
             <ToolPhaseHeader />
             {[
@@ -417,6 +445,7 @@ export function ToolMatrixSection({ data, updateField }: ToolMatrixSectionProps)
                 Get API key
               </a>
             </span>
+            {keyError && <span className="formHint" role="alert" style={{ color: 'var(--status-error-text)' }}>{keyError}</span>}
           </div>
         )}
       </Modal>

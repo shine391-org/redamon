@@ -15,12 +15,13 @@ import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { requireVersionInProject } from '@/lib/scanVersionAccess'
 import { sanitizeVersionLabel } from '@/lib/scanVersionLabel'
 import { writeAudit } from '@/lib/audit'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; versionId: string }>
 }
 
-export async function PATCH(request: NextRequest, { params }: RouteParams) {
+export const PATCH = withRouteErrors('Failed to update version', async (request: NextRequest, { params }: RouteParams) => {
   const { id, versionId } = await params
 
   const eff = await requireEffectiveUser()
@@ -71,15 +72,11 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ version: updated })
   } catch (error) {
-    console.error('[scanTimeline] version update failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to update version' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update version', { log: '[scanTimeline] version update failed' })
   }
-}
+})
 
-export async function DELETE(_request: NextRequest, { params }: RouteParams) {
+export const DELETE = withRouteErrors('Failed to delete version', async (_request: NextRequest, { params }: RouteParams) => {
   const { id, versionId } = await params
 
   const eff = await requireEffectiveUser()
@@ -141,10 +138,6 @@ export async function DELETE(_request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ ok: true, deletedVersionId: versionId, seq: version.seq })
   } catch (error) {
-    console.error('[scanTimeline] version delete failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to delete version' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete version', { log: '[scanTimeline] version delete failed' })
   }
-}
+})

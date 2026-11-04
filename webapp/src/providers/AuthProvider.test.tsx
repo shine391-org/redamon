@@ -1,0 +1,65 @@
+/**
+ * Session hydrate: a database outage is not a sign-out.
+ *
+ * /api/auth/me failing used to leave `user` null whatever the cause. A 401 is a
+ * plain sign-out; a 5xx or no answer is now exposed as `sessionError`, with its
+ * code and status, so the app can say the session could not be read.
+ */
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, cleanup, waitFor } from '@testing-library/react'
+import { AuthProvider, useAuth } from './AuthProvider'
+
+function Consumer() {
+  const { user, isLoading, sessionError } = useAuth()
+  return (
+    <div>
+      <span data-testid="loading">{String(isLoading)}</span>
+      <span data-testid="user">{user?.id ?? 'none'}</span>
+      <span data-testid="error">{sessionError?.message ?? ''}</span>
+    </div>
+  )
+}
+
+let fetchMock: ReturnType<typeof vi.fn>
+beforeEach(() => {
+  fetchMock = vi.fn()
+  vi.stubGlobal('fetch', fetchMock)
+})
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+async function hydrate() {
+  render(<AuthProvider><Consumer /></AuthProvider>)
+  await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+}
+
+describe('AuthProvider session hydrate', () => {
+  test('a 5xx is a session error with its code, not a sign-out', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: 'Internal server error', code: 'P1001' }), { status: 500 }))
+    await hydrate()
+    expect(screen.getByTestId('user').textContent).toBe('none')
+    expect(screen.getByTestId('error').textContent).toBe('Internal server error (P1001 · HTTP 500)')
+  })
+
+  test('no answer at all is a session error too', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await hydrate()
+    expect(screen.getByTestId('error').textContent).toBe('Could not read your session (network_error)')
+  })
+
+  test('a 401 is a plain sign-out, with no error', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }))
+    await hydrate()
+    expect(screen.getByTestId('user').textContent).toBe('none')
+    expect(screen.getByTestId('error').textContent).toBe('')
+  })
+
+  test('a session that reads loads the user', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ id: 'u1', name: 'U', email: 'u@x', role: 'admin' }), { status: 200 }))
+    await hydrate()
+    expect(screen.getByTestId('user').textContent).toBe('u1')
+    expect(screen.getByTestId('error').textContent).toBe('')
+  })
+})

@@ -4,6 +4,7 @@ import { getEffectiveUser, getSession } from '@/lib/session'
 import { auditPlugin } from '@/lib/plugins/audit'
 import { isBuiltinSkill } from '@/lib/plugins/builtinSkills'
 import { bodyOwnerMatches, ownsScope } from '@/lib/plugins/changeSetAccess'
+import { internalErrorResponse, pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 
@@ -19,8 +20,8 @@ export const dynamic = 'force-dynamic'
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
-export async function POST(request: NextRequest) {
-  if (!sameOrigin(request)) return crossOriginResponse()
+export const POST = pluginRoute('override reset', 'The skill could not be reset; see the webapp log.', async (request: NextRequest) => {
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await getEffectiveUser()
@@ -52,10 +53,21 @@ export async function POST(request: NextRequest) {
   const actor = session?.userId ?? eff.userId
   const result = await ov.reset(scope, 'skill.text', group, actor)
   if (result) {
-    const cleared = await ov.getChangeSet(result.changeSetId)
+    // The reset is done: a failure reading the set for its audit entry must not read as a
+    // failed reset, which a retry would then find already cleared.
+    let pluginId: string
+    try {
+      pluginId = (await ov.getChangeSet(result.changeSetId))?.pluginId ?? 'unknown'
+    } catch (e) {
+      return internalErrorResponse(e, 'override reset audit', 'The skill was reset, but its audit entry could not be written; see the webapp log.', {
+        committed: true,
+        cleared: true,
+        revision: result.revision,
+      })
+    }
     await auditPlugin('plugin.override.reset', {
       actorId: actor,
-      pluginId: cleared?.pluginId ?? 'unknown',
+      pluginId,
       targetType: 'plugin_change_set',
       targetId: result.changeSetId,
       after: { point: 'skill.text', targetGroup: group, scope: scope.type, scopeId: scope.id, clearedRevision: result.revision },
@@ -63,4 +75,4 @@ export async function POST(request: NextRequest) {
     })
   }
   return NextResponse.json({ cleared: !!result, revision: result?.revision ?? null })
-}
+})

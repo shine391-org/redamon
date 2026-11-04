@@ -20,16 +20,21 @@ import hashlib
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import stat as statlib
 import subprocess
 import tarfile
 import time
+import urllib.parse
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from workspace_import import busy as _busy
+from workspace_import import provenance as _provenance
 
 logger = logging.getLogger(__name__)
 
@@ -1249,6 +1254,52 @@ def list_dir_for_project(project_id: str, path: str = ".") -> list[dict]:
     return rows
 
 
+def list_dir_page(project_id: str, path: str = ".", limit: int = 2000) -> tuple[list[dict], int]:
+    """The first `limit` entries of a directory, dirs first then by name, and
+    the total count. Only the page is stat'ed: the drawer polls this every few
+    seconds, and an imported tree can hold tens of thousands of entries."""
+    target = resolve_for_project(project_id, path)
+    if not target.is_dir():
+        raise ValueError(f"not a directory: {path}")
+    root = (WORKSPACE_ROOT / project_id).resolve()
+    with os.scandir(target) as it:
+        entries = list(it)
+
+    def _is_dir(e: os.DirEntry) -> bool:
+        try:
+            return e.is_dir()
+        except OSError:
+            return False
+
+    entries.sort(key=lambda e: (not _is_dir(e), e.name.lower()))
+    rows = []
+    for entry in entries[:max(0, limit)]:
+        try:
+            st = os.stat(entry.path)
+            is_dir = _is_dir(entry)
+            # A signed record of this project, not just a file of that name.
+            record = _provenance.read(entry.path, project_id=project_id) \
+                if is_dir and not entry.is_symlink() and os.path.isfile(os.path.join(entry.path, _provenance.FILENAME)) \
+                else None
+            row = {
+                "name": entry.name,
+                "path": str(Path(entry.path).relative_to(root)),
+                "isDir": is_dir,
+                "isSymlink": entry.is_symlink(),
+                "size": st.st_size,
+                "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
+                "imported": record is not None,
+            }
+            if record is not None:
+                facts = import_facts(record)
+                row["importKind"] = facts["kind"]
+                row["resyncable"] = facts["resyncable"]
+            rows.append(row)
+        except Exception as e:
+            logger.warning(f"list_dir: skipped {entry.path}: {e}")
+    return rows, len(entries)
+
+
 def tree_for_project(project_id: str, path: str = ".", max_depth: int = 3, max_entries: int = 500) -> str:
     """ASCII tree as a single string (for the drawer's tree view)."""
     base = resolve_for_project(project_id, path)
@@ -1294,6 +1345,64 @@ def download_for_project(project_id: str, path: str) -> tuple[bytes, str]:
     return full.read_bytes(), mime
 
 
+def project_relative(project_id: str, user_path: Optional[str], follow_symlinks: bool = False) -> str:
+    """`user_path` (relative or absolute) as a normalized project-relative path,
+    '.' for the root. Raises ValueError when it escapes the project."""
+    full = resolve_for_project(project_id, user_path, follow_symlinks=follow_symlinks)
+    root = (WORKSPACE_ROOT / project_id).resolve()
+    return "." if full == root else str(full.relative_to(root))
+
+
+def check_not_busy(project_id: str, user_path: Optional[str]) -> None:
+    """Refuse a mutation a running import would undo (workspace_import.busy).
+    Both the path as written and where its symlinks lead are checked; any error
+    in the check refuses."""
+    try:
+        for follow in (False, True):
+            try:
+                rel = project_relative(project_id, user_path, follow_symlinks=follow)
+            except ValueError:
+                continue
+            _busy.check_mutation(project_id, rel)
+    except Exception as e:
+        if getattr(e, "code", None) == "busy":
+            raise
+        raise _busy.ImportFailure("busy", detail="unknown") from None
+
+
+def open_download_for_project(project_id: str, path: str) -> tuple[int, int, str, str]:
+    """Open a workspace file for streaming: (fd, size, mime, filename).
+
+    The descriptor checked is the descriptor streamed. The workspace is writable
+    by the agent, kali-sandbox and the host, so a component swapped for a
+    symlink between a check and a later open-by-path would escape: the last
+    component is opened with O_NOFOLLOW, and the opened file's real path is
+    checked against the project root. O_NONBLOCK keeps a FIFO from hanging the
+    open; fstat then refuses anything that is not a regular file.
+    """
+    full = resolve_for_project(project_id, path)
+    root = str((WORKSPACE_ROOT / project_id).resolve())
+    try:
+        fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise ValueError(f"not a file: {path}") from None
+    try:
+        st = os.fstat(fd)
+        if not statlib.S_ISREG(st.st_mode):
+            raise ValueError(f"not a file: {path}")
+        real = os.readlink(f"/proc/self/fd/{fd}")
+        if real != root and not real.startswith(root + os.sep):
+            raise ValueError(f"path escapes workspace: {path}")
+    except OSError:
+        os.close(fd)
+        raise ValueError(f"not a file: {path}") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    mime = mimetypes.guess_type(str(full))[0] or "application/octet-stream"
+    return fd, st.st_size, mime, os.path.basename(str(full)) or "download"
+
+
 def rename_for_project(project_id: str, path: str, new_name: str) -> str:
     """Rename a single entry within its parent dir. Returns new relative path."""
     if is_protected_path(path):
@@ -1306,7 +1415,10 @@ def rename_for_project(project_id: str, path: str, new_name: str) -> str:
         raise ValueError(f"not found: {path}")
     new_full = full.parent / new_name
     # Re-validate the new path to be sure it stays in-workspace
-    resolve_for_project(project_id, str(new_full.relative_to((WORKSPACE_ROOT / project_id).resolve())))
+    new_rel = str(new_full.relative_to((WORKSPACE_ROOT / project_id).resolve()))
+    resolve_for_project(project_id, new_rel)
+    check_not_busy(project_id, path)
+    check_not_busy(project_id, new_rel)
     if new_full.exists() or new_full.is_symlink():
         raise ValueError(f"destination already exists: {new_name}")
     full.rename(new_full)
@@ -1320,6 +1432,7 @@ def delete_for_project(project_id: str, path: str, recursive: bool = False) -> N
     full = resolve_for_project(project_id, path)
     if not (full.exists() or full.is_symlink()):
         raise ValueError(f"not found: {path}")
+    check_not_busy(project_id, path)
     if full.is_dir() and not full.is_symlink():
         if not recursive:
             raise ValueError(f"{path} is a directory (pass recursive=True)")
@@ -1387,6 +1500,8 @@ def upload_for_project(
     if not full_dir.is_dir():
         raise ValueError(f"not a directory: {dest_dir}")
     target = full_dir / filename
+    # Inside a folder a Re-sync is replacing, the swap would delete this file.
+    check_not_busy(project_id, posixpath.join(dest_dir or ".", filename))
     if (target.exists() or target.is_symlink()) and not overwrite:
         raise FileExistsError(f"{filename} already exists in {dest_dir}")
     # Atomic write (consistent with fs_write)
@@ -1411,6 +1526,7 @@ def mkdir_for_project(project_id: str, path: str) -> str:
     full = resolve_for_project(project_id, path)
     if full.exists() or full.is_symlink():
         raise ValueError(f"already exists: {path}")
+    check_not_busy(project_id, path)
     full.mkdir(parents=True)
     try:
         os.chmod(full, 0o777)
@@ -1435,33 +1551,42 @@ def bulk_archive_for_project(
     contents are nested under that.
     """
     import io as _io
+    resolved, filename = prepare_bulk_archive(project_id, paths, format, archive_name)
+    buf = _io.BytesIO()
+    write_bulk_archive(buf, resolved, format)
+    return buf.getvalue(), filename
+
+
+def prepare_bulk_archive(project_id: str, paths: list, format: str, archive_name: str) -> tuple[list, str]:
+    """Validate a bulk download: (resolved paths, suggested filename)."""
     if format not in ("tar.gz", "zip"):
         raise ValueError(f"format must be tar.gz or zip, got {format!r}")
     if not isinstance(paths, list) or not paths:
         raise ValueError("paths must be a non-empty list")
-
     resolved = []
     for p in paths:
         full = resolve_for_project(project_id, p)
         if not (full.exists() or full.is_symlink()):
             raise ValueError(f"not found: {p}")
         resolved.append(full)
+    return resolved, f"{archive_name}.{format}"
 
-    def _skip_symlinks(tarinfo):
-        if tarinfo.issym() or tarinfo.islnk():
-            return None
-        return tarinfo
 
-    buf = _io.BytesIO()
+def _skip_symlinks(tarinfo):
+    if tarinfo.issym() or tarinfo.islnk():
+        return None
+    return tarinfo
+
+
+def write_bulk_archive(fileobj, resolved: list, format: str) -> None:
     if format == "tar.gz":
-        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        with tarfile.open(fileobj=fileobj, mode="w:gz") as tf:
             for p in resolved:
                 if p.is_symlink():
                     continue
                 tf.add(p, arcname=p.name, filter=_skip_symlinks)
-        filename = f"{archive_name}.tar.gz"
     else:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in resolved:
                 if p.is_symlink():
                     continue
@@ -1473,8 +1598,6 @@ def bulk_archive_for_project(
                             zf.write(sub, arcname=f"{p.name}/{sub.relative_to(p)}")
                 else:
                     zf.write(p, arcname=p.name)
-        filename = f"{archive_name}.zip"
-    return buf.getvalue(), filename
 
 
 def archive_dir_for_project(
@@ -1497,32 +1620,62 @@ def archive_dir_for_project(
     consistency and defense in depth.
     """
     import io as _io
+    src, name, filename = prepare_dir_archive(project_id, path, format)
+    buf = _io.BytesIO()
+    write_dir_archive(buf, src, name, format)
+    return buf.getvalue(), filename
+
+
+def prepare_dir_archive(project_id: str, path: str, format: str) -> tuple[Path, str, str]:
+    """Validate a folder download: (source dir, top-level name, suggested filename)."""
     if format not in ("tar.gz", "zip"):
         raise ValueError(f"format must be tar.gz or zip, got {format!r}")
     src = resolve_for_project(project_id, path)
     if not src.is_dir():
         raise ValueError(f"not a directory: {path}")
     name = src.name or project_id
-    buf = _io.BytesIO()
+    return src, name, f"{name}.{format}"
+
+
+def write_dir_archive(fileobj, src: Path, name: str, format: str) -> None:
     if format == "tar.gz":
-        def _skip_symlinks(tarinfo):
-            # Drop any symlink entries before they're written
-            if tarinfo.issym() or tarinfo.islnk():
-                return None
-            return tarinfo
-        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        with tarfile.open(fileobj=fileobj, mode="w:gz") as tf:
             tf.add(src, arcname=name, filter=_skip_symlinks)
-        filename = f"{name}.tar.gz"
     else:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(fileobj, "w", zipfile.ZIP_DEFLATED) as zf:
             for sub in src.rglob("*"):
                 # Skip symlinks: zf.write would follow and leak target content
                 if sub.is_symlink():
                     continue
                 if sub.is_file():
                     zf.write(sub, arcname=str(sub.relative_to(src.parent)))
-        filename = f"{name}.zip"
-    return buf.getvalue(), filename
+
+
+_ARCHIVE_ENTRY_OVERHEAD = 1024  # a tar header block plus padding, per entry
+
+
+def tree_bytes(paths: list) -> int:
+    """An upper bound for an archive of `paths` (symlinks not followed): the
+    regular files' bytes plus a header's worth per entry. Sizes the disk
+    reservation of an archive build."""
+    total = 0
+    for p in paths:
+        p = Path(p)
+        if p.is_symlink():
+            continue
+        if p.is_file():
+            total += p.stat().st_size + _ARCHIVE_ENTRY_OVERHEAD
+            continue
+        for dirpath, dirs, files in os.walk(p):
+            total += _ARCHIVE_ENTRY_OVERHEAD * (1 + len(dirs))
+            for f in files:
+                try:
+                    st = os.lstat(os.path.join(dirpath, f))
+                except OSError:
+                    continue
+                if statlib.S_ISREG(st.st_mode):
+                    total += st.st_size + _ARCHIVE_ENTRY_OVERHEAD
+    return total
 
 
 PREVIEW_MAX_BYTES = 1024 * 1024  # 1 MiB - default preview cap
@@ -1595,7 +1748,35 @@ def properties_for_project(project_id: str, path: str) -> dict:
         props["sha256"] = h.hexdigest()
     if full.is_symlink():
         props["target"] = os.readlink(full)
+    if kind == "dir":
+        record = _provenance.read(full, project_id=project_id)
+        if record is not None:
+            props["import"] = import_facts(record)
     return props
+
+
+def import_facts(record: dict) -> dict:
+    """What the Properties popover shows about an import, every field sanitized."""
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+
+    def text(value, limit=200):
+        value = "" if value is None else str(value)
+        return "".join(ch if ch.isprintable() else "?" for ch in value)[:limit]
+
+    try:
+        source_path = urllib.parse.urlsplit(str(source.get("url") or "")).path
+    except ValueError:
+        source_path = ""
+    commit = text(source.get("commit"), 64)
+    return {
+        "kind": text(source.get("kind"), 40),
+        "host": text(source.get("host"), 255),
+        "sourcePath": text(source_path, 500),
+        "ref": text(source.get("ref"), 255),
+        "commit7": commit[:7],
+        "fetchedAt": text(record.get("fetchedAt"), 40),
+        "resyncable": bool(record.get("resyncable")),
+    }
 
 
 DISPATCH = {
@@ -1630,3 +1811,27 @@ DISPATCH = {
 }
 
 FS_TOOL_NAMES = frozenset(DISPATCH.keys())
+
+# For each mutating fs_* tool, the arguments that name a path it writes,
+# deletes or moves. The executor's single fs chokepoint refuses those paths
+# while a running import is replacing them (workspace_import.busy). Every
+# DISPATCH key is in exactly one of these two tables; a test enforces it, so a
+# new tool cannot skip the check silently.
+FS_TOOL_WRITE_ARGS: dict[str, tuple[str, ...]] = {
+    "fs_write": ("path",),
+    "fs_edit": ("path",),
+    "fs_multi_edit": ("path",),
+    "fs_undo_edit": ("path",),
+    "fs_chmod": ("path",),
+    "fs_delete": ("path",),
+    "fs_move": ("src", "dst"),
+    "fs_copy": ("dst",),
+    "fs_mkdir": ("path",),
+    "fs_symlink_create": ("linkname",),
+    "fs_extract": ("dest",),
+    "fs_archive": ("dest",),
+}
+FS_TOOL_READ_ONLY = frozenset({
+    "fs_read", "fs_read_many", "fs_stat", "fs_grep", "fs_glob", "fs_find", "fs_list",
+    "fs_tree", "fs_symbols", "fs_symlink_read", "fs_hash", "fs_diff",
+})

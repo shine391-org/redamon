@@ -75,10 +75,11 @@ describe('phase B: shared contract', () => {
     ['paramMatrix',   paramMatrixRoute.GET],
     ['sharedInfra',   sharedInfraRoute.GET],
     ['dnsEmail',      dnsEmailRoute.GET],
-  ])('%s returns 500 on Neo4j failure', async (_, handler) => {
-    shouldThrow = new Error('connection refused')
+  ])('%s returns 500 on Neo4j failure, with the Neo4j code and no raw text', async (_, handler) => {
+    shouldThrow = Object.assign(new Error('connection refused'), { code: 'Neo.ClientError.Statement.SyntaxError' })
     const res = await handler(makeRequest('p1'))
     expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Query failed', code: 'Neo.ClientError.Statement.SyntaxError' })
   })
 
   test.each([

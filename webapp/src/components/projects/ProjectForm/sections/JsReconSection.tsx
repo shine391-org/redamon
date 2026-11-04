@@ -1,13 +1,15 @@
 'use client'
 
-import { useState, useRef, useEffect, useCallback } from 'react'
-import { ChevronDown, Search, Upload, Trash2, Loader2, FileText, HelpCircle, Play } from 'lucide-react'
+import { useState, useRef, useEffect, useCallback, useId } from 'react'
+import { AlertTriangle, ChevronDown, Search, Upload, Trash2, Loader2, FileText, HelpCircle, Play } from 'lucide-react'
 import { Toggle, Modal, WikiInfoButton } from '@/components/ui'
 import type { Project } from '@prisma/client'
 import styles from '../ProjectForm.module.css'
 import { NodeInfoTooltip } from '../NodeInfoTooltip'
 import { RegistryFields } from '../RegistryFields'
 import { announceProjectWrite } from '@/lib/projectVersion'
+import { readApiError, toApiError } from '@/lib/apiError'
+import { field as registryField } from '@/lib/reconSettings/registry'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -255,6 +257,37 @@ The example above is ready to copy-paste into a .json file.`,
 
 const DEFAULT_ENDPOINT_ACCEPT_STATUS = [200, 201, 204, 301, 302, 307, 308, 401, 403, 405]
 
+export const TRUFFLEHOG_IMAGE_MISSING = 'TruffleHog image not installed: run ./redamon.sh update'
+
+/** The registry's closed `jsReconTrufflehogResults` values, in its order. */
+export const TRUFFLEHOG_RESULT_OPTIONS: { value: string; label: string; hint: string }[] = [
+  { value: 'verified', label: 'Verified', hint: 'the provider accepted the key' },
+  { value: 'unknown', label: 'Unknown', hint: 'the check errored' },
+  { value: 'unverified', label: 'Unverified', hint: 'not shown live, or not checkable' },
+]
+const DEFAULT_TRUFFLEHOG_RESULTS = TRUFFLEHOG_RESULT_OPTIONS.map(o => o.value)
+
+type TrufflehogAvailability =
+  | { state: 'checking' }
+  | { state: 'available' }
+  | { state: 'image_missing' }
+  // The orchestrator did not say: nothing is known about the image.
+  | { state: 'unknown'; detail: string }
+
+async function fetchTrufflehogAvailability(): Promise<TrufflehogAvailability> {
+  const fallback = 'availability check failed'
+  try {
+    const res = await fetch('/api/js-recon/trufflehog/available')
+    if (!res.ok) return { state: 'unknown', detail: (await readApiError(res, fallback)).message }
+    const body = await res.json()
+    if (body?.available === true) return { state: 'available' }
+    if (body?.reason === 'image_missing') return { state: 'image_missing' }
+    return { state: 'unknown', detail: typeof body?.reason === 'string' ? body.reason : fallback }
+  } catch (err) {
+    return { state: 'unknown', detail: toApiError(err, fallback).message }
+  }
+}
+
 interface JsReconSectionProps {
   data: FormData
   updateField: <K extends keyof FormData>(field: K, value: FormData[K]) => void
@@ -270,13 +303,48 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
   const [customFiles, setCustomFiles] = useState<CustomFileState>({})
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  // The manual JS upload's own error: uploadError renders inside the custom
+  // files panel, which is usually collapsed.
+  const [jsFileError, setJsFileError] = useState<string | null>(null)
   const [guideModal, setGuideModal] = useState<string | null>(null)
   const [validationError, setValidationError] = useState<string | null>(null)
   const jsFileRef = useRef<HTMLInputElement>(null)
   const customFileRefs = useRef<Record<string, HTMLInputElement | null>>({})
+  const [trufflehog, setTrufflehog] = useState<TrufflehogAvailability>({ state: 'checking' })
+  const trufflehogResultsLabelId = useId()
+
+  const jsReconEnabled = (data as any).jsReconEnabled ?? false
+  useEffect(() => {
+    if (!isOpen || !jsReconEnabled) return
+    let cancelled = false
+    fetchTrufflehogAvailability().then(answer => { if (!cancelled) setTrufflehog(answer) })
+    return () => { cancelled = true }
+  }, [isOpen, jsReconEnabled])
+
+  // The registry says what stealth does to the field, so the form follows it
+  // rather than repeating it.
+  const stealthForcesValidationOff = !!data.stealthMode
+    && registryField('jsReconValidateKeys')?.stealth?.set === false
+  const validateKeysStored = (data as any).jsReconValidateKeys ?? true
+  const validateKeysEffective = validateKeysStored && !stealthForcesValidationOff
+
+  const trufflehogEnabled = (data as any).jsReconTrufflehogEnabled ?? true
+  const trufflehogMissing = trufflehog.state === 'image_missing'
+  const storedResults = (data as any).jsReconTrufflehogResults
+  const trufflehogResults: string[] = Array.isArray(storedResults) ? storedResults : DEFAULT_TRUFFLEHOG_RESULTS
+  const toggleTrufflehogResult = (value: string) => {
+    const next = trufflehogResults.includes(value)
+      ? trufflehogResults.filter(v => v !== value)
+      : [...trufflehogResults, value]
+    // Canonical order, so ticking and unticking never reorders the stored list.
+    const ordered = DEFAULT_TRUFFLEHOG_RESULTS.filter(v => next.includes(v))
+    updateField('jsReconTrufflehogResults' as any, ordered as any)
+  }
 
   const isEditMode = mode === 'edit' && projectId
-  const canUpload = !!projectId  // uploads work in both create and edit mode when projectId exists
+  // The upload routes need a saved project they can check ownership of, so a
+  // create-mode form, whose id is only pre-generated, cannot upload yet.
+  const canUpload = !!projectId && mode === 'edit'
 
   const fetchUploadedFiles = useCallback(async () => {
     if (!canUpload) return
@@ -310,20 +378,19 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
   const handleJsFileUpload = async (file: File) => {
     if (!canUpload) return
     setIsUploading(true)
-    setUploadError(null)
+    setJsFileError(null)
     try {
       const formData = new FormData()
       formData.append('file', file)
       const res = await fetch(`/api/js-recon/${projectId}/upload`, { method: 'POST', body: formData })
       if (!res.ok) {
-        const data = await res.json()
-        setUploadError(data.error || 'Upload failed')
+        setJsFileError(`${file.name}: ${(await readApiError(res, 'Upload failed')).message}`)
         return
       }
       announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
       await fetchUploadedFiles()
-    } catch {
-      setUploadError('Upload failed')
+    } catch (err) {
+      setJsFileError(`${file.name}: ${toApiError(err, 'Upload failed').message}`)
     } finally {
       setIsUploading(false)
       if (jsFileRef.current) jsFileRef.current.value = ''
@@ -332,11 +399,15 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
 
   const handleJsFileDelete = async (filename: string) => {
     if (!canUpload) return
+    setJsFileError(null)
     try {
       const res = await fetch(`/api/js-recon/${projectId}/upload?name=${encodeURIComponent(filename)}`, { method: 'DELETE' })
       if (res.ok) announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
+      else setJsFileError((await readApiError(res, `Could not delete ${filename}`)).message)
       await fetchUploadedFiles()
-    } catch { /* ignore */ }
+    } catch (err) {
+      setJsFileError(toApiError(err, `Could not delete ${filename}`).message)
+    }
   }
 
   const handleCustomFileUpload = async (fileType: string, file: File) => {
@@ -370,14 +441,13 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
       formData.append('type', fileType)
       const res = await fetch(`/api/js-recon/${projectId}/custom-files`, { method: 'POST', body: formData })
       if (!res.ok) {
-        const data = await res.json()
-        setUploadError(data.error || 'Upload failed')
+        setUploadError((await readApiError(res, 'Upload failed')).message)
         return
       }
       announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
       await fetchCustomFiles()
-    } catch {
-      setUploadError('Upload failed')
+    } catch (err) {
+      setUploadError(toApiError(err, 'Upload failed').message)
     } finally {
       setIsUploading(false)
       const ref = customFileRefs.current[fileType]
@@ -387,11 +457,15 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
 
   const handleCustomFileDelete = async (fileType: string) => {
     if (!canUpload) return
+    setUploadError(null)
     try {
       const res = await fetch(`/api/js-recon/${projectId}/custom-files?type=${fileType}`, { method: 'DELETE' })
       if (res.ok) announceProjectWrite(projectId, (await res.json()).projectUpdatedAt)
+      else setUploadError((await readApiError(res, 'Could not delete the file')).message)
       await fetchCustomFiles()
-    } catch { /* ignore */ }
+    } catch (err) {
+      setUploadError(toApiError(err, 'Could not delete the file').message)
+    }
   }
 
   return (
@@ -431,8 +505,9 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
       {isOpen && (
         <div className={styles.sectionContent}>
           <p className={styles.sectionDescription}>
-            Deep JavaScript reconnaissance beyond jsluice. Scans JS files for secrets with 90+ regex patterns,
-            validates discovered API keys against live services, detects dependency confusion vulnerabilities,
+            Deep JavaScript reconnaissance beyond jsluice. Scans JS files for secrets with 90+ regex patterns
+            (and optionally TruffleHog&apos;s detectors), validates discovered API keys against their providers,
+            detects dependency confusion vulnerabilities,
             discovers exposed source maps, extracts hidden API endpoints (REST, GraphQL, WebSocket),
             fingerprints frameworks with versions, and identifies DOM-based XSS sinks.
           </p>
@@ -537,7 +612,7 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
                 <div className={styles.toggleRow}>
                   <div>
                     <span className={styles.toggleLabel}>Secret Detection (Regex)</span>
-                    <p className={styles.toggleDescription}>90+ patterns for AWS keys, Stripe, Firebase, GitHub tokens, database URIs, JWTs, and more</p>
+                    <p className={styles.toggleDescription}>90+ patterns for AWS keys, Stripe, Firebase, GitHub tokens, database URIs, JWTs, and more. TruffleHog can run beside them: see Key Validation below.</p>
                   </div>
                   <Toggle
                     checked={(data as any).jsReconRegexPatterns ?? true}
@@ -685,7 +760,10 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
                 <div className={styles.toggleRow}>
                   <div>
                     <span className={styles.toggleLabel}>Validate Discovered Keys</span>
-                    <p className={styles.toggleDescription}>Make live API calls to verify if discovered keys are active (AWS STS, GitHub /user, Stripe /v1/account, etc.). Generates outbound traffic to third-party services.</p>
+                    <p className={styles.toggleDescription}>Make live API calls to verify if discovered keys are active (AWS STS, GitHub /user, Stripe /v1/account, etc.). Generates outbound traffic to third-party services. With TruffleHog on, this also decides whether TruffleHog checks the keys it finds.</p>
+                    {stealthForcesValidationOff && (
+                      <p className={styles.fieldHint}>Stealth mode turns key validation off for this project&apos;s scans.</p>
+                    )}
                   </div>
                   <Toggle
                     checked={(data as any).jsReconValidateKeys ?? true}
@@ -708,7 +786,80 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
                     </div>
                   </div>
                 )}
+                <div className={styles.toggleRow}>
+                  <div>
+                    <span className={styles.toggleLabel}>TruffleHog</span>
+                    <p className={styles.toggleDescription}>
+                      Also run TruffleHog, in an isolated container, over local copies of the JavaScript JS Recon analyses,
+                      and merge its findings with JS Recon&apos;s: one finding per key. It scans those local copies only and
+                      never fetches anything from the target. With key validation on, TruffleHog checks the keys it finds
+                      with their providers, never with a host named in the JavaScript; with key validation off its
+                      container has no network.
+                    </p>
+                    {trufflehogMissing && trufflehogEnabled && (
+                      <div className={`${styles.callout} ${styles.calloutWarning}`} role="alert">
+                        <AlertTriangle size={16} />
+                        <span>
+                          <strong>{TRUFFLEHOG_IMAGE_MISSING}.</strong> TruffleHog stays on for this project, but scans
+                          skip it until the image is installed; the regex engine still runs.
+                        </span>
+                      </div>
+                    )}
+                    {trufflehog.state === 'unknown' && (
+                      <p className={styles.fieldHint}>
+                        Could not check whether the TruffleHog image is installed ({trufflehog.detail}). A scan without it skips TruffleHog and says so.
+                      </p>
+                    )}
+                  </div>
+                  {/* The tooltip sits on a wrapper: a disabled button gets no hover events. */}
+                  <span title={trufflehogMissing ? TRUFFLEHOG_IMAGE_MISSING : undefined}>
+                    {/* Missing image: it cannot be turned on, but one already on can still be turned off. */}
+                    <Toggle
+                      checked={trufflehogEnabled}
+                      onChange={(checked) => updateField('jsReconTrufflehogEnabled' as any, checked)}
+                      disabled={trufflehogMissing && !trufflehogEnabled}
+                      aria-label="Run TruffleHog"
+                    />
+                  </span>
+                </div>
+                {trufflehogEnabled && (
+                  <div className={styles.fieldGroup}>
+                    <span className={styles.fieldLabel} id={trufflehogResultsLabelId}>Keep TruffleHog-only keys that are</span>
+                    <div className={styles.checkboxGroup} role="group" aria-labelledby={trufflehogResultsLabelId}>
+                      {TRUFFLEHOG_RESULT_OPTIONS.map(option => (
+                        <label key={option.value} className="checkboxLabel">
+                          <input
+                            type="checkbox"
+                            className="checkbox"
+                            checked={trufflehogResults.includes(option.value)}
+                            onChange={() => toggleTrufflehogResult(option.value)}
+                            disabled={!validateKeysEffective}
+                          />
+                          {option.label} <span className={styles.fieldHint}>({option.hint})</span>
+                        </label>
+                      ))}
+                    </div>
+                    {!validateKeysEffective ? (
+                      <span className={styles.fieldHint}>
+                        {stealthForcesValidationOff ? 'Ignored in stealth mode, which turns key validation off' : 'Ignored while Validate Discovered Keys is off'}:
+                        {' '}TruffleHog checks no key then, so it keeps every key it finds.
+                      </span>
+                    ) : (
+                      <span className={styles.fieldHint}>
+                        A key JS Recon also found is always kept.
+                        {trufflehogResults.length === 0 && ' Nothing ticked keeps all three.'}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
+
+              {!canUpload && (
+                <p className={styles.fieldHint}>
+                  Save the project first; then you can upload JS files for analysis (max 10MB each) and custom
+                  extension files.
+                </p>
+              )}
 
               {/* Custom Extension Files */}
               {canUpload && (
@@ -823,6 +974,7 @@ export function JsReconSection({ data, updateField, projectId, mode, onRun }: Js
                     {isUploading ? <Loader2 size={13} className={styles.spin} /> : <Upload size={13} />}
                     {isUploading ? ' Uploading...' : ' Upload JS Files'}
                   </button>
+                  {jsFileError && <p className={styles.inlineError}>{jsFileError}</p>}
 
                   {uploadedFiles.length > 0 && (
                     <div className={styles.itemList}>

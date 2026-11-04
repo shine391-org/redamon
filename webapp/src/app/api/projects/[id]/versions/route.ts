@@ -19,12 +19,13 @@ import { isActivationInProgress } from '@/lib/activationLock'
 import { describeScanWriters, describeSecondaryScanWriters } from '@/lib/graphWriters'
 import { applyRetentionSafe } from '@/lib/scanRetention'
 import { sanitizeVersionLabel } from '@/lib/scanVersionLabel'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
 }
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to list versions', async (_request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -82,15 +83,11 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       activating: await isActivationInProgress(id),
     }, { headers: { 'Cache-Control': 'private, no-cache' } })
   } catch (error) {
-    console.error('[scanTimeline] version list failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to list versions' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list versions', { log: '[scanTimeline] version list failed' })
   }
-}
+})
 
-export async function POST(request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Failed to save the current graph as a version', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -165,10 +162,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       currentVersion: created,
     })
   } catch (error) {
-    console.error('[scanTimeline] save-current failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to save the current graph as a version' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to save the current graph as a version', { log: '[scanTimeline] save-current failed' })
   }
-}
+})

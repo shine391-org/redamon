@@ -33,6 +33,14 @@ const nextConfig: NextConfig = {
 
   serverExternalPackages: ['neo4j-driver', 'pdfjs-dist'],
 
+  experimental: {
+    // The middleware matches /api, so Next buffers each request body there and
+    // silently cuts it at this size (default 10 MB): the route then fails to parse
+    // a truncated upload. Equal to nginx's client_max_body_size 60m
+    // (tooling/deploy/single-host/nginx), above the largest route cap (50 MB wordlists).
+    proxyClientMaxBodySize: '60mb',
+  },
+
   // Keys are picomatch globs matched with `contains`, so '/api/projects' also
   // covers '/api/projects/[id]/roe' (a literal '[id]' would be a character class).
   outputFileTracingIncludes: {

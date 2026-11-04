@@ -7,6 +7,7 @@ import { useTheme } from '@/hooks/useTheme'
 import { Tooltip } from '@/components/ui/Tooltip/Tooltip'
 import { ConversationHistory } from './ConversationHistory'
 import { formatTokenCount } from '@/lib/formatTokens'
+import { describeWsClose } from '@/hooks/agentWsClose'
 import type { Conversation } from '@/hooks/useConversations'
 import type { ChatItem } from './types'
 import styles from './AIAssistantDrawer.module.css'
@@ -31,6 +32,32 @@ interface DrawerHeaderProps {
   handleSelectConversation: (conv: Conversation) => void
   handleDeleteConversation: (id: string) => void
   handleHistoryNewChat: () => void
+  /** Why the socket is not connected (the hook's error). */
+  connectionError?: string | null
+  /** The last close the agent sent, kept while reconnecting. */
+  lastClose?: { code: number; reason: string } | null
+  /** The URL dialed, without its query. */
+  socketUrl?: string | null
+  /** The agent service's own health answer, asked once the socket has failed. */
+  agentHealthError?: string | null
+  /** The session list could not be loaded. */
+  conversationsError?: string | null
+}
+
+/** The lines under the status that say why the drawer is not connected. */
+export function connectionDetailLines({
+  status, connectionError, lastClose, socketUrl, agentHealthError,
+}: Pick<DrawerHeaderProps, 'status' | 'connectionError' | 'lastClose' | 'socketUrl' | 'agentHealthError'>): string[] {
+  const where = socketUrl ? ` · ${socketUrl}` : ''
+  if (status === ConnectionStatus.FAILED) {
+    const lines = [connectionError || (lastClose ? `Last ${describeWsClose(lastClose.code, lastClose.reason)}${where}` : `Could not connect${where}`)]
+    if (agentHealthError) lines.push(`Agent service: ${agentHealthError}`)
+    return lines
+  }
+  if (status === ConnectionStatus.RECONNECTING && lastClose) {
+    return [`Last ${describeWsClose(lastClose.code, lastClose.reason)}${where}`]
+  }
+  return []
 }
 
 export function DrawerHeader({
@@ -53,8 +80,14 @@ export function DrawerHeader({
   handleSelectConversation,
   handleDeleteConversation,
   handleHistoryNewChat,
+  connectionError,
+  lastClose,
+  socketUrl,
+  agentHealthError,
+  conversationsError,
 }: DrawerHeaderProps) {
   const { isLight } = useTheme()
+  const detailLines = connectionDetailLines({ status, connectionError, lastClose, socketUrl, agentHealthError })
 
   // The header is a dark strip in dark mode and a light strip in light mode, so
   // the status color needs to shift: bright emerald/red read on the dark header,
@@ -140,6 +173,18 @@ export function DrawerHeader({
                 </Tooltip>
               )}
             </div>
+            {detailLines.length > 0 && (
+              <div role="status" aria-label="Agent connection detail">
+                {detailLines.map((line, i) => (
+                  <div
+                    key={i}
+                    className={`${styles.connectionDetail} ${status === ConnectionStatus.RECONNECTING ? styles.connectionDetailMuted : ''}`}
+                  >
+                    {line}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
         <div className={styles.headerActions}>
@@ -207,6 +252,7 @@ export function DrawerHeader({
           onSelect={handleSelectConversation}
           onDelete={handleDeleteConversation}
           onNewChat={handleHistoryNewChat}
+          error={conversationsError}
         />
       )}
     </>

@@ -29,6 +29,7 @@ import type { TableViewMode } from '../components/ViewTabs'
  * enrichment mixins, so they stay.
  */
 export const ALL_GRAPH_LABELS = [
+  'ADComputer', 'ADGroup', 'ADUser', 'Credential',
   'AttackChain', 'BaseURL', 'Capec', 'Certificate', 'ChainDecision', 'ChainFailure',
   'ChainFinding', 'ChainStep', 'CVE', 'DNSRecord', 'Domain', 'Endpoint',
   'ExploitGvm', 'ExternalDomain', 'GithubHunt', 'GithubPath', 'GithubRepository',
@@ -67,7 +68,7 @@ export const BADGED_TABS = [
   'nodeDetails', 'all', 'jsRecon', 'aiSurface', 'aiRisk', 'killChain', 'blastRadius',
   'takeover', 'secrets', 'netInitAccess', 'graphql', 'webInitAccess', 'paramMatrix',
   'sharedInfra', 'dnsEmail', 'threatIntel', 'jsDepSignals', 'supplyChainSca',
-  'dnsDrift', 'webCachePoison',
+  'dnsDrift', 'webCachePoison', 'routeExposure',
 ] as const satisfies readonly Exclude<
   TableViewMode, 'reconDelta' | 'scanSchedule' | 'triage' | 'nodeFilters' | 'muted'
 >[]

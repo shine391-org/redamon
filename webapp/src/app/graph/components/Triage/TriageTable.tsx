@@ -42,7 +42,11 @@ import {
   resetConfirmText, reviewChip, tierOf, whyText, REVIEW_VERDICT_TONE,
   type Factors, type TriageFinding, type TriageTier, type VerdictResult, type VerdictStatus,
 } from './triageLayers'
+import { triageBodyErrorText } from '@/lib/triage/errorText'
+import { toApiError } from '@/lib/apiError'
 import styles from './TriageTable.module.css'
+
+const BOARD_LOAD_FAILED = 'The Priority Board could not be loaded'
 
 export type { TriageFinding, TriageStatus, TriageTier } from './triageLayers'
 export { TIER_LABELS } from './triageLayers'
@@ -252,7 +256,9 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
       const query = new URLSearchParams({ projectId })
       if (boardFilter) query.set(boardFilter.param, boardFilter.value)
       const f = await fetch(`/api/triage/findings?${query.toString()}`)
-      if (!f.ok) throw new Error((await f.json().catch(() => ({}))).error || `Findings: ${f.status}`)
+      if (!f.ok) {
+        throw new Error(triageBodyErrorText(await f.json().catch(() => ({})), f.status, BOARD_LOAD_FAILED))
+      }
       const findingsBody = await f.json()
       if (seq !== loadSeqRef.current) return
       setFindings(findingsBody.findings ?? [])
@@ -262,7 +268,9 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
       setRowErrors({})
     } catch (e) {
       if (seq !== loadSeqRef.current) return
-      setError(e instanceof Error ? e.message : 'Failed to load Priority Board data')
+      // A TypeError is fetch getting no answer at all; its "Failed to fetch" says nothing.
+      setError(e instanceof Error && !(e instanceof TypeError)
+        ? e.message : toApiError(e, BOARD_LOAD_FAILED).message)
     } finally {
       if (seq === loadSeqRef.current) setLoading(false)
     }
@@ -470,7 +478,7 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
             message: res.status === 404
               ? 'This finding is no longer on the board: a rescan or a version switch ' +
                 'replaced it. Reload to see the current list.'
-              : body.error || 'The verdict could not be saved.',
+              : triageBodyErrorText(body, res.status, 'The verdict could not be saved.'),
           }
         }
         const row = body.row as TriageFinding | null | undefined
@@ -483,8 +491,8 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
         toast.success(VERDICT_TOASTS[status] +
           (body.rescored === false ? ' The score follows at the next run.' : ''))
         return { ok: true }
-      } catch {
-        return { ok: false, message: 'The verdict could not be saved: the server did not answer.' }
+      } catch (e) {
+        return { ok: false, message: toApiError(e, 'The verdict could not be saved: the server did not answer.').message }
       }
     },
     [projectId, dangerConfirm, toast, load],

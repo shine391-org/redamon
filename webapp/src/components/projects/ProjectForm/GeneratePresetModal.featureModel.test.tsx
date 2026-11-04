@@ -65,3 +65,52 @@ describe('Generate preset', () => {
     await waitFor(() => expect(screen.getAllByRole('dialog')).toHaveLength(1))
   })
 })
+
+describe('Generate preset: failures say why', () => {
+  test("a proxy's HTML 504 is shown with its status, not as a network error", async () => {
+    stubGateFetch({ preset_generator: 'claude-haiku-4-5' }, () => new Response('<html>504 Gateway Time-out</html>', { status: 504 }))
+    renderModal()
+    generate('fast passive OSINT')
+    expect(await screen.findByText('Failed to generate preset (non_json_response · HTTP 504)')).toBeInTheDocument()
+    expect(screen.queryByText(/Network error/)).toBeNull()
+  })
+
+  test("a provider refusal shows its error type and the provider's status", async () => {
+    stubGateFetch({ preset_generator: 'claude-haiku-4-5' }, () => jsonResponse(502, {
+      error: 'The model provider answered 429. Try again in a moment.', code: 'insufficient_quota', upstreamStatus: 429,
+    }))
+    renderModal()
+    generate('fast passive OSINT')
+    expect(await screen.findByText(
+      'The model provider answered 429. Try again in a moment. (insufficient_quota · HTTP 502 · upstream HTTP 429)',
+    )).toBeInTheDocument()
+  })
+
+  test('an unreachable custom base URL names the errno', async () => {
+    stubGateFetch({ preset_generator: 'custom/p1' }, () => jsonResponse(502, {
+      error: 'Failed to generate preset. The details are in the webapp log.', code: 'DEPTH_ZERO_SELF_SIGNED_CERT',
+    }))
+    renderModal()
+    generate('fast passive OSINT')
+    expect(await screen.findByText(
+      'Failed to generate preset. The details are in the webapp log. (DEPTH_ZERO_SELF_SIGNED_CERT · HTTP 502)',
+    )).toBeInTheDocument()
+  })
+
+  test('the field errors of an invalid preset are still listed', async () => {
+    stubGateFetch({ preset_generator: 'claude-haiku-4-5' }, () => jsonResponse(422, {
+      error: 'Generated preset has invalid fields', details: ['naabuTopPorts: Expected number'],
+    }))
+    renderModal()
+    generate('fast passive OSINT')
+    expect(await screen.findByText('Generated preset has invalid fields (HTTP 422)')).toBeInTheDocument()
+    expect(screen.getByText('naabuTopPorts: Expected number')).toBeInTheDocument()
+  })
+
+  test('no answer at all keeps the network wording and adds network_error', async () => {
+    stubGateFetch({ preset_generator: 'claude-haiku-4-5' }, () => { throw new TypeError('Failed to fetch') })
+    renderModal()
+    generate('fast passive OSINT')
+    expect(await screen.findByText('Network error. Check your connection and try again. (network_error)')).toBeInTheDocument()
+  })
+})

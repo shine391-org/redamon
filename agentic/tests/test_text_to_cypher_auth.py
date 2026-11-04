@@ -91,6 +91,7 @@ class TextToCypherErrorNormalisationTests(unittest.TestCase):
             api.text_to_cypher,
             api._build_cypher_manager,
             api._generate_validated_cypher,
+            api._cypher_model_error,
         ):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
             for node in ast.walk(tree):
@@ -123,9 +124,77 @@ class TextToCypherErrorNormalisationTests(unittest.TestCase):
         import inspect
 
         src = inspect.getsource(api.text_to_cypher)
-        self.assertIn('content={"error": e.message}', src)
+        # The extra fields are built by _cypher_model_error from a class name and
+        # an integer status only; ModelFailureTests pins that no text leaks.
+        self.assertIn('content={"error": e.message, **e.fields}', src)
         # ...and nothing else builds an error body in the handler.
         self.assertEqual(src.count('"error"'), 1)
+
+
+LEAK = "sk-live-LEAKED-FRAGMENT"
+
+
+class _Status(Exception):
+    def __init__(self, status):
+        super().__init__(f"provider said no to key {LEAK}")
+        self.status_code = status
+
+
+class _Manager:
+    """Counts generation calls; `_generate_cypher` raises what it is given."""
+
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
+
+    async def _generate_cypher(self, *_a, **_kw):
+        self.calls += 1
+        raise self.error
+
+
+class ModelFailureTests(unittest.IsolatedAsyncioTestCase):
+    """G-14: a failed model call is the model's problem, not a bad question."""
+
+    async def _generate(self, error):
+        manager = _Manager(error)
+        with self.assertRaises(api._CypherSetupError) as raised:
+            await api._generate_validated_cypher(manager, "q", "u1", "p1", True)
+        return manager, raised.exception
+
+    async def test_a_refused_key_is_model_unavailable_and_not_retried(self):
+        manager, err = await self._generate(_Status(401))
+        self.assertEqual(manager.calls, 1)
+        self.assertEqual(err.status, 503)
+        self.assertEqual(err.fields, {"code": "model_unavailable",
+                                      "error_class": "_Status", "provider_status": 401})
+        self.assertNotIn("rephras", err.message.lower())
+
+    async def test_a_rate_limit_is_a_failed_call_with_its_status(self):
+        manager, err = await self._generate(_Status(429))
+        self.assertEqual(manager.calls, 1)
+        self.assertEqual(err.status, 502)
+        self.assertEqual(err.fields["code"], "model_call_failed")
+        self.assertEqual(err.fields["provider_status"], 429)
+
+    async def test_no_provider_text_reaches_the_answer(self):
+        _, err = await self._generate(_Status(401))
+        self.assertNotIn(LEAK, err.message)
+        self.assertNotIn(LEAK, repr(err.fields))
+
+    async def test_the_endpoint_answers_the_fields(self):
+        async def build(*_a):
+            return _Manager(_Status(429))
+
+        from unittest import mock
+        with mock.patch.object(api, "_build_cypher_manager", build):
+            resp = await api.text_to_cypher(api.TextToCypherRequest(
+                question="q", user_id="u1", project_id="p1"))
+        import json
+        body = json.loads(resp.body)
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(body["code"], "model_call_failed")
+        self.assertEqual(body["provider_status"], 429)
+        self.assertNotIn(LEAK, resp.body.decode())
 
 
 if __name__ == "__main__":

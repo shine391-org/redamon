@@ -1,0 +1,61 @@
+{
+  "version": "v1.1.0",
+  "entity": {
+    "type": "individual",
+    "role": "owner",
+    "name": "Samuele Giampieri",
+    "email": "samuele@redamon.org",
+    "description": "Samuele Giampieri created RedAmon in December 2025 and is its lead maintainer. He is an independent software engineer based in Italy and maintains the project with co-maintainer Ritesh Gohil and a community of outside contributors. Grants for RedAmon are shared equally between its two maintainers, Samuele Giampieri and Ritesh Gohil, and paid to each directly where the funder allows it; otherwise they are paid to Samuele Giampieri, who pays Ritesh Gohil's share.",
+    "webpageUrl": {
+      "url": "https://github.com/samugit83"
+    }
+  },
+  "projects": [
+    {
+      "guid": "redamon",
+      "name": "RedAmon",
+      "description": "RedAmon is an open-source, self-hosted framework for authorized security testing that helps teams find and fix vulnerabilities in their own systems. It maps an organisation's attack surface into a knowledge graph, triages the findings with AI, confirms them by testing from an isolated sandbox behind human approval gates, and opens pull requests that fix the vulnerable code. Built-in Rules-of-Engagement checks keep testing inside the authorized scope.\n\nSince the project started in late December 2025 it has reached about 3,200 GitHub stars, 680 forks and more than 2,000 commits, with about 20 outside contributors so far. It scored 101 of 104 on the XBOW validation benchmark, fully black-box. NVISO, a European security firm, is its founding sponsor.\n\nRedAmon is MIT-licensed, and the complete project stays free to use and update.",
+      "webpageUrl": {
+        "url": "https://www.redamon.org",
+        "wellKnown": "https://www.redamon.org/.well-known/funding-manifest-urls"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/samugit83/redamon"
+      },
+      "licenses": ["spdx:MIT"],
+      "tags": [
+        "security",
+        "application-security",
+        "devsecops",
+        "vulnerability-management",
+        "penetration-testing",
+        "attack-surface",
+        "ai",
+        "ai-agents",
+        "llm",
+        "self-hosted"
+      ]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "bank",
+        "type": "bank",
+        "description": "Bank transfer (SEPA or SWIFT). Details on request."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "maintainer-time-2027",
+        "status": "active",
+        "name": "Maintainer time, 2027",
+        "description": "Pays for the two maintainers' time in 2027, shared equally: security hardening of RedAmon itself (signed releases and container images, SBOM, pinned dependencies), review of community contributions, releases and documentation.",
+        "amount": 25000,
+        "currency": "USD",
+        "frequency": "yearly",
+        "channels": ["bank"]
+      }
+    ]
+  }
+}

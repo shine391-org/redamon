@@ -169,3 +169,62 @@ describe('repository and organization targets', () => {
     expect(written('supplyChainOrgName')).toBe('https://ghe.example.com/orgs/acme-corp')
   })
 })
+
+describe('failures keep their cause', () => {
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status })
+  const FILE = { name: 'package-lock.json', size: 10, uploaded_at: '2026-08-01T00:00:00Z' }
+
+  function route(replies: { list?: () => Response; upload?: () => Response; remove?: () => Response }) {
+    fetchMock = vi.fn().mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (init?.method === 'POST') return replies.upload ? replies.upload() : json(200, { success: true, filename: 'sbom.json' })
+      if (init?.method === 'DELETE') return replies.remove ? replies.remove() : json(200, { success: true })
+      if (String(url).includes('/upload')) return replies.list ? replies.list() : json(200, { files: [FILE] })
+      return json(200, {})
+    })
+    vi.stubGlobal('fetch', fetchMock)
+  }
+
+  test('a failed listing is an error with the fs code, not "No file uploaded yet"', async () => {
+    route({ list: () => json(500, { error: 'Failed to list files', code: 'EACCES' }) })
+    renderSection()
+    expect((await screen.findByRole('alert')).textContent).toBe('Failed to list files (EACCES · HTTP 500)')
+    expect(screen.queryByText('No file uploaded yet.')).toBeNull()
+  })
+
+  test('a failed upload shows the fs code and status', async () => {
+    route({ list: () => json(200, { files: [] }), upload: () => json(500, { error: 'Failed to upload file', code: 'ENOSPC' }) })
+    const { written } = renderSection()
+    await waitFor(() => expect(screen.getByText('No file uploaded yet.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Upload SBOM or lockfile'), { target: { files: [new File(['{}'], 'sbom.json')] } })
+    await waitFor(() => expect(screen.getByText('Failed to upload file (ENOSPC · HTTP 500)')).toBeTruthy())
+    expect(written('supplyChainSbomFile')).toBeUndefined()
+  })
+
+  test('a proxy error page on upload is named, not the bare fallback', async () => {
+    route({
+      list: () => json(200, { files: [] }),
+      upload: () => new Response('<html>502 Bad Gateway</html>', { status: 502 }),
+    })
+    renderSection()
+    await waitFor(() => expect(screen.getByText('No file uploaded yet.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Upload SBOM or lockfile'), { target: { files: [new File(['{}'], 'sbom.json')] } })
+    await waitFor(() => expect(screen.getByText('Upload failed (non_json_response · HTTP 502)')).toBeTruthy())
+  })
+
+  test('a failed delete keeps the file as the scan input and says why', async () => {
+    route({ remove: () => json(500, { error: 'Failed to delete file', code: 'EROFS' }) })
+    const { written } = renderSection()
+    fireEvent.click(await screen.findByLabelText('Remove package-lock.json'))
+    await waitFor(() => expect(screen.getByText('Failed to delete file (EROFS · HTTP 500)')).toBeTruthy())
+    expect(written('supplyChainSbomFile')).toBeUndefined()
+    expect(screen.getByText('package-lock.json')).toBeTruthy()
+  })
+
+  test('a delete that got no answer keeps the file too', async () => {
+    route({ remove: () => { throw new TypeError('Failed to fetch') } })
+    const { written } = renderSection()
+    fireEvent.click(await screen.findByLabelText('Remove package-lock.json'))
+    await waitFor(() => expect(screen.getByText('Could not remove the file (network_error)')).toBeTruthy())
+    expect(written('supplyChainSbomFile')).toBeUndefined()
+  })
+})

@@ -175,3 +175,34 @@ test('a bare name keeps defaulting to github.com and stamps host on the batch', 
   expect(h.batchCreate.mock.calls[0][0].data).toMatchObject({ host: 'github.com' })
   expect(h.jobCreate.mock.calls[0][0].data.payload).toMatchObject({ host: 'github.com' })
 })
+
+test('a GitHub refusal keeps its own text and gains a code', async () => {
+  const { GithubEnumError } = await import('@/lib/github/orgRepos')
+  h.listOwnerRepos.mockRejectedValue(new GithubEnumError('GitHub returned 404: Not Found', 404))
+  const res = await POST(post(), sp('p1'))
+  expect(res.status).toBe(404)
+  expect(await res.json()).toEqual({ error: 'GitHub returned 404: Not Found', code: 'github_enum_failed' })
+})
+
+test('an unexpected enumeration throw is a 502 with its class, not its text', async () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  h.listOwnerRepos.mockRejectedValue(new TypeError('Cannot read properties of undefined (reading acme-internal)'))
+  const res = await POST(post(), sp('p1'))
+  expect(res.status).toBe(502)
+  const body = await res.json()
+  expect(body).toEqual({ error: 'GitHub enumeration failed', code: 'TypeError' })
+  expect(JSON.stringify(body)).not.toContain('acme-internal')
+})
+
+test('a failed transaction answers the Prisma code, never the message', async () => {
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  h.batchCreate.mockRejectedValue(Object.assign(
+    new Error('Transaction failed writing repo acme/secret-repo'),
+    { name: 'PrismaClientKnownRequestError', code: 'P2028' },
+  ))
+  const res = await POST(post(), sp('p1'))
+  expect(res.status).toBe(500)
+  const body = await res.json()
+  expect(body).toEqual({ error: 'Failed to create the org batch', code: 'P2028' })
+  expect(JSON.stringify(body)).not.toContain('secret-repo')
+})

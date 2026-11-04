@@ -8,6 +8,7 @@ import { useProject } from '@/providers/ProjectProvider'
 import { PluginBadge } from '@/components/plugins/PluginBadge'
 import { PluginIcon } from '@/components/plugins/pluginIcons'
 import { usePluginContributions } from '@/hooks/usePluginContributions'
+import { errorMessage } from '@/lib/apiError'
 import type { ChatSessionActionContribution } from '@/lib/plugins/contributions'
 import type { ActionContext } from '@/components/plugins/host/actionClient'
 import { PHASE_CONFIG, getAttackPathConfig, formatModelDisplay } from './phaseConfig'
@@ -78,7 +79,7 @@ export function PhaseIndicatorBar({
   const PhaseIcon = PHASE_CONFIG[currentPhase].icon
   const { userId } = useProject()
   const [userMcpServers, setUserMcpServers] = useState<UserMcpServer[]>([])
-  const { data: contributions } = usePluginContributions()
+  const { data: contributions, error: contributionsError, refetch: refetchContributions } = usePluginContributions()
   // Only plugins with a gear-menu action; a nav-only plugin adds nothing here.
   const pluginGroups = (contributions ?? []).filter((c) => c.chatSessionActions.length > 0)
 
@@ -284,6 +285,20 @@ export function PhaseIndicatorBar({
             >
               Agent Skills
             </button>
+
+            {!contributions && contributionsError && (
+              <div className={styles.pluginGroup} role="status" data-testid="plugin-items-error">
+                <div className={styles.pluginGroupLabel}>
+                  <span className={styles.pluginUpdating}>{errorMessage(contributionsError, 'Plugin items could not be loaded')}</span>
+                </div>
+                <button
+                  className={`${styles.settingsDropdownItem} ${styles.pluginItem}`}
+                  onClick={() => void refetchContributions()}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
 
             {pluginGroups.map((plugin) => (
               <div key={plugin.pluginId} className={styles.pluginGroup}>

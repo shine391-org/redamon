@@ -935,7 +935,13 @@ def _merge_isolated_result(combined: dict, key: str, result) -> None:
     if isinstance(result, TopLevelKeys):
         combined[key] = result.get(key, {})
         for name, value in result.items():
-            if name != key:
+            if name == key:
+                continue
+            if name == "jev_shadow" and isinstance(value, dict):
+                # Each hook owns its own slot; a tool's answer never replaces
+                # another hook's records written earlier in the run.
+                combined.setdefault("jev_shadow", {}).update(value)
+            else:
                 combined[name] = value
     else:
         combined[key] = result
@@ -1518,6 +1524,9 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         if settings.get('ORIGIN_DISCOVERY_ENABLED', False):
             from recon.main_recon_modules.origin_discovery import run_origin_discovery_enrichment_isolated
             ip_phase_a['origin_discovery'] = run_origin_discovery_enrichment_isolated
+        if settings.get('ROUTE_EXPOSURE_ENABLED', False):
+            from recon.route_exposure import run_route_exposure_isolated
+            ip_phase_a['route_exposure'] = run_route_exposure_isolated
 
         _run_phase_a_fan_out(ip_phase_a, combined_result, settings, output_file)
 
@@ -2214,6 +2223,9 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         if _settings.get('ORIGIN_DISCOVERY_ENABLED', False):
             from recon.main_recon_modules.origin_discovery import run_origin_discovery_enrichment_isolated
             phase_a_tools['origin_discovery'] = run_origin_discovery_enrichment_isolated
+        if _settings.get('ROUTE_EXPOSURE_ENABLED', False):
+            from recon.route_exposure import run_route_exposure_isolated
+            phase_a_tools['route_exposure'] = run_route_exposure_isolated
 
         _run_phase_a_fan_out(phase_a_tools, combined_result, _settings, output_file)
 
@@ -2544,6 +2556,7 @@ _PHASE_FINDING_SOURCES = {
     "cache_scan": ("cache_poisoning", "wcvs"),
     "origin_discovery": ("origin_discovery",),
     "serialized_scan": ("serialized_scan",),
+    "route_exposure": ("route_exposure",),
     **PASSIVE_CVE_SOURCES,
 }
 

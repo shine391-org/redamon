@@ -177,3 +177,30 @@ describe('DELETE /api/mute-rule-presets/[id]', () => {
     expect(h.del).not.toHaveBeenCalled()
   })
 })
+
+describe('a database that is down', () => {
+  const down = () => Object.assign(new Error('Invalid `prisma.userMuteRulesPreset` invocation: "SECRET-RULE"'), {
+    name: 'PrismaClientKnownRequestError', code: 'P1001',
+  })
+  const CASES: [string, () => Promise<Response>, string][] = [
+    ['GET the list', () => listPresets(), 'Failed to load the presets'],
+    ['POST a preset', () => createPreset(json('http://x/api/mute-rule-presets', 'POST',
+      { name: 'Quiet', mode: 'denylist', rules: RULES })), 'Failed to save the preset'],
+    ['GET one preset', () => getPreset(new NextRequest('http://x/api/mute-rule-presets/p1'), params()), 'Failed to read the preset'],
+    ['PATCH one preset', () => patchPreset(json('http://x/api/mute-rule-presets/p1', 'PATCH', { name: 'New' }), params()),
+      'Failed to rename the preset'],
+    ['DELETE one preset', () => deletePreset(new NextRequest('http://x/api/mute-rule-presets/p1', { method: 'DELETE' }), params()),
+      'Failed to delete the preset'],
+  ]
+
+  test.each(CASES)('%s: 500 with the fixed sentence and the Prisma code, never a bodiless 500', async (_name, call, error) => {
+    for (const fn of [h.findMany, h.findUnique, h.create, h.update, h.del]) fn.mockRejectedValue(down())
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await call()
+    const text = await res.text()
+    expect(res.status).toBe(500)
+    expect(JSON.parse(text)).toEqual({ error, code: 'P1001' })
+    expect(text).not.toContain('SECRET-RULE')
+    log.mockRestore()
+  })
+})

@@ -191,6 +191,45 @@ describe('ensureFeatureModel', () => {
   })
 })
 
+describe('failures say why', () => {
+  test('a model list that fails names the code and status, and Check again retries', async () => {
+    modelsAnswer = () => ({ status: 503, body: { error: 'Failed to connect to agent API', code: 'agent_unreachable' } })
+    mountProvider()
+    act(() => { void api.ensureFeatureModel('triage') })
+    expect(await screen.findByText("Couldn't load your models.")).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Failed to connect to agent API (agent_unreachable · HTTP 503)')
+    modelsAnswer = () => ({ status: 200, body: MODELS })
+    fireEvent.click(screen.getByRole('button', { name: /Check again/ }))
+    expect(await screen.findByText('Choose a model')).toBeInTheDocument()
+  })
+
+  test('saved settings that cannot be read open the gate saying so, not as if nothing were saved', async () => {
+    saved = { triage: 'claude-haiku-4-5' }
+    const real = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (
+      url === '/api/users/user-1/settings' && !init?.method
+        ? json(500, { error: 'Failed to fetch settings', code: 'P1001' })
+        : real(url, init)
+    ))
+    mountProvider()
+    act(() => { void api.ensureFeatureModel('triage') })
+    expect(await screen.findByText(
+      "Couldn't read your saved model (P1001 · HTTP 500). Choose one to continue.",
+    )).toBeInTheDocument()
+  })
+
+  test("a caller's own message wins over the read failure", async () => {
+    const real = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => (
+      url === '/api/users/user-1/settings' && !init?.method ? json(500, {}) : real(url, init)
+    ))
+    mountProvider()
+    act(() => { void api.ensureFeatureModel('triage', { message: 'Pick one for this run' }) })
+    expect(await screen.findByText('Pick one for this run')).toBeInTheDocument()
+    expect(screen.queryByText(/Couldn't read your saved model/)).toBeNull()
+  })
+})
+
 describe('a gate replaced while it is saving', () => {
   test('its late save never answers the newer gate (review: a stale save settled the gate on screen)', async () => {
     mountProvider()

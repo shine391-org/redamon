@@ -5,6 +5,7 @@ import { notMuted, agentCandidateConfirmedOrNA } from '@/lib/graphMute'
 import { queryJudgedFindings, reportCountable } from '@/lib/triage/reportable'
 import { inSeverityBreakdown, queryDispositionSummary } from '@/lib/triage/disposition'
 import { githubSecretCounts, githubSecretCountsCypher } from '@/lib/secrets/githubSecretCounts'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -212,11 +213,7 @@ export async function GET(request: NextRequest) {
       judged,
     })
   } catch (error) {
-    console.error('Analytics vulnerabilities error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Analytics vulnerabilities error' })
   } finally {
     await session.close()
   }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -8,24 +9,30 @@ interface RouteParams {
   params: Promise<{ projectId: string; runId: string }>
 }
 
+const UNAVAILABLE = 'AI Gauntlet status unavailable'
+
 // GET /api/ai-attack-surface/{projectId}/{runId}/status
+// The orchestrator answers `idle` itself for a run it does not know, so any
+// failure here is a real one: a synthetic idle would make a live run look stopped.
 export async function GET(_request: NextRequest, { params }: RouteParams) {
   const { projectId, runId } = await params
   const __denied = await guardProject(projectId)
   if (__denied) return __denied
+  let response: Response
   try {
-    const response = await orchestratorFetch(
+    response = await orchestratorFetch(
       `${RECON_ORCHESTRATOR_URL}/ai-attack-surface/${projectId}/${runId}/status`,
       { headers: { 'Content-Type': 'application/json' }, cache: 'no-store' },
     )
-    if (!response.ok) {
-      return NextResponse.json(
-        { project_id: projectId, run_id: runId, status: 'idle' },
-        { status: 200 },
-      )
-    }
+  } catch (err) {
+    return upstreamFailureResponse('orchestrator', err, UNAVAILABLE)
+  }
+  if (!response.ok) {
+    return upstreamErrorResponse('orchestrator', response, UNAVAILABLE, { forwardText: true })
+  }
+  try {
     return NextResponse.json(await response.json())
-  } catch {
-    return NextResponse.json({ project_id: projectId, run_id: runId, status: 'idle' })
+  } catch (err) {
+    return internalError(err, UNAVAILABLE)
   }
 }

@@ -174,6 +174,31 @@ class TriageGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 500)
         self.assertEqual(self.sem.exited, 1)
 
+    async def test_a_failure_answers_a_fixed_text_and_the_class_never_the_message(self):
+        # A Neo4j message quotes the Cypher and its values (target data).
+        def boom(*a, **k):
+            raise RuntimeError("MATCH (n {name: 'secret.example.com'}) failed")
+
+        self.client.list_triage_findings = boom
+        resp = await api.graph_triage(self._req())
+        body = _body(resp)
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(body["code"], "internal_error")
+        self.assertEqual(body["error_class"], "RuntimeError")
+        self.assertNotIn("secret.example.com", resp.body.decode())
+
+    async def test_a_neo4j_failure_answers_its_status_code(self):
+        class DatabaseError(Exception):
+            code = "Neo.DatabaseError.General.UnknownError"
+
+        def boom(*a, **k):
+            raise DatabaseError("detail with values")
+
+        self.client.list_triage_findings = boom
+        body = _body(await api.graph_triage(self._req()))
+        self.assertEqual(body["error_class"], "Neo.DatabaseError.General.UnknownError")
+        self.assertNotIn("values", body["error"])
+
 
 class TriageLimitTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

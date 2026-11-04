@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { reconcileRunScanJobs } from '@/lib/scanTimeline'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -15,17 +16,20 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const __denied = await guardProject(projectId)
     if (__denied) return __denied
 
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial/all`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-    })
+    // No answer is reported as such, never as an empty list: "no partial runs"
+    // would hide a run that is still writing the graph.
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial/all`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      })
+    } catch (err) {
+      return upstreamFailureResponse('orchestrator', err, 'Partial recon list unavailable')
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.detail || 'Failed to get partial recon list' },
-        { status: response.status }
-      )
+      return upstreamErrorResponse('orchestrator', response, 'Failed to get partial recon list', { forwardText: true })
     }
 
     const data = await response.json()
@@ -33,17 +37,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json(data)
 
   } catch (error) {
-    // If orchestrator is not available, return empty list
-    if (error instanceof TypeError && error.message.includes('fetch')) {
-      return NextResponse.json({
-        project_id: (await params).projectId,
-        runs: [],
-      })
-    }
-
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to get partial recon list')
   }
 }

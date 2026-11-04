@@ -1,3 +1,4 @@
+import { toApiError } from '@/lib/apiError'
 import { PluginActionError } from './actionClient'
 import type { Params } from './hostContext'
 
@@ -37,10 +38,10 @@ export function pick(row: Params, fields: readonly string[]): Params {
   return out
 }
 
-/** A refusal or failure the plugin platform named is shown as is; anything else is not. */
+/** A refusal or failure the plugin platform named is shown as is; anything else by its class only. */
 export function errorMessage(e: unknown): string {
   if (e instanceof PluginActionError) return e.message
-  return 'Something went wrong while running the plugin action.'
+  return toApiError(e, 'Something went wrong while running the plugin action').message
 }
 
 export function resultMessage(result: Params, fallback: string): string {

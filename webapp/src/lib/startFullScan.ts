@@ -14,9 +14,10 @@ import { isActivationInProgress } from '@/lib/activationLock'
 import { describeScanWriters } from '@/lib/graphWriters'
 import { currentAuthorization, loadEngagement } from '@/lib/engagement'
 import { settingsFingerprint } from '@/lib/jobQueue'
-import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
+import { normalizeOrchestratorStartError, type NormalizedStartError } from '@/lib/orchestratorError'
 import { classifyStartFailure } from '@/lib/scanStartOutcome'
 import { applyRetentionSafe } from '@/lib/scanRetention'
+import { upstreamFailure } from '@/lib/routeErrors'
 import type { InvalidEntry } from '@/lib/domainBatch'
 import { scopeStartProblem } from '@/lib/scopeGroups'
 import {
@@ -24,6 +25,7 @@ import {
   rollbackPreparedVersions,
   createScanJob,
   SnapshotFreezeError,
+  type PrepareResult,
   type ScanMode,
   type ScanTrigger,
 } from '@/lib/scanTimeline'
@@ -116,9 +118,41 @@ export interface StartFullScanFailure {
    */
   code?: 'scope_invalid' | string
   invalidEntries?: InvalidEntry[]
+  /** The orchestrator's own HTTP status, when it answered with an error. */
+  upstreamStatus?: number
+  /** The errno of a call that got no answer (ECONNREFUSED, ENOTFOUND). */
+  cause?: string
 }
 
 export type StartFullScanResult = StartFullScanSuccess | StartFullScanFailure
+
+/**
+ * Errnos raised before a request is sent: a refused connection, an unknown
+ * host, no route. The orchestrator never saw the start, so nothing runs. A
+ * timeout or a reset can come after it acted, so those stay "unknown".
+ */
+const NEVER_DELIVERED = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH'])
+
+export interface OrchestratorStartThrow {
+  /** 503 for no connection, 504 for a timeout. */
+  status: 503 | 504
+  /** `orchestrator_unreachable` or `orchestrator_timeout`. */
+  code: string
+  cause?: string
+  /** False only when the request certainly never reached the orchestrator. */
+  outcomeUnknown: boolean
+}
+
+/** What a start call that got no HTTP answer means for the scan it asked for. */
+export function classifyOrchestratorThrow(err: unknown): OrchestratorStartThrow {
+  const { status, body } = upstreamFailure('orchestrator', err, '')
+  return {
+    status,
+    code: body.code,
+    ...(body.cause ? { cause: body.cause } : {}),
+    outcomeUnknown: !(body.cause && NEVER_DELIVERED.has(body.cause)),
+  }
+}
 
 /**
  * The settings digest for a directly-started run.
@@ -144,6 +178,63 @@ async function currentAuthorizationId(projectId: string): Promise<string | null>
   } catch (err) {
     console.error('[scanTimeline] could not read the current authorization:', err)
     return null
+  }
+}
+
+interface Refusal {
+  status: number
+  norm: NormalizedStartError
+  /** The reason recorded on the failed ScanJob. */
+  ramReason: string | null
+  upstreamStatus?: number
+  cause?: string
+}
+
+/** A start that certainly did not begin: nothing was spawned. */
+async function refuseStart(
+  input: StartFullScanInput,
+  prepared: PrepareResult,
+  roeTextSha256: string | null,
+  r: Refusal,
+): Promise<StartFullScanFailure> {
+  const { projectId, mode, trigger } = input
+  const { status, norm } = r
+  const isLimit = !!norm.limit?.limitType
+
+  // Undo the freeze rather than leave a minted version and a duplicate
+  // snapshot behind (P0-2).
+  const rolledBack = await rollbackPreparedVersions(projectId, prepared)
+  const versionId = rolledBack ? prepared.frozenVersionId : prepared.currentVersion.id
+
+  // Record the attempt so the timeline shows why it did not run, unless the
+  // caller retries it: then it is recorded once, when the refusal is final.
+  const retried = input.quietTransient && classifyStartFailure(
+    status, { error: norm.error, code: norm.code, limit: norm.limit }, { orchestratorAnswered: true },
+  ).kind === 'transient'
+  const job = retried ? null : await createScanJob({
+    projectId,
+    versionId,
+    trigger,
+    mode,
+    status: norm.limit?.limitType === 'ram' ? 'deferred_ram' : 'failed',
+    initiatedByUserId: input.actorUserId ?? null,
+    roeTextSha256,
+    scheduleId: input.scheduleId ?? null,
+    ramReason: r.ramReason,
+  }).catch(err => {
+    console.error('[scanTimeline] could not record failed scan job:', err)
+    return null
+  })
+
+  return {
+    ok: false,
+    status,
+    error: norm.error,
+    ...(isLimit ? { limit: norm.limit as Record<string, unknown> } : {}),
+    ...(norm.code ? { code: norm.code } : {}),
+    ...(r.upstreamStatus ? { upstreamStatus: r.upstreamStatus } : {}),
+    ...(r.cause ? { cause: r.cause } : {}),
+    scanJobId: job?.id ?? null,
   }
 }
 
@@ -258,12 +349,20 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
       }),
     })
   } catch (err) {
-    // A thrown fetch (timeout, connection reset) is NOT a refusal: the
-    // orchestrator may already have spawned the container. Rolling the versions
-    // back could therefore discard the snapshot of a graph a live scan is about
-    // to overwrite, so the prepared version stays and the caller is told the
-    // outcome is unknown.
     console.error(`[scanTimeline] orchestrator start call failed for project ${projectId}:`, err)
+    const thrown = classifyOrchestratorThrow(err)
+    if (!thrown.outcomeUnknown) {
+      return refuseStart(input, prepared, engagement.documentTextSha256, {
+        status: thrown.status,
+        norm: { error: 'The orchestrator could not be reached, so the scan was not started.', code: thrown.code },
+        ramReason: 'the orchestrator could not be reached',
+        ...(thrown.cause ? { cause: thrown.cause } : {}),
+      })
+    }
+    // A timeout or a reset is NOT a refusal: the orchestrator may already have
+    // spawned the container. Rolling the versions back could therefore discard
+    // the snapshot of a graph a live scan is about to overwrite, so the prepared
+    // version stays and the caller is told the outcome is unknown.
     const job = await createScanJob({
       projectId,
       versionId: prepared.currentVersion.id,
@@ -281,8 +380,10 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
 
     return {
       ok: false,
-      status: 503,
+      status: thrown.status,
       startOutcome: 'unknown',
+      code: thrown.code,
+      ...(thrown.cause ? { cause: thrown.cause } : {}),
       error:
         'The orchestrator did not answer, so it is unknown whether the scan started. ' +
         'Check the scan status before retrying.',
@@ -301,45 +402,15 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
       ? { detail: { detail: String((accepted as { error?: unknown }).error ?? 'The scan container could not be started'),
           code: 'spawn_failed' } }
       : await response.json().catch(() => ({}))
-    const status = spawnFailed ? 500 : response.status
     // Single source of truth for turning a structured governor detail into a safe
     // string + limit object (Scan Queue Phase 0.4). Never render the raw object.
     const norm = normalizeOrchestratorStartError(errorData, 'Failed to start recon')
-    const isLimit = !!norm.limit?.limitType
-
-    // A definitive refusal: nothing was spawned, so undo the freeze rather than
-    // leave a minted version and a duplicate snapshot behind (P0-2).
-    const rolledBack = await rollbackPreparedVersions(projectId, prepared)
-    const versionId = rolledBack ? prepared.frozenVersionId : prepared.currentVersion.id
-
-    // Record the attempt so the timeline shows why it did not run, unless the
-    // caller retries it: then it is recorded once, when the refusal is final.
-    const retried = input.quietTransient && classifyStartFailure(
-      status, { error: norm.error, code: norm.code, limit: norm.limit }, { orchestratorAnswered: true },
-    ).kind === 'transient'
-    const job = retried ? null : await createScanJob({
-      projectId,
-      versionId,
-      trigger,
-      mode,
-      status: norm.limit?.limitType === 'ram' ? 'deferred_ram' : 'failed',
-      initiatedByUserId: input.actorUserId ?? null,
-      roeTextSha256: engagement.documentTextSha256,
-      scheduleId: input.scheduleId ?? null,
-      ramReason: isLimit ? String(norm.limit?.detail ?? norm.error) : (spawnFailed ? norm.error : null),
-    }).catch(err => {
-      console.error('[scanTimeline] could not record failed scan job:', err)
-      return null
+    return refuseStart(input, prepared, engagement.documentTextSha256, {
+      status: spawnFailed ? 500 : response.status,
+      norm,
+      ramReason: norm.limit?.limitType ? String(norm.limit?.detail ?? norm.error) : (spawnFailed ? norm.error : null),
+      ...(spawnFailed ? {} : { upstreamStatus: response.status }),
     })
-
-    return {
-      ok: false,
-      status,
-      error: norm.error,
-      ...(isLimit ? { limit: norm.limit as Record<string, unknown> } : {}),
-      ...(norm.code ? { code: norm.code } : {}),
-      scanJobId: job?.id ?? null,
-    }
   }
 
   const state = accepted as Record<string, unknown>

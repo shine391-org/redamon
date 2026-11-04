@@ -138,6 +138,11 @@ CERT_BASE="${LEGACY_CERT_DIR:-$SCRIPT_DIR}"
 : "${MCP_RATE_START_PER_WINDOW:=}"; : "${MCP_RATE_START_WINDOW_MS:=}"
 : "${MCP_RATE_COMPARE_PER_WINDOW:=}"; : "${MCP_RATE_COMPARE_WINDOW_MS:=}"
 : "${MCP_KALI_EXEC_ENABLED:=true}"; : "${MCP_RATE_EXEC_PER_MIN:=}"
+# Agent in the Loop rides on the MCP server: on by default, inert unless
+# MCP_SERVER_ENABLED is on too (that one stays off by default on a deployed host).
+: "${AGENT_IN_THE_LOOP_ENABLED:=true}"; : "${MCP_RATE_LOOP_PER_MIN:=}"
+# Empty keeps the app's default (on): the server fetches public URLs a signed-in user names.
+: "${WORKSPACE_URL_IMPORT_ENABLED:=}"
 : "${MCP_DISABLED_TOOLS:=}"
 : "${MCP_TOKEN_PRUNE_INTERVAL:=}"
 : "${ADMIN_NAME:=}"; : "${ADMIN_EMAIL:=}"; : "${ADMIN_PASSWORD:=}"
@@ -234,6 +239,11 @@ preflight_validate() {
       warn "MCP over https-ip with a self-signed cert: most MCP clients reject the certificate. Use a real cert (TLS_MODE=provided) or a domain."
     fi
   fi
+  # A note, not a warning: the loop switch is on by default and harmless while
+  # the server is off, which is this deploy's default.
+  if is_true "${AGENT_IN_THE_LOOP_ENABLED}" && ! is_true "${MCP_SERVER_ENABLED}"; then
+    log "AGENT_IN_THE_LOOP_ENABLED=true but MCP_SERVER_ENABLED is off: an external agent reaches its steps over the MCP server, so Agent in the Loop stays inert until you turn the MCP server on."
+  fi
   [[ -z "${OPERATOR_ALLOW_CIDRS}" && "${GATE_MODE}" == "ip_allowlist" ]] && warn "GATE_MODE=ip_allowlist but OPERATOR_ALLOW_CIDRS is empty -> the nginx gate will allow all"
 
   if [[ "${MODE}" == "init" ]]; then
@@ -259,7 +269,7 @@ setup_ssh() {
   if [[ -f "${auth}" ]]; then
     AUTH_MODE="key"; PEM="${auth}"
   elif [[ "${auth}" == "pass" || "${auth}" == "-" ]]; then
-    AUTH_MODE="password"; read -rs -p "SSH password for ${REMOTE_USER}@${HOST_IP}: " SSH_PASSWORD; echo
+    AUTH_MODE="password"; read -ers -p "SSH password for ${REMOTE_USER}@${HOST_IP}: " SSH_PASSWORD; echo
   elif [[ "${auth}" == pass:* ]]; then
     AUTH_MODE="password"; SSH_PASSWORD="${auth#pass:}"
   else
@@ -373,6 +383,8 @@ build_deploy_env() {
              MCP_RATE_START_PER_WINDOW MCP_RATE_START_WINDOW_MS MCP_TOKEN_PRUNE_INTERVAL \
              MCP_RATE_COMPARE_PER_WINDOW MCP_RATE_COMPARE_WINDOW_MS \
              MCP_KALI_EXEC_ENABLED MCP_RATE_EXEC_PER_MIN \
+             AGENT_IN_THE_LOOP_ENABLED MCP_RATE_LOOP_PER_MIN \
+             WORKSPACE_URL_IMPORT_ENABLED \
              MCP_DISABLED_TOOLS \
              MCP_PUBLIC_ORIGIN \
              ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD \
@@ -435,7 +447,7 @@ cmd_init() {
   hr "INIT ${HOST_IP}  (DESTRUCTIVE -- wipes ALL Docker state + the checkout)"
   if ! is_true "${INIT_FORCE}"; then
     echo "This ERASES every container, image, volume and network on ${HOST_IP} (not just RedAmon)."
-    read -rp "Type INIT to wipe ${HOST_IP}: " confirm
+    read -erp "Type INIT to wipe ${HOST_IP}: " confirm
     [[ "${confirm}" == "INIT" ]] || die "Aborted (confirmation not given)"
   fi
   ship_assets
@@ -523,6 +535,8 @@ seed CAPTURE_IOC_IGNORE_SUFFIXES "\${CAPTURE_IOC_IGNORE_SUFFIXES}"
 # host actively pins the flag off and the operator's choice is unreachable.
 # seed() overwrites an existing key, so re-running is idempotent either way.
 seed MCP_SERVER_ENABLED "\${MCP_SERVER_ENABLED}"
+# Marks this .env as a deployed server: redamon.sh then never turns its MCP server on.
+seed REDAMON_SINGLE_HOST_DEPLOY true
 seed MCP_TOKEN_RETENTION_DAYS "\${MCP_TOKEN_RETENTION_DAYS}"
 seed MCP_LLM_DAILY_BUDGET "\${MCP_LLM_DAILY_BUDGET}"
 seed MCP_RATE_MUTE_PER_MIN "\${MCP_RATE_MUTE_PER_MIN}"
@@ -535,6 +549,9 @@ seed MCP_RATE_COMPARE_PER_WINDOW "\${MCP_RATE_COMPARE_PER_WINDOW}"
 seed MCP_RATE_COMPARE_WINDOW_MS "\${MCP_RATE_COMPARE_WINDOW_MS}"
 seed MCP_KALI_EXEC_ENABLED "\${MCP_KALI_EXEC_ENABLED}"
 seed MCP_RATE_EXEC_PER_MIN "\${MCP_RATE_EXEC_PER_MIN}"
+seed AGENT_IN_THE_LOOP_ENABLED "\${AGENT_IN_THE_LOOP_ENABLED}"
+seed MCP_RATE_LOOP_PER_MIN "\${MCP_RATE_LOOP_PER_MIN}"
+seed WORKSPACE_URL_IMPORT_ENABLED "\${WORKSPACE_URL_IMPORT_ENABLED}"
 seed MCP_DISABLED_TOOLS "\${MCP_DISABLED_TOOLS}"
 seed MCP_TOKEN_PRUNE_INTERVAL "\${MCP_TOKEN_PRUNE_INTERVAL}"
 # The webapp validates the request Origin against its own URL, which nginx
@@ -800,6 +817,21 @@ elif [ "\$(run_sudo ls -1 "\$osv_mp" 2>/dev/null | grep -c '^\.redamon_synced_')
 else
   success "OSV database synced: \$(run_sudo ls -1 "\$osv_mp" 2>/dev/null | sed -n 's/^\.redamon_synced_//p' | tr '\n' ' ')"
 fi
+step "Agent in the Loop switch"
+# Both services read it: the agent opens steps, the webapp serves the loop_* tools.
+# The switch defaults on here, so deploy assets newer than the app (a REPO_BRANCH
+# from before the feature) must not fail verify on a flag that app never passes.
+if ! grep -q AGENT_IN_THE_LOOP_ENABLED "\$APP_PATH/docker-compose.yml" 2>/dev/null; then
+  info "Agent in the Loop: not in this app version (skipped)"
+elif is_true "\${AGENT_IN_THE_LOOP_ENABLED:-false}"; then
+  for svc in agent webapp; do
+    v=\$(sg docker -c "docker compose exec -T \$svc printenv AGENT_IN_THE_LOOP_ENABLED" 2>/dev/null | tr -d '[:space:]')
+    if is_true "\$v"; then success "\$svc has AGENT_IN_THE_LOOP_ENABLED=true"
+    else err "AGENT_IN_THE_LOOP_ENABLED=true but the flag did not reach the \$svc container (seed/plumbing)"; rc=1; fi
+  done
+else
+  info "Agent in the Loop off (as configured)"
+fi
 step "Admin present"
 cnt=\$(sg docker -c "docker compose exec -T webapp node scripts/check-admin.mjs" 2>/dev/null | tr -d '[:space:]')
 [ "\${cnt:-0}" -ge 1 ] 2>/dev/null && success "admin count = \${cnt}" || { err "no admin user found"; rc=1; }
@@ -837,8 +869,11 @@ EOF
       *)   warn "MCP -> ${mcp} (unexpected)" ;;
     esac
   else
-    [[ "${mcp}" == "404" ]] && ok "MCP disabled -> 404 (as configured)" \
-      || warn "MCP is disabled but /api/mcp-server -> ${mcp} (expected 404)"
+    case "${mcp}" in
+      404) ok "MCP disabled -> 404 (as configured)" ;;
+      401) err "MCP is configured off but /api/mcp-server -> 401: the webapp has it ON. Check MCP_SERVER_ENABLED in the server's app .env and re-run update" ;;
+      *)   warn "MCP is disabled but /api/mcp-server -> ${mcp} (expected 404)" ;;
+    esac
   fi
 
   # Stateless mode has no stream to manage, so GET must be refused.
@@ -899,6 +934,8 @@ seed() { local k="\$1" v="\$2"; [ -z "\$v" ] && return 0; grep -q "^\$k=" .env &
 # host actively pins the flag off and the operator's choice is unreachable.
 # seed() overwrites an existing key, so re-running is idempotent either way.
 seed MCP_SERVER_ENABLED "\${MCP_SERVER_ENABLED}"
+# Marks this .env as a deployed server: redamon.sh then never turns its MCP server on.
+seed REDAMON_SINGLE_HOST_DEPLOY true
 seed MCP_TOKEN_RETENTION_DAYS "\${MCP_TOKEN_RETENTION_DAYS}"
 seed MCP_LLM_DAILY_BUDGET "\${MCP_LLM_DAILY_BUDGET}"
 seed MCP_RATE_MUTE_PER_MIN "\${MCP_RATE_MUTE_PER_MIN}"
@@ -911,6 +948,9 @@ seed MCP_RATE_COMPARE_PER_WINDOW "\${MCP_RATE_COMPARE_PER_WINDOW}"
 seed MCP_RATE_COMPARE_WINDOW_MS "\${MCP_RATE_COMPARE_WINDOW_MS}"
 seed MCP_KALI_EXEC_ENABLED "\${MCP_KALI_EXEC_ENABLED}"
 seed MCP_RATE_EXEC_PER_MIN "\${MCP_RATE_EXEC_PER_MIN}"
+seed AGENT_IN_THE_LOOP_ENABLED "\${AGENT_IN_THE_LOOP_ENABLED}"
+seed MCP_RATE_LOOP_PER_MIN "\${MCP_RATE_LOOP_PER_MIN}"
+seed WORKSPACE_URL_IMPORT_ENABLED "\${WORKSPACE_URL_IMPORT_ENABLED}"
 seed MCP_DISABLED_TOOLS "\${MCP_DISABLED_TOOLS}"
 seed MCP_TOKEN_PRUNE_INTERVAL "\${MCP_TOKEN_PRUNE_INTERVAL}"
 # The webapp validates the request Origin against its own URL, which nginx

@@ -4,6 +4,7 @@ import prisma from '@/lib/prisma'
 import { readFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
+import { internalError } from '@/lib/routeErrors'
 
 // Path to GVM scan output directory (mounted volume or local path)
 const GVM_OUTPUT_PATH = process.env.GVM_OUTPUT_PATH || '/home/samuele/Progetti didattici/RedAmon/gvm_scan/output'
@@ -57,11 +58,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     })
 
   } catch (error) {
-    console.error('Error downloading GVM scan data:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to download GVM scan data', { log: 'Error downloading GVM scan data' })
   }
 }
 
@@ -90,7 +87,9 @@ export async function HEAD(request: NextRequest, { params }: RouteParams) {
 
     return new NextResponse(null, { status: 200 })
 
-  } catch {
+  } catch (error) {
+    // A HEAD answer has no body, so the cause only reaches the log.
+    console.error('Error checking GVM scan data:', error)
     return new NextResponse(null, { status: 500 })
   }
 }

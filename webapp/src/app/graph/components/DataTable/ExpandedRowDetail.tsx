@@ -6,6 +6,7 @@ import { NODE_COLORS } from '../../config'
 import { renderPropertyValue } from '../../utils/renderPropertyValue'
 import { getNodeUrl, getUrlForTypeName, HIDDEN_KEYS } from '../../utils'
 import type { TableRow } from '../../hooks/useTableData'
+import { endpointExposureFields, isRouteExposureFinding, routeExposureDisplayFields } from '@/lib/routeExposureDisplay'
 import styles from './ExpandedRowDetail.module.css'
 
 interface ExpandedRowDetailProps {
@@ -23,6 +24,16 @@ export const ExpandedRowDetail = memo(function ExpandedRowDetail({ row }: Expand
 
   const nodeUrl = useMemo(() => getNodeUrl(row.node), [row.node])
 
+  // The table row carries its own CONFIRMS edges, unlike a raw property list.
+  const routeExposure = useMemo(() => {
+    const props = row.node.properties
+    if (isRouteExposureFinding(row.node.type, props)) {
+      const confirmed = row.connectionsIn.some(c => c.relationType === 'CONFIRMS')
+      return routeExposureDisplayFields(props, confirmed)
+    }
+    return row.node.type === 'Endpoint' ? endpointExposureFields(props) : []
+  }, [row])
+
   const renderConnName = (nodeType: string, nodeName: string) => {
     const url = getUrlForTypeName(nodeType, nodeName)
     return url
@@ -33,6 +44,22 @@ export const ExpandedRowDetail = memo(function ExpandedRowDetail({ row }: Expand
   return (
     <div className={styles.detail}>
       <div className={styles.sections}>
+        {/* The summary leads: a wide table stretches this row past the viewport,
+            so a section after Properties starts off-screen. */}
+        {routeExposure.length > 0 && (
+          <div className={styles.section} data-testid="route-exposure-detail">
+            <h4 className={styles.sectionTitle}>Route exposure</h4>
+            <div className={styles.propsGrid}>
+              {routeExposure.map(({ label, value }) => (
+                <div key={label} className={styles.propRow}>
+                  <span className={styles.propKey}>{label}</span>
+                  <span className={styles.propValue}>{value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Properties */}
         <div className={styles.section}>
           <h4 className={styles.sectionTitle}>Properties</h4>

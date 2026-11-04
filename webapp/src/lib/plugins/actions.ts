@@ -10,6 +10,7 @@ import { now } from './clock'
 import { isValidPluginId } from './ids'
 import { retireCallToken } from './gateway'
 import { failJob, markRunning, startJob, type JobContext, type JobPick } from './jobs'
+import { internalErrorResponse } from './lifecycleRoutes'
 import * as ov from './overrides'
 import { findInstall, hasPermission, servesActions } from './registry'
 import { RunnerError, RunnerUnavailableError, cancelJob, runAction } from './runnerClient'
@@ -82,32 +83,60 @@ export async function checkReviewProposal(
 
 // The runner's own named failures: a busy or crashed worker, a timeout.
 const RUNNER_NAMED_5XX = new Set([502, 503, 504])
+// The runner's codes are its supervisor's; one in another shape is not shown.
+const RUNNER_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/
 
-/** A runner failure as the browser receives it, [status, code, message]; null for any other error. */
-function runnerRefusal(e: unknown): [number, string, string] | null {
+/** Why the runner was not reached, in words that say what to do: each reason has its own fix. */
+function unavailableMessage(e: RunnerUnavailableError): string {
+  if (e.reason === 'not_configured') {
+    return 'The plugin runner is not configured on this deployment: PLUGIN_RUNNER_KEY is not set (./redamon.sh up generates it).'
+  }
+  if (e.proxyCode === 'proxy_busy') return 'The plugin-gateway proxy is busy (proxy_busy); try again shortly.'
+  if (e.reason === 'timeout') {
+    return `The plugin runner did not answer in time (${e.proxyCode ?? 'timeout'}); the action may still have run.`
+  }
+  if (e.reason === 'bad_response') {
+    return `The plugin runner answered with something RedAmon cannot read (${e.proxyCode ?? 'bad_response'}); its log has the details.`
+  }
+  return `The plugin runner could not be reached (${e.proxyCode ?? 'unreachable'}); try again shortly.`
+}
+
+type Refusal = [number, string, string, Json]
+
+/** A runner failure as the browser receives it, [status, code, message, extra]; null for any other error. */
+function runnerRefusal(e: unknown): Refusal | null {
   if (e instanceof RunnerUnavailableError) {
-    return [503, 'runner_unavailable', 'The plugin runner is not available right now; try again shortly.']
+    return [503, 'runner_unavailable', unavailableMessage(e), { reason: e.reason, ...(e.proxyCode ? { proxyCode: e.proxyCode } : {}) }]
   }
   if (!(e instanceof RunnerError)) return null
+  const runnerCode = RUNNER_CODE_RE.test(e.code) ? e.code : 'runner_error'
   // The plugin is installed here but the runner has not started it yet (it reloads
   // within a minute of an install).
   if (e.status === 404 && e.code === 'unknown_plugin') {
-    return [503, 'plugin_not_running', 'The plugin runner has not started this plugin yet; try again in a minute.']
+    return [503, 'plugin_not_running', 'The plugin runner has not started this plugin yet; try again in a minute.', {}]
   }
   // The runner refusing the webapp's key, or its request, or failing without saying how,
   // is no fault of the user's: a 401 would also read as a lost login in the UI.
   if (e.status === 401) {
-    return [502, 'runner_misconfigured', 'The plugin runner refused the webapp: PLUGIN_RUNNER_KEY differs between them.']
+    return [502, 'runner_misconfigured', 'The plugin runner refused the webapp: PLUGIN_RUNNER_KEY differs between them.', { upstreamStatus: 401 }]
   }
   if (e.status === 400 || e.status === 403 || (e.status >= 500 && !RUNNER_NAMED_5XX.has(e.status))) {
-    return [502, 'runner_error', 'The plugin runner could not run this action; its log has the details.']
+    return [
+      502,
+      'runner_error',
+      `The plugin runner could not run this action (${runnerCode}); its log has the details.`,
+      { upstreamStatus: e.status, runnerCode },
+    ]
   }
-  return [e.status, e.code, e.message]
+  return [e.status, e.code, e.message, {}]
 }
 
 function runnerFailure(e: unknown, extra: Json = {}): NextResponse | null {
   const refusal = runnerRefusal(e)
-  return refusal ? refuse(...refusal, extra) : null
+  if (!refusal) return null
+  const [status, code, message, own] = refusal
+  console.warn(`[plugins] action refused: ${code} (${e instanceof RunnerError ? `runner HTTP ${e.status} ${e.code}` : (e as RunnerUnavailableError).reason})`)
+  return refuse(status, code, message, { ...own, ...extra })
 }
 
 /** The context of an action or a picker, owned by `userId` by a strict check (never requireProjectAccess). */
@@ -137,15 +166,32 @@ export async function strictContext(raw: unknown, userId: string): Promise<JobCo
   return { projectId: (projectId as string) ?? null, sessionId: (sessionId as string) ?? null, conversationId }
 }
 
+/** How far an action got, for the 500 of an unexpected failure: the step, and the job it created. */
+interface ActionTrace {
+  step: string
+  jobId?: string
+}
+
 export async function handleAction(request: NextRequest, pluginId: string, actionId: string): Promise<NextResponse> {
   const started = Date.now()
-  const res = await act(request, pluginId, actionId)
+  const trace: ActionTrace = { step: 'checking the request' }
+  let res: NextResponse
+  try {
+    res = await act(request, pluginId, actionId, trace)
+  } catch (e) {
+    res = internalErrorResponse(
+      e,
+      `action ${isValidPluginId(pluginId) ? pluginId : '-'}/${ACTION_ID_RE.test(actionId) ? actionId : '-'} at ${trace.step}`,
+      `The plugin action failed while ${trace.step}; the webapp log has the details.`,
+      { step: trace.step, ...(trace.jobId ? { jobId: trace.jobId } : {}) },
+    )
+  }
   console.log(`[plugins] action plugin=${isValidPluginId(pluginId) ? pluginId : '-'} action=${ACTION_ID_RE.test(actionId) ? actionId : '-'} status=${res.status} ms=${Date.now() - started}`)
   return res
 }
 
-async function act(request: NextRequest, pluginId: string, actionId: string): Promise<NextResponse> {
-  if (!sameOrigin(request)) return crossOriginResponse()
+async function act(request: NextRequest, pluginId: string, actionId: string, trace: ActionTrace): Promise<NextResponse> {
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const body = parsed.body
@@ -153,6 +199,7 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
   if (!eff) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   if (!isValidPluginId(pluginId) || !ACTION_ID_RE.test(actionId)) return refuse(404, 'not_found', 'No such plugin action.')
+  trace.step = 'reading the plugin'
   const plugin = await findInstall(pluginId)
   if (!plugin || ['available', 'installing', 'uninstalling'].includes(plugin.status)) {
     return refuse(404, 'not_found', 'No such plugin action.')
@@ -171,6 +218,7 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
   if (Buffer.byteLength(JSON.stringify(params), 'utf8') > PARAMS_MAX_BYTES) {
     return refuse(413, 'params_too_large', `params are limited to ${PARAMS_MAX_BYTES} bytes of JSON`)
   }
+  trace.step = 'checking the project and session'
   const context = await strictContext(body.context, eff.userId)
   if (context instanceof NextResponse) return context
 
@@ -178,6 +226,7 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
   // server's {kind, point, target, ref}, and the job records it.
   let pick: JobPick | null = null
   if (params.pick !== undefined) {
+    trace.step = 'reading the picked skill'
     try {
       pick = await resolvePick(plugin, actionId, params.pick, context.conversationId, eff.userId)
     } catch (e) {
@@ -187,6 +236,7 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
     params.pick = { kind: pick.kind, point: pick.point, target: pick.target, ref: pick.ref }
   }
 
+  trace.step = 'reading the chosen model'
   if (action.llm && !(await readFeatureModel(eff.userId, pluginFeatureId(pluginId)))) {
     return refuse(409, 'model_required', 'Choose a model for this plugin in Models by feature.', { featureId: pluginFeatureId(pluginId) })
   }
@@ -212,6 +262,7 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
 
   try {
     if (!action.async) {
+      trace.step = 'running the action'
       const { token, jti, expiresAt } = await mintCallToken({ ...tokenBase, kind: 'action' })
       let out
       try {
@@ -221,15 +272,19 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
       }
       if (out.kind !== 'result') return refuse(502, 'runner_bad_answer', 'The plugin runner answered a sync action as a job.')
       if (!out.ok) return NextResponse.json({ ok: false, error: out.error })
+      trace.step = 'checking the result'
       const result = await checkReviewProposal(out.result, { pluginId, userId: eff.userId, projectId: context.projectId })
       return NextResponse.json({ ok: true, result })
     }
 
     const deadline = new Date(now().getTime() + (timeoutSeconds + JOB_GRACE_SECONDS) * 1000)
+    trace.step = 'creating the job'
     const { job, created } = await startJob({ pluginId, userId: eff.userId, actionId, context, deadline, pick })
     // One job per session: the answer names the skill it works on, so a second pick is told
     // why its choice did not start a job of its own.
     if (!created) return NextResponse.json({ jobId: job.jobId, status: job.status, existing: true, pick: job.pick ?? null })
+    trace.step = 'handing the job to the plugin runner'
+    trace.jobId = job.jobId
     try {
       const { token } = await mintCallToken({ ...tokenBase, kind: 'job', jid: job.jobId })
       const out = await runAction(pluginId, actionId, {
@@ -253,13 +308,14 @@ async function act(request: NextRequest, pluginId: string, actionId: string): Pr
     } catch (e) {
       const refusal = runnerRefusal(e)
       await failJob(job, { code: refusal?.[1] ?? 'start_failed', message: 'The job could not be handed to the plugin runner.' })
-      if (refusal) return refuse(...refusal, { jobId: job.jobId })
+      if (refusal) return runnerFailure(e, { jobId: job.jobId })!
       throw e
     }
   } catch (e) {
     if (e instanceof CallTokenConfigError) {
       console.error(`[plugins] action refused: ${e.message}`)
-      return refuse(503, e.code, 'The plugin platform is not configured on this deployment.')
+      // The message names the setting and its rule, never its value.
+      return refuse(503, e.code, `The plugin platform is not configured on this deployment: ${e.message}.`)
     }
     const failure = runnerFailure(e)
     if (failure) return failure

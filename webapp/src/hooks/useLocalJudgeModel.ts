@@ -1,11 +1,20 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { readApiError, toApiError } from '@/lib/apiError'
 
 export type LocalJudgeModel =
   | { status: 'loading' }
   | { status: 'ready'; model: string }
-  | { status: 'unavailable' }
+  /**
+   * `reason` is the route's code: `no_model` (the orchestrator answered without
+   * one), `orchestrator_error` (it answered non-OK), `orchestrator_unreachable` /
+   * `orchestrator_timeout` (no answer), or `network_error` (the webapp did not
+   * answer). `error` is the formatted cause, with the code and HTTP statuses.
+   */
+  | { status: 'unavailable'; reason?: string; error?: string }
+
+const UNAVAILABLE = 'The local judge model is unavailable'
 
 /**
  * The AI attack-surface judge model the backend runs (the orchestrator's
@@ -20,12 +29,18 @@ export function useLocalJudgeModel(projectId: string | null): LocalJudgeModel {
     let cancelled = false
     fetch(`/api/ai-attack-surface/${projectId}/judge-model`, { cache: 'no-store' })
       .then(async (r) => {
-        const d = r.ok ? await r.json() : null
+        if (!r.ok) {
+          const e = await readApiError(r, UNAVAILABLE)
+          if (!cancelled) setState({ status: 'unavailable', reason: e.code, error: e.message })
+          return
+        }
+        const d = await r.json().catch(() => null)
         const model = typeof d?.model === 'string' ? d.model : ''
-        if (!cancelled) setState(model ? { status: 'ready', model } : { status: 'unavailable' })
+        if (!cancelled) setState(model ? { status: 'ready', model } : { status: 'unavailable', reason: 'no_model' })
       })
-      .catch(() => {
-        if (!cancelled) setState({ status: 'unavailable' })
+      .catch((err) => {
+        const e = toApiError(err, UNAVAILABLE)
+        if (!cancelled) setState({ status: 'unavailable', reason: e.code, error: e.message })
       })
     return () => { cancelled = true }
   }, [projectId])

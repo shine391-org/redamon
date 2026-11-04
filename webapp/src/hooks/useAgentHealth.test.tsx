@@ -84,6 +84,20 @@ describe('useAgentHealth', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  test('a disabled hook does not probe until it is enabled', async () => {
+    fetchMock.mockResolvedValue(offline('connection refused'))
+    const { result, rerender } = renderHook((p: { enabled: boolean }) => useAgentHealth(p), {
+      initialProps: { enabled: false },
+    })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(result.current.status).toBe('unknown')
+
+    rerender({ enabled: true })
+    await waitFor(() => expect(result.current.status).toBe('offline'))
+    expect(result.current.error).toBe('connection refused')
+  })
+
   test('does not set state after unmount', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     let resolveProbe: (v: unknown) => void = () => {}

@@ -7,6 +7,8 @@
 
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { buildAgentWsUrl } from './agentWsUrl'
+import { mintWsTicket } from '@/lib/wsTicket'
+import { closeEventText, isAbnormalClose, reviewNoticeText, socketErrorText } from '@/lib/triage/socketErrors'
 import {
   CypherFixTriageMessageType,
   PUBLISHING_STOP_REFUSAL,
@@ -122,26 +124,17 @@ export function useCypherFixTriageWS({
     // STRIDE S4: mint a ws-ticket (effective user + project) before dialing;
     // the agent handler now fails closed without one.
     const sessionId = `triage-${Date.now()}`
-    let ticket: string | null = null
-    try {
-      const resp = await fetch('/api/agent/ws-ticket', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, sessionId }),
-      })
-      if (resp.ok) ticket = (await resp.json())?.ticket ?? null
-    } catch {
-      ticket = null
-    }
-    if (!ticket) {
+    const minted = await mintWsTicket(projectId, sessionId)
+    if (!minted.ok) {
       connectingRef.current = false
       wsRef.current = null
       setStatus('error')
-      setError('Triage authentication failed (could not obtain a ticket)')
+      setError(`Triage authentication failed (could not obtain a ticket): ${minted.error.message}`)
       return
     }
 
-    const url = getWebSocketUrl(ticket)
+    // A null ticket is a deployment without ticket signing, not a failure.
+    const url = getWebSocketUrl(minted.ticket ?? undefined)
     const ws = new WebSocket(url)
     wsRef.current = ws
     connectingRef.current = false
@@ -206,7 +199,7 @@ export function useCypherFixTriageWS({
 
         case CypherFixTriageMessageType.TRIAGE_COMPLETE: {
           const complete = payload as unknown as TriageCompletePayload
-          setNotice(null)
+          setNotice(reviewNoticeText(payload))
           setStatus('completed')
           setProgress(100)
           onComplete?.(complete)
@@ -215,13 +208,13 @@ export function useCypherFixTriageWS({
 
         case CypherFixTriageMessageType.ERROR: {
           const { message, code } = payload as { message?: string; code?: string }
-          const errMsg = message || 'Unknown error'
           // A refused Stop is not a failed run: the run is still going and
           // will finish, so the status must stay where it is.
           if (code === 'publishing') {
             setNotice(message || PUBLISHING_STOP_REFUSAL)
             break
           }
+          const errMsg = socketErrorText(payload)
           setError(errMsg)
           setStatus('error')
           onError?.(errMsg)
@@ -245,7 +238,7 @@ export function useCypherFixTriageWS({
       setStatus('error')
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       wsRef.current = null
       isAuthenticatedRef.current = false
       if (pingIntervalRef.current) {
@@ -254,6 +247,12 @@ export function useCypherFixTriageWS({
       }
       if (status !== 'completed' && status !== 'error' && status !== 'stopped') {
         setStatus('disconnected')
+      }
+      // onerror carries nothing; the close code and the agent's reason (an
+      // expired ticket, a restart) are the only account of what happened.
+      if (event && isAbnormalClose(event)) {
+        setError(closeEventText('The connection to the triage agent closed', event))
+        setStatus(s => (s === 'completed' || s === 'stopped') ? s : 'error')
       }
     }
   }, [enabled, userId, projectId, getWebSocketUrl, sendMessage, onPhase, onFinding, onComplete, onError, status])
@@ -312,6 +311,12 @@ export function useCypherFixTriageWS({
   }, [connect, sendMessage])
 
   const stopTriage = useCallback(() => {
+    // sendMessage drops a frame on a closed socket, so a Stop pressed while
+    // disconnected looked sent while the run went on.
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setNotice('Stop was not sent: this page is not connected to the agent. Reload the page to reconnect, then stop the run.')
+      return
+    }
     sendMessage(CypherFixTriageMessageType.STOP)
   }, [sendMessage])
 

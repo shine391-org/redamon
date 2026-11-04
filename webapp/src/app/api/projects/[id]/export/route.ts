@@ -11,6 +11,7 @@ import { PROJECT_EXPORT_EXCLUDED, PROJECT_EXPORT_EXCLUDED_REASON } from '@/lib/p
 import { exportProjectGraph, type ExportedGraph } from '@/lib/projectExport/graph'
 import { REFERENCE_LINKS_BUNDLE_PATH } from '@/lib/graphReferenceLinks'
 import { exportRevision, REVISIONS_BUNDLE_PATH } from '@/lib/roe/revisionBundle'
+import { internalError } from '@/lib/routeErrors'
 
 const RECON_OUTPUT_PATH = process.env.RECON_OUTPUT_PATH || '/data/recon-output'
 const GVM_OUTPUT_PATH = process.env.GVM_OUTPUT_PATH || '/data/gvm-output'
@@ -323,10 +324,6 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       },
     })
   } catch (error) {
-    console.error('Export failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Export failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Export failed')
   }
 }

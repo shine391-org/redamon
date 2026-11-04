@@ -68,7 +68,7 @@ Section guidelines:
 
   ATTACK SURFACE METRICS: Subdomains (active vs total), IPs (direct vs CDN-fronted), endpoints, parameters, open ports and services. Total graph nodes for scope context.
 
-  SECRETS & DATA EXPOSURE: GitHub secrets or sensitive files found: detail count and implications. TruffleHog credential findings in git history: total findings, verified vs unverified, detector types. Generic secret detection findings (from jsluice, JS Recon): count by severity, types (API keys, tokens, credentials), validation status. If none, state that no credential exposure was detected.
+  SECRETS & DATA EXPOSURE: GitHub secrets or sensitive files found: detail count and implications. TruffleHog credential findings in git history: total findings, verified vs unverified, detector types. Generic secret detection findings (from jsluice, JS Recon and its optional TruffleHog engine): count by severity, types (API keys, tokens, credentials), validation status. If none, state that no credential exposure was detected.
 
   JAVASCRIPT RECONNAISSANCE: JS Recon findings covering dependency confusion risks, source map exposure, DOM sinks, developer comments, and framework detection. Detail counts by severity and finding type. Highlight critical/high findings.
 
@@ -159,15 +159,16 @@ async def generate_report_narratives(
 
     except json.JSONDecodeError as e:
         logger.error(f"Report summarizer: invalid JSON from LLM: {type(e).__name__}: {e}")
-        return _empty_narratives()
+        return {**_empty_narratives(), "narratives_failed": "unreadable_answer"}
     except Exception as e:
         # A refused key or unknown model is the person's to fix, so it reaches
         # the endpoint and opens the model picker; empty narratives would hide it.
-        from llm_builder import is_model_unavailable_error
+        from llm_builder import is_model_unavailable_error, provider_error_details
         if is_model_unavailable_error(e):
             raise
         logger.error(f"Report summarizer error: {type(e).__name__}: {e}")
-        return _empty_narratives()
+        # The report is still built, without narratives; the marker says why.
+        return {**_empty_narratives(), "narratives_failed": "model_call_failed", **provider_error_details(e)}
 
 
 def _condense_for_llm(data: dict) -> dict:

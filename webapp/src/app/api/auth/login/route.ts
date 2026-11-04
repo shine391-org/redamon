@@ -5,6 +5,7 @@ import { writeAudit } from '@/lib/audit'
 import { getClientMeta } from '@/lib/requestMeta'
 import { checkLockout, recordFailure, clearAttempts } from '@/lib/loginThrottle'
 import { isSecureRequest } from '@/lib/cookieSecurity'
+import { internalError } from '@/lib/routeErrors'
 
 export async function POST(request: NextRequest) {
   try {
@@ -95,10 +96,6 @@ export async function POST(request: NextRequest) {
 
     return response
   } catch (error) {
-    console.error('Login error:', error)
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Internal server error', { log: 'Login error' })
   }
 }

@@ -15,6 +15,9 @@ export const JEV_ENGINE_FIELDS = [
   'resourceEnumJevToolHealth',
   'hakrawlerJevSeedOrder',
   'serializedScanJevRank',
+  'routeExposureJevRank',
+  'routeExposureJevWallCheck',
+  'routeExposureJevAssess',
 ] as const
 
 export type JevEngineField = typeof JEV_ENGINE_FIELDS[number]
@@ -39,6 +42,9 @@ export const JEV_HOOK_LABEL: Record<JevEngineField, string> = {
   resourceEnumJevToolHealth: 'silent tool-failure check',
   hakrawlerJevSeedOrder: 'Hakrawler seed order',
   serializedScanJevRank: 'serialized-object ranking',
+  routeExposureJevRank: 'route exposure ranking',
+  routeExposureJevWallCheck: 'route exposure wall check',
+  routeExposureJevAssess: 'route exposure lead assessment',
 }
 
 export const JEV_VERIFY_FAILED = "Couldn't verify your Jev token, try again."

@@ -199,12 +199,14 @@ async def _run(user_id, project_id, seed_key, model, exempt_pairs, driver, build
 
     status = "ok"
     raw_text = None
+    call_failure: dict = {}
     if not candidates:
         status = "empty_pool"
         assembled = {"status": "empty_pool", "read": None, "groups": []}
     else:
         from llm_builder import (MODEL_UNAVAILABLE_MESSAGE, ProvidersUnreachable,
-                                 is_model_unavailable_error, log_provider_error)
+                                 is_model_unavailable_error, log_provider_error,
+                                 provider_error_details)
         try:
             llm = await _in_thread(build_llm, model)
         except ProvidersUnreachable:
@@ -230,6 +232,10 @@ async def _run(user_id, project_id, seed_key, model, exempt_pairs, driver, build
                 raise SuggestError("model_unavailable", 503,
                                    MODEL_UNAVAILABLE_MESSAGE.format(model=model)) from None
             raw_text = None
+            # Same fallback as an unreadable answer, but the modal must not
+            # blame the answer: the call itself failed (a 429, a 5xx, a context
+            # overflow), and its class and HTTP status say which.
+            call_failure = {"model_call_failed": 1, **provider_error_details(exc)}
         assembled = await _in_thread(
             validate.assemble, raw_text, seed, ranked, lenses, candidates)
         status = assembled.get("status") or "ok"
@@ -258,6 +264,7 @@ async def _run(user_id, project_id, seed_key, model, exempt_pairs, driver, build
             "clusters_sent": len(ranked),
         },
         "groups": groups,
+        **call_failure,
     }
     from session_log import log_event
     # `kind` is log_event's own first parameter (the event's name), so the

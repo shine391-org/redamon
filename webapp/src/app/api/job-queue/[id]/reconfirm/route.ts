@@ -16,6 +16,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { guardProject } from '@/lib/access'
 import { currentFingerprintFor } from '@/lib/jobFingerprint'
+import { internalError } from '@/lib/routeErrors'
 
 export const runtime = 'nodejs'
 
@@ -87,10 +88,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ ok: true })
   } catch (error) {
-    console.error('[jobQueue] reconfirm failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Could not re-confirm the job', { log: '[jobQueue] reconfirm failed' })
   }
 }

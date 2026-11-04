@@ -1336,6 +1336,7 @@ export async function queryVulnerabilities(session: any, pid: string) {
           CASE WHEN v.source = 'takeover_scan' THEN 'Subdomain Takeover'
                WHEN v.source = 'vhost_sni_enum' THEN 'VHost & SNI'
                WHEN v.source = 'serialized_scan' THEN 'Insecure Deserialization'
+               WHEN v.source = 'route_exposure' THEN 'Route Exposure'
                WHEN ep IS NOT NULL THEN 'DAST'
                WHEN v.source = 'gvm' THEN 'GVM'
                WHEN v.source = 'nuclei' THEN 'Nuclei'

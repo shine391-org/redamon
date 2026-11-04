@@ -90,4 +90,13 @@ describe('POST /api/agent/ws-ticket — S6 + impersonation', () => {
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ticket: null })
   })
+
+  test('a mint that throws answers a readable body with its code, not an empty 500', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockGetEffectiveUser.mockResolvedValue({ userId: 'u1' })
+    mockCreateWsTicket.mockRejectedValue(Object.assign(new Error('secret material: abc'), { name: 'TypeError' }))
+    const res = await POST(req({ projectId: 'p', sessionId: 's' }))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not issue a ticket for the agent connection', code: 'TypeError' })
+  })
 })

@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { mkdir, readdir, readFile, stat, unlink, rmdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import path from 'path'
+import { declaredBodyTooLarge } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
 
 const TEMPLATES_PATH = process.env.NUCLEI_TEMPLATES_PATH || '/data/nuclei-templates'
 const MAX_FILE_SIZE = 1 * 1024 * 1024 // 1 MB
@@ -88,8 +90,7 @@ export async function GET() {
     const templates = await listTemplates()
     return NextResponse.json({ templates })
   } catch (error) {
-    console.error('Error listing nuclei templates:', error)
-    return NextResponse.json({ error: 'Failed to list templates' }, { status: 500 })
+    return internalError(error, 'Failed to list templates', { log: 'Error listing nuclei templates' })
   }
 }
 
@@ -98,7 +99,18 @@ export async function GET() {
 // ---------------------------------------------------------------------------
 export async function POST(request: NextRequest) {
   try {
-    const formData = await request.formData()
+    const lengthProblem = declaredBodyTooLarge(request, MAX_FILE_SIZE)
+    if (lengthProblem) return lengthProblem
+
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch {
+      return NextResponse.json(
+        { error: 'The upload could not be read as multipart form data.', code: 'invalid_multipart' },
+        { status: 400 }
+      )
+    }
     const file = formData.get('file') as File | null
     const subdir = (formData.get('subdir') as string) || ''
 
@@ -108,7 +120,7 @@ export async function POST(request: NextRequest) {
 
     if (file.size > MAX_FILE_SIZE) {
       return NextResponse.json(
-        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB` },
+        { error: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB`, code: 'file_too_large', limitBytes: MAX_FILE_SIZE },
         { status: 400 }
       )
     }
@@ -162,8 +174,7 @@ export async function POST(request: NextRequest) {
       uploaded: { name: safeName, path: relPath, id: meta.id },
     })
   } catch (error) {
-    console.error('Error uploading nuclei template:', error)
-    return NextResponse.json({ error: 'Failed to upload template' }, { status: 500 })
+    return internalError(error, 'Failed to upload template', { log: 'Error uploading nuclei template' })
   }
 }
 
@@ -208,7 +219,6 @@ export async function DELETE(request: NextRequest) {
     const templates = await listTemplates()
     return NextResponse.json({ templates })
   } catch (error) {
-    console.error('Error deleting nuclei template:', error)
-    return NextResponse.json({ error: 'Failed to delete template' }, { status: 500 })
+    return internalError(error, 'Failed to delete template', { log: 'Error deleting nuclei template' })
   }
 }

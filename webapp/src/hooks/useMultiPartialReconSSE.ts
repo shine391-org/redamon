@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ReconLogEvent } from '@/lib/recon-types'
+import { STREAM_EVENT_ERROR, describeStreamFailure, reconnectingText } from './useReconSSE'
+import { LOG_STREAM_LOST } from './logStreamError'
 
 interface UseMultiPartialReconSSEOptions {
   projectId: string | null
@@ -88,7 +90,8 @@ export function useMultiPartialReconSSE({
     function connect() {
       if (!projectId || !runId) return
 
-      const eventSource = new EventSource(`/api/recon/${projectId}/partial/${runId}/logs`)
+      const url = `/api/recon/${projectId}/partial/${runId}/logs`
+      const eventSource = new EventSource(url)
       eventSourceRef.current = eventSource
 
       eventSource.onopen = () => {
@@ -159,7 +162,8 @@ export function useMultiPartialReconSSE({
 
           const data = JSON.parse(eventData)
           if (data.error) {
-            setError(data.error)
+            console.error('Partial recon log stream error event:', data.error)
+            setError(STREAM_EVENT_ERROR)
           }
         } catch {
           // Connection-level error, not a named error event
@@ -187,9 +191,13 @@ export function useMultiPartialReconSSE({
         if (reconnectAttempts.current < maxReconnectAttempts && activeRunIdRef.current === runId) {
           const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 10000)
           reconnectAttempts.current++
+          setError(reconnectingText(reconnectAttempts.current, maxReconnectAttempts))
           reconnectTimeoutRef.current = setTimeout(connect, delay)
         } else if (reconnectAttempts.current >= maxReconnectAttempts) {
-          setError('Connection lost. Max reconnection attempts reached.')
+          setError(LOG_STREAM_LOST)
+          void describeStreamFailure(url).then(message => {
+            if (eventSourceRef.current === eventSource) setError(message)
+          })
         }
       }
     }

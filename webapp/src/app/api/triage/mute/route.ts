@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { withRouteErrors } from '@/lib/routeErrors'
 import { requireProjectOwner, callGraphTriage } from '@/lib/triageClient'
 import { readJsonBody } from '@/lib/jsonBody'
 import { invalidateCache } from '@/app/api/graph/cache'
@@ -22,7 +23,9 @@ import { activationBusy, activationBusyResponse } from '@/lib/activationLock'
  * `already: true`. Refused with 409 while a version activation holds the graph,
  * which would otherwise swallow the mute after reporting success.
  */
-export async function POST(request: NextRequest) {
+// Ownership and the activation lock read Postgres before any try; a failure
+// there would otherwise be Next's empty-bodied 500.
+export const POST = withRouteErrors('The finding could not be muted.', async (request: NextRequest) => {
   // A plain HTML form cannot send JSON, so a cross-site page cannot drive this.
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
@@ -46,4 +49,4 @@ export async function POST(request: NextRequest) {
   // leave it now, not then.
   if (res.ok) invalidateCache(caller.projectId)
   return res
-}
+})

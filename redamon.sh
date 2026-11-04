@@ -1975,14 +1975,45 @@ ensure_auth_secrets() {
         echo "TRAFFIC_INGEST_DATABASE_URL=postgresql://traffic_ingest:$(openssl rand -hex 32)@postgres:5432/${_ti_db}" >> "$env_file"
         info "Generated TRAFFIC_INGEST_DATABASE_URL (capture ingest role)"
     fi
-    # Inbound MCP server. Written EXPLICITLY as false rather than left unset, so
-    # the operator can see the switch exists and where to flip it. The webapp has
-    # NO env_file, so this is also listed in its compose `environment` block - a
-    # value set only here would otherwise be silently inert.
-    if ! grep -q '^MCP_SERVER_ENABLED=' "$env_file" 2>/dev/null; then
-        echo "MCP_SERVER_ENABLED=false" >> "$env_file"
-        info "Initialized MCP_SERVER_ENABLED=false (inbound MCP server off by default)"
-    fi
+    # Inbound MCP server and Agent in the Loop: ON by default, and written
+    # EXPLICITLY so the operator can see each switch and where to flip it. Neither
+    # does anything until a person mints a token. The webapp has NO env_file, so
+    # both are also listed in its compose `environment` block (the loop switch in
+    # the agent's too) - a value set only here would otherwise be silently inert.
+    #
+    # Earlier releases wrote MCP_SERVER_ENABLED=false, so an existing .env is
+    # switched on ONCE and the marker key below records it: a false written after
+    # it is the operator's own choice and is kept. A KEY=value line, not a comment:
+    # every line this function writes is one (redamon_plugins_lifecycle_test.sh).
+    #
+    # A single-host deploy faces the internet and sets MCP_SERVER_ENABLED itself,
+    # default off and refused over plain http: its MCP switch is never turned on
+    # here, even by a hand-run update, and the operator is told why.
+    local switched_on_once='MCP_AND_LOOP_DEFAULT_ON_APPLIED=1'
+    # REDAMON_SINGLE_HOST_DEPLOY is deploy.sh's own mark; MCP_ALLOWED_ORIGIN (seeded
+    # since 2026-09) and the prod overlay deploy.sh keeps in ~/.redamon-deploy
+    # (since 2026-08) also cover servers deployed before the mark existed.
+    local deployed="" switch value default
+    [[ "$(_env_get REDAMON_SINGLE_HOST_DEPLOY "$env_file")" == "true" \
+       || -n "$(_env_get MCP_ALLOWED_ORIGIN "$env_file")" \
+       || -f "${HOME:-/nonexistent}/.redamon-deploy/docker-compose.prod.yml" ]] && deployed=1
+    for switch in MCP_SERVER_ENABLED AGENT_IN_THE_LOOP_ENABLED; do
+        default=true
+        [[ -n "$deployed" && "$switch" == MCP_SERVER_ENABLED ]] && default=false
+        value="$(_env_get "$switch" "$env_file")"
+        if ! grep -q "^${switch}=" "$env_file" 2>/dev/null; then
+            echo "${switch}=${default}" >> "$env_file"
+            info "Initialized ${switch}=${default}"
+        elif [[ "$default" == "true" && "$value" == "false" ]] && ! grep -qxF "$switched_on_once" "$env_file" 2>/dev/null; then
+            _env_strip_var "$env_file" "$switch"
+            echo "${switch}=true" >> "$env_file"
+            info "Turned ${switch} on (now on by default; set it to false in .env to keep it off)"
+        elif [[ -n "$deployed" && "$switch" == "MCP_SERVER_ENABLED" && "$value" == "false" ]] \
+             && ! grep -qxF "$switched_on_once" "$env_file" 2>/dev/null; then
+            info "MCP_SERVER_ENABLED stays false: this is a single-host deploy (REDAMON_SINGLE_HOST_DEPLOY or MCP_ALLOWED_ORIGIN in .env, or ~/.redamon-deploy). On a local install, set MCP_SERVER_ENABLED=true yourself."
+        fi
+    done
+    grep -qxF "$switched_on_once" "$env_file" 2>/dev/null || echo "$switched_on_once" >> "$env_file"
     # The plugin platform always runs, so a PLUGINS_ENABLED line left by an older
     # release only misleads whoever reads .env. Nothing reads it.
     if grep -qE '^[[:space:]]*(export[[:space:]]+)?PLUGINS_ENABLED=' "$env_file" 2>/dev/null; then
@@ -2019,11 +2050,10 @@ mcp_server_preflight() {
 
     internal="$(_env_get INTERNAL_API_KEY "$env_file")"
     if [[ -z "$internal" || "$internal" == "changeme" ]]; then
-        error "MCP_SERVER_ENABLED=true but INTERNAL_API_KEY is unset or 'changeme'."
+        error "MCP_SERVER_ENABLED=true but INTERNAL_API_KEY is unset or 'changeme' (delete the line; the next ./redamon.sh up generates it)."
         error "The agent's auth fails OPEN in that state, and its port is published"
         error "on 0.0.0.0 in docker-compose.yml. Refusing to enable the inbound MCP"
-        error "server. Run './redamon.sh install' to generate the secrets, or set"
-        error "MCP_SERVER_ENABLED=false in .env."
+        error "server. Or set MCP_SERVER_ENABLED=false in .env."
         return 1
     fi
     return 0
@@ -2655,12 +2685,16 @@ _prompt_and_create_admin() {
             exit 1
         fi
     else
-        read -rp "  Admin name: " a_name </dev/tty
-        read -rp "  Admin email: " a_email </dev/tty
+        # -e on every prompt (issue #210): readline turns an arrow key, pressed
+        # early or to fix a typo, into line editing. Without it the raw escape
+        # bytes land in the value, and an email or a password holding them
+        # never matches at the browser login.
+        read -erp "  Admin name: " a_name </dev/tty
+        read -erp "  Admin email: " a_email </dev/tty
         while true; do
-            read -srp "  Admin password: " a_pass </dev/tty
+            read -esrp "  Admin password: " a_pass </dev/tty
             echo ""
-            read -srp "  Confirm password: " a_pass2 </dev/tty
+            read -esrp "  Confirm password: " a_pass2 </dev/tty
             echo ""
             if [[ "$a_pass" != "$a_pass2" ]]; then
                 warn "Passwords do not match. Try again."
@@ -2724,10 +2758,10 @@ cmd_create_admin() {
 
 cmd_reset_password() {
     echo ""
-    read -rp "  User email: " EMAIL </dev/tty
-    read -srp "  New password: " NEW_PASS </dev/tty
+    read -erp "  User email: " EMAIL </dev/tty
+    read -esrp "  New password: " NEW_PASS </dev/tty
     echo ""
-    read -srp "  Confirm password: " CONFIRM </dev/tty
+    read -esrp "  Confirm password: " CONFIRM </dev/tty
     echo ""
 
     if [[ "$NEW_PASS" != "$CONFIRM" ]]; then
@@ -3185,7 +3219,7 @@ _kb_choose_profile() {
     echo "==========================================================" >&2
     echo ""                                                            >&2
 
-    read -rp "  Run full ingestion now? [y/N] " full_ingest </dev/tty
+    read -erp "  Run full ingestion now? [y/N] " full_ingest </dev/tty
 
     if [[ "$full_ingest" =~ ^[Yy]$ ]]; then
         info "Full ingestion selected. This will take a while..." >&2
@@ -3647,6 +3681,42 @@ _map_plugin_consumers() {
     [[ " ${rebuild_core[*]-} ${restart_only[*]-} " == *" webapp "* ]] || restart_only+=(webapp)
 }
 
+# Bring every RUNNING core service onto the current .env and images. compose
+# recreates a service only when its configuration drifted, so an unchanged one
+# keeps running (and keeps its chats); a stopped one stays stopped, because an
+# update never starts what someone took down. Runs in update's own environment:
+# the GPU and plugins overlays and the caps computed for this host, which a bare
+# `docker compose` call from outside redamon.sh would not reproduce.
+_converge_running_core() {
+    local svc running=()
+    for svc in $CORE_SERVICES; do
+        _service_running "$svc" && running+=("$svc")
+    done
+    [[ ${#running[@]} -eq 0 ]] && return 0
+    docker compose up -d --no-deps "${running[@]}"
+}
+
+# An update with nothing to pull still applies a changed .env: an edit by hand,
+# or a single-host deploy's seeds (a switch such as AGENT_IN_THE_LOOP_ENABLED or
+# WORKSPACE_URL_IMPORT_ENABLED), would otherwise reach a container only at the
+# next release that rebuilds it. Secrets first, so nothing comes up with one empty.
+_update_apply_env() {
+    local svc any=false
+    for svc in $CORE_SERVICES; do
+        _service_running "$svc" && { any=true; break; }
+    done
+    [[ "$any" == true ]] || return 0
+    ensure_auth_secrets
+    mcp_server_preflight || exit 1
+    _plugins_prepare || exit 1
+    export_resource_caps
+    info "Applying the current .env to the running services..."
+    _converge_running_core
+    if _service_running webapp; then
+        plugins_converge || exit 1
+    fi
+}
+
 cmd_update() {
     # --gpu / --cpu are accepted here too, so switching the PyTorch variant does
     # not require a full `install`. Unlike install, omitting them PRESERVES the
@@ -3737,6 +3807,7 @@ cmd_update() {
 
         if [[ "$old_head" == "$new_head" ]]; then
             success "Already up to date (v$(get_version))."
+            _update_apply_env
             return
         fi
 
@@ -3891,6 +3962,11 @@ cmd_update() {
         for svc in "${rebuild_core[@]}"; do
             docker compose up -d --no-deps "$svc"
         done
+    fi
+    # The services this release did not rebuild still pick up a changed .env.
+    if [[ "$rebuild_all" != "true" ]]; then
+        export_resource_caps
+        _converge_running_core
     fi
 
     # Converge the GVM stack onto the current compose config + .env.
@@ -4431,7 +4507,7 @@ cmd_clean() {
     warn "This will remove all RedAmon containers and images."
     warn "Your data (databases, reports, scan results) will be preserved in Docker volumes."
     echo ""
-    read -rp "Continue? [y/N] " confirm
+    read -erp "Continue? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         info "Cancelled."
         return
@@ -4461,7 +4537,7 @@ cmd_purge() {
     echo ""
     echo -e "${RED}${BOLD}This action cannot be undone.${NC}"
     echo ""
-    read -rp "Type 'yes' to confirm: " confirm
+    read -erp "Type 'yes' to confirm: " confirm
     if [[ "$confirm" != "yes" ]]; then
         info "Cancelled."
         return
@@ -4494,6 +4570,9 @@ cmd_purge() {
     # Per-run TruffleHog scratch dirs (job file + findings before publication).
     # One per project+source, so bounded — but `purge` claims to leave nothing.
     rm -rf /tmp/redamon/trufflehog_* >/dev/null 2>&1 || true
+    # JS Recon's TruffleHog stage dirs: copies of a target's JavaScript, which a
+    # run removes itself unless its container was killed or crashed.
+    rm -rf /tmp/redamon/js_recon_th_* >/dev/null 2>&1 || true
 
     info "Removing RedAmon images..."
     remove_redamon_images

@@ -22,6 +22,7 @@ import { requireEffectiveUser } from '@/lib/access'
 import { getSession } from '@/lib/session'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 import { internalKeyHeaders } from '@/lib/agentAuth'
+import { safeErrorCode, upstreamFailure } from '@/lib/routeErrors'
 
 export interface TriageCaller {
   userId: string
@@ -104,18 +105,49 @@ export async function graphTriage(
         ...extra,
       }),
     })
-    const body = await res.json().catch(() => ({ error: 'invalid response from agent' }))
-    return { status: res.status, body }
+    const parsed = await res.json().catch(() => null)
+    const body: Record<string, unknown> = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : { error: 'invalid response from agent', code: 'non_json_response' }
+    if (res.ok) return { status: res.status, body }
+    return { status: res.status, body: failureBody(body, res.status) }
   } catch (err) {
     if (err instanceof AgentUnreachableError) {
       // Name the real service. Reporting this as a triage failure sends the
       // operator looking at the graph instead of at a stopped container.
-      return { status: 503, body: { error: err.message } }
+      const { body } = upstreamFailure('agent', err.cause_, err.message)
+      return { status: 503, body: { ...body, error: err.message } }
     }
+    console.error(`[triage] ${op} failed:`, err)
     return {
       status: 500,
-      body: { error: err instanceof Error ? err.message : 'triage request failed' },
+      body: { error: 'The triage request failed.', code: safeErrorCode(err) },
     }
+  }
+}
+
+const AGENT_CODE = /^[a-z][a-z0-9_]{0,63}$/
+const AGENT_CLASS = /^[A-Za-z_][A-Za-z0-9_.]{0,79}$/
+
+/**
+ * An agent refusal as the browser reads it: `error` is the agent's `error`, or
+ * FastAPI's string `detail` (a refused key, a rate limit), and `upstreamStatus`
+ * says what the agent answered. A 5xx's text is shown only when it carries a
+ * code: every 5xx this agent writes does, while an older agent's catch-all
+ * answered the raw Neo4j message, which can quote target data.
+ */
+function failureBody(body: Record<string, unknown>, status: number): Record<string, unknown> {
+  const { code: rawCode, error_class: rawClass, ...rest } = body
+  const code = typeof rawCode === 'string' && AGENT_CODE.test(rawCode) ? rawCode : undefined
+  const errorClass = typeof rawClass === 'string' && AGENT_CLASS.test(rawClass) ? rawClass : undefined
+  const text = [body.error, body.detail].find((v): v is string => typeof v === 'string' && v.trim() !== '')
+  const trusted = status < 500 || code !== undefined
+  return {
+    ...rest,
+    error: (trusted && text) || `The findings service answered ${status}.`,
+    ...(code ? { code } : {}),
+    ...(errorClass ? { errorClass } : {}),
+    upstreamStatus: status,
   }
 }
 

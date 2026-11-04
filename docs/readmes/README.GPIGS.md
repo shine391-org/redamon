@@ -23,6 +23,7 @@ has no row there.
 | `nested_wildcard_lab` | Self-contained DNS + web lab | Domain-batch scope groups: nested wildcards, scan roots below the org domain |
 | `supply_chain_target` | Deterministic HTTP target | Every branch of the L2 supply-chain harvest, each once, with a known outcome |
 | `serialized_target` | App that leaks serialized objects | `recon/serialized_scan` and the agent's `deserialization` skill |
+| `route_exposure_lab` | Four services: an app with open internal, admin and debug routes and exposed files (and, for v2 and v3, a Spring and Laravel fingerprint, an actuator route catalog, a client-side admin router, a credentialed CORS reflection, a cacheable logged-in profile and a disguised login wall), its twin, a hostile host (connection resets, a zlib bomb behind `.git`, a false Ignition, a `*` CORS route), and an outsider that must receive nothing | `recon/route_exposure`, its Jev hooks, and the agent's route-exposure parts in `access_control`, `path_traversal` and `rce` |
 | `web-cache-poisoning` | Real nginx shared cache in front of a vulnerable origin | The web cache poisoning module (`recon/cache_scan`) |
 | `waf-bypass` | Signature WAF edge in front of an origin also reachable by IP | WAF bypass via direct origin access (taxonomy class 13) |
 | `proxy_brain_target` | Vulnerable Flask app | The agent's `proxy_brain` / `redamon.*` capabilities |

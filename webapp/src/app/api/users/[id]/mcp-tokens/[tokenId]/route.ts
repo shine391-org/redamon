@@ -34,6 +34,7 @@ import {
   type McpScope,
 } from '@/lib/mcpAuth'
 import { validateProfile, type ProfileId } from '@/lib/mcp/profiles'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; tokenId: string }>
@@ -67,7 +68,7 @@ const sameScopes = (a: readonly string[], b: readonly string[]) =>
 const sameExpiry = (a: Date | null, b: Date | null) =>
   (a === null && b === null) || (a !== null && b !== null && a.getTime() === b.getTime())
 
-export async function PATCH(request: NextRequest, { params }: RouteParams) {
+export const PATCH = withRouteErrors('Could not update the token', async (request: NextRequest, { params }: RouteParams) => {
   const { id, tokenId } = await params
   const denied = await requireUserAccess(request, id)
   if (denied) return denied
@@ -224,12 +225,11 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ token: updated })
   } catch (error) {
-    console.error('[mcp-tokens] update failed:', error)
-    return NextResponse.json({ error: 'Could not update the token' }, { status: 500 })
+    return internalError(error, 'Could not update the token', { log: '[mcp-tokens] update failed' })
   }
-}
+})
 
-export async function DELETE(request: NextRequest, { params }: RouteParams) {
+export const DELETE = withRouteErrors('Could not delete the token', async (request: NextRequest, { params }: RouteParams) => {
   const { id, tokenId } = await params
   const denied = await requireUserAccess(request, id)
   if (denied) return denied
@@ -268,7 +268,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ deleted: true, token: existing })
   } catch (error) {
-    console.error('[mcp-tokens] delete failed:', error)
-    return NextResponse.json({ error: 'Could not delete the token' }, { status: 500 })
+    return internalError(error, 'Could not delete the token', { log: '[mcp-tokens] delete failed' })
   }
-}
+})

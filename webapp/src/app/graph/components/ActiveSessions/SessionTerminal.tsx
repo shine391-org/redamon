@@ -5,7 +5,30 @@ import { Send, Terminal, AlertTriangle, Sparkles, Loader2 } from 'lucide-react'
 import type { SessionInteractResult } from '@/lib/websocket-types'
 import { FeatureModelLine, useFeatureModelGate } from '@/components/shared/FeatureModelGate'
 import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { toApiError } from '@/lib/apiError'
 import styles from './SessionTerminal.module.css'
+
+/**
+ * The whisperer's failure line, with the provider's class and HTTP status when
+ * the agent sent them (it never sends the provider's text): "The model call
+ * failed. (RateLimitError · provider HTTP 429)". A body that is not JSON says
+ * its HTTP status.
+ */
+export function whispererErrorText(status: number, data: unknown): string {
+  const body = data && typeof data === 'object' ? data as Record<string, unknown> : null
+  const code = readFeatureModelCode(body)
+  const text = code
+    ? featureModelMessage(code, typeof body?.model === 'string' ? body.model : undefined)
+    : (typeof body?.error === 'string' && body.error.trim()) || `Error ${status}`
+  const cls = body?.error_class ?? body?.errorClass
+  const provider = body?.provider_status ?? body?.providerStatus
+  const parts: string[] = []
+  if (typeof cls === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(cls)) parts.push(cls)
+  if (typeof provider === 'number' && Number.isInteger(provider) && provider >= 100 && provider <= 599) {
+    parts.push(`provider HTTP ${provider}`)
+  }
+  return parts.length ? `${text} (${parts.join(' · ')})` : text
+}
 
 interface TerminalLine {
   text: string
@@ -142,11 +165,7 @@ export const SessionTerminal = memo(function SessionTerminal({
       }))
 
       if (!resp.ok) {
-        const data = await resp.json().catch(() => ({ error: 'Request failed' }))
-        const code = readFeatureModelCode(data)
-        setNlpError(code
-          ? featureModelMessage(code, typeof data.model === 'string' ? data.model : undefined)
-          : data.error || `Error ${resp.status}`)
+        setNlpError(whispererErrorText(resp.status, await resp.json().catch(() => null)))
         return
       }
 
@@ -157,7 +176,7 @@ export const SessionTerminal = memo(function SessionTerminal({
         inputRef.current?.focus()
       }
     } catch (err) {
-      setNlpError(err instanceof Error ? err.message : 'Network error')
+      setNlpError(toApiError(err, 'The command whisperer could not be reached').message)
     } finally {
       setIsGenerating(false)
     }

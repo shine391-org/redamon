@@ -124,7 +124,20 @@ describe('ReconDeltaTable', () => {
   test('surfaces a comparison error instead of rendering an empty diff', async () => {
     fetchMock.mockResolvedValue(fail(409, { error: 'Version "Scan 1" has no stored snapshot' }))
     render(<ReconDeltaTable projectId="p1" versions={versions} />)
-    await waitFor(() => expect(screen.getByText(/no stored snapshot/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Version "Scan 1" has no stored snapshot (HTTP 409)')).toBeTruthy())
+  })
+
+  test('a proxy error page is reported with its status, not as a JSON parse error', async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 502, text: async () => '<html>Bad Gateway</html>' })
+    render(<ReconDeltaTable projectId="p1" versions={versions} />)
+    await waitFor(() => expect(screen.getByText('Failed to compare versions (non_json_response · HTTP 502)')).toBeTruthy())
+    expect(screen.queryByText(/SyntaxError/)).toBeNull()
+  })
+
+  test('a comparison that got no answer says so', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    render(<ReconDeltaTable projectId="p1" versions={versions} />)
+    await waitFor(() => expect(screen.getByText('Failed to compare versions (network_error)')).toBeTruthy())
   })
 
   test('a failing overlay fetch does NOT retry forever', async () => {
@@ -192,7 +205,7 @@ describe('ReconDeltaTable', () => {
     render(<ReconDeltaTable projectId="p1" versions={versions} />)
     await waitFor(() => expect(screen.getByText(/1 added/)).toBeTruthy())
     fireEvent.click(screen.getByRole('tab', { name: /Graph overlay/ }))
-    await waitFor(() => expect(screen.getByText(/overlay exploded/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('overlay exploded (HTTP 500)')).toBeTruthy())
   })
 
   test('the overlay is fetched once and only when its tab is opened', async () => {

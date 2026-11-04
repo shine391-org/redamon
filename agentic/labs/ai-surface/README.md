@@ -14,6 +14,12 @@ When `Service.ai_runtime_version` is set by `nmap_scan` (if Nmap is enabled and 
 
 The DNS hint (`Subdomain.ai_service_hint`) is **not** triggered by this lab — it requires DNS records pointing at AI vendor domains (anthropic, openai, replicate, …). Test the DNS path separately by configuring a project whose target domain has SPF/TXT records mentioning one of those vendors.
 
+The fixture is tracked explicitly despite the general ignore rule for local Compose overrides.
+It uses its own Compose project and volumes, and all service listeners bind to loopback.
+Image defaults are fixed for reproducible fixtures: [Ollama 0.6.8](https://github.com/ollama/ollama/releases/tag/v0.6.8), [Open WebUI 0.6.5](https://github.com/open-webui/open-webui/releases/tag/v0.6.5), and [Chroma 0.6.3](https://github.com/chroma-core/chroma/releases/tag/0.6.3).
+Override them with `AI_LAB_OLLAMA_IMAGE`, `AI_LAB_WEBUI_IMAGE`, and `AI_LAB_CHROMA_IMAGE` when testing other versions.
+Structural tests parse the fixture without starting its services.
+
 ## Bring the lab up
 
 ```bash

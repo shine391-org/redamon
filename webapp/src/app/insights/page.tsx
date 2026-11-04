@@ -16,6 +16,7 @@ import {
 } from './hooks/useInsightsData'
 import { DashboardHeader } from './components/DashboardHeader'
 import { KPICards } from './components/KPICards'
+import { QueryErrors } from './components/QueryErrors'
 import { SeverityDonut } from './components/SeverityDonut'
 import { JudgedFindingsNote } from './components/JudgedFindingsNote'
 import { CvssHistogram } from './components/CvssHistogram'
@@ -66,6 +67,7 @@ import { AttackFlowSankey } from './components/AttackFlowSankey'
 import { AttackChainSankey } from './components/AttackChainSankey'
 import { VulnAccumulationArea } from './components/VulnAccumulationArea'
 import { formatNumber } from './utils/formatters'
+import { errorMessage } from '@/lib/apiError'
 import { type RiskFinding } from '@/lib/projectRisk'
 import { SCANNER_SEVERITY_LABEL } from '@/lib/triage/disposition'
 import styles from './page.module.css'
@@ -155,8 +157,23 @@ export default function InsightsPage() {
         onRefresh={refresh}
       />
 
+      <QueryErrors queries={[
+        { label: 'Graph overview', isError: graphOverview.isError, error: graphOverview.error },
+        { label: 'Vulnerabilities', isError: vulns.isError, error: vulns.error },
+        { label: 'Attack surface', isError: surface.isError, error: surface.error },
+        { label: 'Activity', isError: activity.isError, error: activity.error },
+        { label: 'Attack chains', isError: attackChains.isError, error: attackChains.error },
+      ]} />
+
       {/* KPI Cards + Pipeline Status */}
-      <KPICards items={kpis} isLoading={graphOverview.isLoading} pipeline={pipeline.data} sessions={sessions.data} />
+      <KPICards
+        items={kpis}
+        isLoading={graphOverview.isLoading}
+        pipeline={pipeline.data}
+        sessions={sessions.data}
+        pipelineError={pipeline.isError ? errorMessage(pipeline.error, 'Failed to load pipeline status') : null}
+        sessionsError={sessions.isError ? errorMessage(sessions.error, 'Failed to load agent sessions') : null}
+      />
 
       {/* Executive Summary */}
       <div className={styles.section}>

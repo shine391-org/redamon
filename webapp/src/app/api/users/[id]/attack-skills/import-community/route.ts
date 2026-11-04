@@ -6,8 +6,8 @@ import { DESCRIPTION_MAX_CHARS, UserSkillError } from '@/lib/userSkills'
 import {
   USER_SKILL_AUDIT_TARGET, auditActorFor, contentSha256, createUserSkillTx, lockUserSkills,
 } from '@/lib/userSkillWrites'
-
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8090'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -35,17 +35,22 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const __denied = await requireUserAccess(request, id)
     if (__denied) return __denied
 
-    const catalogRes = await fetch(`${AGENT_API_URL}/community-skills`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      cache: 'no-store',
-    })
+    let catalogRes: Response
+    try {
+      catalogRes = await agentFetch('/community-skills', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+      })
+    } catch (error) {
+      if (error instanceof AgentUnreachableError) {
+        return upstreamFailureResponse('agent', error.cause_, 'Failed to fetch community skills catalog from agent service')
+      }
+      throw error
+    }
 
     if (!catalogRes.ok) {
-      return NextResponse.json(
-        { error: 'Failed to fetch community skills catalog from agent service' },
-        { status: 502 }
-      )
+      return upstreamErrorResponse('agent', catalogRes, 'Failed to fetch community skills catalog from agent service')
     }
 
     const catalog = await catalogRes.json()
@@ -55,7 +60,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const candidates: { name: unknown; description: string | null; content: unknown; communityId: string }[] = []
     for (const skill of skills) {
       try {
-        const contentRes = await fetch(`${AGENT_API_URL}/community-skills/${encodeURIComponent(skill.id)}`, {
+        const contentRes = await agentFetch(`/community-skills/${encodeURIComponent(skill.id)}`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
@@ -118,10 +123,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       total: skills.length,
     })
   } catch (error) {
-    console.error('Failed to import community attack skills:', error)
-    return NextResponse.json(
-      { error: 'Failed to import community attack skills' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to import community attack skills')
   }
 }

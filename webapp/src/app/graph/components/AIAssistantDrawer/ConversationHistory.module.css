@@ -267,3 +267,21 @@
 .confirmNo:hover {
   background: var(--bg-primary);
 }
+
+.listError {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 6px 8px;
+  font-size: 11px;
+  color: var(--status-error, #ef4444);
+  overflow-wrap: anywhere;
+}
+
+.emptyDetail {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--status-error, #ef4444);
+  text-align: center;
+  overflow-wrap: anywhere;
+}

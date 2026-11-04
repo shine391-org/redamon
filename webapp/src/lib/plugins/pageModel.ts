@@ -38,6 +38,13 @@ export interface PermissionView {
 export interface CatalogView {
   state: 'ok' | 'unreachable' | 'invalid' | 'untrusted'
   message: string | null
+  /**
+   * Admins only, when the catalog is not used: the check's own sentence (the file that
+   * failed, the HTTP status or errno, the key id, which signature check) and the first
+   * schema errors. All the platform's words or our validator's paths, capped.
+   */
+  detail?: string
+  details?: string[]
   official: boolean
   extraKey: boolean
   replayed: boolean
@@ -105,12 +112,20 @@ const STATE_OF: Record<string, CatalogView['state']> = {
   unknown_key: 'untrusted',
 }
 
-function catalogView(loaded: LoadedCatalog | null, error: CatalogError | null): CatalogView {
+const CATALOG_DETAIL_MAX = 300
+const CATALOG_DETAILS_MAX = 5
+
+const capped = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}…` : text)
+
+function catalogView(loaded: LoadedCatalog | null, error: CatalogError | null, isAdmin: boolean): CatalogView {
   if (!loaded) {
     const code = error?.code ?? 'catalog_unreachable'
+    const details = error?.details?.slice(0, CATALOG_DETAILS_MAX).map((d) => capped(d, CATALOG_DETAIL_MAX))
     return {
       state: STATE_OF[code] ?? 'unreachable',
       message: error ? (CATALOG_MESSAGES[code] ?? (() => error.message))(error) : null,
+      ...(isAdmin && error ? { detail: capped(error.message, CATALOG_DETAIL_MAX) } : {}),
+      ...(isAdmin && details?.length ? { details } : {}),
       official: false,
       extraKey: false,
       replayed: false,
@@ -241,7 +256,7 @@ export async function buildPluginsPage(isAdmin: boolean): Promise<PluginsPage> {
     }
   }
   plugins.sort((a, b) => a.displayName.localeCompare(b.displayName))
-  return { platformVersion: PLUGIN_PLATFORM_VERSION, isAdmin, catalog: catalogView(loaded, error), plugins }
+  return { platformVersion: PLUGIN_PLATFORM_VERSION, isAdmin, catalog: catalogView(loaded, error, isAdmin), plugins }
 }
 
 export interface PluginDetail {

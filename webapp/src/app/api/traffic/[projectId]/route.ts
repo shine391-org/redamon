@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess, ownerScope } from '@/lib/access'
 import { gcOrphanBodies } from '@/lib/captureBodies'
 import type { Prisma } from '@prisma/client'
@@ -164,8 +165,7 @@ export async function GET(
 
     return NextResponse.json({ rows, total, page, pageSize })
   } catch (error) {
-    console.error('Failed to list captured traffic:', error)
-    return NextResponse.json({ error: 'Failed to list traffic' }, { status: 500 })
+    return internalError(error, 'Failed to list traffic', { log: 'Failed to list captured traffic' })
   }
 }
 
@@ -217,7 +217,6 @@ export async function DELETE(
     console.log(`[traffic-delete] user=${eff.userId} project=${projectId} mode=${mode} deleted=${res.count} blobsGC=${gc.deleted}`)
     return NextResponse.json({ deleted: res.count, blobsDeleted: gc.deleted })
   } catch (error) {
-    console.error('Failed to delete captured traffic:', error)
-    return NextResponse.json({ error: 'Failed to delete traffic' }, { status: 500 })
+    return internalError(error, 'Failed to delete traffic', { log: 'Failed to delete captured traffic' })
   }
 }

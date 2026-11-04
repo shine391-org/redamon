@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess, ownerScope } from '@/lib/access'
 import { readCapturedBody } from '@/lib/captureBodies'
 
@@ -41,7 +42,6 @@ export async function GET(
 
     return NextResponse.json(row)
   } catch (error) {
-    console.error('Failed to load captured transaction:', error)
-    return NextResponse.json({ error: 'Failed to load transaction' }, { status: 500 })
+    return internalError(error, 'Failed to load transaction', { log: 'Failed to load captured transaction' })
   }
 }

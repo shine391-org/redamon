@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSession, requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { nameKeys } from '@/lib/userSkillNames'
 import { USER_SKILL_POINT } from '@/lib/plugins/overrides'
 import {
@@ -53,11 +54,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       duplicateName: (keyCount.get(keys[i]) ?? 0) > 1,
     })))
   } catch (error) {
-    console.error('Failed to fetch attack skills:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch attack skills' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch attack skills')
   }
 }
 
@@ -80,10 +77,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   } catch (error) {
     const refused = userSkillErrorResponse(error)
     if (refused) return refused
-    console.error('Failed to create attack skill:', error)
-    return NextResponse.json(
-      { error: 'Failed to create attack skill' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create attack skill')
   }
 }

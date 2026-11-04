@@ -101,6 +101,8 @@ from .rce_prompts import (
     RCE_OOB_WORKFLOW,
     RCE_DESERIALIZATION_WORKFLOW,
     RCE_PAYLOAD_REFERENCE,
+    RCE_ROUTE_EXPOSURE_CONSOLES,
+    RCE_HEAPDUMP_ANALYSIS,
 )
 
 # Re-export from Path Traversal / LFI / RFI prompts
@@ -116,6 +118,9 @@ from .path_traversal_prompts import (
     PATH_TRAVERSAL_OOB_WORKFLOW,
     PATH_TRAVERSAL_ARCHIVE_EXTRACTION,
     PATH_TRAVERSAL_PAYLOAD_REFERENCE,
+    PATH_TRAVERSAL_EXPOSED_FILES,
+    PATH_TRAVERSAL_GIT_RECONSTRUCT,
+    PATH_TRAVERSAL_VALIDATE_SECRETS,
 )
 
 # Re-export from HTTP request smuggling prompts
@@ -136,7 +141,15 @@ from .crypto_attack_prompts import CRYPTO_ATTACK_TOOLS
 from .unclassified_prompts import UNCLASSIFIED_EXPLOIT_TOOLS
 
 # Re-export from Broken Access Control / Authorization Bypass prompts
-from .access_control_prompts import ACCESS_CONTROL_TOOLS
+from .access_control_prompts import (
+    ACCESS_CONTROL_TOOLS, ACCESS_CONTROL_ROUTE_EXPOSURE_LEADS, ACCESS_CONTROL_ROUTE_EXPOSURE_BROWSER_LEADS,
+)
+from .safe_handling_prompts import (
+    ACCESS_CONTROL_SAFE_STATE,
+    ACCESS_CONTROL_SAFE_VALUES,
+    PATH_TRAVERSAL_SAFE_STATE,
+    PATH_TRAVERSAL_SAFE_VALUES,
+)
 
 # Re-export from post-exploitation prompts
 from .post_exploitation import (
@@ -397,6 +410,11 @@ def _build_builtin_skill_workflow_parts(
         }
         parts.append(_seam.resolve_skill_part(
             "path_traversal", "tools", PATH_TRAVERSAL_TOOLS, pt_settings))
+        if get_setting('ROE_SENSITIVE_DATA_HANDLING', 'no_access') != 'full_access':
+            parts.append(_seam.resolve_skill_part(
+                "path_traversal", "safe_values", PATH_TRAVERSAL_SAFE_VALUES))
+        parts.append(_seam.resolve_skill_part(
+            "path_traversal", "safe_state", PATH_TRAVERSAL_SAFE_STATE))
         if pt_php_enabled:
             parts.append(_seam.resolve_skill_part(
                 "path_traversal", "php_wrappers", PATH_TRAVERSAL_PHP_WRAPPERS))
@@ -409,6 +427,24 @@ def _build_builtin_skill_workflow_parts(
         if pt_payref_enabled:
             parts.append(_seam.resolve_skill_part(
                 "path_traversal", "payload_reference", PATH_TRAVERSAL_PAYLOAD_REFERENCE))
+        if get_setting('ROUTE_EXPOSURE_ENABLED', False):
+            # Recon's route exposure findings; the risky impact steps are omitted
+            # unless their switch AND the RoE allow them.
+            git_ok = (get_setting('PATH_TRAVERSAL_GIT_RECONSTRUCT_ENABLED', False)
+                      and get_setting('ROE_ALLOW_DATA_EXFILTRATION', False)
+                      and "execute_code" in allowed_tools)
+            val_ok = (get_setting('PATH_TRAVERSAL_VALIDATE_SECRETS_ENABLED', False)
+                      and "execute_code" in allowed_tools)
+            parts.append(_seam.resolve_skill_part(
+                "path_traversal", "exposed_files", PATH_TRAVERSAL_EXPOSED_FILES,
+                {"git_reconstruct": "ENABLED" if git_ok else "DISABLED",
+                 "validate_secrets": "ENABLED" if val_ok else "DISABLED"}))
+            if git_ok:
+                parts.append(_seam.resolve_skill_part(
+                    "path_traversal", "git_reconstruct", PATH_TRAVERSAL_GIT_RECONSTRUCT))
+            if val_ok:
+                parts.append(_seam.resolve_skill_part(
+                    "path_traversal", "validate_secrets", PATH_TRAVERSAL_VALIDATE_SECRETS))
         return parts
     elif (attack_path_type == "deserialization"
             and "deserialization" in enabled_builtins
@@ -435,6 +471,16 @@ def _build_builtin_skill_workflow_parts(
             parts.append(_seam.resolve_skill_part(
                 "rce", "deserialization_workflow", RCE_DESERIALIZATION_WORKFLOW))
         parts.append(_seam.resolve_skill_part("rce", "payload_reference", RCE_PAYLOAD_REFERENCE))
+        if get_setting('ROUTE_EXPOSURE_ENABLED', False):
+            hd_ok = (get_setting('RCE_HEAPDUMP_ANALYSIS_ENABLED', False)
+                     and get_setting('ROE_ALLOW_DATA_EXFILTRATION', False)
+                     and get_setting('ROE_SENSITIVE_DATA_HANDLING', 'no_access') != 'no_access'
+                     and "execute_code" in allowed_tools)
+            parts.append(_seam.resolve_skill_part(
+                "rce", "route_exposure_consoles", RCE_ROUTE_EXPOSURE_CONSOLES,
+                {"heapdump_analysis": "ENABLED" if hd_ok else "DISABLED"}))
+            if hd_ok:
+                parts.append(_seam.resolve_skill_part("rce", "heapdump_analysis", RCE_HEAPDUMP_ANALYSIS))
         return parts
     elif ("cve_exploit" == attack_path_type
             and "cve_exploit" in enabled_builtins
@@ -458,6 +504,17 @@ def _build_builtin_skill_workflow_parts(
             and "access_control" in enabled_builtins
             and "execute_curl" in allowed_tools):
         parts.append(_seam.resolve_skill_part("access_control", "tools", ACCESS_CONTROL_TOOLS))
+        if get_setting('ROE_SENSITIVE_DATA_HANDLING', 'no_access') != 'full_access':
+            parts.append(_seam.resolve_skill_part(
+                "access_control", "safe_values", ACCESS_CONTROL_SAFE_VALUES))
+        parts.append(_seam.resolve_skill_part(
+            "access_control", "safe_state", ACCESS_CONTROL_SAFE_STATE))
+        if get_setting('ROUTE_EXPOSURE_ENABLED', False):
+            parts.append(_seam.resolve_skill_part(
+                "access_control", "route_exposure_leads", ACCESS_CONTROL_ROUTE_EXPOSURE_LEADS))
+            parts.append(_seam.resolve_skill_part(
+                "access_control", "route_exposure_browser_leads",
+                ACCESS_CONTROL_ROUTE_EXPOSURE_BROWSER_LEADS))
         return parts
     elif (attack_path_type == "http_request_smuggling"
             and "http_request_smuggling" in enabled_builtins
@@ -772,6 +829,8 @@ __all__ = [
     "RCE_OOB_WORKFLOW",
     "RCE_DESERIALIZATION_WORKFLOW",
     "RCE_PAYLOAD_REFERENCE",
+    "RCE_ROUTE_EXPOSURE_CONSOLES",
+    "RCE_HEAPDUMP_ANALYSIS",
     # Insecure Deserialization
     "DESERIALIZATION_TOOLS",
     "DESERIALIZATION_OOB_WORKFLOW",
@@ -783,9 +842,18 @@ __all__ = [
     "PATH_TRAVERSAL_OOB_WORKFLOW",
     "PATH_TRAVERSAL_ARCHIVE_EXTRACTION",
     "PATH_TRAVERSAL_PAYLOAD_REFERENCE",
+    "PATH_TRAVERSAL_EXPOSED_FILES",
+    "PATH_TRAVERSAL_GIT_RECONSTRUCT",
+    "PATH_TRAVERSAL_VALIDATE_SECRETS",
     # Unclassified attack path
     "UNCLASSIFIED_EXPLOIT_TOOLS",
     "ACCESS_CONTROL_TOOLS",
+    "ACCESS_CONTROL_ROUTE_EXPOSURE_LEADS",
+    "ACCESS_CONTROL_ROUTE_EXPOSURE_BROWSER_LEADS",
+    "ACCESS_CONTROL_SAFE_VALUES",
+    "ACCESS_CONTROL_SAFE_STATE",
+    "PATH_TRAVERSAL_SAFE_VALUES",
+    "PATH_TRAVERSAL_SAFE_STATE",
     "HTTP_SMUGGLING_TOOLS",
     "HTTP_SMUGGLING_ZERO_CL_STEP",
     "HTTP_SMUGGLING_EXPECT_STEP",

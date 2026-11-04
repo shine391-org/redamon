@@ -162,6 +162,7 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 
     // --- DISABLE JS Recon (jsluice covers endpoint extraction) ---
     jsReconEnabled: false,
+    jsReconTrufflehogEnabled: false,
 
     aiSurfaceReconEnabled: false,
     // --- ffuf: API-specific extensions, smart fuzz ---
@@ -232,6 +233,8 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 
     // --- DISABLE security checks ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: false,
 
     // --- DISABLE all OSINT ---

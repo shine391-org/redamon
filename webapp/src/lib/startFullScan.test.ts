@@ -667,3 +667,64 @@ describe('a headless caller records no failed run for a transient refusal (plan 
     expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }))
   })
 })
+
+describe('an orchestrator that never answered says why, and whether anything started', () => {
+  const refused = () => Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8010'), { code: 'ECONNREFUSED' }),
+  })
+  const timedOut = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
+
+  test('a refused connection is 503 orchestrator_unreachable: certainly not started', async () => {
+    h.orchestratorFetch.mockRejectedValue(refused())
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({
+      ok: false, status: 503, code: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+      error: 'The orchestrator could not be reached, so the scan was not started.',
+    })
+    if (res.ok) throw new Error('unreachable')
+    expect(res.startOutcome).toBeUndefined()
+  })
+
+  test('nothing reached the orchestrator, so the freeze is undone like any refusal', async () => {
+    h.orchestratorFetch.mockRejectedValue(refused())
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(h.rollback).toHaveBeenCalledOnce()
+    expect(h.retention).not.toHaveBeenCalled()
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed', versionId: 'v2', ramReason: 'the orchestrator could not be reached',
+    }))
+  })
+
+  test('the queue and the scheduler retry it as transient, with no failed run per attempt', async () => {
+    h.orchestratorFetch.mockRejectedValue(refused())
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', quietTransient: true })
+    if (res.ok) throw new Error('unreachable')
+    expect(classifyStartFailure(res.status, res, { orchestratorAnswered: res.startOutcome !== 'unknown' }).kind)
+      .toBe('transient')
+    expect(h.createJob).not.toHaveBeenCalled()
+  })
+
+  test('a timeout is 504 orchestrator_timeout and keeps the outcome unknown', async () => {
+    h.orchestratorFetch.mockRejectedValue(timedOut())
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 504, code: 'orchestrator_timeout', startOutcome: 'unknown' })
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  test('a reset after the request went out keeps the outcome unknown', async () => {
+    h.orchestratorFetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+    }))
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ status: 503, code: 'orchestrator_unreachable', cause: 'ECONNRESET', startOutcome: 'unknown' })
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  test('an answered error carries the orchestrator status, even with a non-JSON body', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500, json: async () => { throw new SyntaxError('Unexpected token I') },
+    })
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 500, upstreamStatus: 500, error: 'Failed to start recon' })
+  })
+})

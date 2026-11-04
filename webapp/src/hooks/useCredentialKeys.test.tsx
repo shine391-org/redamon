@@ -97,19 +97,46 @@ describe('useCredentialKeys', () => {
     const { result } = renderHook(() => useCredentialKeys())
     await waitFor(() => expect(result.current.loading).toBe(false))
 
-    fetchMock.mockRejectedValueOnce(new Error('offline'))
+    // What a browser fetch throws when nothing answered.
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
     let ok: boolean | undefined
     await act(async () => { ok = await result.current.save('trufflehogGithubToken', 'x') })
 
     expect(ok).toBe(false)
-    expect(result.current.error).toBe('Could not save the key')
+    expect(result.current.error).toBe('Could not save the key (network_error)')
   })
 
-  test('a failed read degrades to "nothing is set" instead of throwing', async () => {
-    fetchMock.mockRejectedValue(new Error('offline'))
+  test('a server failure on save carries its code and status', async () => {
+    const { result } = renderHook(() => useCredentialKeys())
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    fetchMock.mockResolvedValueOnce({
+      ok: false, status: 500, json: async () => ({ error: 'Failed to update user settings', code: 'P2024' }),
+    })
+    await act(async () => { await result.current.save('trufflehogGithubToken', 'x') })
+
+    expect(result.current.error).toBe('Failed to update user settings (P2024 · HTTP 500)')
+  })
+
+  test('a failed read degrades to "nothing is set" instead of throwing, and says why', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
     const { result } = renderHook(() => useCredentialKeys())
     await waitFor(() => expect(result.current.loading).toBe(false))
     expect(result.current.isSet('githubAccessToken')).toBe(false)
+    expect(result.current.loadError).toBe("Couldn't read your saved keys (network_error)")
+  })
+
+  test('a read the server refused names its status, and a later good read clears it', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false, status: 500, json: async () => ({ error: 'Failed to fetch user settings', code: 'P1001' }),
+    })
+    const { result } = renderHook(() => useCredentialKeys())
+    await waitFor(() => expect(result.current.loadError).toBe("Couldn't read your saved keys (P1001 · HTTP 500)"))
+    expect(result.current.isSet('githubAccessToken')).toBe(false)
+
+    await act(async () => { await result.current.refresh() })
+    expect(result.current.loadError).toBeUndefined()
+    expect(result.current.isSet('githubAccessToken')).toBe(true)
   })
 
   test('with no user in scope it neither fetches nor hangs on loading', async () => {

@@ -12,13 +12,19 @@ export const MAX_SKILLS_PER_USER = 1000
 // settings payload, so this bound is what keeps those as large as they were with the old
 // cap of 20 skills per user.
 export const MAX_ENABLED_USER_SKILLS_PER_PROJECT = 20
-export const MAX_CONTENT_SIZE = 50 * 1024
+// In UTF-16 units. A chosen skill's whole text enters the agent's system prompt on every
+// turn, so a file near this limit is ~125k tokens: past the context window of smaller models.
+// agentic/skill_metadata.py CONTENT_MAX_CHARS and the plugin SDK's USER_SKILL_MAX_CHARS
+// (services/plugin_runner/sdk/redamon_plugin_sdk/testing.py) must equal it.
+export const MAX_CONTENT_SIZE = 500 * 1024
+// A chat skill's text, in UTF-16 units; /skill sends it whole to the agent.
+export const MAX_CHAT_SKILL_CONTENT_SIZE = 500 * 1024
 export const NAME_MAX_CHARS = 100
 export const DESCRIPTION_MAX_CHARS = 500
 // One upload batch is one JSON body and one transaction under the per-user lock.
 export const MAX_SKILLS_PER_BATCH = 50
-// MAX_CONTENT_SIZE counts UTF-16 units, so 50 non-ASCII files can approach 8 MB of UTF-8 JSON;
-// past the proxy's 10 MB Next truncates the body silently, so refuse it first with a clear 413.
+// Binds before MAX_SKILLS_PER_BATCH once files are large (about 16 files near MAX_CONTENT_SIZE).
+// Past the proxy's 10 MB Next truncates the body silently, so refuse it first with a clear 413.
 export const MAX_SKILL_BATCH_BYTES = 8 * 1024 * 1024
 // Skills per Generate-with-AI request: the dialog sends them one request at a time to show progress,
 // and the agent's per-request timeout covers 5 skills run 3 at a time.

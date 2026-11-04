@@ -1,30 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { agentErrorResponse, callAgent } from '../../../agentProxy'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+const FAILED = 'Failed to interact with session'
 
-export async function POST(
+export const POST = withRouteErrors(FAILED, async (
   request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+  { params }: { params: Promise<{ id: string }> },
+) => {
   const { id } = await params
-  try {
-    const body = await request.json()
-    const resp = await fetch(`${AGENT_API_URL}/sessions/${id}/interact`, {
-      method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(body),
-    })
-    if (!resp.ok) {
-      const text = await resp.text()
-      return NextResponse.json({ error: text }, { status: resp.status })
-    }
-    return NextResponse.json(await resp.json())
-  } catch (error) {
-    console.error('Session interact proxy error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to interact with session' },
-      { status: 502 }
-    )
+  const body = await request.json().catch(() => null)
+  if (!body || typeof body !== 'object') {
+    return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 })
   }
-}
+  // The agent waits up to 40s on the session manager; ours must outlast it.
+  const call = await callAgent(`/sessions/${encodeURIComponent(id)}/interact`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, FAILED, { timeoutMs: 45_000 })
+  if (!call.ok) return call.response
+  if (!call.res.ok) return agentErrorResponse(call.res, FAILED)
+  return NextResponse.json(await call.res.json())
+})

@@ -356,8 +356,8 @@ await ctx.sdk.override.withdraw(proposal["changeSetId"])    # a pending proposal
 target = await ctx.sdk.override.get("user_skill.text", params["pick"]["target"])
 # {"point": "user_skill.text", "targetGroup": "<skill id>", "displayName": "My SQLi flow v2",
 #  "description": "…", "parts": [{"partId": "body", "text": "…", "sha256": "…", "chars": 1234,
-#  "maxChars": 51200, "kind": "plain", "placeholders": []}], "active": None, "pendingCount": 0,
-#  "limits": {"skillMaxChars": 51200, "parts": {"body": 51200}},
+#  "maxChars": 512000, "kind": "plain", "placeholders": []}], "active": None, "pendingCount": 0,
+#  "limits": {"skillMaxChars": 512000, "parts": {"body": 512000}},
 #  "lineage": {"rootName": "My SQLi flow", "version": 2}}
 proposal = await ctx.sdk.override.propose("user_skill.text", target["targetGroup"],
                                           {"body": new_text}, note="Why", scope="user")

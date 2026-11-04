@@ -22,6 +22,9 @@ import { validateScopes } from '@/lib/mcpAuth'
 import { validateProfile } from '@/lib/mcp/profiles'
 import { listAdvertisedTools } from '@/lib/mcp/apiReference'
 import { renderOnboardingPack, type OnboardingOptions } from '@/lib/mcp/onboarding'
+import { isLoopClient } from '@/lib/mcp/loopSkill'
+import { LOOP_PROFILE_ID, agentInTheLoopEnabled } from '@/lib/agentInTheLoop'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -55,7 +58,7 @@ function resolveServerUrl(raw: unknown): { serverUrl: string | undefined } | { e
   return { serverUrl: parsed.origin }
 }
 
-export async function POST(request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Could not generate the onboarding pack', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const denied = await requireUserAccess(request, id)
   if (denied) return denied
@@ -80,12 +83,24 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json({ error: urlResult.error }, { status: 400 })
   }
 
+  const loopOn = agentInTheLoopEnabled()
+  if (profileResult.profile === LOOP_PROFILE_ID && !loopOn) {
+    return NextResponse.json(
+      { error: 'Agent in the Loop is turned off on this deployment', code: 'loop_disabled' },
+      { status: 409 },
+    )
+  }
+  if (body.client !== undefined && !isLoopClient(body.client)) {
+    return NextResponse.json({ error: 'client must be claude-code, codex or other' }, { status: 400 })
+  }
+
   const style = body.style === 'http' ? 'http' : 'mcp'
   const layout = body.layout === 'single' ? 'single' : 'folder'
   const opts: OnboardingOptions = {
     serverUrl: urlResult.serverUrl,
     style,
     layout,
+    client: isLoopClient(body.client) ? body.client : 'claude-code',
     // The same stamp buildMcpServer reports as the server version, so a reader
     // can tell which build a downloaded pack describes.
     version: process.env.NEXT_PUBLIC_REDAMON_VERSION || '0.0.0',
@@ -103,13 +118,13 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         scopes: scopeResult.scopes,
         available: pack.available,
         unavailable: pack.unavailable,
+        features: { agentInTheLoop: loopOn },
       },
       // A document built from a permission set is not something to cache in a
       // shared proxy, and it changes whenever the surface does.
       { headers: { 'Cache-Control': 'no-store' } }
     )
   } catch (error) {
-    console.error('[agent-onboarding] generation failed:', error)
-    return NextResponse.json({ error: 'Could not generate the onboarding pack' }, { status: 500 })
+    return internalError(error, 'Could not generate the onboarding pack', { log: '[agent-onboarding] generation failed' })
   }
-}
+})

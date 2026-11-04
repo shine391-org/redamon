@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 import { writeAudit } from '@/lib/audit'
 import { actingAdminId } from '@/lib/roe/actor'
 import { attachmentDisposition, downloadContentType } from '@/lib/roe/limits'
@@ -48,7 +49,6 @@ export async function GET(
       },
     })
   } catch (error) {
-    console.error('RoE revision download error:', error)
-    return NextResponse.json({ error: 'Failed to download the RoE revision' }, { status: 500 })
+    return internalError(error, 'Failed to download the RoE revision', { log: 'RoE revision download error' })
   }
 }

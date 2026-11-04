@@ -7,6 +7,7 @@
 #   - ensure_admin            -> actionable skip message (points at create-admin)
 #   - cmd_create_admin        -> standalone recovery command (upsert = safe re-run)
 #   - dispatch + help wiring   for `create-admin`
+#   - interactive prompts      -> arrow keys edit the line, never reach the value (issue #210)
 #
 # Pure unit tests: `docker`/`sleep` are stubbed, no daemon needed, CI-friendly.
 # Run:  bash tests/redamon_admin_test.sh
@@ -121,6 +122,103 @@ assert_true "cmd_create_admin is defined"            "grep -q '^cmd_create_admin
 # 40/40 pass serially, 14/24 FAIL when run concurrently.
 HELP_OUT="$(cd "$REPO_ROOT" && ./redamon.sh help 2>/dev/null || true)"
 assert_true "help lists create-admin"                "echo \"\$HELP_OUT\" | grep -qi 'create-admin'"
+
+# Runs bash code ($1) on a fresh pseudo-terminal: the prompts read /dev/tty, so
+# only a real terminal shows what a person's keys turn into. $2 is typed before
+# anything is on screen (keys pressed while the stack starts); each later
+# "<prompt>" "<keys>" pair answers that prompt once it appears. Prints what the
+# terminal showed; gives up after 20 s so a prompt that loops cannot hang the gate.
+_type_at_tty() {
+    python3 - "$@" <<'PY'
+import os, pty, select, sys, time
+
+code, typeahead, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
+# INPUTRC=/dev/null: the operator's own ~/.inputrc (vi mode, rebinds) must not
+# change what the keys below mean.
+env = dict(os.environ, INPUTRC="/dev/null", TERM="xterm")
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe("bash", ["bash", "--norc", "--noprofile", "-c", code], env)
+
+screen, pending, deadline = b"", b"", time.time() + 20
+
+def pump():
+    global screen, pending
+    if not select.select([fd], [], [], 0.05)[0]:
+        return True
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:  # EIO once the child has exited and closed the terminal
+        return False
+    screen += chunk
+    pending += chunk
+    return bool(chunk)
+
+os.write(fd, os.fsencode(typeahead))
+for prompt, keys in zip(pairs[0::2], pairs[1::2]):
+    while os.fsencode(prompt) not in pending and time.time() < deadline and pump():
+        pass
+    # Drop output up to this prompt, so a prompt that repeats (Confirm password)
+    # is matched against the next copy, not this one.
+    pending = pending.split(os.fsencode(prompt), 1)[-1]
+    try:
+        os.write(fd, os.fsencode(keys))
+    except OSError:  # the child already exited; the asserts report what is missing
+        break
+while time.time() < deadline and pump():
+    pass
+if time.time() >= deadline:
+    os.kill(pid, 9)
+os.waitpid(pid, 0)
+sys.stdout.write(screen.decode(errors="replace"))
+PY
+}
+
+echo "== prompts: arrow keys edit the line, never reach the value (issue #210) =="
+# Up pressed while the stack starts, then Left used to fix a typo in the email and
+# inside the hidden password. Without `read -e` the kernel hands bash those keys
+# as raw escape bytes ($'\e[D'...), which create-admin.mjs stores as typed: an
+# email or password no browser login can ever match.
+if command -v python3 >/dev/null 2>&1; then
+    UP=$'\e[A'; LEFT=$'\e[D'; ENTER=$'\r'
+    EMAIL_KEYS="admin@example.tst${LEFT}${LEFT}e${ENTER}"          # -> admin@example.test
+    PASS_KEYS="correct-horse-batery${LEFT}${LEFT}${LEFT}t${ENTER}"  # -> correct-horse-battery
+    CAPFILE="$(mktemp)"
+    CHILD_PRELUDE='unset ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD
+source "$REPO_ROOT/redamon.sh"; set +e
+docker() { printf "%q\n" "$@" > "$CAPFILE"; }
+'
+    export REPO_ROOT CAPFILE
+
+    SCREEN="$(_type_at_tty "${CHILD_PRELUDE}_prompt_and_create_admin" "${UP}${UP}" \
+        "Admin name:" "Alice${ENTER}" "Admin email:" "$EMAIL_KEYS" \
+        "Admin password:" "$PASS_KEYS" "Confirm password:" "$PASS_KEYS")"
+    assert_true "admin: early arrows do not reach ADMIN_NAME"        "grep -qx 'ADMIN_NAME=Alice' '$CAPFILE'"
+    assert_true "admin: Left fixes the email instead of storing \\e[D" "grep -qx 'ADMIN_EMAIL=admin@example.test' '$CAPFILE'"
+    assert_true "admin: Left fixes the hidden password too"           "grep -qx 'ADMIN_PASSWORD=correct-horse-battery' '$CAPFILE'"
+    assert_false "admin: the password is never shown on screen"       "grep -q 'horse' <<< \"\$SCREEN\""
+
+    : > "$CAPFILE"
+    SCREEN="$(_type_at_tty "${CHILD_PRELUDE}cmd_reset_password" "${UP}" \
+        "User email:" "$EMAIL_KEYS" "New password:" "$PASS_KEYS" "Confirm password:" "$PASS_KEYS")"
+    assert_true "reset: early arrows do not reach RESET_EMAIL"        "grep -qx 'RESET_EMAIL=admin@example.test' '$CAPFILE'"
+    assert_true "reset: Left fixes the hidden password"               "grep -qx 'RESET_PASSWORD=correct-horse-battery' '$CAPFILE'"
+    assert_false "reset: the password is never shown on screen"       "grep -q 'horse' <<< \"\$SCREEN\""
+    rm -f "$CAPFILE"; export -n CAPFILE
+else
+    echo "  SKIP  needs python3 to drive the prompts through a pseudo-terminal"
+fi
+
+echo "== every prompt in redamon.sh and deploy.sh reads through readline (issue #210) =="
+# The guard for prompts the pty run above does not reach (confirmations, the KB
+# question, deploy.sh): a new prompted read without -e brings the bug back.
+PROMPTED_READ='\bread +(-[a-zA-Z]+ +)*-[a-zA-Z]*p\b'
+for f in "$SRC" "$REPO_ROOT/tooling/deploy/single-host/deploy.sh"; do
+    BARE="$(grep -nE "$PROMPTED_READ" "$f" | grep -vE '\bread +(-[a-zA-Z]+ +)*-[a-zA-Z]*e')"
+    assert_eq "no prompted read without -e in ${f#"$REPO_ROOT"/}" "$BARE" ""
+done
+assert_true "the guard's pattern does find the prompts" \
+    "grep -E \"\$PROMPTED_READ\" '$SRC' | grep -q 'Admin name:'"
 
 echo
 echo "-----------------------------------------"

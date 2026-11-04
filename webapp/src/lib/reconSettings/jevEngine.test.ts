@@ -47,15 +47,16 @@ describe('jevSwitchedOn', () => {
 
   test('only the per-hook Jev fields count', () => {
     expect(jevSwitchedOn(null, { nucleiAiResponseFilter: true, ffufAiExtensions: true })).toEqual([])
-    expect(JEV_ENGINE_FIELDS).toHaveLength(9)
+    expect(JEV_ENGINE_FIELDS).toHaveLength(12)
   })
 
   test('a Jev-only hook turned on is a switch-on, like an engine switch', () => {
     expect(jevSwitchedOn(null, {
       ffufJevBasePaths: true, httpxJevPageType: true, resourceEnumJevToolHealth: true,
-      hakrawlerJevSeedOrder: true, serializedScanJevRank: true,
+      hakrawlerJevSeedOrder: true, serializedScanJevRank: true, routeExposureJevRank: true,
+      routeExposureJevWallCheck: true, routeExposureJevAssess: true,
     })).toEqual(['ffufJevBasePaths', 'httpxJevPageType', 'resourceEnumJevToolHealth', 'hakrawlerJevSeedOrder',
-      'serializedScanJevRank'])
+      'serializedScanJevRank', 'routeExposureJevRank', 'routeExposureJevWallCheck', 'routeExposureJevAssess'])
   })
 
   test('every Jev field has a label for the refusal message', () => {

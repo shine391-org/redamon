@@ -129,6 +129,39 @@ class _Session:
                              # endpoint with no Parameter; the builder must skip it
                              "params": [{"name": "data", "sample_values": ["rO0ABXNy"]},
                                         {"name": None, "sample_values": []}]})
+        elif "openapi_security AS openapi_security" in cypher:
+            for url, host in BASEURLS:
+                rows.append({"base": url, "host": host, "path": "/api/v2/orders/1", "method": "GET",
+                             "category": "api", "sources": ["openapi"], "openapi_security": ["bearer"],
+                             "openapi_tags": ["internal"], "declared_only": True,
+                             "discovery_status": 401})
+                rows.append({"base": url, "host": host, "path": "/api/v2/orders/1", "method": "HEAD",
+                             "category": "api", "sources": ["openapi"], "openapi_security": None,
+                             "openapi_tags": None, "declared_only": True, "discovery_status": 200})
+                # What a previous route exposure run wrote: a route it generated
+                # (created by it, listed by nobody else), and one a crawler found
+                # that it only enriched.
+                rows.append({"base": url, "host": host, "path": "/api/v1/orders/1", "method": "GET",
+                             "category": "api", "sources": ["route_exposure"], "creator": "route_exposure",
+                             "openapi_security": None, "openapi_tags": None, "declared_only": None,
+                             "discovery_status": None})
+                rows.append({"base": url, "host": host, "path": "/api/admin/export", "method": "GET",
+                             "category": "api", "sources": ["route_exposure"], "creator": "resource_enum",
+                             "openapi_security": None, "openapi_tags": None, "declared_only": None,
+                             "discovery_status": None})
+        elif "finding_type: 'js_file'" in cypher:
+            bundle = "https://www.alpha.test/static/app.js"
+            for kind, path in (("route", "/admin/dashboard"), ("rest", "/api/admin/stats"),
+                               ("rest", "/api/public/news"), ("graphql", "/graphql")):
+                rows.append({"source_js": bundle, "base": "https://www.alpha.test", "path": path,
+                             "method": "GET", "kind": kind, "category": "api", "template": None})
+            rows.append({"source_js": "https://www.old.test/x.js", "base": "https://www.old.test",
+                         "path": "/api/stale", "method": "GET", "kind": "rest", "category": "api",
+                         "template": None})
+            rows.append({"source_js": "upload://bundle.js", "base": "upload", "path": "/api/up",
+                         "method": "GET", "kind": "rest", "category": "api", "template": None})
+        elif "USES_TECHNOLOGY" in cypher:
+            rows.append({"url": "https://www.alpha.test", "technologies": ["Spring Boot", "Java:17"]})
         elif "form_input_names" in cypher:
             for url, host in BASEURLS:
                 rows.append({"base": url, "host": host, "path": "/forms/aspnet",
@@ -401,6 +434,76 @@ class TestSerializedBuilder:
         assert ("native_java", "param", "https://www.alpha.test/api/load") in found
         assert not any("old.test" in url or url.startswith("https://beta.test/")
                        for _, _, url in found)
+
+
+class TestRouteExposureBuilder:
+    """_build_route_exposure_data_from_graph: the partial route exposure scan."""
+
+    def build(self, groups=GROUPS, settings=None):
+        return gb._build_route_exposure_data_from_graph(ROOTS, "u1", "p1", settings=settings or {},
+                                                        domain_groups=groups)
+
+    def test_a_stale_host_and_an_excluded_apex_are_dropped(self, graph):
+        data = self.build()
+        for section in (data["http_probe"]["by_url"], data["resource_enum"]["by_base_url"]):
+            assert not any("old.test" in u for u in section)
+            assert "https://beta.test" not in section
+        assert "https://alpha.test" in data["http_probe"]["by_url"]
+
+    def test_routes_keep_methods_openapi_and_the_denied_hint(self, graph):
+        eps = self.build()["resource_enum"]["by_base_url"]["https://www.alpha.test"]["endpoints"]
+        assert eps["/api/v2/orders/1"] == {
+            "methods": ["GET", "HEAD"], "category": "api", "sources": ["openapi"],
+            "declared_only": True,
+            "openapi": {"GET": {"security": ["bearer"], "tags": ["internal"]}},
+            "status_code": 401,
+        }
+
+    def test_technologies_and_ip_mode_targets(self, graph):
+        data = self.build(settings={"IP_MODE": True, "TARGET_IPS": ["10.0.0.1"]})
+        assert data["http_probe"]["by_url"]["https://www.alpha.test"]["technologies"] == ["Spring Boot", "Java:17"]
+        assert data["metadata"]["expanded_ips"] == ["10.0.0.1"]
+        assert data["subdomains"] == []
+
+    def test_the_rebuilt_corpus_is_what_the_scanner_reads(self, graph):
+        from recon.route_exposure import harvest, ranking
+        corpus = harvest.harvest(self.build())
+        route = corpus.routes[("https://www.alpha.test", "/api/v2/orders/1", "GET")]
+        ranking.score(route)
+        assert {"openapi", "openapi_tag", "declared_only", "seen_denied"} <= set(route.hints)
+        assert corpus.technologies["https://www.alpha.test"] == {"Spring Boot", "Java:17"}
+
+    def test_a_route_only_the_scan_created_is_not_read_back(self, graph):
+        eps = self.build()["resource_enum"]["by_base_url"]["https://www.alpha.test"]["endpoints"]
+        assert "/api/v1/orders/1" not in eps
+        # Created by a crawler: the scan's enrichment replaced its null sources,
+        # but it is still recon's route.
+        assert "/api/admin/export" in eps
+
+    def test_a_route_the_scan_wrote_is_generated_again_with_its_provenance(self, graph):
+        from recon.route_exposure import generators, harvest
+        corpus = harvest.harvest(self.build())
+        generators.generate(corpus, {"version_variants": True})
+        route = corpus.routes[("https://www.alpha.test", "/api/v1/orders/1", "GET")]
+        assert route.generated_by == "version"
+        assert route.variant_of == "/api/v2/orders/1"
+
+    def test_js_recon_endpoints_come_back_with_their_bundle_in_scope_only(self, graph):
+        eps = self.build()["js_recon"]["endpoints"]
+        assert {(e["type"], e["path"]) for e in eps} == {
+            ("route", "/admin/dashboard"), ("rest", "/api/admin/stats"), ("rest", "/api/public/news")}
+        assert all(e["source_js"] == "https://www.alpha.test/static/app.js" for e in eps)
+        assert eps[1]["resolved_url"] == "https://www.alpha.test/api/admin/stats"
+
+    def test_a_partial_run_tags_the_client_gated_api_as_a_full_run_does(self, graph):
+        from recon.route_exposure import harvest
+        corpus = harvest.harvest(self.build(), routers=True)     # as the scanner calls it
+        assert corpus.routes[("https://www.alpha.test", "/api/admin/stats", "GET")].client_gated
+        assert not corpus.routes[("https://www.alpha.test", "/api/public/news", "GET")].client_gated
+
+    def test_no_roots_reads_nothing(self, graph):
+        data = gb._build_route_exposure_data_from_graph([], "u1", "p1", settings={})
+        assert data["http_probe"]["by_url"] == {} and graph == []
 
 
 class TestGraphUrlScope:

@@ -198,6 +198,15 @@ def test_a_transient_model_failure_degrades_to_the_exact_groups():
 
     out = _run_service(llm=_Llm(error=_Busy("overloaded")))
     assert out["status"] == "model_unreadable"
+    # ...but says the call failed, with the provider's class and status (G-40).
+    assert out["model_call_failed"] == 1
+    assert (out["provider_status"], out["error_class"]) == (529, "_Busy")
+    assert "overloaded" not in str(out)
+
+
+def test_an_unreadable_answer_does_not_claim_the_call_failed():
+    out = _run_service(llm=_Llm("I think they are all fine"))
+    assert "model_call_failed" not in out
 
 
 def test_a_muted_or_missing_seed_is_seed_changed():

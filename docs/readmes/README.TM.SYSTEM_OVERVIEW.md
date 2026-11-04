@@ -48,7 +48,7 @@
 | Graph DB | **Neo4j 5.26 Community** + APOC plugin; bolt protocol (`docker-compose.yml`) |
 | AI agent | **Python / FastAPI / Uvicorn**, **LangGraph + LangChain**, LangGraph Postgres checkpointer (`agentic/`) |
 | LLM providers | OpenAI, Anthropic, Google Gemini, AWS Bedrock, OpenRouter, DeepSeek, Mistral, XAI, Qwen, GLM, Kimi, plus OpenAI-compatible / Ollama-local custom (`agentic/orchestrator_helpers/model_providers.py`) |
-| Decision model (non-chat) | **TypeSafe AI (Jev)**, `api.typesafe.ai`, called only by the agent (`agentic/jev_client.py`, `agentic/jev_hooks.py`) for four recon AI hooks when a project's `*AiUseJev` engine flag is on, and for five Jev-only hooks (`ffufJevBasePaths`, `httpxJevPageType`, `resourceEnumJevToolHealth`, `hakrawlerJevSeedOrder`, `serializedScanJevRank`) when theirs is. The one external service that receives **target-derived data** (response headers, body sample, tech fingerprint; and for the Jev-only hooks: crawled directory names, probed URLs with their title, Server, headers and the first 4 KB of body, hostnames, a collector's error output with header values redacted, and each flagged serialized object's printable snippet and the name of the parameter, cookie or header it rides in) besides the LLM provider the project's model routes to |
+| Decision model (non-chat) | **TypeSafe AI (Jev)**, `api.typesafe.ai`, called only by the agent (`agentic/jev_client.py`, `agentic/jev_hooks.py`) for four recon AI hooks when a project's `*AiUseJev` engine flag is on, and for eight Jev-only hooks (`ffufJevBasePaths`, `httpxJevPageType`, `resourceEnumJevToolHealth`, `hakrawlerJevSeedOrder`, `serializedScanJevRank`, and the route exposure scan's hooks `routeExposureJevRank`, `routeExposureJevWallCheck`, `routeExposureJevAssess`) when theirs is. The one external service that receives **target-derived data** (response headers, body sample, tech fingerprint; and for the Jev-only hooks: crawled directory names, probed URLs with their title, Server, headers and the first 4 KB of body, hostnames, a collector's error output with header values redacted, each flagged serialized object's printable snippet and the name of the parameter, cookie or header it rides in, and route paths with closed flags, and a route exposure lead's statuses, masked key names and closed hint labels, never a value) besides the LLM provider the project's model routes to |
 | Recon orchestration | **Python / FastAPI**, **Docker SDK** (`recon_orchestrator/`) — spawns scan containers |
 | Offensive tooling (MCP) | **Kali sandbox** exposing **MCP servers over SSE**: network-recon, nmap, nuclei, metasploit, playwright; plus interactive terminal + tunnel manager (`mcp/servers/`) |
 | Privilege separation | **docker-broker** — filtering reverse proxy for the Docker socket (`services/docker_broker/`) |
@@ -178,6 +178,8 @@ graph TD
 | Uploaded wordlists (`recon/wordlists`, ≤50 MB `.txt`) | User input | Mounted into recon containers |
 | Uploaded Nuclei templates (`mcp/nuclei-templates`, ≤1 MB `.yaml`) | User input | Executed by Nuclei |
 | Uploaded JS recon files (`js_recon_uploads/custom`, ≤10 MB) | User input | Analyzed by JS recon |
+| Agent Workspace uploads (files, folders, archives; ≤2 GiB and 50,000 entries each) | User input | Archives extracted entry by entry, never through a link or outside their folder; read by the agent |
+| Agent Workspace URL imports (GitHub and other git hosts, archives, files, website copies) | Third-party content | Fetched by the agent through the pinned SSRF transport, every redirect checked; website copies also obey the hard guardrail and the project's RoE exclusions; the agent sees signed facts about them, and their text only when it reads them |
 | RoE documents (`Project.roeDocumentData` bytes; PDF/DOCX/TXT) | User input | Parsed via pdfjs/mammoth → LLM |
 | Agent/community Chat Skills & Attack Skills (`agentic/skills`, `community-skills`, DB) | Behavior definitions | Steer agent tradecraft |
 | Knowledge Base data (`services/knowledge_base/data`, `kb_data` volume) | Reference corpus | NVD/ExploitDB/Nuclei/GTFOBins embeddings |
@@ -277,7 +279,8 @@ graph LR
 
 Everything above describes two ways in: a human at a browser, and RedAmon's own
 agent reaching OUT to tools. The inbound MCP server (`/api/mcp-server`,
-`MCP_SERVER_ENABLED`, off by default) adds a third: **an external AI agent
+`MCP_SERVER_ENABLED`, on by default for a local install, off by default on a
+single-host deploy) adds a third: **an external AI agent
 reaching IN**, authenticating as one user and driving recon on their behalf.
 
 This is RedAmon's THIRD MCP mode and the three are easy to conflate:
@@ -371,6 +374,30 @@ CIDR list (`403`) must not be banned for a configuration problem.
 - **There is no audit-log viewer.** Every call is recorded, failures included -
   a revoked token presented, a scope denied, a project id that was not the
   caller's - but reading it today is a SQL query against `audit_log`.
+
+### Agent in the Loop: the external agent becomes the brain
+
+With `AGENT_IN_THE_LOOP_ENABLED=true` (on by default; needs the MCP server) a
+person may pick `loop/mcp` as a chat's model. Every model call of that run then
+becomes a step that the person's own MCP client claims with `loop_wait_step` and
+answers with `loop_submit_step`. That makes the external agent a **trust boundary
+inside the agent loop**: what it returns is parsed as the agent's own decision.
+
+| Threat | Control |
+|---|---|
+| The driver approves its own dangerous action | Dangerous tools always ask the person in a loop run, whatever `REQUIRE_TOOL_CONFIRMATION` says; no MCP tool answers an approval, a question or a tool confirmation |
+| Target text injects instructions into the driver, which then uses its token's other powers | A driver token may hold no write or exec scope besides `agent:loop` (`loop_token_too_broad`); the skill pack frames prompts as data |
+| A token drives someone else's run | A step is offered only to a token of the run's owner, for a project that user owns (the webapp sends the owned project ids on every call); every claimed step and every answer is an audit row with the project as target |
+| An automated path switches a project to an outside brain | MCP writes, presets, imports and remembered user defaults refuse or drop a `loop/` model: a person picks it in the project form |
+| A loop model is called with no run to answer it (a hang, or a revert that routes `loop/mcp` to OpenAI) | Every builder outside a chat run refuses it (`loop_model_not_supported_here`); the revert procedure resets loop rows first |
+| A driver's Cypher writes the graph | The agent's own `query_graph` runs in a READ-access Neo4j session |
+| Long headless runs exhaust memory | The session cap counts live runs as well as connections; a run with no driver for 5 minutes ends |
+
+**Residual:** the step prompt carries target data and RedAmon's prompts to a
+client RedAmon does not control, which may hold shell, web or file tools on the
+person's machine and keeps its own transcripts. The pack's client templates turn
+those tools off, but that is the person's configuration, not an enforced
+boundary.
 
 ---
 
@@ -616,7 +643,7 @@ Webapp server-side routes under `webapp/src/app/api/` (all behind `middleware.ts
 | User agent skills | `/api/users/[id]/attack-skills` (GET list, POST create), `.../batch`, `.../name-check` (GET one name, POST a batch), `.../generate-metadata`, `.../import-community`, `.../[skillId]` (GET, PUT edit, DELETE), `.../[skillId]/release` | JWT. List, create, edit, delete, import and the name-check GET: `requireUserAccess` (the owner, an admin, or an internal-key caller). `batch`, the name-check POST and `generate-metadata`: same-origin, the strict effective owner (an admin must be acting as the user), no internal key, JSON only (415). `release`: same-origin and the session user must be the owner (an admin acting as the owner is refused). Every write goes through `userSkillWrites.ts` under the per-user advisory lock; a batch is saved whole or not at all; `generate-metadata` never sends a skill whose text holds a key or token to the model |
 | API usage report | `/api/users/[id]/settings/api-usage` (GET the saved report, POST run a check) | JWT; effective-user check (the owner, or an admin only while acting as that user); POST refuses the internal and scanner keys and any non-JSON body (a same-site form cannot start a run); the POST sends the user's stored keys to fixed provider account/usage endpoints, the GitHub Enterprise token only to the user's saved, validated Enterprise host (no redirect followed, 10 s, 256 KB); only numbers, plan names and last-4 hints are returned or stored; one audit row per run; off with `API_USAGE_CHECK_ENABLED=false` (also `0`/`no`/`off`, any case) |
 | Reports / analytics | `/api/reports/*`, `/api/analytics/redzone/*`, `/api/projects/[id]/reports` | JWT |
-| **File uploads** | `/api/projects/[id]/wordlists` (≤50 MB `.txt`), `/api/nuclei-templates` (≤1 MB `.yaml`), `/api/js-recon/[projectId]/upload` (≤10 MB), `/api/roe/parse` (≤20 MB PDF/DOCX → LLM), `/api/users/[id]/attack-skills/batch` (up to 50 `.md` skills of up to 50 KB each, sent as JSON, at most 8 MB: a larger `content-length` is refused with 413 before the body is read) | JWT; extension allowlist + `path.basename` sanitization; the skill batch is text read by the browser, never stored as a file |
+| **File uploads** | `/api/projects/[id]/wordlists` (≤50 MB `.txt`), `/api/nuclei-templates` (≤1 MB `.yaml`), `/api/js-recon/[projectId]/upload` (≤10 MB), `/api/roe/parse` (≤20 MB PDF/DOCX → LLM), `/api/users/[id]/attack-skills/batch` (up to 50 `.md` skills of up to 500 KB each, sent as JSON, at most 8 MB: a larger `content-length` is refused with 413 before the body is read) | JWT; extension allowlist + `path.basename` sanitization; the skill batch is text read by the browser, never stored as a file |
 | Projects | `/api/projects/*` (CRUD, import/export, presets) | JWT |
 | Triage and Mute Rules | `/api/triage/{findings,verdict,mute,unmute,muted,preflight}`, `/api/projects/[id]/node-filters/{,preview,apply,disarm,exemptions,status,runs/[runId]}` | JWT; strict owner check (`requireProjectOwner`: 404, not relaxed by `ACCESS_ENFORCE=0`), because these decide what the operator and the agent can see; every mutation with a body is JSON-only (415); Mute Rules changes and unmutes are audited with the real actor (a person's mute and a UI verdict are not) |
 | User presets | `/api/presets/*` (recon), `/api/mute-rule-presets/*` (Mute Rules) | JWT; scoped to the effective user; another user's preset answers 404 |

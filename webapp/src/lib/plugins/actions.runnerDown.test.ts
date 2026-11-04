@@ -55,8 +55,11 @@ describe('nothing listening', () => {
     process.env.PLUGIN_RUNNER_KEY = RUNNER_KEY
   })
 
-  test('sync: 503 runner_unavailable', async () => {
-    expect(await run('echo')).toMatchObject({ status: 503, body: { code: 'runner_unavailable' } })
+  test('sync: 503 runner_unavailable, saying it was not reached', async () => {
+    expect(await run('echo')).toEqual({
+      status: 503,
+      body: { error: 'The plugin runner could not be reached (unreachable); try again shortly.', code: 'runner_unavailable', reason: 'unreachable' },
+    })
   })
 
   test('async: 503, the job failed with runner_unavailable, the lock released, a retry starts afresh', async () => {
@@ -73,7 +76,25 @@ describe('nothing listening', () => {
 test('no runner key configured: 503 runner_unavailable, no request made', async () => {
   process.env.PLUGIN_RUNNER_URL = 'http://127.0.0.1:1'
   process.env.PLUGIN_RUNNER_KEY = ''
-  expect(await run('echo')).toMatchObject({ status: 503, body: { code: 'runner_unavailable' } })
+  // Not "try again": nothing changes until an administrator sets the key.
+  expect(await run('echo')).toEqual({
+    status: 503,
+    body: {
+      error: 'The plugin runner is not configured on this deployment: PLUGIN_RUNNER_KEY is not set (./redamon.sh up generates it).',
+      code: 'runner_unavailable',
+      reason: 'not_configured',
+    },
+  })
+})
+
+test.each<[string, number, string, string]>([
+  ['the proxy timed out', 504, 'upstream_timeout', 'The plugin runner did not answer in time (upstream_timeout); the action may still have run.'],
+  ['the proxy is full', 503, 'proxy_busy', 'The plugin-gateway proxy is busy (proxy_busy); try again shortly.'],
+  ['the proxy could not reach the runner', 502, 'upstream_unreachable', 'The plugin runner could not be reached (upstream_unreachable); try again shortly.'],
+])('%s: the reason and the proxy code', async (_n, status, code, error) => {
+  runner = await startEchoRunner({ 'echo/echo': () => ({ status, body: { error: 'proxy', code } }) })
+  const r = await run('echo')
+  expect(r).toMatchObject({ status: 503, body: { error, code: 'runner_unavailable', proxyCode: code } })
 })
 
 test('the runner has not started this plugin yet (404 unknown_plugin): 503 plugin_not_running', async () => {

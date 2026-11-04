@@ -22,6 +22,7 @@ const h = vi.hoisted(() => ({
   casCount: 1,
   jevTokens: 0,
   recording: null as { id: string } | null,
+  txError: null as Error | null,
   calls: {
     revisionCreate: [] as unknown[], revisionDelete: [] as unknown[], updateMany: [] as unknown[],
     schedulePause: [] as unknown[], fireteam: [] as unknown[], recordingUpdate: [] as unknown[],
@@ -65,7 +66,10 @@ vi.mock('@/lib/prisma', () => ({
       findFirst: async () => h.recording,
       update: async (a: unknown) => { h.calls.recordingUpdate.push(a); return {} },
     },
-    $transaction: async (fn: (tx: unknown) => unknown) => fn(fakeTx()),
+    $transaction: async (fn: (tx: unknown) => unknown) => {
+      if (h.txError) throw h.txError
+      return fn(fakeTx())
+    },
   },
 }))
 vi.mock('@/lib/audit', () => ({ writeAudit: (...a: unknown[]) => h.audit(...a) }))
@@ -160,6 +164,7 @@ beforeEach(() => {
   h.casCount = 1
   h.jevTokens = 0
   h.recording = null
+  h.txError = null
   for (const k of Object.keys(h.calls) as (keyof typeof h.calls)[]) h.calls[k] = []
   h.extract.mockResolvedValue({
     text: DOC_TEXT, pages: 1, truncated: false, bytesSha256: DOC_SHA, textSha256: digestScopeDocument(DOC_TEXT),
@@ -412,5 +417,18 @@ describe('remove', () => {
 
   test('a malformed body is 400', async () => {
     expect((await del({ changes: {} })).status).toBe(400)
+  })
+})
+
+describe('a transaction that fails names its cause', () => {
+  test('the fixed sentence plus the Prisma code, never the Prisma message', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.txError = Object.assign(
+      new Error('Transaction already closed: a commit cannot be executed on an expired transaction (timeout 5000 ms)'),
+      { code: 'P2028', name: 'PrismaClientKnownRequestError' },
+    )
+    const res = await post({ changes: { roeGlobalMaxRps: 5 }, parsedFields: { roeGlobalMaxRps: 5 } })
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to apply the Rules of Engagement.', code: 'P2028' })
   })
 })

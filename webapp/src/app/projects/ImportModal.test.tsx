@@ -39,3 +39,37 @@ describe('import warnings', () => {
     expect(items).toEqual(['Dropped hostnames the current rules refuse: not a host', 'Skill toggles trimmed'])
   })
 })
+
+async function failWith(fetchImpl: () => Promise<unknown>) {
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(fetchImpl))
+  const { container } = render(<ImportModal isOpen userId="u1" onClose={vi.fn()} onSuccess={vi.fn()} />)
+  const input = container.querySelector('input[type="file"]') as HTMLInputElement
+  fireEvent.change(input, { target: { files: [new File(['zip'], 'export.zip', { type: 'application/zip' })] } })
+  fireEvent.click(screen.getByRole('button', { name: /Import/ }))
+  await waitFor(() => screen.getByText('Import Failed'))
+}
+
+describe('a failed import names its cause', () => {
+  test('the dialog states the size cap', () => {
+    render(<ImportModal isOpen userId="u1" onClose={vi.fn()} onSuccess={vi.fn()} />)
+    expect(screen.getByText(/Archives up to 55 MB\./)).toBeInTheDocument()
+  })
+
+  test('an oversized archive shows the limit, not a FormData parse error', async () => {
+    await failWith(async () => new Response(JSON.stringify({
+      error: 'The upload is larger than 55 MB.', code: 'body_too_large', limitBytes: 55 * 1024 * 1024,
+    }), { status: 413 }))
+    expect(screen.getByText('The upload is larger than 55 MB. (body_too_large · HTTP 413)')).toBeInTheDocument()
+    expect(toast.error).toHaveBeenCalledWith('Import failed')
+  })
+
+  test('a proxy error page shows its status instead of a JSON parse error', async () => {
+    await failWith(async () => new Response('<html>504 Gateway Time-out</html>', { status: 504 }))
+    expect(screen.getByText('Import failed (non_json_response · HTTP 504)')).toBeInTheDocument()
+  })
+
+  test('no answer at all is a network_error', async () => {
+    await failWith(async () => { throw new TypeError('Failed to fetch') })
+    expect(screen.getByText('Import failed (network_error)')).toBeInTheDocument()
+  })
+})

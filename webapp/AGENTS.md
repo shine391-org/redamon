@@ -12,6 +12,7 @@ When performing these actions, ALWAYS invoke the corresponding skill FIRST:
 | ------ | ----- |
 | Adding a built-in attack skill to the agent | `builtin-agent-skill` |
 | Adding a non-chat provider type, or a path that picks any provider row | `llm-provider-integration` |
+| Adding an agent model call site, a retry loop, or a path that builds an LLM from a model id | `agent-in-the-loop` |
 | Adding or integrating an LLM provider | `llm-provider-integration` |
 | Adding, removing or changing a tool on the inbound MCP server | `mcp-server-tools` |
 | Changing MCP token scopes, their UI wording, or the MCP API reference generator | `mcp-server-tools` |
@@ -21,6 +22,7 @@ When performing these actions, ALWAYS invoke the corresponding skill FIRST:
 | Editing a Prisma @default, a Python settings default, or the /defaults endpoint | `project-settings-cascade` |
 | Editing agent skill classification, phase injection, or the attack-skill UI | `builtin-agent-skill` |
 | Editing model-id routing or provider credential handling | `llm-provider-integration` |
+| Editing the Agent in the Loop broker, adapter, routes or loop MCP tools | `agent-in-the-loop` |
 | Editing the Priority Board, the triage graph mixin, or the MCP triage tools | `priority-board-triage` |
 | Editing the plugin platform: the plugins lib or routes, the plugin runner, or the Gateway | `plugin-platform` |
 
@@ -46,6 +48,16 @@ When performing these actions, ALWAYS invoke the corresponding skill FIRST:
   skill cannot be turned on. Write project rows that change toggles through
   Prisma, never raw SQL, so `updatedAt` moves and an open form gets a stale
   save instead of reverting the change.
+- **NEVER answer a failure with the exception's text, and never let the
+  browser drop its cause.** A route's catch answers `internalError(err,
+  '<fixed sentence>')` ([routeErrors.ts](src/lib/routeErrors.ts)): `{error,
+  code}`, where `code` is the Prisma or Neo4j code, the errno or the class,
+  because `error.message` can quote query values, target data or keys. A handler
+  without try/catch is wrapped in `withRouteErrors` (Next's own 500 has no body);
+  a service that failed answers `upstreamFailureResponse` /
+  `upstreamErrorResponse`. The browser reads a failure with `readApiError` /
+  `fetchJson` ([apiError.ts](src/lib/apiError.ts)), whose message carries the
+  code and HTTP status, so a screenshot is enough to tell the causes apart.
 
 ---
 
@@ -77,7 +89,7 @@ its UI `src/components/plugins/` and `src/app/plugins/`; the `plugin-platform` s
 cd webapp
 npm run test          # vitest run --no-file-parallelism (full parallelism OOMs the box)
 npm run type-check    # tsc --noEmit
-npm run lint          # next lint
+npm run lint          # ESLint flat config (Next.js core-web-vitals)
 
 # Prisma schema changes: db push, NOT migrate
 docker compose exec webapp npx prisma db push

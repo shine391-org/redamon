@@ -51,20 +51,47 @@ describe('GET judge-model', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  test.each([
-    ['the orchestrator answers 503', () => new Response('{"detail":"Local LLM manager not initialized"}', { status: 503 })],
-    ['the status has no model', () => new Response(JSON.stringify({ ...STATUS, model: '' }), { status: 200 })],
-  ])('503 with no model when %s', async (_name, reply) => {
-    fetchMock.mockResolvedValue(reply())
+  // The three causes read differently on the page: no answer, a failed answer
+  // (with its status), and an answer without a model.
+  test('503 with no model, reason orchestrator_error and its status, when the orchestrator answers 503', async () => {
+    fetchMock.mockResolvedValue(new Response('{"detail":"Local LLM manager not initialized"}', { status: 503 }))
     const res = await call()
     expect(res.status).toBe(503)
-    expect((await res.json()).model).toBeNull()
+    expect(await res.json()).toEqual({
+      model: null, error: 'The local judge model is unavailable',
+      code: 'orchestrator_error', reason: 'orchestrator_error', upstreamStatus: 503,
+    })
   })
 
-  test('503 with no model when the orchestrator is down', async () => {
-    fetchMock.mockRejectedValue(new TypeError('fetch failed'))
+  test('503 with no model, reason no_model, when the status has no model', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ...STATUS, model: '' }), { status: 200 }))
     const res = await call()
     expect(res.status).toBe(503)
-    expect((await res.json()).model).toBeNull()
+    const body = await res.json()
+    expect(body.model).toBeNull()
+    expect(body.reason).toBe('no_model')
+    expect(body).not.toHaveProperty('upstreamStatus')
+  })
+
+  test('503 with no model, reason orchestrator_unreachable and the errno, when the orchestrator is down', async () => {
+    fetchMock.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect'), { code: 'ECONNREFUSED' }),
+    }))
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await call()
+    spy.mockRestore()
+    expect(res.status).toBe(503)
+    const body = await res.json()
+    expect(body.model).toBeNull()
+    expect(body).toMatchObject({ reason: 'orchestrator_unreachable', code: 'orchestrator_unreachable', cause: 'ECONNREFUSED' })
+  })
+
+  test('504, reason orchestrator_timeout, when the status call times out', async () => {
+    fetchMock.mockRejectedValue(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }))
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await call()
+    spy.mockRestore()
+    expect(res.status).toBe(504)
+    expect((await res.json()).reason).toBe('orchestrator_timeout')
   })
 })

@@ -212,6 +212,15 @@ describe('preconditions', () => {
     // Nothing was taken, so nothing must be released either.
     expect(h.release).not.toHaveBeenCalled()
   })
+
+  test('a failing node-filter check under the lock releases the lock and answers its code', async () => {
+    h.nodeFilterWriter.mockRejectedValue(Object.assign(new Error('pool exhausted'), { code: 'P2024' }))
+    const res = await POST(req(), params('p1', 'v1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Activation failed', code: 'P2024' })
+    expect(h.release).toHaveBeenCalledWith('p1')
+    expect(h.clearGraph).not.toHaveBeenCalled()
+  })
 })
 
 describe('the swap', () => {
@@ -328,6 +337,37 @@ describe('failure modes', () => {
     const res = await POST(req(), params('p1', 'v1'))
     expect(res.status).toBe(500)
     expect(h.release).toHaveBeenCalledWith('p1')
+  })
+
+  test('a freeze failure answers the fixed reason and the Neo4j code, never the exception text', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.capture.mockRejectedValue(Object.assign(new Error('MATCH (n {project_id: "p1"}) failed on host 10.0.0.7'), {
+      code: 'Neo.TransientError.General.DatabaseUnavailable',
+    }))
+    const res = await POST(req(), params('p1', 'v1'))
+    expect(await res.json()).toEqual({
+      error: 'Could not save the current graph before switching, so nothing was changed.',
+      code: 'Neo.TransientError.General.DatabaseUnavailable',
+      freezeFailed: true,
+    })
+  })
+
+  test('a mid-restore failure keeps its flags and drops the exception text', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.restore.mockRejectedValue(new Error('apoc exploded on node alpha.test'))
+    const body = await (await POST(req(), params('p1', 'v1'))).json()
+    expect(body).toEqual({
+      error: 'Activation failed while rebuilding the graph. No version data was lost - retry the activation to rebuild it.',
+      code: 'internal_error', restoreFailed: true, retriable: true,
+    })
+  })
+
+  test('a throw before the lock answers a readable 500, not an empty body', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.describeWriters.mockRejectedValue(Object.assign(new Error('pool exhausted'), { code: 'P2024' }))
+    const res = await POST(req(), params('p1', 'v1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Activation failed', code: 'P2024' })
   })
 
   test('the Neo4j session is closed even when the restore throws', async () => {

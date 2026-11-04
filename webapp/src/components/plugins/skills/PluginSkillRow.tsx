@@ -6,6 +6,7 @@ import { useAlertModal, useToast } from '@/components/ui'
 import { PluginBadge } from '@/components/plugins/PluginBadge'
 import { dormantCopy } from '@/components/plugins/review/dormantCopy'
 import { OverrideApiError, resetSkill } from '@/components/plugins/review/overridesClient'
+import { errorMessage } from '@/lib/apiError'
 import type { SkillSummary } from '@/lib/plugins/summaryModel'
 import { runPluginAction } from '@/components/plugins/runPluginAction'
 import { useFeatureModelGate } from '@/components/shared/FeatureModelGate'
@@ -73,7 +74,9 @@ export function PluginSkillRow({
       toast.success('Reset to factory.')
       onReset()
     } catch (e) {
-      toast.error(e instanceof OverrideApiError ? e.message : 'Could not reset this skill.')
+      toast.error(errorMessage(e, 'Could not reset this skill.'))
+      // The reset took effect; only what came after it failed. Show the factory state now.
+      if (e instanceof OverrideApiError && e.extra.committed === true) onReset()
     } finally {
       setBusy(false)
     }

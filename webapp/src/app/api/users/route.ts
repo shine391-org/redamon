@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { hashPassword } from '@/lib/auth'
 import { getSession, isInternalRequest } from '@/lib/session'
+import { internalError } from '@/lib/routeErrors'
 
 // GET /api/users - List users (admin: all, standard: self only, internal: all)
 export async function GET(request: NextRequest) {
@@ -45,11 +46,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(safeUsers)
   } catch (error) {
-    console.error('Failed to fetch users:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch users' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch users')
   }
 }
 
@@ -95,8 +92,6 @@ export async function POST(request: NextRequest) {
       updatedAt: user.updatedAt,
     }, { status: 201 })
   } catch (error: unknown) {
-    console.error('Failed to create user:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2002') {
       return NextResponse.json(
         { error: 'A user with this email already exists' },
@@ -104,9 +99,6 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to create user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create user')
   }
 }

@@ -41,3 +41,49 @@ describe('stopPartialRecon', () => {
     expect(result.current.runs).toEqual([])
   })
 })
+
+describe('failures carry their cause', () => {
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status })
+
+  test('a refused stop is still readable after the refetch that reverts the optimistic state', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => (
+      String(url).endsWith('/stop')
+        ? json(503, { error: 'Failed to stop partial recon', code: 'orchestrator_unreachable' })
+        : json(200, { project_id: 'p1', runs: [run('running')] })
+    )))
+    const { result } = renderHook(() => useMultiPartialReconStatus({ projectId: 'p1' }))
+    await waitFor(() => expect(result.current.runs).toHaveLength(1))
+    let answer: unknown = 'not called'
+    await act(async () => { answer = await result.current.stopPartialRecon('r1') })
+    expect(answer).toBeNull()
+    expect(result.current.runs.map(r => r.status)).toEqual(['running'])
+    expect(result.current.error).toBe('Failed to stop partial recon (orchestrator_unreachable · HTTP 503)')
+  })
+
+  test('an unavailable list keeps the runs already shown', async () => {
+    let down = false
+    vi.stubGlobal('fetch', vi.fn(async () => (down
+      ? json(503, { error: 'Partial recon list unavailable', code: 'orchestrator_unreachable' })
+      : json(200, { project_id: 'p1', runs: [run('running')] }))))
+    const { result } = renderHook(() => useMultiPartialReconStatus({ projectId: 'p1' }))
+    await waitFor(() => expect(result.current.runs).toHaveLength(1))
+    down = true
+    await act(async () => { await result.current.refetch() })
+    expect(result.current.runs).toHaveLength(1)
+    expect(result.current.error).toBe('Partial recon list unavailable (orchestrator_unreachable · HTTP 503)')
+  })
+
+  test('a refused start keeps its code for the start-failure modal', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => (
+      init?.method === 'POST' && String(url).endsWith('/partial')
+        ? json(504, { error: 'unknown whether it started', code: 'orchestrator_timeout', startOutcome: 'unknown' })
+        : json(200, { project_id: 'p1', runs: [] })
+    )))
+    const { result } = renderHook(() => useMultiPartialReconStatus({ projectId: 'p1' }))
+    await act(async () => { await result.current.startPartialRecon({ tool_id: 'Naabu' } as never) })
+    expect(result.current.getLastStartError()).toEqual({
+      message: 'unknown whether it started', status: 504, code: 'orchestrator_timeout',
+    })
+    expect(result.current.error).toBe('unknown whether it started (orchestrator_timeout · HTTP 504)')
+  })
+})

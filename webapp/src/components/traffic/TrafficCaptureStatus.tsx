@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { useAuth } from '@/providers/AuthProvider'
+import { fetchJson, errorMessage } from '@/lib/apiError'
 
 /**
  * Read-only per-project TrafficMind capture-routing status for the /traffic page
@@ -18,19 +19,27 @@ export function TrafficCaptureStatus({
   projectName?: string | null
 }) {
   const [enabled, setEnabled] = useState<boolean | null>(null)
+  // A failed read is not "Disabled": that told the operator to ask an admin to
+  // enable a capture that may well be on.
+  const [loadError, setLoadError] = useState<string | null>(null)
   const { isAdmin } = useAuth()
 
   useEffect(() => {
     let cancelled = false
     setEnabled(null)
+    setLoadError(null)
     if (!projectId) return
-    fetch(`/api/projects/${projectId}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((p) => { if (!cancelled && p) setEnabled(!!p.captureProxyEnabled) })
-      .catch(() => { if (!cancelled) setEnabled(false) })
+    fetchJson<{ captureProxyEnabled?: boolean }>(`/api/projects/${projectId}`, undefined, 'Capture status unavailable')
+      .then((p) => { if (!cancelled) setEnabled(!!p.captureProxyEnabled) })
+      .catch((err) => { if (!cancelled) setLoadError(errorMessage(err, 'Capture status unavailable')) })
     return () => { cancelled = true }
   }, [projectId])
 
+  if (loadError) {
+    return (
+      <span style={{ fontSize: 13, color: 'var(--text-tertiary)' }} role="status">{loadError}</span>
+    )
+  }
   if (enabled === null) return null
 
   const on = enabled

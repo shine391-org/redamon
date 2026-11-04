@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   effectiveUser: vi.fn(),
   countAuthorizations: vi.fn(),
   archiveTransaction: vi.fn(),
+  purgeWorkspace: vi.fn(),
 }))
 
 vi.mock('@/lib/prisma', () => ({
@@ -31,6 +32,7 @@ vi.mock('@/lib/prisma', () => ({
 }))
 vi.mock('@/app/api/graph/neo4j', () => ({ getGraphSession: () => ({ run: vi.fn(), close: vi.fn() }) }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
+vi.mock('@/lib/workspacePurge', () => ({ purgeProjectWorkspace: (...a: unknown[]) => h.purgeWorkspace(...a) }))
 vi.mock('@/lib/access', async () => {
   const actual = await vi.importActual<typeof import('@/lib/access')>('@/lib/access')
   return { ...actual, requireEffectiveUser: () => h.effectiveUser(), requireProjectAccess: () => null }
@@ -52,6 +54,35 @@ beforeEach(() => {
   h.archiveTransaction.mockImplementation(async (fn: (tx: unknown) => unknown) =>
     fn({ $executeRawUnsafe: async () => 1 })
   )
+  h.purgeWorkspace.mockResolvedValue(undefined)
+})
+
+describe('deleting a project deletes its agent workspace', () => {
+  test('purges the workspace only after the project row is deleted', async () => {
+    expect((await DELETE(del(), params('p1'))).status).toBe(200)
+    expect(h.purgeWorkspace).toHaveBeenCalledWith('p1')
+    expect(h.projectDelete.mock.invocationCallOrder[0])
+      .toBeLessThan(h.purgeWorkspace.mock.invocationCallOrder[0])
+  })
+
+  test('an agent failure does not fail the project delete', async () => {
+    // The real helper never throws; even a rejected call must not surface.
+    const { purgeProjectWorkspace } = await vi.importActual<typeof import('@/lib/workspacePurge')>('@/lib/workspacePurge')
+    h.purgeWorkspace.mockImplementation(purgeProjectWorkspace)
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed') }))
+    try {
+      expect((await DELETE(del(), params('p1'))).status).toBe(200)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  test('a failed authorization archive never purges', async () => {
+    h.countAuthorizations.mockResolvedValue(2)
+    h.archiveTransaction.mockRejectedValue(new Error('archive table missing'))
+    expect((await DELETE(del(), params('p1'))).status).toBe(500)
+    expect(h.purgeWorkspace).not.toHaveBeenCalled()
+  })
 })
 
 describe('the record of what authorized an engagement outlives the engagement', () => {
@@ -79,8 +110,32 @@ describe('the record of what authorized an engagement outlives the engagement', 
     h.archiveTransaction.mockRejectedValue(new Error('archive table missing'))
     const res = await DELETE(del(), params('p1'))
     expect(res.status).toBe(500)
-    expect((await res.json()).error).toMatch(/must outlive/)
+    const body = await res.json()
+    expect(body.error).toMatch(/must outlive/)
+    expect(body.code).toBe('authorization_archive_failed')
     expect(h.projectDelete).not.toHaveBeenCalled()
+  })
+})
+
+describe('a delete that fails says why without quoting the error', () => {
+  test('a database failure answers the fixed sentence and the Prisma code', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.projectDelete.mockRejectedValue(Object.assign(
+      new Error('Timed out fetching a new connection: DELETE FROM "Project" WHERE id = \'p1\''),
+      { code: 'P2024', name: 'PrismaClientKnownRequestError' },
+    ))
+    const res = await DELETE(del(), params('p1'))
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to delete project', code: 'P2024' })
+    expect(JSON.stringify(body)).not.toContain('DELETE FROM')
+  })
+
+  test('a row that is already gone is a 404', async () => {
+    h.projectDelete.mockRejectedValue(Object.assign(new Error('not found'), { code: 'P2025' }))
+    const res = await DELETE(del(), params('p1'))
+    expect(res.status).toBe(404)
+    expect((await res.json()).error).toBe('Project not found')
   })
 })
 

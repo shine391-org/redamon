@@ -283,3 +283,37 @@ describe('useConversationRestoration - events that arrive while the resync reads
     expect(card.interrupted).toBe(true)
   })
 })
+
+describe('useConversationRestoration - failures the person is told about (G-10, G-18)', () => {
+  test('a failed delete keeps the chat on screen', async () => {
+    const deps = makeDeps({ items: [] }, { ...conv, messages: [] })
+    deps.deleteConversation = vi.fn(async () => false)
+    const hook = renderHook(() => useConversationRestoration(deps))
+    act(() => { hook.result.current.setConversationId('c1') })
+    await act(async () => { await hook.result.current.handleDeleteConversation('c1') })
+    expect(deps.handleNewChat).not.toHaveBeenCalled()
+    expect(deps.onRefetchGraph).not.toHaveBeenCalled()
+  })
+
+  test('a delete that went through still clears the chat', async () => {
+    const deps = makeDeps({ items: [] }, { ...conv, messages: [] })
+    deps.deleteConversation = vi.fn(async () => true)
+    const hook = renderHook(() => useConversationRestoration(deps))
+    act(() => { hook.result.current.setConversationId('c1') })
+    await act(async () => { await hook.result.current.handleDeleteConversation('c1') })
+    expect(deps.handleNewChat).toHaveBeenCalled()
+  })
+
+  test('a project switch whose session list fails says so before opening a fresh chat', async () => {
+    const { saveProjectSession } = await import('../sessionMemory')
+    saveProjectSession('p1', 'c1')
+    const { ApiError } = await import('@/lib/apiError')
+    const deps = makeDeps({ items: [] }, { ...conv, messages: [] })
+    deps.fetchConversations = vi.fn(async () => new ApiError({ reason: 'Failed to fetch conversations', status: 500, code: 'P1001' }))
+    deps.notifyError = vi.fn()
+    const hook = renderHook(() => useConversationRestoration(deps))
+    await act(async () => { await hook.result.current.restoreForProject() })
+    expect(deps.notifyError).toHaveBeenCalledWith('Could not reopen your last session: Failed to fetch conversations (P1001 · HTTP 500)')
+    expect(deps.handleNewChat).toHaveBeenCalled()
+  })
+})

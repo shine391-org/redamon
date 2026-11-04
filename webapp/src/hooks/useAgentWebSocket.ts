@@ -7,6 +7,9 @@
 
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { buildAgentWsUrl } from './agentWsUrl'
+import { describeWsClose, wsUrlForDisplay } from './agentWsClose'
+import { ApiError } from '@/lib/apiError'
+import { mintWsTicket } from '@/lib/wsTicket'
 import {
   MessageType,
   ConnectionStatus,
@@ -36,6 +39,30 @@ export const PING_INTERVAL_MS = 30_000
  *  still reports it open (half-open TCP): reconnect instead of waiting. */
 export const PONG_TIMEOUT_MS = 75_000
 
+const TICKET_REFUSED = 'Could not get a ticket for the agent connection'
+
+/** The mint's own refusal (expired session, no project access, a version
+ *  activation in progress), named as the reason the socket is not connected. */
+function ticketRefusal(err: ApiError): ApiError {
+  const reason = err.reason.startsWith(TICKET_REFUSED) ? err.reason : `${TICKET_REFUSED}: ${err.reason}`
+  return new ApiError({ reason, status: err.status, code: err.code, upstreamStatus: err.upstreamStatus, body: err.body })
+}
+
+/** The agent's 1008, told by its reason: the update hint only where a missing
+ *  ticket secret is the cause. */
+function authFailureText(ticketMissing: boolean, reason: string): string {
+  if (ticketMissing) {
+    return 'Agent WebSocket authentication failed: no session ticket was issued. Run ./redamon.sh update to generate AGENT_WS_TICKET_SECRET, then restart the webapp and agent.'
+  }
+  if (reason === 'ticket auth not configured') {
+    return 'Agent WebSocket authentication failed: the agent has no AGENT_WS_TICKET_SECRET. Run ./redamon.sh update, then restart the agent.'
+  }
+  if (!reason || reason === 'Invalid or missing ticket') {
+    return `Agent WebSocket authentication failed: the agent rejected the session ticket (${describeWsClose(1008, reason)}). Check that AGENT_WS_TICKET_SECRET matches for the webapp and agent containers.`
+  }
+  return `Agent WebSocket authentication failed (${describeWsClose(1008, reason)})`
+}
+
 // =============================================================================
 // HOOK CONFIGURATION
 // =============================================================================
@@ -57,16 +84,28 @@ interface UseAgentWebSocketConfig {
   reconnectInterval?: number
 }
 
+export interface AgentSocketClose {
+  code: number
+  /** Written by the agent (fixed text), empty for a bare drop. */
+  reason: string
+}
+
 interface UseAgentWebSocketReturn {
   status: ConnectionStatus
   isConnected: boolean
   reconnectAttempt: number
   error: Error | null
+  /** The last close since the socket was connected, kept across reconnect attempts. */
+  lastClose: AgentSocketClose | null
+  /** The URL dialed, without its query. */
+  url: string | null
   sendQuery: (question: string) => void
-  sendApproval: (decision: 'approve' | 'modify' | 'abort', modification?: string) => void
-  sendToolConfirmation: (decision: 'approve' | 'modify' | 'reject', modifications?: Record<string, any>) => void
-  sendFireteamMemberConfirmation: (wave_id: string, member_id: string, decision: 'approve' | 'reject', modifications?: Record<string, any>) => void
-  sendAnswer: (answer: string) => void
+  // Decisions return false when they were not sent (no authenticated socket):
+  // they are never queued, a stale approval must not land on a later request.
+  sendApproval: (decision: 'approve' | 'modify' | 'abort', modification?: string) => boolean
+  sendToolConfirmation: (decision: 'approve' | 'modify' | 'reject', modifications?: Record<string, any>) => boolean
+  sendFireteamMemberConfirmation: (wave_id: string, member_id: string, decision: 'approve' | 'reject', modifications?: Record<string, any>) => boolean
+  sendAnswer: (answer: string) => boolean
   sendGuidance: (message: string) => void
   sendSkillInject: (payload: { skill_id: string; skill_name: string; content: string }) => void
   sendStop: () => void
@@ -97,6 +136,9 @@ export function useAgentWebSocket({
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED)
   const [reconnectAttempt, setReconnectAttempt] = useState(0)
   const [error, setError] = useState<Error | null>(null)
+  const [lastClose, setLastClose] = useState<AgentSocketClose | null>(null)
+  const [url, setUrl] = useState<string | null>(null)
+  const urlRef = useRef<string | null>(null)
 
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -152,22 +194,29 @@ export function useAgentWebSocket({
   // still sent, but the agent FAILS CLOSED and rejects it with close code 1008
   // (see handleClose) - it does not fail open, whatever the mint side says.
   const sendInit = useCallback(async () => {
-    if (!wsRef.current || isAuthenticatedRef.current) return
+    const ws = wsRef.current
+    if (!ws || isAuthenticatedRef.current) return
 
-    let ticket: string | undefined
-    try {
-      const resp = await fetch('/api/agent/ws-ticket', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, sessionId }),
-      })
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data?.ticket) ticket = data.ticket as string
-      }
-    } catch {
-      // Non-fatal here: the rejection below is what the user is told about.
+    const minted = await mintWsTicket(projectId, sessionId)
+    if (!minted.ok) {
+      // A ticketless init would only earn the agent's 1008 and the wrong
+      // hint; the mint already says why. A newer socket mints its own.
+      if (wsRef.current !== ws) return
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      ws.close()
+      wsRef.current = null
+      const refusal = ticketRefusal(minted.error)
+      setStatus(ConnectionStatus.FAILED)
+      setError(refusal)
+      onError?.(refusal)
+      return
     }
+    // Null on success: the webapp has no ticket secret. The init still goes
+    // out, and the agent's 1008 is then explained by ticketMissingRef.
+    const ticket = minted.ticket ?? undefined
     ticketMissingRef.current = !ticket
 
     const initPayload: InitPayload = {
@@ -180,7 +229,7 @@ export function useAgentWebSocket({
     appliedViewRef.current = graphViewCypherRef.current
 
     sendMessage(MessageType.INIT, initPayload)
-  }, [userId, projectId, sessionId, sendMessage])
+  }, [userId, projectId, sessionId, sendMessage, onError])
 
   // Public API: Send query
   const sendQuery = useCallback((question: string) => {
@@ -195,22 +244,24 @@ export function useAgentWebSocket({
   // Public API: Send approval
   const sendApproval = useCallback((decision: 'approve' | 'modify' | 'abort', modification?: string) => {
     if (!isAuthenticatedRef.current) {
-      return
+      return false
     }
 
     const approvalPayload: ApprovalPayload = { decision, modification }
     sendMessage(MessageType.APPROVAL, approvalPayload)
+    return true
   }, [sendMessage])
 
   // Public API: Send tool confirmation
   const sendToolConfirmation = useCallback((decision: 'approve' | 'modify' | 'reject', modifications?: Record<string, any>) => {
     if (!isAuthenticatedRef.current) {
-      return
+      return false
     }
 
     const payload: any = { decision }
     if (modifications) payload.modifications = modifications
     sendMessage(MessageType.TOOL_CONFIRMATION, payload)
+    return true
   }, [sendMessage])
 
   // Public API: Send a single fireteam member's dangerous-tool decision.
@@ -222,20 +273,22 @@ export function useAgentWebSocket({
     decision: 'approve' | 'reject',
     modifications?: Record<string, any>,
   ) => {
-    if (!isAuthenticatedRef.current) return
+    if (!isAuthenticatedRef.current) return false
     const payload: any = { wave_id, member_id, decision }
     if (modifications) payload.modifications = modifications
     sendMessage(MessageType.FIRETEAM_MEMBER_CONFIRMATION, payload)
+    return true
   }, [sendMessage])
 
   // Public API: Send answer
   const sendAnswer = useCallback((answer: string) => {
     if (!isAuthenticatedRef.current) {
-      return
+      return false
     }
 
     const answerPayload: AnswerPayload = { answer }
     sendMessage(MessageType.ANSWER, answerPayload)
+    return true
   }, [sendMessage])
 
   // Public API: Send guidance (steer agent while it's working)
@@ -315,6 +368,7 @@ export function useAgentWebSocket({
         setStatus(ConnectionStatus.CONNECTED)
         setReconnectAttempt(0)
         setError(null)
+        setLastClose(null)
         startPingInterval()
         flushOutbox()
         onConnect?.(message.payload as ConnectedPayload)
@@ -347,6 +401,7 @@ export function useAgentWebSocket({
     stopPingInterval()
     wsRef.current = null
     setStatus(ConnectionStatus.DISCONNECTED)
+    setLastClose({ code: event.code, reason: event.reason || '' })
     onDisconnect?.()
 
     // 1008 = the agent refused the init frame (ws_ticket verification). It is a
@@ -354,11 +409,7 @@ export function useAgentWebSocket({
     // "Connecting..." forever, which is how a missing AGENT_WS_TICKET_SECRET
     // reached users as a silent hang. Stop and say what is wrong.
     if (event.code === 1008) {
-      const authError = new Error(
-        ticketMissingRef.current
-          ? 'Agent WebSocket authentication failed: no session ticket was issued. Run ./redamon.sh update to generate AGENT_WS_TICKET_SECRET, then restart the webapp and agent.'
-          : 'Agent WebSocket authentication failed: the agent rejected the session ticket. Check that AGENT_WS_TICKET_SECRET matches for the webapp and agent containers.'
-      )
+      const authError = new Error(authFailureText(ticketMissingRef.current, event.reason || ''))
       setStatus(ConnectionStatus.FAILED)
       setError(authError)
       onError?.(authError)
@@ -370,12 +421,17 @@ export function useAgentWebSocket({
       setStatus(ConnectionStatus.RECONNECTING)
       setReconnectAttempt(prev => prev + 1)
 
+      // The latest connect, whose close handler sees the current attempt
+      // count; this render's would reconnect forever and never reach FAILED.
       reconnectTimeoutRef.current = setTimeout(() => {
-        connect()
+        connectRef.current()
       }, reconnectInterval)
     } else if (reconnectAttempt >= maxReconnectAttempts) {
       setStatus(ConnectionStatus.FAILED)
-      const maxRetriesError = new Error('Max reconnection attempts reached')
+      const maxRetriesError = new Error(
+        `Max reconnection attempts reached (last ${describeWsClose(event.code, event.reason)})`
+        + (urlRef.current ? ` · ${urlRef.current}` : ''),
+      )
       setError(maxRetriesError)
       onError?.(maxRetriesError)
     }
@@ -405,6 +461,8 @@ export function useAgentWebSocket({
 
     try {
       const wsUrl = getWebSocketUrl()
+      urlRef.current = wsUrlForDisplay(wsUrl)
+      setUrl(urlRef.current)
 
       setStatus(ConnectionStatus.CONNECTING)
       setError(null)
@@ -501,6 +559,8 @@ export function useAgentWebSocket({
     isConnected: status === ConnectionStatus.CONNECTED,
     reconnectAttempt,
     error,
+    lastClose,
+    url,
     sendQuery,
     sendApproval,
     sendToolConfirmation,

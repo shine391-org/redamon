@@ -12,6 +12,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
+import { internalError } from '@/lib/routeErrors'
 import { BADGED_TABS } from '@/app/graph/unseen/registry'
 import { barTotal, buildLabelCountQuery } from '@/app/graph/unseen/counts'
 import { LABEL_TABS, ROUTE_TABS, countUnseenRows, labelsForTab } from './sources'
@@ -119,8 +120,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ now, counts, total: barTotal(counts) })
   } catch (error) {
-    console.error('Failed to compute unseen counts:', error)
-    return NextResponse.json({ error: 'Failed to compute unseen counts' }, { status: 500 })
+    return internalError(error, 'Failed to compute unseen counts')
   } finally {
     await session.close()
   }

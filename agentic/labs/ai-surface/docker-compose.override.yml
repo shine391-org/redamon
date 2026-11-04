@@ -1,0 +1,59 @@
+name: redamon-ai-surface-lab
+
+services:
+  ai-lab-ollama:
+    image: ${AI_LAB_OLLAMA_IMAGE:-ollama/ollama:0.6.8}
+    network_mode: host
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11434"
+    volumes:
+      - ai-lab-ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  ai-lab-open-webui:
+    image: ${AI_LAB_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.6.5}
+    network_mode: host
+    environment:
+      HOST: "127.0.0.1"
+      PORT: "8080"
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434"
+      WEBUI_AUTH: "false"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+    depends_on:
+      ai-lab-ollama:
+        condition: service_healthy
+    volumes:
+      - ai-lab-open-webui-data:/app/backend/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  ai-lab-chroma:
+    image: ${AI_LAB_CHROMA_IMAGE:-chromadb/chroma:0.6.3}
+    network_mode: host
+    command: ["--workers", "1", "--host", "127.0.0.1", "--port", "8000", "--proxy-headers", "--log-config", "chromadb/log_config.yml"]
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: "/chroma/chroma"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - ai-lab-chroma-data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  ai-lab-ollama-models:
+  ai-lab-open-webui-data:
+  ai-lab-chroma-data:

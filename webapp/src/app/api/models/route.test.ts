@@ -32,9 +32,8 @@ vi.mock('@/lib/prisma', () => ({
 }))
 
 // Import after mocks are registered. Vitest hoists vi.mock above this.
-// Note: AGENT_API_URL is captured at module-import time, so it resolves to the
-// default `http://localhost:8090`. Tests assert on URL shape (path + query),
-// not the host, since the host isn't what leaks.
+// Tests assert on URL shape (path + query), not the host, since the host isn't
+// what leaks.
 import * as route from './route'
 
 // ---------------------------------------------------------------------------
@@ -155,12 +154,62 @@ describe('POST /api/models', () => {
     expect(mockFindMany).not.toHaveBeenCalled()
   })
 
-  test('agent error response is propagated as 503', async () => {
+  test('agent error response is propagated as 503, with the agent status', async () => {
     mockFindMany.mockResolvedValueOnce([])
     installFetchStub({ error: 'boom' }, false)
+    vi.spyOn(console, 'error').mockImplementation(() => {})
 
     const res = await route.POST(makeRequest({}) as never)
     expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({
+      error: 'Failed to fetch models from agent API',
+      code: 'agent_error',
+      upstreamStatus: 503,
+    })
+  })
+
+  test('an agent that never answers is 503 agent_unreachable with the errno', async () => {
+    global.fetch = vi.fn(async () => {
+      throw Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('connect ECONNREFUSED 172.18.0.5:8080'), { code: 'ECONNREFUSED' }),
+      })
+    }) as typeof fetch
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const res = await route.POST(makeRequest({}) as never)
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({ error: 'Failed to connect to agent API', code: 'agent_unreachable', cause: 'ECONNREFUSED' })
+  })
+
+  test('an agent that never answers in time is 504 agent_timeout', async () => {
+    global.fetch = vi.fn(async () => {
+      throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    }) as typeof fetch
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const res = await route.POST(makeRequest({}) as never)
+    expect(res.status).toBe(504)
+    expect((await res.json()).code).toBe('agent_timeout')
+  })
+
+  test('a database failure is 500 with its Prisma code, and the agent is not called', async () => {
+    mockFindMany.mockRejectedValueOnce(Object.assign(new Error('SELECT "apiKey" FROM ...'), { code: 'P1001' }))
+    installFetchStub({})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const res = await route.POST(makeRequest({ userId: 'u1' }) as never)
+    const text = await res.text()
+    expect(res.status).toBe(500)
+    expect(JSON.parse(text)).toEqual({ error: 'Failed to load the models', code: 'P1001' })
+    expect(text).not.toContain('apiKey')
+    expect(capturedFetch).toBeNull()
+  })
+
+  test('the agent call carries the internal key and a timeout', async () => {
+    installFetchStub({})
+    await route.POST(makeRequest({}) as never)
+    expect(capturedFetch!.init.headers).toHaveProperty('x-internal-key')
+    expect(capturedFetch!.init.signal).toBeInstanceOf(AbortSignal)
   })
 })
 

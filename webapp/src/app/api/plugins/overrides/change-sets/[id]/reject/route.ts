@@ -3,6 +3,7 @@ import { readJsonBody } from '@/lib/jsonBody'
 import { getEffectiveUser, getSession } from '@/lib/session'
 import { auditPlugin } from '@/lib/plugins/audit'
 import { bodyOwnerMatches, ownsScope } from '@/lib/plugins/changeSetAccess'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 
@@ -12,8 +13,11 @@ export const dynamic = 'force-dynamic'
 
 const notFound = () => NextResponse.json({ error: 'Not found', code: 'not_found' }, { status: 404 })
 
-export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  if (!sameOrigin(request)) return crossOriginResponse()
+export const POST = pluginRoute('override reject', 'The proposal could not be rejected; see the webapp log.', async (
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) => {
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await getEffectiveUser()
@@ -55,4 +59,4 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     source: 'ui',
   })
   return NextResponse.json({ rejected: true })
-}
+})

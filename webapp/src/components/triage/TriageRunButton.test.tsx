@@ -258,3 +258,46 @@ describe('a run started over MCP says so', () => {
     expect(screen.getByText('The run is publishing and will finish in moments.')).toBeInTheDocument()
   })
 })
+
+describe('a failed preflight says why (G-31, G-32)', () => {
+  const fetchMock = vi.fn()
+
+  beforeEach(() => {
+    alertSpies.confirm.mockReset().mockResolvedValue(true)
+    alertSpies.alertError.mockReset().mockResolvedValue(undefined)
+    gateSpies.ensureFeatureModel.mockReset()
+    fetchMock.mockReset()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  test('a route failure shows its code and status', async () => {
+    fetchMock.mockResolvedValueOnce(answer(500, { error: 'The project could not be checked.', code: 'P1001' }))
+    render(<TriageRunButton projectId="p1" onConfirm={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button'))
+    await waitFor(() => expect(alertSpies.alertError).toHaveBeenCalledWith(
+      'The project could not be checked. (P1001 · HTTP 500)', 'Triage'))
+  })
+
+  test('an empty 500 still names the status', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('', { status: 500 }))
+    render(<TriageRunButton projectId="p1" onConfirm={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button'))
+    await waitFor(() => expect(alertSpies.alertError).toHaveBeenCalledWith(
+      'The project could not be checked. (empty_response · HTTP 500)', 'Triage'))
+  })
+
+  test('no answer at all is a network error', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    render(<TriageRunButton projectId="p1" onConfirm={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button'))
+    await waitFor(() => expect(alertSpies.alertError).toHaveBeenCalledWith(
+      'The project could not be checked. (network_error)', 'Triage'))
+  })
+
+  test('counts that could not be read are unknown, not zero', () => {
+    render(buildDialog({ ...PREFLIGHT, inScope: 0, estimatedAiCalls: 0, countsUnavailable: 'agent_unreachable' }))
+    expect(screen.getByRole('status')).toHaveTextContent('The finding counts could not be read (agent_unreachable)')
+    expect(screen.getByText(/count unavailable/)).toBeInTheDocument()
+    expect(screen.queryByText(/Estimated: up to/)).toBeNull()
+  })
+})

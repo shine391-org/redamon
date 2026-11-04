@@ -5,7 +5,7 @@ import { isJsonContentType } from '@/lib/jsonBody'
 import { CallTokenConfigError, verifyCallToken, type CallTokenClaims, type CallTokenKind } from './callToken'
 import { now } from './clock'
 import { PluginDataError, type PluginOwner } from './dataStore'
-import { jobIsActive, type JobError } from './jobs'
+import { completeJob, jobIsActive, type JobError } from './jobs'
 import { PluginOverrideError } from './overrides'
 import type { PluginPermission } from './permissions'
 import { hasPermission, servesActions, showsContributions } from './registry'
@@ -357,23 +357,54 @@ export function dataOwner(ctx: GatewayContext): PluginOwner {
 export async function withGateway(request: NextRequest, opts: GatewayOptions, handler: Handler): Promise<NextResponse> {
   const started = Date.now()
   let pluginId = '-'
+  const seen: { claims: CallTokenClaims | null } = { claims: null }
   let res: NextResponse
   try {
-    res = await run(request, opts, handler, (id) => (pluginId = id))
+    res = await run(request, opts, handler, (c) => {
+      seen.claims = c
+      pluginId = c.pid
+    })
   } catch (e) {
     res = errorResponse(e, opts.op, pluginId)
   }
   const line = `[plugins] gateway ${opts.op} plugin=${pluginId} status=${res.status} ms=${Date.now() - started}`
   if (res.status >= 400) console.warn(line)
   else console.log(line)
+  if (opts.jobEnd && seen.claims) await failRefusedReport(seen.claims, res)
   return res
+}
+
+// No job to fail (401: not this token's to say; 404: no such job), or a refusal the runner
+// retries (429, 5xx), which a later report may still win.
+const REPORT_NOT_FINAL = new Set([401, 404, 429])
+
+/**
+ * The runner does not retry a 4xx to jobs/complete, and records it only in the plugin's log,
+ * so without this the job would wait out its deadline and read as timed out. It fails now,
+ * with the refusal's code. The answer to the runner is left exactly as it was.
+ */
+async function failRefusedReport(claims: CallTokenClaims, res: NextResponse): Promise<void> {
+  if (res.status < 400 || res.status >= 500 || REPORT_NOT_FINAL.has(res.status) || !claims.jid) return
+  try {
+    const body = (await res.clone().json().catch(() => null)) as { code?: unknown } | null
+    const code = typeof body?.code === 'string' && /^[a-z][a-z0-9_]{0,47}$/.test(body.code) ? body.code : `http_${res.status}`
+    await completeJob(claims.pid, claims.sub, claims.jid, {
+      status: 'failed',
+      error: {
+        code: `report_refused:${code}`,
+        message: `The plugin finished, but RedAmon refused its result report (${code}, HTTP ${res.status}); the plugin's log has the details.`,
+      },
+    })
+  } catch (e) {
+    console.error(`[plugins] job ${claims.jid}: its refused report could not fail it:`, e)
+  }
 }
 
 async function run(
   request: NextRequest,
   opts: GatewayOptions,
   handler: Handler,
-  identify: (pluginId: string) => void,
+  identify: (claims: CallTokenClaims) => void,
 ): Promise<NextResponse> {
   if (!isJsonContentType(request.headers.get('content-type'))) {
     return gatewayError(415, 'unsupported_media_type', 'Content-Type must be application/json')
@@ -391,7 +422,7 @@ async function run(
     throw e
   }
   if (!claims) return gatewayError(401, 'invalid_token', 'Invalid or expired call token.')
-  identify(claims.pid)
+  identify(claims)
 
   if (ledger.retired.has(claims.jti)) {
     return gatewayError(403, 'action_ended', 'The action this call token was issued for has ended.')

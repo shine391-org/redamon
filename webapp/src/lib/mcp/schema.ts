@@ -24,6 +24,7 @@ export type Transport = (typeof TRANSPORTS)[number]
  * agentic/tests/test_reserved_tool_names_parity.py compares the two sets.
  */
 export const BUILTIN_RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'bloodhound_ingest', 'graph_diff', 'mimikatz_parse',
   // graph_summary and graph_schema ship on BOTH the agent and the inbound MCP
   // server from one definition; omitting them here let a user-registered plugin
   // shadow a built-in graph tool with its own.

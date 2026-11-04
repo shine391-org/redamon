@@ -220,10 +220,18 @@ class TestConcurrencyStillBounded(EnvelopeIntegrationBase):
         # per-user count cap, which defaults to 30 and would mask a pool bug).
         self.assertLessEqual(admitted, pool // envelope + 1)
 
-    async def test_second_scan_on_a_zero_pool_host_is_refused(self):
-        # 8 GB host, uncalibrated baseline (6 GB fallback) -> pool 0. The sole-scan
-        # exemption lets ONE through; a second must be refused on budget grounds.
+    def zero_pool_host(self):
+        # 8 GB host whose services take everything the OS leaves: 8 - 2 - 6 = 0. Set
+        # explicitly, since the uncalibrated fallback is a share of the host (60% for
+        # the services) and leaves an 8 GB host about 2.5 GB of pool.
+        os.environ["OS_HEADROOM_MEM"] = "2g"
+        os.environ["SERVICE_BASELINE_MEM"] = "6g"
         self.host(8, 3.8)
+
+    async def test_second_scan_on_a_zero_pool_host_is_refused(self):
+        # The sole-scan exemption lets ONE through; a second must be refused on
+        # budget grounds.
+        self.zero_pool_host()
         led = al.ReservationLedger()
         env = led.envelope_for("partial_recon")
         self.assertEqual(led.scan_pool(), 0)
@@ -233,7 +241,7 @@ class TestConcurrencyStillBounded(EnvelopeIntegrationBase):
         self.assertEqual(second.limit_type, "ram")
 
     async def test_release_reopens_the_sole_scan_slot(self):
-        self.host(8, 3.8)
+        self.zero_pool_host()
         led = al.ReservationLedger()
         env = led.envelope_for("partial_recon")
         await led.try_admit("first", env, user_id="u1")

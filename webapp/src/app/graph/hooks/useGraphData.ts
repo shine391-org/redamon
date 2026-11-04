@@ -1,6 +1,9 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback } from 'react'
 import { GraphData } from '../types'
+import { fetchJson, readApiError, toApiError } from '@/lib/apiError'
+
+const GRAPH_LOAD_FAILED = 'Failed to fetch graph data'
 
 // Store last ETag and data outside component to survive re-renders
 const etagStore = new Map<string, { etag: string; data: GraphData }>()
@@ -20,18 +23,22 @@ async function fetchGraphData(projectId: string, fresh = false): Promise<GraphDa
   }
 
   const url = `/api/graph?projectId=${projectId}${fresh ? '&fresh=1' : ''}`
-  const response = await fetch(url, fetchOpts)
+  let response: Response
+  try {
+    response = await fetch(url, fetchOpts)
+  } catch (err) {
+    throw toApiError(err, GRAPH_LOAD_FAILED)
+  }
 
   // 304 Not Modified -- return previous data, skip JSON parse entirely
   if (response.status === 304) {
     if (stored?.data) return stored.data
     // Fallback: shouldn't happen, but refetch without ETag
-    const fallback = await fetch(`/api/graph?projectId=${projectId}`)
-    return fallback.json()
+    return fetchJson<GraphData>(`/api/graph?projectId=${projectId}`, undefined, GRAPH_LOAD_FAILED)
   }
 
   if (!response.ok) {
-    throw new Error('Failed to fetch graph data')
+    throw await readApiError(response, GRAPH_LOAD_FAILED)
   }
 
   // Extract ETag from response
@@ -54,12 +61,8 @@ async function fetchGraphData(projectId: string, fresh = false): Promise<GraphDa
  * negotiation is needed - react-query's cache is enough.
  */
 async function fetchVersionGraphData(projectId: string, versionId: string): Promise<GraphData> {
-  const response = await fetch(`/api/projects/${projectId}/versions/${versionId}/graph`)
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}))
-    throw new Error(body.error || 'Failed to fetch version graph data')
-  }
-  return response.json()
+  return fetchJson<GraphData>(`/api/projects/${projectId}/versions/${versionId}/graph`, undefined,
+    'Failed to fetch version graph data')
 }
 
 /**

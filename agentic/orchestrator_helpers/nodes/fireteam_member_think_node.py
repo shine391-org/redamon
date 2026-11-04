@@ -24,13 +24,16 @@ from prompt_safety import wrap_untrusted, UNTRUSTED_OUTPUT_GUIDANCE
 from orchestrator_helpers.parsing import try_parse_llm_decision
 from orchestrator_helpers.json_utils import normalize_content, json_dumps_safe
 from orchestrator_helpers.llm_retry import retry_llm_call
+from orchestrator_helpers.llm_retry import llm_error_reason
+from agent_in_the_loop import confirmation_required
+from agent_in_the_loop.purpose import llm_purpose
 import orchestrator_helpers.chain_graph_writer as chain_graph
 from orchestrator_helpers.productivity import (
     audit_productivity_claim,
     build_productivity_audit_section,
     downgrade_verdict_to_no_progress,
 )
-from project_settings import get_setting, get_allowed_tools_for_phase, DANGEROUS_TOOLS
+from project_settings import get_setting, get_allowed_tools_for_phase, is_dangerous_call
 from tools import set_tenant_context, set_phase_context, set_graph_view_context
 
 logger = logging.getLogger(__name__)
@@ -274,7 +277,7 @@ def _plan_has_dangerous_tool(decision: LLMDecision) -> bool:
     plan = decision.tool_plan
     if not plan or not plan.steps:
         return False
-    return any((s.tool_name or "") in DANGEROUS_TOOLS for s in plan.steps)
+    return any(is_dangerous_call(s.tool_name, s.tool_args) for s in plan.steps)
 
 
 def _build_pending_confirmation(decision: LLMDecision, state: FireteamMemberState) -> dict:
@@ -1004,16 +1007,18 @@ async def fireteam_member_think_node(
                 ))
 
         try:
-            response = await retry_llm_call(
-                llm, llm_messages, label=f"{session_id} member {member_id}",
-            )
+            with llm_purpose("fireteam_member", member_id=member_id, member_name=member_name,
+                             iteration=current_iter + 1, attempt=attempt):
+                response = await retry_llm_call(
+                    llm, llm_messages, label=f"{session_id} member {member_id}",
+                )
         except Exception as exc:
             logger.error(
                 "[%s] member %s LLM call failed: %s", session_id, member_id, exc,
             )
             return {
                 "task_complete": True,
-                "completion_reason": f"llm_error: {exc}",
+                "completion_reason": llm_error_reason(exc),
             }
 
         raw_content = normalize_content(response.content if hasattr(response, "content") else response)
@@ -1087,10 +1092,10 @@ async def fireteam_member_think_node(
     logger.info("=" * 60)
 
     # ---- Dangerous-tool escalation ----
-    tool_confirmation_enabled = get_setting("REQUIRE_TOOL_CONFIRMATION", True)
+    tool_confirmation_enabled = confirmation_required(get_setting("REQUIRE_TOOL_CONFIRMATION", True))
     is_dangerous = False
     if tool_confirmation_enabled:
-        if decision.action == "use_tool" and (decision.tool_name or "") in DANGEROUS_TOOLS:
+        if decision.action == "use_tool" and is_dangerous_call(decision.tool_name, decision.tool_args):
             is_dangerous = True
         elif decision.action == "plan_tools" and _plan_has_dangerous_tool(decision):
             is_dangerous = True
@@ -1284,6 +1289,8 @@ async def fireteam_member_think_node(
                         related_cves=cf.related_cves or [],
                         related_ips=cf.related_ips or [],
                         related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                        skill=state.get("attack_path_type", ""),
+                        route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                         agent_id=member_id,
                         source_agent=member_name,
                         fireteam_id=fireteam_id,
@@ -1573,6 +1580,8 @@ async def fireteam_member_think_node(
                         related_cves=cf.related_cves or [],
                         related_ips=cf.related_ips or [],
                         related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                        skill=state.get("attack_path_type", ""),
+                        route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                         agent_id=member_id,
                         source_agent=member_name,
                         fireteam_id=fireteam_id,

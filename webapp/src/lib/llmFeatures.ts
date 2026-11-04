@@ -6,6 +6,7 @@
  * of server-only imports. The ids are the keys of `UserSettings.featureModels`:
  * renaming one orphans every model saved under the old key.
  */
+import { isLoopModel } from '@/lib/agentInTheLoop'
 
 export type FeatureId =
   | 'roe_parse'
@@ -141,6 +142,8 @@ export function getLlmFeature(id: FeatureId): LlmFeature {
 }
 
 export function modelAllowedForFeature(id: FeatureId, modelId: string): boolean {
+  // Agent in the Loop answers only inside a chat run: no feature can run on it.
+  if (isLoopModel(modelId)) return false
   return !getLlmFeature(id).excludeModelPrefixes.some(prefix => modelId.startsWith(prefix))
 }
 
@@ -176,6 +179,9 @@ export interface FeatureModelErrorBody {
   code: FeatureModelCode
   featureId: FeatureId | PluginFeatureId
   model?: string
+  /** The provider exception's class, when the failure came from the model provider. */
+  errorClass?: string
+  providerStatus?: number
 }
 
 /**
@@ -205,4 +211,33 @@ export function readFeatureModelCode(body: unknown): FeatureModelCode | null {
   if (!body || typeof body !== 'object') return null
   const code = (body as { code?: unknown }).code
   return typeof code === 'string' && CODES.has(code) ? (code as FeatureModelCode) : null
+}
+
+const PROVIDER_CLASS = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
+
+/**
+ * "RateLimitError · provider HTTP 429" from the safe provider facts an agent
+ * answer carries (`error_class`, `provider_status`; camelCase once a route has
+ * passed them on), or '' when there are none. The class and the status tell a
+ * bad key from a rate limit or an overflowing context; the provider's own
+ * message is never sent, because it can quote the key.
+ */
+export function providerFailureDetail(body: unknown): string {
+  const facts = providerFacts(body)
+  const parts: string[] = []
+  if (facts.errorClass) parts.push(facts.errorClass)
+  if (facts.providerStatus) parts.push(`provider HTTP ${facts.providerStatus}`)
+  return parts.join(' · ')
+}
+
+/** The provider facts of an agent answer, validated and camelCased, for a route to pass on. */
+export function providerFacts(body: unknown): { errorClass?: string; providerStatus?: number } {
+  if (!body || typeof body !== 'object') return {}
+  const b = body as Record<string, unknown>
+  const cls = b.error_class ?? b.errorClass
+  const status = b.provider_status ?? b.providerStatus
+  return {
+    ...(typeof cls === 'string' && PROVIDER_CLASS.test(cls) ? { errorClass: cls } : {}),
+    ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { providerStatus: status } : {}),
+  }
 }

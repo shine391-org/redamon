@@ -9,6 +9,7 @@ import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import { PROVIDER_TYPES, OPENAI_COMPAT_PRESETS, NON_CHAT_PROVIDER_TYPES, JEV_MODEL, JEV_PROVIDER_NAME } from '@/lib/llmProviderPresets'
 import type { ProviderType } from '@/lib/llmProviderPresets'
 import { REASONING_EFFORTS } from '@/lib/llmReasoning'
+import { fetchJson, readApiError, toApiError } from '@/lib/apiError'
 import type { ReasoningEffort } from '@/lib/llmReasoning'
 import styles from './Settings.module.css'
 
@@ -166,19 +167,22 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
     setTestResult(null)
     try {
       const providerId = provider?.id || 'unsaved'
-      const resp = await fetch(`/api/users/${userId}/llm-providers/${providerId}/test`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody()),
-      })
-      const result = await resp.json()
+      const result = await fetchJson<{ success?: boolean; response_text?: string; error?: string }>(
+        `/api/users/${userId}/llm-providers/${providerId}/test`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody()),
+        },
+        'The provider test failed',
+      )
       setTestResult({
-        success: result.success,
+        success: result.success === true,
         text: result.response_text,
-        error: result.error,
+        error: result.error || (result.success === true ? undefined : 'The provider test failed'),
       })
     } catch (err) {
-      setTestResult({ success: false, error: String(err) })
+      setTestResult({ success: false, error: toApiError(err, 'The provider test failed').message })
     } finally {
       setTesting(false)
     }
@@ -198,10 +202,7 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
         body: JSON.stringify(requestBody()),
       })
 
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => null)
-        throw new Error(err?.error || `Failed to save provider (HTTP ${resp.status})`)
-      }
+      if (!resp.ok) throw await readApiError(resp, 'Failed to save provider')
 
       toast.success(isEditing ? 'Provider updated' : 'Provider added')
       setBaseline(form)
@@ -211,7 +212,7 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
       // Show what the server actually said. The blanket message hid the real
       // cause of issue #173 (a write against a user id that no longer exists)
       // behind an unactionable "Failed to save provider".
-      toast.error(err instanceof Error && err.message ? err.message : 'Failed to save provider')
+      toast.error(toApiError(err, 'Failed to save provider').message)
     } finally {
       setSaving(false)
     }

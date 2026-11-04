@@ -321,6 +321,20 @@ describe('the results', () => {
     await waitFor(() => expect(suggestRoute).toHaveBeenCalledTimes(2))
   })
 
+  test('a failed model call says so, with the provider class and status, not "could not be read"', async () => {
+    suggestRoute.mockImplementationOnce(() => jsonResponse(502, suggestion({
+      status: 'model_unreadable',
+      model_call_failed: 1, error_class: 'RateLimitError', provider_status: 429,
+      read: { reason: 'unclear', why: '', quote: '', quote_verified: false },
+      groups: [{ ...suggestion().groups[1], members: [member('v-3', { checked: false, verdict: null })] }],
+    })))
+    await openResults()
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('The model call failed (RateLimitError · provider HTTP 429)')
+    expect(alert).not.toHaveTextContent(/could not be read/)
+    expect(within(alert).getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
   test('50 rows per group, then "Show more"', async () => {
     const many = Array.from({ length: 120 }, (_, i) => member(`k${String(i).padStart(3, '0')}`))
     suggestRoute.mockImplementationOnce(() => jsonResponse(200, suggestion({

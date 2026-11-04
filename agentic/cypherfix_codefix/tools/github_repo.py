@@ -27,6 +27,40 @@ logger = logging.getLogger(__name__)
 # can bind them into the build sandbox. Falls back to the legacy path off-volume.
 WORK_BASE = Path(os.environ.get("CODEFIX_WORK_BASE", "/app/codefix-work"))
 
+#: git's stderr, reduced to a fixed cause a person may see. git exits 128 for a
+#: bad token, a missing repository and a missing branch alike, and the stderr
+#: itself names the remote URL, so neither can be shown as it is.
+_GIT_CAUSES = (
+    ("authentication failed", "auth_failed"),
+    ("could not read username", "auth_failed"),
+    ("invalid username or password", "auth_failed"),
+    ("permission to", "permission_denied"),
+    ("the requested url returned error: 403", "permission_denied"),
+    ("repository not found", "repo_not_found"),
+    ("not found in upstream", "branch_not_found"),
+    ("could not resolve host", "network_error"),
+    ("protected branch", "protected_branch"),
+)
+
+
+def git_failure_cause(stderr: str) -> str:
+    """The fixed cause of a git failure, or "" when none is recognised."""
+    lowered = (stderr or "").lower()
+    for marker, cause in _GIT_CAUSES:
+        if marker in lowered:
+            return cause
+    return ""
+
+
+class GitCommandError(RuntimeError):
+    """A git command that exited non-zero. The message keeps the (token-free)
+    stderr for the log; `returncode` and `cause` are the parts safe to show."""
+
+    def __init__(self, message: str, returncode: int, cause: str = ""):
+        super().__init__(message)
+        self.returncode = returncode
+        self.cause = cause
+
 
 class GitHubRepoManager:
     def __init__(self, token: str, repo: str, default_branch: str = "main",
@@ -93,7 +127,8 @@ class GitHubRepoManager:
 
         result = self._run_git(args, timeout=120)
         if result.returncode != 0:
-            raise RuntimeError(f"Clone failed: {self._sanitize(result.stderr)}")
+            raise GitCommandError(f"Clone failed: {self._sanitize(result.stderr)}",
+                                  result.returncode, git_failure_cause(result.stderr))
 
         # The sandbox runs as a non-root user (uid 1001) and bind-mounts this
         # worktree read-write; make it group/other-writable so installs succeed.
@@ -112,7 +147,8 @@ class GitHubRepoManager:
         """Create and switch to a new branch."""
         result = self._run_git(["checkout", "-b", branch_name], cwd=self.repo_path)
         if result.returncode != 0:
-            raise RuntimeError(f"Branch create failed: {self._sanitize(result.stderr)}")
+            raise GitCommandError(f"Branch create failed: {self._sanitize(result.stderr)}",
+                                  result.returncode, git_failure_cause(result.stderr))
 
     def commit(self, message: str, files: Optional[list[str]] = None):
         """Stage ONLY the approved files and commit.
@@ -157,7 +193,8 @@ class GitHubRepoManager:
         if result.returncode != 0:
             stderr = self._sanitize(result.stderr)
             logger.error(f"Git push failed (exit {result.returncode}): {stderr}")
-            raise RuntimeError(f"Git push failed: {stderr}")
+            raise GitCommandError(f"Git push failed: {stderr}", result.returncode,
+                                  git_failure_cause(result.stderr))
 
     def create_pr(self, title: str, body: str, branch: str, base: str = None) -> dict:
         """Create a pull request via GitHub API, or update the existing one."""

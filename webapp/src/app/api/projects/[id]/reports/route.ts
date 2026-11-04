@@ -8,6 +8,8 @@ import path from 'path'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
 import { callFeatureAgent } from '@/lib/featureAgentCall'
+import { providerFailureDetail } from '@/lib/llmFeatures'
+import { internalError } from '@/lib/routeErrors'
 
 const REPORT_OUTPUT_PATH = process.env.REPORT_OUTPUT_PATH || '/data/reports'
 const NARRATIVES_TIMEOUT_MS = 300_000
@@ -42,11 +44,7 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json(reports)
   } catch (error) {
-    console.error('List reports failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to list reports' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list reports', { log: 'List reports failed' })
   }
 }
 
@@ -72,6 +70,7 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
     // reached at all falls back to a report without narratives; a model, key or
     // version problem is the person's to fix, so it is shown instead of hidden.
     let narratives: LLMNarratives | null = null
+    let narrativesSkipped: string | null = null
     const agent = await callFeatureAgent({
       featureId: 'report_narratives',
       path: '/api/report/summarize',
@@ -80,10 +79,17 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
       timeoutMs: NARRATIVES_TIMEOUT_MS,
     })
     if (agent.ok) {
-      const { model_used: _modelUsed, ...rest } = agent.body
-      narratives = rest as unknown as LLMNarratives
+      const { model_used: _modelUsed, narratives_failed: failed, ...rest } = agent.body
+      // The agent answers empty narratives with a marker when the model call
+      // failed or its answer was unreadable: a report without them, and the reason.
+      if (typeof failed === 'string' && /^[a-z_]{1,40}$/.test(failed)) {
+        narrativesSkipped = [failed, providerFailureDetail(agent.body)].filter(Boolean).join(' · ')
+      } else {
+        narratives = rest as unknown as LLMNarratives
+      }
     } else if (agent.code === 'agent_unreachable') {
       console.warn('Agent unavailable for report narratives, generating without them')
+      narrativesSkipped = agent.code
     } else {
       return agent.response
     }
@@ -131,13 +137,11 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
       },
     })
 
-    return NextResponse.json(report, { status: 201 })
+    // The report exists either way; the person is told it has no narratives and why.
+    return NextResponse.json(narrativesSkipped ? { ...report, narrativesSkipped } : report, { status: 201 })
   } catch (error) {
-    console.error('Generate report failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Report generation failed' },
-      { status: 500 }
-    )
+    // A Neo4j or Prisma message can quote target data; the code says which failed.
+    return internalError(error, 'Report generation failed', { log: 'Generate report failed' })
   }
 }
 

@@ -48,20 +48,28 @@ export function noneMuted(...variables: string[]): string {
 }
 
 /**
+ * The recon sources that write leads for the agent to confirm:
+ * `:Vulnerability {needs_agent_confirmation:true, severity:'info'}` nodes that
+ * only become real once an agent skill lands a CONFIRMS edge (serialized_scan
+ * for deserialization, route_exposure for unauthenticated routes and exposed
+ * data). route_exposure also writes signature-proven findings under the same
+ * source; those carry needs_agent_confirmation=false and pass the predicate.
+ */
+export const AGENT_CANDIDATE_SOURCES = ['serialized_scan', 'route_exposure'] as const
+
+/**
  * A WHERE fragment excluding an UNCONFIRMED agent-confirmation candidate.
  *
- * serialized_scan writes `:Vulnerability {source:'serialized_scan',
- * needs_agent_confirmation:true, severity:'info'}` leads that only become real
- * once the agent's deserialization skill lands a CONFIRMS edge. The graph
- * screen, Node Inspector and Priority Board intentionally keep showing these
- * leads, but the client report and the Insights analytics are deliverable
- * surfaces that must not count an unconfirmed `info` candidate as a real
- * vulnerability (plan §12-D). This is NOT a mute: the candidate stays unmuted so
- * the agent's `query_graph` can read it.
+ * The graph screen, Node Inspector and Priority Board intentionally keep
+ * showing these leads, but the client report and the Insights analytics are
+ * deliverable surfaces that must not count an unconfirmed `info` candidate as a
+ * real vulnerability (plan §12-D). This is NOT a mute: the candidate stays
+ * unmuted so the agent's `query_graph` can read it.
  */
 export function agentCandidateConfirmedOrNA(variable: string): string {
+  const sources = AGENT_CANDIDATE_SOURCES.map(s => `'${s}'`).join(', ')
   return (
-    `NOT (${variable}.source = 'serialized_scan' ` +
+    `NOT (${variable}.source IN [${sources}] ` +
     `AND coalesce(${variable}.needs_agent_confirmation, false) = true ` +
     `AND NOT EXISTS { (:ChainFinding)-[:CONFIRMS]->(${variable}) })`
   )

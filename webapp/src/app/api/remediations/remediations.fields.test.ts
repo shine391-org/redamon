@@ -152,3 +152,20 @@ describe('GET /api/remediations — sort whitelist', () => {
     )
   })
 })
+
+describe('a database failure says which (G-38)', () => {
+  test('the list answers its fixed text and the Prisma code, never the message', async () => {
+    mockFindMany.mockRejectedValue(Object.assign(new Error('Timed out fetching a new connection for remediation x'),
+      { code: 'P2024' }))
+    const res = await GET(get('projectId=p1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to fetch remediations', code: 'P2024' })
+  })
+
+  test('an update that is not a missing row answers its code too', async () => {
+    mockUpdate.mockRejectedValue(Object.assign(new Error('pool'), { code: 'P1001' }))
+    const res = await PUT(put({ status: 'dismissed' }), PARAMS)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to update remediation', code: 'P1001' })
+  })
+})

@@ -10,8 +10,10 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 
 vi.mock('@/providers/ProjectProvider', () => ({ useProject: () => ({ userId: 'user-1' }) }))
 
-const h = vi.hoisted(() => ({ contributions: [] as unknown[] }))
-vi.mock('@/hooks/usePluginContributions', () => ({ usePluginContributions: () => ({ data: h.contributions }) }))
+const h = vi.hoisted(() => ({ contributions: [] as unknown[] | undefined, error: null as Error | null, refetch: (() => {}) as () => void }))
+vi.mock('@/hooks/usePluginContributions', () => ({
+  usePluginContributions: () => ({ data: h.contributions, error: h.error, refetch: h.refetch }),
+}))
 
 import { PhaseIndicatorBar } from './PhaseIndicatorBar'
 
@@ -53,11 +55,34 @@ function draw(over: Partial<Props> = {}) {
 
 beforeEach(() => {
   h.contributions = []
+  h.error = null
+  h.refetch = vi.fn()
   vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ servers: [] }), { status: 200 })))
 })
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+})
+
+describe('plugin items that could not be loaded', () => {
+  // They must not just vanish: a quiet line names the failure, and Retry asks again.
+  test('a hint with the code and status, and Retry', async () => {
+    const { ApiError } = await import('@/lib/apiError')
+    h.contributions = undefined
+    h.error = new ApiError({ reason: 'Plugin items could not be loaded', status: 500, code: 'P2024' })
+    draw()
+    expect(screen.getByTestId('plugin-items-error').textContent).toContain('Plugin items could not be loaded (P2024 · HTTP 500)')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(h.refetch).toHaveBeenCalled()
+  })
+
+  test('items already loaded stay shown when a later read fails', () => {
+    h.contributions = [skiller]
+    h.error = new Error('later failure')
+    draw()
+    expect(screen.queryByTestId('plugin-items-error')).toBeNull()
+    expect(screen.getByRole('button', { name: /improve skill from this session/i })).toBeInTheDocument()
+  })
 })
 
 describe('the plugin group', () => {

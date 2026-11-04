@@ -56,6 +56,23 @@
   flex-shrink: 0;
 }
 
+/* The toolbar (search, refresh, exports, filters) is wider than a phone, and
+   .container clips overflow, so the buttons at its end were unreachable. It
+   wraps right-aligned: the Filters menu opens leftwards from its button, so
+   the button must stay at the right edge or the menu leaves the screen. */
+@media (max-width: 640px) {
+  .header {
+    flex-wrap: wrap;
+  }
+
+  .headerRight {
+    flex-shrink: 1;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin-left: auto;
+  }
+}
+
 .searchWrapper {
   position: relative;
   display: flex;

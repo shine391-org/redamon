@@ -99,6 +99,14 @@ ALL_ON = {
     "RCE_DESERIALIZATION_ENABLED": True,
     "RCE_AGGRESSIVE_PAYLOADS": True,
     "CAPTURE_PROXY_ENABLED": False,
+    # Recon's route exposure module and the switches of its agent parts; the
+    # RoE allowances the two gated parts also need.
+    "ROUTE_EXPOSURE_ENABLED": True,
+    "PATH_TRAVERSAL_GIT_RECONSTRUCT_ENABLED": True,
+    "PATH_TRAVERSAL_VALIDATE_SECRETS_ENABLED": True,
+    "RCE_HEAPDUMP_ANALYSIS_ENABLED": True,
+    "ROE_ALLOW_DATA_EXFILTRATION": True,
+    "ROE_SENSITIVE_DATA_HANDLING": "limited_collection",
 }
 
 ALL_OFF = {
@@ -127,6 +135,10 @@ ALL_OFF = {
     "RCE_DESERIALIZATION_ENABLED": False,
     "RCE_AGGRESSIVE_PAYLOADS": False,
     "CAPTURE_PROXY_ENABLED": True,
+    "ROUTE_EXPOSURE_ENABLED": False,
+    "PATH_TRAVERSAL_GIT_RECONSTRUCT_ENABLED": False,
+    "PATH_TRAVERSAL_VALIDATE_SECRETS_ENABLED": False,
+    "RCE_HEAPDUMP_ANALYSIS_ENABLED": False,
 }
 
 ROE_RESTRICTED = {

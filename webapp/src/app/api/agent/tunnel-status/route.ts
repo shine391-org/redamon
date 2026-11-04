@@ -1,19 +1,15 @@
 import { NextResponse } from 'next/server'
+import { agentFetch } from '@/lib/agentFetch'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+const INACTIVE = { ngrok: { active: false }, chisel: { active: false } }
 
+// Read-only indicator: an unreachable agent reads as "no tunnel", never an error.
 export async function GET() {
   try {
-    const resp = await fetch(`${AGENT_API_URL}/tunnel-status`, { cache: 'no-store' })
-    if (!resp.ok) {
-      return NextResponse.json(
-        { ngrok: { active: false }, chisel: { active: false } },
-        { status: 200 }
-      )
-    }
+    const resp = await agentFetch('/tunnel-status', { cache: 'no-store' }, { timeoutMs: 5_000 })
+    if (!resp.ok) return NextResponse.json(INACTIVE, { status: 200 })
     return NextResponse.json(await resp.json())
   } catch {
-    // Fallback: both inactive if agent is unreachable
-    return NextResponse.json({ ngrok: { active: false }, chisel: { active: false } })
+    return NextResponse.json(INACTIVE)
   }
 }

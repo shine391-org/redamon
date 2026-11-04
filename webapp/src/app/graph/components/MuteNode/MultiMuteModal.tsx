@@ -13,6 +13,7 @@ import { ChevronDown, ChevronRight, Loader2, RotateCcw } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { useToast } from '@/components/ui'
 import { FeatureModelGate } from '@/components/shared/FeatureModelGate'
+import { providerFailureDetail } from '@/lib/llmFeatures'
 import { NodeIdCell } from '../RedZoneTables/nodeId'
 import type { MutedNodesFocus } from '../MutedNodes/mutedNodes'
 import { MuteButton } from './MuteButton'
@@ -216,7 +217,14 @@ function Results({ mm, onOpenMuteRules }: { mm: MultiMuteState; onOpenMuteRules?
         )}
         {r.status === 'model_unreadable' && (
           <div className={styles.banner} role="alert">
-            <span>The model&apos;s answer could not be read, so only the exact groups are shown, all unticked.</span>
+            {r.model_call_failed ? (
+              <span>
+                The model call failed{providerFailureDetail(r) ? ` (${providerFailureDetail(r)})` : ''}, so
+                only the exact groups are shown, all unticked.
+              </span>
+            ) : (
+              <span>The model&apos;s answer could not be read, so only the exact groups are shown, all unticked.</span>
+            )}
             <button type="button" className={styles.linkButton} onClick={() => void mm.run()} disabled={mm.busy}>
               Retry
             </button>

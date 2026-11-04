@@ -142,3 +142,14 @@
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+.listError {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--status-error, #ef4444);
+  overflow-wrap: anywhere;
+}

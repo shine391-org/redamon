@@ -704,6 +704,10 @@ class FireteamMemberState(TypedDict):
     # Raw tool result from execute_tool_node (success, output, error).
     _tool_result: Optional[dict]
 
+    # Why the harness downgraded the member's last productivity verdict; the
+    # next member think turn shows it in the prompt. None when the claim held.
+    _last_productivity_discrepancy: Optional[str]
+
     # Last-written ChainStep id so follow-on steps can link via prev_step_id.
     _last_chain_step_id: Optional[str]
 
@@ -927,9 +931,10 @@ class ExploitTree(BaseModel):
         model (search_id, phase, shadow_mode, budgets, trajectory) is passed in.
         """
         try:
-            from project_settings import DANGEROUS_TOOLS
+            from project_settings import is_dangerous_call
         except Exception:
-            DANGEROUS_TOOLS = frozenset()
+            def is_dangerous_call(tool_name, tool_args=None):
+                return False
 
         def _node_view(n: "ExploitTreeNode") -> dict:
             return {
@@ -954,7 +959,7 @@ class ExploitTree(BaseModel):
                 "duration_ms": n.duration_ms,
                 "observation": n.observation_summary,
                 "reflection": n.reflection,
-                "is_dangerous": n.tool_name in DANGEROUS_TOOLS if n.tool_name else False,
+                "is_dangerous": is_dangerous_call(n.tool_name, n.tool_args) if n.tool_name else False,
                 "step_id": n.step_id,
             }
 
@@ -1044,6 +1049,7 @@ class AgentState(TypedDict):
     _abort_transition: bool  # True when user aborted a phase transition (routes to generate_response)
     _guardrail_blocked: bool  # True when project target was blocked by the scope guardrail
     _scope_signature: Optional[str]  # The scope the guardrails last approved; a change re-runs them
+    _roe_warnings: List[str]  # RoE date/time-window breaches, recomputed by initialize_node every turn
 
     # Tool plan execution (parallel wave)
     _current_plan: Optional[dict]  # ToolPlan.model_dump() with results after execution
@@ -1066,10 +1072,19 @@ class AgentState(TypedDict):
 
     # Response tier for adaptive formatting ("conversational", "summary", "full_report")
     _response_tier: Optional[str]
+    # Set by generate_response_node; streaming sends task_complete only once it
+    # is set. A new query clears it (_STREAMING_TRANSIENT_FIELDS), or the last
+    # run's flag would announce the next run complete before it starts.
+    _report_generated: Optional[bool]
 
     # Deep Think result (persists for chain, replaced on re-trigger)
     deep_think_result: Optional[str]
     _need_deep_think: bool  # LLM self-requested Deep Think for next iteration
+
+    # Actionable lines that read as a confirmation to record, from an analysis
+    # that recorded no chain finding (orchestrator_helpers/finding_guard.py);
+    # the next prompt says they recorded nothing.
+    _unrecorded_confirmation: Optional[List[str]]
 
     # Productivity scoring v2 — dynamic, multi-signal loop detection.
     # `_deep_think_cooldown_until` suppresses redundant Deep Thinks for N
@@ -1099,6 +1114,9 @@ class AgentState(TypedDict):
     _previous_priority_order: Optional[List[str]]
     tested_axes: dict  # axis_key (str) -> list of {iteration, verdict, tool} dicts
     _last_productivity_score: Optional[dict]  # diagnostic: last computed score + components
+    # Why the harness downgraded the model's last productivity verdict; the next
+    # think turn shows it in the prompt. None when the last claim held.
+    _last_productivity_discrepancy: Optional[str]
 
     # Metasploit state tracking
     msf_session_reset_done: bool  # True if metasploit was reset at start of this session
@@ -1314,6 +1332,7 @@ def create_initial_state(
         # Deep Think
         "deep_think_result": None,
         "_need_deep_think": False,
+        "_unrecorded_confirmation": None,
         # Productivity scoring v2
         "_deep_think_cooldown_until": 0,
         "_iterations_since_state_grew": 0,

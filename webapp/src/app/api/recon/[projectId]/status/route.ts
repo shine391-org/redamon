@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { reconcileScanJobStatus } from '@/lib/scanTimeline'
-import { RECON_TOTAL_PHASES } from '@/lib/recon-types'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -16,20 +16,22 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const __denied = await guardProject(projectId)
     if (__denied) return __denied
 
-    // Call recon orchestrator to get status
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/status`, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
+    // An orchestrator that does not answer is reported as such, never as an
+    // idle recon: "idle" would enable Start over a scan that may be running.
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/status`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
+    } catch (err) {
+      return upstreamFailureResponse('orchestrator', err, 'Recon status unavailable')
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.detail || 'Failed to get recon status' },
-        { status: response.status }
-      )
+      return upstreamErrorResponse('orchestrator', response, 'Failed to get recon status', { forwardText: true })
     }
 
     const data = await response.json()
@@ -42,25 +44,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json(data)
 
   } catch (error) {
-    console.error('Error getting recon status:', error)
-
-    // If orchestrator is not available, return idle status
-    if (error instanceof TypeError && error.message.includes('fetch')) {
-      return NextResponse.json({
-        project_id: (await params).projectId,
-        status: 'idle',
-        current_phase: null,
-        phase_number: null,
-        total_phases: RECON_TOTAL_PHASES,
-        started_at: null,
-        completed_at: null,
-        error: null,
-      })
-    }
-
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to get recon status', { log: 'Error getting recon status' })
   }
 }

@@ -180,7 +180,7 @@ def test_cve_lookup_now_queries_the_graph_technologies(monkeypatch):
     data, _ = _build(monkeypatch)
     queried = []
 
-    def fake_nvd(name, version, max_results, keys, admitted=False):
+    def fake_nvd(name, version, max_results, keys, admitted=False, cpe_hint=None):
         queried.append((name, version))
         return SimpleNamespace(data=[], answered=True, outcome=None, detail="")
 

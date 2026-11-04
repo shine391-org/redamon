@@ -115,6 +115,9 @@ export function CredentialShortcut({
       </div>
 
       {justSaved && <p className={styles.saved}>Saved to Global Settings.</p>}
+      {keys.loadError && !isSet && (
+        <p className={styles.error} role="alert">{keys.loadError}, so this key may already be set.</p>
+      )}
       {keys.error && keys.saving === null && draft && (
         <p className={styles.error}>{keys.error}</p>
       )}

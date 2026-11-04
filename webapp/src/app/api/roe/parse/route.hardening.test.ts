@@ -148,3 +148,24 @@ describe('a successful parse', () => {
     expect(gated.warnings).not.toContain(AGENT_ENFORCEMENT_WARNING)
   }, 30_000)
 })
+
+describe('an infrastructure failure names its code', () => {
+  test('a database failure answers the fixed sentence and the Prisma code, never the message', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockSettings.mockRejectedValue(Object.assign(new Error(`Can't reach database server; ${SECRET_LINE}`), {
+      code: 'P1001', name: 'PrismaClientInitializationError',
+    }))
+    const res = await POST(request())
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to parse the RoE document.', code: 'P1001' })
+    expect(JSON.stringify(body)).not.toContain('Jane Roe')
+    error.mockRestore()
+  })
+
+  test('a declared body over the cap carries the limit', async () => {
+    const res = await POST(request({ headers: { 'content-length': String(MAX_REQUEST_BYTES + 1) } }))
+    expect(res.status).toBe(413)
+    expect(await res.json()).toMatchObject({ code: 'file_too_large', limitBytes: 9 * 1024 * 1024 })
+  })
+})

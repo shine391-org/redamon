@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { reconcileScanJobStatus } from '@/lib/scanTimeline'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
+const STATUS_UNAVAILABLE = 'Secret Multiscanner status unavailable'
 
 interface RouteParams {
   params: Promise<{ projectId: string; source: string }>
@@ -15,17 +17,18 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const __denied = await guardProject(projectId)
     if (__denied) return __denied
 
-    const response = await orchestratorFetch(
-      `${RECON_ORCHESTRATOR_URL}/trufflehog/${projectId}/${encodeURIComponent(source)}/status`,
-      { method: 'GET', headers: { 'Content-Type': 'application/json' } },
-    )
+    let response: Response
+    try {
+      response = await orchestratorFetch(
+        `${RECON_ORCHESTRATOR_URL}/trufflehog/${projectId}/${encodeURIComponent(source)}/status`,
+        { method: 'GET', headers: { 'Content-Type': 'application/json' } },
+      )
+    } catch (error) {
+      return upstreamFailureResponse('orchestrator', error, STATUS_UNAVAILABLE)
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.detail || 'Failed to get Secret Multiscanner status' },
-        { status: response.status },
-      )
+      return upstreamErrorResponse('orchestrator', response, STATUS_UNAVAILABLE, { forwardText: true })
     }
 
     const data = await response.json()
@@ -35,10 +38,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     await reconcileScanJobStatus(projectId, data?.status, { kind: 'trufflehog', runId: source })
     return NextResponse.json(data)
   } catch (error) {
-    console.error('Error getting TruffleHog status:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Failed to get Secret Multiscanner status', { log: 'Error getting TruffleHog status' })
   }
 }

@@ -40,6 +40,7 @@ const ROUTES: Record<string, { GET: (req: any) => Promise<Response> }> = {
   killChain: await import('./killChain/route'),
   netInitAccess: await import('./netInitAccess/route'),
   paramMatrix: await import('./paramMatrix/route'),
+  routeExposure: await import('./routeExposure/route'),
   secrets: await import('./secrets/route'),
   sharedInfra: await import('./sharedInfra/route'),
   supplyChain: await import('./supplyChain/route'),

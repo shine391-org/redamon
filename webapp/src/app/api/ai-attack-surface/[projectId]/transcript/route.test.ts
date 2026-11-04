@@ -22,10 +22,11 @@ vi.mock('@/lib/access', () => ({ guardProject: vi.fn().mockResolvedValue(null) }
 
 let statResult: { isFile: () => boolean; size: number } | null = null
 let fileBody = Buffer.from('')
+let readError: Error | null = null
 vi.mock('fs', () => ({
   promises: {
     stat: async () => { if (!statResult) throw new Error('ENOENT'); return statResult },
-    readFile: async () => fileBody,
+    readFile: async () => { if (readError) throw readError; return fileBody },
   },
 }))
 
@@ -44,6 +45,7 @@ beforeEach(() => {
   ownedCount = 1
   statResult = { isFile: () => true, size: 1024 }
   fileBody = Buffer.from('{"ok":true}')
+  readError = null
 })
 
 describe('transcript route', () => {
@@ -95,5 +97,16 @@ describe('transcript route', () => {
     expect(res.headers.get('Content-Type')).toBe('text/plain')          // NOT text/html
     expect(res.headers.get('Content-Disposition')).toMatch(/^attachment;/)  // download, not render
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
+  })
+
+  test('a read failure answers the errno, never the path or the message', async () => {
+    readError = Object.assign(new Error(`EACCES: permission denied, open '${REF}'`), { code: 'EACCES' })
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await route.GET(req(REF), params('p1'))
+    spy.mockRestore()
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to read transcript', code: 'EACCES' })
+    expect(JSON.stringify(body)).not.toContain('promptfoo_results')
   })
 })

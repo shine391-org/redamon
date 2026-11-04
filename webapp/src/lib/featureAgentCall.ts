@@ -19,7 +19,7 @@ import {
   featureModelErrorResponse,
   modelUsedMismatch,
 } from '@/lib/featureModels'
-import type { FeatureId, PluginFeatureId } from '@/lib/llmFeatures'
+import { providerFacts, type FeatureId, type PluginFeatureId } from '@/lib/llmFeatures'
 
 export type FeatureAgentResult =
   | { ok: true; status: number; body: Record<string, unknown> }
@@ -75,7 +75,7 @@ export async function callFeatureAgent(call: FeatureAgentCall): Promise<FeatureA
     return {
       ok: false,
       response: NextResponse.json(
-        { error: 'The agent refused the webapp\'s internal key. Check INTERNAL_API_KEY on both services.' },
+        { error: 'The agent refused the webapp\'s internal key. Check INTERNAL_API_KEY on both services.', upstreamStatus: res.status },
         { status: 502 },
       ),
     }
@@ -92,7 +92,10 @@ export async function callFeatureAgent(call: FeatureAgentCall): Promise<FeatureA
     console.error(`[${call.featureId}] the agent rejected the request shape:`, body.detail)
     return {
       ok: false,
-      response: NextResponse.json({ error: 'The agent rejected the request. Rebuild the agent and the webapp together.' }, { status: 502 }),
+      response: NextResponse.json(
+        { error: 'The agent rejected the request. Rebuild the agent and the webapp together.', upstreamStatus: res.status },
+        { status: 502 },
+      ),
     }
   }
   // An exception the handler did not catch reaches us as Starlette's plain-text
@@ -103,7 +106,8 @@ export async function callFeatureAgent(call: FeatureAgentCall): Promise<FeatureA
     return {
       ok: false,
       response: NextResponse.json(
-        { error: 'The agent failed while handling this request. The details are in the agent log.' },
+        // The status tells a crash (500) from a proxy in between that gave up (502/504).
+        { error: 'The agent failed while handling this request. The details are in the agent log.', upstreamStatus: res.status },
         { status: 502 },
       ),
     }
@@ -124,7 +128,7 @@ export async function callFeatureAgent(call: FeatureAgentCall): Promise<FeatureA
       ok: false,
       ...(code ? { code } : {}),
       response: NextResponse.json(
-        { error: errorText(body, `The agent answered ${res.status}`), ...(code ? { code } : {}) },
+        { error: errorText(body, `The agent answered ${res.status}`), ...(code ? { code } : {}), ...providerFacts(body) },
         { status: res.status },
       ),
     }

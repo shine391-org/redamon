@@ -12,6 +12,7 @@ import { extractRoeText, ExtractError } from '@/lib/roe/extractText'
 import { readRoeUpload } from '@/lib/roe/upload'
 import { MAX_MODEL_CHARS } from '@/lib/roe/limits'
 import { buildReplaceReview, ReviewUnavailable } from '@/lib/roe/review'
+import { internalError } from '@/lib/routeErrors'
 import type { EffectiveUser } from '@/lib/session'
 
 // Under undici's 300 s default, and over the agent's own 270 s cap on the model
@@ -306,7 +307,6 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     // The document never reaches this process as anything but bytes and the
     // extractor's text, so an error here is infrastructure, not the document.
-    console.error('RoE parse error:', error)
-    return NextResponse.json({ error: 'Failed to parse the RoE document.' }, { status: 500 })
+    return internalError(error, 'Failed to parse the RoE document.', { log: 'RoE parse error' })
   }
 }

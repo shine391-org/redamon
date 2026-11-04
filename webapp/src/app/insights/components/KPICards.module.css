@@ -39,6 +39,13 @@
 .dotCompleted { background: var(--status-success); }
 .dotError { background: var(--status-error); }
 .dotPaused { background: var(--status-warning); }
+.dotUnknown { background: transparent; border: 1px dashed var(--status-warning); }
+
+/* An error code is not a title: keep it as the server wrote it. */
+.unavailable {
+  text-transform: none;
+  color: var(--status-warning);
+}
 
 @keyframes blink {
   0%, 100% { opacity: 1; }

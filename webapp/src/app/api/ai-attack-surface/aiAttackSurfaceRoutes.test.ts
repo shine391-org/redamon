@@ -123,11 +123,13 @@ describe('start route', () => {
 
   test('surfaces orchestrator error status', async () => {
     findUnique.mockResolvedValue({ id: 'proj1', userId: 'user1' })
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-      ok: false, status: 409, json: async () => ({ detail: 'limit reached' }),
-    }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: 'limit reached' }), { status: 409 }),
+    ))
     const res = await startRoute.POST(req({ tool: 'garak' }), params('proj1') as never)
     expect(res.status).toBe(409)
-    expect((await res.json()).error).toMatch(/limit/)
+    const body = await res.json()
+    expect(body.error).toMatch(/limit/)
+    expect(body.upstreamStatus).toBe(409)
   })
 })

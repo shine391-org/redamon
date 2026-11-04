@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, ownerScope } from '@/lib/access'
 import {
   PRESET_DESCRIPTION_MAX,
@@ -33,11 +34,7 @@ export async function GET() {
 
     return NextResponse.json(presets)
   } catch (error) {
-    console.error('Failed to fetch presets:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to fetch presets' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch presets')
   }
 }
 
@@ -80,10 +77,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(preset, { status: 201 })
   } catch (error) {
-    console.error('Failed to create preset:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to create preset' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create preset')
   }
 }

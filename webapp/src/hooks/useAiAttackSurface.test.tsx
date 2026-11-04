@@ -140,4 +140,156 @@ describe('useAiAttackSurface', () => {
     expect(result.current.findings).toHaveLength(1)
     expect(MockEventSource.instances[0].closed).toBe(true)
   })
+
+  describe('failures keep their cause', () => {
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+
+    function failingFetch(routes: Record<string, () => Response | Promise<Response>>) {
+      return vi.fn(async (url: string) => {
+        const key = Object.keys(routes).find((k) => url.includes(k))
+        return key ? routes[key]() : json(200, {})
+      })
+    }
+
+    test('a failed target load is an error with code and status, not "no endpoints"', async () => {
+      vi.stubGlobal('fetch', failingFetch({
+        '/targets': () => json(500, { error: 'Failed to load the LLM endpoints', code: 'Neo.TransientError.General.DatabaseUnavailable', targets: [] }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => { await result.current.loadTargets() })
+      expect(result.current.targetsError)
+        .toBe('Failed to load the LLM endpoints (Neo.TransientError.General.DatabaseUnavailable · HTTP 500)')
+      expect(result.current.targets).toEqual([])
+    })
+
+    test('a failed findings load keeps the findings already shown and says why', async () => {
+      let fail = false
+      vi.stubGlobal('fetch', failingFetch({
+        '/findings': () => fail
+          ? json(500, { error: 'Failed to load AI Gauntlet findings', code: 'Neo4jError', findings: [] })
+          : json(200, { findings: [{ id: 'aiatk_1', source: 'garak' }] }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => { await result.current.loadFindings() })
+      fail = true
+      await act(async () => { await result.current.loadFindings() })
+      expect(result.current.findings).toHaveLength(1)
+      expect(result.current.findingsError).toBe('Failed to load AI Gauntlet findings (Neo4jError · HTTP 500)')
+    })
+
+    test('a launch refusal keeps its code and upstream status for the start modal', async () => {
+      vi.stubGlobal('fetch', failingFetch({
+        '/start': () => json(500, { error: 'Failed to start AI Gauntlet scan', code: 'orchestrator_error', upstreamStatus: 500 }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      let state: unknown
+      await act(async () => {
+        state = await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      expect(state).toBeNull()
+      expect(result.current.getLastStartError()).toEqual({
+        message: 'Failed to start AI Gauntlet scan', status: 500, code: 'orchestrator_error', upstreamStatus: 500,
+      })
+      expect(result.current.error).toBe('Failed to start AI Gauntlet scan (orchestrator_error · HTTP 500 · upstream HTTP 500)')
+    })
+
+    test('a launch that got no answer is a network error, not "Failed to fetch"', async () => {
+      vi.stubGlobal('fetch', failingFetch({ '/start': () => { throw new TypeError('Failed to fetch') } }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => {
+        await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      expect(result.current.getLastStartError()).toEqual({ message: 'Failed to launch', status: 0, code: 'network_error' })
+      expect(result.current.error).toBe('Failed to launch (network_error)')
+    })
+
+    test('a failed stop keeps the run live, says why, and resumes the stream', async () => {
+      vi.stubGlobal('fetch', failingFetch({
+        '/start': () => json(200, { run_id: 'r1', status: 'running', tool: 'garak' }),
+        '/stop': () => json(503, { error: 'Failed to stop AI Gauntlet scan', code: 'orchestrator_unreachable', cause: 'ECONNREFUSED' }),
+        '/findings': () => json(200, { findings: [] }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => {
+        await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      await act(async () => { await result.current.stop() })
+      expect(result.current.run?.status).toBe('running')
+      expect(result.current.error).toBe('Failed to stop AI Gauntlet scan (orchestrator_unreachable · HTTP 503)')
+      const streams = MockEventSource.instances.filter((e) => e.url.includes('/r1/logs'))
+      expect(streams).toHaveLength(2)
+      expect(streams[0].closed).toBe(true)
+      expect(streams[1].closed).toBe(false)
+    })
+
+    test('an orchestrator refusal of the stop is prefixed so it reads as the stop failing', async () => {
+      vi.stubGlobal('fetch', failingFetch({
+        '/start': () => json(200, { run_id: 'r1', status: 'running', tool: 'garak' }),
+        '/stop': () => json(502, { error: 'Service not initialized', code: 'orchestrator_error', upstreamStatus: 503 }),
+        '/findings': () => json(200, { findings: [] }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => {
+        await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      await act(async () => { await result.current.stop() })
+      expect(result.current.error)
+        .toBe('Stop failed: Service not initialized (orchestrator_error · HTTP 502 · upstream HTTP 503)')
+    })
+
+    test('an unreachable status poll keeps the run and says the status is unavailable', async () => {
+      vi.stubGlobal('fetch', failingFetch({
+        '/start': () => json(200, { run_id: 'r1', status: 'running', tool: 'garak' }),
+        '/status': () => json(503, { error: 'AI Gauntlet status unavailable', code: 'orchestrator_unreachable' }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => {
+        await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(3500) })
+      expect(result.current.run?.status).toBe('running')
+      expect(result.current.statusError).toBe('AI Gauntlet status unavailable (orchestrator_unreachable · HTTP 503)')
+    })
+
+    test('a run list the orchestrator could not give is "status unavailable", not "no run"', async () => {
+      vi.stubGlobal('fetch', failingFetch({
+        '/all': () => json(503, { error: 'AI Gauntlet runs unavailable', code: 'orchestrator_unreachable' }),
+      }))
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(result.current.run).toBeNull()
+      expect(result.current.statusError).toBe('AI Gauntlet runs unavailable (orchestrator_unreachable · HTTP 503)')
+    })
+
+    test('a dropped log stream is reported, and the run is polled at once', async () => {
+      const fetchMock = failingFetch({
+        '/start': () => json(200, { run_id: 'r1', status: 'running', tool: 'garak' }),
+        '/status': () => json(200, { run_id: 'r1', status: 'running' }),
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => {
+        await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      const polls = () => fetchMock.mock.calls.filter(([u]) => String(u).includes('/status')).length
+      expect(polls()).toBe(0)
+      await act(async () => { MockEventSource.instances[0].onerror?.() })
+      expect(result.current.streamError).toBe('Log stream lost')
+      expect(polls()).toBe(1)
+    })
+
+    test('an orchestrator stream error is reported without its raw text', async () => {
+      vi.stubGlobal('fetch', failingFetch({ '/start': () => json(200, { run_id: 'r1', status: 'running' }) }))
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const { result } = renderHook(() => useAiAttackSurface('p1'))
+      await act(async () => {
+        await result.current.launch({ tool: 'garak', targets: [], bounds: {}, roe_confirmed: true })
+      })
+      act(() => { MockEventSource.instances[0].emit('error', { error: 'docker.errors.APIError: 500 Server Error' }) })
+      spy.mockRestore()
+      expect(result.current.streamError).toMatch(/^Log stream lost/)
+      expect(result.current.streamError).not.toContain('docker')
+    })
+  })
 })

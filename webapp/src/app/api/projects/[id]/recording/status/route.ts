@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { publicRecordingSession, summarizeMaterial } from '@/lib/recordingSession'
 import type { RecordingMaterial } from '@/lib/recordingSession'
@@ -36,7 +37,6 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       otherProjectRecording: !!otherActive,
     })
   } catch (error) {
-    console.error('Failed to read recording status:', error)
-    return NextResponse.json({ error: 'Failed to read recording status' }, { status: 500 })
+    return internalError(error, 'Failed to read recording status')
   }
 }

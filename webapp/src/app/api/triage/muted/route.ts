@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { withRouteErrors } from '@/lib/routeErrors'
 import { requireProjectOwner, graphTriage } from '@/lib/triageClient'
 import { liveRuleMutedBy } from '@/lib/nodeFilters/model'
 import { MULTI_BATCH_PATTERN } from '@/lib/multiMute'
@@ -38,7 +39,9 @@ function intParam(raw: string | null, fallback: number, min: number, max: number
   return Math.max(min, Math.min(max, n))
 }
 
-export async function GET(request: NextRequest) {
+// The ownership check reads Postgres; a failure there would otherwise be
+// Next's empty-bodied 500.
+export const GET = withRouteErrors('Could not load the muted nodes', async (request: NextRequest) => {
   const q = request.nextUrl.searchParams
   const caller = await requireProjectOwner(q.get('projectId'))
   if (caller instanceof NextResponse) return caller
@@ -79,4 +82,4 @@ export async function GET(request: NextRequest) {
     if (facets.status === 200) out.facets = annotateMutedFacets(doc, facets.body)
   }
   return NextResponse.json(out)
-}
+})

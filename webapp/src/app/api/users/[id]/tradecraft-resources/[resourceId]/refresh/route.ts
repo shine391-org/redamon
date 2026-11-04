@@ -1,13 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { internalError, readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
+import { agentAnswerLastError } from '../../agentLastError'
 
 interface RouteParams {
   params: Promise<{ id: string; resourceId: string }>
 }
 
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8090'
+/** The agent crawls the site and asks an LLM for a summary: minutes, not seconds. */
+const REFRESH_TIMEOUT_MS = 240_000
 
 // POST /api/users/[id]/tradecraft-resources/[resourceId]/refresh
 //   Same as /verify with force=true and bumps lastRefreshedAt.
@@ -32,36 +35,33 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         ? existing.githubTokenOverride
         : ((userSettings as unknown as Record<string, string> | null)?.githubAccessToken || '')
 
-    const controller = new AbortController()
-    const t = setTimeout(() => controller.abort(), 240_000)
+    const agentResp = await agentFetch('/tradecraft/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: existing.url,
+        user_id: id,
+        github_token: tokenForFetch,
+        force: true,
+        // Without it the agent falls back to its default model, which the
+        // user may have no key for, and the refresh fails with 503.
+        model: (existing as unknown as { llmModel?: string }).llmModel || '',
+      }),
+    }, { timeoutMs: REFRESH_TIMEOUT_MS })
 
-    let agentResp: Response
-    try {
-      agentResp = await fetch(`${AGENT_API_URL}/tradecraft/verify`, {
-        method: 'POST',
-        headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({
-          url: existing.url,
-          user_id: id,
-          github_token: tokenForFetch,
-          force: true,
-          // Without it the agent falls back to its default model, which the
-          // user may have no key for, and the refresh fails with 503.
-          model: (existing as unknown as { llmModel?: string }).llmModel || '',
-        }),
-        signal: controller.signal,
-      })
-    } finally {
-      clearTimeout(t)
-    }
-
+    // Neither the row nor the answer carries the agent's text (agentLastError.ts):
+    // the status and the agent's code are what the list and the toast show.
     if (!agentResp.ok) {
-      const errText = await agentResp.text()
-      const updated = await prisma.userTradecraftResource.update({
+      const failed = await readUpstreamBody(agentResp)
+      const code = failed.code ?? 'agent_error'
+      await prisma.userTradecraftResource.update({
         where: { id: resourceId },
-        data: { lastError: `refresh failed (${agentResp.status}): ${errText.slice(0, 500)}` },
+        data: { lastError: agentAnswerLastError('refresh', code, agentResp.status) },
       })
-      return NextResponse.json(updated, { status: agentResp.status })
+      return NextResponse.json(
+        { error: 'The agent could not refresh this resource', code, upstreamStatus: agentResp.status },
+        { status: 502 },
+      )
     }
 
     const result = await agentResp.json()
@@ -81,14 +81,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json(updated)
   } catch (error: unknown) {
-    const e = error as { name?: string }
-    if (e?.name === 'AbortError') {
-      return NextResponse.json({ error: 'refresh timed out' }, { status: 504 })
+    if (error instanceof AgentUnreachableError) {
+      return upstreamFailureResponse('agent', error.cause_, 'Failed to refresh tradecraft resource')
     }
-    console.error('Failed to refresh tradecraft resource:', error)
-    return NextResponse.json(
-      { error: 'Failed to refresh tradecraft resource' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to refresh tradecraft resource')
   }
 }

@@ -1,5 +1,6 @@
 import { verify } from 'crypto'
 import prisma from '@/lib/prisma'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { compareVersions, parseVersion, satisfies } from '@/lib/semver'
 import { now } from './clock'
 import { FetchRemoteError, fetchRemote, type FetchResult } from './fetchRemote'
@@ -194,13 +195,15 @@ async function settleSerial(
   })
 }
 
-async function download(fetcher: CatalogFetch, url: string): Promise<Buffer> {
+async function download(fetcher: CatalogFetch, url: string, file: string): Promise<Buffer> {
   try {
     return (await fetcher(url, { kind: 'catalog' })).bytes
   } catch (e) {
     const code = e instanceof FetchRemoteError ? e.code : undefined
-    const why = e instanceof Error ? e.message : String(e)
-    throw new CatalogError('catalog_unreachable', `The plugin catalog could not be downloaded: ${why}`, undefined, code)
+    // A FetchRemoteError's message is the platform's own (host, HTTP status, errno); any
+    // other error is named by its code only.
+    const why = e instanceof FetchRemoteError ? e.message : safeErrorCode(e)
+    throw new CatalogError('catalog_unreachable', `The plugin catalog could not be downloaded (${file}): ${why}`, undefined, code)
   }
 }
 
@@ -220,11 +223,12 @@ export async function loadCatalog(source: CatalogSource, deps: CatalogDeps = {})
   let out: LoadedCatalog | CatalogError
   try {
     const fetcher = deps.fetch ?? fetchRemote
-    const [bytes, sigBytes] = await Promise.all([download(fetcher, url), download(fetcher, `${url}.sig`)])
+    const [bytes, sigBytes] = await Promise.all([download(fetcher, url, 'catalog.json'), download(fetcher, `${url}.sig`, 'catalog.json.sig')])
     out = await settleSerial(verifyCatalog(bytes, sigBytes, officialKeys), bytes, sigBytes, officialKeys, db)
   } catch (e) {
     if (!(e instanceof CatalogError)) throw e
-    console.warn(`[plugins] catalog not loaded: ${e.code}${e.fetchCode ? ` (${e.fetchCode})` : ''}`)
+    const details = e.details?.length ? ` [${e.details.slice(0, 5).join('; ')}]` : ''
+    console.warn(`[plugins] catalog not loaded: ${e.code}${e.fetchCode ? ` (${e.fetchCode})` : ''}: ${e.message}${details}`)
     out = e
   }
   if (!deps.noCache) cache = { at: t, url, result: out }

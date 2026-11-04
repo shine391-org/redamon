@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { readJsonBody } from '@/lib/jsonBody'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { getSession } from '@/lib/session'
 import { LifecycleError } from './lifecycleCommon'
 import { PluginConflictError } from './registry'
@@ -15,8 +16,42 @@ import { crossOriginResponse, sameOrigin } from './sameOrigin'
  */
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
-export function errorResponse(status: number, code: string, error: string, details?: string[]): NextResponse {
-  return NextResponse.json({ error, code, ...(details?.length ? { details } : {}) }, { status, headers: NO_STORE })
+export function errorResponse(
+  status: number,
+  code: string,
+  error: string,
+  details?: string[],
+  extra?: Record<string, unknown>,
+): NextResponse {
+  return NextResponse.json({ error, code, ...(details?.length ? { details } : {}), ...extra }, { status, headers: NO_STORE })
+}
+
+/**
+ * The 500 of a plugin route: the fixed sentence and the error's safe code (a Prisma or Node
+ * code, else its class), never its message, which can quote a query's values.
+ */
+export function internalErrorResponse(e: unknown, what: string, error: string, extra?: Record<string, unknown>): NextResponse {
+  const code = safeErrorCode(e)
+  console.error(`[plugins] ${what} failed (${code}): ${(e as Error)?.stack ?? String(e)}`)
+  return errorResponse(500, code, error, undefined, extra)
+}
+
+/**
+ * Wraps a plugin route that has no catch of its own, so a throw (a database timeout) answers
+ * `{error, code}` in the platform's shape instead of Next's empty 500 no client can read.
+ */
+export function pluginRoute<A extends unknown[]>(
+  what: string,
+  error: string,
+  handler: (...args: A) => Promise<Response>,
+): (...args: A) => Promise<Response> {
+  return async (...args: A) => {
+    try {
+      return await handler(...args)
+    } catch (e) {
+      return internalErrorResponse(e, what, error)
+    }
+  }
 }
 
 export async function requirePluginAdmin(): Promise<{ userId: string } | NextResponse> {
@@ -30,10 +65,18 @@ export async function requirePluginAdmin(): Promise<{ userId: string } | NextRes
 }
 
 export function lifecycleErrorResponse(e: unknown, what: string): NextResponse {
-  if (e instanceof LifecycleError) return errorResponse(e.status, e.code, e.message, e.details)
+  if (e instanceof LifecycleError) return errorResponse(e.status, e.code, e.message, e.details, e.extra)
   if (e instanceof PluginConflictError) return errorResponse(409, 'plugin_busy', e.message)
-  console.error(`[plugins] ${what} failed: ${(e as Error)?.stack ?? String(e)}`)
-  return errorResponse(500, 'internal_error', 'The plugin operation failed; see the webapp log.')
+  return internalErrorResponse(e, what, 'The plugin operation failed; see the webapp log.')
+}
+
+/** The admin check, its database read failing as a 500 the page can read. */
+async function adminOrResponse(what: string): Promise<{ userId: string } | NextResponse> {
+  try {
+    return await requirePluginAdmin()
+  } catch (e) {
+    return lifecycleErrorResponse(e, what)
+  }
 }
 
 /** A state-changing route: admin, same origin, a JSON object body, then `run`. */
@@ -42,9 +85,9 @@ export async function lifecyclePost(
   what: string,
   run: (body: Record<string, unknown>, adminId: string) => Promise<unknown>,
 ): Promise<NextResponse> {
-  const admin = await requirePluginAdmin()
+  const admin = await adminOrResponse(what)
   if (admin instanceof NextResponse) return admin
-  if (!sameOrigin(request)) return crossOriginResponse()
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const started = Date.now()
@@ -61,7 +104,7 @@ export async function lifecyclePost(
 
 /** A read-only admin route: admin, then `run`. */
 export async function lifecycleGet(what: string, run: (adminId: string) => Promise<NextResponse>): Promise<NextResponse> {
-  const admin = await requirePluginAdmin()
+  const admin = await adminOrResponse(what)
   if (admin instanceof NextResponse) return admin
   try {
     return await run(admin.userId)

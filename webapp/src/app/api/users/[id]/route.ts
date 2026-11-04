@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { projectTargetLabel } from '@/lib/projectSummary'
 import prisma from '@/lib/prisma'
 import { getSession, isInternalRequest } from '@/lib/session'
+import { internalError } from '@/lib/routeErrors'
+import { purgeProjectWorkspace } from '@/lib/workspacePurge'
+import { isLoopModel } from '@/lib/agentInTheLoop'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -68,11 +71,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       })),
     })
   } catch (error) {
-    console.error('Failed to fetch user:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch user')
   }
 }
 
@@ -107,6 +106,12 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     if (email) data.email = email
     if (role === 'admin' || role === 'standard') data.role = role
     // Remembered model choices, used to pre-fill the next new project.
+    if (isLoopModel(defaultAgentModel) || isLoopModel(defaultAiPipelineModel)) {
+      return NextResponse.json(
+        { error: 'Agent in the Loop cannot be a default model; pick it per project.', code: 'loop_model_not_allowed' },
+        { status: 400 },
+      )
+    }
     if (typeof defaultAgentModel === 'string') data.defaultAgentModel = defaultAgentModel
     if (typeof defaultAiPipelineModel === 'string') data.defaultAiPipelineModel = defaultAiPipelineModel
 
@@ -127,8 +132,6 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(user)
   } catch (error: unknown) {
-    console.error('Failed to update user:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
         { error: 'User not found' },
@@ -136,10 +139,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to update user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update user')
   }
 }
 
@@ -176,9 +176,19 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       console.warn('Could not enumerate captured body refs before user delete:', e)
     }
 
+    // The cascade deletes the user's projects; their workspaces are on disk.
+    let projectIds: string[] = []
+    try {
+      projectIds = (await prisma.project.findMany({ where: { userId: id }, select: { id: true } })).map(p => p.id)
+    } catch (e) {
+      console.warn('Could not list projects before user delete:', e)
+    }
+
     await prisma.user.delete({
       where: { id }
     })
+
+    await Promise.allSettled(projectIds.map(pid => purgeProjectWorkspace(pid)))
 
     if (capturedBodyRefs.length > 0) {
       try {
@@ -192,8 +202,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true })
   } catch (error: unknown) {
-    console.error('Failed to delete user:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
         { error: 'User not found' },
@@ -201,9 +209,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to delete user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete user')
   }
 }

@@ -2,31 +2,19 @@
  * PUT    /api/users/[id]/mcp/[serverId] - update one server
  * DELETE /api/users/[id]/mcp/[serverId] - delete one server
  *
- * Both fire async POST ${AGENT_API_URL}/mcp/reload after a successful write.
+ * Both ask the agent to reload after a successful write; a failed reload comes
+ * back as `warnings`.
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
 import { mcpServerSchema, validateMcpServers, type MCPServer } from '@/lib/mcp/schema'
 import { maskMcpServersForApi, restoreMaskedToken } from '../route'
-import { internalKeyHeaders } from '@/lib/agentAuth'
-
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://agent:8080'
+import { internalError } from '@/lib/routeErrors'
+import { reloadAgentMcp } from '../reload'
 
 interface RouteParams {
   params: Promise<{ id: string; serverId: string }>
-}
-
-async function fireReload(userMcpServers: unknown) {
-  try {
-    await fetch(`${AGENT_API_URL}/mcp/reload`, {
-      method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ userMcpServers }),
-    })
-  } catch (e) {
-    console.warn('Failed to ping agent /mcp/reload:', e)
-  }
 }
 
 export async function PUT(request: NextRequest, { params }: RouteParams) {
@@ -83,12 +71,14 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       data: { mcpServers: next as unknown as object },
     })
 
-    void fireReload(next)
+    const warnings = await reloadAgentMcp(next)
     const [returned] = maskMcpServersForApi([updated])
-    return NextResponse.json({ server: returned, servers: maskMcpServersForApi(next) })
+    return NextResponse.json({
+      server: returned, servers: maskMcpServersForApi(next),
+      ...(warnings.length ? { warnings } : {}),
+    })
   } catch (error) {
-    console.error('Failed to update MCP server:', error)
-    return NextResponse.json({ error: 'Failed to update MCP server' }, { status: 500 })
+    return internalError(error, 'Failed to update MCP server')
   }
 }
 
@@ -114,10 +104,10 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       data: { mcpServers: next as unknown as object },
     })
 
-    void fireReload(next)
-    return NextResponse.json({ servers: next })
+    const warnings = await reloadAgentMcp(next)
+    // Masked like every other answer here: the remaining servers hold literal tokens.
+    return NextResponse.json({ servers: maskMcpServersForApi(next), ...(warnings.length ? { warnings } : {}) })
   } catch (error) {
-    console.error('Failed to delete MCP server:', error)
-    return NextResponse.json({ error: 'Failed to delete MCP server' }, { status: 500 })
+    return internalError(error, 'Failed to delete MCP server')
   }
 }

@@ -34,4 +34,14 @@ describe('GET /api/projects', () => {
     expect(select.domainBatchGroups).toBeUndefined()
     expect(projectTargetLabel(body[0])).toBe('2 scope groups across 2 domains (1 enumerated)')
   })
+
+  test('a database failure is a 500 with the Prisma code, never an empty list', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    findMany.mockRejectedValue(Object.assign(new Error('Can\'t reach database server at `db:5432`'), {
+      code: 'P1001', name: 'PrismaClientInitializationError',
+    }))
+    const res = await GET()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to fetch projects', code: 'P1001' })
+  })
 })

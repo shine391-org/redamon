@@ -22,6 +22,8 @@ import {
 } from './triageLayers'
 import { DispositionLine } from './DispositionChip'
 import { readDisposition } from '@/lib/triage/disposition'
+import { triageBodyErrorText } from '@/lib/triage/errorText'
+import { toApiError } from '@/lib/apiError'
 import styles from './TriageDetailPanel.module.css'
 
 interface GroupMember {
@@ -86,10 +88,10 @@ async function readJson(res: Response): Promise<Record<string, unknown>> {
 }
 
 function failureText(body: Record<string, unknown>, what: string, status: number): string {
-  return typeof body.error === 'string' && body.error
-    ? body.error
-    : `The ${what} could not be loaded (${status}).`
+  return triageBodyErrorText(body, status, `The ${what} could not be loaded.`)
 }
+
+const NO_ANSWER = 'The findings service did not answer.'
 
 export function TriageDetailPanel({
   projectId, target, row, onClose, onVerdict, onGone, onReload,
@@ -127,8 +129,8 @@ export function TriageDetailPanel({
         }
         setRowAtLoad(row)
         setDetail({ kind: 'ready', data: body as unknown as FindingDetail })
-      } catch {
-        if (live) setDetail({ kind: 'error', message: 'The findings service did not answer.' })
+      } catch (e) {
+        if (live) setDetail({ kind: 'error', message: toApiError(e, NO_ANSWER).message })
       }
     })()
     return () => { live = false }
@@ -154,8 +156,8 @@ export function TriageDetailPanel({
           return
         }
         setEvidence({ kind: 'ready', data: body as unknown as EvidenceAnswer })
-      } catch {
-        if (live) setEvidence({ kind: 'error', message: 'The findings service did not answer.' })
+      } catch (e) {
+        if (live) setEvidence({ kind: 'error', message: toApiError(e, NO_ANSWER).message })
       }
     })()
     return () => { live = false }

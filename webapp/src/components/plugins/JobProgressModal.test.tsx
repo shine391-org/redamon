@@ -158,3 +158,75 @@ describe('terminal states', () => {
     expect((fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(after)
   })
 })
+
+describe('a failure says its cause', () => {
+  /** fetch answers each GET in turn with these (a Response factory or a thrown error), repeating the last. */
+  function stubPolls(answers: (() => Response)[], cancel?: () => Response) {
+    let i = 0
+    const fn = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return cancel ? cancel() : new Response('{}', { status: 200 })
+      const a = answers[Math.min(i, answers.length - 1)]
+      i++
+      return a()
+    })
+    vi.stubGlobal('fetch', fn)
+    return fn
+  }
+  const ok = (v: Record<string, unknown>) => () => new Response(JSON.stringify(view(v)), { status: 200 })
+  const blip = () => new Response('<html>502 Bad Gateway</html>', { status: 502 })
+
+  test('a poll that fails is asked again: a blip does not end the window', async () => {
+    const fn = stubPolls([blip, blip, ok({ status: 'succeeded', result: { message: 'All done' } })])
+    draw({ pollMs: 1 })
+    expect(await screen.findByText('All done')).toBeInTheDocument()
+    expect(screen.queryByText(/Lost contact/)).toBeNull()
+    expect(fn.mock.calls.length).toBe(3)
+  })
+
+  test('polls that keep failing give up with the code and status', async () => {
+    const fn = stubPolls([blip])
+    draw({ pollMs: 1 })
+    expect(await screen.findByText('Lost contact with the job (non_json_response · HTTP 502); it may still be running.')).toBeInTheDocument()
+    expect(fn.mock.calls.length).toBe(4)
+  })
+
+  test('a job that is not there (404) is not asked again', async () => {
+    const fn = stubPolls([() => new Response(JSON.stringify({ error: 'Not found', code: 'not_found' }), { status: 404 })])
+    draw({ pollMs: 1 })
+    expect(await screen.findByText('Lost contact with the job (not_found · HTTP 404); it may still be running.')).toBeInTheDocument()
+    expect(fn.mock.calls.length).toBe(1)
+  })
+
+  test('a refused cancel says why under the progress, which keeps going', async () => {
+    stubPolls([ok({ status: 'running' })], () => new Response(JSON.stringify({ error: 'Cross-origin request refused.', code: 'cross_origin' }), { status: 403 }))
+    draw()
+    fireEvent.click(await screen.findByRole('button', { name: /cancel/i }))
+    expect(await screen.findByText('The job could not be cancelled (cross_origin · HTTP 403); it may still be running.')).toBeInTheDocument()
+    expect(screen.getByRole('progressbar', { name: 'Working' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeInTheDocument()
+  })
+
+  test('a cancel that gets no answer says so', async () => {
+    stubPolls([ok({ status: 'running' })], () => {
+      throw new TypeError('Failed to fetch')
+    })
+    draw()
+    fireEvent.click(await screen.findByRole('button', { name: /cancel/i }))
+    expect(await screen.findByText('The job could not be cancelled (network_error); it may still be running.')).toBeInTheDocument()
+  })
+
+  test("a failed job shows its code beside the message", async () => {
+    stubJob([view({ status: 'failed', error: { code: 'plugin_error', message: 'The engine raised' } })])
+    draw()
+    await screen.findByText('The engine raised')
+    expect(screen.getByTestId('job-error-code').textContent).toBe('plugin_error')
+  })
+
+  test('a result report the Gateway refused is said as such, not as a timeout', async () => {
+    stubJob([view({ status: 'failed', error: { code: 'report_refused:body_too_large', message: 'The plugin finished, but RedAmon refused its result report (body_too_large, HTTP 413).' } })])
+    draw()
+    expect(await screen.findByText("The plugin's result was refused.")).toBeInTheDocument()
+    expect(screen.queryByText(/timed out/i)).toBeNull()
+    expect(screen.getByTestId('job-error-code').textContent).toBe('report_refused:body_too_large')
+  })
+})

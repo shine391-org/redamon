@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { agentErrorResponse, callAgent } from '../../agentProxy'
+import { codedAgentError } from '../codedAgentError'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
+const FAILED = 'Failed to mkdir'
 
-export async function POST(request: NextRequest) {
+export const POST = withRouteErrors(FAILED, async (request: NextRequest) => {
   let body: { projectId?: string; path?: string }
   try {
     body = await request.json()
@@ -17,19 +19,14 @@ export async function POST(request: NextRequest) {
   const __denied = await guardProject(body.projectId || '')
   if (__denied) return __denied
 
-  try {
-    const resp = await fetch(`${AGENT_API_URL}/workspace/mkdir`, {
-      method: 'POST',
-      headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(body),
-    })
-    const data = await resp.json()
-    return NextResponse.json(data, { status: resp.status })
-  } catch (error) {
-    console.error('workspace/mkdir proxy error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to mkdir' },
-      { status: 502 }
-    )
-  }
-}
+  const call = await callAgent('/workspace/mkdir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, FAILED)
+  if (!call.ok) return call.response
+  // A 409 is the agent's coded busy answer: keep the id of the import that holds the folder.
+  if (call.res.status === 409) return codedAgentError(call.res, FAILED)
+  if (!call.res.ok) return agentErrorResponse(call.res, FAILED)
+  return NextResponse.json(await call.res.json())
+})

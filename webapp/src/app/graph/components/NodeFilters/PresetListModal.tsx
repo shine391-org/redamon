@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Check, FolderOpen, Loader2, Pencil, Trash2, X } from 'lucide-react'
 import { Modal, useAlertModal, useToast, WikiInfoButton } from '@/components/ui'
 import { PRESET_LIMITS, type MuteRulesPresetSummary } from '@/lib/nodeFilters/presets'
+import { fetchJson, formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import styles from './NodeFilters.module.css'
 
 export type PresetListMode = 'load' | 'manage'
@@ -39,11 +40,9 @@ export function PresetListModal({ isOpen, mode, onClose, onLoad }: PresetListMod
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/mute-rule-presets')
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Presets: ${res.status}`)
-      setPresets(await res.json())
+      setPresets(await fetchJson<MuteRulesPresetSummary[]>('/api/mute-rule-presets', undefined, 'Could not load the presets'))
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not load the presets')
+      setError(toApiError(e, 'Could not load the presets').message)
     } finally {
       setLoading(false)
     }
@@ -73,14 +72,18 @@ export function PresetListModal({ isOpen, mode, onClose, onLoad }: PresetListMod
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: editing.name, description: editing.description }),
       })
-      const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        setEditing(prev => (prev ? { ...prev, error: body.error || `Rename failed (${res.status})` } : prev))
+        const err = await readApiError(res, 'Rename failed')
+        setEditing(prev => (prev ? { ...prev, error: err.message } : prev))
         return
       }
+      const body = await res.json()
       setPresets(prev => prev.map(p => (p.id === editing.id ? body : p)))
       setEditing(null)
       toast.success(`Preset "${body.name}" updated.`, 'Mute rules')
+    } catch (e) {
+      const message = toApiError(e, 'Rename failed').message
+      setEditing(prev => (prev ? { ...prev, error: message } : prev))
     } finally {
       setBusyId(null)
     }
@@ -96,11 +99,12 @@ export function PresetListModal({ isOpen, mode, onClose, onLoad }: PresetListMod
     setBusyId(preset.id)
     try {
       const res = await fetch(`/api/mute-rule-presets/${encodeURIComponent(preset.id)}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error()
+      if (!res.ok) throw await readApiError(res, 'could not be deleted')
       setPresets(prev => prev.filter(p => p.id !== preset.id))
       toast.success(`Preset "${preset.name}" deleted.`, 'Mute rules')
-    } catch {
-      toast.error(`Preset "${preset.name}" could not be deleted.`, 'Mute rules')
+    } catch (e) {
+      const err = toApiError(e, 'could not be deleted')
+      toast.error(`${formatApiError({ ...err, reason: `Preset "${preset.name}" could not be deleted` })}.`, 'Mute rules')
     } finally {
       setBusyId(null)
     }

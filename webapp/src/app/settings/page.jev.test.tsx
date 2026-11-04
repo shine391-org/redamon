@@ -94,10 +94,10 @@ describe('TypeSafe AI (Jev) section', () => {
   })
 
   test('a failed fetch says so with a Retry, in the section and in the list', async () => {
-    providersAnswer = async () => ({ status: 500, body: { error: 'boom' } })
+    providersAnswer = async () => ({ status: 500, body: { error: 'boom', code: 'P1001' } })
     renderPage()
     const section = await jevSection()
-    await within(section).findByText("Couldn't load your providers.")
+    await within(section).findByText("Couldn't load your providers (P1001 · HTTP 500).")
     expect(within(section).queryByRole('button', { name: /Add token/ })).not.toBeInTheDocument()
     expect(screen.queryByText('No providers configured. Add one to get started.')).not.toBeInTheDocument()
 
@@ -110,7 +110,7 @@ describe('TypeSafe AI (Jev) section', () => {
     providersAnswer = async () => { throw new TypeError('fetch failed') }
     renderPage()
     const section = await jevSection()
-    await within(section).findByText("Couldn't load your providers.")
+    await within(section).findByText("Couldn't load your providers (network_error).")
   })
 
   test('no Jev row: Add token and the key link; Add token opens the locked form', async () => {

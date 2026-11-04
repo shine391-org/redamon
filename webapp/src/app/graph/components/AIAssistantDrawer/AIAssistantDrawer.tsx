@@ -7,7 +7,7 @@
 
 'use client'
 
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import type { ActiveSkill } from './hooks/useSendHandlers'
 import styles from './AIAssistantDrawer.module.css'
 
@@ -29,9 +29,15 @@ import { usePendingNodeQuery } from './hooks/usePendingNodeQuery'
 
 // External hooks
 import { useAgentWebSocket } from '@/hooks/useAgentWebSocket'
-import type { ConnectedPayload } from '@/lib/websocket-types'
+import { useAgentHealth } from '@/hooks/useAgentHealth'
+import { ConnectionStatus, type ConnectedPayload, type LoopStatusPayload } from '@/lib/websocket-types'
+import { useOptionalAuth } from '@/providers/AuthProvider'
+import { useOptionalProject } from '@/providers/ProjectProvider'
+import { loopDisplay } from './hooks/loopStatus'
 import { useConversations } from '@/hooks/useConversations'
 import { useChatPersistence } from '@/hooks/useChatPersistence'
+import { useToast } from '@/components/ui'
+import { CONVERSATION_FAILURE_TITLE, DECISION_NOT_SENT, deleteWarningsText } from './drawerNotices'
 
 // Sub-components
 import { DrawerHeader } from './DrawerHeader'
@@ -47,6 +53,7 @@ import { ApprovalDialog } from './ApprovalDialog'
 import { QuestionDialog } from './QuestionDialog'
 import { InputArea } from './InputArea'
 import { ApiKeyModal } from './ApiKeyModal'
+import { SkillDataNotice } from './SkillDataNotice'
 
 // Types
 import type { AIAssistantDrawerProps } from './types'
@@ -83,6 +90,15 @@ export function AIAssistantDrawer({
   // ─── State hooks ─────────────────────────────────────────────────────────────
   const [activeSkill, setActiveSkill] = useState<ActiveSkill | null>(null)
   const statusWord = useLoadingWord()
+  // Agent in the Loop: the live status of this session's run (null otherwise).
+  const [loopStatus, setLoopStatus] = useState<LoopStatusPayload | null>(null)
+  useEffect(() => { setLoopStatus(null) }, [sessionId])
+  // Under act-as the run is driven by the impersonated user's own token.
+  const effectiveUserId = useOptionalProject()?.userId ?? null
+  const signedInId = useOptionalAuth()?.user?.id
+  const actingAs = Boolean(effectiveUserId && signedInId && effectiveUserId !== signedInId)
+  const loop = useMemo(() => loopDisplay(loopStatus, { actingAs }), [loopStatus, actingAs])
+  const toast = useToast()
 
   const {
     chatItems, setChatItems,
@@ -125,7 +141,7 @@ export function AIAssistantDrawer({
     scrollToBottom, checkIfAtBottom, resetScrollState,
   } = useScrollBehavior(chatItems)
 
-  const { skillData, refetch: refetchSkillData } = useAttackSkillData(userId, projectId)
+  const { skillData, refetch: refetchSkillData, error: skillDataError } = useAttackSkillData(userId, projectId)
 
   const {
     missingApiKeys,
@@ -151,6 +167,7 @@ export function AIAssistantDrawer({
     settingsModal, setSettingsModal,
     projectFormData, updateProjectField,
     settingsDropdownRef,
+    projectLoadError,
   } = useSettingsModal(projectId)
 
   // Plugin chat-session actions from the gear menu (design §6.7): the review modal (step 6.5)
@@ -172,11 +189,18 @@ export function AIAssistantDrawer({
   const {
     conversations,
     loading: conversationsLoading,
+    error: conversationsError,
     fetchConversations,
     createConversation,
     deleteConversation,
     loadConversation,
-  } = useConversations(projectId, userId)
+  } = useConversations(projectId, userId, {
+    // The list is polled while the history is open: its failure is shown there, not toasted every 5s.
+    onError: (action, err) => {
+      if (action !== 'list') toast.error(err.message, CONVERSATION_FAILURE_TITLE[action])
+    },
+    onDeleteWarnings: (warnings) => toast.warning(deleteWarningsText(warnings), 'Session deleted with warnings'),
+  })
 
   // ─── handleNewChat (cross-cutting - touches state from multiple hooks) ─────
   // Defined before useConversationRestoration via a stable ref pattern
@@ -224,6 +248,7 @@ export function AIAssistantDrawer({
     setActiveSkill,
     updateConvMeta: useCallback((updates: Record<string, any>) => updateConvMetaRef.current(updates), []),
     handleNewChat: useCallback(() => handleNewChatRef.current(), []),
+    notifyError: useCallback((message: string) => toast.error(message), [toast]),
   })
 
   const { saveMessage, updateConversation: updateConvMeta } = useChatPersistence(conversationId)
@@ -261,10 +286,12 @@ export function AIAssistantDrawer({
     awaitingToolConfirmationRef, isProcessingToolConfirmation,
     pendingApprovalToolId, pendingApprovalWaveId,
     onGraphMutation: onRefetchGraph,
+    setLoopStatus,
   })
 
   const {
     status, isConnected, reconnectAttempt,
+    error: socketError, lastClose, url: socketUrl,
     sendQuery, sendGuidance, sendApproval, sendToolConfirmation,
     sendFireteamMemberConfirmation,
     sendAnswer, sendSkillInject, sendStop, sendResume, sendToolStop,
@@ -283,6 +310,7 @@ export function AIAssistantDrawer({
     // believed to be going, and take the spinner state from the server's live
     // agent_running instead of trusting events that may have been lost.
     onConnect: useCallback((payload: ConnectedPayload) => {
+      setLoopStatus(payload?.loop_state ?? null)
       resyncActiveConversation(sessionId, {
         agentRunning: payload?.agent_running,
         clientRunning: isLoadingRef.current,
@@ -290,6 +318,9 @@ export function AIAssistantDrawer({
       })
     }, [resyncActiveConversation, sessionId]),
   })
+
+  // The agent's own health answer (container down vs. refusing) once the socket gave up.
+  const agentHealth = useAgentHealth({ enabled: status === ConnectionStatus.FAILED })
 
   // ─── Send handlers ────────────────────────────────────────────────────────
   const {
@@ -323,6 +354,23 @@ export function AIAssistantDrawer({
     conversationId, setConversationId, projectId, userId, sessionId,
     createConversation, saveMessage, updateConvMeta,
   })
+
+  // A decision made while the socket is down would be shown as sent and never
+  // reach the agent; the pending request stays open until the connection is back.
+  const isConnectedRef = useRef(isConnected)
+  isConnectedRef.current = isConnected
+  const guardedApproval = useCallback((decision: 'approve' | 'modify' | 'abort') => {
+    if (!isConnectedRef.current) { toast.error(DECISION_NOT_SENT, 'Not connected'); return }
+    handleApproval(decision)
+  }, [handleApproval, toast])
+  const guardedAnswer = useCallback(() => {
+    if (!isConnectedRef.current) { toast.error(DECISION_NOT_SENT, 'Not connected'); return }
+    handleAnswer()
+  }, [handleAnswer, toast])
+  const guardedToolConfirmation = useCallback((itemId: string, decision: 'approve' | 'reject') => {
+    if (!isConnectedRef.current) { toast.error(DECISION_NOT_SENT, 'Not connected'); return }
+    handleTimelineToolConfirmation(itemId, decision)
+  }, [handleTimelineToolConfirmation, toast])
 
   // ─── Markdown download ────────────────────────────────────────────────────
   const { handleDownloadMarkdown } = useDownloadMarkdown({
@@ -470,6 +518,11 @@ export function AIAssistantDrawer({
         handleSelectConversation={handleSelectConversation}
         handleDeleteConversation={handleDeleteConversation}
         handleHistoryNewChat={handleHistoryNewChat}
+        connectionError={socketError?.message ?? null}
+        lastClose={lastClose}
+        socketUrl={socketUrl}
+        agentHealthError={agentHealth.status === 'offline' ? agentHealth.error : null}
+        conversationsError={conversationsError}
       />
 
       <PhaseIndicatorBar
@@ -491,6 +544,8 @@ export function AIAssistantDrawer({
         conversationId={conversationId}
         onRunPluginAction={runPluginChatAction}
       />
+
+      <SkillDataNotice error={skillDataError} />
 
       {pluginChatModals}
 
@@ -524,6 +579,7 @@ export function AIAssistantDrawer({
         projectFormData={projectFormData}
         updateProjectField={updateProjectField}
         projectId={projectId}
+        loadError={projectLoadError}
       />
 
       <ModelPickerModal
@@ -553,8 +609,9 @@ export function AIAssistantDrawer({
         setInputValue={setInputValue}
         missingApiKeys={missingApiKeys}
         openApiKeyModal={openApiKeyModal}
-        handleTimelineToolConfirmation={handleTimelineToolConfirmation}
+        handleTimelineToolConfirmation={guardedToolConfirmation}
         handleToolStop={handleToolStop}
+        loop={loop}
       />
 
       <ApprovalDialog
@@ -562,8 +619,9 @@ export function AIAssistantDrawer({
         approvalRequest={approvalRequest}
         modificationText={modificationText}
         isLoading={isLoading}
+        isConnected={isConnected}
         setModificationText={setModificationText}
-        handleApproval={handleApproval}
+        handleApproval={guardedApproval}
       />
 
       <QuestionDialog
@@ -574,7 +632,8 @@ export function AIAssistantDrawer({
         isLoading={isLoading}
         setAnswerText={setAnswerText}
         setSelectedOptions={setSelectedOptions}
-        handleAnswer={handleAnswer}
+        handleAnswer={guardedAnswer}
+        isConnected={isConnected}
       />
 
       <InputArea

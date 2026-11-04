@@ -330,6 +330,8 @@ tools and wordlist paths**.
 | Provider API hosts, 5 copies | `llm_setup.py`, `model_providers.py`, `defaultBaseUrlFor` (`presets/generate/route.ts:85`), `webapp/src/lib/apiUsage/providers/llm/*.ts`, `llmProviderPresets.ts` (20 URLs) | NONE | Agree today |
 | Model-prefix routing, 3 copies | `parse_model_provider` (`llm_setup.py`), `resolveModel` (`presets/generate/route.ts:54-79`, lacks the legacy `openai_compat/` prefix, unverified effect), `formatModelDisplay` (`phaseConfig.ts:14`, display only) | PART | A model chat accepts is misrouted by preset generation |
 | Provider-type facts | `NON_CHAT_PROVIDER_TYPES` (`agentic/llm_builder.py:38`, `webapp/src/lib/llmProviderKinds.ts`); `CUSTOM_PROVIDER_TYPES` (`llm_builder.py:41`) names `bedrock_custom`, `ollama_local`, which no webapp code creates | NONE | A new non-chat provider counted as a chat LLM on one side |
+| Agent in the Loop identity: prefix `loop/`, id `loop/mcp`, label, the switch's accepted values, step `contractVersion` | `agentic/agent_in_the_loop/__init__.py` <-> `webapp/src/lib/agentInTheLoop.ts`, `LOOP_CONTRACT_VERSION` (`webapp/src/lib/mcp/loopSkill.ts`) | TEST (`agentInTheLoop.twins.test.ts` reads the Python constants) | |
+| Who refuses a `loop/` model outside a chat run | `refuse_loop_model` in `agentic/llm_builder.py` and the `api.py` builders; `excludeLoop` / `projectModelProblem` / `loopModelRefusal` in the webapp | PART (`test_loop_out_of_session.py`, `agentInTheLoop.refusals.test.ts`); a NEW builder is unguarded (the `agent-in-the-loop` skill) | A builder that forgets the check waits for a driver that never comes, or routes `loop/mcp` to OpenAI after a revert |
 | Feature-model ids | `FEATURE_IDS` (`agentic/feature_models.py:16`) <-> `webapp/src/lib/llmFeatures.ts`, 9 each | TEST (`test_feature_models.py`) | |
 | Local judge model | `qwen2.5:7b` in `local_llm_manager.py:52`, `scanners/ai_attack_surface_scan/{project_settings,adapters/*}.py`, `docker-compose.yml:687`; the UI reads it from the orchestrator (`/local-llm/status` via `/api/ai-attack-surface/[projectId]/judge-model`) | NONE for the scanner copies | |
 
@@ -500,8 +502,8 @@ relationships) and `graph_db/schema_keys.py` (uniqueness keys, 45 labels).
 
 ### 4.8 Inbound MCP server and API docs
 
-Well guarded: `MCP-API-Reference.md` is rendered from the live `tools/list` (48
-tools, 17 scopes), the onboarding pack must cover every tool, every scope sits in
+Well guarded: `MCP-API-Reference.md` is rendered from the live `tools/list` (51
+tools with both switches on, 18 scopes), the onboarding pack must cover every tool, every scope sits in
 exactly one group, and the server's own agent-facing strings are checked against
 the live surface.
 
@@ -512,6 +514,8 @@ the live surface.
 | Scope labels and blurbs | `webapp/src/lib/mcp/scopeCopy.ts` | TEST |
 | Canonical banner bytes | `CANONICAL_BANNER` (`apiReference.ts`) == `DevergoLabs/scripts/add-wiki-canonical.mjs` | the byte-compare fails if they differ |
 | User MCP manifest schema | `webapp/src/lib/mcp/schema.ts` <-> `agentic/mcp_registry.py:49-105` | NONE (TS is stricter) |
+| Loop status names and the `loop_status` frame | `agentic/websocket_api.py` (`LOOP_STATUS`, `_loop_note`) <-> `websocket-types.ts` (`LoopStatusPayload`), `hooks/loopStatus.ts` | message type: TEST (the WebSocket parity test); the state names: NONE |
+| Loop tools withdrawn with the switch | `LOOP_TOOL_NAMES` (`webapp/src/lib/mcp/loopTools.ts`); every MCP test that stubs `MCP_KALI_EXEC_ENABLED` also stubs `AGENT_IN_THE_LOOP_ENABLED` | TEST (`loopTools.test.ts`); the stub pairing: NONE (the `mcp-server-tools` skill) |
 | Kali exec wait cap 60 | `webapp/src/lib/mcp/kaliTools.ts:87` <-> `agentic/api.py:5083` | NONE |
 | OpenAPI | `docs/readmes/README.OPENAPI.md`, `route.openapi.test.ts` files | PART |
 
@@ -521,7 +525,7 @@ the live surface.
 |---|---|---|
 | Platform version `1.1.0` | 5 pinned copies (section 3.2) + a literal in `services/plugin_runner/tests/test_sdk_contract.py:39` | TEST |
 | JSON schemas | `webapp/src/lib/plugins/schemas/json/*.schema.json` | GEN (`npm run plugins:schemas`) |
-| SDK local validator rules | `services/plugin_runner/sdk/redamon_plugin_sdk/testing.py:36-74` copies permissions, `MAX_PENDING_CHANGE_SETS=5`, `USER_SKILL_MAX_CHARS=51200`, group regex, 8 reserved headings, reserved markers, 10 credential shapes and data-store limits from `webapp/src/lib/plugins/{permissions,overrides,redact,dataStore,settings}.ts`, `userSkills.ts:15`, `agentic/prompts/skill_parts.py:231,241` | PART (`contract_cases.json` exercises a few). The Gateway's value limit is env-tunable (`PLUGIN_DATA_MAX_VALUE_BYTES`), the SDK's is fixed |
+| SDK local validator rules | `services/plugin_runner/sdk/redamon_plugin_sdk/testing.py:36-74` copies permissions, `MAX_PENDING_CHANGE_SETS=5`, `USER_SKILL_MAX_CHARS=512000`, group regex, 8 reserved headings, reserved markers, 10 credential shapes and data-store limits from `webapp/src/lib/plugins/{permissions,overrides,redact,dataStore,settings}.ts`, `userSkills.ts:19`, `agentic/prompts/skill_parts.py:231,241` | PART (`contract_cases.json` exercises a few). The Gateway's value limit is env-tunable (`PLUGIN_DATA_MAX_VALUE_BYTES`), the SDK's is fixed |
 | Plugin and action id regexes | `webapp/src/lib/plugins/ids.ts:8`, `schemas/common.ts:4`, `services/plugin_runner/supervisor/runlist.py:15,17`, `llmFeatures.ts:29` | NONE on the Python side |
 | Signing keys | `webapp/src/lib/plugins/keyring.ts` (key id + public key, optional `notAfter`) | NONE. **Time-based:** the next key must ship before the plugin repo signs with it |
 | Default catalog URL | `DEFAULT_CATALOG_URL` `webapp/src/lib/plugins/catalog.ts:28` | NONE |
@@ -554,13 +558,13 @@ and the webapp build cannot import across its root. So shared facts are copied.
 | Analyzer hardening flags | `container_manager.py:4078-4086` (memory precedence `:593`) <-> `supply_chain_common/analyzer_dispatch.py:128`; an unused third copy `guarddog_runner.py:75` | NONE |
 | Supply-chain three-layer gate | `agentic/supply_chain_tools.py:43` + webapp + orchestrator | PART |
 | TruffleHog sources / registry / digest / result filenames | `scanners/trufflehog_scan/sources.py` <-> `webapp/src/lib/trufflehogSources.ts`; `recon_orchestrator/trufflehog_registry.py`; filenames in `webapp/src/app/api/trufflehog/[projectId]/download/route.ts:15`, `scanners/trufflehog_scan/job_config.py:51`, `container_manager.py:3749` | TEST (filenames: NONE) |
-| Resource governor profile | `recon_orchestrator/resource_profile.default.json` <-> both `resource_governor.py` <-> `redamon.sh:503,704` weights; per-kind envelope bytes `SCAN_JOB_ENVELOPE_BYTES` (`webapp/src/lib/jobQueue.ts:37`, lacks `partial_recon:SupplyChainRecon` and `codefix`) | TEST (JSON <-> governors); NONE for `redamon.sh` and the TS envelopes |
+| Resource governor profile | `recon_orchestrator/resource_profile.default.json` <-> both `resource_governor.py` <-> `redamon.sh:503,704` weights; per-kind envelope bytes `SCAN_JOB_ENVELOPE_BYTES` (`webapp/src/lib/jobQueue.ts:37`, lacks `partial_recon:SupplyChainRecon`, `partial_recon:JsRecon` and `codefix`) | TEST (JSON <-> governors); NONE for `redamon.sh` and the TS envelopes |
 | Triage score formula | `score_model.py` <-> `Triage/triageLayers.ts` | TEST (`triageScore.vectors.json`, both sides); with no stored tier, the UI names the higher tier at a boundary score (accepted, in `KNOWN_DIFFERENCES`) |
 | Triage vocabulary | `TRIAGE_PROPERTIES` (`webapp/src/lib/triage/properties.ts:10`) <-> the mixin; `DECIDED_BY`, `REVIEWED_VIA`, `REVIEW_CURRENT`, `VERDICT_STATUSES` (`actions.ts:49-294`), `RESOLVED_TRIAGE_STATES` (`reportable.ts:27`), `_TRIAGE_FILTERS` (`agentic/api.py:3738`) | TEST for properties (`properties.test.ts` reads the mixin); PART for the vocabularies |
 | Proof types / proof bar 70-80; passive CVE sources | `triage_mixin.py:308-319`, `fact_queries.py:125-128`, `score_model.py:1135-1141`; `recon/helpers/finding_sources.py:22`, `score_model.py:616`, `osint_mixin.py:81` | types NONE, bar TEST; sources TEST (skips without `recon/`) |
 | Mute selector / severity rank | `agentic/multi_mute/{kind,pool}.py` <-> Cypher in the triage mixin | TEST (contract JSON) |
 | Diagnostic failure classes (5) | `productivity.py:250` <-> `error_class.py:203` | NONE |
-| Auth headers, project file roots, chat-skill caps, baddns modules, workspace protected dirs | `webapp/src/lib/authProfile.ts` <-> `recon/helpers/auth_profile.py`; `reconSettings/validators.ts:69-79` <-> `recon/project_settings.py:988-998`; `chat-skills/route.ts:32-57` <-> `import-community/route.ts:9-11`; `TakeoverSection.tsx:27` <-> `takeover_helpers.py:378`; `workspace_fs.py:68` <-> `FileSystemDrawer.tsx:72` | PART / NONE (each agrees today) |
+| Auth headers, project file roots, chat-skill caps, baddns modules, workspace protected dirs | `webapp/src/lib/authProfile.ts` <-> `recon/helpers/auth_profile.py`; `reconSettings/validators.ts:69-79` <-> `recon/project_settings.py:988-998`; `chat-skills/route.ts:32-57` <-> `import-community/route.ts:9-11`; `TakeoverSection.tsx:27` <-> `takeover_helpers.py:378`; `workspace_fs.py:68` <-> `FileSystemDrawer.tsx:99` | PART / NONE (each agrees today) |
 | Neo4j-to-JSON coercion | `agentic/api.py:3667` <-> `mcp/servers/redagraph.py:86` | NONE |
 | Internal routes Python calls on the webapp | `INTERNAL_ALLOWLIST` (28 patterns) and `SCANNER_ALLOWLIST` (3) in `webapp/src/middleware.ts` <-> 32 distinct method+route pairs called with `X-Internal-Key` (all match today) | TEST (`middleware.internalCallers.test.ts`, computed from the callers). Enforcement is **log-only** unless `INTERNAL_KEY_ALLOWLIST_ENFORCE=true` |
 

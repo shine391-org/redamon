@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 
 from cypherfix_errors import safe_error
+from llm_builder import provider_error_details
 from prompt_safety import wrap_untrusted
 from .state import TriageState, TriageFinding, RemediationDraft
 from .tools import TriageNeo4jToolManager
@@ -100,6 +101,12 @@ class TriageOrchestrator:
         self.intel: dict = {}
         self.intel_date: str = ""
         self._client = None         # one Neo4jClient per run (K26, X17)
+        #: Findings whose review call failed, and the first failure's
+        #: provider class and HTTP status. Without them a run whose every review
+        #: hit a bad key or a 429 completes looking like a clean one.
+        self.review_failures = 0
+        self.review_failure: dict = {}
+        self.llm_setup_failure: dict = {}
 
     async def run(self, state: TriageState) -> TriageState:
         """Authorise, work in memory, publish once, always record the outcome."""
@@ -200,6 +207,7 @@ class TriageOrchestrator:
 
             review_summary = await self._review(state, scored)
             summary.update(review_summary)
+            summary["review_failed"] = self.review_failures
             self.run_client.check_abort()
 
             # Every finding's final values, then the groups again from them, so
@@ -237,6 +245,7 @@ class TriageOrchestrator:
                 by_severity=analysis.by_severity,
                 by_type=analysis.by_type,
                 summary=analysis.summary,
+                **self._review_notices(model),
             )
             state["status"] = "complete"
             return state
@@ -246,8 +255,8 @@ class TriageOrchestrator:
             error_class = aborted.error_class
             logger.warning(f"Triage run ended early: {aborted.reason}")
             await self.callback.on_error(
-                safe_error(aborted.error_class), recoverable=True,
-                code=aborted.error_class)
+                safe_error(aborted.error_class, reason=aborted.public_reason),
+                recoverable=True, code=aborted.error_class, **aborted.details)
             state["status"] = "error"
             state["error"] = aborted.error_class
             return state
@@ -334,7 +343,23 @@ class TriageOrchestrator:
             logger.warning(
                 f"No usable LLM for this run ({e.__class__.__name__}); "
                 f"publishing the math-only ranking")
+            self.llm_setup_failure = provider_error_details(e)
             return None
+
+    def _review_notices(self, model: str) -> dict:
+        """The complete event's account of reviews that should have run and did not.
+
+        `review_failed` counts findings whose call failed; `review_unavailable`
+        says the model could not be set up at all. Empty when a review was not
+        expected (no model, budget 0) or every call answered.
+        """
+        if not model or self.review_budget <= 0:
+            return {}
+        if self.llm_client is None:
+            return {"review_unavailable": 1, **self.llm_setup_failure}
+        if self.review_failures:
+            return {"review_failed": self.review_failures, **self.review_failure}
+        return {}
 
     # ── Step B: group by "what the fix is" ────────────────────────────────
 
@@ -521,6 +546,9 @@ class TriageOrchestrator:
         except Exception as e:                                    # noqa: BLE001
             logger.warning(f"Review batch failed ({e.__class__.__name__}); "
                            f"{len(batch)} findings stay math-only")
+            self.review_failures += len(batch)
+            if not self.review_failure:
+                self.review_failure = provider_error_details(e)
             return {}
 
         answers = {}

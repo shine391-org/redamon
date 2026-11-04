@@ -88,6 +88,10 @@ export interface SuggestResult {
     clusters_sent: number
   }
   groups: MultiMuteGroup[]
+  /** The model call itself failed (not its answer); the provider facts say how. */
+  model_call_failed?: 1
+  error_class?: string
+  provider_status?: number
 }
 
 export type MuteOutcome =

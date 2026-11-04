@@ -17,7 +17,7 @@ describe('parseTableViewMode', () => {
       'nodeDetails', 'all', 'jsRecon', 'aiSurface', 'aiRisk', 'killChain',
       'blastRadius', 'takeover', 'secrets', 'netInitAccess', 'graphql',
       'webInitAccess', 'paramMatrix', 'sharedInfra', 'dnsEmail', 'threatIntel',
-      'jsDepSignals', 'supplyChainSca', 'dnsDrift', 'webCachePoison',
+      'jsDepSignals', 'supplyChainSca', 'dnsDrift', 'webCachePoison', 'routeExposure',
       'reconDelta', 'scanSchedule',
     ]) {
       expect(parseTableViewMode(mode)).toBe(mode)

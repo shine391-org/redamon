@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { requireSession } from '@/lib/session'
+import { internalError } from '@/lib/routeErrors'
 
 export async function GET() {
   const session = await requireSession()
@@ -18,8 +19,7 @@ export async function GET() {
     const prefs = (user.uiPreferences ?? {}) as Prisma.JsonObject
     return NextResponse.json(prefs)
   } catch (error) {
-    console.error('Failed to fetch user preferences:', error)
-    return NextResponse.json({ error: 'Failed to fetch preferences' }, { status: 500 })
+    return internalError(error, 'Failed to fetch preferences', { log: 'Failed to fetch user preferences' })
   }
 }
 
@@ -59,7 +59,6 @@ export async function PATCH(request: NextRequest) {
     })
     return NextResponse.json(updated.uiPreferences ?? {})
   } catch (error) {
-    console.error('Failed to update user preferences:', error)
-    return NextResponse.json({ error: 'Failed to update preferences' }, { status: 500 })
+    return internalError(error, 'Failed to update preferences', { log: 'Failed to update user preferences' })
   }
 }

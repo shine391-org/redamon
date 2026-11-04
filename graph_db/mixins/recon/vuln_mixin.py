@@ -333,8 +333,9 @@ class VulnMixin:
             "errors": []
         }
 
-        vuln_scan_data = recon_data.get("vuln_scan", {})
-        if not vuln_scan_data:
+        vuln_scan_data = recon_data.get("vuln_scan") or {}
+        technology_cves = recon_data.get("technology_cves") or {}
+        if not vuln_scan_data and not technology_cves.get("by_technology"):
             stats["errors"].append("No vuln_scan data found in recon_data")
             return stats
 
@@ -702,7 +703,6 @@ class VulnMixin:
             # =========================================================================
             # Process technology_cves - CVE, MitreData, and Capec nodes
             # =========================================================================
-            technology_cves = recon_data.get("technology_cves", {})
             by_technology = technology_cves.get("by_technology", {})
 
             cves_created = 0
@@ -869,6 +869,10 @@ class VulnMixin:
                 print(f"[+][graph-db] Created {mitre_stats['nodes']} MitreData (CWE) nodes")
             if mitre_stats["capec"] > 0:
                 print(f"[+][graph-db] Created {mitre_stats['capec']} Capec nodes")
+
+            # CVE-only enrichment must not reset scan metadata or repair other URLs.
+            if not vuln_scan_data:
+                return stats
 
             # =========================================================================
             # Process security_checks - Direct IP access, WAF bypass, etc.

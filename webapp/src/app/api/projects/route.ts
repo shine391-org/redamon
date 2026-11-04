@@ -16,7 +16,9 @@ import { buildCreateRoeArtefacts, stripRoeArtefacts } from '@/lib/roe/createRoe'
 import { extractRoeText, ExtractError, type ExtractedDocument } from '@/lib/roe/extractText'
 import { ALLOWED_EXTENSIONS_LABEL, MAX_FILE_SIZE, classifyRoeFile, type RoeFileKind } from '@/lib/roe/limits'
 import { contentLengthProblem } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
 import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
+import { projectModelProblem } from '@/lib/agentInTheLoop'
 
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8080'
 const SOFT_GUARDRAIL_TIMEOUT_MS = 10_000
@@ -60,11 +62,7 @@ export async function GET() {
 
     return NextResponse.json(projects)
   } catch (error) {
-    console.error('Failed to fetch projects:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch projects' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch projects')
   }
 }
 
@@ -133,6 +131,11 @@ export async function POST(request: NextRequest) {
       domainBatchMode?: boolean
       id?: string
       [key: string]: unknown
+    }
+
+    const loopProblem = projectModelProblem(optionalParams)
+    if (loopProblem) {
+      return NextResponse.json({ error: loopProblem, code: 'loop_model_not_allowed' }, { status: 400 })
     }
 
     // Domain batch: the groups are ALWAYS re-derived here from the raw host list.
@@ -469,10 +472,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(project, { status: 201 })
   } catch (error) {
-    console.error('Failed to create project:', error)
-    return NextResponse.json(
-      { error: 'Failed to create project' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create project')
   }
 }

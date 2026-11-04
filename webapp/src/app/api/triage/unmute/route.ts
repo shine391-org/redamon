@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { withRouteErrors } from '@/lib/routeErrors'
 import { readJsonBody } from '@/lib/jsonBody'
 import { requireProjectOwner, graphTriage, realActorUserId } from '@/lib/triageClient'
 import { describeNodeFilterWriter } from '@/lib/nodeFilterRun'
@@ -35,7 +36,9 @@ import { MULTI_BATCH_PATTERN } from '@/lib/multiMute'
  */
 const MAX_KEYS = 500
 
-export async function POST(request: NextRequest) {
+// Ownership and the activation lock read Postgres before any try; a failure
+// there would otherwise be Next's empty-bodied 500.
+export const POST = withRouteErrors('The findings could not be unmuted.', async (request: NextRequest) => {
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const { projectId, nodeId, keys, undoBatch } = parsed.body as {
@@ -150,4 +153,4 @@ export async function POST(request: NextRequest) {
     exempted,
     ...(exemptionError ? { exemptionError } : {}),
   })
-}
+})

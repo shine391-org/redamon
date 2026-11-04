@@ -5,6 +5,7 @@
  */
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
+import { isLoopModel } from '@/lib/agentInTheLoop'
 import {
   FEATURE_MODEL_MAX_LEN,
   FEATURE_MODEL_STATUS,
@@ -13,6 +14,7 @@ import {
   isFeatureId,
   isPluginFeatureId,
   modelAllowedForFeature,
+  providerFacts,
   readFeatureModelCode,
   type FeatureId,
   type FeatureModelCode,
@@ -80,6 +82,10 @@ export function parseFeatureModelsPatch(
       return { error: `The model for ${key} is longer than ${FEATURE_MODEL_MAX_LEN} characters` }
     }
     if (CONTROL_CHARS.test(model)) return { error: `The model for ${key} contains a control character` }
+    // Plugin features too: a plugin's model call has no chat run behind it either.
+    if (isLoopModel(model)) {
+      return { error: `Agent in the Loop answers only inside a chat run; pick a provider model for ${key}` }
+    }
     if (!plugin && !modelAllowedForFeature(key as FeatureId, model)) {
       return { error: `${getLlmFeature(key as FeatureId).label} cannot run on ${model}` }
     }
@@ -91,13 +97,14 @@ export function parseFeatureModelsPatch(
 export function featureModelErrorResponse(
   code: FeatureModelCode,
   featureId: FeatureId | PluginFeatureId,
-  opts: { model?: string; error?: string } = {},
+  opts: { model?: string; error?: string; agentBody?: unknown } = {},
 ): NextResponse {
   const body: FeatureModelErrorBody = {
     error: opts.error ?? featureModelMessage(code, opts.model),
     code,
     featureId,
     ...(opts.model ? { model: opts.model } : {}),
+    ...providerFacts(opts.agentBody),
   }
   return NextResponse.json(body, { status: FEATURE_MODEL_STATUS[code] })
 }
@@ -143,5 +150,5 @@ export function agentCodedError(
   if (status >= 200 && status < 300) return null
   const code = readFeatureModelCode(body)
   if (!code || !AGENT_PASSTHROUGH_CODES.has(code)) return null
-  return featureModelErrorResponse(code, featureId, code === 'model_unavailable' ? { model: sentModel } : {})
+  return featureModelErrorResponse(code, featureId, { ...(code === 'model_unavailable' ? { model: sentModel } : {}), agentBody: body })
 }

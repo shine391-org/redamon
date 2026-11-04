@@ -108,11 +108,11 @@ class TestSkillFileShape(unittest.TestCase):
 
     def test_size_under_import_cap(self):
         """
-        webapp import caps content at MAX_CONTENT_SIZE = 50 * 1024 = 51200
-        bytes (webapp/.../attack-skills/route.ts line 29 + line 65). Validate
-        against the real constant, not an approximation.
+        webapp import caps content at MAX_CONTENT_SIZE = 500 * 1024 = 512000
+        (webapp/src/lib/userSkills.ts). Validate against the real constant,
+        not an approximation.
         """
-        cap = 50 * 1024
+        cap = 500 * 1024
         self.assertLess(len(self.text), cap,
                         f"Skill is {len(self.text)} bytes; webapp import caps at {cap}")
 

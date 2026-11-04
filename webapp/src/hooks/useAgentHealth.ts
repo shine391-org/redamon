@@ -25,12 +25,18 @@ export interface AgentHealth {
   refresh: () => void
 }
 
-export function useAgentHealth(): AgentHealth {
+export interface AgentHealthOptions {
+  /** Probe only while true (default true): the chat drawer asks only once its socket has failed. */
+  enabled?: boolean
+}
+
+export function useAgentHealth({ enabled = true }: AgentHealthOptions = {}): AgentHealth {
   const [status, setStatus] = useState<AgentHealthStatus>('unknown')
   const [error, setError] = useState<string | null>(null)
   const [nonce, setNonce] = useState(0)
 
   useEffect(() => {
+    if (!enabled) return
     // `cancelled` covers unmount too: React runs this effect's cleanup on the
     // way out, so a probe that resolves afterwards sets no state.
     let cancelled = false
@@ -63,7 +69,7 @@ export function useAgentHealth(): AgentHealth {
 
     probe()
     return () => { cancelled = true }
-  }, [nonce])
+  }, [nonce, enabled])
 
   const refresh = useCallback(() => {
     setStatus('unknown')

@@ -122,7 +122,7 @@ describe('loading and error states', () => {
     vi.stubGlobal('fetch', mockFetch({ tokensStatus: 500 }))
     render(<McpTokensTab userId="owner" />)
 
-    await waitFor(() => expect(screen.getByText(/request failed \(500\)/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Could not load tokens \(HTTP 500\)/)).toBeTruthy())
     expect(screen.getByText('Retry')).toBeTruthy()
     expect(screen.queryByText(/No MCP access tokens yet/)).toBeNull()
   })
@@ -288,8 +288,18 @@ describe('the create form', () => {
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'ci agent' } })
     fireEvent.click(screen.getByText('Create token'))
 
-    await waitFor(() => expect(screen.getByText('Password is incorrect')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Password is incorrect (HTTP 401)')).toBeTruthy())
     expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('ci agent')
+  })
+
+  test('a create the database refused names its code and status', async () => {
+    vi.stubGlobal('fetch', mockFetch({ createStatus: 500, create: { error: 'Could not create the token', code: 'P2024' } }))
+    await openForm()
+
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'ci agent' } })
+    fireEvent.click(screen.getByText('Create token'))
+
+    await waitFor(() => expect(screen.getByText('Could not create the token (P2024 · HTTP 500)')).toBeTruthy())
   })
 
   test('a double-click cannot mint two tokens', async () => {
@@ -688,12 +698,27 @@ describe('the Agent Profile drives the permissions', () => {
     expect(box('graph:cypher')).not.toBeChecked()
   })
 
-  test.each(PROFILE_IDS)('%s auto-ticks kali:exec but never recon:overwrite', async id => {
+  // Agent in the Loop is the one exception, by design: a driver token holds
+  // read scopes only besides agent:loop (the loop tools refuse anything wider).
+  test.each(PROFILE_IDS.filter(id => id !== 'agent_in_the_loop'))('%s auto-ticks kali:exec but never recon:overwrite', async id => {
     await openForm()
     pick(id)
     await waitFor(() => expect(profileSelect().value).toBe(id))
     expect(box('kali:exec'), `${id} did not tick kali:exec`).toBeChecked()
     expect(box('recon:overwrite'), `${id} auto-ticked recon:overwrite`).not.toBeChecked()
+  })
+
+  test('agent_in_the_loop ticks agent:loop and recon:read only, and is offered only while on', async () => {
+    await openForm(mockFetch({ tokens: { tokens: [], features: { agentInTheLoop: true } } }))
+    pick('agent_in_the_loop')
+    await waitFor(() => expect(profileSelect().value).toBe('agent_in_the_loop'))
+    await waitFor(() => expect(box('agent:loop')).toBeChecked())
+    expect(box('recon:read')).toBeChecked()
+    expect(box('kali:exec')).not.toBeChecked()
+    expect(screen.queryByRole('alert')).toBeNull()
+    cleanup()
+    await openForm()
+    expect([...profileSelect().options].map(o => o.value)).not.toContain('agent_in_the_loop')
   })
 
   test('a profile that wants a dangerous scope says so, with the box still clear', async () => {

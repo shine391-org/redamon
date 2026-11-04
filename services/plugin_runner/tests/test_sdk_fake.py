@@ -452,6 +452,6 @@ def test_a_reserved_marker_is_refused_only_in_the_form_the_agent_reads():
 def test_a_proposal_over_the_size_limit_is_refused_in_utf16_units():
     sdk = _own_skill_fake("Probe the login form.")
     with pytest.raises(PluginError) as caught:
-        asyncio.run(_propose_body(sdk, "x" * 51_201))
+        asyncio.run(_propose_body(sdk, "x" * 512_001))
     assert caught.value.code == "invalid_proposal"
-    assert "the limit is 51200" in str(caught.value)
+    assert "the limit is 512000" in str(caught.value)

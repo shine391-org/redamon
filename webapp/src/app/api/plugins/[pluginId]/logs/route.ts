@@ -16,8 +16,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     try {
       return NextResponse.json({ lines: await pluginLogs(pluginId, lines) }, { headers: { 'Cache-Control': 'no-store' } })
     } catch (e) {
-      if (e instanceof RunnerUnavailableError) return errorResponse(503, 'runner_unavailable', e.message)
-      if (e instanceof RunnerError) return errorResponse(502, e.code, e.message)
+      if (e instanceof RunnerUnavailableError) {
+        return errorResponse(503, 'runner_unavailable', e.message, undefined, { reason: e.reason, ...(e.proxyCode ? { proxyCode: e.proxyCode } : {}) })
+      }
+      if (e instanceof RunnerError) return errorResponse(502, e.code, e.message, undefined, { upstreamStatus: e.status })
       throw e
     }
   })

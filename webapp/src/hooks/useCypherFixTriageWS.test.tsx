@@ -86,11 +86,11 @@ describe('useCypherFixTriageWS terminal states', () => {
     unmount()
   })
 
-  test('any other error still fails the run', async () => {
+  test('any other error still fails the run, and says which', async () => {
     const { result, sock, unmount } = await connectedRun()
     act(() => { sock.receive({ type: 'error', payload: { message: 'Triage failed', code: 'internal_error' } }) })
     expect(result.current.status).toBe('error')
-    expect(result.current.error).toBe('Triage failed')
+    expect(result.current.error).toBe('Triage failed (internal_error)')
     expect(result.current.notice).toBeNull()
     unmount()
   })
@@ -101,6 +101,97 @@ describe('useCypherFixTriageWS terminal states', () => {
     act(() => { result.current.startTriage() })
     expect(result.current.status).toBe('connected')
     expect(sock.sent.map(m => m.type)).toContain('start_triage')
+    unmount()
+  })
+})
+
+describe('useCypherFixTriageWS says why it failed (G-3, G-6, G-33, G-34, G-35, G-49)', () => {
+  test('a refused ticket shows the refusal and its status, and dials nothing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ error: 'A version activation is in progress for this project.' }),
+      { status: 409, headers: { 'Content-Type': 'application/json' } })))
+    const { result, unmount } = renderHook(() => useCypherFixTriageWS({ userId: 'u1', projectId: 'p1', autoConnect: true }))
+    await waitFor(() => expect(result.current.status).toBe('error'))
+    expect(result.current.error).toBe(
+      'Triage authentication failed (could not obtain a ticket): ' +
+      'A version activation is in progress for this project. (HTTP 409)')
+    expect(FakeSocket.instances).toHaveLength(0)
+    unmount()
+  })
+
+  test('a deployment without ticket signing still connects', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ ticket: null }) }) as unknown as Response))
+    const { result, unmount } = renderHook(() => useCypherFixTriageWS({ userId: 'u1', projectId: 'p1', autoConnect: true }))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    expect(result.current.error).toBeNull()
+    unmount()
+  })
+
+  test('a close the page did not ask for shows its code and the agent reason', async () => {
+    const { result, sock, unmount } = await connectedRun()
+    act(() => { sock.onclose?.({ code: 1008, reason: 'missing or invalid ticket' } as CloseEvent) })
+    expect(result.current.status).toBe('error')
+    expect(result.current.error).toBe(
+      'The connection to the triage agent closed (code 1008: missing or invalid ticket)')
+    unmount()
+  })
+
+  test('a dropped connection without a reason still says 1006', async () => {
+    const { result, sock, unmount } = await connectedRun()
+    act(() => { sock.onclose?.({ code: 1006, reason: '' } as CloseEvent) })
+    expect(result.current.error).toMatch(/code 1006: no reason given/)
+    unmount()
+  })
+
+  test('a Stop while disconnected is refused visibly, not dropped', async () => {
+    const { result, sock, unmount } = await connectedRun()
+    sock.readyState = 3
+    act(() => { result.current.stopTriage() })
+    expect(sock.sent.map(m => m.type)).not.toContain('stop')
+    expect(result.current.notice).toMatch(/Stop was not sent/)
+    unmount()
+  })
+
+  test('a run whose reviews failed completes with a notice naming the provider status', async () => {
+    const { result, sock, unmount } = await connectedRun()
+    act(() => {
+      sock.receive({ type: 'triage_complete', payload: {
+        total_remediations: 1, by_severity: {}, by_type: {}, summary: '',
+        review_failed: 12, error_class: 'RateLimitError', provider_status: 429,
+      } })
+    })
+    expect(result.current.status).toBe('completed')
+    expect(result.current.notice).toBe(
+      'The AI review failed for 12 findings (RateLimitError · provider HTTP 429). ' +
+      'They keep their rules-only ranking; run triage again to review them.')
+    unmount()
+  })
+
+  test('a refused start shows the webapp reason, the code and the status', async () => {
+    const { result, sock, unmount } = await connectedRun()
+    act(() => {
+      sock.receive({ type: 'error', payload: {
+        message: 'The triage run could not be authorised and did not start. A triage run is already in progress for this project.',
+        code: 'authorize_failed', upstream_status: 409,
+      } })
+    })
+    expect(result.current.error).toBe(
+      'The triage run could not be authorised and did not start. A triage run is already in progress ' +
+      'for this project. (authorize_failed · upstream HTTP 409)')
+    unmount()
+  })
+
+  test('an internal error names its class and phase; free text in a code field is dropped', async () => {
+    const { result, sock, unmount } = await connectedRun()
+    act(() => {
+      sock.receive({ type: 'error', payload: {
+        message: 'The triage run stopped because of an internal error.',
+        code: 'internal_error', error_class: 'KeyError', phase: 'reviewing',
+        step: 'DROP TABLE x; select',
+      } })
+    })
+    expect(result.current.error).toBe(
+      'The triage run stopped because of an internal error. (internal_error · KeyError · in reviewing)')
     unmount()
   })
 })

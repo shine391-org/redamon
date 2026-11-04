@@ -567,12 +567,29 @@ describe('the detail panel', () => {
     render(<TriageTable projectId="p1" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Exposed admin panel' }))
     const panel = screen.getByRole('complementary', { name: 'Finding details' })
-    expect(await within(panel).findByText('The findings service failed.')).toBeInTheDocument()
+    expect(await within(panel).findByText('The findings service failed. (agent_failed · HTTP 502)')).toBeInTheDocument()
     expect(within(rowOf('Exposed admin panel')).getByTitle(/Mark this real/)).toBeEnabled()
 
     fireEvent.click(within(panel).getByRole('button', { name: 'Retry' }))
     expect(await within(panel).findByRole('heading', { name: 'Rules' })).toBeInTheDocument()
     expect(tries).toBe(2)
+  })
+
+  test('the agent code, class and status reach the panel (G-8)', async () => {
+    serve({
+      findings: board([reviewed]),
+      finding: () => ({ status: 502, body: {
+        error: 'The findings service failed.', code: 'agent_failed',
+        upstreamStatus: 500, agentCode: 'internal_error', errorClass: 'ServiceUnavailable',
+      } }),
+      evidence: () => ({ body: EVIDENCE }),
+    })
+    render(<TriageTable projectId="p1" />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Exposed admin panel' }))
+    const panel = screen.getByRole('complementary', { name: 'Finding details' })
+    expect(await within(panel).findByText(
+      'The findings service failed. (agent_failed · internal_error · ServiceUnavailable · HTTP 502 · upstream HTTP 500)',
+    )).toBeInTheDocument()
   })
 
   test('a finding gone since the board loaded is dropped, and the panel offers a reload', async () => {

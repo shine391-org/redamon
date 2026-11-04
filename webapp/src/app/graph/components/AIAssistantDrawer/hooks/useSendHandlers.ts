@@ -4,6 +4,7 @@ import type { ChatItem, Message, FireteamItem, FireteamMemberPanel } from '../ty
 import type { PlanWaveItem } from '../AgentTimeline'
 import { saveProjectSession } from '../sessionMemory'
 import { wrapNodeContextQuery } from '@/lib/agentQueryEnvelope'
+import { fetchJson, formatApiError, toApiError } from '@/lib/apiError'
 
 interface ChatSkillSummary {
   id: string
@@ -122,11 +123,11 @@ export function useSendHandlers(deps: SendHandlersDeps) {
   const activateSkill = useCallback(async (skillId: string, skillName?: string): Promise<ChatSkillFull | null> => {
     let fullSkill: ChatSkillFull
     try {
-      const res = await fetch(`/api/users/${userId}/chat-skills/${skillId}`)
-      if (!res.ok) throw new Error('Failed to fetch skill content')
-      fullSkill = await res.json()
-    } catch {
-      addSystemMessage(`Failed to load Chat Skill${skillName ? ` '${skillName}'` : ''}. Please try again.`)
+      fullSkill = await fetchJson<ChatSkillFull>(`/api/users/${userId}/chat-skills/${skillId}`, undefined, 'Failed to fetch skill content')
+    } catch (err) {
+      // A 404 means the skill was deleted, which no retry fixes; the status tells it apart.
+      const reason = `Failed to load Chat Skill${skillName ? ` '${skillName}'` : ''}`
+      addSystemMessage(`${formatApiError({ ...toApiError(err, reason), reason })}. Please try again.`)
       return null
     }
 
@@ -170,11 +171,9 @@ export function useSendHandlers(deps: SendHandlersDeps) {
     // Fetch all user chat skills
     let skills: ChatSkillSummary[]
     try {
-      const res = await fetch(`/api/users/${userId}/chat-skills`)
-      if (!res.ok) throw new Error('Failed to fetch chat skills')
-      skills = await res.json()
-    } catch {
-      addSystemMessage('Failed to fetch chat skills. Please try again.')
+      skills = await fetchJson<ChatSkillSummary[]>(`/api/users/${userId}/chat-skills`, undefined, 'Failed to fetch chat skills')
+    } catch (err) {
+      addSystemMessage(`${formatApiError({ ...toApiError(err, 'Failed to fetch chat skills'), reason: 'Failed to fetch chat skills' })}. Please try again.`)
       return
     }
 

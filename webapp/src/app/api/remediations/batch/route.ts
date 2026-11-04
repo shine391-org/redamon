@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
@@ -110,10 +111,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(created, { status: 201 })
   } catch (error) {
-    console.error('Failed to batch create remediations:', error)
-    return NextResponse.json(
-      { error: 'Failed to batch create remediations' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to batch create remediations')
   }
 }

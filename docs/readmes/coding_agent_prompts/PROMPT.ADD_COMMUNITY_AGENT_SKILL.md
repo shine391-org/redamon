@@ -53,7 +53,7 @@ The agentic `GET /community-skills` endpoint auto-discovers files by globbing th
 - **No container rebuild needed for the `.md` file.** `./agentic/community-skills` is volume-mounted read-only into the agent container at [docker-compose.yml:903](../../../docker-compose.yml#L903). Dropping a `.md` file there is instantly visible to the `/community-skills` endpoint. (This is an exception to the general rule that `agentic/` changes require rebuilding `agent`: that rule applies to Python code baked into the image, not to these two mounted directories.) **A skill that calls a new `kali_shell` CLI is NOT rebuild-free**: the binary and the `kali_shell` tool catalogue are baked in, so you must rebuild kali-sandbox and agent (content rule 7).
 - **No Prisma migration needed.** Community skills are not a Prisma model on their own, they become `UserAttackSkill` rows on import. The schema already supports this.
 - **Skills are per-user, not global, and import is by-name only.** Each user who wants this skill must click "Import from Community" in their Global Settings. Already-imported users will NOT auto-pick up new community skills, they need to re-import. Import skips any name the user already has (`import-community/route.ts`), so **editing an existing skill's `.md` does not reach users who already imported it**: re-import leaves their old copy in place. To adopt a rewrite they must delete the old skill first, then re-import. Call this out in the CHANGELOG whenever you change a shipped skill's content.
-- **Skill content is capped at 50 KB.** The validation is at [webapp/src/app/api/users/[id]/attack-skills/route.ts](../../../webapp/src/app/api/users/[id]/attack-skills/route.ts) POST handler (~line 67). Keep your file well under 50,000 characters.
+- **Skill content is capped at 500 KB** (`MAX_CONTENT_SIZE` in [webapp/src/lib/userSkills.ts](../../../webapp/src/lib/userSkills.ts)). Its whole text enters the agent's system prompt on every turn it is chosen, so keep a skill as short as its workflow allows.
 - **Two different limits.** A user can hold up to 1000 skills (`MAX_SKILLS_PER_USER` in [webapp/src/lib/userSkills.ts](../../../webapp/src/lib/userSkills.ts)), but a project can enable at most 20 of them: the webapp refuses a 21st enabled skill, and the agent's `MAX_ENABLED_USER_SKILLS` in [agentic/project_settings.py](../../../agentic/project_settings.py) cuts the rest.
 - **The first non-heading paragraph becomes the description.** [agentic/api.py:2188-2192](../../../agentic/api.py) extracts the first 200-char stripped non-`#` line as the description shown in the import dialog. Write that line well.
 - **No em dashes anywhere.** Use hyphens or rephrase. Enforced project-wide.
@@ -214,7 +214,7 @@ No rebuild. The file is live as soon as you save it (directory is volume-mounted
 | "Import from Community" shows `total: 0` | webapp cannot reach `AGENT_API_URL`. Check `docker compose logs webapp` and the `AGENT_API_URL` env var in the webapp service |
 | Import works but classifier never picks the skill | Description is generic or overlaps with a built-in. Edit the description via Global Settings > Agent Skills > pencil icon. Or rewrite the opening paragraph of the .md |
 | Badge shows `SKILL` but workflow not in system prompt | Unlikely; `resolve_user_skill()` is non-conditional. Check agent logs for errors parsing the `attack_path_type` |
-| "Too large" error on import | File exceeds 50 KB. Trim the workflow |
+| "Too large" error on import | File exceeds 500 KB. Trim the workflow |
 | "You have 1000 skills, the maximum" error on import | User is at the library cap. They need to delete an existing skill first |
 | Cannot enable the skill in a project | The project already has 20 user skills enabled. Turn one off first |
 
@@ -227,7 +227,7 @@ No rebuild. The file is live as soon as you save it (directory is volume-mounted
 - [ ] "When to Classify Here" section lists concrete triggers + keywords
 - [ ] Workflow steps reference real agent tools (`query_graph`, `kali_shell`, `execute_curl`, etc.)
 - [ ] Phase 1 ends with "request transition to exploitation phase" cue
-- [ ] File is under 50 KB
+- [ ] File is under 500 KB
 - [ ] No em dashes anywhere
 - [ ] (Optional) [agentic/community-skills/README.md](../../../agentic/community-skills/README.md) updated
 - [ ] (Optional, if shipping publicly) [redamon.wiki/Agent-Skills.md](../../../redamon.wiki/Agent-Skills.md) Community Skills table updated

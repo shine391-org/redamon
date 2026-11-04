@@ -39,6 +39,7 @@ KIND_ROWS = [
     ("Vulnerability", {"source": "vhost_sni_enum"}, "vuln.vhost_sni"),
     ("Vulnerability", {"source": "cache_poisoning"}, "vuln.cache_poisoning"),
     ("Vulnerability", {"source": "serialized_scan"}, "vuln.serialized_scan"),
+    ("Vulnerability", {"source": "route_exposure", "exposure_kind": "env_file"}, "vuln.route_exposure"),
     ("Vulnerability", {"source": "graphql_scan"}, "vuln.graphql"),
     ("Vulnerability", {"source": "graphql_cop"}, "vuln.graphql"),
     ("Vulnerability", {"source": "ai_surface_recon"}, "vuln.ai_surface"),

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { archiveMaxBytes } from '@/lib/plugins/fetchRemote'
 import { offlineInstall } from '@/lib/plugins/lifecycle'
-import { errorResponse, lifecycleErrorResponse, requirePluginAdmin } from '@/lib/plugins/lifecycleRoutes'
+import { errorResponse, lifecycleErrorResponse, pluginRoute, requirePluginAdmin } from '@/lib/plugins/lifecycleRoutes'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 
 /**
@@ -29,10 +29,10 @@ async function bytesOf(form: FormData, name: string): Promise<Buffer | null> {
   return Buffer.from(await v.arrayBuffer())
 }
 
-export async function POST(request: NextRequest) {
+export const POST = pluginRoute('offline install', 'The plugin operation failed; see the webapp log.', async (request: NextRequest) => {
   const admin = await requirePluginAdmin()
   if (admin instanceof NextResponse) return admin
-  if (!sameOrigin(request)) return crossOriginResponse()
+  if (!sameOrigin(request)) return crossOriginResponse(request)
   if (!(request.headers.get('content-type') ?? '').toLowerCase().startsWith('multipart/form-data')) {
     return errorResponse(415, 'unsupported_media_type', 'Send the archive, the catalog and its signature as multipart/form-data.')
   }
@@ -91,4 +91,4 @@ export async function POST(request: NextRequest) {
     console.warn(`[plugins] offline install by ${admin.userId}: ${res.status} in ${Date.now() - started} ms`)
     return res
   }
-}
+})

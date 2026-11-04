@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 
 /** GET /api/reports - List the effective user's reports (scoped by project owner). */
 export async function GET() {
@@ -37,10 +38,6 @@ export async function GET() {
     })
     return NextResponse.json(reports)
   } catch (error) {
-    console.error('List all reports failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to list reports' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list reports', { log: 'List all reports failed' })
   }
 }

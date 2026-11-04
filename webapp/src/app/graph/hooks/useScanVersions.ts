@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback } from 'react'
+import { fetchJson } from '@/lib/apiError'
 
 /** One row of the project's scan timeline. */
 export interface ScanVersionSummary {
@@ -26,10 +27,8 @@ export interface ScanVersionsResponse {
   activating: boolean
 }
 
-async function fetchVersions(projectId: string): Promise<ScanVersionsResponse> {
-  const res = await fetch(`/api/projects/${projectId}/versions`)
-  if (!res.ok) throw new Error('Failed to load scan versions')
-  return res.json()
+function fetchVersions(projectId: string): Promise<ScanVersionsResponse> {
+  return fetchJson<ScanVersionsResponse>(`/api/projects/${projectId}/versions`, undefined, 'Failed to load scan versions')
 }
 
 export function useScanVersions(projectId: string | null) {

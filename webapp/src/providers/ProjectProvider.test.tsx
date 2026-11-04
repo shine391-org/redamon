@@ -159,3 +159,86 @@ describe('ProjectProvider impersonation wiring', () => {
     expect(actAsCalls().some(c => c.method === 'POST' && c.body.includes('userX'))).toBe(true)
   })
 })
+
+function ErrorConsumer() {
+  const { userId, setUserId, userSwitchError, currentProject } = useProject()
+  return (
+    <div>
+      <span data-testid="userId">{userId ?? 'null'}</span>
+      <span data-testid="switchError">{userSwitchError?.message ?? ''}</span>
+      <span data-testid="project">{currentProject?.id ?? 'none'}</span>
+      <button data-testid="switch" onClick={() => setUserId('userX')}>switch</button>
+    </div>
+  )
+}
+
+/** fetch stub: `actAsPost` answers (or throws for) POST act-as, `project` answers GET /api/projects/:id. */
+function stubFetch(opts: { actAsPost?: () => Response; project?: () => Response }) {
+  vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: RequestInit) => {
+    const u = String(url)
+    const method = init?.method ?? 'GET'
+    fetchCalls.push({ url: u, method, body: init?.body ? String(init.body) : '' })
+    if (u.includes('/api/auth/act-as') && method === 'POST' && opts.actAsPost) return opts.actAsPost()
+    if (u.startsWith('/api/projects/') && opts.project) return opts.project()
+    return new Response(JSON.stringify({ id: 'P1' }), { status: 200 })
+  }))
+}
+
+describe('ProjectProvider failures keep their cause', () => {
+  test('a refused user switch exposes the reason, code and status', async () => {
+    mockAuth = { user: { id: 'admin' }, isLoading: false, isAdmin: true }
+    stubFetch({ actAsPost: () => new Response(JSON.stringify({ error: 'Could not switch user', code: 'P1001' }), { status: 500 }) })
+    render(<ProjectProvider><ErrorConsumer /></ProjectProvider>)
+    await waitFor(() => expect(screen.getByTestId('userId').textContent).toBe('admin'))
+    fireEvent.click(screen.getByTestId('switch'))
+    await waitFor(() => expect(screen.getByTestId('switchError').textContent).toBe('Could not switch user (P1001 · HTTP 500)'))
+    expect(screen.getByTestId('userId').textContent).toBe('admin')
+  })
+
+  test('a switch that got no answer stays on the admin\'s own id and says why', async () => {
+    mockAuth = { user: { id: 'admin' }, isLoading: false, isAdmin: true }
+    stubFetch({ actAsPost: () => { throw new TypeError('Failed to fetch') } })
+    render(<ProjectProvider><ErrorConsumer /></ProjectProvider>)
+    await waitFor(() => expect(screen.getByTestId('userId').textContent).toBe('admin'))
+    fireEvent.click(screen.getByTestId('switch'))
+    await waitFor(() => expect(screen.getByTestId('switchError').textContent).toBe('Could not switch user (network_error)'))
+    expect(screen.getByTestId('userId').textContent).toBe('admin')
+    expect(localStorage.getItem('redamon-current-user')).toBeNull()
+  })
+
+  test('a successful switch clears an earlier error', async () => {
+    mockAuth = { user: { id: 'admin' }, isLoading: false, isAdmin: true }
+    let fail = true
+    stubFetch({
+      actAsPost: () => fail
+        ? new Response(JSON.stringify({ error: 'User not found' }), { status: 404 })
+        : new Response(JSON.stringify({ actingAs: 'userX' }), { status: 200 }),
+    })
+    render(<ProjectProvider><ErrorConsumer /></ProjectProvider>)
+    await waitFor(() => expect(screen.getByTestId('userId').textContent).toBe('admin'))
+    fireEvent.click(screen.getByTestId('switch'))
+    await waitFor(() => expect(screen.getByTestId('switchError').textContent).toBe('User not found (HTTP 404)'))
+    fail = false
+    fireEvent.click(screen.getByTestId('switch'))
+    await waitFor(() => expect(screen.getByTestId('userId').textContent).toBe('userX'))
+    expect(screen.getByTestId('switchError').textContent).toBe('')
+  })
+
+  test('P-20: an outage loading the saved project keeps the saved selection', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    localStorage.setItem('redamon-current-project', 'P1')
+    stubFetch({ project: () => new Response(JSON.stringify({ error: 'Failed to fetch project', code: 'P1001' }), { status: 500 }) })
+    render(<ProjectProvider><ErrorConsumer /></ProjectProvider>)
+    await waitFor(() => expect(fetchCalls.some(c => c.url === '/api/projects/P1')).toBe(true))
+    await new Promise(r => setTimeout(r, 20))
+    expect(localStorage.getItem('redamon-current-project')).toBe('P1')
+    expect(screen.getByTestId('project').textContent).toBe('none')
+  })
+
+  test('P-20: a project that is gone (404) is forgotten', async () => {
+    localStorage.setItem('redamon-current-project', 'P1')
+    stubFetch({ project: () => new Response(JSON.stringify({ error: 'Project not found' }), { status: 404 }) })
+    render(<ProjectProvider><ErrorConsumer /></ProjectProvider>)
+    await waitFor(() => expect(localStorage.getItem('redamon-current-project')).toBeNull())
+  })
+})

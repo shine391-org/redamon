@@ -1,5 +1,6 @@
 import { Prisma, type PluginInstall, type PluginOverride } from '@prisma/client'
 import prisma from '@/lib/prisma'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -35,7 +36,7 @@ import {
   type Operation,
   type PluginStatus,
 } from './registry'
-import { RunnerError, RunnerUnavailableError, runnerHealth, runnerReload } from './runnerClient'
+import { RunnerError, RunnerUnavailableError, runnerFailureSummary, runnerHealth, runnerReload } from './runnerClient'
 import { parseManifest, type PluginManifest } from './schemas/manifest'
 import type { CatalogRelease } from './schemas/catalog'
 import { registrySkill, type RegistrySkill } from './skillPartsRegistry'
@@ -109,7 +110,22 @@ const snapshot = (r: PluginInstall | null) =>
 /** The versions an operation is planned with: its start is a compare-and-set on them. */
 const plannedWith = (r: PluginInstall) => ({ activeVersion: r.activeVersion, previousVersion: r.previousVersion, dataVersion: r.dataVersion })
 const samePlan = (a: PluginInstall, b: PluginInstall) => JSON.stringify(plannedWith(a)) === JSON.stringify(plannedWith(b))
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+/**
+ * A failure after the commit: the operation took effect, so the answer says so instead of
+ * reporting a failure that a retry would then refuse as already done.
+ */
+function failedAfterCommit(e: unknown, what: string): LifecycleError {
+  const code = safeErrorCode(e)
+  console.error(`[plugins] ${what} took effect, but a step after its commit failed (${code}): ${(e as Error)?.stack ?? String(e)}`)
+  return new LifecycleError(
+    500,
+    code,
+    `The ${what} took effect, but a step after it failed (${code}); the page shows its state now. The webapp log has the details.`,
+    undefined,
+    { committed: true },
+  )
+}
 
 function changed(pluginId: string, row: PluginInstall): LifecycleError {
   return new LifecycleError(
@@ -179,8 +195,7 @@ export async function startWorker(pluginId: string, version: string): Promise<Wo
     if (w.state && w.state !== 'ready') return { ok: false, lastError: `worker_failed: the worker is ${w.state}` }
     return { ok: true }
   } catch (e) {
-    if (e instanceof RunnerUnavailableError) return { ok: false, lastError: 'runner_unavailable' }
-    if (e instanceof RunnerError) return { ok: false, lastError: `runner_error: ${e.code}` }
+    if (e instanceof RunnerUnavailableError || e instanceof RunnerError) return { ok: false, lastError: runnerFailureSummary(e) }
     throw e
   }
 }
@@ -489,14 +504,14 @@ export async function install(
   try {
     bytes = await d.fetchArchive(release.url)
   } catch (e) {
-    const why = e instanceof FetchRemoteError ? `${e.code}: ${e.message}` : (e as Error).message
+    const why = e instanceof FetchRemoteError ? `${e.code}: ${e.message}` : safeErrorCode(e)
     throw await refuse('download_failed', `The archive could not be downloaded (${why}).`, 502)
   }
   let checked: Awaited<ReturnType<typeof checkAndStage>>
   try {
     checked = await checkAndStage(op.operationId, { pluginId, archiveBytes: bytes, release, platformVersion: d.platformVersion })
   } catch (e) {
-    throw await refuse('staging_failed', `The archive could not be written to the plugins volume: ${errorText(e)}`, 500)
+    throw await refuse('staging_failed', `The archive could not be written to the plugins volume (${safeErrorCode(e)}).`, 500)
   }
   if (!checked.ok) throw await refuse(checked.code, checked.message, 422, checked.details)
 
@@ -569,8 +584,8 @@ export async function install(
       throw new LifecycleError(409, 'plugin_busy', `Plugin ${pluginId}: the install lost its lease to another operation.`)
     }
     // Before the commit nothing is installed yet: undone now, not ten minutes later.
-    if (!committed) throw await refuse('install_failed', `The install failed before it was committed: ${errorText(e)}`, 500)
-    throw e
+    if (!committed) throw await refuse('install_failed', `The install failed before it was committed (${safeErrorCode(e)}).`, 500)
+    throw failedAfterCommit(e, `install of ${pluginId} ${release.version}`)
   }
 }
 
@@ -729,14 +744,14 @@ export async function update(
   try {
     bytes = await d.fetchArchive(release.url)
   } catch (e) {
-    const why = e instanceof FetchRemoteError ? `${e.code}: ${e.message}` : (e as Error).message
+    const why = e instanceof FetchRemoteError ? `${e.code}: ${e.message}` : safeErrorCode(e)
     throw await fail('download_failed', `The archive could not be downloaded (${why}).`, 502)
   }
   let checked: Awaited<ReturnType<typeof checkAndStage>>
   try {
     checked = await checkAndStage(op.operationId, { pluginId, archiveBytes: bytes, release, platformVersion: d.platformVersion })
   } catch (e) {
-    throw await fail('staging_failed', `The archive could not be written to the plugins volume: ${errorText(e)}`, 500)
+    throw await fail('staging_failed', `The archive could not be written to the plugins volume (${safeErrorCode(e)}).`, 500)
   }
   if (!checked.ok) throw await fail(checked.code, checked.message, 422, checked.details)
 
@@ -805,8 +820,8 @@ export async function update(
     if (e instanceof PluginConflictError) {
       throw new LifecycleError(409, 'plugin_busy', `Plugin ${pluginId}: the update lost its lease to another operation.`)
     }
-    if (!committed) throw await fail('update_failed', `The update failed before it was committed: ${errorText(e)}`, 500)
-    throw e
+    if (!committed) throw await fail('update_failed', `The update failed before it was committed (${safeErrorCode(e)}).`, 500)
+    throw failedAfterCommit(e, `update of ${pluginId} to ${release.version}`)
   }
 }
 
@@ -954,7 +969,7 @@ export async function rollback(
       throw new LifecycleError(409, 'plugin_busy', `Plugin ${pluginId}: the rollback lost its lease to another operation.`)
     }
     // Nothing was committed: back now, not when reconciliation finds the lease.
-    const message = `The rollback failed before it was committed: ${errorText(e)}`
+    const message = `The rollback failed before it was committed (${safeErrorCode(e)}).`
     await restoreStatus(op, before.status, `rollback_failed: ${message}`)
     await auditPlugin('plugin.rollback', {
       actorId,
@@ -966,10 +981,14 @@ export async function rollback(
     throw new LifecycleError(500, 'rollback_failed', message)
   }
   let row: PluginInstall
-  if (before.enabled) row = await settleWorker(pluginId, prev)
-  else {
-    await tellRunner(pluginId, 'rollback')
-    row = (await findInstall(pluginId))!
+  try {
+    if (before.enabled) row = await settleWorker(pluginId, prev)
+    else {
+      await tellRunner(pluginId, 'rollback')
+      row = (await findInstall(pluginId))!
+    }
+  } catch (e) {
+    throw failedAfterCommit(e, `rollback of ${pluginId} to ${prev}`)
   }
   await auditPlugin('plugin.rollback', {
     actorId,

@@ -52,12 +52,21 @@ def _headers() -> dict:
 
 
 class TriageRunAborted(Exception):
-    """The run must stop now. `error_class` is what gets recorded."""
+    """The run must stop now. `error_class` is what gets recorded.
 
-    def __init__(self, reason: str, error_class: str = "aborted"):
+    `public_reason` is a refusal the WEBAPP wrote (our own fixed text, such as
+    "A version activation is in progress"), safe to show after the fixed
+    sentence; `details` are safe fields for the tab (`upstream_status`, an
+    exception's class name). An exception's message never goes in either.
+    """
+
+    def __init__(self, reason: str, error_class: str = "aborted",
+                 public_reason: str = "", details: dict | None = None):
         super().__init__(reason)
         self.reason = reason
         self.error_class = error_class
+        self.public_reason = public_reason
+        self.details = dict(details or {})
 
 
 class TriageRunClient:
@@ -119,13 +128,17 @@ class TriageRunClient:
         except Exception as exc:                                  # noqa: BLE001
             logger.error(f"Triage authorize failed to reach the webapp: {exc}")
             raise TriageRunAborted(
-                "the run could not be authorised", "authorize_failed") from exc
+                "the run could not be authorised", "authorize_failed",
+                public_reason="The webapp could not be reached.",
+                details={"error_class": type(exc).__name__}) from exc
 
         if response.status_code != 201:
             detail = _reason(response)
             logger.warning(
                 f"Triage authorize refused ({response.status_code}): {detail}")
-            raise TriageRunAborted(detail, "authorize_failed")
+            raise TriageRunAborted(detail, "authorize_failed",
+                                   public_reason=_webapp_refusal(response),
+                                   details={"upstream_status": response.status_code})
 
         self.run_id = str(response.json().get("runId") or "")
         if not self.run_id:
@@ -208,7 +221,9 @@ class TriageRunClient:
         except Exception as exc:                                  # noqa: BLE001
             logger.error(f"Triage publish claim failed to reach the webapp: {exc}")
             raise TriageRunAborted(
-                "the results could not be published", "publish_refused") from exc
+                "the results could not be published", "publish_refused",
+                public_reason="The webapp could not be reached.",
+                details={"error_class": type(exc).__name__}) from exc
 
         if response.status_code != 200:
             detail = _reason(response)
@@ -218,7 +233,9 @@ class TriageRunClient:
                 error_class = response.json().get("errorClass") or error_class
             except Exception:                                     # noqa: BLE001
                 pass
-            raise TriageRunAborted(detail, error_class)
+            raise TriageRunAborted(detail, error_class,
+                                   public_reason=_webapp_refusal(response),
+                                   details={"upstream_status": response.status_code})
 
     # -- finish ------------------------------------------------------------
     async def finish(self, status: str, summary: dict | None = None,
@@ -243,6 +260,27 @@ class TriageRunClient:
             # The run stays `running` until its heartbeat expires, which is the
             # designed fallback rather than a second failure mode.
             logger.error(f"Could not record how triage run {self.run_id} ended: {exc}")
+
+
+#: A refusal the webapp wrote for a person: one short line from a 4xx answer.
+_REFUSAL_MAX = 300
+
+
+def _webapp_refusal(response: httpx.Response) -> str:
+    """The webapp's own refusal sentence, or "".
+
+    Only a 4xx carries one: those bodies are the internal triage-run routes'
+    fixed texts. A 5xx can be a framework page or a proxy's, so it is never shown.
+    """
+    if not 400 <= response.status_code < 500:
+        return ""
+    try:
+        text = response.json().get("error")
+    except Exception:                                             # noqa: BLE001
+        return ""
+    if not isinstance(text, str):
+        return ""
+    return " ".join(text.split())[:_REFUSAL_MAX]
 
 
 def _reason(response: httpx.Response) -> str:

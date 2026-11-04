@@ -38,7 +38,7 @@ MAX_PENDING_CHANGE_SETS = 5
 USER_SKILL_POINT = "user_skill.text"
 USER_SKILL_PART = "body"
 # MAX_CONTENT_SIZE of webapp src/lib/userSkills.ts, in UTF-16 code units.
-USER_SKILL_MAX_CHARS = 51_200
+USER_SKILL_MAX_CHARS = 512_000
 _GROUP_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
 _VERSION_SUFFIX = re.compile(r"^(.*\S)\s+v(\d{1,6})\Z", re.IGNORECASE)
 # agentic prompts/skill_parts.py RESERVED_HEADINGS and RESERVED_MARKERS.

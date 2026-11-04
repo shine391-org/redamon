@@ -3,6 +3,7 @@ import { getSession } from '@/lib/session'
 import { readJsonBody } from '@/lib/jsonBody'
 import { MAX_SKILL_BATCH_BYTES } from '@/lib/userSkills'
 import { requireOwnBrowserRequest } from '@/lib/userSkillRouteGuard'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { auditActorFor, createUserSkillsBatch, userSkillErrorResponse } from '@/lib/userSkillWrites'
 
 interface RouteParams {
@@ -19,7 +20,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   // Before anything reads the body: past 10 MB the proxy would truncate it into "Invalid JSON".
   if (Number(request.headers.get('content-length') || 0) > MAX_SKILL_BATCH_BYTES) {
     return NextResponse.json(
-      { error: 'This batch is larger than 8 MB; upload it in two batches.', code: 'batch_too_large' }, { status: 413 })
+      { error: 'This batch is larger than 8 MB; upload it in smaller batches.', code: 'batch_too_large' }, { status: 413 })
   }
   try {
     const { id } = await params
@@ -38,6 +39,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     // Its kind only: a Prisma message can quote the query's values, and an item's text can hold anything.
     const code = (error as { code?: unknown } | null)?.code
     console.error('Failed to upload a skill batch:', error instanceof Error ? error.name : typeof error, code ?? '')
-    return NextResponse.json({ error: 'Failed to upload the skills' }, { status: 500 })
+    return NextResponse.json({ error: 'Failed to upload the skills', code: safeErrorCode(error) }, { status: 500 })
   }
 }

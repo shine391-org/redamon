@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError } from '@/lib/routeErrors'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 import { applyRoe } from '@/lib/roe/applyRoe'
 import { extractRoeText, ExtractError } from '@/lib/roe/extractText'
@@ -86,8 +87,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       unknownKeys: Array.isArray(unknownKeys) ? unknownKeys.filter((k): k is string => typeof k === 'string') : [],
     })
   } catch (error) {
-    console.error('RoE replace error:', error)
-    return NextResponse.json({ error: 'Failed to apply the Rules of Engagement.' }, { status: 500 })
+    return internalError(error, 'Failed to apply the Rules of Engagement.', { log: 'RoE replace error' })
   }
 }
 
@@ -105,7 +105,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     }
     return await applyRoe({ mode: 'remove', projectId: id, eff, rowVersion: body.rowVersion, changes: body.changes })
   } catch (error) {
-    console.error('RoE remove error:', error)
-    return NextResponse.json({ error: 'Failed to remove the Rules of Engagement.' }, { status: 500 })
+    return internalError(error, 'Failed to remove the Rules of Engagement.', { log: 'RoE remove error' })
   }
 }

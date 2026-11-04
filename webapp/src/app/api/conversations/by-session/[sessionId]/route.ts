@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireConversationAccessBySession } from '@/lib/access'
@@ -38,11 +39,7 @@ export async function GET(
 
     return NextResponse.json(conversation)
   } catch (error) {
-    console.error('Failed to fetch conversation by session:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch conversation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch conversation', { log: 'Failed to fetch conversation by session' })
   }
 }
 
@@ -78,10 +75,6 @@ export async function PATCH(
 
     return NextResponse.json(conversation)
   } catch (error) {
-    console.error('Failed to update conversation by session:', error)
-    return NextResponse.json(
-      { error: 'Failed to update conversation' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update conversation', { log: 'Failed to update conversation by session' })
   }
 }

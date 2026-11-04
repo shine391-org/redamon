@@ -311,6 +311,9 @@ class TheGateNamesRealTools(unittest.TestCase):
 _NOT_AGENT_EXECUTORS = {
     "api.py": "operator-initiated sandbox file reads and the inbound MCP Kali "
               "surface, which skips agent phase and RoE checks by design",
+    "orchestrator_helpers/body_sweep.py": "a run's end deletes the route exposure body files "
+              "the session itself named in the sandbox's /tmp; it sends no target traffic, and "
+              "an RoE that forbade kali_shell must not leave those bodies on disk",
 }
 _DISPATCH = re.compile(r"\btool_executor\.execute(?:_with_progress)?\(")
 

@@ -101,13 +101,47 @@ describe('errors are normalised', () => {
     expect(json.error).not.toMatch(/MATCH|anthropic|attempts/)
   })
 
-  test('an unreachable agent gives a stable 502 message', async () => {
+  test('an unreachable agent gives a stable 503 agent_unreachable message', async () => {
     h.fetch.mockRejectedValue(new Error('ECONNREFUSED 10.0.0.5:8080'))
     const res = await post({ question: 'q', project_id: 'p1' })
     const json = await res.json()
 
-    expect(res.status).toBe(502)
+    expect(res.status).toBe(503)
+    expect(json.code).toBe('agent_unreachable')
+    expect(JSON.stringify(json)).not.toMatch(/10\.0\.0\.5/)
     expect(json.error).not.toMatch(/ECONNREFUSED|10\.0\.0\.5/)
+  })
+
+  test('the agent own sentence reaches the person, with its status (G-13)', async () => {
+    h.fetch.mockResolvedValue(new Response(JSON.stringify({
+      error: 'No LLM configured. Configure an AI model in project settings to use graph views.',
+    }), { status: 400 }))
+    const res = await post({ question: 'q', project_id: 'p1' })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({
+      error: 'No LLM configured. Configure an AI model in project settings to use graph views.',
+      upstreamStatus: 400,
+    })
+  })
+
+  test('the daily cap 429 detail is forwarded', async () => {
+    h.fetch.mockResolvedValue(new Response(JSON.stringify({ detail: 'Daily LLM call cap exceeded' }), { status: 429 }))
+    const res = await post({ question: 'q', project_id: 'p1' })
+    expect(res.status).toBe(429)
+    expect((await res.json()).error).toBe('Daily LLM call cap exceeded')
+  })
+
+  test('a failed model call carries its code and the provider class and status (G-14)', async () => {
+    h.fetch.mockResolvedValue(new Response(JSON.stringify({
+      error: 'The AI model call failed. Try again in a moment.', code: 'model_call_failed',
+      error_class: 'RateLimitError', provider_status: 429,
+    }), { status: 502 }))
+    const res = await post({ question: 'q', project_id: 'p1' })
+    expect(res.status).toBe(502)
+    expect(await res.json()).toEqual({
+      error: 'The AI model call failed. Try again in a moment.', code: 'model_call_failed',
+      upstreamStatus: 502, errorClass: 'RateLimitError', providerStatus: 429,
+    })
   })
 
   test('a malformed JSON body is a 400, not a 500', async () => {

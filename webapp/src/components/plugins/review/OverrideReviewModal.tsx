@@ -9,6 +9,7 @@ import { SafeMarkdown } from '@/components/plugins/host/SafeMarkdown'
 import { TextDiff } from '@/components/plugins/host/TextDiff'
 import type { ReviewModel, ReviewPart } from '@/lib/plugins/reviewModel'
 import type { UserSkillReviewModel } from '@/lib/plugins/userSkillReviewModel'
+import { errorMessage } from '@/lib/apiError'
 import { OverrideApiError, approveChangeSet, fetchReviewModel, rejectChangeSet } from './overridesClient'
 import { UserSkillReview } from './UserSkillReview'
 import { dormantCopy } from './dormantCopy'
@@ -37,9 +38,12 @@ function warnings(m: ReviewModel): { tone: 'warn' | 'block'; text: string }[] {
     out.push({ tone: 'block', text: `RedAmon's factory text for ${partId} changed since this proposal. Review it again before approving.` })
   }
   if (m.registryError) {
+    // registryErrorText says whether the agent answered at all, and with which status.
     out.push({
       tone: 'block',
-      text: m.registryError === 'agent_outdated' ? 'The agent is older than the webapp (rebuild the agent); this cannot be approved now.' : 'The agent cannot be reached; this cannot be approved now.',
+      text: m.registryError === 'agent_outdated'
+        ? 'The agent is older than the webapp (rebuild the agent); this cannot be approved now.'
+        : `${m.registryErrorText ?? 'The agent cannot be reached'}; this cannot be approved now.`,
     })
   }
   if (m.dormantReason) out.push({ tone: 'warn', text: `This version would not be applied now: ${dormantCopy(m.dormantReason)}.` })
@@ -73,10 +77,12 @@ export function OverrideReviewModal({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [tab, setTab] = useState(0)
+  // Every reason an approval was refused (an over-limit text can break several limits).
+  const [approveErrors, setApproveErrors] = useState<string[]>([])
 
   const load = useCallback(() => {
     setLoadError(null)
-    fetchReviewModel(changeSetId, projectId).then(setLoaded, (e) => setLoadError(e instanceof Error ? e.message : 'Could not load the proposal.'))
+    fetchReviewModel(changeSetId, projectId).then(setLoaded, (e) => setLoadError(errorMessage(e, 'Could not load the proposal.')))
   }, [changeSetId, projectId])
   useEffect(() => load(), [load])
 
@@ -103,6 +109,7 @@ export function OverrideReviewModal({
     )
     if (!ok) return
     setBusy(true)
+    setApproveErrors([])
     try {
       const { revision } = await approveChangeSet(changeSetId, ownerId)
       toast.success(`Approved v${revision} of ${model.skill.displayName}.`)
@@ -110,9 +117,10 @@ export function OverrideReviewModal({
     } catch (e) {
       if (e instanceof OverrideApiError) {
         toast.error(e.message)
+        if (e.details.length > 1) setApproveErrors(e.details)
         load() // re-read: the reason (stale, already decided) is now in the model.
       } else {
-        toast.error('Could not approve the proposal.')
+        toast.error(errorMessage(e, 'Could not approve the proposal.'))
       }
     } finally {
       setBusy(false)
@@ -129,7 +137,7 @@ export function OverrideReviewModal({
       toast.success('Proposal rejected.')
       onDecided('rejected')
     } catch (e) {
-      toast.error(e instanceof OverrideApiError ? e.message : 'Could not reject the proposal.')
+      toast.error(errorMessage(e, 'Could not reject the proposal.'))
     } finally {
       setBusy(false)
     }
@@ -160,6 +168,13 @@ export function OverrideReviewModal({
         </div>
       )}
       {loadError && <div className={styles.block} role="alert">{loadError}</div>}
+      {approveErrors.length > 0 && (
+        <ul className={styles.block} role="alert" data-testid="approve-errors">
+          {approveErrors.map((text, i) => (
+            <li key={i}>{text}</li>
+          ))}
+        </ul>
+      )}
       {model && <ReviewBody model={model} tab={tab} setTab={setTab} />}
     </Modal>
   )

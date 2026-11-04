@@ -1,8 +1,10 @@
 'use client'
 
 import { useState, useCallback, memo } from 'react'
-import { Terminal } from 'lucide-react'
+import { Terminal, AlertCircle } from 'lucide-react'
 import type { MsfSession, MsfJob, NonMsfSession, SessionInteractResult } from '@/lib/websocket-types'
+import { useToast } from '@/components/ui'
+import { errorMessage } from '@/lib/apiError'
 import { SessionCard, NonMsfCard, JobCard } from './SessionCard'
 import { SessionTerminal } from './SessionTerminal'
 import styles from './ActiveSessions.module.css'
@@ -17,6 +19,8 @@ interface ActiveSessionsProps {
   onInteract: (sessionId: number, command: string) => Promise<SessionInteractResult>
   onKillSession: (sessionId: number) => Promise<void>
   onKillJob: (jobId: number) => Promise<void>
+  /** Why the list could not be refreshed (the agent is down, the route failed). */
+  error?: string | null
 }
 
 export const ActiveSessions = memo(function ActiveSessions({
@@ -29,18 +33,33 @@ export const ActiveSessions = memo(function ActiveSessions({
   onInteract,
   onKillSession,
   onKillJob,
+  error = null,
 }: ActiveSessionsProps) {
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
+  const toast = useToast()
 
   const selectedSession = sessions.find(s => s.id === selectedSessionId)
   const totalSessions = sessions.length + nonMsfSessions.length
 
   const handleKill = useCallback(async (id: number) => {
-    await onKillSession(id)
+    try {
+      await onKillSession(id)
+    } catch (err) {
+      toast.error(errorMessage(err, `Failed to kill session ${id}`), 'Session not killed')
+      return
+    }
     if (selectedSessionId === id) {
       setSelectedSessionId(null)
     }
-  }, [onKillSession, selectedSessionId])
+  }, [onKillSession, selectedSessionId, toast])
+
+  const handleKillJob = useCallback(async (id: number) => {
+    try {
+      await onKillJob(id)
+    } catch (err) {
+      toast.error(errorMessage(err, `Failed to kill job ${id}`), 'Job not stopped')
+    }
+  }, [onKillJob, toast])
 
   // Loading state
   if (isLoading) {
@@ -48,6 +67,17 @@ export const ActiveSessions = memo(function ActiveSessions({
       <div className={styles.loading}>
         <div className={styles.spinner} />
         Loading sessions...
+      </div>
+    )
+  }
+
+  // An unreachable agent is not "no sessions": say what failed instead.
+  if (totalSessions === 0 && jobs.length === 0 && error) {
+    return (
+      <div className={styles.emptyState} role="alert">
+        <AlertCircle size={40} className={styles.emptyIcon} />
+        <p className={styles.emptyTitle}>Could not load sessions</p>
+        <p className={styles.emptyText}>{error}</p>
       </div>
     )
   }
@@ -76,6 +106,13 @@ export const ActiveSessions = memo(function ActiveSessions({
             <span className={styles.count}>{totalSessions}</span>
           </span>
         </div>
+
+        {error && (
+          <div className={styles.listError} role="alert">
+            <AlertCircle size={12} />
+            <span>Not refreshed: {error}</span>
+          </div>
+        )}
 
         <div className={styles.sidebarBody}>
           {/* Metasploit sessions */}
@@ -121,7 +158,7 @@ export const ActiveSessions = memo(function ActiveSessions({
                 <JobCard
                   key={j.id}
                   job={j}
-                  onKill={() => onKillJob(j.id)}
+                  onKill={() => handleKillJob(j.id)}
                 />
               ))}
             </>

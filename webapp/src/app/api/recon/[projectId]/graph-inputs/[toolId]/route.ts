@@ -11,6 +11,7 @@ import {
   type GraphDomainRow,
 } from '@/lib/partialReconScope'
 import { findLegacyDomains } from '@/lib/legacyGraph'
+import { internalError, safeErrorCode } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ projectId: string; toolId: string }>
@@ -308,6 +309,7 @@ const TOOL_QUERIES: Record<string, ToolQuery> = {
     }),
   },
   WebCachePoison: JS_TOOL,
+  RouteExposure: JS_TOOL,
   VhostSni: {
     cypher: q => `${q.domains}
       ${q.subPath('')}
@@ -406,6 +408,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
         ? { ...fields, discovery_domains: discoveryDomains(scope, fields.domains) }
         : fields
 
+    let graphFailure: unknown = null
     if (tool) {
       try {
         const session = getGraphSession()
@@ -441,22 +444,22 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
         }
       } catch (err) {
         console.warn(`Neo4j query failed for ${toolId} graph-inputs, falling back to settings:`, err)
+        graphFailure = err
       }
     }
 
     // Fallback: the project's own roots with zero counts. The orchestrator
-    // re-derives the scope anyway, so offering the roots here is safe.
+    // re-derives the scope anyway, so offering the roots here is safe. When the
+    // graph could not be read, the zeros are unknown, not "nothing found", and
+    // the flag lets the modal say so instead of "run Naabu first".
     return NextResponse.json({
       ...withDiscovery(partialScopeFields(scope, null)),
       ...ZERO_COUNTS,
       source: 'settings',
+      ...(graphFailure ? { degraded: 'graph_unavailable', code: safeErrorCode(graphFailure) } : {}),
     })
 
   } catch (error) {
-    console.error('Error getting graph inputs:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to get graph inputs', { log: 'Error getting graph inputs' })
   }
 }

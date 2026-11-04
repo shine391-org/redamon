@@ -48,12 +48,36 @@ describe('readActionAnswer', () => {
   test('a refusal from the platform keeps its code, message and status', async () => {
     const err = await readActionAnswer(json(409, { error: 'This plugin is disabled or not ready.', code: 'plugin_unavailable' })).catch((e) => e)
     expect(err).toBeInstanceOf(PluginActionError)
-    expect(err).toMatchObject({ code: 'plugin_unavailable', status: 409, message: 'This plugin is disabled or not ready.' })
+    // What the person sees carries the code and the status, so a screenshot names the cause.
+    expect(err).toMatchObject({ code: 'plugin_unavailable', status: 409, message: 'This plugin is disabled or not ready. (plugin_unavailable · HTTP 409)' })
   })
 
-  test('a non-JSON error page is still a named failure', async () => {
+  test("a runner failure shows the runner's own status beside the platform's", async () => {
+    const res = json(502, { error: 'The plugin runner could not run this action (worker_crashed); its log has the details.', code: 'runner_error', upstreamStatus: 500, runnerCode: 'worker_crashed' })
+    const err = await readActionAnswer(res).catch((e) => e)
+    expect(err).toMatchObject({ code: 'runner_error', status: 502 })
+    expect(err.message).toBe('The plugin runner could not run this action (worker_crashed); its log has the details. (runner_error · HTTP 502 · upstream HTTP 500)')
+  })
+
+  test('a non-JSON error page is still a named failure, with its status', async () => {
     const err = await readActionAnswer(new Response('<html>bad gateway</html>', { status: 502 })).catch((e) => e)
-    expect(err).toMatchObject({ code: 'http_502', status: 502 })
+    expect(err).toMatchObject({ code: 'non_json_response', status: 502, message: 'The plugin action failed (non_json_response · HTTP 502)' })
+  })
+
+  test("Next's empty 500 says so", async () => {
+    const err = await readActionAnswer(new Response('', { status: 500 })).catch((e) => e)
+    expect(err).toMatchObject({ code: 'empty_response', status: 500, message: 'The plugin action failed (empty_response · HTTP 500)' })
+  })
+
+  test('a request that got no answer is a named failure with status 0, offline said when the browser knows', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    const err = await postPluginAction('echo', 'run', {}).catch((e) => e)
+    expect(err).toBeInstanceOf(PluginActionError)
+    expect(err).toMatchObject({ code: 'network_error', status: 0, message: 'The plugin action got no answer from RedAmon (network_error).' })
+    const online = vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false)
+    const offline = await postPluginAction('echo', 'run', {}).catch((e) => e)
+    expect(offline.message).toBe('The plugin action got no answer from RedAmon (network_error); this browser is offline.')
+    online.mockRestore()
   })
 
   test('a 200 that is neither a result nor a job is refused', async () => {

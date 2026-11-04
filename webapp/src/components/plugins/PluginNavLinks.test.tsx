@@ -4,7 +4,7 @@
  * header). Nothing is drawn when no plugin has one.
  */
 import { describe, test, expect, vi, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { PluginNavLinks } from './PluginNavLinks'
 
@@ -59,9 +59,25 @@ describe('PluginNavLinks', () => {
     expect(container.textContent).toBe('')
   })
 
-  test('a failed request draws nothing and breaks nothing', async () => {
-    const { container } = draw(500, { error: 'boom' })
-    await new Promise((r) => setTimeout(r, 0))
-    expect(container.textContent).toBe('')
+  // The links must not just vanish: a quiet line says what failed, and Retry asks again.
+  test('a failed request shows a small hint with the code and status, and Retry reads again', async () => {
+    draw(500, { error: 'The plugin items could not be read; see the webapp log.', code: 'P2024' })
+    const hint = await screen.findByTestId('plugin-nav-error')
+    expect(hint.textContent).toContain('The plugin items could not be read; see the webapp log. (P2024 · HTTP 500)')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify([echo]), { status: 200 })))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('link', { name: /open echo items/i })).toBeInTheDocument()
+    expect(screen.queryByTestId('plugin-nav-error')).toBeNull()
+  })
+
+  test("Next's empty 500 still names its status", async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 500 })))
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <PluginNavLinks />
+      </QueryClientProvider>,
+    )
+    expect((await screen.findByTestId('plugin-nav-error')).textContent).toContain('Plugin items could not be loaded (empty_response · HTTP 500)')
   })
 })

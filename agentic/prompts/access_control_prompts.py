@@ -472,3 +472,177 @@ exactly as it appears in that response body - never a placeholder, a summary, or
 re-typed guess. If the winning request's output was offloaded or truncated, re-
 fetch it and read the literal value before you report or `complete`.
 """
+
+
+# The route-exposure parts load only when the project runs recon's route
+# exposure scan (ROUTE_EXPOSURE_ENABLED); with it off the skill's prompt is
+# byte-identical to the one above. Still no tunables: the limit is a constant.
+from .route_exposure_shared import (  # noqa: E402
+    RECORD_CONTRACT as _RECORD_CONTRACT,
+    SAFETY_RULES as _SAFETY_RULES,
+    VALUES_IN_FILES as _VALUES_IN_FILES,
+    candidate_query as _candidate_query,
+)
+
+ACCESS_CONTROL_ROUTE_EXPOSURE_LEADS = """
+## ROUTE EXPOSURE LEADS (recon found routes that may answer without authentication)
+
+Recon's route exposure scan requested every known route anonymously and logged in,
+and wrote leads (`source='route_exposure'`, `needs_agent_confirmation=true`,
+severity info). Your job: prove or reject each one with a non-destructive pair of
+requests plus the judgement a scanner cannot make (is this public by design?).
+These steps run in the INFORMATIONAL phase with execute_curl and execute_code.
+
+**L0. When this applies.** Run graph_summary, then query_graph for
+`MATCH (v:Vulnerability {source:'route_exposure'}) RETURN count(v)`. If there are
+none, say "the route exposure scan has not run or found nothing" and continue with
+the access-control workflow above. Never reuse a count from an earlier turn.
+
+**L1. Pull the leads (ordered, bounded, paged).**
+""" + _candidate_query(["anonymous_access", "sensitive_data"]) + """
+When TrafficMind is on, read the original request with proxy_brain's read helpers
+instead of re-crawling. To replay a captured request anonymously, use proxy_brain's
+`redamon.replay(<txn id>, anonymous=True)`: it strips every credential the profile adds
+(bearer, cookie, header, basic) and every redacted header, and its Response prints as
+`<Response <status> <length>b anonymous>`. Print that line and hashes, never `.body`.
+A replay is an EXPLOITATION-phase request (proxy_brain refuses it in the informational
+phase): request `transition_phase` naming it, and replay once the operator approves.
+When the user asks only for an anonymous replay, send only that anonymous side: no
+logged-in request goes with it.
+
+**L2. The pair (every lead), GET only.**
+```
+execute_curl  args: -s -o /tmp/rex-<id>-anon.body -w '%{http_code} %{size_download} %{content_type}' '<url>'
+execute_curl  args: -s -o /tmp/rex-<id>-auth.body -w '%{http_code} %{size_download} %{content_type}' '<url>'
+              use_session: true
+execute_code  (python) read /tmp/rex-<id>-anon.body and /tmp/rex-<id>-auth.body; print ONLY:
+              the status pair, the sizes, sha256[:8] of each body with whitespace collapsed,
+              equal yes/no, the JSON key paths present in both (names only), counts of
+              e-mails / phones, and the count of distinct identifier hashes; then os.remove both
+```
+`use_session=true` is attached server-side for one in-scope URL only; if the tool
+says "Auth headers NOT attached", the comparison is anonymous-only: say so.
+
+**L3. Proof standards, by route class.** Every condition of a row must hold.
+
+| route_class | Proof | Reject when |
+| --- | --- | --- |
+| internal_api, admin_function, debug_management, data_export | the anonymous 2xx returns the SAME content as the logged-in GET (equal body hash, or the same key paths) AND one of: (a) `login_declared` is true (the lead's `expected` holds openapi, siblings_locked, version_locked or vary_auth): the API itself says a login is required there, so the content need not be sensitive and "public by design" does not apply; (b) sensitive key paths; (c) 3 or more other people's identities | `login_declared` is false, and the answer is public by design (health, status, version, docs, public catalogue, marketing JSON, login, help) or carries nothing sensitive |
+| old_version | the pair on the variant AND on its `variant_of`: the newer route denies anonymously, the older one returns the same resource | the old version returns only public data |
+| uploaded_content | an anonymous GET (or HEAD, or `Range: bytes=0-0` for a large file) returns the file, AND a logged-in page links to it: fetch the site root anonymously and with `use_session=true` (bodies to files) and count the file's path in each with execute_code; it appears in the logged-in body only | the file is a public asset: the anonymous root links it too |
+| kind sensitive_data (any class) | the logged-in body carries sensitive key paths, OR 3 or more records whose identifier hashes differ from the session's own (hash the identifier fields of a /me-style route the same way and print only the hash prefix) | only the session's own record and no sensitive key path |
+
+**L4. UI-vs-API diff** (EXPLOITATION phase only, excessive data). proxy_brain's
+browser renders, logged in, the page that calls the API: `b = redamon.browser(<id of a
+captured request to that host>)`, `b.goto('<page path>')`, then the script reads
+`b.text()` and closes it. A curl of the page is not a render: it runs no script and
+loads no sub-resource, and it is logged in through the engagement's session, so you
+never submit the login form to reach it. The script compares the API's key paths with
+the labels and values present in the rendered text, by hash.
+Keys returned but never rendered are the evidence. The browser sends the session to
+the pinned host only. A logged-in request is always `use_session=true` on execute_curl
+or `redamon.browser` (both use the credential the AuthProfile holds): NEVER submit a
+login form, POST credentials, or loop authentication. A plain curl that 302-redirects
+to /login only means that curl had no session; re-send it with `use_session=true`. From the informational phase, finish L2-L3 and record them first,
+then request `transition_phase` to exploitation naming this step, and run it once the
+operator approves.
+
+**L5. Record, then verify.** As below. Record each proven lead in the response that
+read its proof.
+
+**L6. Hand the artifacts to their skill.** Count the signature findings not yet
+confirmed:
+```cypher
+MATCH (v:Vulnerability {source:'route_exposure'})
+WHERE v.needs_agent_confirmation = false AND NOT (:ChainFinding)-[:CONFIRMS]->(v)
+RETURN v.exposure_kind AS kind, count(*) AS n ORDER BY n DESC
+```
+Name the counts in your final answer. If vcs_exposure, env_file, config_file,
+backup_file or secret_in_response exist and the path_traversal skill is enabled, end
+with `action='switch_skill'`, `skill_switch: {to_skill: 'path_traversal', reason}`. If
+debug_console or debug_endpoint exist and rce is enabled, switch to `rce`. If both
+apply, take the larger group first and name the other in the reason. A disabled
+skill: say the finding stands on its signature.
+
+**L7. Admin panels.** Once an admin_function route is confirmed, name the product if
+you recognise it. If brute_force_credential_guess is enabled and the RoE does not
+forbid brute force, propose it in your final answer. Never try a password here.
+""" + _VALUES_IN_FILES + _RECORD_CONTRACT + _SAFETY_RULES
+
+ACCESS_CONTROL_ROUTE_EXPOSURE_BROWSER_LEADS = """
+## ROUTE EXPOSURE BROWSER LEADS (CORS, cached logged-in pages, client-side-only gating)
+
+Recon's riders flagged logged-in routes whose answers a browser could leak: a CORS
+policy that hands them to another origin, a cache that would serve them to anyone, and
+pages hidden only by the browser. Prove or reject each, all in the INFORMATIONAL phase
+(execute_curl, execute_code, execute_playwright, fs_write). L1 above also returns the
+client_gated leads (route_class `client_gated`): prove those with B4, not with L2-L3.
+
+**B1. Pull them.**
+```cypher
+MATCH (v:Vulnerability {source:'route_exposure'})
+WHERE v.needs_agent_confirmation = true AND NOT (:ChainFinding)-[:CONFIRMS]->(v)
+  AND (v.exposure_kind IN ['cors_misconfig', 'auth_cacheable']
+       OR (v.exposure_kind = 'anonymous_access' AND v.route_class = 'client_gated'))
+RETURN v.id AS id, v.exposure_kind AS kind, v.matched_at AS url, v.path AS path,
+       v.anon_status AS anon, v.authed_status AS authed, v.cors_variants AS cors_variants,
+       v.cache_signals AS cache_signals, v.sensitive_fields AS fields, v.leak_signals AS leaks
+ORDER BY v.exposure_kind, v.id
+LIMIT 50
+```
+Copy every `id` exactly. Page with `AND v.id > '<last id>'`.
+
+**B2. CORS (kind cors_misconfig).** Send the logged-in GET once per Origin:
+`https://evil.invalid`, `null`, `https://<host>.evil.invalid` and
+`https://evil<registrable domain>` (for an IP host, `https://evil<ip>`). Each:
+```
+execute_curl  args: -s -D /tmp/rex-<id>-<n>.hdr -o /tmp/rex-<id>-<n>.body -w '%{http_code}' -H 'Origin: <origin>' '<url>'
+              use_session: true
+```
+One execute_code script prints, per origin, only the Access-Control-Allow-Origin and
+Access-Control-Allow-Credentials values and the body's sha256[:8], then removes the files.
+Proof: Access-Control-Allow-Origin echoes the sent origin (or `null`) AND
+Access-Control-Allow-Credentials is `true` AND the lead's `fields` or `leaks` show the
+logged-in body is sensitive. Then write the evidence with fs_write to
+`evidence/cors-<id>.html`: a page that runs `fetch('<url>', {credentials: 'include'})` and
+shows the response length. It is a file, never served, never opened. Reject: a `*` origin
+without credentials, or a body with nothing sensitive.
+
+**B3. Cache (kind auth_cacheable).** Build `<url>?rdmncb=<12 random hex>`, a new one per
+lead and never reused. Then, on that SAME URL:
+```
+execute_curl  args: -s -D /tmp/rex-<id>-auth.hdr -o /tmp/rex-<id>-auth.body -w '%{http_code}' '<buster url>'
+              use_session: true
+execute_curl  args: -s -D /tmp/rex-<id>-anon.hdr -o /tmp/rex-<id>-anon.body -w '%{http_code}' '<buster url>'
+```
+One execute_code script prints both statuses, both bodies' sha256[:8], equal yes/no, and
+from the ANONYMOUS answer only the Age, X-Cache, CF-Cache-Status and Cache-Control
+headers; then removes the files. Proof: the anonymous body hash equals the logged-in one
+AND a cache hit shows (Age above 0, or X-Cache / CF-Cache-Status HIT). Your own account
+only; never send PURGE; never reuse a buster.
+
+**B4. Client-side-only gating (anonymous_access, route_class client_gated).**
+1. Find the hidden pages. A client_gated lead that is an API was tagged because a bundle
+   that defines client-side router pages also calls it; those pages are in the graph,
+   linked from the same bundle (put the lead's `path` in):
+   ```cypher
+   MATCH (f:JsReconFinding {finding_type:'js_file'})-[:HAS_ENDPOINT]->(api:Endpoint {path:'<path>'})
+   MATCH (f)-[:HAS_ENDPOINT]->(page:Endpoint {endpoint_type:'route'})
+   WHERE page.baseurl = api.baseurl
+   RETURN DISTINCT page.baseurl + page.path AS page
+   LIMIT 10
+   ```
+   Never guess a page from the API's path. No row, and the lead is itself a page: use its url.
+2. execute_playwright, which never carries the session: open the site root, then go to each
+   page from step 1, and print, per page, only the paths of the fetch/XHR requests it fires.
+3. Each API path a page fires, and the lead's url when it is itself an API, gets the L2 pair.
+4. Proof needs BOTH: a page rendered without the session fired the API (step 2), AND the API
+   answers anonymously with the content it gives logged in (step 3). Name that page in the
+   evidence. The pair alone only proves an anonymous API, which is L2's finding, not this
+   one: without the render the lead stays unproven, so never skip step 2.
+5. A hidden page whose API answers 401 anonymously is NOT a finding: client-side hiding
+   with server-side enforcement is correct. Record nothing for it; list it as rejected.
+
+**B5. Record, then verify,** under the contract below: one `vulnerability_confirmed`
+entry per proven lead with its exact id, nothing for a rejected one.
+""" + _VALUES_IN_FILES + _RECORD_CONTRACT + _SAFETY_RULES

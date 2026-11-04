@@ -4,9 +4,11 @@ import { useState, useEffect, useMemo } from 'react'
 import { Loader2, Eye, EyeOff, Search } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
 import { ModelPicker } from '@/components/shared/ModelPicker'
+import { excludeLoop } from '@/lib/agentInTheLoop'
 import { useFeatureModelGate } from '@/components/shared/FeatureModelGate'
 import { useDirtyState } from '@/hooks/useDirtyState'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
+import { readApiError, toApiError } from '@/lib/apiError'
 import styles from './Settings.module.css'
 
 export interface TradecraftResource {
@@ -326,14 +328,11 @@ export function TradecraftResourceForm({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}))
-        throw new Error(data.error || `HTTP ${resp.status}`)
-      }
+      if (!resp.ok) throw await readApiError(resp, isEdit ? 'Failed to update the resource' : 'Failed to add the resource')
       setBaseline(currentValues)
       onSave()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(toApiError(e, isEdit ? 'Failed to update the resource' : 'Failed to add the resource').message)
     } finally {
       setSubmitting(false)
     }
@@ -552,6 +551,7 @@ export function TradecraftResourceForm({
             value={llmModel}
             onChange={setLlmModel}
             placeholder="pick the model used to crawl + summarize this resource"
+            filter={excludeLoop}
           />
           <span style={{ fontSize: '11px', color: 'var(--text-secondary)', display: 'block', marginTop: '4px' }}>
             Required. Used at verify time (crawl decisions + summary) and at agent runtime. The

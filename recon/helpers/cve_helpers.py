@@ -4,6 +4,7 @@ RedAmon - CVE Lookup Helpers
 Functions for looking up CVEs from NVD and Vulners APIs based on detected technologies.
 """
 
+import operator
 import re
 import time
 import requests
@@ -362,8 +363,80 @@ def parse_technology_string(tech: str) -> Tuple[str, Optional[str]]:
     return tech.lower(), None
 
 
+def parse_httpx_technology(tech: str) -> Tuple[str, Optional[str]]:
+    """Parse an httpx / Wappalyzer label, "Name:version" or "Name", into (name, version).
+
+    Only a colon introduces a version in these labels; a "/" or a number is part
+    of the name ("HTTP/3", "Microsoft 365"), which is how the graph writer reads
+    the same label (http_mixin). parse_technology_string also splits on "/" and
+    on a trailing number, right for a Server header but here it turned the
+    protocol "HTTP/3" into the product "http" at version 3.
+    """
+    tech = tech.strip()
+    if ":" not in tech:
+        return tech.lower(), None
+    return parse_technology_string(tech)
+
+
+#: Words nmap and the fingerprinters put after a product name without making it
+#: another product: "Exim smtpd", "PostgreSQL DB", "Squid http proxy", "TYPO3 CMS".
+#: vuln_mixin._TECH_DESCRIPTOR_WORDS strips the same words to link a CVE to a node.
+_DESCRIPTOR_WORDS = frozenset({
+    "http", "https", "httpd", "server", "web", "webserver", "daemon", "smtpd",
+    "ftpd", "sshd", "imapd", "pop3d", "smbd", "proxy", "accelerator", "framework",
+    "db", "database", "app", "application", "api", "net", "cms",
+})
+#: "rest" alone is part of a name: "Django REST framework" is not Django.
+_DESCRIPTOR_PHRASES = (("rest", "api"), ("key-value", "store"))
+#: The descriptors that name the daemon rather than the product, which a CVE's
+#: text seldom repeats ("Dropbear sshd", "Samba smbd"). "HTTP Server" and the
+#: like stay: "IBM HTTP Server" searched as "ibm" would return every IBM CVE.
+_SERVICE_WORDS = frozenset({"httpd", "smtpd", "ftpd", "sshd", "imapd", "pop3d", "smbd",
+                            "daemon", "db", "database"})
+
+
+def _strip_descriptors(name: str, words_to_strip=_DESCRIPTOR_WORDS) -> str:
+    """`name` without the descriptor words that trail it, keeping one word at least."""
+    words = name.split()
+    while len(words) > 1:
+        if len(words) > 2 and tuple(words[-2:]) in _DESCRIPTOR_PHRASES:
+            del words[-2:]
+        elif words[-1] in words_to_strip:
+            words.pop()
+        else:
+            break
+    return " ".join(words)
+
+
+def _strip_service_words(name: str) -> str:
+    return _strip_descriptors(name, _SERVICE_WORDS)
+
+
 def normalize_product_name(name: str) -> str:
-    """Normalize product name for lookup."""
+    """Normalize a product name for lookup.
+
+    A name that is not a known product is retried without its descriptor words
+    and without a leading vendor word, so nmap's "Exim smtpd", "PostgreSQL DB"
+    and "ISC BIND" reach the exact CPE query; the keyword search finds almost
+    nothing for them. The shorter name is used only when it is a CPE_MAPPINGS
+    product, and a dropped word only when it is that product's CPE vendor
+    ("Mongo Express" is not Express).
+    """
+    name = _product_alias(name)
+    if name in CPE_MAPPINGS:
+        return name
+    core = _product_alias(_strip_descriptors(name))
+    if core in CPE_MAPPINGS:
+        return core
+    vendor, _, rest = core.partition(" ")
+    rest = _product_alias(rest)
+    if rest in CPE_MAPPINGS and CPE_MAPPINGS[rest][0] == vendor:
+        return rest
+    return name
+
+
+def _product_alias(name: str) -> str:
+    """The canonical spelling of a product name: "apache httpd" -> "apache"."""
     name = name.lower().strip()
     aliases = {
         # Apache variants
@@ -381,7 +454,7 @@ def normalize_product_name(name: str) -> str:
         "node": "node.js", "nodejs": "node.js",
         "nextjs": "next.js",
         "nuxtjs": "nuxt.js", "nuxt": "nuxt.js",
-        "expressjs": "express",
+        "expressjs": "express", "node.js express": "express",
         "ruby on rails": "rails", "rubyonrails": "rails",
         # Databases
         "postgres": "postgresql", "mongo": "mongodb",
@@ -476,71 +549,280 @@ def _nvd_classify(sent):
     return cb.json_result(resp, keyed=keyed)
 
 
+_CPE_VERSION_BOUNDS = (
+    ("versionStartIncluding", operator.ge),
+    ("versionStartExcluding", operator.gt),
+    ("versionEndIncluding", operator.le),
+    ("versionEndExcluding", operator.lt),
+)
+
+
+def _cpe_token(value: str) -> str:
+    """A name as a CPE spells it: lowercase, "_" between words, no "\\" escapes."""
+    return re.sub(r"[\s_-]+", "_", value.replace("\\", "").strip().lower())
+
+
+def _version_tuple(version: Optional[str]) -> Optional[Tuple[int, ...]]:
+    semver = _extract_semver(version or "")
+    return tuple(int(part) for part in semver.split(".")) if semver else None
+
+
+def _padded(a: Tuple[int, ...], b: Tuple[int, ...]):
+    width = max(len(a), len(b))
+    return a + (0,) * (width - len(a)), b + (0,) * (width - len(b))
+
+
+def _loose_key(token: str) -> str:
+    """A name without punctuation or a trailing "js": "angular.js" and "angularjs" agree."""
+    return re.sub(r"js$", "", re.sub(r"[^a-z0-9]", "", token))
+
+
+#: Qualifiers that make a vendor's product a separate one, not an edition of
+#: the product named after it: elementor_pro is not Elementor, zabbix-agent2
+#: not the Zabbix frontend.
+_COMPANION_WORDS = frozenset({"pro", "premium", "enterprise", "desktop", "mobile", "android",
+                              "ios", "client", "agent", "app", "plugin", "extension", "addon",
+                              "addons", "theme", "sdk", "connector"})
+
+
+def _in_line_of(token: str, name: str) -> bool:
+    """Whether `token` is `name` or an edition of it ("liferay_portal", "datatables.net")."""
+    if token == name:
+        return True
+    if not token.startswith((f"{name}_", f"{name}.")):
+        return False
+    qualifier = token[len(name) + 1:].split("_")
+    return not any(re.sub(r"\d+$", "", word) in _COMPANION_WORDS for word in qualifier)
+
+
+def _names_cpe_product(name: str, vendor: str, cpe_product: str) -> bool:
+    """Whether the product a CPE names is `name` (both _cpe_tokens).
+
+    It is the CPE product alone or after its vendor; the same name spelled
+    with or without ".js" when the vendor is named after it too
+    (angularjs:angular.js); or a product of the vendor named after `name`
+    (liferay:liferay_portal, dropbear_ssh_project:dropbear_ssh). A product
+    that only contains the name is not: "http" is not ibm:http_server,
+    "font awesome" not newnine:font_awesome_4_menus.
+    """
+    key = _loose_key(name)
+    return (name in (cpe_product, f"{vendor}_{cpe_product}")
+            or bool(key) and key == _loose_key(cpe_product) == _loose_key(vendor)
+            or _in_line_of(vendor, name) and _in_line_of(cpe_product, name))
+
+
+def _cpe_match_covers(match: dict, names: set, version: Optional[str]) -> bool:
+    """Whether one cpeMatch entry names the product (`names`, _cpe_tokens) at `version`."""
+    parts = re.split(r"(?<!\\):", match.get("criteria") or "")
+    if len(parts) < 6:
+        return False
+    vendor, cpe_product, cpe_version = _cpe_token(parts[3]), _cpe_token(parts[4]), parts[5]
+    if not any(_names_cpe_product(name, vendor, cpe_product) for name in names):
+        return False
+    ours = _version_tuple(version)
+    if ours is None:
+        return True
+    if cpe_version not in ("*", "-"):
+        theirs = _version_tuple(cpe_version)
+        # Either side may stop early: a fingerprint says "5.2" or drops the
+        # "rc21" NVD pins as "0.94.14.21". Agreeing on what both state is a match.
+        return theirs is not None and ours[:len(theirs)] == theirs[:len(ours)]
+    for field, within in _CPE_VERSION_BOUNDS:
+        bound = _version_tuple(match.get(field))
+        # A bound that is not a number cannot place the version; the product matched.
+        if bound is not None and not within(*_padded(ours, bound)):
+            return False
+    return True
+
+
+def _text_names_version(cve_data: dict, names: set, version: Optional[str]) -> bool:
+    """Whether the CVE's text names the product directly followed by `version`.
+
+    "ACME mini_httpd 1.30 and prior" counts. Text that only carries the name
+    inside another product does not: "Enable jQuery Migrate Helper plugin ...
+    up to 1.4.1", "Slider Path for Elementor: from n/a through 3.0.0".
+    """
+    if not version:
+        return False
+    text = " ".join(d.get("value") or "" for d in cve_data.get("descriptions") or []
+                    if d.get("lang") == "en")
+    for name in names:
+        words = r"[\s_-]+".join(re.escape(w) for w in name.split("_") if w)
+        if re.search(rf"(?<![\w.-]){words}[\s_-]+v?{re.escape(version)}(?![\w.])",
+                     text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _cve_affects(cve_data: dict, product: str, version: Optional[str],
+                 cpe_hint: Optional[str] = None) -> bool:
+    """Whether the CVE is about `product` (or nmap's CPE product for it) at
+    `version`, by its NVD configuration.
+
+    A keyword search only proves the words occur somewhere in the text: "http 3"
+    returned InterScan VirusWall 3.6 and WinVNC 3.3.3, both for a "long HTTP GET
+    request". A CVE NVD has not analysed has no configuration (many are
+    "Deferred" and never will have one); its text must then name the product at
+    this version.
+    """
+    names = {_cpe_token(product), _cpe_token(_strip_descriptors(product))}
+    if cpe_hint:
+        names.add(_cpe_token(cpe_hint))
+    configurations = cve_data.get("configurations")
+    if not configurations:
+        return _text_names_version(cve_data, names, version)
+    return any(
+        match.get("vulnerable") and _cpe_match_covers(match, names, version)
+        for config in configurations
+        for node in config.get("nodes") or []
+        for match in node.get("cpeMatch") or []
+    )
+
+
+#: The most NVD returns per request, and the most pages read for one search.
+NVD_PAGE_SIZE = 2000
+NVD_MAX_PAGES = 2
+
+
+def _nmap_cpe_product(cpe) -> Optional[str]:
+    """The application product of an nmap CPE: "cpe:/a:webmin:webmin:1.890" -> "webmin"."""
+    if not isinstance(cpe, str):
+        return None
+    parts = cpe.strip().lower().split(":")
+    if parts[:2] == ["cpe", "/a"] and len(parts) > 3:
+        return parts[3] or None
+    if parts[:3] == ["cpe", "2.3", "a"] and len(parts) > 4:
+        return parts[4] or None
+    return None
+
+
+def _nvd_pacing(keys) -> float:
+    """Seconds between NVD requests: 5 per 30s are allowed without a key, 50 with one."""
+    return 0.6 if keys.has_key else 6.0
+
+
+def _nvd_fetch(params: dict, keys, *, admitted: bool):
+    """Every record NVD answers for `params`, through the `nvd` breaker.
+
+    NVD lists the oldest CVEs first, so reading only the first `max_results`
+    would keep the oldest and miss the newest, often the most severe (Exim
+    4.92: 48 CVEs, two 9.8s past the first 20). Returns a CallResult whose data
+    is the list of NVD vulnerability records.
+    """
+    from recon.helpers import circuit_breaker as cb
+    records, start, res = [], 0, None
+    for page in range(NVD_MAX_PAGES):
+        if page:
+            time.sleep(_nvd_pacing(keys))
+        page_params = {**params, "resultsPerPage": NVD_PAGE_SIZE, "startIndex": start}
+
+        def send(key, page_params=page_params):
+            headers = {"apiKey": key} if key else {}
+            return (requests.get(NVD_API_URL, params=page_params, headers=headers, timeout=60),
+                    bool(key))
+
+        res = cb.guarded_call(_nvd_breaker(), send, _nvd_classify, keys=keys,
+                              admitted=admitted and not page)
+        if not res.ok:
+            break
+        body = res.data or {}
+        batch = body.get("vulnerabilities") or []
+        records += batch
+        start += len(batch)
+        if not batch or start >= (body.get("totalResults") or 0):
+            break
+    if records:
+        return cb.CallResult(records, cb.Outcome.OK, res.detail)
+    return cb.CallResult([], res.outcome, res.detail)
+
+
+def _nvd_cve(cve_data: dict) -> dict:
+    """The CVE dict the pipeline stores, from one NVD record."""
+    cve_id = cve_data.get("id", "")
+    metrics = cve_data.get("metrics", {})
+    cvss_score = severity = None
+    # A CVE scored in 2016-2019 often has only a v3.0 metric, and an unscored
+    # CVE sorts below every scored one.
+    for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV40", "cvssMetricV2"):
+        if metrics.get(key):
+            metric = metrics[key][0]
+            cvss_score = metric.get("cvssData", {}).get("baseScore")
+            severity = (metric.get("baseSeverity") if key == "cvssMetricV2"
+                        else metric.get("cvssData", {}).get("baseSeverity"))
+            break
+
+    descriptions = cve_data.get("descriptions", [])
+    description = next((d["value"] for d in descriptions if d.get("lang") == "en"), "")
+
+    refs = cve_data.get("references", [])
+    reference_urls = [ref.get("url") for ref in refs[:3] if ref.get("url")]
+
+    return {
+        "id": cve_id,
+        "cvss": cvss_score,
+        "severity": severity,
+        "description": description[:300] if description else "",
+        "published": cve_data.get("published"),
+        "references": reference_urls,
+        "source": "nvd",
+        "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+    }
+
+
 def _nvd_query(product: str, version: str, max_results: int, keys, *,
-               admitted: bool = False):
-    """One NVD lookup through the `nvd` breaker. Returns a CallResult whose data
-    is the list of CVE dicts."""
+               admitted: bool = False, cpe_hint: Optional[str] = None):
+    """One technology's NVD lookup through the `nvd` breaker. Returns a CallResult
+    whose data is the `max_results` CVE dicts with the highest CVSS.
+
+    A CPE_MAPPINGS product is asked by its exact CPE name, which NVD matches
+    itself. Any other product is asked by its name alone, since a CVE's text
+    gives its range ("before 1.13.0") rather than the version found, and each
+    hit is kept only when _cve_affects places it at this version. `cpe_hint` is
+    the CPE product nmap reported for the service: NVD also matches it, under
+    any vendor, against every CVE's configuration, which finds the CVEs whose
+    text never names the product (Webmin for nmap's "MiniServ", Zerologon for
+    Samba).
+    """
     from recon.helpers import circuit_breaker as cb
     product_normalized = normalize_product_name(product)
     cpe_info = CPE_MAPPINGS.get(product_normalized)
 
-    params = {"resultsPerPage": max_results}
-    if cpe_info and version:
-        vendor, prod = cpe_info
-        params["cpeName"] = f"cpe:2.3:a:{vendor}:{prod}:{version}:*:*:*:*:*:*:*"
-    elif cpe_info:
-        vendor, prod = cpe_info
-        params["cpeName"] = f"cpe:2.3:a:{vendor}:{prod}:*:*:*:*:*:*:*:*"
+    # Each search, and whether NVD placed the version itself (a CPE match) or
+    # only the name occurs in the CVE's text (a keyword search).
+    if cpe_info:
+        vendor, cpe_product = cpe_info
+        searches = [({"cpeName": f"cpe:2.3:a:{vendor}:{cpe_product}:{version or '*'}"
+                                 ":*:*:*:*:*:*:*"}, True)]
     else:
-        # Fallback to keyword search for unknown products
-        keyword = product
-        if version:
-            keyword += f" {version}"
-        params["keywordSearch"] = keyword
+        cpe_product = cpe_hint
+        searches = []
+        if cpe_hint and version:
+            searches.append(({"virtualMatchString": f"cpe:2.3:a:*:{cpe_hint}:{version}"}, True))
+        searches.append(({"keywordSearch": _strip_service_words(product_normalized)}, False))
 
-    def send(key):
-        headers = {"apiKey": key} if key else {}
-        return requests.get(NVD_API_URL, params=params, headers=headers, timeout=30), bool(key)
+    found, results = {}, []
+    for i, (params, nvd_placed_version) in enumerate(searches):
+        if i:
+            time.sleep(_nvd_pacing(keys))
+        res = _nvd_fetch(params, keys, admitted=admitted and not i)
+        results.append(res)
+        for vuln in res.data or []:
+            cve_data = vuln.get("cve", {})
+            if nvd_placed_version:
+                # A CPE match also returns the CVEs of what runs ON the product,
+                # listed beside it as not vulnerable: a WordPress plugin's under
+                # WordPress, a TYPO3 extension's under TYPO3.
+                keep = (not cve_data.get("configurations")
+                        or _cve_affects(cve_data, product_normalized, None, cpe_product))
+            else:
+                keep = _cve_affects(cve_data, product_normalized, version, cpe_product)
+            if keep:
+                found.setdefault(cve_data.get("id", ""), _nvd_cve(cve_data))
 
-    res = cb.guarded_call(_nvd_breaker(), send, _nvd_classify, keys=keys, admitted=admitted)
-    if not res.ok:
-        return cb.CallResult([], res.outcome, res.detail)
-    cves = []
-    for vuln in (res.data or {}).get("vulnerabilities", []):
-        cve_data = vuln.get("cve", {})
-        cve_id = cve_data.get("id", "")
-
-        metrics = cve_data.get("metrics", {})
-        cvss_v3 = metrics.get("cvssMetricV31", [{}])[0] if metrics.get("cvssMetricV31") else None
-        cvss_v2 = metrics.get("cvssMetricV2", [{}])[0] if metrics.get("cvssMetricV2") else None
-
-        cvss_score = None
-        severity = None
-
-        if cvss_v3:
-            cvss_score = cvss_v3.get("cvssData", {}).get("baseScore")
-            severity = cvss_v3.get("cvssData", {}).get("baseSeverity")
-        elif cvss_v2:
-            cvss_score = cvss_v2.get("cvssData", {}).get("baseScore")
-            severity = cvss_v2.get("baseSeverity")
-
-        descriptions = cve_data.get("descriptions", [])
-        description = next((d["value"] for d in descriptions if d.get("lang") == "en"), "")
-
-        refs = cve_data.get("references", [])
-        reference_urls = [ref.get("url") for ref in refs[:3] if ref.get("url")]
-
-        cves.append({
-            "id": cve_id,
-            "cvss": cvss_score,
-            "severity": severity,
-            "description": description[:300] if description else "",
-            "published": cve_data.get("published"),
-            "references": reference_urls,
-            "source": "nvd",
-            "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-        })
-    return cb.CallResult(cves, cb.Outcome.OK if cves else cb.Outcome.NO_DATA, res.detail)
+    if not any(r.answered for r in results):
+        return cb.CallResult([], results[-1].outcome, results[-1].detail)
+    cves = sorted(found.values(), key=lambda c: c.get("cvss") or 0, reverse=True)[:max_results]
+    return cb.CallResult(cves, cb.Outcome.OK if cves else cb.Outcome.NO_DATA, results[-1].detail)
 
 
 def lookup_cves_nvd(
@@ -687,20 +969,23 @@ def run_cve_lookup(
     print(f"[*][CVE] Source: {source.upper()}")
     print(f"[*][CVE] Min CVSS: {min_cvss}")
     
-    # Extract technologies from httpx
-    technologies = set()
+    # Raw detector string -> (name, version), each parsed in its own source's
+    # format: httpx labels are "Name:version", the others "Name/version".
+    technologies = {}
+    # Raw detector string -> the CPE product nmap reported for that service.
+    cpe_hints = {}
     httpx_data = recon_data.get("http_probe", {})
 
     for url_data in httpx_data.get("by_url", {}).values():
-        techs = url_data.get("technologies", [])
-        technologies.update(techs)
+        for tech in url_data.get("technologies", []):
+            technologies.setdefault(tech, parse_httpx_technology(tech))
         server = url_data.get("server")
         if server:
             # Split compound server headers like
             # "Apache/2.4.49 (Unix) OpenSSL/1.1.1l PHP/8.1.2"
             # into individual product strings
             for product in split_server_header(server):
-                technologies.add(product)
+                technologies.setdefault(product, parse_technology_string(product))
 
     # Also extract technologies from banner grab (non-HTTP services like SSH, FTP, MySQL)
     banner_data = recon_data.get("banner_grab", {})
@@ -708,7 +993,7 @@ def run_cve_lookup(
         for instance in instances:
             version_str = instance.get("version")
             if version_str:
-                technologies.add(version_str)
+                technologies.setdefault(version_str, parse_technology_string(version_str))
 
     # Also extract technologies from Nmap service version detection
     nmap_data = recon_data.get("nmap_scan", {})
@@ -716,26 +1001,26 @@ def run_cve_lookup(
         product = svc.get("product", "")
         version = svc.get("version", "")
         if product and version:
-            technologies.add(f"{product}/{version}")
+            tech = f"{product}/{version}"
+            technologies.setdefault(tech, parse_technology_string(tech))
+            cpe_hints[tech] = cpe_hints.get(tech) or _nmap_cpe_product(svc.get("cpe"))
 
     # Filter and deduplicate technologies to lookup
-    tech_to_lookup = []
-    seen_normalized = set()
+    lookups = {}
     skip_list = ["ubuntu", "debian", "centos", "linux", "windows",
                  "dreamweaver", "frontpage", "html", "css", "aws",
                  "cloudflare", "google analytics", "google tag manager",
                  "facebook pixel", "hotjar", "google font api"]
 
-    for tech in technologies:
-        name, version = parse_technology_string(tech)
+    for tech, (name, version) in technologies.items():
         name = normalize_product_name(name)
         if not version or name in skip_list:
             continue
-        key = (name.lower(), version.lower())
-        if key in seen_normalized:
-            continue
-        seen_normalized.add(key)
-        tech_to_lookup.append(tech)
+        entry = lookups.setdefault((name.lower(), version.lower()), [tech, name, version, None])
+        # The Server header and nmap often report one product ("MiniServ/1.890");
+        # the lookup keeps the first string and nmap's CPE for it.
+        entry[3] = entry[3] or cpe_hints.get(tech)
+    tech_to_lookup = list(lookups.values())
     
     print(f"\n[*][CVE] Technologies with versions: {len(tech_to_lookup)}")
     
@@ -752,14 +1037,10 @@ def run_cve_lookup(
             else cb.KeyPool(nvd_key_rotator, nvd_api_key or "", label="CVE-NVD"))
     breaker = _vulners_breaker() if use_vulners else _nvd_breaker()
     cve_scope = cb.scope(("nvd", "vulners"), label="CVE", unit="technolog(ies)")
-    # NVD allows 5 requests / 30s without a key, 50 with one.
-    nvd_pacing = 0.6 if keys.has_key else 6.0
+    nvd_pacing = _nvd_pacing(keys)
     hinted = False
 
-    for i, tech in enumerate(tech_to_lookup, 1):
-        name, version = parse_technology_string(tech)
-        name = normalize_product_name(name)
-
+    for i, (tech, name, version, cpe_hint) in enumerate(tech_to_lookup, 1):
         # A paused or stopped source is skipped silently; the scope summarises it.
         if not breaker.allow():
             continue
@@ -768,7 +1049,7 @@ def run_cve_lookup(
         if use_vulners:
             res = _vulners_query(name, version, keys, admitted=True)
         else:
-            res = _nvd_query(name, version, max_cves, keys, admitted=True)
+            res = _nvd_query(name, version, max_cves, keys, admitted=True, cpe_hint=cpe_hint)
         cves = res.data or []
         if not res.answered:
             print(f"failed ({res.detail})")
@@ -818,7 +1099,8 @@ def run_cve_lookup(
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for tech_data in cve_results.values():
         for cve in tech_data.get("cves", []):
-            sev = cve.get("severity", "").upper()
+            # An unscored CVE carries severity None, not a missing key.
+            sev = (cve.get("severity") or "").upper()
             if sev in severity_counts:
                 severity_counts[sev] += 1
 

@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getEffectiveUser } from '@/lib/session'
 import { enqueueJob } from '@/lib/enqueueJob'
+import { internalError } from '@/lib/routeErrors'
 
 export const runtime = 'nodejs'
 
@@ -45,10 +46,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     }
     return NextResponse.json({ ok: true, id: result.id }, { status: 201 })
   } catch (error) {
-    console.error('[jobQueue] enqueue failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Could not add this scan to the queue', { log: '[jobQueue] enqueue failed' })
   }
 }

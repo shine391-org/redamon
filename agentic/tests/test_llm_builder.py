@@ -190,3 +190,48 @@ class TestTheClassifierMissedCommonBadKeyAndModelShapes:
         closed = Exception("socket closed")
         closed.code = 1011
         assert not llm_builder.is_model_unavailable_error(closed)
+
+
+class RateLimitError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+        self.status_code = 429
+
+
+class TestProviderErrorDetails:
+    """What a person may see of a provider failure: class and status, never the text."""
+
+    def test_the_status_and_its_class_are_read_through_a_wrapper(self):
+        wrapper = RuntimeError("langchain wrapper")
+        wrapper.__cause__ = RateLimitError("sk-live-123 is over quota")
+        assert llm_builder.provider_error_details(wrapper) == {
+            "error_class": "RateLimitError", "provider_status": 429}
+
+    def test_the_message_never_appears(self):
+        details = llm_builder.provider_error_details(RateLimitError("key sk-live-123"))
+        assert "sk-live-123" not in repr(details)
+
+    def test_a_response_status_and_a_google_code(self):
+        err = Exception("bad")
+        err.response = MagicMock(status_code=401)
+        assert llm_builder.provider_error_details(err)["provider_status"] == 401
+        google = Exception("quota")
+        google.code = 429
+        assert llm_builder.provider_error_details(google)["provider_status"] == 429
+
+    def test_a_bedrock_client_error_reports_its_http_status(self):
+        err = Exception("throttled")
+        err.response = {"Error": {"Code": "ThrottlingException"},
+                        "ResponseMetadata": {"HTTPStatusCode": 429}}
+        assert llm_builder.provider_error_details(err)["provider_status"] == 429
+
+    def test_no_status_keeps_only_the_class(self):
+        assert llm_builder.provider_error_details(TimeoutError()) == {"error_class": "TimeoutError"}
+
+    def test_a_close_code_or_a_bool_is_not_a_status(self):
+        closed = Exception("socket closed")
+        closed.code = 1011
+        assert "provider_status" not in llm_builder.provider_error_details(closed)
+        flag = Exception("x")
+        flag.status_code = True
+        assert "provider_status" not in llm_builder.provider_error_details(flag)

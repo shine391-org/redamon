@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { isInternalRequest, requireUserAccess } from '@/lib/session'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { agentFetch } from '@/lib/agentFetch'
+import { internalError, readUpstreamBody } from '@/lib/routeErrors'
+import { agentAnswerLastError, thrownLastError } from './agentLastError'
+import { isLoopModel } from '@/lib/agentInTheLoop'
 
 interface RouteParams {
   params: Promise<{ id: string }>
 }
-
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8090'
 
 function maskSecret(value: string): string {
   if (!value || value.length <= 4) return value ? '••••' : ''
@@ -102,11 +103,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       resources.map(r => maskResource(r as unknown as Record<string, unknown>))
     )
   } catch (error) {
-    console.error('Failed to fetch tradecraft resources:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch tradecraft resources' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch tradecraft resources')
   }
 }
 
@@ -137,6 +134,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         { error: 'llmModel is required - pick a model for this resource' },
         { status: 400 }
       )
+    }
+    if (isLoopModel(body.llmModel)) {
+      return NextResponse.json({ error: 'Agent in the Loop answers only inside a chat run; pick a provider model for this resource', code: 'loop_model_not_allowed' }, { status: 400 })
     }
 
     const v = validateUrl(body.url)
@@ -177,9 +177,11 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
               ? created.githubTokenOverride
               : ((userSettings as unknown as Record<string, string> | null)?.githubAccessToken || '')
 
-          const agentResp = await fetch(`${AGENT_API_URL}/tradecraft/verify`, {
+          // No request waits on this background crawl and the agent bounds its
+          // own run, so no hop timeout of ours cuts a long but healthy one short.
+          const agentResp = await agentFetch('/tradecraft/verify', {
             method: 'POST',
-            headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               url: created.url,
               user_id: id,
@@ -187,12 +189,12 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
               force: false,
               model: created.llmModel,
             }),
-          })
+          }, { timeoutMs: 0 })
           if (!agentResp.ok) {
-            const errText = await agentResp.text()
+            const failed = await readUpstreamBody(agentResp)
             await prisma.userTradecraftResource.update({
               where: { id: created.id },
-              data: { lastError: `verify failed: ${errText.slice(0, 500)}` },
+              data: { lastError: agentAnswerLastError('verify', failed.code ?? 'agent_error', agentResp.status) },
             })
             return
           }
@@ -213,7 +215,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
           console.error('Background verify failed:', e)
           await prisma.userTradecraftResource.update({
             where: { id: created.id },
-            data: { lastError: `verify exception: ${String(e).slice(0, 500)}` },
+            data: { lastError: thrownLastError('verify', e) },
           }).catch(() => {})
         }
       })()
@@ -231,10 +233,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         { status: 409 }
       )
     }
-    console.error('Failed to create tradecraft resource:', error)
-    return NextResponse.json(
-      { error: 'Failed to create tradecraft resource' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create tradecraft resource')
   }
 }

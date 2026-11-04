@@ -290,3 +290,11 @@ describe('REGRESSION: the shared graph tools are reserved', () => {
     }
   })
 })
+
+
+describe('private built-in tool collisions', () => {
+  test.each(['bloodhound_ingest', 'graph_diff', 'mimikatz_parse'])('refuses a plugin tool named %s', name => {
+    const result = mcpServerSchema.safeParse(httpServer({ tools: [tool({ name })] }))
+    expect(result.success).toBe(false)
+  })
+})

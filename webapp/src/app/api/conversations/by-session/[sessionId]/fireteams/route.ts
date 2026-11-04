@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { isInternalRequest } from '@/lib/session'
 import { requireEffectiveUser, requireConversationAccessBySession } from '@/lib/access'
@@ -80,8 +81,7 @@ export async function POST(
 
     return NextResponse.json({ id: fireteam.id, members: fireteam.members.map(m => ({ id: m.id })) }, { status: 201 })
   } catch (error) {
-    console.error('Failed to create fireteam:', error)
-    return NextResponse.json({ error: 'Failed to create fireteam' }, { status: 500 })
+    return internalError(error, 'Failed to create fireteam')
   }
 }
 
@@ -112,7 +112,6 @@ export async function GET(
     })
     return NextResponse.json({ fireteams })
   } catch (error) {
-    console.error('Failed to list fireteams:', error)
-    return NextResponse.json({ error: 'Failed to list fireteams' }, { status: 500 })
+    return internalError(error, 'Failed to list fireteams')
   }
 }

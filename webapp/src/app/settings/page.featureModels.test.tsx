@@ -156,7 +156,14 @@ describe('Models by feature section', () => {
     expect(await within(triage).findByText('claude-haiku-4-5')).toBeInTheDocument()
     // The chip and the read-only value both say so.
     expect(within(await tile('multi_mute')).getAllByText('Not set')).toHaveLength(2)
-    expect(screen.getAllByRole('button', { name: /Retry/ })).toHaveLength(9)
+    // One Retry per feature, plus the plugin list's own: this stub answers every
+    // unrouted URL, /api/plugins/llm-features included, with a 404.
+    // Looked up on each call: the grid re-renders, so the notice is a new node.
+    const pluginNotice = () => screen.getByText(/Plugin items could not be loaded \(HTTP 404\)/).closest('[role="alert"]') as HTMLElement
+    await waitFor(() => expect(within(pluginNotice()).getByRole('button', { name: /Retry/ })).toBeInTheDocument())
+    const featureRetries = () => screen.queryAllByRole('button', { name: /Retry/ }).filter(b => !pluginNotice().contains(b))
+    expect(featureRetries()).toHaveLength(9)
+    expect(screen.getAllByRole('button', { name: /Retry/ })).toHaveLength(10)
     expect(screen.queryByText('Choose a model')).toBeNull()
 
     modelsAnswer = async () => ({ status: 200, body: MODELS })
@@ -164,7 +171,9 @@ describe('Models by feature section', () => {
     // The grid re-renders from the skeleton, so the tile is a new node.
     await waitFor(() => expect(screen.queryAllByTestId('feature-model-skeleton')).toHaveLength(0))
     expect(await within(await tile('triage')).findByText('Claude Haiku 4.5')).toBeInTheDocument()
-    expect(screen.queryAllByRole('button', { name: /Retry/ })).toHaveLength(0)
+    // The models are back; only the plugin list's notice (still a 404) keeps a Retry.
+    expect(featureRetries()).toHaveLength(0)
+    expect(within(pluginNotice()).getByRole('button', { name: /Retry/ })).toBeInTheDocument()
     expect(calls('/api/models')).toHaveLength(2)
   })
 

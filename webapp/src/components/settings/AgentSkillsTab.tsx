@@ -9,6 +9,7 @@ import { FeatureModelLine, useFeatureModelGate } from '@/components/shared/Featu
 import { AI_FAILED_TEXT, CREDENTIALS_TEXT } from '@/components/userSkills/SkillUploadReviewModal'
 import { useSkillUpload } from '@/components/userSkills/useSkillUpload'
 import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { formatApiError, readApiError, toApiError, type ApiError } from '@/lib/apiError'
 import { tidySkillName } from '@/lib/skillMetadata'
 import { CREDENTIALS_ERROR } from '@/lib/skillUploadDraft'
 import { DESCRIPTION_MAX_CHARS, MAX_SKILLS_PER_USER, NAME_MAX_CHARS, USER_SKILL_LIMIT_TEXT } from '@/lib/userSkills'
@@ -40,6 +41,13 @@ const QUARANTINE_TEXT: Record<string, string> = {
     'It was saved from a skill whose plugin version the plugin catalog revoked, so it carries that text on and was turned off in every project.',
 }
 
+const LOAD_FAILED = 'Your skills could not be loaded'
+
+/** " (code · HTTP n)", the part of a failure's message after its reason. */
+function causeOf(err: ApiError): string {
+  return formatApiError({ ...err, reason: '' })
+}
+
 function downloadText(name: string, content: string) {
   const blob = new Blob([content], { type: 'text/markdown' })
   const url = URL.createObjectURL(blob)
@@ -62,7 +70,8 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
   const { ensureFeatureModel, fetchWithFeatureModel } = useFeatureModelGate()
   const [skills, setSkills] = useState<UserSkillRow[]>([])
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState(false)
+  // The failed read's code and status, e.g. " (P1001 · HTTP 500)"; null while the list is good.
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [importing, setImporting] = useState(false)
   const [edit, setEdit] = useState<{ id: string; name: string; description: string } | null>(null)
@@ -84,13 +93,13 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
       const resp = await fetch(`/api/users/${userId}/attack-skills`)
       if (resp.ok) {
         setSkills(await resp.json())
-        setLoadError(false)
+        setLoadError(null)
       } else {
-        setLoadError(true)
+        setLoadError(causeOf(await readApiError(resp, LOAD_FAILED)))
       }
     } catch (err) {
       console.error('Failed to fetch attack skills:', err)
-      setLoadError(true)
+      setLoadError(causeOf(toApiError(err, LOAD_FAILED)))
     } finally {
       setLoading(false)
     }
@@ -111,11 +120,16 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
     if (!userId) return
     try {
       const resp = await fetch(`/api/users/${userId}/attack-skills/${skill.id}`)
-      if (resp.ok) downloadText(skill.name, (await resp.json()).content)
+      if (!resp.ok) {
+        toast.error((await readApiError(resp, 'Failed to download the skill')).message)
+        return
+      }
+      downloadText(skill.name, (await resp.json()).content)
     } catch (err) {
       console.error('Failed to download skill:', err)
+      toast.error(toApiError(err, 'Failed to download the skill').message)
     }
-  }, [userId])
+  }, [userId, toast])
 
   const remove = useCallback(async (skill: UserSkillRow) => {
     if (!userId) return
@@ -126,15 +140,14 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
     try {
       const resp = await fetch(`/api/users/${userId}/attack-skills/${skill.id}`, { method: 'DELETE' })
       if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}))
-        alertError(body.error || 'Failed to delete skill')
+        alertError((await readApiError(resp, 'Failed to delete skill')).message)
         return
       }
       postUserSkillsChanged({})
       toast.success('Attack skill deleted')
     } catch (err) {
       console.error('Failed to delete skill:', err)
-      toast.error('Failed to delete skill')
+      toast.error(toApiError(err, 'Failed to delete skill').message)
     }
   }, [userId, fetchSkills, showConfirm, alertError, toast])
 
@@ -149,15 +162,14 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
     if (!ok) return
     try {
       const resp = await fetch(`/api/users/${userId}/attack-skills/${skill.id}/release`, { method: 'POST' })
-      const body = await resp.json().catch(() => ({}))
       if (!resp.ok) {
-        alertError(body.error || 'Failed to release the skill')
+        alertError((await readApiError(resp, 'Failed to release the skill')).message)
         return
       }
       postUserSkillsChanged({})
       toast.success('Skill released; turn it on in a project to use it')
-    } catch {
-      toast.error('Failed to release the skill')
+    } catch (err) {
+      toast.error(toApiError(err, 'Failed to release the skill').message)
     }
   }, [userId, dangerConfirm, alertError, fetchSkills, toast])
 
@@ -184,7 +196,8 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
       if (!model) return
       const text = await fetch(`/api/users/${userId}/attack-skills/${skillId}`)
       if (!text.ok) {
-        if (stillOpen()) setEditAiError('The skill text could not be read.')
+        const err = await readApiError(text, 'The skill text could not be read')
+        if (stillOpen()) setEditAiError(`${formatApiError({ ...err, reason: 'The skill text could not be read' })}.`)
         return
       }
       const { content } = await text.json()
@@ -196,13 +209,15 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ items: [{ key: skillId, fileName: '', content, name: contextName, fields }] }),
       }))
-      const body = await res.json().catch(() => ({}))
-      if (!stillOpen()) return
       if (!res.ok) {
-        const code = readFeatureModelCode(body)
-        setEditAiError(code ? featureModelMessage(code, model) : (typeof body.error === 'string' && body.error) || AI_FAILED_TEXT)
+        const err = await readApiError(res, AI_FAILED_TEXT)
+        if (!stillOpen()) return
+        const code = readFeatureModelCode(err.body)
+        setEditAiError(code ? featureModelMessage(code, model) : err.message)
         return
       }
+      const body = await res.json().catch(() => ({}))
+      if (!stillOpen()) return
       const item = Array.isArray(body.items) ? body.items[0] : null
       if (item?.error === CREDENTIALS_ERROR) setEditAiError(CREDENTIALS_TEXT)
       else if (!item?.name && !item?.description) setEditAiError(AI_FAILED_TEXT)
@@ -214,7 +229,7 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
       } : x))
     } catch (err) {
       console.error('Failed to generate the skill metadata:', err)
-      if (stillOpen()) setEditAiError(AI_FAILED_TEXT)
+      if (stillOpen()) setEditAiError(toApiError(err, AI_FAILED_TEXT).message)
     } finally {
       if (editGeneratingRef.current === skillId) editGeneratingRef.current = null
       setEditGenerating((g) => (g === skillId ? null : g))
@@ -230,19 +245,21 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: edit.name, description: edit.description.trim() || null }),
       })
-      const body = await resp.json().catch(() => ({}))
       if (resp.ok) {
         setEdit(null)
         postUserSkillsChanged({})
         toast.success('Skill updated')
-      } else if (body.code === 'name_taken' || body.code === 'name_invalid' || body.code === 'name_too_long') {
-        setEditError(body.error)
+        return
+      }
+      const err = await readApiError(resp, 'Failed to update the skill')
+      if (err.code === 'name_taken' || err.code === 'name_invalid' || err.code === 'name_too_long') {
+        setEditError(err.reason)
       } else {
-        alertError(body.error || 'Failed to update the skill')
+        alertError(err.message)
       }
     } catch (err) {
       console.error('Failed to update skill:', err)
-      toast.error('Failed to update the skill')
+      toast.error(toApiError(err, 'Failed to update the skill').message)
     } finally {
       setEditSaving(false)
     }
@@ -253,15 +270,18 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
     setImporting(true)
     try {
       const resp = await fetch(`/api/users/${userId}/attack-skills/import-community`, { method: 'POST' })
-      const data = await resp.json()
-      if (resp.ok) {
-        postUserSkillsChanged({})
-        showAlert(importSummary(data))
-      } else {
-        alertError(data.error || 'Failed to import community skills')
+      if (!resp.ok) {
+        alertError((await readApiError(resp, 'Failed to import community skills')).message)
+        return
       }
+      // Skills may have landed even when the answer cannot be read.
+      postUserSkillsChanged({})
+      const data = await resp.json().catch(() => null)
+      if (data) showAlert(importSummary(data))
+      else alertError(`Failed to read the import's answer (invalid_json · HTTP ${resp.status}). Check your skills list.`)
     } catch (err) {
       console.error('Failed to import community skills:', err)
+      alertError(toApiError(err, 'Failed to import community skills').message)
     } finally {
       setImporting(false)
     }
@@ -271,8 +291,8 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
   const upload = useSkillUpload({ userId, existingCount: skills.length })
   const uploadTitle = loading
     ? 'Loading your skills…'
-    : loadError ? 'Your skills could not be loaded. Reload the page to upload.' : atLimit ? USER_SKILL_LIMIT_TEXT : undefined
-  const uploadDisabled = !userId || loading || loadError || atLimit
+    : loadError !== null ? `${LOAD_FAILED}${loadError}. Reload the page to upload.` : atLimit ? USER_SKILL_LIMIT_TEXT : undefined
+  const uploadDisabled = !userId || loading || loadError !== null || atLimit
   const editEmptyField = !!edit && (!edit.name.trim() || !edit.description.trim())
 
   return (
@@ -319,8 +339,8 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
 
       {loading ? (
         <div className={styles.emptyState}><Loader2 size={16} className={styles.spin} /> Loading...</div>
-      ) : skills.length === 0 && loadError ? (
-        <div className={styles.emptyState} role="alert">Your skills could not be loaded. Reload the page.</div>
+      ) : skills.length === 0 && loadError !== null ? (
+        <div className={styles.emptyState} role="alert">{LOAD_FAILED}{loadError}. Reload the page.</div>
       ) : skills.length === 0 ? (
         <div className={styles.emptyState}>No custom skills uploaded yet. Upload a .md file, or a batch of them, to get started.</div>
       ) : visible.length === 0 ? (
@@ -470,7 +490,7 @@ export function AgentSkillsTab({ userId }: { userId: string | null | undefined }
 /** The community import's answer, with each reason a skill was skipped said apart. */
 export function importSummary(data: {
   imported?: number
-  skippedBy?: Partial<Record<'duplicate' | 'limit' | 'fetchFailed' | 'tooLarge' | 'invalid', number>>
+  skippedBy?: Partial<Record<'duplicate' | 'limit' | 'fetchFailed' | 'tooLarge' | 'invalid' | 'saveFailed', number>>
   skipped?: number
   message?: string
 }): string {
@@ -482,6 +502,7 @@ export function importSummary(data: {
     by.tooLarge ? `${by.tooLarge} too large` : '',
     by.fetchFailed ? `${by.fetchFailed} could not be fetched` : '',
     by.invalid ? `${by.invalid} not valid` : '',
+    by.saveFailed ? `${by.saveFailed} could not be saved` : '',
   ].filter(Boolean)
   return `Imported ${data.imported ?? 0} community skill(s)` + (parts.length ? `; skipped ${parts.join(', ')}.` : '.')
 }

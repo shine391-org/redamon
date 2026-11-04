@@ -79,3 +79,13 @@ agentic/knowledge_base/
 # run_amass copies the image's own baked list here on first use; shipping it
 # back into the build context would add it to the image a second time.
 recon/wordlists/jhaddix-all.txt
+
+# Local migration: runtime data and private backups stay out of image contexts.
+.local/
+backups/
+agentic/agent-workspace/
+agentic/logs/
+recon/output/
+mcp/output/
+scanners/*/output/
+services/knowledge_base/data/

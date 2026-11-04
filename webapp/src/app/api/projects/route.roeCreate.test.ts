@@ -117,3 +117,20 @@ describe('a create without a document', () => {
     }
   })
 })
+
+describe('a create that fails', () => {
+  test('answers the fixed sentence and the Prisma code, never the Prisma message', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockProjectCreate.mockRejectedValue(Object.assign(
+      new Error('Unique constraint failed on the fields: (`id`) value roe-e2e.example'),
+      { code: 'P2002', name: 'PrismaClientKnownRequestError' },
+    ))
+    const res = await POST(new NextRequest('http://localhost:3000/api/projects', {
+      method: 'POST',
+      headers: { host: 'localhost:3000', 'content-type': 'application/json' },
+      body: JSON.stringify(base),
+    }))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to create project', code: 'P2002' })
+  })
+})

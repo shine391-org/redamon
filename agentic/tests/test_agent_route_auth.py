@@ -39,6 +39,15 @@ LOCKED_ROUTES = {
     ("POST", "/workspace/reset"),
     ("GET", "/workspace/jobs"),
     ("POST", "/workspace/jobs/{job_id}/cancel"),
+    ("GET", "/workspace/jobs/{job_id}"),
+    ("POST", "/workspace/upload-sessions"),
+    ("PUT", "/workspace/upload-sessions/{upload_id}/chunk"),
+    ("POST", "/workspace/upload-sessions/{upload_id}/commit"),
+    ("DELETE", "/workspace/upload-sessions/{upload_id}"),
+    ("POST", "/workspace/project-purge"),
+    ("POST", "/workspace/import-url/resolve"),
+    ("POST", "/workspace/import-url"),
+    ("POST", "/workspace/import-url/resync"),
     ("POST", "/workspace/upload"),
     ("POST", "/workspace/mkdir"),
     ("POST", "/workspace/bulk-archive"),
@@ -58,8 +67,12 @@ def _route_deps():
     """(method, path) -> the dependency callables declared on that route."""
     out = {}
     for r in api.app.routes:
-        for m in getattr(r, "methods", None) or ():
-            out[(m, r.path)] = [d.dependency for d in getattr(r, "dependencies", [])]
+        # FastAPI keeps an included APIRouter as one nested entry; walk its routes
+        # too, or a router-mounted /workspace route would escape both checks.
+        inner = getattr(r, "original_router", None)
+        for route in (inner.routes if inner is not None else [r]):
+            for m in getattr(route, "methods", None) or ():
+                out[(m, route.path)] = [d.dependency for d in getattr(route, "dependencies", [])]
     return out
 
 

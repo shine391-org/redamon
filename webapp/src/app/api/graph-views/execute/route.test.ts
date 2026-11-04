@@ -128,3 +128,23 @@ describe('the surrounding guards still hold', () => {
     expect(executed()).toContain('(c:CVE)')
   })
 })
+
+describe('a failed query says why without echoing it (G-25)', () => {
+  test('a Neo4j error answers its status code, never the message that quotes the query', async () => {
+    mockRun.mockRejectedValue(Object.assign(
+      new Error("Invalid input 'x': expected ... \"MATCH (s:Subdomain {name:'admin.target.example'})\""),
+      { code: 'Neo.ClientError.Statement.SyntaxError' }))
+    const res = await run('MATCH (s:Subdomain) RETURN s')
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(JSON.parse(text)).toEqual({ error: 'Query execution failed', code: 'Neo.ClientError.Statement.SyntaxError' })
+    expect(text).not.toContain('admin.target.example')
+  })
+
+  test('a dropped database connection is ServiceUnavailable', async () => {
+    mockRun.mockRejectedValue(Object.assign(new Error('Could not perform discovery'), {
+      name: 'Neo4jError', code: 'ServiceUnavailable' }))
+    const res = await run('MATCH (s:Subdomain) RETURN s')
+    expect((await res.json()).code).toBe('ServiceUnavailable')
+  })
+})

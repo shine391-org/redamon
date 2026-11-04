@@ -19,6 +19,9 @@ import { ScanActions } from '@/components/scans/ScanActions'
 import { OtherScansModal } from '@/app/graph/components/OtherScansModal/OtherScansModal'
 import { useMultiPartialReconStatus } from '@/hooks/useMultiPartialReconStatus'
 import { useScanStartFailure } from '@/hooks/useScanStartFailure'
+import { isStreamReconnecting } from '@/hooks/useReconSSE'
+import { ApiError, errorMessage, fetchJson, fetchOk, readApiError, toApiError } from '@/lib/apiError'
+import { readScanStartError, type ScanStartError } from '@/lib/scanStartError'
 import { useDrawerOffsets } from '@/hooks/useDrawerOffsets'
 import { useMultiPartialReconSSE } from '@/hooks/useMultiPartialReconSSE'
 import { useDirtyState } from '@/hooks/useDirtyState'
@@ -86,10 +89,16 @@ import { GraphqlScanSection } from './sections/GraphqlScanSection'
 import { TakeoverSection } from './sections/TakeoverSection'
 import { VhostSniSection } from './sections/VhostSniSection'
 import { WebCachePoisonSection } from './sections/WebCachePoisonSection'
+import { RouteExposureSection } from './sections/RouteExposureSection'
 import { PartialReconModal } from './WorkflowView/PartialReconModal'
 import { ReconPresetModal } from './ReconPresetModal'
 import { ProviderRequiredModal, ModelSelectionModal } from './ProjectLlmGate'
-import { seedInitialModels, needsModelGate, hasNoConfiguredProvider } from './projectLlmGate.logic'
+import {
+  seedInitialModels, needsModelGate, hasNoConfiguredProvider, providerGateApplies,
+  pipelineModelOptional, loopModelOffered,
+} from './projectLlmGate.logic'
+import { fetchModelOptions } from '@/components/shared/modelOptions'
+import { LOOP_MODEL_ID } from '@/lib/agentInTheLoop'
 import { SavePresetModal } from './SavePresetModal'
 import { UserPresetDrawer } from './UserPresetDrawer'
 import { getPresetById, type ReconPreset } from '@/lib/recon-presets'
@@ -234,21 +243,64 @@ function firstHardBlockedTarget(
   return hit ? { domain: hit.name, reason: hit.reason } : null
 }
 
-// Fetch defaults from the recon backend (single source of truth)
-async function fetchDefaults(): Promise<Partial<ProjectFormData>> {
+// Fetch defaults from the recon backend (single source of truth). On a failure
+// the form still opens on the minimal fallback, and `error` says why, so the
+// person knows the values are not the backend's.
+async function fetchDefaults(): Promise<{ defaults: Partial<ProjectFormData>; error: string | null }> {
   try {
-    const response = await fetch('/api/projects/defaults')
-    if (!response.ok) {
-      console.warn('Failed to fetch defaults, using minimal fallback')
-      return MINIMAL_DEFAULTS
-    }
-    const defaults = await response.json()
+    const defaults = await fetchJson<Partial<ProjectFormData>>('/api/projects/defaults', undefined, 'Could not load the recon defaults')
     // Merge with minimal defaults to ensure required fields exist
-    return { ...MINIMAL_DEFAULTS, ...defaults }
+    return { defaults: { ...MINIMAL_DEFAULTS, ...defaults }, error: null }
   } catch (error) {
     console.warn('Error fetching defaults:', error)
-    return MINIMAL_DEFAULTS
+    return { defaults: MINIMAL_DEFAULTS, error: errorMessage(error, 'Could not load the recon defaults') }
   }
+}
+
+/**
+ * Toast a scan hook's failure once per new message. The hooks keep their last
+ * failed action or status read in `error`, and this page has no log drawer to
+ * show it in. A start failure is left out: it opens the start-failure modal.
+ */
+export function useScanErrorToast(label: string, error: string | null | undefined, lastStartError?: () => ScanStartError | null) {
+  const toast = useToast()
+  const latest = useRef({ toast, lastStartError })
+  latest.current = { toast, lastStartError }
+  useEffect(() => {
+    if (!error) return
+    const start = latest.current.lastStartError?.()
+    if (start && error.startsWith(start.message)) return
+    latest.current.toast.error(error, label)
+  }, [error, label])
+}
+
+/**
+ * Toast each run seen ending in `error`, with the reason the orchestrator gave.
+ * A run already in error when first seen is not announced: that is an earlier
+ * visit's news, not something that just happened.
+ */
+export function useRunFailureToast(
+  label: string,
+  runs: Array<{ key: string; status?: string | null; error?: string | null }>,
+) {
+  const toast = useToast()
+  const latest = useRef({ toast, runs })
+  latest.current = { toast, runs }
+  const seen = useRef<Record<string, string>>({})
+  const signature = runs.map(r => `${r.key}=${r.status ?? ''}`).join('|')
+  useEffect(() => {
+    const before = seen.current
+    const next: Record<string, string> = {}
+    for (const run of latest.current.runs) {
+      const status = run.status ?? ''
+      next[run.key] = status
+      const previous = before[run.key]
+      if (status === 'error' && previous && previous !== 'error') {
+        latest.current.toast.error(run.error ? `${label} failed: ${run.error}` : `${label} failed`, label)
+      }
+    }
+    seen.current = next
+  }, [signature, label])
 }
 
 /**
@@ -310,6 +362,7 @@ export function ProjectForm({
   // Scans card via /projects/<id>/settings#github-secret-hunting.
   const [pendingAnchor, setPendingAnchor] = useState<string | null>(null)
   const [isLoadingDefaults, setIsLoadingDefaults] = useState(mode === 'create')
+  const [defaultsWarning, setDefaultsWarning] = useState<string | null>(null)
   const [formData, setFormData] = useState<ProjectFormData>(() => ({
     ...MINIMAL_DEFAULTS,
     ...withoutDerived(initialData as Record<string, unknown>),
@@ -366,6 +419,10 @@ export function ProjectForm({
 
   // LLM provider / model gates (create mode only)
   const [showProviderGate, setShowProviderGate] = useState(false)
+  // Agent in the Loop needs no provider: offered from the provider gate while
+  // the deployment has it on (the model list then carries it).
+  const [loopAvailable, setLoopAvailable] = useState(false)
+  const [noProvider, setNoProvider] = useState(false)
   // create mode: false until the provider check resolves; gates the form render
   // so a no-provider user sees the "configure provider" gate immediately, not
   // the project form flashing first.
@@ -450,6 +507,18 @@ export function ProjectForm({
       serverRowRef.current = { ...(serverRowRef.current ?? {}), ...(row as Record<string, unknown>) }
     }
   }, [])
+  // True when the server wrote the row and only a step after the write failed
+  // (`stage: 'after_write'`). The save happened, so the row's new version is
+  // read back: without it the next save would be refused as stale.
+  const savedDespiteError = useCallback(async (error: unknown): Promise<boolean> => {
+    if (!(error instanceof ApiError) || error.body?.stage !== 'after_write' || !projectId) return false
+    try {
+      adoptSavedVersion(await fetchJson(`/api/projects/${projectId}`, undefined, 'Could not reload the project'))
+    } catch {
+      /* the next save then reports the stale version itself */
+    }
+    return true
+  }, [projectId, adoptSavedVersion])
   // The upload sections write the row through their own endpoints. The row is read back so a
   // later skills event does not take the uploaded column for another writer's change; only
   // when it is still at the announced version, so no one else's write is taken as known.
@@ -507,6 +576,7 @@ export function ProjectForm({
   // Scan Queue (Phase 3): a temporary partial-recon start refusal offers Cancel /
   // Add to queue instead of a dead-end toast.
   const { handleStartFailure: handlePartialStartFailure } = useScanStartFailure(projectId ?? null)
+  const { handleStartFailure: handleScanStartFailure } = useScanStartFailure(projectId ?? null)
 
   // Deep-link support: `?tab=<id>` (e.g. from the CodeFix "missing settings" alert
   // linking to `/projects/[id]/settings?tab=cypherfix`) opens that tab directly.
@@ -520,7 +590,7 @@ export function ProjectForm({
   }, [])
 
   // Track recon status in edit mode to reflect running state on the Start Recon button
-  const { state: reconState } = useReconStatus({ projectId: mode === 'edit' ? (projectId ?? null) : null, enabled: mode === 'edit' })
+  const { state: reconState, error: reconStatusError } = useReconStatus({ projectId: mode === 'edit' ? (projectId ?? null) : null, enabled: mode === 'edit' })
   // Host LAN IP suggested for the LHOST field (issue #180). Fetched in both create
   // and edit mode; it is a separate signal, never merged into formData, so it never
   // reaches the save payload.
@@ -535,6 +605,14 @@ export function ProjectForm({
     // status traffic whenever both are open.
     pollingInterval: 15_000,
   })
+  useScanErrorToast('GVM scan', scans.gvm.error, scans.gvm.getLastStartError)
+  useScanErrorToast('GitHub Secret Hunt', scans.githubHunt.error, scans.githubHunt.getLastStartError)
+  useScanErrorToast('Secret Multiscanner', scans.trufflehog.error, scans.trufflehog.getLastStartError)
+  useScanErrorToast('Supply-Chain scan', scans.supplyChain.error, scans.supplyChain.getLastStartError)
+  useRunFailureToast('GVM scan', [{ key: 'gvm', status: scans.gvm.state?.status, error: scans.gvm.state?.error }])
+  useRunFailureToast('GitHub Secret Hunt', [{ key: 'github', status: scans.githubHunt.state?.status, error: scans.githubHunt.state?.error }])
+  useRunFailureToast('Supply-Chain scan', [{ key: 'supply', status: scans.supplyChain.state?.status, error: scans.supplyChain.state?.error }])
+  useRunFailureToast('Secret Multiscanner', scans.trufflehog.runs.map(r => ({ key: r.source ?? r.run_id ?? '', status: r.status, error: r.error })))
   const isReconRunning = reconState?.status === 'running' || reconState?.status === 'starting'
   const isReconPaused = reconState?.status === 'paused'
   const isReconBusy = isReconRunning || isReconPaused
@@ -564,12 +642,19 @@ export function ProjectForm({
   const {
     logsMap: partialReconLogsMap,
     phaseMap: partialReconPhaseMap,
+    error: partialReconStreamError,
     clearLogsForRun: clearPartialReconLogsForRun,
   } = useMultiPartialReconSSE({
     projectId: projectId ?? null,
     activeRunId: activePartialLogsRunId,
     onComplete: () => { refetchPartialReconStatuses() },
   })
+  // The drawer shows a run's own error only; a log stream that could not be
+  // reopened would otherwise just stop updating. Retries are not announced.
+  useScanErrorToast(
+    'Partial recon logs',
+    isStreamReconnecting(partialReconStreamError) ? null : partialReconStreamError,
+  )
 
   // Fetch defaults from backend on mount (only for create mode).
   // For a new project the LLM model fields are NOT taken from the backend
@@ -583,7 +668,8 @@ export function ProjectForm({
       userId
         ? fetch(`/api/users/${userId}`).then(r => (r.ok ? r.json() : null)).catch(() => null)
         : Promise.resolve(null),
-    ]).then(([defaults, user]) => {
+    ]).then(([{ defaults, error: defaultsError }, user]) => {
+      setDefaultsWarning(defaultsError)
       const seeded = seedInitialModels(user)
       let loaded: ProjectFormData | null = null
       setFormData(prev => {
@@ -605,17 +691,25 @@ export function ProjectForm({
   }, [mode, initialData, userId, setBaseline])
 
   // Provider gate: block creating a project when no LLM provider is configured.
+  // A list that failed to load is not an empty one: it never shows the gate.
+  const toastRef = useRef(toast)
+  toastRef.current = toast
   useEffect(() => {
     if (mode !== 'create' || !userId) return
-    fetch(`/api/users/${userId}/llm-providers`)
-      .then(r => (r.ok ? r.json() : []))
-      .then((providers) => {
+    fetchJson<unknown>(`/api/users/${userId}/llm-providers`, undefined, 'Could not check your LLM providers')
+      .then(async (providers) => {
         if (hasNoConfiguredProvider(providers)) {
+          setNoProvider(true)
+          setLoopAvailable(await fetchModelOptions(userId).then(loopModelOffered, () => false))
           setShowProviderGate(true)
         }
         setProviderChecked(true)
       })
-      .catch(() => { setProviderChecked(true) /* network error: don't hard-block, model gate still applies */ })
+      .catch((err) => {
+        // Don't hard-block on a failed check; the model gate still applies.
+        setProviderChecked(true)
+        toastRef.current.warning(errorMessage(err, 'Could not check your LLM providers'))
+      })
   }, [mode, userId])
 
   // Log drawers pin to the body wrapper, which moves as the form scrolls.
@@ -641,18 +735,23 @@ export function ProjectForm({
         body: JSON.stringify({ [field]: value }),
       })
       if (!res.ok) {
-        const err = await res.json()
-        toast.error(err.error || 'Failed to save')
+        const failure = await readApiError(res, 'Failed to save')
+        if (await savedDespiteError(failure)) {
+          setBaseline(prev => ({ ...prev, [field]: value }))
+          toast.error(`Setting saved, but a step after the save failed: ${failure.message}`)
+          return
+        }
+        toast.error(failure.message)
         return
       }
       adoptSavedVersion(await res.json().catch(() => null))
       // Workflow toggles persist immediately; adopt the saved field into the
       // baseline so the batched Update button + guard don't flag it as unsaved.
       setBaseline(prev => ({ ...prev, [field]: value }))
-    } catch {
-      toast.error('Failed to save setting')
+    } catch (err) {
+      toast.error(toApiError(err, 'Failed to save setting').message)
     }
-  }, [projectId, mode, toast, setBaseline, adoptSavedVersion])
+  }, [projectId, mode, toast, setBaseline, adoptSavedVersion, savedDespiteError])
 
   const updateMultipleFields = (fields: Partial<ProjectFormData>) => {
     setFormData(prev => ({ ...prev, ...fields }))
@@ -708,17 +807,15 @@ export function ProjectForm({
       ;[presetSettings, backendDefaults] = await Promise.all([
         source.kind === 'builtin'
           ? Promise.resolve({ ...source.preset.parameters, reconPresetId: source.preset.id })
-          : fetch(`/api/presets/${source.id}`).then(async r => {
-              if (!r.ok) throw new Error('Failed to fetch preset')
-              return ((await r.json()).settings ?? {}) as Record<string, unknown>
-            }),
+          : fetchJson<{ settings?: Record<string, unknown> }>(`/api/presets/${source.id}`, undefined, 'Failed to fetch preset')
+              .then(body => (body.settings ?? {}) as Record<string, unknown>),
         // Unavailable defaults are not fatal: the Prisma defaults cover every field.
         fetch('/api/projects/defaults')
           .then(r => (r.ok ? r.json() : {}))
           .catch(() => ({})),
       ])
-    } catch {
-      toast.error(`Failed to load preset "${presetName}"`)
+    } catch (err) {
+      toast.error(`Failed to load preset "${presetName}": ${errorMessage(err, 'Failed to fetch preset')}`)
       return
     }
 
@@ -797,6 +894,11 @@ export function ProjectForm({
       toast.success(`Preset "${presetName}" loaded and saved`, 'Preset Loaded')
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save project'
+      if (await savedDespiteError(error)) {
+        setBaseline(prev => ({ ...prev, ...saved }) as ProjectFormData)
+        alertError(`Preset "${presetName}" was loaded and saved, but a step after the save failed: ${message}`)
+        return
+      }
       alertError(`Preset "${presetName}" was loaded but NOT saved: ${message}\n\nClick Update Settings to retry.`)
     }
   }
@@ -808,14 +910,14 @@ export function ProjectForm({
   const ensureProviderConfigured = async (): Promise<boolean> => {
     if (mode !== 'create' || !userId) return true
     try {
-      const r = await fetch(`/api/users/${userId}/llm-providers`)
-      const providers = r.ok ? await r.json() : []
-      if (hasNoConfiguredProvider(providers)) {
+      const providers = await fetchJson<unknown>(`/api/users/${userId}/llm-providers`, undefined, 'Could not check your LLM providers')
+      setNoProvider(hasNoConfiguredProvider(providers))
+      if (providerGateApplies(providers, formData.agentOpenaiModel as string, loopAvailable)) {
         setShowProviderGate(true)
         return false
       }
     } catch {
-      /* network error: don't hard-block; the model gate still applies */
+      /* a failed check is not "no provider": don't hard-block; the model gate still applies */
     }
     return true
   }
@@ -852,7 +954,8 @@ export function ProjectForm({
     if (!(await ensureProviderConfigured())) return
 
     // Force explicit LLM model selection on create (agent + AI recon pipeline)
-    if (needsModelGate(mode, formData.agentOpenaiModel, formData.aiPipelineModel)) {
+    if (needsModelGate(mode, formData.agentOpenaiModel, formData.aiPipelineModel,
+      pipelineModelOptional(formData.agentOpenaiModel as string, noProvider))) {
       setPendingSaveAction('submit')
       setShowModelGate(true)
       return
@@ -876,6 +979,11 @@ export function ProjectForm({
       setBaseline(formData)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save project'
+      if (await savedDespiteError(error)) {
+        setBaseline(formData)
+        alertError(`The project was saved, but a step after the save failed: ${message}`)
+        return
+      }
       if (message.toLowerCase().includes('guardrail') || message.toLowerCase().includes('permanently blocked')) {
         const reason = message
           .replace(/^Target blocked by guardrail:\s*/i, '')
@@ -927,7 +1035,8 @@ export function ProjectForm({
     if (!(await ensureProviderConfigured())) return false
 
     // Force explicit LLM model selection on create (agent + AI recon pipeline)
-    if (needsModelGate(mode, formData.agentOpenaiModel, formData.aiPipelineModel)) {
+    if (needsModelGate(mode, formData.agentOpenaiModel, formData.aiPipelineModel,
+      pipelineModelOptional(formData.agentOpenaiModel as string, noProvider))) {
       setPendingSaveAction('stay')
       setShowModelGate(true)
       return false
@@ -949,6 +1058,13 @@ export function ProjectForm({
       return true
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save project'
+      if (await savedDespiteError(error)) {
+        // Written, so the caller may act on it; `after` is skipped so the
+        // alert is not navigated away from.
+        setBaseline(formData)
+        alertError(`The project was saved, but a step after the save failed: ${message}`)
+        return true
+      }
       if (message.toLowerCase().includes('guardrail') || message.toLowerCase().includes('permanently blocked')) {
         const reason = message
           .replace(/^Target blocked by guardrail:\s*/i, '')
@@ -1012,14 +1128,10 @@ export function ProjectForm({
         body: JSON.stringify(params),
       })
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
+        const startError = await readScanStartError(response, 'Failed to start partial recon')
         setPartialReconToolId(null)
         // Temporary -> Cancel / Add to queue; permanent -> error (Scan Queue Phase 3).
-        await handlePartialStartFailure(
-          'partial_recon',
-          { message: data.error || 'Failed to start partial recon', limit: data.limit, status: response.status },
-          params as unknown as Record<string, unknown>,
-        )
+        await handlePartialStartFailure('partial_recon', startError, params as unknown as Record<string, unknown>)
         return
       }
       const data: PartialReconState = await response.json()
@@ -1029,11 +1141,66 @@ export function ProjectForm({
       setLocalPartialRun(data)
       setActivePartialLogsRunId(data.run_id)
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to start partial recon')
+      toast.error(toApiError(err, 'Failed to start partial recon').message)
     } finally {
       setIsPartialReconStarting(false)
     }
   }, [projectId, toast, handlePartialStartFailure])
+
+  // A refused or unanswered stop leaves the run going, so it is said, and the
+  // logs drawer stays open on it.
+  const stopPartialRun = useCallback(async (runId: string): Promise<boolean> => {
+    if (!projectId) return false
+    try {
+      await fetchOk(`/api/recon/${projectId}/partial/${runId}/stop`, { method: 'POST' }, 'Failed to stop partial recon')
+      return true
+    } catch (err) {
+      toast.error(errorMessage(err, 'Failed to stop partial recon'))
+      return false
+    }
+  }, [projectId, toast])
+
+  // Starts from Other Scans: a refused start gets the same modal as on the
+  // graph page (queue offer for a temporary refusal), never a silent no-op.
+  const startOtherScan = useCallback(async (
+    kind: string,
+    start: () => Promise<unknown>,
+    lastStartError: () => ScanStartError | null,
+    payload?: Record<string, unknown>,
+  ) => {
+    let started = false
+    try {
+      started = (await start()) != null
+    } catch {
+      started = false
+    }
+    if (!started) await handleScanStartFailure(kind, lastStartError(), payload)
+  }, [handleScanStartFailure])
+
+  const [isExporting, setIsExporting] = useState(false)
+  // Fetched rather than opened in a tab, so a failed export reads as an error
+  // with its code instead of a tab of raw JSON.
+  const exportProject = useCallback(async () => {
+    if (!projectId) return
+    setIsExporting(true)
+    try {
+      const res = await fetchOk(`/api/projects/${projectId}/export`, undefined, 'Export failed')
+      const blob = await res.blob()
+      const name = /filename="([^"]+)"/i.exec(res.headers.get('content-disposition') || '')?.[1] ?? `redamon-project-${projectId}.zip`
+      const href = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = href
+      a.download = name
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(href), 1000)
+    } catch (err) {
+      alertError(errorMessage(err, 'Export failed'), 'Export failed')
+    } finally {
+      setIsExporting(false)
+    }
+  }, [projectId, alertError])
 
   // Determine if form can be submitted
   const canSubmit = !isSubmitting && !isLoadingDefaults
@@ -1049,8 +1216,11 @@ export function ProjectForm({
       </div>
     )
   }
+  const useLoopInstead = loopAvailable
+    ? () => { updateField('agentOpenaiModel', LOOP_MODEL_ID); setShowProviderGate(false) }
+    : undefined
   if (mode === 'create' && showProviderGate) {
-    return <ProviderRequiredModal onCancel={onCancel} />
+    return <ProviderRequiredModal onCancel={onCancel} onUseLoop={useLoopInstead} />
   }
 
   return (
@@ -1071,7 +1241,7 @@ export function ProjectForm({
                 className={`reconStartButton${isReconBusy ? ' reconStartButtonActive' : ''}`}
                 onClick={() => guardedNavigate(() => router.push(isReconBusy ? `/graph?project=${projectId}&openlogs=recon` : `/graph?project=${projectId}&autostart=true`))}
                 disabled={isSubmitting || runningPartialToolIds.size > 0}
-                title={runningPartialToolIds.size > 0 ? 'Partial recon is running -- stop it first' : isReconRunning ? 'Recon is running -- click to view progress' : isReconPaused ? 'Recon is paused -- click to view' : 'Navigate to the graph page and start the full recon pipeline'}
+                title={runningPartialToolIds.size > 0 ? 'Partial recon is running -- stop it first' : isReconRunning ? 'Recon is running -- click to view progress' : isReconPaused ? 'Recon is paused -- click to view' : reconStatusError ? `${reconStatusError} -- a recon may be running; the graph page shows it` : 'Navigate to the graph page and start the full recon pipeline'}
               >
                 {isReconRunning ? (
                   <Loader2 size={14} className={styles.spinner} />
@@ -1089,7 +1259,7 @@ export function ProjectForm({
                   activeLogsRunId={activePartialLogsRunId}
                   onToggleLogs={(runId) => setActivePartialLogsRunId(prev => prev === runId ? null : runId)}
                   onStop={async (runId) => {
-                    await fetch(`/api/recon/${projectId}/partial/${runId}/stop`, { method: 'POST' })
+                    await stopPartialRun(runId)
                   }}
                 />
               )}
@@ -1130,11 +1300,12 @@ export function ProjectForm({
             <button
               type="button"
               className="secondaryButton"
-              onClick={() => window.open(`/api/projects/${projectId}/export`)}
+              onClick={() => void exportProject()}
+              disabled={isExporting}
               title="Download a full project backup as a ZIP file including settings, conversations, graph data, reports, and artifacts"
             >
-              <Download size={14} />
-              Export
+              {isExporting ? <Loader2 size={14} className={styles.spinner} /> : <Download size={14} />}
+              {isExporting ? 'Exporting...' : 'Export'}
             </button>
           )}
           <button
@@ -1157,6 +1328,15 @@ export function ProjectForm({
           </button>
         </div>
       </div>
+
+      {defaultsWarning && (
+        <div className={`${styles.callout} ${styles.calloutWarning}`} role="alert" data-testid="defaults-warning">
+          <span>
+            <strong>The recon defaults could not be loaded, so this form starts from built-in fallbacks.</strong>{' '}
+            {defaultsWarning}
+          </span>
+        </div>
+      )}
 
       <div ref={bodyRef} className={styles.bodyWrapper}>
       {isLoadingDefaults ? (
@@ -1368,6 +1548,7 @@ export function ProjectForm({
             <VhostSniSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('VhostSni') : undefined} />
             <GraphqlScanSection data={formData} updateField={updateField} projectId={projectId} mode={mode} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('GraphqlScan') : undefined} />
             <WebCachePoisonSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('WebCachePoison') : undefined} />
+            <RouteExposureSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('RouteExposure') : undefined} onOpenAuth={() => setActiveTab('target')} onOpenAgentSkills={() => setActiveTab('attack')} />
           </>
         )}
 
@@ -1410,7 +1591,8 @@ export function ProjectForm({
         )}
 
         {activeTab === 'attack' && (
-          <AttackSkillsSection data={formData} updateField={updateField} projectId={mode === 'edit' ? projectId : null} />
+          <AttackSkillsSection data={formData} updateField={updateField} projectId={mode === 'edit' ? projectId : null}
+                               onOpenRoe={() => setActiveTab('roe' as TabId)} />
         )}
 
         {activeTab === 'cypherfix' && (
@@ -1464,6 +1646,7 @@ export function ProjectForm({
         isStarting={isPartialReconStarting}
         userId={userId ?? undefined}
         openapiSources={formData.openapiSources}
+        ipTargets={formData.ipMode ? formData.targetIps : null}
       />
 
       {/* Partial Recon Logs Drawer */}
@@ -1478,8 +1661,7 @@ export function ProjectForm({
           errorMessage={activePartialLogsRun.error}
           onClearLogs={() => activePartialLogsRunId && clearPartialReconLogsForRun(activePartialLogsRunId)}
           onStop={async () => {
-            if (activePartialLogsRunId) {
-              await fetch(`/api/recon/${projectId}/partial/${activePartialLogsRunId}/stop`, { method: 'POST' })
+            if (activePartialLogsRunId && await stopPartialRun(activePartialLogsRunId)) {
               setActivePartialLogsRunId(null)
             }
           }}
@@ -1515,7 +1697,7 @@ export function ProjectForm({
 
       {/* LLM provider gate: no provider configured -> can't create a project */}
       {showProviderGate && (
-        <ProviderRequiredModal onCancel={onCancel} />
+        <ProviderRequiredModal onCancel={onCancel} onUseLoop={useLoopInstead} />
       )}
 
       {/* Model selection gate: force picking both models before saving */}
@@ -1526,6 +1708,7 @@ export function ProjectForm({
           aiPipelineModel={(formData.aiPipelineModel as string) || ''}
           onChangeAgent={(id) => updateField('agentOpenaiModel', id)}
           onChangeAiPipeline={(id) => updateField('aiPipelineModel', id)}
+          pipelineOptional={pipelineModelOptional(formData.agentOpenaiModel as string, noProvider)}
           onCancel={() => { setShowModelGate(false); setPendingSaveAction(null) }}
           onConfirm={() => {
             setShowModelGate(false)
@@ -1557,18 +1740,24 @@ export function ProjectForm({
         hasReconData={scans.hasReconData}
         hasGithubToken={hasGithubToken}
         githubHuntStatus={scans.githubHunt.state?.status}
-        onStartGithubHunt={() => void scans.githubHunt.startGithubHunt()}
+        githubHuntError={scans.githubHunt.state?.error}
+        githubHuntStatusError={scans.githubHunt.statusError}
+        trufflehogProfilesError={scans.trufflehog.profilesError}
+        trufflehogStatusError={scans.trufflehog.statusError}
+        supplyChainError={scans.supplyChain.state?.error}
+        supplyChainStatusError={scans.supplyChain.statusError}
+        onStartGithubHunt={() => void startOtherScan('github_hunt', scans.githubHunt.startGithubHunt, scans.githubHunt.getLastStartError)}
         onPauseGithubHunt={() => void scans.githubHunt.pauseGithubHunt()}
         onResumeGithubHunt={() => void scans.githubHunt.resumeGithubHunt()}
         onStopGithubHunt={() => void scans.githubHunt.stopGithubHunt()}
         onDownloadGithubHuntJSON={() => projectId && window.open(`/api/github-hunt/${projectId}/download`, '_blank')}
         trufflehogProfiles={scans.trufflehog.profiles}
         trufflehogRunsBySource={scans.trufflehog.bySource}
-        onStartTrufflehog={(source) => void scans.trufflehog.startTrufflehog(source)}
+        onStartTrufflehog={(source) => void startOtherScan('trufflehog', () => scans.trufflehog.startTrufflehog(source), scans.trufflehog.getLastStartError, { source })}
         onStopTrufflehog={(source) => void scans.trufflehog.stopTrufflehog(source)}
         onDownloadTrufflehogJSON={() => projectId && window.open(`/api/trufflehog/${projectId}/download`, '_blank')}
         supplyChainStatus={scans.supplyChain.state?.status}
-        onStartSupplyChain={() => void scans.supplyChain.startSupplyChain()}
+        onStartSupplyChain={() => void startOtherScan('supply_chain', scans.supplyChain.startSupplyChain, scans.supplyChain.getLastStartError)}
         onPauseSupplyChain={() => void scans.supplyChain.pauseSupplyChain()}
         onResumeSupplyChain={() => void scans.supplyChain.resumeSupplyChain()}
         onStopSupplyChain={() => void scans.supplyChain.stopSupplyChain()}

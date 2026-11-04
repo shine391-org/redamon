@@ -28,6 +28,8 @@ vi.mock('@/lib/captureStatus', () => ({ isCaptureGloballyEnabled: (...a: unknown
 
 import { POST as START } from './start/route'
 import { POST as COMMIT } from './commit/route'
+import { POST as STOP } from './stop/route'
+import { GET as STATUS } from './status/route'
 
 const params = { params: Promise.resolve({ id: 'p1' }) }
 const req = (body?: unknown) => new NextRequest('http://x', { method: 'POST', ...(body ? { body: JSON.stringify(body) } : {}) })
@@ -73,9 +75,18 @@ describe('start', () => {
     expect(db.recordingSession.create).not.toHaveBeenCalled()
   })
 
-  test('fails closed when the lock check throws (G11)', async () => {
-    mockAssertNotActivating.mockRejectedValue(new Error('db down'))
-    expect((await START(req(), params)).status).toBe(409)
+  test('fails closed when the lock check throws (G11), and says why with a code', async () => {
+    mockAssertNotActivating.mockRejectedValue(Object.assign(new Error('db down at 10.0.0.5'), { code: 'P1001' }))
+    const res = await START(req(), params)
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual({ error: 'activation check failed; try again', code: 'P1001' })
+  })
+
+  test('a DB failure answers the fixed message and the Prisma code, never the raw text', async () => {
+    db.project.findUnique.mockRejectedValue(Object.assign(new Error('Timed out fetching a new connection'), { code: 'P2024' }))
+    const res = await START(req(), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to start recording', code: 'P2024' })
   })
 
   test('409 when another project holds the slot (G10)', async () => {
@@ -157,5 +168,29 @@ describe('commit', () => {
     const res = await COMMIT(req({ save: false }), params)
     expect((await res.json()).discarded).toBe(true)
     expect(db.projectAuthProfile.upsert).not.toHaveBeenCalled()
+  })
+})
+
+describe('failures carry a code', () => {
+  test('stop: a DB failure is 500 with the Prisma code', async () => {
+    db.recordingSession.findFirst.mockRejectedValue(Object.assign(new Error('pool'), { code: 'P2024' }))
+    const res = await STOP(req(), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to stop recording', code: 'P2024' })
+  })
+
+  test('commit: a DB failure is 500 with the error class when there is no code', async () => {
+    class PrismaClientUnknownRequestError extends Error { name = 'PrismaClientUnknownRequestError' }
+    db.recordingSession.findFirst.mockRejectedValue(new PrismaClientUnknownRequestError('raw sql text'))
+    const res = await COMMIT(req({ save: true }), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to commit recording', code: 'PrismaClientUnknownRequestError' })
+  })
+
+  test('status: a DB failure is 500 with the Prisma code', async () => {
+    db.recordingSession.findFirst.mockRejectedValue(Object.assign(new Error('x'), { code: 'P1001' }))
+    const res = await STATUS(new NextRequest('http://x'), params)
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to read recording status', code: 'P1001' })
   })
 })

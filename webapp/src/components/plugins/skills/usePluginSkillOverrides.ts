@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
+import { fetchJson, settle } from '@/lib/apiError'
 import type { ProjectSkillsRowContribution } from '@/lib/plugins/contributions'
 import type { SkillSummary, SummaryModel } from '@/lib/plugins/summaryModel'
 
@@ -13,6 +14,7 @@ interface Loaded {
   projectId: string
   bySkill: Map<string, SkillSummary>
   rowActions: ProjectSkillRowAction[]
+  error: string | null
 }
 
 const NONE = { bySkill: new Map<string, SkillSummary>(), rowActions: [] as ProjectSkillRowAction[] }
@@ -20,7 +22,8 @@ const NONE = { bySkill: new Map<string, SkillSummary>(), rowActions: [] as Proje
 /**
  * The plugin facts the Agent Skills section needs for a saved project: the per-skill override
  * summary and the `project.skills.row` contributions. A failed or refused fetch of either
- * resolves to "nothing" here — the section must never break on a core page (RV-52). Null
+ * resolves to "nothing" here — the section must never break on a core page (RV-52) — and
+ * `error` says what failed ("… (code · HTTP n)"), for a hint with Retry (`reload`). Null
  * projectId (create mode) fetches nothing.
  *
  * State is only ever set from a finished fetch, filed under its project: a reload keeps the
@@ -35,28 +38,33 @@ export function usePluginSkillOverrides(projectId: string | null | undefined) {
   useEffect(() => {
     if (!projectId) return
     let live = true
+    const read = (url: string, fallback: string) =>
+      settle(() => fetchJson<unknown>(url, { cache: 'no-store' }, fallback), fallback)
     Promise.all([
-      fetch(`/api/plugins/overrides/summary?projectId=${encodeURIComponent(projectId)}`, { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)),
-      fetch('/api/plugins/contributions', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)),
+      read(`/api/plugins/overrides/summary?projectId=${encodeURIComponent(projectId)}`, 'Plugin skill versions could not be loaded'),
+      read('/api/plugins/contributions', 'Plugin items could not be loaded'),
     ])
-      .then(([summary, contributions]) => {
+      .then(([summaryRead, contributionsRead]) => {
         if (!live) return
+        const summary = summaryRead.ok ? summaryRead.value : null
+        const contributions = contributionsRead.ok ? contributionsRead.value : null
+        const failed = !summaryRead.ok ? summaryRead.error : !contributionsRead.ok ? contributionsRead.error : null
         const bySkill = new Map<string, SkillSummary>()
         if (summary && Array.isArray((summary as SummaryModel).skills)) {
           for (const s of (summary as SummaryModel).skills) bySkill.set(s.skillId, s)
         }
         const rowActions: ProjectSkillRowAction[] = []
         if (Array.isArray(contributions)) {
-          for (const c of contributions) {
+          for (const c of contributions as { pluginId: string; displayName: string; projectSkillsRow?: ProjectSkillsRowContribution[] }[]) {
             for (const row of c.projectSkillsRow ?? []) {
               rowActions.push({ ...row, pluginId: c.pluginId, pluginDisplayName: c.displayName })
             }
           }
         }
-        setLoaded({ projectId, bySkill, rowActions })
+        setLoaded({ projectId, bySkill, rowActions, error: failed ? failed.message : null })
       })
       .catch(() => {
-        if (live) setLoaded({ projectId, ...NONE })
+        if (live) setLoaded({ projectId, ...NONE, error: 'Plugin items could not be loaded' })
       })
     return () => {
       live = false
@@ -70,6 +78,7 @@ export function usePluginSkillOverrides(projectId: string | null | undefined) {
     bySkill: current?.bySkill ?? NONE.bySkill,
     rowActions: current?.rowActions ?? NONE.rowActions,
     ready: !!current,
+    error: current?.error ?? null,
     reload,
   }
 }

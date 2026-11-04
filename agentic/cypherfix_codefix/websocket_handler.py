@@ -6,7 +6,7 @@ import logging
 import uuid
 from fastapi import WebSocket, WebSocketDisconnect
 
-from cypherfix_errors import safe_error
+from cypherfix_errors import reject_websocket, safe_error
 from .orchestrator import CodeFixOrchestrator
 from .state import CodeFixState
 
@@ -18,8 +18,11 @@ class CodeFixStreamingCallback:
 
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
+        #: Named in an internal error, so a crash says which step it died in.
+        self.last_phase = ""
 
     async def on_phase(self, phase: str, description: str):
+        self.last_phase = phase
         await self._send("codefix_phase", {"phase": phase, "description": description})
 
     async def on_thinking(self, thought: str):
@@ -58,8 +61,10 @@ class CodeFixStreamingCallback:
             "remediation_id": remediation_id, "status": status, "pr_url": pr_url,
         })
 
-    async def on_error(self, message: str, recoverable: bool = True, code: str = ""):
-        await self._send("error", {"message": message, "recoverable": recoverable, "code": code})
+    async def on_error(self, message: str, recoverable: bool = True, code: str = "",
+                       **details):
+        await self._send("error", {"message": message, "recoverable": recoverable,
+                                   "code": code, **details})
 
     async def _send(self, msg_type: str, payload: dict):
         try:
@@ -89,7 +94,7 @@ async def handle_codefix_websocket(websocket: WebSocket):
     _ok, _claims, _reason = authorize_ws(_origin, _host, _ticket, cors_allowlist())
     if not _ok:
         logger.warning("Rejected /ws/cypherfix-codefix: %s (origin=%r)", _reason, _origin)
-        await websocket.close(code=1008)
+        await reject_websocket(websocket, _reason)
         return
 
     await websocket.accept()
@@ -139,6 +144,8 @@ async def handle_codefix_websocket(websocket: WebSocket):
                             safe_error("internal_error", codefix=True),
                             recoverable=False,
                             code="internal_error",
+                            error_class=type(e).__name__,
+                            phase=callback.last_phase,
                         )
 
                 codefix_task = asyncio.create_task(run_codefix())

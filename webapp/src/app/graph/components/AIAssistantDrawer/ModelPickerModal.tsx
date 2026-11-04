@@ -2,9 +2,12 @@
 
 import React from 'react'
 import { X, Loader2 } from 'lucide-react'
+import { WikiInfoButton } from '@/components/ui/WikiInfoButton'
+import { isLoopModel } from '@/lib/agentInTheLoop'
 import { formatContextLength } from './modelUtils'
 import type { ModelOption } from './modelUtils'
 import { formatModelDisplay } from './phaseConfig'
+import { LOOP_WIKI_URL } from './hooks/loopStatus'
 import styles from './AIAssistantDrawer.module.css'
 
 interface ModelPickerModalProps {
@@ -14,7 +17,8 @@ interface ModelPickerModalProps {
   setModelSearch: (v: string) => void
   modelSearchRef: React.RefObject<HTMLInputElement | null>
   modelsLoading: boolean
-  modelsError: boolean
+  /** The failure with its cause; `true` when only the fact is known. */
+  modelsError: boolean | string | null
   filteredModels: Record<string, ModelOption[]>
   modelName?: string
   onModelChange?: (modelId: string) => void
@@ -65,7 +69,7 @@ export function ModelPickerModal({
               </div>
             ) : modelsError ? (
               <div className={styles.modelListEmpty}>
-                <span>Failed to load models. Type a model ID manually:</span>
+                <span>{typeof modelsError === 'string' ? modelsError : 'Failed to load models'}. Type a model ID manually:</span>
                 <input
                   className={styles.modelModalManualInput}
                   type="text"
@@ -92,6 +96,9 @@ export function ModelPickerModal({
                         <span className={styles.modelListOptionName}>{model.name}</span>
                         {model.context_length && (
                           <span className={styles.modelListOptionCtx}>{formatContextLength(model.context_length)}</span>
+                        )}
+                        {isLoopModel(model.id) && (
+                          <WikiInfoButton target={LOOP_WIKI_URL} className={styles.modelListOptionWiki} />
                         )}
                       </div>
                       {model.description && (

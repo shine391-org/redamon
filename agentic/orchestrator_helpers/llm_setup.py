@@ -102,6 +102,8 @@ def parse_model_provider(model_name: str) -> tuple[str, str]:
       - "qwen/<model>"        → ("qwen", "<model>")
       - "xai/<model>"         → ("xai", "<model>")
       - "mistral/<model>"     → ("mistral", "<model>")
+      - "loop/<name>"         → ("loop", "<name>")  Agent in the Loop, not a provider:
+                                an external MCP client answers, no key is involved
       - "claude-*"            → ("anthropic", "claude-*")
       - anything else         → ("openai", "<model>")
 
@@ -130,6 +132,8 @@ def parse_model_provider(model_name: str) -> tuple[str, str]:
         return ("xai", model_name[len("xai/"):])
     elif model_name.startswith("mistral/"):
         return ("mistral", model_name[len("mistral/"):])
+    elif model_name.startswith("loop/"):
+        return ("loop", model_name[len("loop/"):])
     elif model_name.startswith("claude-"):
         return ("anthropic", model_name)
     else:
@@ -165,6 +169,15 @@ def setup_llm(
     logger.info(f"Setting up LLM: {model_name}")
 
     provider, api_model = parse_model_provider(model_name)
+
+    if provider == "loop":
+        from agent_in_the_loop import loop_enabled
+        if not loop_enabled():
+            raise ValueError(
+                "Agent in the Loop is turned off on this deployment (AGENT_IN_THE_LOOP_ENABLED)."
+            )
+        from agent_in_the_loop.model import LoopChatModel
+        return LoopChatModel()
 
     if provider == "custom":
         if not custom_llm_config:
@@ -291,7 +304,7 @@ def setup_llm(
             base_url="https://openrouter.ai/api/v1",
             temperature=0,
             default_headers={
-                "HTTP-Referer": "https://redamon.dev",
+                "HTTP-Referer": "https://www.redamon.org",
                 "X-Title": "RedAmon Agent",
             },
         )
@@ -455,6 +468,23 @@ def _resolve_provider_key(
     return None
 
 
+# Every setup_llm refusal for a missing key or provider row says this, and only those do.
+_MISSING_CREDENTIALS_MARKER = " is required for model "
+
+
+def llm_setup_failure(model: str, exc: BaseException) -> dict:
+    """Why `model` could not be built, in the words an error frame may carry.
+
+    A missing key or provider row is `llm_not_configured`: the person has to add
+    one. Anything else (an SDK refusing its arguments, a non-chat provider row,
+    a bad option) is `llm_setup_failed` with the exception's class, never its
+    text: a client constructor's validation error can echo the key it was given.
+    """
+    if isinstance(exc, ValueError) and _MISSING_CREDENTIALS_MARKER in str(exc):
+        return {"code": "llm_not_configured", "model": model}
+    return {"code": "llm_setup_failed", "model": model, "error_class": type(exc).__name__}
+
+
 def apply_project_settings(orchestrator, project_id: str) -> None:
     """Load project settings from webapp API and reconfigure LLM if model changed."""
     settings = load_project_settings(project_id)
@@ -515,8 +545,10 @@ def apply_project_settings(orchestrator, project_id: str) -> None:
         except (ValueError, Exception) as e:
             logger.error(f"LLM setup failed for {new_model}: {type(e).__name__}: {e}")
             orchestrator.llm = None
+            orchestrator.llm_setup_failure = llm_setup_failure(new_model, e)
             set_llm_context(None)
             return
+        orchestrator.llm_setup_failure = None
 
         # Update Neo4j tool's LLM for text-to-Cypher queries
         if orchestrator.neo4j_manager:

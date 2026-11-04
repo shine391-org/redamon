@@ -1,18 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
-
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8090'
+import { MAX_CHAT_SKILL_CONTENT_SIZE } from '@/lib/userSkills'
+import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
+import { internalError, safeErrorCode, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 // Mirror the caps the manual POST path enforces so bulk import cannot be used
 // to bypass them (content size, per-user ceiling, description length).
-const MAX_CONTENT_SIZE = 50 * 1024 // 50KB
 const MAX_SKILLS_PER_USER = 50
 const MAX_DESCRIPTION = 500
 
 interface RouteParams {
   params: Promise<{ id: string }>
 }
+
+type SkipReason = 'duplicate' | 'limit' | 'fetchFailed' | 'tooLarge' | 'invalid' | 'saveFailed'
 
 // POST /api/users/[id]/chat-skills/import-community - Import all chat skills from agentic catalog
 export async function POST(request: NextRequest, { params }: RouteParams) {
@@ -21,18 +23,22 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const __denied = await requireUserAccess(request, id)
     if (__denied) return __denied
 
-    // Fetch the chat skills catalog from agentic /skills endpoint
-    const catalogRes = await fetch(`${AGENT_API_URL}/skills`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      cache: 'no-store',
-    })
+    let catalogRes: Response
+    try {
+      catalogRes = await agentFetch('/skills', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+      })
+    } catch (error) {
+      if (error instanceof AgentUnreachableError) {
+        return upstreamFailureResponse('agent', error.cause_, 'Failed to fetch skills catalog from agent service')
+      }
+      throw error
+    }
 
     if (!catalogRes.ok) {
-      return NextResponse.json(
-        { error: 'Failed to fetch skills catalog from agent service' },
-        { status: 502 }
-      )
+      return upstreamErrorResponse('agent', catalogRes, 'Failed to fetch skills catalog from agent service')
     }
 
     const catalog = await catalogRes.json()
@@ -46,68 +52,79 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const existingNames = new Set(existingSkills.map((s) => s.name))
 
     let imported = 0
-    let skipped = 0
     let total = existingSkills.length
+    const skippedBy: Record<SkipReason, number> = {
+      duplicate: 0, limit: 0, fetchFailed: 0, tooLarge: 0, invalid: 0, saveFailed: 0,
+    }
 
     for (const skill of skills) {
       if (existingNames.has(skill.name)) {
-        skipped++
+        skippedBy.duplicate++
         continue
       }
 
       if (total >= MAX_SKILLS_PER_USER) {
-        skipped++
+        skippedBy.limit++
         continue
       }
 
-      // Fetch full content for this skill
+      let skillData: Record<string, unknown>
       try {
-        const contentRes = await fetch(`${AGENT_API_URL}/skills/${encodeURIComponent(skill.id)}`, {
+        const contentRes = await agentFetch(`/skills/${encodeURIComponent(skill.id)}`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
         })
-
         if (!contentRes.ok) {
-          skipped++
+          skippedBy.fetchFailed++
           continue
         }
+        const parsed: unknown = await contentRes.json()
+        skillData = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
+      } catch {
+        skippedBy.fetchFailed++
+        continue
+      }
 
-        const skillData = await contentRes.json()
+      const content = typeof skillData.content === 'string' ? skillData.content : ''
+      if (!content) {
+        skippedBy.invalid++
+        continue
+      }
+      if (content.length > MAX_CHAT_SKILL_CONTENT_SIZE) {
+        skippedBy.tooLarge++
+        continue
+      }
+      const rawDescription = skillData.description || skill.description || null
+      const description = typeof rawDescription === 'string'
+        ? rawDescription.slice(0, MAX_DESCRIPTION)
+        : null
 
-        const content = typeof skillData.content === 'string' ? skillData.content : ''
-        if (!content || content.length > MAX_CONTENT_SIZE) {
-          skipped++
-          continue
-        }
-        const rawDescription = skillData.description || skill.description || null
-        const description = typeof rawDescription === 'string'
-          ? rawDescription.slice(0, MAX_DESCRIPTION)
-          : null
-
+      try {
         await prisma.userChatSkill.create({
           data: {
             userId: id,
-            name: skillData.name || skill.name,
+            name: (skillData.name as string) || skill.name,
             description,
-            category: skillData.category || skill.category || 'general',
+            category: (skillData.category as string) || skill.category || 'general',
             content,
           },
         })
-
-        imported++
-        total++
-      } catch {
-        skipped++
+      } catch (error) {
+        // Counted, not fatal: the skills saved before it stay saved. Its code only, as in the
+        // batch upload: a Prisma message can quote the skill's text.
+        console.error('Failed to save a community chat skill:', safeErrorCode(error))
+        skippedBy.saveFailed++
+        continue
       }
+
+      imported++
+      total++
     }
 
-    return NextResponse.json({ imported, skipped, total: skills.length })
+    const skipped = Object.values(skippedBy).reduce((a, b) => a + b, 0)
+    return NextResponse.json({ imported, skipped, skippedBy, total: skills.length })
   } catch (error) {
-    console.error('Failed to import community chat skills:', error)
-    return NextResponse.json(
-      { error: 'Failed to import community chat skills' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to import community chat skills')
   }
 }

@@ -59,7 +59,16 @@ describe('runner states', () => {
     vi.stubEnv('PLUGIN_RUNNER_URL', base)
     const res = await GET()
     expect(res.status).toBe(200)
-    expect((await res.json()).runner).toEqual({ reachable: false, error: 'runner_unavailable' })
+    // The reason tells a stopped runner from a slow one or a garbled answer.
+    expect((await res.json()).runner).toEqual({ reachable: false, error: 'runner_unavailable', reason: 'unreachable' })
+  })
+
+  test('the proxy answering for a runner it could not reach: its code rides along', async () => {
+    const s = await startFakeServer({ 'GET /runner/v1/health': { status: 504, body: { error: 'upstream timed out', code: 'upstream_timeout' } } })
+    vi.stubEnv('PLUGIN_RUNNER_URL', s.baseUrl)
+    const res = await GET()
+    expect(res.status).toBe(200)
+    expect((await res.json()).runner).toEqual({ reachable: false, error: 'runner_unavailable', reason: 'timeout', proxyCode: 'upstream_timeout' })
   })
 
   test.each([[{}], [{ platformVersion: '1.0.0', state: 'ok', workers: 'none' }], [[1, 2]]])(
@@ -68,20 +77,20 @@ describe('runner states', () => {
       vi.stubEnv('PLUGIN_RUNNER_URL', s.baseUrl)
       const res = await GET()
       expect(res.status).toBe(200)
-      expect((await res.json()).runner).toEqual({ reachable: false, error: 'runner_unavailable' })
+      expect((await res.json()).runner).toEqual({ reachable: false, error: 'runner_unavailable', reason: 'bad_response' })
     })
 
   test('a runner with another key: reachable false, unauthorized', async () => {
     const r = await startFakeRunner({ runnerKey: 'o'.repeat(64) })
     vi.stubEnv('PLUGIN_RUNNER_URL', r.baseUrl)
-    expect((await (await GET()).json()).runner).toEqual({ reachable: false, error: 'unauthorized' })
+    expect((await (await GET()).json()).runner).toEqual({ reachable: false, error: 'unauthorized', upstreamStatus: 401 })
   })
 
   test('no key configured: reachable false without a request', async () => {
     const r = await startFakeRunner({ runnerKey: KEY })
     vi.stubEnv('PLUGIN_RUNNER_URL', r.baseUrl)
     vi.stubEnv('PLUGIN_RUNNER_KEY', '')
-    expect((await (await GET()).json()).runner).toEqual({ reachable: false, error: 'runner_not_configured' })
+    expect((await (await GET()).json()).runner).toEqual({ reachable: false, error: 'runner_not_configured', reason: 'not_configured' })
     expect(r.server.calls).toHaveLength(0)
   })
 })

@@ -41,3 +41,8 @@ coverage
 .gitignore
 docker-compose*.yml
 Dockerfile*
+
+# Keep local environment and backup files out of the image.
+.env*
+!.env.example
+*.bak

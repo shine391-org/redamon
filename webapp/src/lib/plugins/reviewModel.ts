@@ -2,7 +2,7 @@ import * as ov from './overrides'
 import { skillDisplayName } from './overrideOps'
 import { dormantReason, findInstall, type DormantReason } from './registry'
 import { addedRiskLines, type RiskLine } from './riskFlags'
-import { SkillPartsRegistryError, clearSkillPartsCache, registrySkill, type RegistrySkill } from './skillPartsRegistry'
+import { SkillPartsRegistryError, clearSkillPartsCache, registryFailureText, registrySkill, type RegistrySkill } from './skillPartsRegistry'
 import { buildUserSkillReviewModel, type UserSkillReviewModel } from './userSkillReviewModel'
 
 /**
@@ -53,6 +53,8 @@ export interface ReviewModel {
   pendingCount: number
   /** The agent registry could not be read: factory texts are unknown, approval will refuse. */
   registryError: 'agent_unreachable' | 'agent_outdated' | null
+  /** With a registryError: why, in words (the agent's HTTP status, or the errno of no answer). */
+  registryErrorText?: string
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
@@ -84,12 +86,15 @@ export async function buildReviewModel(
 
   let skill: RegistrySkill | null = null
   let registryError: ReviewModel['registryError'] = null
+  let registryErrorText: string | null = null
   try {
     clearSkillPartsCache()
     skill = await registrySkill(group)
   } catch (e) {
-    if (e instanceof SkillPartsRegistryError && (e.code === 'agent_unreachable' || e.code === 'agent_outdated')) registryError = e.code
-    else throw e
+    if (e instanceof SkillPartsRegistryError && (e.code === 'agent_unreachable' || e.code === 'agent_outdated')) {
+      registryError = e.code
+      registryErrorText = registryFailureText(e)
+    } else throw e
   }
   const factory = new Map((skill?.parts ?? []).map((p) => [p.partId, p]))
 
@@ -164,5 +169,6 @@ export async function buildReviewModel(
     dormantReason: dormantReason(install, { agentSupportsSeam: registryError !== 'agent_outdated' }),
     pendingCount: pending,
     registryError,
+    ...(registryErrorText ? { registryErrorText } : {}),
   }
 }

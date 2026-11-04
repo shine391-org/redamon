@@ -111,9 +111,9 @@ describe('rows', () => {
     expect(screen.getByTestId('skill-upload-summary').textContent).toMatch(/^3 files · \d ready/)
   })
 
-  test('a file over 50 KB and a .txt file are excluded with their reason; Upload counts only the valid rows', async () => {
+  test('a file over MAX_CONTENT_SIZE and a .txt file are excluded with their reason; Upload counts only the valid rows', async () => {
     draw([HEADING, { name: 'huge.md', text: 'x'.repeat(MAX_CONTENT_SIZE + 1) }, { name: 'notes.txt', text: 'plain' }])
-    expect(within(row('huge.md')).getByText("Larger than 50 KB: it can't be uploaded.")).toBeInTheDocument()
+    expect(within(row('huge.md')).getByText("Larger than 500 KB: it can't be uploaded.")).toBeInTheDocument()
     expect(within(row('notes.txt')).getByText('Not a Markdown file.')).toBeInTheDocument()
     expect(screen.getByLabelText('Include huge.md')).toBeDisabled()
     expect(screen.getByLabelText('Include huge.md')).not.toBeChecked()
@@ -217,7 +217,7 @@ describe('Upload', () => {
     draw(files)
     await ready()
     fireEvent.click(uploadButton())
-    expect(await screen.findByText(/^This batch is 8\.\d MB, above the 8 MB limit\. Remove some files, or upload them in two batches\.$/)).toBeInTheDocument()
+    expect(await screen.findByText(/^This batch is 8\.\d MB, above the 8 MB limit\. Remove some files, or upload them in smaller batches\.$/)).toBeInTheDocument()
     expect(batches()).toHaveLength(0)
   })
 

@@ -7,6 +7,8 @@
 
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { buildAgentWsUrl } from './agentWsUrl'
+import { mintWsTicket } from '@/lib/wsTicket'
+import { closeEventText, isAbnormalClose, socketErrorText } from '@/lib/triage/socketErrors'
 import {
   CypherFixCodeFixMessageType,
   type ActivityEntry,
@@ -118,26 +120,17 @@ export function useCypherFixCodeFixWS({
 
     // STRIDE S4: mint a ws-ticket before dialing; the agent fails closed now.
     const sessionId = `codefix-${Date.now()}`
-    let ticket: string | null = null
-    try {
-      const resp = await fetch('/api/agent/ws-ticket', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, sessionId }),
-      })
-      if (resp.ok) ticket = (await resp.json())?.ticket ?? null
-    } catch {
-      ticket = null
-    }
-    if (!ticket) {
+    const minted = await mintWsTicket(projectId, sessionId)
+    if (!minted.ok) {
       connectingRef.current = false
       wsRef.current = null
       setStatus('error')
-      setError('CodeFix authentication failed (could not obtain a ticket)')
+      setError(`CodeFix authentication failed (could not obtain a ticket): ${minted.error.message}`)
       return
     }
 
-    const url = getWebSocketUrl(ticket)
+    // A null ticket is a deployment without ticket signing, not a failure.
+    const url = getWebSocketUrl(minted.ticket ?? undefined)
     const ws = new WebSocket(url)
     wsRef.current = ws
     connectingRef.current = false
@@ -296,7 +289,7 @@ export function useCypherFixCodeFixWS({
         }
 
         case CypherFixCodeFixMessageType.ERROR: {
-          const errMsg = (payload as { message?: string }).message || 'Unknown error'
+          const errMsg = socketErrorText(payload)
           const errCode = (payload as { code?: unknown }).code
           setError(errMsg)
           setErrorCode(typeof errCode === 'string' ? errCode : null)
@@ -320,7 +313,7 @@ export function useCypherFixCodeFixWS({
       setStatus('error')
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       wsRef.current = null
       isAuthenticatedRef.current = false
       if (pingIntervalRef.current) {
@@ -329,6 +322,12 @@ export function useCypherFixCodeFixWS({
       }
       if (status !== 'completed' && status !== 'error') {
         setStatus('disconnected')
+      }
+      // onerror carries nothing; the close code and the agent's reason (an
+      // expired ticket, a restart) are the only account of what happened.
+      if (event && isAbnormalClose(event)) {
+        setError(closeEventText('The connection to the CodeFix agent closed', event))
+        setStatus(s => (s === 'completed' ? s : 'error'))
       }
     }
   }, [enabled, userId, projectId, getWebSocketUrl, sendMessage, pushLog, onDiffBlock, onPRCreated, onComplete, onError, status])

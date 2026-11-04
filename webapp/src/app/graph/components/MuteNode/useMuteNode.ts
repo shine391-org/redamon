@@ -10,6 +10,8 @@
  */
 import { useCallback, useState } from 'react'
 import { useAlertModal, useToast } from '@/components/ui'
+import { toApiError } from '@/lib/apiError'
+import { triageBodyErrorText } from '@/lib/triage/errorText'
 
 /** A node to mute, by exactly one of its two keys. */
 export interface MuteTarget {
@@ -91,7 +93,7 @@ export function useMuteNode(
           )
         }
         if (!res.ok || !body.muted) {
-          throw new Error(body.error || 'The finding could not be muted.')
+          throw new Error(triageBodyErrorText(body, res.status, 'The finding could not be muted.'))
         }
         callbacks.onMuted?.()
         toast.addToast({
@@ -104,7 +106,9 @@ export function useMuteNode(
           ...(onViewMuted ? { action: { label: 'View muted', onClick: onViewMuted } } : {}),
         })
       } catch (e) {
-        await alertError(e instanceof Error ? e.message : 'Mute failed', 'Mute finding')
+        // A TypeError is fetch getting no answer; its own text says nothing.
+        await alertError(e instanceof Error && !(e instanceof TypeError)
+          ? e.message : toApiError(e, 'The finding could not be muted.').message, 'Mute finding')
       } finally {
         setMutingKey(null)
       }

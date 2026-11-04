@@ -11,6 +11,7 @@ import { CredentialShortcut } from '@/components/settings/CredentialShortcut'
 import { useCredentialKeys, type CredentialKeysApi } from '@/hooks/useCredentialKeys'
 import { SCAN_TARGET_FOLDERS } from '@/lib/trufflehogSources'
 import { copyText } from '@/lib/copyText'
+import { readApiError, toApiError } from '@/lib/apiError'
 import {
   TRUFFLEHOG_DETECTOR_COUNT,
   filterDetectors,
@@ -72,6 +73,9 @@ export function TrufflehogSection({ data, updateField, projectId, mode = 'edit',
   const [profiles, setProfiles] = useState<TrufflehogProfile[]>([])
   const [addingSource, setAddingSource] = useState('')
   const [error, setError] = useState('')
+  // Kept apart from `error`: a failed list must read as a failure, not as "no
+  // sources configured", and must not be cleared by the next add or save.
+  const [listError, setListError] = useState('')
   const [expanded, setExpanded] = useState<string | null>(null)
   // The raw text of the concurrency box while it is being edited. The stored
   // setting is an Int, so it cannot hold the empty string the user must pass
@@ -85,13 +89,15 @@ export function TrufflehogSection({ data, updateField, projectId, mode = 'edit',
 
   const loadProfiles = useCallback(async () => {
     if (!canManageProfiles) return
+    // A failed list must not break the whole project form, only say why.
     try {
       const res = await fetch(`/api/trufflehog/${projectId}/profiles`)
-      if (!res.ok) return
+      if (!res.ok) throw await readApiError(res, 'Could not load the sources')
       const body = await res.json()
       setProfiles(body.profiles ?? [])
-    } catch {
-      // A failed list must not break the whole project form.
+      setListError('')
+    } catch (e) {
+      setListError(toApiError(e, 'Could not load the sources').message)
     }
   }, [canManageProfiles, projectId])
 
@@ -132,13 +138,19 @@ export function TrufflehogSection({ data, updateField, projectId, mode = 'edit',
   const addProfile = async () => {
     if (!addingSource || !projectId) return
     setError('')
-    const res = await fetch(`/api/trufflehog/${projectId}/profiles`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: addingSource, config: {} }),
-    })
-    const body = await res.json().catch(() => ({}))
-    if (!res.ok) { setError(body.error ?? 'Could not add the source'); return }
+    let body: { profile?: { id?: string } }
+    try {
+      const res = await fetch(`/api/trufflehog/${projectId}/profiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: addingSource, config: {} }),
+      })
+      if (!res.ok) { setError((await readApiError(res, 'Could not add the source')).message); return }
+      body = await res.json().catch(() => ({}))
+    } catch (e) {
+      setError(toApiError(e, 'Could not add the source').message)
+      return
+    }
     setAddingSource('')
     setExpanded(body.profile?.id ?? null)
     await loadProfiles()
@@ -148,20 +160,34 @@ export function TrufflehogSection({ data, updateField, projectId, mode = 'edit',
     if (!projectId) return
     setError('')
     setProfiles(prev => prev.map(p => (p.id === profile.id ? { ...p, config } : p)))
-    const res = await fetch(`/api/trufflehog/${projectId}/profiles/${profile.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ config }),
-    })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      setError(body.error ?? 'Could not save the source')
+    let failure = ''
+    try {
+      const res = await fetch(`/api/trufflehog/${projectId}/profiles/${profile.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config }),
+      })
+      if (!res.ok) failure = (await readApiError(res, 'Could not save the source')).message
+    } catch (e) {
+      failure = toApiError(e, 'Could not save the source').message
+    }
+    if (failure) {
+      // The card keeps what was typed (it owns its edits), so the list goes back
+      // to what the server holds and the message says the edit is not saved.
+      setProfiles(prev => prev.map(p => (p.id === profile.id ? { ...p, config: profile.config } : p)))
+      setError(`${failure}. The last change to ${TRUFFLEHOG_SOURCES[profile.source]?.label ?? profile.source} is not saved.`)
     }
   }
 
   const deleteProfile = async (profile: TrufflehogProfile) => {
     if (!projectId) return
-    await fetch(`/api/trufflehog/${projectId}/profiles/${profile.id}`, { method: 'DELETE' })
+    setError('')
+    try {
+      const res = await fetch(`/api/trufflehog/${projectId}/profiles/${profile.id}`, { method: 'DELETE' })
+      if (!res.ok) setError((await readApiError(res, 'Could not remove the source')).message)
+    } catch (e) {
+      setError(toApiError(e, 'Could not remove the source').message)
+    }
     await loadProfiles()
   }
 
@@ -214,7 +240,14 @@ export function TrufflehogSection({ data, updateField, projectId, mode = 'edit',
                 </div>
               )}
 
-              {profiles.length === 0 && (
+              {listError && (
+                <div className={`${styles.callout} ${styles.calloutDanger}`} role="alert">
+                  <AlertTriangle size={16} />
+                  <span>{listError}</span>
+                </div>
+              )}
+
+              {!listError && profiles.length === 0 && (
                 <p className={styles.fieldHint}>
                   No sources configured yet. Add one below to make it startable from Other Scans.
                 </p>

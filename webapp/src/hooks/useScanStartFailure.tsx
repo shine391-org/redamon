@@ -13,6 +13,7 @@
 import { useCallback } from 'react'
 import { useAlertModal } from '@/components/ui/AlertModal/AlertModal'
 import { classifyStartFailure } from '@/lib/scanStartOutcome'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import type { ScanStartError } from '@/lib/scanStartError'
 
 export type StartFailureOutcome = 'queued' | 'cancelled' | 'shown'
@@ -40,11 +41,12 @@ export function useScanStartFailure(projectId: string | null) {
       payload: Record<string, unknown> = {},
     ): Promise<StartFailureOutcome> => {
       const message = err?.message || 'The scan could not be started.'
-      const cls = classifyStartFailure(err?.status, { error: message, limit: err?.limit })
+      const cls = classifyStartFailure(err?.status, { error: message, limit: err?.limit, code: err?.code })
 
-      // Permanent: no point queueing. Today's single-button behaviour.
+      // Permanent: no point queueing. The code and status say why, for a bug report.
       if (!cls.temporary) {
-        await alertError(message, permanentTitle(err))
+        const why = formatApiError({ reason: message, code: err?.code, status: err?.status ?? 0, upstreamStatus: err?.upstreamStatus })
+        await alertError(why, permanentTitle(err))
         return 'shown'
       }
 
@@ -82,14 +84,13 @@ export function useScanStartFailure(projectId: string | null) {
           body: JSON.stringify({ kind, payload }),
         })
         if (!res.ok) {
-          const d = await res.json().catch(() => ({}))
-          await alertError(d.error || 'Could not add this scan to the queue.')
+          await alertError((await readApiError(res, 'Could not add this scan to the queue.')).message)
           return 'shown'
         }
         await alert('Added to the scan queue. It will start automatically when resources free up.', 'Queued')
         return 'queued'
-      } catch {
-        await alertError('Could not add this scan to the queue.')
+      } catch (e) {
+        await alertError(toApiError(e, 'Could not add this scan to the queue.').message)
         return 'shown'
       }
     },

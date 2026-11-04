@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getSession } from '@/lib/session'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 import { releaseUserSkill, userSkillErrorResponse } from '@/lib/userSkillWrites'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; skillId: string }>
@@ -29,7 +30,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   } catch (error) {
     const refused = userSkillErrorResponse(error)
     if (refused) return refused
-    console.error('Failed to release attack skill:', error)
-    return NextResponse.json({ error: 'Failed to release the skill' }, { status: 500 })
+    return internalError(error, 'Failed to release the skill', { log: 'Failed to release attack skill' })
   }
 }

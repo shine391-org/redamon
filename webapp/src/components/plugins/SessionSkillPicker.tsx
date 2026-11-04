@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Loader2, RotateCw } from 'lucide-react'
 import { Modal } from '@/components/ui/Modal/Modal'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import type { ActionContext } from './host/actionClient'
 import styles from './SessionSkillPicker.module.css'
 
@@ -35,11 +36,28 @@ const REASON: Record<NonNullable<PickerSkill['reason']>, string> = {
   quarantined: 'quarantined',
 }
 
+/** Why the agent could not say whether it is running here (the route's `agentCheck`). */
+interface AgentCheck {
+  code?: string
+  upstreamStatus?: number
+  cause?: string
+}
+
 type Load =
   | { state: 'loading' }
   | { state: 'failed'; message: string }
   | { state: 'unavailable' }
-  | { state: 'ready'; running: boolean | 'unverified'; skills: PickerSkill[]; suggested: string | null }
+  | { state: 'ready'; running: boolean | 'unverified'; agentCheck?: AgentCheck; skills: PickerSkill[]; suggested: string | null }
+
+const READ_FAILED = 'The skills of this session could not be read'
+
+/** "agent_unreachable · ECONNREFUSED", "agent_error · agent HTTP 500": what to check, in a few words. */
+function agentCheckText(check: AgentCheck | undefined): string {
+  if (!check) return ''
+  const parts = [check.code, check.cause, check.upstreamStatus ? `agent HTTP ${check.upstreamStatus}` : undefined]
+    .filter((p): p is string => typeof p === 'string' && /^[\w .:-]{1,64}$/.test(p))
+  return parts.length ? ` (${parts.join(' · ')})` : ''
+}
 
 /**
  * The core's skill picker (platform 1.1.0), opened by a chat action whose manifest item says
@@ -75,6 +93,22 @@ export function SessionSkillPicker({
     if (context.projectId) qs.set('projectId', context.projectId)
     fetch(`/api/plugins/${encodeURIComponent(pluginId)}/session-skills?${qs}`)
       .then(async (res) => {
+        if (!res.ok) {
+          const err = await readApiError(res, READ_FAILED)
+          if (cancelled) return
+          if (PLUGIN_GONE.has(err.code ?? '')) {
+            // The gear menu's list is cached; this plugin should leave it now.
+            void queryClient.invalidateQueries({ queryKey: ['plugins', 'contributions'] })
+            setLoad({ state: 'unavailable' })
+            return
+          }
+          if (res.status === 404) {
+            setLoad({ state: 'failed', message: 'This session was not found. Send the agent a message first, then try again.' })
+            return
+          }
+          setLoad({ state: 'failed', message: err.message })
+          return
+        }
         const body = await res.json().catch(() => null)
         if (cancelled) return
         if (PLUGIN_GONE.has(body?.code)) {
@@ -87,17 +121,17 @@ export function SessionSkillPicker({
           setLoad({ state: 'failed', message: 'This session was not found. Send the agent a message first, then try again.' })
           return
         }
-        if (!res.ok || !body || !Array.isArray(body.skills)) {
-          setLoad({ state: 'failed', message: typeof body?.error === 'string' ? body.error : 'The skills of this session could not be read.' })
+        if (!body || !Array.isArray(body.skills)) {
+          setLoad({ state: 'failed', message: formatApiError({ reason: READ_FAILED, code: 'invalid_answer', status: res.status }) })
           return
         }
         const skills = body.skills as PickerSkill[]
         const suggested = typeof body.suggested === 'string' ? body.suggested : null
-        setLoad({ state: 'ready', running: body.running, skills, suggested })
+        setLoad({ state: 'ready', running: body.running, agentCheck: body.agentCheck ?? undefined, skills, suggested })
         setChosen(suggested)
       })
-      .catch(() => {
-        if (!cancelled) setLoad({ state: 'failed', message: 'The skills of this session could not be read.' })
+      .catch((e) => {
+        if (!cancelled) setLoad({ state: 'failed', message: toApiError(e, READ_FAILED).message })
       })
     return () => { cancelled = true }
   }, [pluginId, context.sessionId, context.projectId, generation, queryClient])
@@ -151,7 +185,7 @@ export function SessionSkillPicker({
           )}
           {unverified && (
             <div className={styles.notice} role="status">
-              RedAmon could not confirm that the agent has stopped in this session.
+              RedAmon could not confirm that the agent has stopped in this session{agentCheckText(ready.agentCheck)}.
               <button type="button" className="secondaryButton" onClick={retry}><RotateCw size={13} /> Check again</button>
             </div>
           )}

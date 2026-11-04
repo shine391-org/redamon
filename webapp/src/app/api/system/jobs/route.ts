@@ -16,6 +16,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 export const runtime = 'nodejs'
 
@@ -165,7 +166,7 @@ const SCAN_SELECT = {
   project: { select: { name: true } },
 } as const
 
-export async function GET(_request: NextRequest) {
+export const GET = withRouteErrors('Could not load scan activity', async (_request: NextRequest) => {
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
 
@@ -327,10 +328,6 @@ export async function GET(_request: NextRequest) {
       ledger,
     })
   } catch (error) {
-    console.error('[jobQueue] system/jobs failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
-    )
+    return internalError(error, 'Could not load scan activity', { log: '[jobQueue] system/jobs failed' })
   }
-}
+})

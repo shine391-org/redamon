@@ -230,7 +230,7 @@ export interface PartialReconParams {
  *  recon_orchestrator/batch_scope.py. */
 export const PARTIAL_RECON_OVERRIDE_KEYS = ['CVE_LOOKUP_ENABLED', 'MITRE_ENABLED', 'SECURITY_CHECK_ENABLED'] as const
 
-export const PARTIAL_RECON_SUPPORTED_TOOLS = new Set(['SubdomainDiscovery', 'Naabu', 'Masscan', 'Nmap', 'Tlsx', 'Httpx', 'IpAttribution', 'Katana', 'OpenAPI', 'ZapAjaxSpider', 'Hakrawler', 'Jsluice', 'Gau', 'Kiterunner', 'ParamSpider', 'Arjun', 'Ffuf', 'EndpointAiClassifier', 'AiSurfaceRecon', 'JsRecon', 'SerializedScan', 'SupplyChainRecon', 'GraphqlScan', 'Nuclei', 'SubdomainTakeover', 'VhostSni', 'WebCachePoison', 'SecurityChecks', 'Shodan', 'Urlscan', 'Uncover', 'OsintEnrichment', 'OriginDiscovery'])
+export const PARTIAL_RECON_SUPPORTED_TOOLS = new Set(['SubdomainDiscovery', 'Naabu', 'Masscan', 'Nmap', 'Tlsx', 'Httpx', 'IpAttribution', 'Katana', 'OpenAPI', 'ZapAjaxSpider', 'Hakrawler', 'Jsluice', 'Gau', 'Kiterunner', 'ParamSpider', 'Arjun', 'Ffuf', 'EndpointAiClassifier', 'AiSurfaceRecon', 'JsRecon', 'SerializedScan', 'RouteExposure', 'SupplyChainRecon', 'GraphqlScan', 'Nuclei', 'SubdomainTakeover', 'VhostSni', 'WebCachePoison', 'SecurityChecks', 'Shodan', 'Urlscan', 'Uncover', 'OsintEnrichment', 'OriginDiscovery'])
 
 /**
  * A partial run's phase count. The orchestrator pins every partial-run log

@@ -43,3 +43,20 @@ describe('useApplyRun', () => {
     expect(onFinished).toHaveBeenCalledWith({ id: 'run1', status: 'completed' })
   })
 })
+
+describe('useApplyRun: a refused apply', () => {
+  test("throws the agent's sentence with the code and both statuses", async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({
+      error: 'this run is already being applied', code: 'agent_error', upstreamStatus: 409,
+    }), { status: 409 }))))
+    const { result } = renderHook(() => useApplyRun('p1', null, vi.fn()))
+    await expect(result.current.apply('current', 3, 'v7')).rejects.toThrow(
+      'this run is already being applied (agent_error · HTTP 409 · upstream HTTP 409)')
+  })
+
+  test("a proxy's error page is read with its status", async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('<html>502</html>', { status: 502 }))))
+    const { result } = renderHook(() => useApplyRun('p1', null, vi.fn()))
+    await expect(result.current.apply('current', 3, 'v7')).rejects.toThrow('Apply failed (non_json_response · HTTP 502)')
+  })
+})

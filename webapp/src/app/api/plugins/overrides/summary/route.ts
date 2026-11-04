@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { getEffectiveUser } from '@/lib/session'
+import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import { buildSummaryModel } from '@/lib/plugins/summaryModel'
 
 /**
@@ -11,7 +12,7 @@ import { buildSummaryModel } from '@/lib/plugins/summaryModel'
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export async function GET(request: NextRequest) {
+export const GET = pluginRoute('override summary', 'The plugin skill versions could not be read; see the webapp log.', async (request: NextRequest) => {
   const eff = await getEffectiveUser()
   if (!eff) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const projectId = new URL(request.url).searchParams.get('projectId')
@@ -19,4 +20,4 @@ export async function GET(request: NextRequest) {
   const model = await buildSummaryModel(eff.userId, projectId)
   if (!model) return NextResponse.json({ error: 'Not found', code: 'not_found' }, { status: 404 })
   return NextResponse.json(model, { headers: { 'Cache-Control': 'no-store' } })
-}
+})

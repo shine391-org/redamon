@@ -13,12 +13,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { writeAudit } from '@/lib/audit'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
 }
 
-export async function DELETE(request: NextRequest, { params }: RouteParams) {
+export const DELETE = withRouteErrors('Failed to clear run history', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -58,10 +59,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ ok: true, deleted })
   } catch (error) {
-    console.error('[scanTimeline] run-history delete failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to clear run history' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to clear run history', { log: '[scanTimeline] run-history delete failed' })
   }
-}
+})

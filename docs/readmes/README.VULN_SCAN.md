@@ -152,6 +152,16 @@ Product names are mapped to CPEs (Common Platform Enumeration) by the `CPE_MAPPI
 | **Security** | OpenSSH, OpenSSL |
 | **Other** | Varnish, HAProxy, Grafana, Jenkins, GitLab |
 
+A name the table does not know is retried without the words nmap puts after a product and without a leading vendor word (`Exim smtpd`, `PostgreSQL DB`, `ISC BIND`), so it still reaches the exact CPE query when the shorter name is in the table.
+
+A product outside the table is looked up by an NVD keyword search on its name alone, since a CVE's text gives a range ("before 1.13.0") rather than the version found. That only proves the name occurs somewhere in a CVE's text, so a hit is kept only when the CVE's NVD configuration lists that product (or, for a name that is the vendor, an edition of it such as `liferay_portal` for Liferay, but not a separate product such as `elementor_pro`) as vulnerable at a version inside its affected range. A CVE NVD has not analysed carries no configuration, and many are "Deferred" for good; it is kept only when its text names the product directly followed by the version (`mini_httpd 1.30`).
+
+For an nmap service outside the table, the CPE nmap reported is also matched by NVD, under any vendor, against every CVE's configuration. This finds the CVEs whose text never names the product: Webmin's behind nmap's `MiniServ`, Zerologon for Samba.
+
+Every lookup reads NVD's whole answer (up to 4,000 CVEs) and keeps the `CVE_LOOKUP_MAX_CVES` with the highest CVSS. NVD lists the oldest CVEs first, so reading only the first `CVE_LOOKUP_MAX_CVES` kept the oldest and dropped the newest, often the most severe.
+
+httpx/Wappalyzer labels carry a version only after a colon (`Nginx:1.19.0`), so a label such as `HTTP/3` or `Microsoft 365` is a name with no version and is not looked up. Server headers, banners and nmap services keep the `Name/version` form.
+
 ### Example Output
 
 For a host whose responses name nginx 1.19.0 and PHP 5.6.40:

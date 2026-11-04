@@ -1,3 +1,4 @@
+import { readApiError, toApiError } from '@/lib/apiError'
 import { pluginFeatureId } from '@/lib/llmFeatures'
 import type { FeatureModelGateApi } from '@/components/shared/FeatureModelGate'
 
@@ -36,28 +37,35 @@ export type ActionAnswer =
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
-export function postPluginAction(
+/**
+ * A request that got no answer (offline, a reset connection) is a PluginActionError too,
+ * `network_error` with status 0, so every place that shows these errors shows it.
+ */
+export async function postPluginAction(
   pluginId: string,
   action: string,
   body: { context?: ActionContext; params?: Record<string, unknown> },
 ): Promise<Response> {
-  return fetch(`/api/plugins/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(action)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  try {
+    return await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/actions/${encodeURIComponent(action)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (e) {
+    const err = toApiError(e, 'The plugin action got no answer from RedAmon')
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false
+    throw new PluginActionError(err.code ?? 'network_error', offline ? `${err.message}; this browser is offline.` : `${err.message}.`, 0)
+  }
 }
 
 export async function readActionAnswer(res: Response): Promise<ActionAnswer> {
-  const body: unknown = await res.json().catch(() => null)
   if (!res.ok) {
-    const b = isObj(body) ? body : {}
-    throw new PluginActionError(
-      typeof b.code === 'string' ? b.code : `http_${res.status}`,
-      typeof b.error === 'string' ? b.error : `The plugin action failed (HTTP ${res.status}).`,
-      res.status,
-    )
+    // "reason (code · HTTP n · upstream HTTP m)": the runner's status rides along when it failed.
+    const err = await readApiError(res, 'The plugin action failed')
+    throw new PluginActionError(err.code ?? `http_${res.status}`, err.message, res.status)
   }
+  const body: unknown = await res.json().catch(() => null)
   if (isObj(body) && typeof body.jobId === 'string') {
     const pick = isObj(body.pick) && typeof body.pick.ref === 'string'
       ? { ref: body.pick.ref, name: typeof body.pick.name === 'string' ? body.pick.name : null }

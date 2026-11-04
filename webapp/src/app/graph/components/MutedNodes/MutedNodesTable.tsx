@@ -20,6 +20,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, ChevronRight, Download, Eye, Loader2, RotateCcw } from 'lucide-react'
 import { useAlertModal, useToast } from '@/components/ui'
+import { toApiError } from '@/lib/apiError'
+import { triageBodyErrorText } from '@/lib/triage/errorText'
 import { useProject } from '@/providers/ProjectProvider'
 import { downloadBlob, timestampSlug, toGuardedCsv, CSV_MIME } from '../../utils/exportHelpers'
 import {
@@ -29,6 +31,11 @@ import {
 } from './mutedNodes'
 import { NodeIdCell, NodeIdTh } from '../RedZoneTables/nodeId'
 import styles from './MutedNodesTable.module.css'
+
+/** A thrown route failure keeps its text; fetch's own TypeError ("Failed to fetch") becomes `network_error`. */
+function failureMessage(e: unknown, fallback: string): string {
+  return e instanceof Error && !(e instanceof TypeError) ? e.message : toApiError(e, fallback).message
+}
 
 const UNMUTE_TITLE =
   'Rules will not mute it again. To undo a whole rule, disable it and apply to the current graph.'
@@ -109,7 +116,7 @@ export function MutedNodesTable({ projectId, onOpenRule, focus }: MutedNodesTabl
     try {
       const res = await fetch(mutedQuery(projectId, filters, { offset, limit: PAGE_SIZE }, true))
       const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(body.error || `Muted Nodes: ${res.status}`)
+      if (!res.ok) throw new Error(triageBodyErrorText(body, res.status, 'Could not load the muted nodes'))
       // An older, slower response must not overwrite a newer filter's result.
       if (request !== requestRef.current) return
       const count = Number(body.total ?? 0)
@@ -125,7 +132,7 @@ export function MutedNodesTable({ projectId, onOpenRule, focus }: MutedNodesTabl
       setSelected(new Set())
     } catch (e) {
       if (request === requestRef.current) {
-        setError(e instanceof Error ? e.message : 'Could not load the muted nodes')
+        setError(failureMessage(e, 'Could not load the muted nodes'))
       }
     } finally {
       if (request === requestRef.current) setLoading(false)
@@ -155,7 +162,7 @@ export function MutedNodesTable({ projectId, onOpenRule, focus }: MutedNodesTabl
         body: JSON.stringify({ projectId, keys }),
       })
       const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(body.error || 'The findings could not be unmuted.')
+      if (!res.ok) throw new Error(triageBodyErrorText(body, res.status, 'The findings could not be unmuted.'))
       const n = Number(body.unmuted ?? 0)
       if (n === 0) {
         // The node was replaced (a rescan or an activation) since this page loaded.
@@ -167,7 +174,7 @@ export function MutedNodesTable({ projectId, onOpenRule, focus }: MutedNodesTabl
       }
       await load()
     } catch (e) {
-      await alertError(e instanceof Error ? e.message : 'Unmute failed', 'Unmute')
+      await alertError(failureMessage(e, 'The findings could not be unmuted.'), 'Unmute')
     } finally {
       setBusy(false)
     }
@@ -180,7 +187,7 @@ export function MutedNodesTable({ projectId, onOpenRule, focus }: MutedNodesTabl
     try {
       const res = await fetch(mutedQuery(projectId, filters, { offset: 0, limit: EXPORT_MAX }))
       const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(body.error || `Export: ${res.status}`)
+      if (!res.ok) throw new Error(triageBodyErrorText(body, res.status, 'The muted nodes could not be exported'))
       const all: MutedRow[] = body.findings ?? []
       const out = exportRows(all, userId)
       const name = `muted-nodes-${timestampSlug()}`
@@ -195,7 +202,7 @@ export function MutedNodesTable({ projectId, onOpenRule, focus }: MutedNodesTabl
         toast.warning(`Exported the first ${all.length.toLocaleString()} of ${Number(body.total).toLocaleString()} muted nodes.`)
       }
     } catch (e) {
-      await alertError(e instanceof Error ? e.message : 'Export failed', 'Export')
+      await alertError(failureMessage(e, 'The muted nodes could not be exported'), 'Export')
     } finally {
       setExporting(false)
     }

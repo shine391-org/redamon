@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AiAttackRunState, AiFinding, AiTarget } from '@/lib/aiAttackSurface'
-import type { ScanStartError } from '@/lib/scanStartError'
+import { readScanStartError, scanStartNetworkError, type ScanStartError } from '@/lib/scanStartError'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 
 export interface AiAttackLogLine {
   log: string
@@ -40,6 +41,8 @@ export interface LaunchPayload {
   auth_scheme?: string
 }
 
+const STOP_FAILED = 'Failed to stop AI Gauntlet scan'
+
 export function useAiAttackSurface(projectId: string | null) {
   const [targets, setTargets] = useState<AiTarget[]>([])
   const [findings, setFindings] = useState<AiFinding[]>([])
@@ -50,6 +53,12 @@ export function useAiAttackSurface(projectId: string | null) {
   const [stopping, setStopping] = useState(false)
   const [loadingTargets, setLoadingTargets] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Each read keeps its own error so a failed load never reads as "none found",
+  // and a failed poll keeps the last known run instead of making it look idle.
+  const [targetsError, setTargetsError] = useState<string | null>(null)
+  const [findingsError, setFindingsError] = useState<string | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
+  const [streamError, setStreamError] = useState<string | null>(null)
 
   const esRef = useRef<EventSource | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -69,10 +78,12 @@ export function useAiAttackSurface(projectId: string | null) {
     setLoadingTargets(true)
     try {
       const r = await fetch(`/api/ai-attack-surface/${projectId}/targets`)
+      if (!r.ok) throw await readApiError(r, 'Failed to load the LLM endpoints')
       const d = await r.json()
       setTargets(d.targets || [])
-    } catch {
-      setTargets([])
+      setTargetsError(null)
+    } catch (e) {
+      setTargetsError(toApiError(e, 'Failed to load the LLM endpoints').message)
     } finally {
       setLoadingTargets(false)
     }
@@ -82,10 +93,12 @@ export function useAiAttackSurface(projectId: string | null) {
     if (!projectId) return
     try {
       const r = await fetch(`/api/ai-attack-surface/${projectId}/findings`)
+      if (!r.ok) throw await readApiError(r, 'Failed to load AI Gauntlet findings')
       const d = await r.json()
       setFindings(d.findings || [])
-    } catch {
-      /* soft */
+      setFindingsError(null)
+    } catch (e) {
+      setFindingsError(toApiError(e, 'Failed to load AI Gauntlet findings').message)
     }
   }, [projectId])
 
@@ -93,14 +106,16 @@ export function useAiAttackSurface(projectId: string | null) {
     if (!projectId) return
     try {
       const r = await fetch(`/api/ai-attack-surface/${projectId}/${runId}/status`)
+      if (!r.ok) throw await readApiError(r, 'AI Gauntlet status unavailable')
       const d: AiAttackRunState = await r.json()
       setRun(d)
+      setStatusError(null)
       if (d.status === 'completed' || d.status === 'error') {
         stopStream()
         loadFindings()
       }
-    } catch {
-      /* soft */
+    } catch (e) {
+      setStatusError(toApiError(e, 'AI Gauntlet status unavailable').message)
     }
   }, [projectId, stopStream, loadFindings])
 
@@ -111,9 +126,10 @@ export function useAiAttackSurface(projectId: string | null) {
     stopStream()
     const es = new EventSource(`/api/ai-attack-surface/${projectId}/${runId}/logs`)
     esRef.current = es
+    setStreamError(null)
     // The server replays the full log history on (re)connect; reset our view on
     // open so a refresh/reconnect restores everything without duplicating lines.
-    es.onopen = () => { setLogs([]); setPhase({ name: null, num: null }) }
+    es.onopen = () => { setLogs([]); setPhase({ name: null, num: null }); setStreamError(null) }
     es.addEventListener('log', (ev: MessageEvent) => {
       try {
         const data = JSON.parse(ev.data) as AiAttackLogLine
@@ -125,7 +141,23 @@ export function useAiAttackSurface(projectId: string | null) {
         /* ignore malformed line */
       }
     })
-    es.onerror = () => es.close()
+    // A named `error` event is the orchestrator giving up on the stream. Its text
+    // is a raw exception, so it goes to the console, not the screen.
+    es.addEventListener('error', (ev: Event) => {
+      const data = (ev as MessageEvent).data
+      if (typeof data !== 'string' || !data) return
+      console.error('AI Gauntlet log stream error:', data)
+      setStreamError('Log stream lost: the orchestrator stopped streaming this run\'s logs')
+    })
+    es.addEventListener('complete', () => es.close())
+    // EventSource also lands here when the stream simply ended with the run: poll
+    // at once so a finished run reads as finished, and the page shows the loss
+    // only while the run is still live.
+    es.onerror = () => {
+      es.close()
+      setStreamError((prev) => prev ?? 'Log stream lost')
+      void pollStatus(runId)
+    }
     pollRef.current = setInterval(() => pollStatus(runId), 3000)
   }, [projectId, stopStream, pollStatus])
 
@@ -135,7 +167,10 @@ export function useAiAttackSurface(projectId: string | null) {
     if (!projectId || esRef.current) return
     try {
       const r = await fetch(`/api/ai-attack-surface/${projectId}/all`)
+      // An orchestrator that cannot list its runs is not "no run in flight".
+      if (!r.ok) throw await readApiError(r, 'AI Gauntlet status unavailable')
       const d = await r.json()
+      setStatusError(null)
       const active = (d.runs || []).find(
         (x: AiAttackRunState) => x.status === 'running' || x.status === 'starting')
       // Re-check after the await: a launch during the fetch may have attached a
@@ -144,8 +179,8 @@ export function useAiAttackSurface(projectId: string | null) {
         setRun(active)
         attachStream(active.run_id)
       }
-    } catch {
-      /* soft */
+    } catch (e) {
+      setStatusError(toApiError(e, 'AI Gauntlet status unavailable').message)
     }
   }, [projectId, attachStream])
 
@@ -160,23 +195,32 @@ export function useAiAttackSurface(projectId: string | null) {
     stopStream()
     lastStartErrorRef.current = null
     try {
-      const r = await fetch(`/api/ai-attack-surface/${projectId}/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      const d = await r.json().catch(() => ({}))
-      if (!r.ok) {
-        lastStartErrorRef.current = { message: d.error || 'Failed to launch', limit: d.limit, status: r.status }
-        throw new Error(d.error || 'Failed to launch')
+      let r: Response
+      try {
+        r = await fetch(`/api/ai-attack-surface/${projectId}/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      } catch (e) {
+        lastStartErrorRef.current = scanStartNetworkError(e, 'Failed to launch')
+        throw e
       }
+      if (!r.ok) {
+        lastStartErrorRef.current = await readScanStartError(r, 'Failed to launch')
+        throw new Error(lastStartErrorRef.current.message)
+      }
+      const d = await r.json()
       setRun(d)
+      setStatusError(null)
       attachStream(d.run_id)
       return d
     } catch (e) {
-      const m = e instanceof Error ? e.message : 'Launch failed'
-      if (!lastStartErrorRef.current) lastStartErrorRef.current = { message: m }
-      setError(m)
+      if (!lastStartErrorRef.current) lastStartErrorRef.current = scanStartNetworkError(e, 'Launch failed')
+      const failed = lastStartErrorRef.current
+      setError(formatApiError({
+        reason: failed.message, code: failed.code, status: failed.status ?? 0, upstreamStatus: failed.upstreamStatus,
+      }))
       return null
     } finally {
       setLaunching(false)
@@ -191,19 +235,24 @@ export function useAiAttackSurface(projectId: string | null) {
     // sees instant feedback instead of waiting on the backend kill.
     setStopping(true)
     stopStream()
+    setError(null)
     try {
       const r = await fetch(`/api/ai-attack-surface/${projectId}/${run.run_id}/stop`, { method: 'POST' })
-      const d: AiAttackRunState = await r.json()
+      if (!r.ok) throw await readApiError(r, STOP_FAILED)
+      const d = await r.json().catch(() => null) as AiAttackRunState | null
       if (d && d.status) setRun(d)            // use the authoritative stopped state
       else setRun((prev) => (prev ? { ...prev, status: 'idle' } : prev))
-    } catch {
-      // Even if the call fails, drop out of the running state locally.
-      setRun((prev) => (prev ? { ...prev, status: 'idle' } : prev))
+    } catch (e) {
+      // The run is still live as far as anyone knows: keep it, say why the stop
+      // failed, and resume the stream + poll the stop froze.
+      const failed = toApiError(e, STOP_FAILED)
+      setError(failed.reason === STOP_FAILED ? failed.message : `Stop failed: ${failed.message}`)
+      attachStream(run.run_id)
     } finally {
       setStopping(false)
     }
     loadFindings()
-  }, [projectId, run, stopStream, loadFindings])
+  }, [projectId, run, stopStream, loadFindings, attachStream])
 
   useEffect(() => () => stopStream(), [stopStream])
 
@@ -212,6 +261,7 @@ export function useAiAttackSurface(projectId: string | null) {
 
   return {
     targets, findings, run, logs, phase, launching, stopping, loadingTargets, error,
+    targetsError, findingsError, statusError, streamError,
     loadTargets, loadFindings, launch, stop, reconnect, getLastStartError,
   }
 }

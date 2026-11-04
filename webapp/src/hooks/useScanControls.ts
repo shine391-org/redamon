@@ -1,10 +1,12 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { downloadScanFile, fetchGvmAvailability, probeScanData, type GvmAvailability } from '@/components/scans/scanErrors'
 import { useGvmStatus } from './useGvmStatus'
 import { useGithubHuntStatus } from './useGithubHuntStatus'
 import { useTrufflehogRuns } from './useTrufflehogRuns'
 import { useSupplyChainStatus } from './useSupplyChainStatus'
+import { useScanStartFailure } from './useScanStartFailure'
 
 /**
  * One bundle of live scan state and actions, for surfaces OTHER than the graph
@@ -47,50 +49,56 @@ export function useScanControls({
   const trufflehog = useTrufflehogRuns({ projectId: id, enabled: on, ...poll })
   const supplyChain = useSupplyChainStatus({ projectId: id, enabled: on, ...poll })
 
+  const { handleStartFailure } = useScanStartFailure(projectId ?? null)
+
   const [otherScansOpen, setOtherScansOpen] = useState(false)
   const [hasReconData, setHasReconData] = useState(false)
   const [hasGvmData, setHasGvmData] = useState(false)
+  const [reconDataError, setReconDataError] = useState<string | null>(null)
+  const [gvmDataError, setGvmDataError] = useState<string | null>(null)
   // Optimistic like the graph page: assume installed until /available says no,
   // so the button does not flash disabled on every mount.
-  const [gvmAvailable, setGvmAvailable] = useState(true)
+  const [gvmAvailability, setGvmAvailability] = useState<GvmAvailability>({ available: true, reason: '' })
 
   // The GVM stack is an optional install (./redamon.sh install --gvm). Without
   // this the button starts a scan that can only fail.
   useEffect(() => {
     if (!enabled) return
     let cancelled = false
-    fetch('/api/gvm/available')
-      .then(res => res.json())
-      .then(data => { if (!cancelled) setGvmAvailable(data.available ?? false) })
-      .catch(() => { if (!cancelled) setGvmAvailable(false) })
+    void fetchGvmAvailability().then(a => { if (!cancelled) setGvmAvailability(a) })
     return () => { cancelled = true }
   }, [enabled])
 
   // Exactly how the graph page decides whether a download button is live: a HEAD
   // against the download route. Re-probed when a scan settles, since that is
   // when an artifact appears.
-  const probe = useCallback(async (url: string) => {
-    try {
-      const res = await fetch(url, { method: 'HEAD' })
-      return res.ok
-    } catch {
-      return false
-    }
-  }, [])
-
   useEffect(() => {
-    if (!on) { setHasReconData(false); setHasGvmData(false); return }
+    if (!on) {
+      setHasReconData(false); setHasGvmData(false); setReconDataError(null); setGvmDataError(null)
+      return
+    }
     let cancelled = false
     void (async () => {
       const [recon, gvmData] = await Promise.all([
-        probe(`/api/recon/${id}/download`),
-        probe(`/api/gvm/${id}/download`),
+        probeScanData(`/api/recon/${id}/download`),
+        probeScanData(`/api/gvm/${id}/download`),
       ])
-      if (!cancelled) { setHasReconData(recon); setHasGvmData(gvmData) }
+      if (cancelled) return
+      setHasReconData(recon.has); setReconDataError(recon.error)
+      setHasGvmData(gvmData.has); setGvmDataError(gvmData.error)
     })()
     return () => { cancelled = true }
     // gvm.state?.status is in the deps so finishing a scan reveals its download.
-  }, [on, id, probe, gvm.state?.status])
+  }, [on, id, gvm.state?.status])
+
+  // startGvm resolves to null on failure and keeps the reason for
+  // getLastStartError(); the shared handler shows it (or offers the queue), as
+  // on the graph page. Pause/resume/stop failures land in the hook's `error`,
+  // which the surface that mounts this toasts.
+  const startGvmReported = useCallback(async () => {
+    const result = await gvm.startGvm().catch(() => null)
+    if (!result) await handleStartFailure('gvm', gvm.getLastStartError())
+  }, [gvm, handleStartFailure])
 
   // The same three-way split the graph toolbar draws its labels from: `busy` is
   // "the container is working", `active` also covers paused (a paused scan still
@@ -115,8 +123,10 @@ export function useScanControls({
   const scBusy = scStatus === 'running' || scStatus === 'starting' || scStatus === 'pausing'
   const scActive = scBusy || scStatus === 'stopping' || scStatus === 'paused'
 
-  const downloadReconJSON = useCallback(() => {
-    if (projectId) window.open(`/api/recon/${projectId}/download`, '_blank')
+  /** Resolves to why the download failed, or null; the caller shows it. */
+  const downloadReconJSON = useCallback(async (): Promise<string | null> => {
+    if (!projectId) return null
+    return downloadScanFile(`/api/recon/${projectId}/download`, `recon_${projectId}.json`)
   }, [projectId])
 
   const downloadGvmJSON = useCallback(() => {
@@ -135,13 +145,20 @@ export function useScanControls({
       isPaused: gvmPaused,
       isActive: gvmActive,
       hasData: hasGvmData,
-      isAvailable: gvmAvailable,
+      dataError: gvmDataError,
+      isAvailable: gvmAvailability.available,
+      /** Why the button is off when it is not available: not installed, or the check itself failed. */
+      unavailableReason: gvmAvailability.reason,
       download: downloadGvmJSON,
+      start: startGvmReported,
     },
     githubHunt: { ...githubHunt, isBusy: ghBusy, isRunning: ghRunning, isActive: ghActive },
     trufflehog: { ...trufflehog, isRunning: thRunning, isActive: thActive },
     supplyChain: { ...supplyChain, status: scStatus, isBusy: scBusy, isActive: scActive },
+    /** One entry per scan whose status could not be read; the buttons then show the last known state. */
+    statusErrors: [gvm.statusError, githubHunt.statusError, trufflehog.statusError, supplyChain.statusError],
     hasReconData,
+    reconDataError,
     downloadReconJSON,
     otherScansOpen,
     openOtherScans: () => setOtherScansOpen(true),
@@ -152,7 +169,8 @@ export function useScanControls({
     githubHunt, ghBusy, ghRunning, ghActive,
     trufflehog, thRunning, thActive,
     supplyChain, scStatus, scBusy, scActive,
-    downloadReconJSON, downloadGvmJSON, otherScansOpen, hasReconData, hasGvmData, gvmAvailable,
+    downloadReconJSON, downloadGvmJSON, otherScansOpen, hasReconData, hasGvmData, gvmAvailability,
+    reconDataError, gvmDataError, startGvmReported,
   ])
 }
 

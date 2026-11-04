@@ -24,6 +24,7 @@ import { describeLiveGraphWriters } from '@/lib/graphWriters'
 import { isActivationInProgress } from '@/lib/activationLock'
 import { RunAlreadyLiveError, createNodeFilterRun } from '@/lib/nodeFilterRun'
 import { activeVersion, loadNodeFilter } from '@/lib/nodeFilters/server'
+import { readUpstreamBody, upstreamFailure } from '@/lib/routeErrors'
 
 const TARGETS = new Set(['current', 'scans', 'both'])
 
@@ -137,17 +138,24 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         body: JSON.stringify({ run_id: runId }),
       })
       if (res.status !== 202) {
-        const body = await res.json().catch(() => ({}))
-        await failRun(body?.error || `the agent answered ${res.status}`)
+        // The agent's refusals (`error`, or FastAPI's `detail` from its auth guard) are
+        // sentences its own code writes, so they are shown as they are.
+        const body = await readUpstreamBody(res)
+        await failRun(body.text || `the agent answered ${res.status}`)
         return NextResponse.json(
-          { error: body?.error || 'The agent refused the apply.' },
+          {
+            error: body.text || 'The agent refused the apply.',
+            code: body.code ?? 'agent_error',
+            upstreamStatus: res.status,
+          },
           { status: res.status >= 500 ? 502 : res.status },
         )
       }
     } catch (err) {
       const message = err instanceof AgentUnreachableError ? err.message : 'Cannot reach the agent.'
       await failRun(message)
-      return NextResponse.json({ error: message }, { status: 503 })
+      const failure = upstreamFailure('agent', err instanceof AgentUnreachableError ? err.cause_ : err, message)
+      return NextResponse.json(failure.body, { status: failure.status })
     }
 
     await writeAudit({

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ReconLogEvent } from '@/lib/recon-types'
+import { LOG_STREAM_EVENT_ERROR, LOG_STREAM_LOST, describeLogStreamLoss } from './logStreamError'
 
 interface UseGithubHuntSSEOptions {
   projectId: string | null
@@ -53,7 +54,8 @@ export function useGithubHuntSSE({
       eventSourceRef.current.close()
     }
 
-    const eventSource = new EventSource(`/api/github-hunt/${projectId}/logs`)
+    const streamUrl = `/api/github-hunt/${projectId}/logs`
+    const eventSource = new EventSource(streamUrl)
     eventSourceRef.current = eventSource
 
     eventSource.onopen = () => {
@@ -98,8 +100,9 @@ export function useGithubHuntSSE({
 
         const data = JSON.parse(eventData)
         if (data.error) {
-          setError(data.error)
-          onError?.(data.error)
+          console.error('GitHub hunt log stream error:', data.error)
+          setError(LOG_STREAM_EVENT_ERROR)
+          onError?.(LOG_STREAM_EVENT_ERROR)
         }
       } catch (err) {
         console.error('Error parsing GitHub hunt SSE error event:', err)
@@ -126,8 +129,9 @@ export function useGithubHuntSSE({
         const data = JSON.parse(event.data)
 
         if (data.error) {
-          setError(data.error)
-          onError?.(data.error)
+          console.error('GitHub hunt log stream error:', data.error)
+          setError(LOG_STREAM_EVENT_ERROR)
+          onError?.(LOG_STREAM_EVENT_ERROR)
           return
         }
 
@@ -172,8 +176,11 @@ export function useGithubHuntSSE({
           connect()
         }, delay)
       } else {
-        setError('Connection lost. Max reconnection attempts reached.')
-        onError?.('Connection lost. Max reconnection attempts reached.')
+        setError(LOG_STREAM_LOST)
+        onError?.(LOG_STREAM_LOST)
+        void describeLogStreamLoss(streamUrl, 'Failed to connect to GitHub Hunt log stream').then(reason => {
+          if (eventSourceRef.current === eventSource) setError(reason)
+        })
       }
     }
 
@@ -184,6 +191,7 @@ export function useGithubHuntSSE({
     setLogs([])
     setCurrentPhase(null)
     setCurrentPhaseNumber(null)
+    setError(null)
     reconnectAttempts.current = 0
   }, [projectId])
 

@@ -484,3 +484,28 @@ describe('POST reconfirm', () => {
     expect(res.status).toBe(404)
   })
 })
+
+describe('failures answer a fixed sentence and a code, never the exception text', () => {
+  const withCode = (message: string, code: string) => Object.assign(new Error(message), { code })
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}) })
+
+  test('the activity list', async () => {
+    h.jqFindMany.mockRejectedValue(withCode('Timed out fetching a new connection (job_queue for u1)', 'P2024'))
+    const res = await systemJobs(req())
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not load scan activity', code: 'P2024' })
+  })
+
+  test('a session read that throws is readable, not an empty 500', async () => {
+    h.effectiveUser.mockRejectedValue(withCode('session store down', 'ECONNREFUSED'))
+    const res = await systemJobs(req())
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Could not load scan activity', code: 'ECONNREFUSED' })
+  })
+
+  test('cancel and re-confirm', async () => {
+    h.jqFindUnique.mockRejectedValue(withCode("Can't reach database server at db:5432", 'P1001'))
+    expect(await (await cancel(req(), sp('j1'))).json()).toEqual({ error: 'Could not cancel the job', code: 'P1001' })
+    expect(await (await reconfirm(req(), sp('j1'))).json()).toEqual({ error: 'Could not re-confirm the job', code: 'P1001' })
+  })
+})

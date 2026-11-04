@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
+import { internalError } from '@/lib/routeErrors'
+import { MAX_CHAT_SKILL_CONTENT_SIZE } from '@/lib/userSkills'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -21,15 +23,10 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(skills)
   } catch (error) {
-    console.error('Failed to fetch chat skills:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch chat skills' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch chat skills')
   }
 }
 
-const MAX_CONTENT_SIZE = 50 * 1024 // 50KB
 const MAX_SKILLS_PER_USER = 50
 
 // POST /api/users/[id]/chat-skills - Create skill { name, content, category?, description? }
@@ -67,9 +64,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         { status: 400 }
       )
     }
-    if (content.length > MAX_CONTENT_SIZE) {
+    if (content.length > MAX_CHAT_SKILL_CONTENT_SIZE) {
       return NextResponse.json(
-        { error: `content exceeds maximum size of ${MAX_CONTENT_SIZE / 1024}KB` },
+        { error: `content exceeds maximum size of ${MAX_CHAT_SKILL_CONTENT_SIZE / 1024}KB` },
         { status: 400 }
       )
     }
@@ -104,10 +101,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(skill, { status: 201 })
   } catch (error) {
-    console.error('Failed to create chat skill:', error)
-    return NextResponse.json(
-      { error: 'Failed to create chat skill' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create chat skill')
   }
 }

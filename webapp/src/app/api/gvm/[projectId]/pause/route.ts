@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
+const FAILED = 'Failed to pause GVM scan'
 
 interface RouteParams {
   params: Promise<{ projectId: string }>
@@ -14,26 +16,23 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const __denied = await guardProject(projectId)
     if (__denied) return __denied
 
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/gvm/${projectId}/pause`, {
-      method: 'POST',
-    })
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/gvm/${projectId}/pause`, {
+        method: 'POST',
+      })
+    } catch (error) {
+      return upstreamFailureResponse('orchestrator', error, FAILED)
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
-      return NextResponse.json(
-        { error: errorData.detail || 'Failed to pause GVM scan' },
-        { status: response.status }
-      )
+      return upstreamErrorResponse('orchestrator', response, FAILED, { forwardText: true })
     }
 
     const data = await response.json()
     return NextResponse.json(data)
 
   } catch (error) {
-    console.error('Error pausing GVM scan:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, FAILED, { log: 'Error pausing GVM scan' })
   }
 }

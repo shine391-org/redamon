@@ -15,13 +15,25 @@ import { NextRequest, NextResponse } from 'next/server'
  *   bind address (HOSTNAME=0.0.0.0 in the image).
  */
 export function sameOrigin(request: NextRequest): boolean {
+  return crossOriginReason(request) === null
+}
+
+// The Origin header is whatever the other page sent: kept short when it is quoted back.
+const quote = (v: string) => (v.length > 120 ? `${v.slice(0, 120)}…` : v)
+
+/**
+ * Why `sameOrigin` refuses this request, null when it does not. It names the comparison that
+ * failed with both addresses (the person's own deployment and the page they came from) and
+ * the setting to change, never anything secret.
+ */
+export function crossOriginReason(request: NextRequest): string | null {
   const origin = request.headers.get('origin')
-  if (!origin) return true
+  if (!origin) return null
   let candidate: URL
   try {
     candidate = new URL(origin)
   } catch {
-    return false
+    return `the Origin header "${quote(origin)}" is not an origin`
   }
   const configured = (process.env.PLUGINS_ALLOWED_ORIGIN || '').trim()
   if (configured) {
@@ -34,17 +46,30 @@ export function sameOrigin(request: NextRequest): boolean {
     // A host without a scheme ("example.com:8443") parses with a scheme of its own.
     if (!allowed || (allowed.protocol !== 'https:' && allowed.protocol !== 'http:')) {
       console.error(`[plugins] PLUGINS_ALLOWED_ORIGIN is not a valid URL: ${configured}`)
-      return false
+      return 'PLUGINS_ALLOWED_ORIGIN is not a valid URL, so every browser request is refused'
     }
     return candidate.origin === allowed.origin
+      ? null
+      : `the page's origin ${quote(candidate.origin)} is not PLUGINS_ALLOWED_ORIGIN (${allowed.origin})`
   }
+  let host: string
   try {
-    return candidate.host === (request.headers.get('host') || new URL(request.url).host)
+    host = request.headers.get('host') || new URL(request.url).host
   } catch {
-    return false
+    return 'the request names no host to compare the origin with'
   }
+  return candidate.host === host
+    ? null
+    : `the page's host ${quote(candidate.host)} is not the host this request was sent to (${quote(host)}); behind a proxy set PLUGINS_ALLOWED_ORIGIN`
 }
 
-export function crossOriginResponse(): NextResponse {
-  return NextResponse.json({ error: 'Cross-origin request refused.', code: 'cross_origin' }, { status: 403 })
+/**
+ * The 403 of a refused origin. Given the request, it says which comparison failed, so a
+ * deployment behind a proxy that rewrites Host can be told from a request from another site.
+ */
+export function crossOriginResponse(request?: NextRequest): NextResponse {
+  const why = request ? crossOriginReason(request) : null
+  if (why) console.warn(`[plugins] cross-origin request refused: ${why}`)
+  const error = why ? `Cross-origin request refused: ${why}.` : 'Cross-origin request refused.'
+  return NextResponse.json({ error, code: 'cross_origin' }, { status: 403 })
 }

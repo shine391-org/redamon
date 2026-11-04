@@ -6,6 +6,7 @@
  * review can show each failure where it happened.
  */
 import { featureModelMessage, readFeatureModelCode } from '@/lib/llmFeatures'
+import { formatApiError } from '@/lib/apiError'
 
 export interface RoeApiError {
   status: number
@@ -18,6 +19,7 @@ export interface RoeApiError {
 export async function readRoeError(res: Response): Promise<RoeApiError> {
   const body = await res.json().catch(() => ({})) as Record<string, unknown>
   const code = readFeatureModelCode(body)
+  const bodyCode = typeof body.code === 'string' ? body.code : code ?? undefined
   const message = code
     ? featureModelMessage(code, typeof body.model === 'string' ? body.model : undefined)
     : typeof body.error === 'string' && body.error
@@ -25,8 +27,10 @@ export async function readRoeError(res: Response): Promise<RoeApiError> {
       : `The request failed (${res.status}).`
   return {
     status: res.status,
-    code: typeof body.code === 'string' ? body.code : code ?? undefined,
-    error: message,
+    code: bodyCode,
+    // A refusal's own sentence names its cause; a server failure's fixed sentence
+    // does not, so it carries the code (P2028, ENOSPC) and the status.
+    error: !code && res.status >= 500 ? formatApiError({ reason: message, code: bodyCode, status: res.status }) : message,
     keys: Array.isArray(body.keys) ? body.keys.filter((k): k is string => typeof k === 'string') : undefined,
     busy: typeof body.busy === 'string' ? body.busy : undefined,
   }

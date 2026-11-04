@@ -63,11 +63,11 @@ class FileExistsAndSize(unittest.TestCase):
     def test_file_exists(self):
         self.assertTrue(SKILL_FILE.exists(), f"Missing: {SKILL_FILE}")
 
-    def test_under_50kb_import_cap(self):
+    def test_under_import_cap(self):
         size = SKILL_FILE.stat().st_size
         self.assertLess(
-            size, 50_000,
-            f"Skill is {size} bytes; the webapp import endpoint rejects >= 50 KB."
+            size, 500 * 1024,
+            f"Skill is {size} bytes; the webapp import endpoint rejects > 500 KB."
         )
 
     def test_target_line_range(self):

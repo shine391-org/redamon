@@ -75,20 +75,6 @@
   color: var(--text-primary);
 }
 
-.newBadge {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
-  background: var(--status-success, #16a34a);
-  color: #fff;
-  font-size: 8px;
-  font-weight: var(--font-bold, 700);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  line-height: 1;
-}
-
 .statusBadge {
   display: inline-flex;
   align-items: center;

@@ -2560,7 +2560,7 @@
               "text": "Probe the login form.",
               "sha256": "5b05ec8bfb65fd57a2b08da5ba1606bb5450974a1d6a1d25f124d163fdf41fda",
               "chars": 21,
-              "maxChars": 51200,
+              "maxChars": 512000,
               "kind": "plain",
               "placeholders": []
             }
@@ -2568,9 +2568,9 @@
           "active": null,
           "pendingCount": 0,
           "limits": {
-            "skillMaxChars": 51200,
+            "skillMaxChars": 512000,
             "parts": {
-              "body": 51200
+              "body": 512000
             }
           },
           "lineage": {
@@ -2591,7 +2591,7 @@
               "text": "Probe the login form.",
               "sha256": "5b05ec8bfb65fd57a2b08da5ba1606bb5450974a1d6a1d25f124d163fdf41fda",
               "chars": 21,
-              "maxChars": 51200,
+              "maxChars": 512000,
               "kind": "plain",
               "placeholders": []
             }
@@ -2599,9 +2599,9 @@
           "active": null,
           "pendingCount": 0,
           "limits": {
-            "skillMaxChars": 51200,
+            "skillMaxChars": 512000,
             "parts": {
-              "body": 51200
+              "body": 512000
             }
           },
           "lineage": {

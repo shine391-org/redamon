@@ -17,7 +17,7 @@ vi.mock('next/dynamic', () => ({ default: () => () => null }))
 vi.mock('@/providers/ProjectProvider', () => ({ useProject: () => ({ userId: 'alice' }) }))
 vi.mock('@/hooks/useReconStatus', () => ({ default: () => ({ state: null }) }))
 vi.mock('@/hooks/useScanControls', () => ({
-  useScanControls: () => ({ otherScansOpen: false, githubHunt: {}, trufflehog: {}, supplyChain: {} }),
+  useScanControls: () => ({ otherScansOpen: false, gvm: {}, githubHunt: {}, trufflehog: { runs: [] }, supplyChain: {} }),
 }))
 vi.mock('@/components/scans/ScanActions', () => ({ ScanActions: () => null }))
 vi.mock('@/app/graph/components/OtherScansModal/OtherScansModal', () => ({ OtherScansModal: () => null }))

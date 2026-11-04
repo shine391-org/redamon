@@ -677,6 +677,32 @@ const SerializedScan = (
   </div>
 )
 
+const RouteExposure = (
+  <div style={wrapperStyle}>
+    <div style={firstSectionTitleStyle}>How input is generated</div>
+    <p style={paraStyle}>
+      Route Exposure reads the routes recon already found: the BaseURL and Endpoint nodes (crawl, ffuf,
+      kiterunner, OpenAPI, the routes JS Recon pulled from bundles), with their methods and any OpenAPI security
+      declaration. Next to them it generates routes of its own: well-known internal, admin and debug paths,
+      version-control and env files, backup copies of server-side files and older API versions.
+    </p>
+    <p style={{ ...paraStyle, margin: 0 }}>
+      In partial recon the URLs typed in the modal are added. Each route is requested with GET (HEAD and a 1 KB
+      read for a backup) without credentials, and again logged in where your authentication profile covers the
+      host. Logout, delete, reset and other state-changing paths are never requested. With no BaseURL, no
+      Endpoint and no typed URL there is nothing to request, and the run stops.
+    </p>
+
+    <div style={sectionTitleStyle}>How output transforms the graph</div>
+    <ul style={listStyle}>
+      <li>A route that answers without credentials where authentication was expected, or that returns sensitive fields or other people&apos;s personal data, becomes an <strong>info-severity Vulnerability</strong> lead with <span style={codeStyle}>source: &quot;route_exposure&quot;</span> and <span style={codeStyle}>needs_agent_confirmation: true</span>, linked from its <strong>Endpoint</strong> and <strong>BaseURL</strong> via <span style={codeStyle}>HAS_VULNERABILITY</span>. It stays at the bottom of the Priority Board until the agent confirms it; reports and Insights hide it until then.</li>
+      <li>A route whose answer proves the exposure by itself (an exposed .git or .env file, a backup archive, a debug console or endpoint, a debug page, a route catalog, a secret) becomes a <strong>Vulnerability</strong> with its real severity, linked from the <strong>BaseURL</strong>.</li>
+      <li>A generated route that answered with content becomes a new <strong>Endpoint</strong> via <span style={codeStyle}>HAS_ENDPOINT</span>; an exposed file never does.</li>
+      <li>Every route recon already had is enriched with its anonymous status (<span style={codeStyle}>anon_status</span>).</li>
+    </ul>
+  </div>
+)
+
 const JsRecon = (
   <div style={wrapperStyle}>
     <div style={firstSectionTitleStyle}>How input is generated</div>
@@ -698,6 +724,7 @@ const JsRecon = (
     <div style={sectionTitleStyle}>How output transforms the graph</div>
     <ul style={listStyle}>
       <li>Each regex-matched secret (API keys, hardcoded endpoints, auth tokens) becomes a <strong>Secret</strong> node attached to its source BaseURL.</li>
+      <li><strong>TruffleHog</strong> (on by default for new projects) also scans local copies of the same files in an isolated container and never fetches from the target. With key validation off it has no network; with it on it checks the keys it finds with their providers only. A key both engines find stays one Secret, with <span style={codeStyle}>{'TruffleHog:<Detector>'}</span> in <span style={codeStyle}>alternate_names</span>; a key only TruffleHog finds is a Secret with <span style={codeStyle}>detection_method</span> trufflehog.</li>
       <li>URLs found inside JS source become <strong>Endpoint</strong> nodes attached to the matching BaseURL, tagged with their source JS file.</li>
       <li>Variable assignments and route definitions extracted from JS produce <strong>Parameter</strong> nodes attached to relevant Endpoints.</li>
       <li>Detected JS libraries and frameworks (React, Vue, jQuery, etc.) become <strong>JsReconFinding</strong> nodes (with finding type "framework") attached to the analysed JS file via <span style={codeStyle}>HAS_JS_FINDING</span>. They are <em>not</em> currently promoted to Technology nodes, so they do not feed the CVE Lookup phase - that's a known gap.</li>
@@ -1136,6 +1163,7 @@ export const INPUT_LOGIC_TOOLTIPS: Record<string, ReactNode> = {
   SubdomainTakeover,
   VhostSni,
   WebCachePoison,
+  RouteExposure,
   SecurityChecks,
   OriginDiscovery,
   CveLookup,

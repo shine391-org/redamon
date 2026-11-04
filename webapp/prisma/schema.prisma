@@ -172,8 +172,8 @@ model UserSettings {
   user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Tool API Keys
-  /// github.com PAT for GitHub Secret Hunt, and for Tradecraft Lookup fetching
-  /// a resource from GitHub. Supply Chain has its own (below): the two scan a
+  /// github.com PAT for GitHub Secret Hunt, for Tradecraft Lookup fetching
+  /// a resource from GitHub, and Workspace URL import. Supply Chain has its own (below): the two scan a
   /// different set of repositories and an operator has to be able to give them
   /// different scopes, or revoke one without stopping the other.
   githubAccessToken String @default("") @map("github_access_token")
@@ -773,6 +773,36 @@ model Project {
   webCachePoisonBehavioralDelay    Float    @default(1.1) @map("web_cache_poison_behavioral_delay")
   webCachePoisonDifferential       Boolean  @default(true) @map("web_cache_poison_differential")
 
+  // ========== ROUTE EXPOSURE ==========
+  // Active GROUP 6 Phase A scanner: requests found and generated routes anonymously
+  // (and logged in where the AuthProfile covers the host); writes leads for the
+  // agent and signature-proven findings. GET/HEAD only.
+  routeExposureEnabled             Boolean  @default(false) @map("route_exposure_enabled")
+  routeExposureMaxRps              Float    @default(5) @map("route_exposure_max_rps")
+  routeExposureWorkers             Int      @default(4) @map("route_exposure_workers")
+  routeExposureTimeout             Int      @default(10) @map("route_exposure_timeout")
+  routeExposureMaxRoutesPerHost    Int      @default(300) @map("route_exposure_max_routes_per_host")
+  routeExposureMaxRoutesTotal      Int      @default(3000) @map("route_exposure_max_routes_total")
+  routeExposureSeedPaths           Boolean  @default(true) @map("route_exposure_seed_paths")
+  routeExposureVcsFiles            Boolean  @default(true) @map("route_exposure_vcs_files")
+  routeExposureBackupFiles         Boolean  @default(true) @map("route_exposure_backup_files")
+  routeExposureVersionVariants     Boolean  @default(true) @map("route_exposure_version_variants")
+  routeExposureCompareLoggedIn     Boolean  @default(true) @map("route_exposure_compare_logged_in")
+  routeExposurePiiDetection        Boolean  @default(true) @map("route_exposure_pii_detection")
+  // v2 discovery multiplier and riders
+  routeExposureSiblings            Boolean  @default(true) @map("route_exposure_siblings")
+  routeExposureFrameworkSeeds      Boolean  @default(true) @map("route_exposure_framework_seeds")
+  routeExposureFollowCatalogs      Boolean  @default(true) @map("route_exposure_follow_catalogs")
+  routeExposureGitWalk             Boolean  @default(true) @map("route_exposure_git_walk")
+  routeExposureCrossHost           Boolean  @default(false) @map("route_exposure_cross_host")
+  routeExposureCorsRider           Boolean  @default(true) @map("route_exposure_cors_rider")
+  routeExposureCacheRider          Boolean  @default(true) @map("route_exposure_cache_rider")
+  // v3: Jev-only hooks (shadow). Each runs only with aiInPipeline, which does not
+  // reset it; each annotates nothing and never drops a lead while in shadow.
+  routeExposureJevRank             Boolean  @default(false) @map("route_exposure_jev_rank")
+  routeExposureJevWallCheck        Boolean  @default(false) @map("route_exposure_jev_wall_check")
+  routeExposureJevAssess           Boolean  @default(false) @map("route_exposure_jev_assess")
+
   // ========== RESOURCE ENUM AI CLASSIFIER ==========
   // Cross-cutting AI classifier — runs after Katana/Hakrawler/GAU/FFuf/jsluice/
   // ParamSpider/Kiterunner/Arjun have produced endpoints. Tags every Endpoint
@@ -882,6 +912,8 @@ model Project {
   jsReconConcurrency          Int      @default(10)    @map("js_recon_concurrency")
   jsReconValidateKeys         Boolean  @default(true)  @map("js_recon_validate_keys")
   jsReconValidationTimeout    Int      @default(5)     @map("js_recon_validation_timeout")
+  jsReconTrufflehogEnabled    Boolean  @default(true)  @map("js_recon_trufflehog_enabled")
+  jsReconTrufflehogResults    String[] @default(["verified", "unknown", "unverified"]) @map("js_recon_trufflehog_results")
   jsReconExtractEndpoints     Boolean  @default(true)  @map("js_recon_extract_endpoints")
   jsReconValidateEndpoints     Boolean  @default(false) @map("js_recon_validate_endpoints")
   jsReconEndpointAcceptStatus  Int[]    @default([200, 201, 204, 301, 302, 307, 308, 401, 403, 405]) @map("js_recon_endpoint_accept_status")
@@ -1140,7 +1172,7 @@ model Project {
   agentCreateGraphImageOnInit           Boolean  @default(false) @map("agent_create_graph_image_on_init")
   agentLogMaxMb                         Int      @default(10) @map("agent_log_max_mb")
   agentLogBackupCount                   Int      @default(5) @map("agent_log_backup_count")
-  agentToolPhaseMap                     Json     @default("{\"query_graph\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"proxy_brain\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"web_search\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"cve_intel\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"shodan\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"google_dork\":[\"informational\"],\"execute_curl\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_naabu\":[\"informational\",\"exploitation\"],\"execute_httpx\":[\"informational\",\"exploitation\"],\"execute_subfinder\":[\"informational\",\"exploitation\"],\"execute_wpscan\":[\"informational\",\"exploitation\"],\"execute_jsluice\":[\"informational\",\"exploitation\"],\"execute_amass\":[\"informational\",\"exploitation\"],\"execute_katana\":[\"informational\",\"exploitation\"],\"execute_arjun\":[\"informational\",\"exploitation\"],\"execute_ffuf\":[\"informational\",\"exploitation\"],\"execute_gau\":[\"informational\",\"exploitation\"],\"execute_nmap\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_nuclei\":[\"informational\",\"exploitation\"],\"kali_shell\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_code\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_playwright\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_hydra\":[\"exploitation\",\"post_exploitation\"],\"metasploit_console\":[\"exploitation\",\"post_exploitation\"],\"msf_restart\":[\"exploitation\",\"post_exploitation\"],\"tradecraft_lookup\":[\"exploitation\",\"post_exploitation\"],\"execute_osv_scanner\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_guarddog\":[\"informational\",\"exploitation\"]}") @map("agent_tool_phase_map")
+  agentToolPhaseMap                     Json     @default("{\"query_graph\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"proxy_brain\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"web_search\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"cve_intel\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"shodan\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"google_dork\":[\"informational\"],\"execute_curl\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_naabu\":[\"informational\",\"exploitation\"],\"execute_httpx\":[\"informational\",\"exploitation\"],\"execute_subfinder\":[\"informational\",\"exploitation\"],\"execute_wpscan\":[\"informational\",\"exploitation\"],\"execute_jsluice\":[\"informational\",\"exploitation\"],\"execute_amass\":[\"informational\",\"exploitation\"],\"execute_katana\":[\"informational\",\"exploitation\"],\"execute_arjun\":[\"informational\",\"exploitation\"],\"execute_ffuf\":[\"informational\",\"exploitation\"],\"execute_gau\":[\"informational\",\"exploitation\"],\"execute_nmap\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_nuclei\":[\"informational\",\"exploitation\"],\"kali_shell\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_code\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_playwright\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_hydra\":[\"exploitation\",\"post_exploitation\"],\"metasploit_console\":[\"exploitation\",\"post_exploitation\"],\"msf_restart\":[\"exploitation\",\"post_exploitation\"],\"tradecraft_lookup\":[\"exploitation\",\"post_exploitation\"],\"execute_osv_scanner\":[\"informational\",\"exploitation\",\"post_exploitation\"],\"execute_guarddog\":[\"informational\",\"exploitation\"],\"graph_diff\":[\"informational\"],\"bloodhound_ingest\":[\"post_exploitation\"],\"mimikatz_parse\":[\"post_exploitation\"]}") @map("agent_tool_phase_map")
   agentKaliInstallEnabled               Boolean  @default(false) @map("agent_kali_install_enabled")
   agentKaliInstallAllowedPackages       String   @default("") @map("agent_kali_install_allowed_packages")
   agentKaliInstallForbiddenPackages     String   @default("") @map("agent_kali_install_forbidden_packages")
@@ -1295,6 +1327,8 @@ model Project {
   rceOobCallbackEnabled                 Boolean  @default(true) @map("rce_oob_callback_enabled")
   rceDeserializationEnabled             Boolean  @default(true) @map("rce_deserialization_enabled")
   rceAggressivePayloads                 Boolean  @default(false) @map("rce_aggressive_payloads")
+  // Route exposure: download an exposed heap dump once, count its credential shapes, delete it.
+  rceHeapdumpAnalysisEnabled            Boolean  @default(false) @map("rce_heapdump_analysis_enabled")
 
   // ========== PATH TRAVERSAL / LFI / RFI SETTINGS ==========
   pathTraversalOobCallbackEnabled       Boolean  @default(true)  @map("path_traversal_oob_callback_enabled")
@@ -1303,6 +1337,9 @@ model Project {
   pathTraversalPayloadReferenceEnabled  Boolean  @default(true)  @map("path_traversal_payload_reference_enabled")
   pathTraversalRequestTimeout           Int      @default(10)    @map("path_traversal_request_timeout")
   pathTraversalOobProvider              String   @default("oast.fun") @map("path_traversal_oob_provider")
+  // Route exposure: rebuild an exposed .git in kali and count its secrets; validate a found secret.
+  pathTraversalGitReconstructEnabled    Boolean  @default(false) @map("path_traversal_git_reconstruct_enabled")
+  pathTraversalValidateSecretsEnabled   Boolean  @default(false) @map("path_traversal_validate_secrets_enabled")
 
   // ========== INSECURE DESERIALIZATION SETTINGS ==========
   deserializationOobCallbackEnabled     Boolean  @default(true)  @map("deserialization_oob_callback_enabled")

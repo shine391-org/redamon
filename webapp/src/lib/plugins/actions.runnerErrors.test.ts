@@ -51,7 +51,7 @@ const answering = (status: number, body: unknown): ActionScript => () => ({ stat
 
 test('the runner refuses the webapp’s key: 502 runner_misconfigured, not 401', async () => {
   runner = await startEchoRunner({ 'echo/echo': () => ({ result: {} }) }, { runnerKey: 'z'.repeat(64) })
-  expect(await run('echo')).toMatchObject({ status: 502, body: { code: 'runner_misconfigured' } })
+  expect(await run('echo')).toMatchObject({ status: 502, body: { code: 'runner_misconfigured', upstreamStatus: 401 } })
 })
 
 test.each<[string, number, unknown]>([
@@ -59,9 +59,23 @@ test.each<[string, number, unknown]>([
   ['a 500 with a code', 500, { error: 'boom', code: 'internal' }],
   ['a 400 about the webapp’s request', 400, { error: 'ctx.version is missing', code: 'bad_request' }],
   ['a 403', 403, { error: 'nope', code: 'forbidden' }],
-])('%s: 502 runner_error', async (_n, status, body) => {
+])('%s: 502 runner_error, with the runner status and code', async (_n, status, body) => {
   runner = await startEchoRunner({ 'echo/echo': answering(status, body) })
-  expect(await run('echo')).toMatchObject({ status: 502, body: { code: 'runner_error' } })
+  const runnerCode = typeof body === 'object' ? (body as { code: string }).code : 'runner_error'
+  expect(await run('echo')).toEqual({
+    status: 502,
+    body: {
+      error: `The plugin runner could not run this action (${runnerCode}); its log has the details.`,
+      code: 'runner_error',
+      upstreamStatus: status,
+      runnerCode,
+    },
+  })
+})
+
+test('a runner code in another shape is not shown', async () => {
+  runner = await startEchoRunner({ 'echo/echo': answering(500, { error: 'boom', code: 'Not A Code <b>' }) })
+  expect(await run('echo')).toMatchObject({ status: 502, body: { runnerCode: 'runner_error', upstreamStatus: 500 } })
 })
 
 test('an async action the runner fails that way: 502, and the job failed with runner_error', async () => {
@@ -86,5 +100,19 @@ describe('the runner’s named answers pass through', () => {
   ])('%i %s', async (status, code) => {
     runner = await startEchoRunner({ 'echo/echo': answering(status, { error: 'x', code }) })
     expect(await run('echo')).toMatchObject({ status, body: { code } })
+  })
+})
+
+describe('a deployment without a usable call-token secret', () => {
+  test.each<[string, string, RegExp]>([
+    ['missing', '', /: PLUGIN_CALL_TOKEN_SECRET is not configured \(at least \d+ characters; \.\/redamon\.sh up generates it\)\.$/],
+    ['equal to AUTH_SECRET', 'a'.repeat(64), /: PLUGIN_CALL_TOKEN_SECRET must differ from AUTH_SECRET\.$/],
+  ])('%s: 503 naming the setting and its rule, never its value', async (_n, value, rule) => {
+    vi.stubEnv('PLUGIN_CALL_TOKEN_SECRET', value)
+    const r = await run('echo')
+    expect(r).toMatchObject({ status: 503, body: { code: 'plugins_not_configured' } })
+    expect(r.body.error).toMatch(/^The plugin platform is not configured on this deployment: /)
+    expect(r.body.error).toMatch(rule)
+    expect(JSON.stringify(r.body)).not.toContain('a'.repeat(32))
   })
 })

@@ -34,6 +34,7 @@ import {
   fieldsWhere,
 } from '@/lib/reconSettings/registry'
 import { canonicalJson, cyrb53 } from '@/lib/fingerprint'
+import { isLoopModel } from '@/lib/agentInTheLoop'
 
 /** Columns with no registry classification that says "not configuration". */
 const UNCLASSIFIED_EXCLUDED_FIELDS = [
@@ -93,7 +94,7 @@ export const KEPT_WHEN_ABSENT: ReadonlySet<string> = new Set([
   'agentOpenaiModel', 'aiPipelineModel',
   'ffufAiUseJev', 'nucleiTagsAiUseJev', 'wafAiUseJev', 'takeoverAiUseJev',
   'ffufJevBasePaths', 'httpxJevPageType', 'resourceEnumJevToolHealth', 'hakrawlerJevSeedOrder',
-  'serializedScanJevRank',
+  'serializedScanJevRank', 'routeExposureJevRank', 'routeExposureJevWallCheck', 'routeExposureJevAssess',
 ])
 
 export type Lookup = { found: true; value: unknown } | { found: false }
@@ -187,7 +188,9 @@ export function applyPresetSettings(
       if (fromPreset.found) next[key] = withOwnSkillToggles(fromPreset.value, current[key], hasOwn(presetSettings, key))
       continue
     }
-    if (hasOwn(presetSettings, key)) {
+    // A preset never chooses Agent in the Loop, even one stored before that was
+    // refused: the value is treated as absent, so the project keeps its model.
+    if (hasOwn(presetSettings, key) && !(KEPT_WHEN_ABSENT.has(key) && isLoopModel(presetSettings[key]))) {
       next[key] = presetSettings[key]
       continue
     }

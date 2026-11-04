@@ -188,6 +188,20 @@ stop and inform the user honestly — do NOT proceed with noisy techniques.
 - Maximum 2 exploit attempts per target, then STOP
 - No `db_nmap`, no `hosts`, no `services` scanning commands
 
+# bloodhound_ingest — RESTRICTED (graph-only import; the collector run is the loud part)
+- This tool only WRITES the local graph from already-collected JSON — but do not run a fresh
+  BloodHound collection to feed it in stealth mode: directory enumeration (LDAP/SMB/DC sync)
+  is high-noise and touches every object in the domain.
+- Importing files the operator already collected is allowed; prefer reading them from the
+  workspace instead of pulling new ones off a share.
+- Never collect over an interactive session you did not already hold before stealth was enabled.
+### mimikatz_parse — RESTRICTED (local parse; the dump is the loud part)
+- This tool only parses a transcript already in the workspace and writes the local
+  graph — but in stealth mode do NOT harvest a fresh dump to feed it: LSASS access
+  and dcsync are among the loudest actions possible on a host/DC (EDR bait,
+  replication events). Parse what the operator already captured, nothing more.
+- Never pull transcripts off a share you did not already control pre-stealth.
+
 ---
 
 ## Phase-Specific Rules

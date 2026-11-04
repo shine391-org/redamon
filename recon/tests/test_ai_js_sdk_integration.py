@@ -84,19 +84,34 @@ def _import_js_recon():
     # non-AI analysis pass OFF in the settings so these stubs never execute.
     for name in (
         "patterns", "validators", "sourcemap", "dependency",
-        "endpoints", "framework",
+        "endpoints", "framework", "trufflehog_bridge",
     ):
         mod = types.ModuleType(f"recon.helpers.js_recon.{name}")
         sys.modules[f"recon.helpers.js_recon.{name}"] = mod
     js_recon_pkg = types.ModuleType("recon.helpers.js_recon")
     sys.modules["recon.helpers.js_recon"] = js_recon_pkg
+    # js_recon imports this one as a module (`from recon.helpers.js_recon import
+    # trufflehog_bridge`), so the package must carry it.
+    js_recon_pkg.trufflehog_bridge = sys.modules["recon.helpers.js_recon.trufflehog_bridge"]
+
+    # What counts as a JS file decides which files reach the AI-SDK matcher, and it
+    # needs only the stdlib, so load the real one.
+    spec = importlib.util.spec_from_file_location(
+        "recon.helpers.js_recon.urls",
+        os.path.join(_REPO_ROOT, "recon", "helpers", "js_recon", "urls.py"),
+    )
+    js_urls = importlib.util.module_from_spec(spec)
+    sys.modules["recon.helpers.js_recon.urls"] = js_urls
+    spec.loader.exec_module(js_urls)
 
     # Minimal symbols js_recon.py imports from each.
+    sys.modules["recon.helpers.js_recon.patterns"].SUPERSEDED_BY_TRUFFLEHOG = frozenset()
     sys.modules["recon.helpers.js_recon.patterns"].scan_js_content = lambda *a, **kw: ([], {})
     sys.modules["recon.helpers.js_recon.patterns"].scan_dev_comments = lambda *a, **kw: []
     sys.modules["recon.helpers.js_recon.patterns"].load_custom_patterns = lambda *a, **kw: None
     sys.modules["recon.helpers.js_recon.validators"].validate_secret = lambda *a, **kw: {}
     sys.modules["recon.helpers.js_recon.sourcemap"].discover_and_analyze_sourcemaps = lambda *a, **kw: []
+    sys.modules["recon.helpers.js_recon.sourcemap"].pseudo_file_base = lambda map_url, js_url: js_url or map_url
     sys.modules["recon.helpers.js_recon.dependency"].detect_dependency_confusion = lambda *a, **kw: []
     sys.modules["recon.helpers.js_recon.endpoints"].extract_endpoints = lambda *a, **kw: []
     sys.modules["recon.helpers.js_recon.framework"].detect_frameworks = lambda *a, **kw: []
@@ -104,15 +119,16 @@ def _import_js_recon():
     sys.modules["recon.helpers.js_recon.framework"].detect_dev_comments = lambda *a, **kw: []
     sys.modules["recon.helpers.js_recon.framework"].load_custom_frameworks = lambda *a, **kw: None
 
-    # js_recon imports is_url_safe_to_probe from recon.main_recon_modules.ip_filter
-    # (falling back to a bare `ip_filter`). Stub both so the SSRF guard is a no-op
-    # in the test (every probe target is treated as safe).
+    # js_recon imports is_url_safe_to_probe and is_address_safe_to_scan from
+    # recon.main_recon_modules.ip_filter (falling back to a bare `ip_filter`). Stub
+    # both so the address guards are a no-op in the test (every target is safe).
     mrm_pkg = types.ModuleType("recon.main_recon_modules")
     mrm_pkg.__path__ = []  # mark as a package so submodule imports resolve
     sys.modules["recon.main_recon_modules"] = mrm_pkg
     sys.modules["recon"].main_recon_modules = mrm_pkg  # type: ignore[attr-defined]
     _ip_filter = types.ModuleType("ip_filter")
     _ip_filter.is_url_safe_to_probe = lambda *a, **kw: True
+    _ip_filter.is_address_safe_to_scan = lambda *a, **kw: True
     sys.modules["ip_filter"] = _ip_filter
     sys.modules["recon.main_recon_modules.ip_filter"] = _ip_filter
 
@@ -146,6 +162,7 @@ def _make_settings(ai_on: bool = True) -> dict:
         "JS_RECON_FRAMEWORK_DETECT": False,
         "JS_RECON_DOM_SINKS": False,
         "JS_RECON_DEV_COMMENTS": False,
+        "JS_RECON_TRUFFLEHOG_ENABLED": False,
         "JS_RECON_AI_SDK_DETECTION_ENABLED": ai_on,
         "JS_RECON_TIMEOUT": 30,
         "JS_RECON_MIN_CONFIDENCE": "low",

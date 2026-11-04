@@ -4,7 +4,7 @@ Tests for the idor_bola_exploitation Community Agent Skill.
 This skill ships as a single .md file in agentic/community-skills/. It has no
 Python wiring, so the contract under test is:
 
-  1. The file exists, parses, and is well within the 50 KB import cap.
+  1. The file exists, parses, and is well within the 500 KB import cap.
   2. Required structural sections are present (template fidelity).
   3. The first non-heading line is a sensible auto-description (drives the
      classifier when no operator-supplied description exists; agentic/api.py
@@ -39,7 +39,7 @@ _README_PATH = _COMMUNITY_DIR / "README.md"
 _WIKI_PATH = _REPO_ROOT / "redamon.wiki" / "Agent-Skills.md"
 
 # Cap enforced at webapp/src/app/api/users/[id]/attack-skills/route.ts (POST handler).
-_IMPORT_CAP_BYTES = 50_000
+_IMPORT_CAP_BYTES = 500 * 1024
 
 # Match the live extraction logic in agentic/api.py:572-578.
 def _extract_auto_description(text: str) -> str:
@@ -67,7 +67,7 @@ class TestSkillFileSmoke(unittest.TestCase):
     def test_file_size_under_import_cap(self):
         size = _SKILL_PATH.stat().st_size
         self.assertLess(size, _IMPORT_CAP_BYTES,
-                        f"{size} bytes exceeds 50 KB import cap")
+                        f"{size} bytes exceeds 500 KB import cap")
 
     def test_file_size_in_recommended_band(self):
         # Brief targets 200-800 lines per PROMPT.ADD_COMMUNITY_AGENT_SKILL.md.

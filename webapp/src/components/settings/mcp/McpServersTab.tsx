@@ -14,7 +14,9 @@ import {
   type Phase,
 } from '@/lib/mcp/schema'
 import { MCP_PRESETS, PRESET_CATEGORY_LABELS, type McpPreset } from '@/lib/mcp/presets'
-import { useAlertModal } from '@/components/ui'
+import { useAlertModal, useToast } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
+import { actionFailedText, failureText, saveWarningLines } from '../failureText'
 import { useDirtyState } from '@/hooks/useDirtyState'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import styles from './McpServersTab.module.css'
@@ -172,9 +174,13 @@ function transportIcon(t: Transport) {
   return <Globe size={14} />
 }
 
+const LOAD_FAILED = "Couldn't load your MCP Tool Plugins"
+
 export default function McpServersTab({ userId, onDirtyChange }: Props) {
   const [servers, setServers] = useState<MCPServer[]>([])
   const [loading, setLoading] = useState(false)
+  // Never a silent empty list: that reads as "nothing saved" and invites a duplicate.
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [editing, setEditing] = useState<MCPServer | null>(null)
   const [isNew, setIsNew] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
@@ -184,6 +190,13 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
   const [topLevelError, setTopLevelError] = useState<string | null>(null)
   const [tokenVisible, setTokenVisible] = useState(false)
   const { dangerConfirm, alertError } = useAlertModal()
+  const toast = useToast()
+
+  // The save is stored even when the agent did not reload it; say so.
+  const warnIfNotReloaded = useCallback((body: unknown) => {
+    const lines = saveWarningLines(body)
+    if (lines.length) toast.warning(lines.join('\n'), 'Saved, but not live yet')
+  }, [toast])
 
   // Dirty tracking only matters in the edit/add view. Baseline is set when
   // entering that view: an existing server for edit (dirty on any change), or an
@@ -203,9 +216,13 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
       if (r.ok) {
         const data = await r.json()
         setServers(Array.isArray(data.servers) ? data.servers : [])
+        setLoadError(null)
+      } else {
+        setLoadError(failureText(LOAD_FAILED, await readApiError(r, LOAD_FAILED)))
       }
     } catch (e) {
       console.error('load mcp servers', e)
+      setLoadError(failureText(LOAD_FAILED, e))
     } finally {
       setLoading(false)
     }
@@ -293,14 +310,21 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ server: draft, userId }),
       })
-      const data = await r.json()
-      setTestResult(data as TestResult)
+      if (!r.ok) throw await readApiError(r, 'The MCP test failed')
+      const data = await r.json() as Partial<TestResult>
+      setTestResult({
+        ok: data.ok === true,
+        elapsed_ms: typeof data.elapsed_ms === 'number' ? data.elapsed_ms : 0,
+        discovered_tools: Array.isArray(data.discovered_tools) ? data.discovered_tools : [],
+        error: typeof data.error === 'string' ? data.error : null,
+        warnings: Array.isArray(data.warnings) ? data.warnings : [],
+      })
     } catch (e) {
       setTestResult({
         ok: false,
         elapsed_ms: 0,
         discovered_tools: [],
-        error: e instanceof Error ? e.message : 'unknown error',
+        error: toApiError(e, 'The MCP test failed').message,
         warnings: [],
       })
     } finally {
@@ -326,24 +350,26 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(editing),
       })
-      const data = await r.json()
       if (!r.ok) {
-        setTopLevelError(data.error || `request failed (${r.status})`)
-        if (Array.isArray(data.issues)) {
+        const err = await readApiError(r, isNew ? 'Failed to add the MCP Tool Plugin' : 'Failed to update the MCP Tool Plugin')
+        setTopLevelError(err.message)
+        const issues = err.body?.issues
+        if (Array.isArray(issues)) {
           const issueMap: Record<string, string> = {}
-          for (const i of data.issues) {
+          for (const i of issues) {
             issueMap[(i.path || []).join('.')] = i.message
           }
           setErrors(issueMap)
         }
         return
       }
+      warnIfNotReloaded(await r.json().catch(() => null))
       await load()
       setEditing(null)
       setErrors({})
       setTestResult(null)
     } catch (e) {
-      setTopLevelError(e instanceof Error ? e.message : 'unknown error')
+      setTopLevelError(toApiError(e, isNew ? 'Failed to add the MCP Tool Plugin' : 'Failed to update the MCP Tool Plugin').message)
     } finally {
       setSaving(false)
     }
@@ -360,13 +386,13 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
         method: 'DELETE',
       })
       if (r.ok) {
+        warnIfNotReloaded(await r.json().catch(() => null))
         await load()
       } else {
-        const data = await r.json().catch(() => ({}))
-        await alertError(data.error || `Delete failed (${r.status})`, 'Delete MCP Tool Plugin')
+        await alertError((await readApiError(r, 'Delete failed')).message, 'Delete MCP Tool Plugin')
       }
     } catch (e) {
-      await alertError(e instanceof Error ? e.message : 'Delete failed', 'Delete MCP Tool Plugin')
+      await alertError(toApiError(e, 'Delete failed').message, 'Delete MCP Tool Plugin')
     }
   }
 
@@ -378,9 +404,12 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updated),
       })
-      if (r.ok) await load()
+      if (!r.ok) throw await readApiError(r, 'the server gave no reason')
+      warnIfNotReloaded(await r.json().catch(() => null))
+      await load()
     } catch (e) {
       console.error('toggle enabled', e)
+      toast.error(actionFailedText(updated.enabled ? 'Enable' : 'Disable', e))
     }
   }
 
@@ -479,6 +508,13 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
 
         {loading && <p className={styles.muted}><Loader2 className={styles.spin} size={14} /> Loading…</p>}
 
+        {!loading && loadError && (
+          <div className={styles.errorBanner} role="alert">
+            <AlertTriangle size={14} /> {loadError}.{' '}
+            <button type="button" className="textButton" onClick={load}>Retry</button>
+          </div>
+        )}
+
         {/* Quick-Add presets - 10 publicly-available MCPs vetted for pentest workflow */}
         {!loading && (
           <div className={styles.presetsBlock}>
@@ -519,7 +555,7 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
           </div>
         )}
 
-        {!loading && servers.length === 0 && (
+        {!loading && !loadError && servers.length === 0 && (
           <p className={styles.muted}>No saved MCP Tool Plugins yet - pick one from Quick add above, or click Add MCP to configure one manually.</p>
         )}
 

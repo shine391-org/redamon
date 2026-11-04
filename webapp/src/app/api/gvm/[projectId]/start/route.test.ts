@@ -146,3 +146,63 @@ describe('an old-model graph', () => {
     expect(res.status).toBe(200)
   })
 })
+
+describe('a start the orchestrator or the DB refuses', () => {
+  beforeEach(() => {
+    h.findProject.mockResolvedValue({ ...BATCH, domainBatchMode: false, domainBatchHosts: [], targetDomain: 'example.com' })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  test('a non-JSON 500 still says which status the orchestrator answered', async () => {
+    h.orchestratorFetch.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+    const res = await call()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({
+      error: 'Failed to start GVM scan', code: 'orchestrator_error', upstreamStatus: 500,
+    })
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test("the orchestrator's own reason code is passed through", async () => {
+    h.orchestratorFetch.mockResolvedValue(new Response(
+      JSON.stringify({ detail: { detail: 'GVM container could not be created', code: 'spawn_failed' } }),
+      { status: 500 },
+    ))
+    const body = await (await call()).json()
+    expect(body).toMatchObject({ error: 'GVM container could not be created', code: 'spawn_failed', upstreamStatus: 500 })
+  })
+
+  test('a memory-governor refusal keeps its limit for the queue offer', async () => {
+    const limit = { limitType: 'ram', detail: 'Not enough memory', current: 9, ceiling: 8 }
+    h.orchestratorFetch.mockResolvedValue(new Response(JSON.stringify({ detail: limit }), { status: 409 }))
+    const res = await call()
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.limit).toEqual(limit)
+    expect(body.upstreamStatus).toBe(409)
+    expect(typeof body.error).toBe('string')
+  })
+
+  test('an unreachable orchestrator is a 503 naming it, with the errno', async () => {
+    const err = new TypeError('fetch failed')
+    ;(err as TypeError & { cause?: unknown }).cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+    h.orchestratorFetch.mockRejectedValue(err)
+    const res = await call()
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({
+      error: 'Failed to start GVM scan', code: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+    })
+  })
+
+  test('a DB failure answers its Prisma code, never the message', async () => {
+    h.findProject.mockRejectedValue(Object.assign(
+      new Error("Can't reach database server while reading target example.com"),
+      { name: 'PrismaClientInitializationError', code: 'P1001' },
+    ))
+    const res = await call()
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to start GVM scan', code: 'P1001' })
+    expect(JSON.stringify(body)).not.toContain('example.com')
+  })
+})

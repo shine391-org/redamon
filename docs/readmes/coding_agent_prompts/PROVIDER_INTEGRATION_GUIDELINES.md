@@ -283,7 +283,7 @@ If you genuinely need new columns:
 
 ### 4.6 Agentic - `parse_model_provider` (prefix routing)
 
-**File:** [agentic/orchestrator_helpers/llm_setup.py](../../../agentic/orchestrator_helpers/llm_setup.py) (`parse_model_provider` at lines 27-73)
+**File:** [agentic/orchestrator_helpers/llm_setup.py](../../../agentic/orchestrator_helpers/llm_setup.py) (`parse_model_provider`, near line 90)
 
 Add your prefix branch in the existing `elif` chain:
 
@@ -295,6 +295,7 @@ elif model_name.startswith("myprovider/"):
 Rules:
 - The string before the slash **must equal** the `id` you used in [§4.1](#41-webapp---provider-type-registry) and the `providerType` value stored in Postgres.
 - Do not reuse a bare prefix that already maps elsewhere. The only "bare" mappings are `claude-*` to anthropic and everything-else to openai.
+- `loop/` is taken and is **not a provider**: it is Agent in the Loop, where the person's own MCP client (Claude Code, Codex) answers the agent's model calls. It has no key, no `/models` fetch and no `setup_llm` provider branch beyond the adapter, and every builder outside a chat run refuses it (`refuse_loop_model`, the `agent-in-the-loop` skill). Never add a provider type named `loop`.
 - This routing table is mirrored in TypeScript at [presets/generate/route.ts:34](../../../webapp/src/app/api/presets/generate/route.ts#L34). **Both must stay in sync** - drift between them was the cause of past bugs.
 
 ### 4.7 Agentic - `setup_llm` (LangChain client factory)
@@ -508,7 +509,7 @@ Use this table as a quick comparison. Every cell is a real value in today's code
 |---|---|---|---|---|---|---|
 | OpenAI | `openai` | `ChatOpenAI` | `https://api.openai.com/v1` | (none - bare id) | `Authorization: Bearer` | `/v1/models`, filter `gpt-*`, `o1-*`, `o3-*`, `o4-*` |
 | Anthropic | `anthropic` | `ChatAnthropic` | `https://api.anthropic.com` | `claude-*` (bare) | `x-api-key`, `anthropic-version` | `/v1/models?limit=100` |
-| OpenRouter | `openrouter` | `ChatOpenAI` | `https://openrouter.ai/api/v1` | `openrouter/` | `Authorization: Bearer` + `HTTP-Referer: https://redamon.dev`, `X-Title: RedAmon Agent` | public `/api/v1/models`, filter text I/O |
+| OpenRouter | `openrouter` | `ChatOpenAI` | `https://openrouter.ai/api/v1` | `openrouter/` | `Authorization: Bearer` + `HTTP-Referer: https://www.redamon.org`, `X-Title: RedAmon Agent` | public `/api/v1/models`, filter text I/O |
 | DeepSeek | `deepseek` | `ChatOpenAI` | `https://api.deepseek.com/v1` | `deepseek/` | `Authorization: Bearer` | `/v1/models` + fallback list |
 | Google Gemini | `gemini` | `ChatGoogleGenerativeAI` | `https://generativelanguage.googleapis.com` | `gemini/` | `?key=` query param | `/v1beta/models`, filter `models/gemini-*` with `generateContent` |
 | GLM (Zhipu) | `glm` | `ChatOpenAI` | `https://open.bigmodel.cn/api/paas/v4` | `glm/` | `Authorization: Bearer` | OpenAI-compat `/models` + fallback |
@@ -600,9 +601,10 @@ A model identifier as stored in `Project.agentOpenaiModel`, `Project.aiPipelineM
 | `mistral/` | `mistral` | `mistral/mistral-large-2411` |
 | `custom/{configId}` | `openai_compatible` (per-user config) | `custom/clx7abc123` |
 | `openai_compat/` (legacy) | env-var-driven OpenAI-compat | `openai_compat/llama3` |
+| `loop/` | none: Agent in the Loop, an external MCP client answers (chat runs only) | `loop/mcp` |
 | **your new prefix** | **your provider** | **`myprovider/myprovider-large`** |
 
-When in doubt, the **single source of truth** is `parse_model_provider()` at [agentic/orchestrator_helpers/llm_setup.py:27](../../../agentic/orchestrator_helpers/llm_setup.py#L27). Any disagreement between this table and that function is a bug, fix the table, not the function.
+When in doubt, the **single source of truth** is `parse_model_provider()` at [agentic/orchestrator_helpers/llm_setup.py:90](../../../agentic/orchestrator_helpers/llm_setup.py#L90). Any disagreement between this table and that function is a bug, fix the table, not the function.
 
 ---
 

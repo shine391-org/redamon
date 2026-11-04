@@ -161,7 +161,7 @@ class TestRunVulnScanIsolated(unittest.TestCase):
             self.assertIsInstance(result, TopLevelKeys)
             self.assertEqual(result, {'vuln_scan': {'findings': ['marker'], '_received_output_file': None}})
 
-    def test_isolated_returns_empty_when_key_missing(self):
+    def test_isolated_returns_empty_namespace_when_key_missing(self):
         """If run_vuln_scan doesn't add vuln_scan (e.g. Nuclei disabled early return),
         wrapper returns an empty vuln_scan instead of raising."""
         def no_op(recon_data, output_file=None, settings=None):

@@ -36,6 +36,7 @@ export const SECTION_INPUT_MAP: Record<string, string[]> = {
   SubdomainTakeover:  ['Subdomain', 'BaseURL', 'Domain'],
   VhostSni:           ['Subdomain', 'IP', 'Port', 'BaseURL', 'Certificate', 'DNSRecord', 'ExternalDomain'],
   WebCachePoison:     ['BaseURL', 'Endpoint'],
+  RouteExposure:      ['BaseURL', 'Endpoint', 'Technology'],
 }
 
 export const SECTION_NODE_MAP: Record<string, string[]> = {
@@ -76,6 +77,7 @@ export const SECTION_NODE_MAP: Record<string, string[]> = {
   SubdomainTakeover:  ['Vulnerability'],
   VhostSni:           ['Vulnerability', 'BaseURL', 'Subdomain'],
   WebCachePoison:     ['Vulnerability'],
+  RouteExposure:      ['Vulnerability', 'Endpoint'],
 }
 
 export const SECTION_ENRICH_MAP: Record<string, string[]> = {
@@ -97,4 +99,5 @@ export const SECTION_ENRICH_MAP: Record<string, string[]> = {
   GraphqlScan:        ['Endpoint'],
   VhostSni:           ['Subdomain', 'IP'],
   WebCachePoison:     ['Endpoint', 'BaseURL'],
+  RouteExposure:      ['Endpoint'],
 }

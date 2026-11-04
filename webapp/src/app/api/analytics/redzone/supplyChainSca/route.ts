@@ -4,6 +4,7 @@ import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { reportCountable } from '@/lib/triage/reportable'
+import { internalError } from '@/lib/routeErrors'
 
 /**
  * Supply-Chain SCA: the Package / MalPackageFinding / Vulnerability model that
@@ -311,9 +312,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Red-zone supplyChainSca error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' }, { status: 500 })
+    return internalError(error, 'Query failed', { log: 'Red-zone supplyChainSca error' })
   } finally {
     await session.close()
   }

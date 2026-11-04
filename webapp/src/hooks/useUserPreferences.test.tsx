@@ -278,6 +278,41 @@ describe('useUserPreferences', () => {
 
     errSpy.mockRestore()
   })
+
+  test('a failed PATCH is exposed with its code and status, and cleared by the next good write', async () => {
+    vi.useRealTimers()
+    let fail = true
+    installFetchMock(async ({ url, init }) => {
+      if (url === '/api/user/preferences' && (!init?.method || init.method === 'GET')) return jsonResponse({ theme: 'dark' })
+      if (init?.method === 'PATCH') {
+        return fail
+          ? jsonResponse({ error: 'Failed to update preferences', code: 'P2024' }, 500)
+          : jsonResponse({ theme: 'light' })
+      }
+      return jsonResponse({})
+    })
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { result } = renderHook(() => useUserPreferences(), { wrapper: makeWrapper() })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.persistError).toBeNull()
+
+    await act(async () => { result.current.updatePref('theme', 'light') })
+    await waitFor(() => expect(result.current.persistError?.message)
+      .toBe('Failed to update preferences (P2024 · HTTP 500)'), { timeout: 2000 })
+    expect(result.current.prefs.theme).toBe('dark')
+
+    fail = false
+    await act(async () => { result.current.updatePref('theme', 'light') })
+    await waitFor(() => expect(result.current.persistError).toBeNull(), { timeout: 2000 })
+    errSpy.mockRestore()
+  })
+
+  test('a failed load carries its code and status', async () => {
+    vi.useRealTimers()
+    installFetchMock(async () => jsonResponse({ error: 'Failed to fetch preferences', code: 'P1001' }, 500))
+    const { result } = renderHook(() => useUserPreferences(), { wrapper: makeWrapper() })
+    await waitFor(() => expect(result.current.error?.message).toBe('Failed to fetch preferences (P1001 · HTTP 500)'))
+  })
 })
 
 describe('useNodeDetailsPrefs', () => {
