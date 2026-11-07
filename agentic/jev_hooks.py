@@ -61,17 +61,50 @@ def _noul(instructions: str, *, true: str = "", false: str = "") -> dict:
     return q
 
 
-async def _ask(key: str, state, questions: dict) -> dict:
+def _fits(key: jev_client.JevProvider | str, state, questions: dict) -> bool:
+    """Whether one request stays under the backend's body budget (always, with none)."""
+    if not isinstance(key, jev_client.JevProvider):
+        return True
+    limit = jev_client.body_limit(key)
+    return limit is None or jev_client.request_size(key, state, questions) < limit
+
+
+def _preflight(key: jev_client.JevProvider | str, requests: list[tuple[Any, dict]]) -> None:
+    """Refuse the hook before any request is sent if one of them cannot be sent.
+
+    A batch is only too large when a single item or the shared state alone
+    exceeds the budget, and failing then, before spending, keeps the hook
+    all-or-nothing instead of paying for answers it would have to discard.
+    """
+    if isinstance(key, jev_client.JevProvider):
+        for state, chunk in requests:
+            jev_client.validate_request_size(key, state, chunk)
+
+
+async def _ask(key: jev_client.JevProvider | str, state, questions: dict) -> dict:
     """One or more sequential requests, same state, all-or-nothing.
+
+    A chunk closes at JEV_MAX_QUESTIONS_PER_CALL questions or, on a backend with
+    a body budget (OpenRouter), before the request would reach it: the state is
+    re-sent with every chunk, so the questions are what gets split.
 
     Splitting is sequential (never concurrent) so one scan cannot burst the
     per-account rate. If any request fails the whole hook fails: a partial
     answer set would silently narrow coverage.
     """
-    names = list(questions)
+    chunks: list[dict] = []
+    chunk: dict[str, Any] = {}
+    for name, question in questions.items():
+        grown = {**chunk, name: question}
+        if chunk and (len(grown) > JEV_MAX_QUESTIONS_PER_CALL or not _fits(key, state, grown)):
+            chunks.append(chunk)
+            grown = {name: question}
+        chunk = grown
+    if chunk:
+        chunks.append(chunk)
+    _preflight(key, [(state, c) for c in chunks])
     answers: dict[str, Any] = {}
-    for i in range(0, len(names), JEV_MAX_QUESTIONS_PER_CALL):
-        chunk = {n: questions[n] for n in names[i:i + JEV_MAX_QUESTIONS_PER_CALL]}
+    for chunk in chunks:
         result = await jev_client.system_one(key, JEV_MODEL, state, chunk)
         answers.update(result["answers"])
     return answers
@@ -98,7 +131,7 @@ FFUF_JEV_CATALOG: tuple[str, ...] = (
 _FFUF_FLOOR = (".bak", ".old")
 
 
-async def ffuf_extensions(key: str, url: str, headers: dict, max_extensions: int) -> dict:
+async def ffuf_extensions(key: jev_client.JevProvider | str, url: str, headers: dict, max_extensions: int) -> dict:
     """`{"extensions": [...]}` — the same shape as `/llm/ffuf-extensions`."""
     questions = {
         f"ext_{i}": _noul(
@@ -137,7 +170,7 @@ async def ffuf_extensions(key: str, url: str, headers: dict, max_extensions: int
 _NUCLEI_UNIVERSAL = ("cve", "exposure", "misconfig", "default-login", "kev", "oast", "takeover")
 
 
-async def nuclei_tags(key: str, technologies: list, servers: list,
+async def nuclei_tags(key: jev_client.JevProvider | str, technologies: list, servers: list,
                       candidates: list, max_tags: int) -> dict:
     """`{"tags": [...]}` — the same shape as `/llm/nuclei-tags`.
 
@@ -184,7 +217,7 @@ _WAF_VENDORS = (
 )
 
 
-async def waf_classify(key: str, url: str, status_code: int, headers: dict,
+async def waf_classify(key: jev_client.JevProvider | str, url: str, status_code: int, headers: dict,
                        body_sample: str, response_time_ms: int) -> dict:
     """The `/llm/waf-classify` shape: waf_detected, waf_type, confidence, reasoning, source."""
     questions = {
@@ -219,7 +252,7 @@ async def waf_classify(key: str, url: str, status_code: int, headers: dict,
 # Takeover classify
 # ---------------------------------------------------------------------------
 
-async def takeover_classify(key: str, hostname: str, expected_provider: str,
+async def takeover_classify(key: jev_client.JevProvider | str, hostname: str, expected_provider: str,
                             status_code: int, headers: dict, response_sample: str) -> dict:
     """The `/llm/takeover-classify` shape: is_waf_block, confidence, reason, source."""
     questions = {
@@ -259,40 +292,46 @@ async def takeover_classify(key: str, hostname: str, expected_provider: str,
 _ITEM_STATE_CHARS = 120_000
 
 
-async def _ask_items(key: str, shared: dict, items: dict, questions: dict) -> dict:
+async def _ask_items(key: jev_client.JevProvider | str, shared: dict, items: dict, questions: dict) -> dict:
     """Ask per-item questions, sending each request only its own items.
 
     `_ask` re-sends one state with every chunk, which is right for one header set
     and many questions, and wrong here: a scan's worth of items would exceed the
     request limit. `items` maps an item id to its state; `questions` maps the same
     id to that item's questions. A chunk closes at JEV_MAX_QUESTIONS_PER_CALL
-    questions or _ITEM_STATE_CHARS of item state, whichever comes first (an item
-    larger than the budget goes alone; the per-field clips bound it).
-    Sequential and all-or-nothing, like `_ask`.
+    questions, _ITEM_STATE_CHARS of item state, or the backend's body budget
+    (OpenRouter), whichever comes first (an item larger than the budget goes
+    alone; the per-field clips bound it). Sequential and all-or-nothing, like `_ask`.
     """
     answers: dict[str, Any] = {}
     chunk_items: dict[str, Any] = {}
     chunk_questions: dict[str, Any] = {}
     chunk_chars = 0
 
-    async def flush():
-        result = await jev_client.system_one(
-            key, JEV_MODEL, {**shared, "items": chunk_items}, chunk_questions)
-        answers.update(result["answers"])
+    requests: list[tuple[dict, dict]] = []
+
+    def flush():
+        requests.append(({**shared, "items": chunk_items}, chunk_questions))
 
     for item_id, item_state in items.items():
         item_questions = questions[item_id]
         size = len(json.dumps(item_state))
         if chunk_questions and (
                 len(chunk_questions) + len(item_questions) > JEV_MAX_QUESTIONS_PER_CALL
-                or chunk_chars + size > _ITEM_STATE_CHARS):
-            await flush()
+                or chunk_chars + size > _ITEM_STATE_CHARS
+                or not _fits(key, {**shared, "items": {**chunk_items, item_id: item_state}},
+                             {**chunk_questions, **item_questions})):
+            flush()
             chunk_items, chunk_questions, chunk_chars = {}, {}, 0
         chunk_items[item_id] = item_state
         chunk_questions.update(item_questions)
         chunk_chars += size
     if chunk_questions:
-        await flush()
+        flush()
+    _preflight(key, requests)
+    for state, chunk in requests:
+        result = await jev_client.system_one(key, JEV_MODEL, state, chunk)
+        answers.update(result["answers"])
     return answers
 
 
@@ -306,7 +345,7 @@ FFUF_BASE_PATHS_MAX = 400
 FFUF_BASE_PATH_CHARS = 200
 
 
-async def ffuf_base_paths(key: str, candidates: list, cap: int) -> dict:
+async def ffuf_base_paths(key: jev_client.JevProvider | str, candidates: list, cap: int) -> dict:
     """Rank FFuf smart-fuzz base paths.
 
     Returns `{"ranked", "scores", "model"}`: `scores[i]` is the noul for
@@ -391,7 +430,7 @@ def _page_state(page: dict) -> dict:
     }
 
 
-async def page_type(key: str, pages: list) -> dict:
+async def page_type(key: jev_client.JevProvider | str, pages: list) -> dict:
     """Label each page: `{"labels": [{"page_class", "confidence"}], "model"}`.
 
     One request per page, sequential and all-or-nothing, with five nouls about
@@ -429,7 +468,7 @@ TOOL_HEALTH_TOOLS = ("katana", "hakrawler", "gau", "paramspider", "kiterunner",
 _STDERR_CHARS = 4_000
 
 
-async def tool_health(key: str, tool: str, return_code: int, elapsed_s: float,
+async def tool_health(key: jev_client.JevProvider | str, tool: str, return_code: int, elapsed_s: float,
                       seed_count: int, stderr: str) -> dict:
     """Is an empty result's error output transient? `{"transient", "confidence", "model"}`.
 
@@ -482,7 +521,7 @@ def _host_state(host: dict) -> dict:
     }
 
 
-async def crawl_seed_order(key: str, hosts: list) -> dict:
+async def crawl_seed_order(key: jev_client.JevProvider | str, hosts: list) -> dict:
     """Score each host for crawl order: `{"scores": [noul per host], "model"}`.
 
     Ordering only: recon sorts by (-score, hostname) and never drops a host, so
@@ -567,7 +606,7 @@ def _blob_state(blob: dict) -> dict:
     }
 
 
-async def serialized_classify(key: str, blobs: list) -> dict:
+async def serialized_classify(key: jev_client.JevProvider | str, blobs: list) -> dict:
     """Assess each blob: `{"labels": [{"format", "format_confidence", "exploitability"}], "model"}`.
 
     One request per blob, sequential and all-or-nothing, like `page_type`:
@@ -627,7 +666,7 @@ def _route_state(route: dict) -> dict:
     }
 
 
-async def route_privacy_rank(key: str, routes: list) -> dict:
+async def route_privacy_rank(key: jev_client.JevProvider | str, routes: list) -> dict:
     """Score each route for privacy: `{"scores": [noul per route], "model"}`.
 
     Ranking only: recon spends its request budget floor first, so the answer can
@@ -692,7 +731,7 @@ def _candidate_state(candidate: dict) -> dict:
     }
 
 
-async def route_exposure_assess(key: str, candidates: list) -> dict:
+async def route_exposure_assess(key: jev_client.JevProvider | str, candidates: list) -> dict:
     """Assess each lead: `{"labels": [{"kind", "kind_confidence", "sensitivity"}], "model"}`.
 
     One request per lead, sequential and all-or-nothing, like `serialized_classify`:

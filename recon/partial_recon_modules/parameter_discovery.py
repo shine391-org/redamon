@@ -314,6 +314,8 @@ def run_kiterunner(config: dict) -> None:
     KITERUNNER_MATCH_STATUS = settings.get('KITERUNNER_MATCH_STATUS', [])
     KITERUNNER_MIN_CONTENT_LENGTH = settings.get('KITERUNNER_MIN_CONTENT_LENGTH', 0)
     KITERUNNER_HEADERS = merge_auth_headers(settings.get('KITERUNNER_HEADERS', []), settings, sorted(target_domains))
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    KITERUNNER_HEADERS = _append_identity(KITERUNNER_HEADERS, settings)
     KITERUNNER_DETECT_METHODS = settings.get('KITERUNNER_DETECT_METHODS', True)
     KITERUNNER_METHOD_DETECTION_MODE = settings.get('KITERUNNER_METHOD_DETECTION_MODE', 'options')
     KITERUNNER_BRUTEFORCE_METHODS = settings.get('KITERUNNER_BRUTEFORCE_METHODS', ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
@@ -675,6 +677,8 @@ def run_arjun(config: dict) -> None:
     ARJUN_PASSIVE = settings.get('ARJUN_PASSIVE', False)
     ARJUN_DISABLE_REDIRECTS = settings.get('ARJUN_DISABLE_REDIRECTS', False)
     ARJUN_CUSTOM_HEADERS = merge_auth_headers(settings.get('ARJUN_CUSTOM_HEADERS', []), settings, sorted(target_domains))
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    ARJUN_CUSTOM_HEADERS = _append_identity(ARJUN_CUSTOM_HEADERS, settings)
 
     # Run Arjun parameter discovery
     print(f"[*][Partial Recon] Running Arjun parameter discovery on {len(arjun_target_urls)} URLs...")

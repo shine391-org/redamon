@@ -92,20 +92,36 @@ def _js_failed(url, exc) -> None:
         pass
 
 
-def _safe_redirect_get(url, *, timeout, headers, max_redirects=5):
+def _identity_request_headers(settings) -> dict:
+    """The validated engagement identity line as a header dict (or {})."""
+    from recon.helpers.auth_profile import engagement_identity_header
+    line = engagement_identity_header(settings)
+    if not line:
+        return {}
+    name, value = line.split(':', 1)
+    return {name.strip(): value.strip()}
+
+
+def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
+                       extra_headers=None):
     """GET that validates the SSRF guard on every hop (STRIDE I14).
 
     Follows redirects manually (allow_redirects=False) so a target-hosted JS URL
     that 3xx-redirects into cloud metadata / an internal host is refused, while
     legitimate CDN redirects to public hosts still resolve. Returns the final
     ``requests.Response`` or ``None`` if a hop is unsafe / exceeds the hop cap.
+
+    ``extra_headers`` (engagement identity) is merged into every hop after the
+    caller's per-request headers, so attribution survives a redirect.
     """
+    merged = dict(headers or {})
+    merged.update(extra_headers or {})
     current = url
     for _hop in range(max_redirects + 1):
         if not _download_allowed(current):
             print(f"[!][JsRecon] {current} -- blocked (SSRF guard)")
             return None
-        resp = requests.get(current, timeout=timeout, headers=headers, allow_redirects=False)
+        resp = requests.get(current, timeout=timeout, headers=merged, allow_redirects=False)
         if resp.status_code in (301, 302, 303, 307, 308):
             loc = resp.headers.get('Location') or resp.headers.get('location')
             if not loc:
@@ -660,19 +676,22 @@ def _download_js_files(
     concurrency: int,
     timeout: int,
     unreachable: Optional[list] = None,
+    settings: Optional[dict] = None,
 ) -> list:
     """
     Download JS files to local temp directory.
 
     Returns list of dicts with: url, filepath, content, headers, size.
     `unreachable` collects the URLs never fetched: a host already known down,
-    or a request that raised.
+    or a request that raised. `settings`, when given, supplies the validated
+    engagement identity header (attrbuted like every other target request).
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
     urls_to_fetch = js_urls[:max_files]
     if unreachable is None:
         unreachable = []
+    identity_headers = _identity_request_headers(settings)
 
     print(f"[*][JsRecon] Downloading {len(urls_to_fetch)} JS files (max {max_files})...")
 
@@ -688,6 +707,7 @@ def _download_js_files(
                 url,
                 timeout=min(timeout // 10, 30),
                 headers={'User-Agent': 'Mozilla/5.0 (compatible; RedAmon/1.0)'},
+                extra_headers=identity_headers,
             )
             if resp is None:
                 return None
@@ -1356,6 +1376,10 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
         settings.get('JS_RECON_ENDPOINT_ACCEPT_STATUS')
     )
     custom_header_lines = settings.get('JS_RECON_ENDPOINT_CUSTOM_HEADERS', [])
+    # Engagement identity rides the endpoint probes too (same-origin probes
+    # only, per _endpoint_probe_headers). Line format matches the setting.
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    custom_header_lines = _append_identity(custom_header_lines, settings)
     timeout = _clamp_int(settings.get('JS_RECON_VALIDATION_TIMEOUT', 5), 5, 1, 30)
     # Dedicated parallelism dial for endpoint probes, independent of the shared
     # JS_RECON_CONCURRENCY used for downloads/secret validation.
@@ -1857,6 +1881,7 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
                 concurrency=settings.get('JS_RECON_CONCURRENCY', 10),
                 timeout=settings.get('JS_RECON_TIMEOUT', 900),
                 unreachable=unreachable,
+                settings=settings,
             )
         downloaded = list(js_files)
         if file_budget['cut']:

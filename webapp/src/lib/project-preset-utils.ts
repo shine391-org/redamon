@@ -63,6 +63,7 @@ export const PRESET_EXCLUDED_FIELDS: ReadonlySet<string> = new Set([
   ...fieldsWhere(f => f.tool === 'engagement').map(f => f.key),
   ...fieldsWhere(f => f.deny_reason === 'upload-managed').map(f => f.key),
   ...fieldsWhere(f => f.read_deny_reason === 'credential').map(f => f.key),
+  ...fieldsWhere(f => f.validator === 'provider_reference').map(f => f.key),
   // A preset that does not name one of these resets it to its default, and the
   // default of `mcpKaliExecEnabled` is ON: carrying it let applying any preset
   // quietly re-enable the MCP sandbox a person had switched off.
@@ -85,10 +86,10 @@ export const PRESET_FIELD_KEYS: readonly string[] = fieldKeys().filter(k => !PRE
  * The first two are models the user may have no provider for, which is why the
  * create form makes them pick explicitly. The per-hook Jev fields (the four
  * *AiUseJev engine switches and the Jev-only hooks) are tied to whether the
- * owner has a Jev token, a fact no preset can know; resetting them to false on
+ * project selects a Jev provider, a fact no preset can know; resetting them to false on
  * every preset apply would silently turn Jev off for the project. Built-in
  * presets never name any of these; an AI-generated one can name a Jev field, and
- * switching one on is then refused without the owner's token (jevEngine.ts).
+ * switching one on is then refused without that selection (jevEngine.ts).
  */
 export const KEPT_WHEN_ABSENT: ReadonlySet<string> = new Set([
   'agentOpenaiModel', 'aiPipelineModel',

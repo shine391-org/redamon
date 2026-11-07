@@ -656,6 +656,8 @@ def _run_nuclei_takeover(urls: list[str], work_dir: Path, settings: dict) -> lis
     # A uuid name so a timeout kills THIS container. vuln_scan's Nuclei and this
     # one start together in GROUP 6, so a pid-based name would collide.
     container_name = f"redamon-nuclei-takeover-{uuid.uuid4().hex[:12]}"
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    _takeover_headers = _append_identity([], settings)
     cmd = build_nuclei_command(
         targets_file=str(targets_file),
         output_file=str(output_file),
@@ -672,6 +674,7 @@ def _run_nuclei_takeover(urls: list[str], work_dir: Path, settings: dict) -> lis
         follow_redirects=bool(settings.get("NUCLEI_FOLLOW_REDIRECTS", True)),
         max_redirects=int(settings.get("NUCLEI_MAX_REDIRECTS", 10)),
         interactsh=False,  # Takeover templates don't need OOB interactions
+        auth_headers=_takeover_headers,
         container_name=container_name,
         max_host_error=int(settings.get("NUCLEI_MAX_HOST_ERROR", 30)),
     )

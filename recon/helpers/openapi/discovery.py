@@ -16,7 +16,9 @@ from html import unescape
 from urllib.parse import urljoin, urlsplit
 
 from helpers import proxy_routing
-from recon.helpers.auth_profile import auth_header_lines, profile_from_settings
+from recon.helpers.auth_profile import (
+    append_engagement_identity, auth_header_lines, profile_from_settings,
+)
 from recon.helpers.openapi.fetch import (
     DocumentError, Fetcher, RequestPacer, decode_document, http_url, origin, parse_headers, public_url,
 )
@@ -366,8 +368,9 @@ def _discover(recon_data, settings, seed_urls, explicit_urls, result):
             allowed_origin = allowed_origin or origin(url)
             if origin(url) != allowed_origin:
                 raise DocumentError('Cross-origin documentation link blocked', code='out_of_scope')
-            headers = parse_headers(auth_header_lines(profile_from_settings(settings),
-                                                      urlsplit(url).hostname, settings))
+            headers = parse_headers(append_engagement_identity(
+                auth_header_lines(profile_from_settings(settings),
+                                  urlsplit(url).hostname, settings), settings))
             key = (url, tuple(sorted(headers.items())), override, (context or {}).get('id') or url)
             if key not in seen and len(seen) < 2000:
                 seen.add(key)

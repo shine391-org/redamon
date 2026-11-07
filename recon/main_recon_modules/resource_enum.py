@@ -400,6 +400,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             ("ZAP_AJAX_SPIDER_SCOPE_CHECK", "ZAP Ajax Spider"),
             ("ZAP_AJAX_SPIDER_MAX_URLS", "ZAP Ajax Spider"),
             ("ZAP_AJAX_SPIDER_PARALLELISM", "ZAP Ajax Spider"),
+            ("ZAP_AJAX_SPIDER_MAX_SEEDS", "ZAP Ajax Spider"),
             ("ZAP_AJAX_SPIDER_CUSTOM_HEADERS", "ZAP Ajax Spider"),
             ("ZAP_AJAX_SPIDER_EXCLUDE_PATTERNS", "ZAP Ajax Spider"),
             ("KITERUNNER_ENABLED", "Kiterunner"),
@@ -716,6 +717,18 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     ZAP_AJAX_SPIDER_CUSTOM_HEADERS = _merge_auth(ZAP_AJAX_SPIDER_CUSTOM_HEADERS, settings, _auth_hosts)
     ARJUN_CUSTOM_HEADERS = _merge_auth(ARJUN_CUSTOM_HEADERS, settings, _auth_hosts)
     KITERUNNER_HEADERS = _merge_auth(KITERUNNER_HEADERS, settings, _auth_hosts)
+
+    # Engagement identity header: one append per tool's header set. It rides the
+    # tool's own -H path, so it is sent identically direct and through the
+    # capture proxy (the fail-open fallback cannot lose it), and it is deduped
+    # against anything the auth merge above already produced.
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    KATANA_CUSTOM_HEADERS = _append_identity(KATANA_CUSTOM_HEADERS, settings)
+    HAKRAWLER_CUSTOM_HEADERS = _append_identity(HAKRAWLER_CUSTOM_HEADERS, settings)
+    FFUF_CUSTOM_HEADERS = _append_identity(FFUF_CUSTOM_HEADERS, settings)
+    ZAP_AJAX_SPIDER_CUSTOM_HEADERS = _append_identity(ZAP_AJAX_SPIDER_CUSTOM_HEADERS, settings)
+    ARJUN_CUSTOM_HEADERS = _append_identity(ARJUN_CUSTOM_HEADERS, settings)
+    KITERUNNER_HEADERS = _append_identity(KITERUNNER_HEADERS, settings)
 
     # An EXACT group scans its listed hosts: Hakrawler must not follow links
     # into sibling subdomains, and ParamSpider keeps only the exact hosts.
@@ -1159,7 +1172,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 JSLUICE_EXTRACT_SECRETS,
                 JSLUICE_CONCURRENCY,
                 JSLUICE_PARALLELISM,
-                target_domains
+                target_domains,
+                settings=settings,
             )
 
             jsluice_urls_pre_verify_count = len(jsluice_result.get("urls", []))

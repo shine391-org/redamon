@@ -354,7 +354,8 @@ def run_jsluice_analysis(
     extract_secrets: bool,
     concurrency: int,
     parallelism: int = 3,
-    allowed_hosts: set = None
+    allowed_hosts: set = None,
+    settings: Optional[dict] = None,
 ) -> Dict:
     """
     Analyze JavaScript files with jsluice to extract URLs, endpoints, and secrets.
@@ -402,7 +403,7 @@ def run_jsluice_analysis(
     try:
         download_errors = []
         downloaded = _download_js_files(js_urls, work_dir, parallelism=parallelism,
-                                        errors=download_errors)
+                                        errors=download_errors, settings=settings)
         if not downloaded:
             print("[-][jsluice] No JS files downloaded successfully")
             # Every file answering non-200 means the files are gone and their
@@ -599,11 +600,22 @@ def _is_js_url(url: str) -> bool:
     return is_js_url(url)
 
 
+def _identity_request_headers(settings) -> dict:
+    """The engagement identity line as a requests/urllib header dict (or {})."""
+    from recon.helpers.auth_profile import engagement_identity_header
+    line = engagement_identity_header(settings)
+    if not line:
+        return {}
+    name, value = line.split(':', 1)
+    return {name.strip(): value.strip()}
+
+
 def _download_js_files(
     js_urls: List[str],
     work_dir: Path,
     parallelism: int = 5,
     errors: Optional[list] = None,
+    settings: Optional[dict] = None,
 ) -> Dict[str, str]:
     """Download JavaScript files to a local directory.
 
@@ -611,8 +623,11 @@ def _download_js_files(
     and host-gated: a host HostHealth already marked down is skipped, and each
     fetch records what it saw so a host that dies mid-download stops early.
     ``errors``, when given, collects the URLs whose fetch raised, as opposed to
-    answering with a non-200 status.
+    answering with a non-200 status. ``settings``, when given, supplies the
+    validated engagement identity header so jsluice downloads are attributed
+    like every other active target request.
     """
+    extra_headers = _identity_request_headers(settings)
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
@@ -631,6 +646,7 @@ def _download_js_files(
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': '*/*',
+                    **extra_headers,
                 }
             )
             response = opener.open(request, timeout=10)

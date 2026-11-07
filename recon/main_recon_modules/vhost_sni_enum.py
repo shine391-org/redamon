@@ -216,6 +216,11 @@ def run_vhost_sni_enrichment(
             "skipped": len(wordlist_skipped),
         }])
 
+    # Engagement identity header on every curl probe: attribution applies to
+    # this module's direct HTTP traffic exactly as it does to the -H tools.
+    from recon.helpers.auth_profile import engagement_identity_header as _identity_header
+    _identity = _identity_header(settings)
+
     print(f"[*][VhostSni] Probing {len(ip_port_map)} IP target(s) with concurrency={concurrency}")
     for ip, ports in ip_port_map.items():
         try:
@@ -234,6 +239,7 @@ def run_vhost_sni_enrichment(
                 max_candidates=max_candidates_per_ip,
                 scope=candidate_scope,
                 dns_known=_dns_known_names(combined_result, ip),
+                identity=_identity,
             )
         except Exception as e:
             print(f"[!][VhostSni] IP {ip} probing failed: {e}")
@@ -376,6 +382,7 @@ def _probe_single_ip(
     max_candidates: int,
     scope: Optional["_CandidateScope"] = None,
     dns_known: Iterable[str] = (),
+    identity: Optional[str] = None,
 ) -> dict:
     """Run baseline + L7/L4 anomaly probes for one IP across all its ports.
 
@@ -404,6 +411,10 @@ def _probe_single_ip(
     suppressed_as_noise: list[str] = []
     dead_ports: list[str] = []
 
+    # Engagement identity header, resolved once by the caller (run_*): every
+    # curl probe this IP run sends carries it, so the traffic is attributable.
+    _identity = identity
+
     for port_info in ports:
         port = int(port_info.get("port", 443))
         scheme = port_info.get("scheme") or _scheme_for_port(port)
@@ -423,6 +434,7 @@ def _probe_single_ip(
             target=ip,
             port=port,
             timeout=timeout,
+            identity_header=_identity,
         )
         if baseline is None:
             print(f"[!][VhostSni] IP {ip}:{port} ({scheme}) baseline failed -- skipping port")
@@ -435,7 +447,7 @@ def _probe_single_ip(
         # real hidden vhost (suppressed below).
         l7_controls, l4_controls = _run_control_probes(
             scheme, ip, port, timeout, test_l7=test_l7, test_l4=test_l4,
-            apex_domain=apex_domain,
+            apex_domain=apex_domain, identity=_identity,
         )
         if l7_controls or l4_controls:
             print(
@@ -451,9 +463,9 @@ def _probe_single_ip(
             futures = {}
             for hostname in candidates:
                 if test_l7:
-                    futures[pool.submit(_curl_probe, scheme, hostname, None, ip, port, timeout)] = (hostname, "L7")
+                    futures[pool.submit(_curl_probe, scheme, hostname, None, ip, port, timeout, _identity)] = (hostname, "L7")
                 if test_l4 and scheme == "https":
-                    futures[pool.submit(_curl_probe, scheme, hostname, hostname, ip, port, timeout)] = (hostname, "L4")
+                    futures[pool.submit(_curl_probe, scheme, hostname, hostname, ip, port, timeout, _identity)] = (hostname, "L4")
             none_streak = 0
             for fut in as_completed(futures):
                 hostname, layer = futures[fut]
@@ -645,6 +657,7 @@ def _curl_probe(
     target: str,
     port: int,
     timeout: int,
+    identity_header: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Single curl invocation. Returns {"status": int, "size": int, "body_hash": str}
@@ -675,6 +688,7 @@ def _curl_probe(
             "--resolve", f"{sni_hostname}:{port}:{addr}",
             "--connect-timeout", str(timeout),
             "--max-time", str(timeout * 3),
+        ] + (["-H", identity_header] if identity_header else []) + [
             url,
         ]
     else:
@@ -690,6 +704,8 @@ def _curl_probe(
         ]
         if host_header:
             cmd += ["-H", f"Host: {host_header}"]
+        if identity_header:
+            cmd += ["-H", identity_header]
         cmd.append(url)
 
     try:
@@ -837,6 +853,7 @@ def _run_control_probes(
     test_l7: bool,
     test_l4: bool,
     apex_domain: Optional[str] = None,
+    identity: Optional[str] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Send `_CONTROL_PROBE_COUNT` probes with random bogus hostnames and
     return (l7_controls, l4_controls). Used to characterize what the IP
@@ -845,11 +862,11 @@ def _run_control_probes(
     l4_controls: list[dict] = []
     for bogus in _control_hostnames(apex_domain):
         if test_l7:
-            r = _curl_probe(scheme, bogus, None, ip, port, timeout)
+            r = _curl_probe(scheme, bogus, None, ip, port, timeout, identity)
             if r:
                 l7_controls.append(r)
         if test_l4 and scheme == "https":
-            r = _curl_probe(scheme, None, bogus, ip, port, timeout)
+            r = _curl_probe(scheme, None, bogus, ip, port, timeout, identity)
             if r:
                 l4_controls.append(r)
     return l7_controls, l4_controls

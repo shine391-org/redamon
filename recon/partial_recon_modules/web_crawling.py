@@ -166,6 +166,8 @@ def run_katana(config: dict) -> None:
     KATANA_JS_CRAWL = settings.get('KATANA_JS_CRAWL', True)
     KATANA_PARAMS_ONLY = settings.get('KATANA_PARAMS_ONLY', False)
     KATANA_CUSTOM_HEADERS = merge_auth_headers(settings.get('KATANA_CUSTOM_HEADERS', []), settings, sorted(target_domains))
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    KATANA_CUSTOM_HEADERS = _append_identity(KATANA_CUSTOM_HEADERS, settings)
     KATANA_EXCLUDE_PATTERNS = settings.get('KATANA_EXCLUDE_PATTERNS', [])
     KATANA_PARALLELISM = settings.get('KATANA_PARALLELISM', 5)
     KATANA_CONCURRENCY = settings.get('KATANA_CONCURRENCY', 10)
@@ -431,6 +433,8 @@ def run_hakrawler(config: dict) -> None:
     HAKRAWLER_INCLUDE_SUBS = settings.get('HAKRAWLER_INCLUDE_SUBS', False)
     HAKRAWLER_INSECURE = settings.get('HAKRAWLER_INSECURE', True)
     HAKRAWLER_CUSTOM_HEADERS = merge_auth_headers(settings.get('HAKRAWLER_CUSTOM_HEADERS', []), settings, sorted(target_domains))
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    HAKRAWLER_CUSTOM_HEADERS = _append_identity(HAKRAWLER_CUSTOM_HEADERS, settings)
 
     # Pull Docker image
     print(f"[*][Partial Recon] Pulling Hakrawler Docker image: {HAKRAWLER_DOCKER_IMAGE}")
@@ -739,6 +743,8 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
     ZAP_AJAX_SPIDER_LOGOUT_AVOIDANCE = settings.get("ZAP_AJAX_SPIDER_LOGOUT_AVOIDANCE", True)
     ZAP_AJAX_SPIDER_SCOPE_CHECK = settings.get("ZAP_AJAX_SPIDER_SCOPE_CHECK", "Strict")
     ZAP_AJAX_SPIDER_CUSTOM_HEADERS = merge_auth_headers(settings.get("ZAP_AJAX_SPIDER_CUSTOM_HEADERS", []), settings, sorted(target_domains))
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    ZAP_AJAX_SPIDER_CUSTOM_HEADERS = _append_identity(ZAP_AJAX_SPIDER_CUSTOM_HEADERS, settings)
     ZAP_AJAX_SPIDER_EXCLUDE_PATTERNS = settings.get("ZAP_AJAX_SPIDER_EXCLUDE_PATTERNS", [])
     ZAP_AJAX_SPIDER_MAX_URLS = settings.get("ZAP_AJAX_SPIDER_MAX_URLS", 1000)
     ZAP_AJAX_SPIDER_PARALLELISM = settings.get("ZAP_AJAX_SPIDER_PARALLELISM", 1)
@@ -1057,6 +1063,8 @@ def run_ffuf(config: dict) -> None:
     FFUF_AUTO_CALIBRATE = settings.get('FFUF_AUTO_CALIBRATE', True)
     FFUF_FOLLOW_REDIRECTS = settings.get('FFUF_FOLLOW_REDIRECTS', False)
     FFUF_CUSTOM_HEADERS = merge_auth_headers(settings.get('FFUF_CUSTOM_HEADERS', []), settings, sorted(target_domains))
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    FFUF_CUSTOM_HEADERS = _append_identity(FFUF_CUSTOM_HEADERS, settings)
     FFUF_SMART_FUZZ = settings.get('FFUF_SMART_FUZZ', True)
     FFUF_SMART_FUZZ_MAX_BASE_PATHS = settings.get('FFUF_SMART_FUZZ_MAX_BASE_PATHS', 20)
     FFUF_PARALLELISM = settings.get('FFUF_PARALLELISM', 20)
@@ -1669,6 +1677,7 @@ def run_jsluice(config: dict) -> None:
         JSLUICE_CONCURRENCY,
         JSLUICE_PARALLELISM,
         target_domains,
+        settings=settings,
     )
 
     jsluice_urls = jsluice_result.get("urls", [])

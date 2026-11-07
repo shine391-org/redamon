@@ -67,7 +67,21 @@ def _roe_excluded(url: str, settings: dict) -> bool:
     return _is_roe_excluded(urlparse(url).hostname or '', excluded)
 
 
-def _missing_key_control(map_url: str, timeout: int) -> str:
+def _identity_request_headers(settings) -> dict:
+    """The validated engagement identity line as a header dict (or {})."""
+    try:
+        from recon.helpers.auth_profile import engagement_identity_header
+    except ImportError:  # spawned-container path
+        from auth_profile import engagement_identity_header
+    line = engagement_identity_header(settings)
+    if not line:
+        return {}
+    name, value = line.split(':', 1)
+    return {name.strip(): value.strip()}
+
+
+def _missing_key_control(map_url: str, timeout: int,
+                          identity_headers: Optional[dict] = None) -> str:
     """Fetch a sibling that cannot exist (``<map_url>.<nonce>``): ``'denied'``
     when it is refused alike, ``'passed'`` when it is not, ``'failed'`` when no
     answer came (an error is no evidence either way). Same guard, user agent
@@ -76,7 +90,9 @@ def _missing_key_control(map_url: str, timeout: int) -> str:
     if not is_url_safe_to_probe(control):
         return 'failed'
     try:
-        resp = requests.get(control, timeout=timeout, headers={'User-Agent': DEFAULT_BROWSER_UA},
+        resp = requests.get(control, timeout=timeout,
+                            headers={**{'User-Agent': DEFAULT_BROWSER_UA},
+                                     **(identity_headers or {})},
                             allow_redirects=False)
     except requests.RequestException:
         return 'failed'
@@ -183,7 +199,8 @@ def _parse_sourcemap_body(text: str, outcome: dict) -> Optional[dict]:
     return data
 
 
-def _fetch_sourcemap(url: str, timeout: int = 10, outcome: Optional[dict] = None) -> Optional[dict]:
+def _fetch_sourcemap(url: str, timeout: int = 10, outcome: Optional[dict] = None,
+                     identity_headers: Optional[dict] = None) -> Optional[dict]:
     """Fetch and parse a source map JSON file. Uses HEAD to skip guaranteed misses.
 
     `outcome`, when given, receives `reason` (and `status` for an HTTP
@@ -211,6 +228,7 @@ def _fetch_sourcemap(url: str, timeout: int = 10, outcome: Optional[dict] = None
         return None
 
     headers = {'User-Agent': DEFAULT_BROWSER_UA}
+    headers.update(identity_headers or {})
     head_timeout = min(timeout, 5)
 
     try:
@@ -434,6 +452,7 @@ def discover_and_analyze_sourcemaps(
     checked_lock = threading.Lock()
     # Use fraction of overall timeout for each sourcemap fetch, minimum 10s
     timeout = max(settings.get('JS_RECON_TIMEOUT', 900) // 60, 10)
+    identity_headers = _identity_request_headers(settings)
 
     def _claim(url: str) -> bool:
         """Atomically reserve a probe URL. Returns False if already claimed."""
@@ -508,7 +527,8 @@ def discover_and_analyze_sourcemaps(
                         return []
                     if not _claim(probe_url):
                         continue
-                    map_data = _fetch_sourcemap(probe_url, timeout=timeout)
+                    map_data = _fetch_sourcemap(probe_url, timeout=timeout,
+                                                identity_headers=identity_headers)
                     if map_data:
                         return _served(map_data, probe_url, js_url, 'probe')
                 return []
@@ -518,7 +538,8 @@ def discover_and_analyze_sourcemaps(
             if _roe_excluded(map_url, settings) or not _claim(map_url):
                 return []
             outcome: dict = {}
-            map_data = _fetch_sourcemap(map_url, timeout=timeout, outcome=outcome)
+            map_data = _fetch_sourcemap(map_url, timeout=timeout, outcome=outcome,
+                                        identity_headers=identity_headers)
             if map_data:
                 return _served(map_data, map_url, js_url, discovery_method)
             # Referenced but not served. An access refusal can mean the map
@@ -537,7 +558,8 @@ def discover_and_analyze_sourcemaps(
             if reason == 'http_403':
                 if outcome.get('storage_denial'):
                     return []
-                control_check = _missing_key_control(map_url, timeout)
+                control_check = _missing_key_control(map_url, timeout,
+                                                     identity_headers=identity_headers)
                 if control_check == 'denied':
                     return []
             finding_id = hashlib.sha256(f"srcmap-ref:{js_url}:{map_url}".encode()).hexdigest()[:16]

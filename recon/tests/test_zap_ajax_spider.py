@@ -5,6 +5,7 @@ Unit tests for ZAP Ajax Spider resource enumeration integration.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 
@@ -223,14 +224,17 @@ def test_reflected_payload_inside_a_path_is_not_a_browser_seed():
     """A catch-all host turns one reflected payload into thousands of seeds."""
     zap = _load_zap_module()
 
-    assert zap._bundled_zap_seed_path(
+    assert zap._reflected_payload_in_path(
         "http://api.example.com:8080/%5Cu003e%5Cu003cfigcaption%5Cu003eButtercup"
     )
-    assert zap._bundled_zap_seed_path("http://api.example.com/%3Cscript%3E")
-    assert not zap._bundled_zap_seed_path("http://api.example.com/api/v1/users")
-    assert not zap._bundled_zap_seed_path("http://api.example.com/a?b=1")
+    assert zap._reflected_payload_in_path("http://api.example.com/%3Cscript%3E")
+    assert zap._reflected_payload_in_path("http://api.example.com/%253Cscript%253E")
+    assert not zap._reflected_payload_in_path("http://api.example.com/api/v1/users")
+    assert not zap._reflected_payload_in_path("http://api.example.com/a?b=1")
     # a real path that happens to mention the word is left alone
-    assert not zap._bundled_zap_seed_path("http://api.example.com/docs/figcaption")
+    assert not zap._reflected_payload_in_path("http://api.example.com/docs/figcaption")
+    # a payload in the QUERY is a parameter value; the page is still worth crawling
+    assert not zap._reflected_payload_in_path("http://shop.example.com/search?q=%3Cb%3E")
 
 
 def test_zap_heap_is_sized_from_the_container_not_the_host(monkeypatch):
@@ -246,12 +250,8 @@ def test_zap_heap_is_sized_from_the_container_not_the_host(monkeypatch):
 
 def test_zap_heap_leaves_room_for_firefox_in_the_same_cgroup(monkeypatch):
     """The heap plus Firefox must fit the ceiling, or the kernel kills the JVM.
-
-    Firefox headless is not one process: firefox-esr plus several Isolated Web
-    Content children measured 0.82-1.20 GiB. A heap taken as a fraction of the
-    ceiling ignored that and produced 1.87 GiB of demand inside a 2 GiB cgroup,
-    which is why every seed died with exit 137.
-    """
+    Firefox headless is several processes (firefox-esr plus its content
+    processes), measured at 0.82-1.20 GiB per browser."""
     zap = _load_zap_module()
 
     for gib in (2, 3, 4, 8):
@@ -282,26 +282,24 @@ def test_zap_heap_is_clamped_at_both_ends(monkeypatch):
     assert zap._zap_heap_mb(64 * 1024 ** 3) == zap._ZAP_HEAP_MAX_MB
 
 
-def test_zap_heap_falls_back_when_the_governor_is_unavailable(monkeypatch):
-    def boom():
-        raise RuntimeError("no governor")
+def test_zap_container_falls_back_to_2_gib_when_the_governor_cannot_load(monkeypatch):
+    import sys
 
     zap = _load_zap_module()
-    monkeypatch.setattr(zap, "_zap_container_bytes", boom)
+    # A None entry in sys.modules makes the import raise ImportError; the package
+    # attribute must go too, or `from graph_db import resource_governor` finds it.
+    monkeypatch.setitem(sys.modules, "graph_db.resource_governor", None)
+    monkeypatch.setitem(sys.modules, "resource_governor", None)
+    if "graph_db" in sys.modules:
+        monkeypatch.delattr(sys.modules["graph_db"], "resource_governor", raising=False)
 
-    # _zap_heap_mb takes the ceiling as an argument, so a governor failure in
-    # the caller cannot make the heap calculation raise into the crawl.
+    assert zap._zap_container_bytes() == zap._DEFAULT_ZAP_CONTAINER_BYTES == 2 * 1024 ** 3
     assert zap._zap_heap_mb(zap._DEFAULT_ZAP_CONTAINER_BYTES) == zap._ZAP_HEAP_MIN_MB
 
 
 def test_zap_container_passes_the_ceiling_it_sized_the_heap_from(monkeypatch):
-    """--memory and -Xmx must come from one number, or they disagree again.
-
-    The heap was once derived from the governor's guess while the broker clamped
-    the container to a smaller value, so the JVM was sized for headroom it never
-    had. Passing the ceiling on the command line makes the two agree by
-    construction.
-    """
+    """--memory and -Xmx come from one number, so the heap is sized for the
+    limit the container is actually given."""
     zap = _load_zap_module()
     captured = {}
 
@@ -352,3 +350,212 @@ def test_zap_container_passes_the_ceiling_it_sized_the_heap_from(monkeypatch):
     assert xmx == f"-Xmx{zap._zap_heap_mb(3 * 1024 ** 3)}m", (
         f"-Xmx {xmx} must match the ceiling"
     )
+
+
+# --- run_zap_ajax_spider end to end, with docker replaced by a recorder -------------
+
+def _run_spider(zap, seeds, **overrides):
+    args = dict(
+        target_urls=seeds,
+        docker_image="ghcr.io/zaproxy/zaproxy:stable",
+        allowed_hosts=[],
+        custom_headers=[],
+        exclude_patterns=[],
+        max_urls=1000,
+        max_duration=10,
+        max_crawl_depth=5,
+        max_crawl_states=0,
+        number_of_browsers=1,
+        browser_id="firefox-headless",
+        event_wait=1000,
+        reload_wait=1000,
+        click_default_elems=True,
+        click_elems_once=True,
+        random_inputs=False,
+        logout_avoidance=True,
+        scope_check="Strict",
+        parallelism=1,
+    )
+    args.update(overrides)
+    return zap.run_zap_ajax_spider(**args)
+
+
+class _DockerRecorder:
+    """Stands in for subprocess.run: records every docker call, and can make
+    `docker run` time out the way a stuck crawl does."""
+
+    def __init__(self, run_times_out=False):
+        self.calls = []
+        self.run_times_out = run_times_out
+
+    def __call__(self, cmd, **kwargs):
+        import subprocess
+
+        self.calls.append((list(cmd), kwargs))
+        if cmd[:2] == ["docker", "run"] and self.run_times_out:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def runs(self):
+        return [(cmd, kw) for cmd, kw in self.calls if cmd[:2] == ["docker", "run"]]
+
+
+def _plans_built(monkeypatch, zap):
+    """Record the seed and browser count of every automation plan the run builds."""
+    built = []
+    real = zap.build_zap_ajax_automation_plan
+
+    def spy(**kwargs):
+        built.append({"seed": kwargs["seed_url"], "browsers": kwargs["number_of_browsers"]})
+        return real(**kwargs)
+
+    monkeypatch.setattr(zap, "build_zap_ajax_automation_plan", spy)
+    return built
+
+
+def test_a_timed_out_seed_is_killed_by_the_name_it_was_started_with(monkeypatch):
+    """subprocess.run's timeout kills only the docker CLI; the container must be
+    killed by name or it keeps crawling while the next seed starts."""
+    zap = _load_zap_module()
+    docker = _DockerRecorder(run_times_out=True)
+    monkeypatch.setattr(zap.subprocess, "run", docker)
+
+    _, meta = _run_spider(zap, ["https://app.example.com/"])
+
+    (run_cmd, _), = docker.runs()
+    name = run_cmd[run_cmd.index("--name") + 1]
+    assert name.startswith("redamon-zap-ajax-")
+    kills = [cmd for cmd, _ in docker.calls if cmd[:2] == ["docker", "kill"]]
+    assert kills == [["docker", "kill", name]]
+    assert meta["seeds_failed"] == 1
+    assert meta["errors"][0]["type"] == "timeout"
+
+
+def test_a_seed_that_finishes_is_not_killed(monkeypatch):
+    zap = _load_zap_module()
+    docker = _DockerRecorder()
+    monkeypatch.setattr(zap.subprocess, "run", docker)
+
+    _run_spider(zap, ["https://app.example.com/"])
+
+    assert not [cmd for cmd, _ in docker.calls if cmd[:2] == ["docker", "kill"]]
+
+
+def test_each_seed_runs_with_a_timeout_that_covers_its_whole_plan(monkeypatch):
+    zap = _load_zap_module()
+    docker = _DockerRecorder()
+    monkeypatch.setattr(zap.subprocess, "run", docker)
+
+    _run_spider(zap, ["https://app.example.com/"], max_duration=10)
+
+    (_, kwargs), = docker.runs()
+    plan = zap.build_zap_ajax_automation_plan("https://app.example.com/", "e.txt", max_duration=10)
+    plan_minutes = sum(int(m) for m in re.findall(r"maxDuration: (\d+)", plan))
+    assert kwargs["timeout"] == zap._zap_seed_timeout(10)
+    assert kwargs["timeout"] >= plan_minutes * 60
+
+
+def test_the_seed_cap_gives_every_host_its_base_url_before_any_second_seed(monkeypatch):
+    zap = _load_zap_module()
+    monkeypatch.setattr(zap.subprocess, "run", _DockerRecorder())
+    built = _plans_built(monkeypatch, zap)
+    hosts = ["a.example.com", "b.example.com", "c.example.com"]
+    # sorted like the callers sort: each base URL comes before its own endpoints
+    seeds = sorted(
+        [f"https://{h}" for h in hosts]
+        + [f"https://{h}/p{i:03d}" for h in hosts for i in range(200)]
+    )
+
+    _, meta = _run_spider(zap, seeds, max_seeds=10)
+
+    crawled = [b["seed"] for b in built]
+    assert len(crawled) == 10
+    assert {f"https://{h}" for h in hosts} <= set(crawled)
+    assert meta["seeds_dropped_by_cap"] == len(seeds) - 10
+    assert meta["hosts_dropped_by_cap"] == 0
+    assert meta["seed_cap"] == 10
+
+
+def test_hosts_the_cap_leaves_out_are_recorded_with_the_cap_as_the_reason(monkeypatch):
+    """A host the cap left uncrawled was not re-checked by ZAP, so the run must
+    say so (and the prune must keep its endpoints) instead of treating it as
+    clean, and must not call it unreachable: the other crawlers reached it."""
+    from recon.helpers import circuit_breaker
+
+    zap = _load_zap_module()
+    monkeypatch.setattr(zap.subprocess, "run", _DockerRecorder())
+    notes = []
+    monkeypatch.setattr(circuit_breaker, "note_degraded", lambda module, **kw: notes.append((module, kw)))
+    seeds = [f"https://h{i:02d}.example.com/" for i in range(12)]
+
+    _, meta = _run_spider(zap, seeds, max_seeds=10)
+
+    assert meta["hosts_dropped_by_cap"] == 2
+    assert notes == [("resource_enum", {
+        "hosts": ["h10.example.com:443", "h11.example.com:443"],
+        "host_source": "resource_enum",
+        "source_only_hosts": True,
+        "reason": "ZAP seed cap (10)",
+    })]
+
+
+def test_a_zero_or_invalid_seed_cap_falls_back_to_the_default_not_to_no_cap(monkeypatch):
+    zap = _load_zap_module()
+    seeds = [f"https://app.example.com/p{i}" for i in range(zap.ZAP_MAX_SEEDS_DEFAULT + 5)]
+
+    for bad in (0, -1, None, "abc"):
+        docker = _DockerRecorder()
+        monkeypatch.setattr(zap.subprocess, "run", docker)
+        _, meta = _run_spider(zap, seeds, max_seeds=bad)
+        assert len(docker.runs()) == zap.ZAP_MAX_SEEDS_DEFAULT, bad
+        assert meta["seed_cap"] == zap.ZAP_MAX_SEEDS_DEFAULT
+
+
+def test_a_reflected_payload_in_the_path_never_reaches_a_container(monkeypatch):
+    zap = _load_zap_module()
+    monkeypatch.setattr(zap.subprocess, "run", _DockerRecorder())
+    built = _plans_built(monkeypatch, zap)
+    seeds = [
+        "https://app.example.com/",
+        "https://app.example.com/static/%3Cscript%3Ealert(1)%3C/script%3E",
+        "https://app.example.com/search?q=%3Cb%3E",
+    ]
+
+    _, meta = _run_spider(zap, seeds)
+
+    assert [b["seed"] for b in built] == [
+        "https://app.example.com/",
+        "https://app.example.com/search?q=%3Cb%3E",
+    ]
+    assert meta["reflected_path_seed_urls"] == 1
+    assert {"reason": "reflected_payload_in_path"}.items() <= meta["dropped_seed_urls"][0].items()
+
+
+def test_browsers_that_do_not_fit_the_container_are_reduced(monkeypatch):
+    """Each browser is a separate Firefox: four of them plus a JVM cannot fit a
+    3 GiB container, and asking for them anyway OOM-kills every seed."""
+    zap = _load_zap_module()
+    monkeypatch.setattr(zap.subprocess, "run", _DockerRecorder())
+    monkeypatch.setattr(zap, "_zap_container_bytes", lambda: 3 * 1024 ** 3)
+    built = _plans_built(monkeypatch, zap)
+
+    _, meta = _run_spider(zap, ["https://app.example.com/"], number_of_browsers=4)
+
+    assert built[0]["browsers"] == 1
+    assert meta["browsers_used"] == 1
+    assert meta["browsers_requested"] == 4
+
+
+def test_heap_plus_every_browser_fits_the_container_at_any_size():
+    zap = _load_zap_module()
+
+    for gib in (3, 4, 6, 8, 16):
+        ceiling = gib * 1024 ** 3
+        for requested in (1, 2, 4, 10):
+            browsers = zap._zap_browsers_that_fit(ceiling, requested)
+            heap = zap._zap_heap_mb(ceiling, browsers)
+            planned_mb = heap + zap._ZAP_JVM_OVERHEAD_MB + browsers * zap._ZAP_BROWSER_RESERVE_MB
+            assert 1 <= browsers <= requested
+            assert planned_mb * 1024 ** 2 < ceiling, (gib, requested, browsers, heap)
+    # a big container keeps what was asked for
+    assert zap._zap_browsers_that_fit(8 * 1024 ** 3, 4) == 4

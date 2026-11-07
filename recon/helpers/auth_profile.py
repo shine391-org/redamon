@@ -314,6 +314,68 @@ def profile_from_settings(settings: Optional[dict]) -> Optional[dict]:
     return profile
 
 
+def engagement_identity_header(settings: Optional[dict]) -> Optional[str]:
+    """The validated ``engagementIdentityHeader`` line ("Name: value"), or None.
+
+    One place, so every HTTP tool path gets the same answer: this is a
+    mandatory-attribution header, not a credential, so it is attached
+    unconditionally (no scope gate — an identity header only makes sense on
+    traffic the operator wants attributed, and scope-gating it would drop it on
+    exactly the out-of-scope hosts where attribution matters most). It rides
+    the tool's own ``-H`` set, so it is sent identically on the direct path and
+    through the capture proxy, and survives the proxy's fail-open fallback.
+
+    Validated on write by the webapp (checkHeader) and re-validated here:
+    the value crosses a DB boundary and a scan that silently sent a forged or
+    split header would be worse than one that sent none. Host / Authorization /
+    Cookie / Proxy-* are refused — an identity header that changes where the
+    request goes or what it carries is not an identity header.
+    """
+    raw = (settings or {}).get('ENGAGEMENT_IDENTITY_HEADER')
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    if _CONTROL_CHARS_RE.search(raw) or any(d in raw for d in _TOOL_JOIN_DELIMITERS):
+        return None
+    line = raw.strip()
+    if len(line) > MAX_HEADER_VALUE_LEN + MAX_HEADER_NAME_LEN:
+        return None
+    if line.count(':') < 1:
+        return None
+    name, value = line.split(':', 1)
+    name = sanitize_header_name(name)
+    value = sanitize_header_value(value)
+    if (not name or not value or name.lower() in _IDENTITY_FORBIDDEN_NAMES
+            or name.lower().startswith('proxy-')):
+        return None
+    return f"{name}: {value}"
+
+
+# Mirrors the webapp's checkHeader FORBIDDEN_HEADERS: names that change where
+# the request goes or what it carries, plus the proxy-* family.
+_IDENTITY_FORBIDDEN_NAMES = frozenset({
+    'host', 'authorization', 'cookie', 'proxy-authorization',
+    'x-redamon-ctx', 'content-length', 'transfer-encoding', 'connection',
+})
+
+
+def append_engagement_identity(headers: Optional[Iterable[str]],
+                                settings: Optional[dict]) -> List[str]:
+    """``headers`` plus the engagement identity line, deduplicated.
+
+    The identity header is appended once, after any auth-session lines: if the
+    operator (or a tool profile) already sends the same header name, THEIR line
+    wins and ours is dropped — never sent twice, which some servers treat as a
+    malformed request. Returns a new list; the input is not mutated.
+    """
+    out = [h for h in (headers or []) if h]
+    line = engagement_identity_header(settings)
+    if line:
+        name = line.split(':', 1)[0].strip().lower()
+        if not any(h.split(':', 1)[0].strip().lower() == name for h in out):
+            out.append(line)
+    return out
+
+
 def merge_auth_headers(custom_headers: Optional[Iterable[str]], settings: Optional[dict],
                        hosts: Iterable[str]) -> List[str]:
     """Prepend the profile's in-scope auth lines to a tool's ``custom_headers``.

@@ -482,7 +482,7 @@ class TestJsluiceWorkDir:
     def test_interleaved_runs_never_share_or_delete_each_others_work_dir(self):
         seen, after = [], {}
 
-        def fake_download(js_urls, work_dir, parallelism=5, errors=None):
+        def fake_download(js_urls, work_dir, parallelism=5, errors=None, settings=None):
             work_dir = Path(work_dir)
             seen.append(work_dir)
             (work_dir / "js_0.js").write_text(js_urls[0])

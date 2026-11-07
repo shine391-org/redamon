@@ -276,6 +276,7 @@ def run_probe_packs(
     timeout: float = 10.0,
     user_agent: str = "RedAmon-AISurfaceRecon/1.0",
     extract_models: bool = True,
+    extra_headers: dict | None = None,
 ) -> list[ProbeResult]:
     """Run all probes against base_url, return matches ranked by specificity (desc).
 
@@ -284,6 +285,7 @@ def run_probe_packs(
     """
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent})
+    session.headers.update(extra_headers or {})
 
     ordered = probes
     if target_port:

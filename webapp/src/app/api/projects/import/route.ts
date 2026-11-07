@@ -262,6 +262,8 @@ export async function POST(request: NextRequest) {
     // a nested write past that relation's own import checks (node filters
     // arriving armed, a run that never goes stale). Export writes columns only.
     const projectFields = pickProjectColumns(bundleFields)
+    // Provider ids are account-scoped, even when the importing account owns one.
+    delete projectFields.jevProviderId
 
     // The scope columns get the create routes' rules: groups re-derived from the
     // hosts, one targeting mode, and the hard guardrail in every mode.
@@ -872,9 +874,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Kept as imported, not refused: a bundle exported from an account with a
-    // Jev token must still import elsewhere. The warning says what will fall back.
+    // Jev provider must still import elsewhere. The warning says what will fall back.
     const warnings = [
-      ...await jevImportWarnings(projectFields, userId),
+      ...jevImportWarnings(projectFields),
       // Serialized scan on without the capture proxy: warn, never block (§4.1).
       ...validateSerializedScanChange(null, projectFields),
       ...(pluginFiles.length

@@ -146,7 +146,7 @@ def test_a_redirect_is_not_followed():
     assert len(seen) == 1
 
 
-@pytest.mark.parametrize("model", ["jev-latest", "jev-preview", "gpt-4o", "jev-1.13", "../x", "", None])
+@pytest.mark.parametrize("model", ["jev-latest", "jev-preview", "jev-1.14.0", "gpt-4o", "jev-1.13", "../x", "", None])
 def test_a_model_that_is_not_a_pinned_version_is_refused_before_any_request(model):
     seen: list = []
     with _transport(_ok({}), seen):
@@ -261,44 +261,7 @@ def test_list_models_malformed_is_a_bad_response():
 # Owner binding
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True)
-def _clear_owner_cache():
-    jev_client._owner_cache.clear()
-    yield
-    jev_client._owner_cache.clear()
-
-
-def test_owner_match_passes_and_is_cached():
-    with patch.object(jev_client, "_fetch_project_owner", return_value="u1") as fetch:
-        _run(jev_client.verify_owner("p1", "u1"))
-        _run(jev_client.verify_owner("p1", "u1"))
-    assert fetch.call_count == 1
-
-
-def test_owner_mismatch_is_forbidden_and_not_cached():
-    with patch.object(jev_client, "_fetch_project_owner", return_value="someone-else") as fetch:
-        for _ in range(2):
-            with pytest.raises(JevError) as err:
-                _run(jev_client.verify_owner("p1", "u1"))
-            assert err.value.error_type == "jev_forbidden"
-    assert fetch.call_count == 2
-
-
-def test_a_missing_project_is_forbidden():
-    with patch.object(jev_client, "_fetch_project_owner", return_value=None):
-        with pytest.raises(JevError) as err:
-            _run(jev_client.verify_owner("p-gone", "u1"))
-    assert err.value.error_type == "jev_forbidden"
-
-
-def test_an_unreachable_webapp_is_unavailable():
-    with patch.object(jev_client, "_fetch_project_owner", side_effect=ConnectionError("down")):
-        with pytest.raises(JevError) as err:
-            _run(jev_client.verify_owner("p1", "u1"))
-    assert err.value.error_type == "jev_unavailable"
-
-
-def test_fetch_project_owner_reads_user_id_and_maps_404_to_none():
+def test_fetch_project_quotes_the_id_and_maps_404_to_none():
     class _Resp:
         def __init__(self, status, body):
             self.status_code, self._body = status, body
@@ -310,24 +273,29 @@ def test_fetch_project_owner_reads_user_id_and_maps_404_to_none():
         def json(self):
             return self._body
 
-    with patch("requests.get", return_value=_Resp(200, {"userId": "u1"})) as get:
-        assert jev_client._fetch_project_owner("p/1") == "u1"
+    row = {"userId": "u1", "jevProviderId": "p-jev"}
+    with patch("requests.get", return_value=_Resp(200, row)) as get:
+        assert jev_client._fetch_project("p/1") == row
     assert get.call_args.args[0].endswith("/api/projects/p%2F1")
     with patch("requests.get", return_value=_Resp(404, {})):
-        assert jev_client._fetch_project_owner("p1") is None
+        assert jev_client._fetch_project("p1") is None
     with patch("requests.get", return_value=_Resp(500, {})):
         with pytest.raises(RuntimeError):
-            jev_client._fetch_project_owner("p1")
+            jev_client._fetch_project("p1")
+    # A 200 that is not an object (a proxy page, a list) is not a project.
+    with patch("requests.get", return_value=_Resp(200, ["not", "a", "project"])):
+        with pytest.raises(JevError) as err:
+            jev_client._fetch_project("p1")
+    assert err.value.error_type == "jev_unavailable"
 
 
-def test_pick_jev_key():
-    rows = [{"providerType": "anthropic", "apiKey": "sk"},
-            {"providerType": "jev", "apiKey": KEY},
-            {"providerType": "jev", "apiKey": "newer"}]
-    assert jev_client.pick_jev_key(rows) == KEY
-    assert jev_client.pick_jev_key([{"providerType": "jev", "apiKey": ""}]) is None
-    assert jev_client.pick_jev_key([{"providerType": "openai", "apiKey": "x"}]) is None
-    assert jev_client.pick_jev_key(None) is None
+def test_resolve_exact_jev_provider_without_first_row_fallback():
+    rows = [{"id": "first", "providerType": "jev", "apiKey": "first-key"},
+            {"id": "selected", "providerType": "jev", "apiKey": KEY}]
+    assert jev_client.resolve_provider(rows, "selected", "u1").api_key == KEY
+    for selected in ("missing", "", None):
+        with pytest.raises(JevError):
+            jev_client.resolve_provider(rows, selected, "u1")
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +317,7 @@ def _post_test(client, **body):
 
 
 def test_provider_test_lists_models_and_never_builds_a_chat_model(client):
-    with patch.object(jev_client, "list_models", AsyncMock(return_value=["jev-latest"])) as lm, \
+    with patch.object(jev_client, "list_models", AsyncMock(return_value=["jev-1.13.0"])) as lm, \
             patch("orchestrator_helpers.llm_setup.setup_llm") as setup:
         resp = _post_test(client, baseUrl="http://evil.example")
     assert resp.status_code == 200
