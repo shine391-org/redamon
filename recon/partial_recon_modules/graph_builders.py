@@ -7,7 +7,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from recon.partial_recon_modules.helpers import (
-    _classify_ip, allowed_hosts_for, include_root_for, org_for_root, project_scan_roots, root_for_host,
+    _classify_ip, allowed_hosts_for, include_root_for, org_for_root, project_scan_roots, roe_excluded,
+    root_for_host,
 )
 
 #: A path known only from an API specification is requested with GET or HEAD
@@ -27,11 +28,35 @@ def declared_only_unsafe(alias: str = "e") -> str:
     return DECLARED_ONLY_UNSAFE.format(a=alias)
 
 
-#: True for a RESOLVES_TO edge `r` that is forward DNS. Shodan's reverse-DNS
-#: and domain-DNS answers write the same edge with source 'shodan_rdns' /
-#: 'shodan_dns'; a partial run reading them would take a PTR record for the
-#: name's current address. An edge with no source (DNS, or older) counts.
-FORWARD_DNS = "NOT coalesce(r.source, '') STARTS WITH 'shodan_'"
+#: An Endpoint whose archived URL carried a leaked one-time link, a secret, a
+#: state-changing link with a value or a web-shell trace (recon/helpers/url_leaks.py).
+#: Never a request target, whatever the method: it has no full_url and no
+#: parameter value, and every reader that turns graph Endpoints into requests
+#: filters it.
+QUARANTINED = "coalesce({a}.quarantined, false)"
+
+
+def quarantined(alias: str = "e") -> str:
+    """Cypher, true for an Endpoint no tool may request."""
+    return QUARANTINED.format(a=alias)
+
+
+#: Cypher, true for an Endpoint only web archives reported (urlscan, GAU,
+#: ParamSpider read history, not the live site).
+ARCHIVE_ONLY = (
+    "(size([s IN coalesce(e.sources, CASE WHEN e.source IS NULL THEN [] ELSE [e.source] END) "
+    "| toLower(s)]) > 0 AND all(s IN [x IN coalesce(e.sources, CASE WHEN e.source IS NULL "
+    "THEN [] ELSE [e.source] END) | toLower(x)] WHERE s IN ['urlscan', 'gau', 'paramspider']))"
+)
+
+
+#: True for a RESOLVES_TO edge `r` that is current forward DNS. Every passive
+#: writer (Shodan's reverse DNS and domain DNS, Censys, FOFA, OTX passive DNS,
+#: ZoomEye) sets `source` when it creates the edge, and a DNS resolution of the
+#: pair REMOVEs it; an edge the one-off urlscan backfill could not vouch for
+#: carries 'legacy_unknown'. A partial run reading a passive edge as current
+#: would scan an address the name had years ago, which may be someone else's now.
+FORWARD_DNS = "r.source IS NULL"
 
 
 #: A BaseURL is a thin service-identity node: httpx writes the response data
@@ -154,6 +179,33 @@ def graph_url_fingerprints(base_urls, user_id: str, project_id: str) -> dict:
         return {}
 
 
+def graph_takeover_page_hosts(user_id: str, project_id: str) -> list:
+    """The hosts a urlscan takeover verdict kept (item 5: `takeover_page_seen`),
+    which partial Subdomain Takeover adds to its list as the full run does with
+    urlscan.takeover_hosts. The caller applies the run's scope and RoE. Never
+    raises."""
+    try:
+        from graph_db import Neo4jClient
+        with Neo4jClient() as graph_client:
+            if not graph_client.verify_connection():
+                return []
+            with graph_client.driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (v:Vulnerability {user_id: $uid, project_id: $pid,
+                                           source: 'urlscan_leak', type: 'takeover_page_seen'})
+                    WHERE v.hostname IS NOT NULL AND NOT v:Muted
+                    RETURN collect(DISTINCT toLower(v.hostname)) AS hosts
+                    """,
+                    uid=user_id, pid=project_id,
+                )
+                record = result.single()
+                return sorted(h for h in (_field(record, "hosts") or []) if isinstance(h, str) and h)
+    except Exception as e:  # noqa: BLE001
+        print(f"[!][Partial Recon] Could not read urlscan takeover hosts: {e}")
+        return []
+
+
 def graph_open_ports(ips, user_id: str, project_id: str) -> dict:
     """{ip: [open port numbers]} from the graph's Port nodes. Never raises.
 
@@ -256,6 +308,8 @@ class _GraphScope:
         a root itself even when its group leaves it out (the tools that never
         honoured Include Root)."""
         h = (host or "").strip().strip(".").lower()
+        if roe_excluded(h):
+            return None
         if not self.scoped:
             root = record_root or root_for_host(h, self.roots)
             return root if root is not None and _host_allowed(root, h, self.allowed) else None
@@ -268,6 +322,8 @@ class _GraphScope:
         return root if _host_allowed(root, h, self.allowed) else None
 
     def keeps(self, host, record_root=None) -> bool:
+        if roe_excluded(host):
+            return False
         if not self.scoped:
             # A host under no root (IP mode's dashed names) was always kept.
             root = record_root or root_for_host(host, self.roots)
@@ -412,6 +468,8 @@ def graph_url_scope(session, user_id: str, project_id: str, domains, domain_grou
         host = (host or "").strip().lower()
         if not host:
             return True
+        if roe_excluded(host):
+            return False
         if scope.scoped:
             if scope.root_of(host, apex=apex_filter) is not None:
                 return True
@@ -571,6 +629,8 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
         return recon_data
 
     def _add_ip(ips: dict, addr: str, version) -> None:
+        if roe_excluded(addr):
+            return
         bucket = _classify_ip(addr, version)
         if addr not in ips[bucket]:
             ips[bucket].append(addr)
@@ -749,6 +809,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
             for record in apex_records:
                 root = record["root"]
                 ip_addr = record["ip"]
+                if roe_excluded(ip_addr):
+                    continue
                 bucket = _classify_ip(ip_addr, record["version"])
                 if root == primary:
                     if ip_addr not in recon_data["dns"]["domain"]["ips"][bucket]:
@@ -779,6 +841,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 if not scope.keeps(subdomain, record["root"]):
                     continue
                 ip_addr = record["ip"]
+                if roe_excluded(ip_addr):
+                    continue
                 bucket = _classify_ip(ip_addr, record["version"])
                 sub_ips = _dns_entry(subdomain)["ips"]
                 if ip_addr not in sub_ips[bucket]:
@@ -835,6 +899,8 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
         return recon_data
 
     def _add_ip(ips: dict, addr: str, version) -> None:
+        if roe_excluded(addr):
+            return
         bucket = _classify_ip(addr, version)
         if addr not in ips[bucket]:
             ips[bucket].append(addr)
@@ -991,6 +1057,8 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
             entry["asn"] = asn
 
     def _add_ip(ips: dict, addr: str, version) -> None:
+        if roe_excluded(addr):
+            return
         bucket = _classify_ip(addr, version)
         if addr not in ips[bucket]:
             ips[bucket].append(addr)
@@ -1066,19 +1134,23 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                 """ + _PROBED_ENDPOINT + """
+                OPTIONAL MATCH (b)-[:HAS_CERTIFICATE]->(c:Certificate)
+                WITH b, probe, head(collect(c)) AS cert
                 RETURN b.url AS url, coalesce(b.status_code, probe.status_code) AS status_code,
                        b.host AS host, coalesce(b.content_type, probe.content_type) AS content_type,
                        coalesce(b.is_cdn, probe.is_cdn) AS is_cdn,
                        coalesce(b.cdn, probe.cdn) AS cdn, coalesce(b.asn, probe.asn) AS asn,
-                       coalesce(b.server, probe.server) AS server
+                       coalesce(b.server, probe.server) AS server,
+                       probe.title AS title, probe.final_url AS final_url, probe.cname AS cname,
+                       cert {.issuer, .issuer_cn, .issuer_dn, .subject_cn, .subject_dn, .san,
+                             .not_after, .expired, .self_signed, .mismatched, .wildcard,
+                             .tls_version, .cipher} AS cert
                 """,
                 uid=user_id, pid=project_id,
             )
             for record in result:
                 url = record["url"]
                 status_code = record["status_code"]
-                if status_code is not None and int(status_code) >= 500:
-                    continue
                 host = record["host"] or ""
                 if not keep(url_host(url, host)):
                     continue
@@ -1093,7 +1165,11 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                         (sub_ips.get("ipv4") or [None])[0]
                         or (sub_ips.get("ipv6") or [None])[0]
                     )
-                recon_data["http_probe"]["by_url"][url] = {
+                # The real status (Tomcat's and Fastly's error pages are 500s,
+                # and an open console counts only at 200). An unprobed BaseURL
+                # still reads as live for the target builders, which skip >= 500
+                # themselves, and is marked so no status rule trusts the 200.
+                entry = recon_data["http_probe"]["by_url"][url] = {
                     "url": url,
                     "host": host,
                     "status_code": int(status_code) if status_code is not None else 200,
@@ -1105,6 +1181,21 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                     "server": _field(record, "server"),
                     "technologies": [],
                 }
+                # What the Page Content checks read, when httpx recorded it.
+                for key in ("title", "final_url", "cname"):
+                    if _field(record, key) is not None:
+                        entry[key] = _field(record, key)
+                if status_code is None:
+                    entry["status_unknown"] = True
+                cert = _field(record, "cert")
+                if isinstance(cert, dict) and any(cert.values()):
+                    entry["tls"] = {
+                        "version": cert.get("tls_version"), "cipher": cert.get("cipher"),
+                        "certificate": {k: cert.get(k) for k in (
+                            "issuer", "issuer_cn", "issuer_dn", "subject_cn", "subject_dn",
+                            "not_after", "expired", "self_signed", "mismatched", "wildcard")}
+                        | {"san": cert.get("san") or []},
+                    }
                 # If the URL is CDN-flagged AND the cdn name is a reliable
                 # edge provider (not generic "aws"/"azure"), also stamp
                 # is_cdn on every IP the host resolves to so port_scan.by_ip
@@ -1152,26 +1243,31 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                       -[:HAS_ENDPOINT]->(e:Endpoint)
                       -[:HAS_PARAMETER]->(p:Parameter)
                 WHERE p.position = 'query' AND p.name IS NOT NULL AND e.path IS NOT NULL
-                  AND NOT """ + declared_only_unsafe("e") + """
+                  AND NOT """ + declared_only_unsafe("e") + """ AND NOT """ + quarantined("e") + """
                 WITH b, e, p ORDER BY p.name
-                RETURN b.url AS baseurl, e.path AS path,
+                RETURN b.url AS baseurl, e.path AS path, """ + ARCHIVE_ONLY + """ AS archive_only,
                        collect(DISTINCT [p.name, coalesce(head(p.sample_values), '1')]) AS params
                 """,
                 uid=user_id, pid=project_id,
             )
             discovered_urls = []
+            archived_urls = []
             for record in result:
                 base = record["baseurl"]
                 params = [(name, str(value)) for name, value in (record["params"] or []) if name]
                 if base and params and keep(url_host(base)):
-                    discovered_urls.append(f"{base}{record['path']}?{urlencode(params)}")
+                    url = f"{base}{record['path']}?{urlencode(params)}"
+                    discovered_urls.append(url)
+                    if record.get("archive_only"):
+                        archived_urls.append(url)
             # URLs other writers store whole (JS Recon, urlscan) still count.
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
-                WHERE e.full_url IS NOT NULL
-                RETURN e.full_url AS url, e.baseurl AS baseurl
+                WHERE e.full_url IS NOT NULL AND NOT """ + quarantined("e") + """
+                  AND NOT """ + declared_only_unsafe("e") + """
+                RETURN e.full_url AS url, e.baseurl AS baseurl, """ + ARCHIVE_ONLY + """ AS archive_only
                 """,
                 uid=user_id, pid=project_id,
             )
@@ -1179,7 +1275,12 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 url = record["url"]
                 if url and keep(url_host(record["baseurl"] or url)):
                     discovered_urls.append(url)
+                    if record.get("archive_only"):
+                        archived_urls.append(url)
             recon_data["resource_enum"]["discovered_urls"] = list(dict.fromkeys(discovered_urls))
+            # The full run's marker for URLs only web archives reported: the
+            # rate-limit check never requests them.
+            recon_data["resource_enum"]["archived_urls"] = list(dict.fromkeys(archived_urls))
 
     return recon_data
 
@@ -1265,7 +1366,7 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
-                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """ AND NOT """ + quarantined("e") + """
                 OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
                 RETURN b.url AS base_url, e.path AS path,
                        coalesce(e.method, 'GET') AS method,
@@ -1297,6 +1398,7 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
                 WHERE e.endpoint_type IN ['graphql', 'graphql_introspection']
+                  AND NOT """ + quarantined("e") + """
                 RETURN b.url AS base_url, e.path AS path, e.endpoint_type AS type,
                        coalesce(e.full_url, '') AS full_url
                 """,
@@ -1426,7 +1528,7 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
-                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """ AND NOT """ + quarantined("e") + """
                 OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
                 WHERE p.name IS NOT NULL
                 RETURN b.url AS base, b.host AS host, e.path AS path,
@@ -1555,21 +1657,33 @@ def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
-                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """ AND NOT """ + quarantined("e") + """
                 RETURN b.url AS base, b.host AS host, e.path AS path,
                        coalesce(e.method, 'GET') AS method, e.category AS category,
                        coalesce(e.sources, CASE WHEN e.source IS NULL THEN [] ELSE [e.source] END) AS sources,
                        e.source AS creator,
                        e.openapi_security AS openapi_security, e.openapi_tags AS openapi_tags,
-                       e.openapi_declared_only AS declared_only, e.status_code AS discovery_status
+                       e.openapi_declared_only AS declared_only, e.status_code AS discovery_status,
+                       e.urlscan_file_kind AS urlscan_file_kind,
+                       e.ffuf_category AS ffuf_category, e.js_recon_category AS js_recon_category
                 """,
                 uid=user_id, pid=project_id,
             )
+            urlscan_files = []
             for record in result:
                 base = record["base"]
                 if not base or not keep(url_host(base, record["host"] or "")):
                     continue
                 sources = [s for s in (record["sources"] or []) if isinstance(s, str)]
+                # A sensitive file urlscan saw is handed over the way the full
+                # run does it (harvest._read_urlscan), so a heap dump stays HEAD
+                # and a dump is read as a backup, never fetched with a plain GET.
+                file_kind = _field(record, "urlscan_file_kind")
+                if file_kind:
+                    urlscan_files.append({"type": "sensitive_file_seen", "kind": file_kind,
+                                          "host": url_host(base, record["host"] or ""),
+                                          "path": record["path"],
+                                          "url": base.rstrip("/") + record["path"]})
                 # A route the scan itself generated and wrote is not recon's input: a
                 # full run never reads it. Read back, it became a found route, lost its
                 # generated_by and variant_of (an old API version stopped being
@@ -1582,10 +1696,14 @@ def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str
                     continue
                 endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
                 entry = endpoints.setdefault(record["path"], {
-                    "methods": [], "category": record["category"] or "other",
+                    "methods": [],
+                    # JS Recon's own word ranks the route, as in a full run.
+                    "category": _field(record, "js_recon_category") or record["category"] or "other",
                     "sources": sources,
                     "declared_only": record["declared_only"] is True,
                 })
+                if _field(record, "ffuf_category"):
+                    entry["ffuf_category"] = _field(record, "ffuf_category")
                 method = str(record["method"] or "GET").upper()
                 if method not in entry["methods"]:
                     entry["methods"].append(method)
@@ -1608,9 +1726,10 @@ def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str
                 MATCH (f:JsReconFinding {user_id: $uid, project_id: $pid, finding_type: 'js_file'})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
                 WHERE NOT f:Muted AND e.path IS NOT NULL AND e.endpoint_type IS NOT NULL
+                  AND NOT """ + quarantined("e") + """
                 RETURN f.source_url AS source_js, e.baseurl AS base, e.path AS path,
                        coalesce(e.method, 'GET') AS method, e.endpoint_type AS kind,
-                       e.category AS category, e.path_template AS template
+                       coalesce(e.js_recon_category, e.category) AS category, e.path_template AS template
                 """,
                 uid=user_id, pid=project_id,
             )
@@ -1626,5 +1745,8 @@ def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str
                     "source_js": record["source_js"] or "",
                     "parameterized": record["template"] is not None,
                 })
+
+            if urlscan_files:
+                recon_data["urlscan"] = {"findings": urlscan_files}
 
     return recon_data

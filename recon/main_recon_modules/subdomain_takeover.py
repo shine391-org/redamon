@@ -193,8 +193,8 @@ def run_subdomain_takeover(
     # --------------------------------------------------------------
     # 1. Target collection
     # --------------------------------------------------------------
-    subdomains = _collect_subdomains(recon_data)
-    alive_urls = _collect_alive_urls(recon_data)
+    subdomains = _collect_subdomains(recon_data, settings)
+    alive_urls = _collect_alive_urls(recon_data, settings)
 
     print(f"[*][Takeover] {len(subdomains)} subdomain(s), {len(alive_urls)} alive URL(s)")
 
@@ -881,14 +881,20 @@ def _load_nuclei_jsonl(path: Path) -> list[dict]:
 # =============================================================================
 # Target collection
 # =============================================================================
-def _collect_subdomains(recon_data: dict) -> list[str]:
+def _roe_excluded_list(settings: Optional[dict]) -> list:
+    settings = settings or {}
+    return list(settings.get("ROE_EXCLUDED_HOSTS") or []) if settings.get("ROE_ENABLED") else []
+
+
+def _collect_subdomains(recon_data: dict, settings: Optional[dict] = None) -> list[str]:
     """
     Pull every resolvable subdomain from the DNS map. We include the root
     domain too: every root of a Domain batch run (recon_data["domains"]).
 
     A group's recon file narrows that (§4.6): the scan root only when it is a
     target, an EXACT group's listed hosts and nothing else. IP mode's synthetic
-    root is never a name to check.
+    root is never a name to check. The RoE applies in every mode, partial runs
+    (which pass a `domains` list and skip the group scope) included.
     """
     from recon.helpers.recon_scope import recon_scope
     scope = recon_scope(recon_data)
@@ -913,15 +919,33 @@ def _collect_subdomains(recon_data: dict) -> list[str]:
             if isinstance(n, str) and n.strip():
                 names.add(n.strip().lower())
 
+    # Item 5: names whose urlscan deleted-service page this scan's verdict kept.
+    # A name from history joins only a group that takes found names (never an
+    # EXACT one) and only as a target of its scope; the RoE below applies too.
+    root_names = {r.strip().lower() for r in roots if isinstance(r, str) and r.strip()}
+    for host in (recon_data.get("urlscan") or {}).get("takeover_hosts") or []:
+        if not isinstance(host, str) or not host.strip() or not scope.may_inject:
+            continue
+        h = host.strip().strip(".").lower()
+        if scope.admits(h) if scope.mode else any(h.endswith("." + r) for r in root_names):
+            names.add(h)
+
     names = {n for n in names if not n.startswith("ip-targets.")}
     if scope.mode and not isinstance(recon_data.get("domains"), list):
         if scope.exact:
             names |= set(scope.targets())
         names = {n for n in names if scope.admits(n)}
+    excluded = _roe_excluded_list(settings)
+    if excluded:
+        from recon.helpers.roe_scope import _is_roe_excluded
+        kept = {n for n in names if not _is_roe_excluded(n, excluded)}
+        if len(kept) != len(names):
+            print(f"[RoE] Takeover: skipped {len(names) - len(kept)} excluded name(s)")
+        names = kept
     return [n for n in names if n and "." in n]
 
 
-def _collect_alive_urls(recon_data: dict) -> list[str]:
+def _collect_alive_urls(recon_data: dict, settings: Optional[dict] = None) -> list[str]:
     """
     Pull live HTTP/HTTPS URLs produced by httpx in GROUP 4. We only probe alive
     hosts with nuclei takeover templates -- dead hosts are subjack's job.
@@ -950,6 +974,10 @@ def _collect_alive_urls(recon_data: dict) -> list[str]:
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 urls.add(url)
 
+    excluded = _roe_excluded_list(settings)
+    if excluded:
+        from recon.helpers.roe_scope import _is_roe_excluded
+        urls = {u for u in urls if not _is_roe_excluded(u, excluded)}
     return sorted(urls)
 
 

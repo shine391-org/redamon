@@ -26,7 +26,9 @@ from graph_db.mixins.recon.scope import (
     IN_SCOPE, OUT_OF_SCOPE, attach_for_host, attach_roots, classify_host, home_domain,
     org_for_scan_root, scope_groups_by_root,
 )
+from graph_db.mixins.recon.vuln_mixin import stable_vuln_id
 from urllib.parse import urlparse as _urlparse
+from graph_db.endpoint_paths import normalize_endpoint_path
 
 
 def _cvss_severity(cvss) -> str | None:
@@ -101,6 +103,18 @@ def netlas_vuln_id(cve_id: str, ip: str, port) -> str:
     return f"netlas-{cve_id}-{ip}-{port}"
 
 
+_SEVERITIES = ("info", "low", "medium", "high", "critical")
+
+
+def _history_severity(severity, live=False) -> str:
+    """A finding seen only in urlscan's history is at most high: critical needs
+    this scan to confirm it live."""
+    sev = str(severity or "medium").strip().lower()
+    if sev not in _SEVERITIES:
+        sev = "medium"
+    return sev if live or sev != "critical" else "high"
+
+
 def _split_url(url: str) -> tuple[str, str]:
     """(base_url, path), where base_url is scheme://netloc and path defaults to
     '/'. Query and fragment are dropped.
@@ -113,7 +127,7 @@ def _split_url(url: str) -> tuple[str, str]:
     osint tests do not load.
     """
     parsed = _urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}", (parsed.path or "/")
+    return f"{parsed.scheme}://{parsed.netloc}", normalize_endpoint_path(parsed.path or "/")
 
 # K19: one except block logs through `logger`, which was never defined here, so
 # the handler raised NameError while handling an error and took the whole
@@ -623,7 +637,9 @@ class OsintMixin:
         }
 
         urlscan_data = recon_data.get("urlscan", {})
-        if not urlscan_data or urlscan_data.get("results_count", 0) == 0:
+        # The redirect search can find start hosts when the main search found nothing.
+        if not urlscan_data or (urlscan_data.get("results_count", 0) == 0
+                                and not urlscan_data.get("redirect_start_hosts")):
             return stats
 
         domain = recon_data.get("domain", "")
@@ -639,33 +655,36 @@ class OsintMixin:
         with self.driver.session() as session:
 
             # ── 1. Subdomain + IP discovery ──
+            # A visit's page.ip is history, not current DNS: written only as
+            # HISTORICALLY_RESOLVED_TO {source: 'urlscan'} (S5), only for a host
+            # the scan may target and a routable address the RoE does not
+            # exclude (urlscan_enrich tags each entry; an entry without the tag,
+            # from an older recon file, gets no IP at all), and only through an
+            # existing Subdomain, so no orphan IP is left (B11).
             seen_subs = set()
-            seen_ips = set()
-            seen_sub_ip_links = set()
+            history: dict = {}
             for entry in urlscan_data.get("entries", []):
                 subdomain = entry.get("domain", "")
-                ip = entry.get("ip", "")
-                asn = entry.get("asn", "")
-                asn_name = entry.get("asn_name", "")
-                country = entry.get("country", "")
+                in_scope = entry.get("in_scope", True)
 
                 # Create/update subdomain or external domain node
                 if subdomain and subdomain.lower() not in apexes and subdomain not in seen_subs:
                     seen_subs.add(subdomain)
                     kind, root = attach_for_host(subdomain, recon_data)
                     try:
-                        if root:
+                        if root and in_scope:
                             # MATCH, never MERGE: the run's domain write (or
                             # ensure_root_domains, in a batch) made the root's
                             # Domain, and creating one here could leave a Domain
-                            # the scope no longer names.
+                            # the scope no longer names. Unverified until DNS
+                            # resolves it: urlscan only saw it in the past.
                             rec = session.run(
                                 """
                                 MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
                                 SET d.updated_at = datetime()
                                 MERGE (s:Subdomain {name: $subdomain, user_id: $uid, project_id: $pid})
-                                ON CREATE SET s.discovered_by = 'urlscan', s.status = 'resolved',
-                                              s.updated_at = datetime()
+                                ON CREATE SET s.source = 'urlscan', s.discovered_by = 'urlscan',
+                                              s.status = 'unverified', s.updated_at = datetime()
                                 MERGE (d)-[:HAS_SUBDOMAIN]->(s)
                                 MERGE (s)-[:BELONGS_TO]->(d)
                                 RETURN count(s) AS n
@@ -693,47 +712,69 @@ class OsintMixin:
                     except Exception as e:
                         stats["errors"].append(f"Subdomain {subdomain}: {e}")
 
-                # Enrich IP with ASN/country (deduplicate — many entries share the same IP)
-                if ip and ip not in seen_ips:
-                    seen_ips.add(ip)
-                    try:
-                        props = {k: v for k, v in {
-                            "country": country or None,
-                            "asn": asn or None,
-                            "asn_name": asn_name or None,
+                ip = entry.get("ip", "")
+                if subdomain and ip and entry.get("ip_in_scope") and subdomain.lower() not in apexes:
+                    key = (subdomain, ip)
+                    seen = entry.get("scan_time") or ""
+                    slot = history.setdefault(key, {
+                        "first": seen, "last": seen,
+                        "props": {k: v for k, v in {
+                            "country": entry.get("country") or None,
+                            "asn": entry.get("asn") or None,
+                            "asn_name": entry.get("asn_name") or None,
                             "urlscan_enriched": True,
-                        }.items() if v is not None}
+                        }.items() if v is not None},
+                    })
+                    if seen:
+                        slot["first"] = min(slot["first"] or seen, seen)
+                        slot["last"] = max(slot["last"] or seen, seen)
 
-                        session.run(
-                            """
-                            MERGE (i:IP {address: $ip, user_id: $uid, project_id: $pid})
-                            SET i += $props, i.updated_at = datetime()
-                            """,
-                            ip=ip, uid=user_id, pid=project_id, props=props
-                        )
+            for (subdomain, ip), slot in history.items():
+                try:
+                    rec = session.run(
+                        """
+                        MATCH (s:Subdomain {name: $subdomain, user_id: $uid, project_id: $pid})
+                        MERGE (i:IP {address: $ip, user_id: $uid, project_id: $pid})
+                        SET i += $props, i.updated_at = datetime()
+                        MERGE (s)-[r:HISTORICALLY_RESOLVED_TO {source: 'urlscan'}]->(i)
+                        ON CREATE SET r.first_seen = $first, r.last_seen = $last
+                        ON MATCH SET r.first_seen = CASE WHEN $first <> '' AND (r.first_seen IS NULL OR r.first_seen = '' OR $first < r.first_seen) THEN $first ELSE r.first_seen END,
+                                     r.last_seen = CASE WHEN $last > coalesce(r.last_seen, '') THEN $last ELSE r.last_seen END
+                        RETURN count(r) AS n
+                        """,
+                        subdomain=subdomain, ip=ip, props=slot["props"],
+                        first=slot["first"], last=slot["last"],
+                        uid=user_id, pid=project_id
+                    ).single()
+                    if rec and rec["n"]:
                         stats["ips_enriched"] += 1
-                    except Exception as e:
-                        stats["errors"].append(f"IP {ip}: {e}")
+                        stats["relationships_created"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"IP history {subdomain}->{ip}: {e}")
 
-                # Link subdomain -> IP (deduplicate the pair, skip any root apex)
-                if subdomain and ip and subdomain.lower() not in apexes:
-                    link_key = (subdomain, ip)
-                    if link_key not in seen_sub_ip_links:
-                        seen_sub_ip_links.add(link_key)
-                        try:
-                            session.run(
-                                """
-                                MATCH (s:Subdomain {name: $subdomain, user_id: $uid, project_id: $pid})
-                                MERGE (i:IP {address: $ip, user_id: $uid, project_id: $pid})
-                                SET i.updated_at = datetime()
-                                MERGE (s)-[:RESOLVES_TO]->(i)
-                                """,
-                                subdomain=subdomain, ip=ip,
-                                uid=user_id, pid=project_id
-                            )
-                            stats["relationships_created"] += 1
-                        except Exception as e:
-                            stats["errors"].append(f"Link {subdomain}->{ip}: {e}")
+            # Hosts a visit STARTED on and urlscan saw nowhere else (the
+            # redirect search): no IP, since the visit's page.ip is the other
+            # site's address.
+            for host in urlscan_data.get("redirect_start_hosts") or []:
+                if not host or host in seen_subs or host.lower() in apexes:
+                    continue
+                seen_subs.add(host)
+                kind, root = attach_for_host(host, recon_data)
+                if kind != IN_SCOPE or not root:
+                    continue
+                try:
+                    session.run(
+                        """
+                        MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
+                        MERGE (s:Subdomain {name: $subdomain, user_id: $uid, project_id: $pid})
+                        ON CREATE SET s.source = 'urlscan', s.discovered_by = 'urlscan',
+                                      s.status = 'unverified', s.updated_at = datetime()
+                        MERGE (d)-[:HAS_SUBDOMAIN]->(s)
+                        MERGE (s)-[:BELONGS_TO]->(d)
+                        """, domain=root, subdomain=host, uid=user_id, pid=project_id)
+                    stats["subdomains_created"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"Redirect start host {host}: {e}")
 
             # ── 2. Domain age enrichment ──
             domain_age = urlscan_data.get("domain_age_days")
@@ -782,7 +823,9 @@ class OsintMixin:
         }
 
         urlscan_data = recon_data.get("urlscan", {})
-        if not urlscan_data or urlscan_data.get("results_count", 0) == 0:
+        if not urlscan_data or (urlscan_data.get("results_count", 0) == 0
+                                and not urlscan_data.get("redirect_entries")
+                                and not urlscan_data.get("quarantined_urls")):
             return stats
 
         with self.driver.session() as session:
@@ -792,7 +835,9 @@ class OsintMixin:
             baseurl_data: dict[str, dict] = {}
             for entry in urlscan_data.get("entries", []):
                 url = entry.get("url", "")
-                if not url:
+                # A quarantined visit's screenshot and scan ID open the
+                # unmasked scan on urlscan: never the BaseURL's evidence.
+                if not url or entry.get("quarantined"):
                     continue
                 try:
                     parsed = _urlparse(url)
@@ -805,6 +850,10 @@ class OsintMixin:
                         "screenshot_url": entry.get("screenshot_url", ""),
                         "server": entry.get("server", ""),
                         "title": entry.get("title", ""),
+                        "tls_issuer": entry.get("tls_issuer", ""),
+                        "tls_valid_days": entry.get("tls_valid_days"),
+                        "tls_valid_from": entry.get("tls_valid_from", ""),
+                        "tls_age_days": entry.get("tls_age_days"),
                     }
 
             for base_url, data in baseurl_data.items():
@@ -842,7 +891,7 @@ class OsintMixin:
             # ── 2. Create Endpoint + Parameter nodes for URLs with paths ──
             for url_entry in urlscan_data.get("urls_with_paths", []):
                 base_url = url_entry.get("base_url", "")
-                path = url_entry.get("path", "")
+                path = normalize_endpoint_path(url_entry.get("path", "")) if url_entry.get("path") else ""
                 full_url = url_entry.get("full_url", "")
                 params = url_entry.get("params", {})
 
@@ -859,22 +908,30 @@ class OsintMixin:
                                            user_id: $uid, project_id: $pid})
                         ON CREATE SET e.source = 'urlscan', e.full_url = $full_url,
                                       e.has_parameters = $has_params, e.updated_at = datetime()
+                        SET e.full_url = CASE WHEN e.source = 'urlscan' THEN $full_url ELSE e.full_url END
                         SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
+                        SET e += $file_props
                         MERGE (bu)-[:HAS_ENDPOINT]->(e)
                         RETURN e.path AS path
                         """,
                         base_url=base_url, path=path, full_url=full_url,
-                        has_params=has_params, uid=user_id, pid=project_id
+                        has_params=has_params, uid=user_id, pid=project_id,
+                        # Item 3: a document's type, its content type, and a
+                        # sensitive file's kind (partial Route Exposure reads it).
+                        file_props={k: url_entry[k] for k in
+                                    ("document_type", "urlscan_mime_type", "urlscan_file_kind")
+                                    if url_entry.get(k)},
                     )
                     record = result.single()
                     if record:
                         stats["endpoints_created"] += 1
                         stats["relationships_created"] += 1
 
-                        # Create Parameter nodes from query string
-                        for param_name, param_value in params.items():
+                        # Parameter nodes from the query string: names only. An
+                        # archived value is someone's old request, so none is
+                        # stored (S4); a value an older run stored is removed.
+                        for param_name in params:
                             try:
-                                sample_val = param_value if isinstance(param_value, str) else str(param_value)
                                 session.run(
                                     """
                                     MATCH (e:Endpoint {path: $path, method: 'GET', baseurl: $base_url,
@@ -882,12 +939,12 @@ class OsintMixin:
                                     MERGE (p:Parameter {name: $param_name, position: 'query',
                                                         endpoint_path: $path, baseurl: $base_url,
                                                         user_id: $uid, project_id: $pid})
-                                    ON CREATE SET p.source = 'urlscan', p.sample_value = $sample_val,
-                                                  p.is_injectable = false, p.updated_at = datetime()
+                                    ON CREATE SET p.source = 'urlscan', p.is_injectable = false,
+                                                  p.updated_at = datetime()
+                                    REMOVE p.sample_value
                                     MERGE (e)-[:HAS_PARAMETER]->(p)
                                     """,
                                     path=path, base_url=base_url, param_name=param_name,
-                                    sample_val=sample_val[:500],
                                     uid=user_id, pid=project_id
                                 )
                                 stats["parameters_created"] += 1
@@ -900,8 +957,92 @@ class OsintMixin:
                 except Exception as e:
                     stats["errors"].append(f"Endpoint {path}: {e}")
 
+            # ── 2b. Item 1: the target's own URL a visit started on before it
+            # was redirected away. Names only; the other site's origin is the
+            # redirect target, kept as a label and never scanned.
+            stats["redirect_endpoints"] = 0
+            for row in urlscan_data.get("redirect_entries") or []:
+                base_url = row.get("base_url", "")
+                path = normalize_endpoint_path(row.get("path") or "/")
+                if not base_url:
+                    continue
+                try:
+                    rec = session.run(
+                        """
+                        MATCH (bu:BaseURL {url: $base_url, user_id: $uid, project_id: $pid})
+                        MERGE (e:Endpoint {path: $path, method: 'GET', baseurl: $base_url,
+                                           user_id: $uid, project_id: $pid})
+                        ON CREATE SET e.source = 'urlscan', e.updated_at = datetime()
+                        SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
+                        SET e.urlscan_redirect_target = $target,
+                            e.has_parameters = coalesce(e.has_parameters, false) OR size($names) > 0
+                        MERGE (bu)-[:HAS_ENDPOINT]->(e)
+                        WITH e
+                        UNWIND (CASE WHEN size($names) = 0 THEN [null] ELSE $names END) AS name
+                        WITH e, name WHERE name IS NOT NULL
+                        MERGE (p:Parameter {name: name, position: 'query', endpoint_path: $path,
+                                            baseurl: $base_url, user_id: $uid, project_id: $pid})
+                        ON CREATE SET p.source = 'urlscan', p.is_injectable = false,
+                                      p.updated_at = datetime()
+                        MERGE (e)-[:HAS_PARAMETER]->(p)
+                        RETURN count(DISTINCT e) AS n
+                        """,
+                        base_url=base_url, path=path, target=row.get("end_origin") or "",
+                        names=[n for n in row.get("param_names") or [] if isinstance(n, str) and n],
+                        uid=user_id, pid=project_id,
+                    ).single()
+                    if rec is not None:
+                        stats["redirect_endpoints"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"Redirect endpoint {path}: {e}")
+
+            # ── 3. Quarantined URLs: a leaked one-time link, a secret, a state-
+            # changing link with a value, a web-shell trace. The Endpoint is
+            # kept (the path, masked, and the parameter NAMES) so the agent and
+            # the operator see it, flagged so every reader that turns graph
+            # Endpoints into requests skips it. A plain SET flags one another
+            # tool wrote too; its full_url and parameter values are removed.
+            stats["endpoints_quarantined"] = 0
+            for row in urlscan_data.get("quarantined_urls", []) or []:
+                base_url = row.get("base_url", "")
+                path = normalize_endpoint_path(row.get("path", "")) if row.get("path") else ""
+                if not base_url or not path:
+                    continue
+                try:
+                    rec = session.run(
+                        """
+                        MATCH (bu:BaseURL {url: $base_url, user_id: $uid, project_id: $pid})
+                        MERGE (e:Endpoint {path: $path, method: 'GET', baseurl: $base_url,
+                                           user_id: $uid, project_id: $pid})
+                        ON CREATE SET e.source = 'urlscan', e.updated_at = datetime()
+                        SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
+                        SET e.quarantined = true, e.quarantine_reasons = $reasons,
+                            e.has_parameters = coalesce(e.has_parameters, false) OR size($names) > 0
+                        REMOVE e.full_url
+                        MERGE (bu)-[:HAS_ENDPOINT]->(e)
+                        WITH e
+                        UNWIND (CASE WHEN size($names) = 0 THEN [null] ELSE $names END) AS name
+                        WITH e, name WHERE name IS NOT NULL
+                        MERGE (p:Parameter {name: name, position: 'query', endpoint_path: $path,
+                                            baseurl: $base_url, user_id: $uid, project_id: $pid})
+                        ON CREATE SET p.source = 'urlscan', p.is_injectable = false,
+                                      p.updated_at = datetime()
+                        REMOVE p.sample_value, p.sample_values
+                        MERGE (e)-[:HAS_PARAMETER]->(p)
+                        RETURN count(DISTINCT e) AS n
+                        """,
+                        base_url=base_url, path=path, reasons=list(row.get("reasons") or []),
+                        names=[n for n in row.get("param_names") or [] if isinstance(n, str) and n],
+                        uid=user_id, pid=project_id,
+                    ).single()
+                    if rec is not None:
+                        stats["endpoints_quarantined"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"Quarantined endpoint {path}: {e}")
+
             print(f"[+][graph-db] URLScan enrichment: {stats['baseurls_enriched']} BaseURLs enriched, "
-                  f"{stats['endpoints_created']} endpoints, {stats['parameters_created']} parameters")
+                  f"{stats['endpoints_created']} endpoints, {stats['parameters_created']} parameters, "
+                  f"{stats['endpoints_quarantined']} quarantined")
             if stats["baseurls_not_found"]:
                 print(f"[*][graph-db] {stats['baseurls_not_found']} BaseURLs not in graph (stale URLScan data, expected)")
             if stats["endpoints_skipped"]:
@@ -911,6 +1052,155 @@ class OsintMixin:
 
         return stats
 
+
+    def update_graph_from_urlscan_takeover(self, recon_data: dict, user_id: str,
+                                           project_id: str) -> dict:
+        """The takeover verdict's findings (item 5), decided after httpx: the
+        same writer, reading only that list."""
+        return self.update_graph_from_urlscan_findings(recon_data, user_id, project_id,
+                                                       keys=("takeover_findings",))
+
+    def update_graph_from_urlscan_findings(self, recon_data: dict, user_id: str, project_id: str,
+                                           keys: tuple = ("findings", "problem_pages")) -> dict:
+        """The findings urlscan's history gives about the target: leaked links,
+        exposed files, open redirects, problem and takeover pages (Vulnerability
+        {source: 'urlscan_leak'}) and secrets written in URLs (Secret {source:
+        'urlscan'}).
+
+        Its own writer, queued with the discovery writer (GROUP 1), not the
+        enrichment one, which runs only inside the httpx step. `keys` names the
+        urlscan lists to read: the takeover verdict, decided after httpx, is a
+        second call that writes only its own list. It never prunes.
+
+        Every finding is a public record ("seen in a public urlscan scan on
+        DATE"), never confirmed by RedAmon and never an agent lead: no
+        needs_agent_confirmation. History alone is at most high.
+        """
+        stats = {"findings_written": 0, "secrets_written": 0, "skipped_out_of_scope": 0, "errors": []}
+        urlscan_data = recon_data.get("urlscan") or {}
+        rows = [f for key in keys for f in (urlscan_data.get(key) or []) if isinstance(f, dict)]
+        secrets = [s for s in (urlscan_data.get("url_secrets") or []) if isinstance(s, dict)] \
+            if "findings" in keys else []
+        if not rows and not secrets:
+            return stats
+
+        def _parent(session, host: str, rel: str, label: str, node_id: str) -> bool:
+            kind, org = attach_for_host(host, recon_data)
+            if kind != IN_SCOPE or not org:
+                return False
+            if host.strip().lower() == org.strip().lower():
+                session.run(
+                    f"""
+                    MATCH (d:Domain {{name: $org, user_id: $uid, project_id: $pid}})
+                    MATCH (n:{label} {{id: $id, user_id: $uid, project_id: $pid}})
+                    MERGE (d)-[:{rel}]->(n)
+                    """, org=org, id=node_id, uid=user_id, pid=project_id)
+                return True
+            # A host seen only in a visit's start URL has no Subdomain yet.
+            session.run(
+                f"""
+                MATCH (d:Domain {{name: $org, user_id: $uid, project_id: $pid}})
+                MERGE (s:Subdomain {{name: $host, user_id: $uid, project_id: $pid}})
+                ON CREATE SET s.source = 'urlscan', s.discovered_by = 'urlscan',
+                              s.status = 'unverified', s.updated_at = datetime()
+                MERGE (d)-[:HAS_SUBDOMAIN]->(s)
+                MERGE (s)-[:BELONGS_TO]->(d)
+                WITH s
+                MATCH (n:{label} {{id: $id, user_id: $uid, project_id: $pid}})
+                MERGE (s)-[:{rel}]->(n)
+                """, org=org, host=host.strip().lower(), id=node_id, uid=user_id, pid=project_id)
+            return True
+
+        with self.driver.session() as session:
+            for f in rows:
+                host = (f.get("host") or "").strip().lower()
+                ftype = f.get("type") or ""
+                if not host or not ftype:
+                    continue
+                kind = f.get("kind") or ""
+                path = f.get("path") or "/"
+                vid = "urlscan-" + stable_vuln_id(f"{ftype}:{kind}" if kind else ftype, path, host,
+                                                  user_id, project_id)
+                props = {k: v for k, v in (f.get("props") or {}).items()
+                         if v is not None and not isinstance(v, (dict, list)) or isinstance(v, list)
+                         and all(not isinstance(x, (dict, list)) for x in v)}
+                if f.get("kind_field") and kind:
+                    props[f["kind_field"]] = kind
+                props.update({
+                    "type": ftype,
+                    "name": f.get("name") or ftype,
+                    "description": f.get("description") or "",
+                    "severity": _history_severity(f.get("severity"), f.get("live")),
+                    "matched_at": f.get("url") or f"https://{host}{path}",
+                    "url": f.get("url") or f"https://{host}{path}",
+                    "hostname": host,
+                    "first_seen": f.get("first_seen") or "",
+                    "last_seen": f.get("last_seen") or "",
+                })
+                if f.get("urlscan_scan_id"):
+                    props["urlscan_scan_id"] = f["urlscan_scan_id"]
+                try:
+                    session.run(
+                        """
+                        MERGE (v:Vulnerability {id: $id, user_id: $uid, project_id: $pid})
+                        ON CREATE SET v.source = 'urlscan_leak', v.created_at = datetime()
+                        SET v += $props, v.updated_at = datetime()
+                        """, id=vid, props=props, uid=user_id, pid=project_id)
+                    if _parent(session, host, "HAS_VULNERABILITY", "Vulnerability", vid):
+                        stats["findings_written"] += 1
+                    else:
+                        stats["skipped_out_of_scope"] += 1
+                        session.run(
+                            "MATCH (v:Vulnerability {id: $id, user_id: $uid, project_id: $pid}) "
+                            "WHERE NOT (v)--() DELETE v", id=vid, uid=user_id, pid=project_id)
+                except Exception as e:
+                    stats["errors"].append(f"urlscan finding {ftype}: {e}")
+
+            for sec in secrets:
+                host = (sec.get("host") or "").strip().lower()
+                stype = sec.get("secret_type") or ""
+                if not host or not stype:
+                    continue
+                # One Secret per distinct value (its HMAC); with no HMAC key, one
+                # per host, type and parameter.
+                ident = sec.get("value_hmac") or sec.get("param_name") or ""
+                sid = "secret-urlscan-" + stable_vuln_id(stype, ident, host, user_id, project_id)
+                props = {k: v for k, v in {
+                    "secret_type": stype,
+                    "param_name": sec.get("param_name"),
+                    "value_length": sec.get("value_length"),
+                    "value_hmac": sec.get("value_hmac"),
+                    "jwt_alg": sec.get("jwt_alg"),
+                    "jwt_expired": sec.get("jwt_expired"),
+                    "masked_url": sec.get("masked_url"),
+                    "base_url": sec.get("base_url"),
+                    "severity": _history_severity(sec.get("severity"), False),
+                    "first_seen": sec.get("first_seen") or "",
+                    "last_seen": sec.get("last_seen") or "",
+                    "sighting_count": sec.get("count"),
+                }.items() if v is not None}
+                try:
+                    session.run(
+                        """
+                        MERGE (s:Secret {id: $id, user_id: $uid, project_id: $pid})
+                        ON CREATE SET s.source = 'urlscan', s.created_at = datetime()
+                        SET s += $props, s.updated_at = datetime()
+                        """, id=sid, props=props, uid=user_id, pid=project_id)
+                    if _parent(session, host, "HAS_SECRET", "Secret", sid):
+                        stats["secrets_written"] += 1
+                    else:
+                        stats["skipped_out_of_scope"] += 1
+                        session.run(
+                            "MATCH (s:Secret {id: $id, user_id: $uid, project_id: $pid}) "
+                            "WHERE NOT (s)--() DELETE s", id=sid, uid=user_id, pid=project_id)
+                except Exception as e:
+                    stats["errors"].append(f"urlscan secret {stype}: {e}")
+
+        print(f"[+][graph-db] URLScan findings: {stats['findings_written']} findings, "
+              f"{stats['secrets_written']} secrets")
+        if stats["errors"]:
+            print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
+        return stats
 
     def update_graph_from_external_domains(self, recon_data, user_id, project_id):
         """Update graph with aggregated external (out-of-scope) domains.
@@ -956,18 +1246,21 @@ class OsintMixin:
                             logger.warning(f"Cross-root Subdomain graph error for {ed_domain}: {e}")
                     continue
                 try:
+                    # Additive: a partial run writes only its own source's
+                    # sightings, so it must not overwrite what a full run
+                    # (or another source) recorded on the same node.
                     result = session.run("""
                         MERGE (ed:ExternalDomain {domain: $ed_domain, user_id: $uid, project_id: $pid})
                         ON CREATE SET ed.first_seen_at = datetime()
-                        SET ed.sources = $sources,
-                            ed.redirect_from_urls = $redirect_from,
-                            ed.redirect_to_urls = $redirect_to,
-                            ed.status_codes_seen = $status_codes,
-                            ed.titles_seen = $titles,
-                            ed.servers_seen = $servers,
-                            ed.ips_seen = $ips,
-                            ed.countries_seen = $countries,
-                            ed.times_seen = $times_seen,
+                        SET ed.sources = coalesce(ed.sources, []) + [x IN $sources WHERE NOT x IN coalesce(ed.sources, [])],
+                            ed.redirect_from_urls = coalesce(ed.redirect_from_urls, []) + [x IN $redirect_from WHERE NOT x IN coalesce(ed.redirect_from_urls, [])],
+                            ed.redirect_to_urls = coalesce(ed.redirect_to_urls, []) + [x IN $redirect_to WHERE NOT x IN coalesce(ed.redirect_to_urls, [])],
+                            ed.status_codes_seen = coalesce(ed.status_codes_seen, []) + [x IN $status_codes WHERE NOT x IN coalesce(ed.status_codes_seen, [])],
+                            ed.titles_seen = coalesce(ed.titles_seen, []) + [x IN $titles WHERE NOT x IN coalesce(ed.titles_seen, [])],
+                            ed.servers_seen = coalesce(ed.servers_seen, []) + [x IN $servers WHERE NOT x IN coalesce(ed.servers_seen, [])],
+                            ed.ips_seen = coalesce(ed.ips_seen, []) + [x IN $ips WHERE NOT x IN coalesce(ed.ips_seen, [])],
+                            ed.countries_seen = coalesce(ed.countries_seen, []) + [x IN $countries WHERE NOT x IN coalesce(ed.countries_seen, [])],
+                            ed.times_seen = coalesce(ed.times_seen, 0) + $times_seen,
                             ed.updated_at = datetime()
                         RETURN ed.first_seen_at = ed.updated_at AS is_new
                     """, ed_domain=ed_domain, uid=user_id, pid=project_id,
@@ -1200,7 +1493,7 @@ class OsintMixin:
                                         MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                         SET i.updated_at = datetime()
                                         MERGE (s)-[r:RESOLVES_TO]->(i)
-                                        ON CREATE SET r.timestamp = datetime()
+                                        ON CREATE SET r.timestamp = datetime(), r.source = 'censys_dns'
                                         SET r.last_seen_at = datetime(),
                                             r.record_type = coalesce(r.record_type,
                                                 CASE WHEN $ip CONTAINS ':' THEN 'AAAA' ELSE 'A' END)
@@ -1383,7 +1676,7 @@ class OsintMixin:
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (s)-[r:RESOLVES_TO]->(i)
-                                    ON CREATE SET r.timestamp = datetime()
+                                    ON CREATE SET r.timestamp = datetime(), r.source = 'fofa_dns'
                                     SET r.last_seen_at = datetime(),
                                         r.record_type = coalesce(r.record_type,
                                             CASE WHEN $ip CONTAINS ':' THEN 'AAAA' ELSE 'A' END)
@@ -1509,7 +1802,7 @@ class OsintMixin:
                                         MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                         SET i.updated_at = datetime()
                                         MERGE (s)-[r:RESOLVES_TO]->(i)
-                                        ON CREATE SET r.timestamp = datetime()
+                                        ON CREATE SET r.timestamp = datetime(), r.source = 'otx_passive_dns'
                                         SET r.record_type = coalesce(r.record_type, $record_type),
                                             r.first_seen = CASE
                                                 WHEN $first_seen = '' THEN r.first_seen
@@ -2228,7 +2521,7 @@ class OsintMixin:
                                                      project_id: $project_id})
                                         SET i.updated_at = datetime()
                                         MERGE (s)-[r:RESOLVES_TO]->(i)
-                                        ON CREATE SET r.timestamp = datetime()
+                                        ON CREATE SET r.timestamp = datetime(), r.source = 'zoomeye_dns'
                                         SET r.last_seen_at = datetime(),
                                             r.record_type = coalesce(r.record_type,
                                                 CASE WHEN $ip CONTAINS ':' THEN 'AAAA' ELSE 'A' END)
@@ -2815,7 +3108,8 @@ class OsintMixin:
                         "last_seen": now_iso,
                     }
                     for k in ("confidence_score", "port", "match_method", "html_similarity",
-                              "cert_match", "header_match", "status_code", "evidence"):
+                              "cert_match", "header_match", "status_code", "evidence",
+                              "file_match", "own_file", "urlscan_seen_at"):
                         if finding.get(k) is not None:
                             vuln_props[k] = finding[k]
                     if cdn:

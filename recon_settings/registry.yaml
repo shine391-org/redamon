@@ -1613,22 +1613,6 @@ fields:
     group: wordlist
     meaning: >-
       Wordlists amass brute-forces with. Only the shipped list names are accepted.
-  amassDockerImage:
-    tool: amass
-    runtime_key: "AMASS_DOCKER_IMAGE"
-    unit: none
-    phase: domain_discovery
-    traffic: passive
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for amass. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   amassEnabled:
     tool: amass
     runtime_key: "AMASS_ENABLED"
@@ -1837,22 +1821,6 @@ fields:
       and a quarantined skill cannot be turned on. Rewritten across every project
       when a user deletes one of their own skills.
     form_section: "AttackSkillsSection"
-  baddnsDockerImage:
-    tool: baddns
-    runtime_key: "BADDNS_DOCKER_IMAGE"
-    unit: none
-    phase: vuln_scan
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for baddns. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   baddnsEnabled:
     tool: baddns
     runtime_key: "BADDNS_ENABLED"
@@ -2977,7 +2945,10 @@ fields:
     validator: free_text
     group: not-tuning
     meaning: >-
-      File extensions to skip, e.g. [".jpg", ".css"]
+      File extensions GAU drops from the archived URLs, e.g. ["jpg", "css"]. The
+      default skips images, fonts and media only, so archived documents, exports
+      and backups (pdf, xlsx, zip...) reach the URL quarantine and the sensitive
+      file checks. A project saved with the older default keeps its own list.
   gauDetectMethods:
     tool: gau
     runtime_key: "GAU_DETECT_METHODS"
@@ -2989,21 +2960,6 @@ fields:
     group: not-tuning
     meaning: >-
       Detect allowed HTTP methods
-  gauDockerImage:
-    tool: gau
-    runtime_key: "GAU_DOCKER_IMAGE"
-    unit: none
-    phase: resource_enum
-    traffic: passive
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for gau. Any value outside the shipped allowlist
-      is silently pinned back to the default at scan start, with a [guardrail]
-      line recording it, so the field is open and the runtime is the control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   gauEnabled:
     tool: gau
     runtime_key: "GAU_ENABLED"
@@ -3152,21 +3108,6 @@ fields:
     meaning: >-
       Status codes that indicate a live URL. Include 401/403 for auth-protected
       endpoints
-  gauVerifyDockerImage:
-    tool: gau
-    runtime_key: "GAU_VERIFY_DOCKER_IMAGE"
-    unit: none
-    phase: resource_enum
-    traffic: passive
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for gau. Any value outside the shipped allowlist
-      is silently pinned back to the default at scan start, with a [guardrail]
-      line recording it, so the field is open and the runtime is the control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   gauVerifyRateLimit:
     tool: gau
     runtime_key: "GAU_VERIFY_RATE_LIMIT"
@@ -3403,22 +3344,6 @@ fields:
     group: not-tuning
     meaning: >-
       -d flag: adds X-GraphQL-Cop-Test header per request
-  graphqlCopDockerImage:
-    tool: graphql_cop
-    runtime_key: "GRAPHQL_COP_DOCKER_IMAGE"
-    unit: none
-    phase: vuln_scan
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for GraphQL Cop. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   graphqlCopEnabled:
     tool: graphql_cop
     runtime_key: "GRAPHQL_COP_ENABLED"
@@ -3831,22 +3756,6 @@ fields:
     bounds: { min: 1, max: 10 }
     meaning: >-
       How many links deep to follow
-  hakrawlerDockerImage:
-    tool: hakrawler
-    runtime_key: "HAKRAWLER_DOCKER_IMAGE"
-    unit: none
-    phase: resource_enum
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for hakrawler. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   hakrawlerEnabled:
     tool: hakrawler
     runtime_key: "HAKRAWLER_ENABLED"
@@ -4029,22 +3938,6 @@ fields:
       contain CR or LF, and Host, Authorization, Cookie and Proxy-* are refused,
       because each would change where the request goes or what it carries rather
       than annotating it.
-  httpxDockerImage:
-    tool: httpx
-    runtime_key: "HTTPX_DOCKER_IMAGE"
-    unit: none
-    phase: http_probe
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for httpx. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   httpxEnabled:
     tool: httpx
     runtime_key: "HTTPX_ENABLED"
@@ -5162,22 +5055,6 @@ fields:
     group: not-tuning
     meaning: >-
       HTTP status codes treated as "live" by the verifier
-  jsluiceVerifyDockerImage:
-    tool: jsluice
-    runtime_key: "JSLUICE_VERIFY_DOCKER_IMAGE"
-    unit: none
-    phase: js_recon
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for jsluice. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   jsluiceVerifyRateLimit:
     tool: jsluice
     runtime_key: "JSLUICE_VERIFY_RATE_LIMIT"
@@ -5268,22 +5145,6 @@ fields:
     stealth: { set: 1 }
     meaning: >-
       How many links deep the crawl goes from each seed URL.
-  katanaDockerImage:
-    tool: katana
-    runtime_key: "KATANA_DOCKER_IMAGE"
-    unit: none
-    phase: resource_enum
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for katana. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   katanaEnabled:
     tool: katana
     runtime_key: "KATANA_ENABLED"
@@ -5920,22 +5781,6 @@ fields:
     meaning: >-
       Reports CDN-fronted hosts rather than dropping them silently, so the
       operator can see what was skipped.
-  naabuDockerImage:
-    tool: naabu
-    runtime_key: "NAABU_DOCKER_IMAGE"
-    unit: none
-    phase: port_scan
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for naabu. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   naabuEnabled:
     tool: naabu
     runtime_key: "NAABU_ENABLED"
@@ -6334,22 +6179,6 @@ fields:
     group: intrusive
     meaning: >-
       Dynamic testing mode
-  nucleiDockerImage:
-    tool: nuclei
-    runtime_key: "NUCLEI_DOCKER_IMAGE"
-    unit: none
-    phase: vuln_scan
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for nuclei. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   nucleiEnabled:
     tool: nuclei
     runtime_key: "NUCLEI_ENABLED"
@@ -6679,6 +6508,26 @@ fields:
     group: egress
     meaning: >-
       SecurityTrails + ViewDNS DNS history
+  originDiscoveryUrlscan:
+    tool: origin_discovery
+    runtime_key: "ORIGIN_DISCOVERY_URLSCAN"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: egress
+    meaning: >-
+      urlscan history and file fingerprint: two clues from urlscan.io, run first.
+      Old addresses: the IPs public urlscan visits recorded for a fronted host, from
+      the visits the URLScan module already downloaded (no search; in partial recon
+      from the graph's urlscan history). Same file: the host's own build JavaScript
+      file is downloaded once, fingerprinted (SHA256) and searched on urlscan
+      (hash:, then filename: when the hash search finds nothing; at most 3 searches
+      per scan, counted against urlscanMaxSearches and the module's search budget);
+      only bare IPs and in-scope hosts are kept, and a file more than 5 other
+      domains loaded is ignored as shared. Every suspect is checked live like any
+      other. Skipped while URLScan is off. RedAmon never submits a urlscan scan.
   originDiscoveryScanners:
     tool: origin_discovery
     runtime_key: "ORIGIN_DISCOVERY_SCANNERS"
@@ -6997,22 +6846,6 @@ fields:
       decides whether the tool runs INSIDE its phase, and scanModules decides
       whether the phase runs at all. Setting one without the other is a silent
       no-op.
-  purednsDockerImage:
-    tool: puredns
-    runtime_key: "PUREDNS_DOCKER_IMAGE"
-    unit: none
-    phase: domain_discovery
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for puredns. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   purednsEnabled:
     tool: puredns
     runtime_key: "PUREDNS_ENABLED"
@@ -8560,6 +8393,131 @@ fields:
       Whether this individual check runs during the security-check pass. Each
       check is one condition tested against what the earlier phases already found;
       turning it off removes that finding class without affecting the rest.
+  securityCheckOpenConsoles:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_OPEN_CONSOLES"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Open Consoles Without Login: live consoles that
+      show their content without asking to log in (Jupyter, Jenkins, Ray, Spark,
+      Flink, Airflow, Mongo Express, phpMyAdmin, Selenium, Prometheus and others),
+      recognised by the page title with status 200 (security_check type
+      open_console). It reads what httpx and tlsx already collected and sends no
+      request; off removes this finding class without affecting the other checks.
+  securityCheckDebugPages:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_DEBUG_PAGES"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Debug Pages: live debug and error pages that
+      show code or settings (Werkzeug, Django, Laravel, Symfony, Rails, phpinfo,
+      Apache server-status), recognised by the page title (debug_page). It reads
+      what httpx and tlsx already collected and sends no request; off removes this
+      finding class without affecting the other checks.
+  securityCheckUnfinishedInstallers:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_UNFINISHED_INSTALLERS"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Unfinished Installers: live install pages
+      anyone can complete to take over the site (WordPress, Joomla, Drupal, Gitea,
+      TYPO3, PrestaShop and others), recognised by the page title
+      (unfinished_installer). It reads what httpx and tlsx already collected and
+      sends no request; off removes this finding class without affecting the other
+      checks.
+  securityCheckDevServers:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_DEV_SERVERS"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Development Servers: live sites answered by a
+      development server not built for the internet (Werkzeug, Python's built-in
+      server, WEBrick), recognised by the Server header, one finding per host
+      (dev_server). It reads what httpx and tlsx already collected and sends no
+      request; off removes this finding class without affecting the other checks.
+  securityCheckDirectoryListing:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_DIRECTORY_LISTING"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Directory Listings: live pages that list every
+      file in a folder (Index of /, IIS, Tomcat, Jetty and Python listings),
+      recognised by the page title (directory_listing). It reads what httpx and tlsx
+      already collected and sends no request; off removes this finding class without
+      affecting the other checks.
+  securityCheckDefacedPages:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_DEFACED_PAGES"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Defaced Pages: a live root page whose title
+      says Hacked by (defaced_page). It reads what httpx and tlsx already collected
+      and sends no request; off removes this finding class without affecting the
+      other checks.
+  securityCheckTakeoverErrorPages:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_TAKEOVER_ERROR_PAGES"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Takeover Error Pages: live hosts showing a
+      cloud provider's deleted-service page (GitHub Pages, Heroku, Surge, S3 and
+      others), recognised by title, Server header and status; severity from the
+      provider's outcome. Subdomain Takeover gives the full verdict
+      (takeover_error_page). It reads what httpx and tlsx already collected and
+      sends no request; off removes this finding class without affecting the other
+      checks.
+  securityCheckTestCertificates:
+    tool: security_check
+    runtime_key: "SECURITY_CHECK_TEST_CERTIFICATES"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: not-tuning
+    meaning: >-
+      Whether the Page Content check Test or Default Certificates: live hosts using
+      a Let's Encrypt staging certificate or the default certificate of Kubernetes
+      Ingress or Traefik, a test deployment or a host the ingress does not know;
+      read from the certificate issuer, one finding per host, also when the active
+      scans are skipped (test_certificate). It reads what httpx and tlsx already
+      collected and sends no request; off removes this finding class without
+      affecting the other checks.
   securityCheckRedisNoAuth:
     tool: security_check
     runtime_key: "SECURITY_CHECK_REDIS_NO_AUTH"
@@ -9133,22 +9091,6 @@ fields:
       Whether takeover runs. Configuration is two levels: this flag decides
       whether the tool runs INSIDE its phase, and scanModules decides whether the
       phase runs at all. Setting one without the other is a silent no-op.
-  subfinderDockerImage:
-    tool: subfinder
-    runtime_key: "SUBFINDER_DOCKER_IMAGE"
-    unit: none
-    phase: domain_discovery
-    traffic: passive
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for subfinder. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   subfinderEnabled:
     tool: subfinder
     runtime_key: "SUBFINDER_ENABLED"
@@ -9710,22 +9652,6 @@ fields:
     meaning: >-
       Optional -delay between connections (e.g. "200ms"); stealth only. Default
       "".
-  tlsxDockerImage:
-    tool: tlsx
-    runtime_key: "TLSX_DOCKER_IMAGE"
-    unit: none
-    phase: http_probe
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for tlsx. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   tlsxEnabled:
     tool: tlsx
     runtime_key: "TLSX_ENABLED"
@@ -10110,22 +10036,6 @@ fields:
       trufflehogOnlyVerified boolean, which combined with trufflehogNoVerification
       asked TruffleHog to report only verified results while forbidding it to
       verify — zero findings, no error.
-  uncoverDockerImage:
-    tool: uncover
-    runtime_key: "UNCOVER_DOCKER_IMAGE"
-    unit: none
-    phase: domain_discovery
-    traffic: passive
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for uncover. Any value outside the shipped
-      allowlist is silently pinned back to the default at scan start, with a
-      [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   uncoverEnabled:
     tool: uncover
     runtime_key: "UNCOVER_ENABLED"
@@ -10222,9 +10132,162 @@ fields:
     stealth: { ceiling: 100 }
     governor: { model: budget, family: osint_result, floor: 100 }
     meaning: >-
-      The most results urlscan accumulates in one pass. The memory governor
-      budgets it against available RAM, so the effective value can be below what
-      is written here.
+      The most urlscan visits read per domain in one scan. Capped at scan start
+      at 10,000 with an API key and 1,000 without one (urlscan returns 100 visits
+      per search without a key and only the last 30 days), so a saved value above
+      that is read as the cap. The memory governor budgets it against available
+      RAM, so the effective value can be below what is written here.
+  urlscanMaxSearches:
+    tool: urlscan
+    runtime_key: "URLSCAN_MAX_SEARCHES"
+    unit: count
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 1, max: 1000 }
+    meaning: >-
+      The most searches one scan may send to urlscan, across every domain of the
+      project and every caller (the main search and its pages, the outbound
+      redirect search, Origin Discovery's file fingerprint search). Each domain's
+      first search is reserved first. When it runs out the scan stops asking,
+      records a coverage gap and keeps the earlier urlscan findings. Without a
+      key urlscan allows 30 searches a minute; the free plan allows 1,000 a day,
+      shared by every scan, scheduled ones included.
+  urlscanInjectMaxAgeDays:
+    tool: urlscan
+    runtime_key: "URLSCAN_INJECT_MAX_AGE_DAYS"
+    unit: count
+    phase: domain_discovery
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 1, max: 3650 }
+    meaning: >-
+      Days: a host name urlscan saw under the scan root in the last this-many days
+      joins the scan like a discovered subdomain (resolved, port-scanned, probed,
+      crawled, scanned). Older names stay in the graph as unverified history only.
+      Applies only where subdomain discovery runs: never in filtered mode, in an
+      EXACT group or with discovery off; the group scope, the RoE, the wildcard
+      check and the address guards still apply, and a name urlscan showed as a
+      deleted-service page never joins.
+  urlscanMaxInjectedHosts:
+    tool: urlscan
+    runtime_key: "URLSCAN_MAX_INJECTED_HOSTS"
+    unit: count
+    phase: domain_discovery
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 0, max: 5000 }
+    meaning: >-
+      The most urlscan host names that join one scan per domain, newest first; 0
+      adds none (urlscan names then stay in the graph as unverified history only).
+      Each name that joins is resolved and actively scanned like a discovered
+      subdomain.
+  urlscanLeakedLinks:
+    tool: urlscan
+    runtime_key: "URLSCAN_LEAKED_LINKS"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Checks the URLs urlscan already returned for the target's password-reset,
+      account-setup, invitation, payment and login links. Each one becomes a finding
+      (Vulnerability source urlscan_leak, type leaked_one_time_link), one per host,
+      path and kind. RedAmon never opens them: such a URL is quarantined whatever
+      this switch says. No extra searches.
+  urlscanSecretsInUrls:
+    tool: urlscan
+    runtime_key: "URLSCAN_SECRETS_IN_URLS"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Checks the URLs urlscan already returned for passwords, API keys, tokens and
+      JWTs written in the address. Each one becomes a Secret (source urlscan) stored
+      masked: its length and an HMAC, never the value. Such a URL is quarantined
+      whatever this switch says. No extra searches.
+  urlscanSensitiveFiles:
+    tool: urlscan
+    runtime_key: "URLSCAN_SENSITIVE_FILES"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Checks the URLs urlscan already returned for files and pages that should never
+      be public: .env, .git, database dumps, backups, private keys, logs, phpinfo,
+      debug pages, leftover installers, web shells, file managers, debug consoles
+      and memory dumps. Each one becomes a finding (Vulnerability source
+      urlscan_leak, type sensitive_file_seen) marked seen on urlscan. With Route
+      Exposure on, the kinds it can prove are handed to it to check whether they are
+      still online. No extra searches.
+  urlscanDocumentLinks:
+    tool: urlscan
+    runtime_key: "URLSCAN_DOCUMENT_LINKS"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Marks the URLs urlscan already returned that are documents or data rather than
+      web pages (PDF, Word, Excel, CSV, ZIP, JSON and raw text) with
+      Endpoint.document_type and urlscan_mime_type, for review. No finding and no
+      extra searches.
+  urlscanRedirectSearch:
+    tool: urlscan
+    runtime_key: "URLSCAN_REDIRECT_SEARCH"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      One extra urlscan search per domain (task.apexDomain:X AND NOT
+      page.apexDomain:X): visits that started on the target and were redirected to
+      another site. Gives open redirects proven by the visit (a parameter named the
+      site the browser ended on), leaked reset or invite links and sign-in flows on
+      the target's own URLs. The other sites are only recorded as External Domains,
+      origin only, never scanned. Counts against urlscanMaxSearches.
+  urlscanTakeoverPages:
+    tool: urlscan
+    runtime_key: "URLSCAN_TAKEOVER_PAGES"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Takeover Pages: checks the page titles urlscan already returned for the error
+      pages a cloud provider shows when a subdomain points to a deleted service
+      (Surge, Ghost, GitHub Pages, Heroku, Azure, S3 and others). Each host is then
+      checked after httpx against this scan's DNS and live pages: only a host that
+      still points to the provider and shows the same page now, or whose CNAME
+      target no longer exists, is reported (takeover_page_seen). When Subdomain
+      Takeover is on, these hosts join its list. No extra searches; a host only
+      urlscan knows costs one or two DNS queries.
+  urlscanProblemPages:
+    tool: urlscan
+    runtime_key: "URLSCAN_PROBLEM_PAGES"
+    unit: none
+    phase: domain_discovery
+    traffic: passive
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Problem Pages from Titles and Certificates: checks the titles, server names
+      and certificates urlscan already returned for consoles open without login
+      (Jupyter, Jenkins, Spark, Airflow and others), debug pages, unfinished
+      installers, development servers, folder listings, defaced pages and test or
+      default certificates. Each one becomes a finding marked seen on urlscan, at
+      most high. No extra searches.
   useBruteforceForSubdomains:
     tool: pipeline
     runtime_key: "USE_BRUTEFORCE_FOR_SUBDOMAINS"
@@ -10692,22 +10755,6 @@ fields:
       across two clean baselines. Catches CPDoS-style status flips,
       scheme/redirect poisoning, and cache-key confusion. Adds one extra baseline
       request per vector. Default true.
-  webCachePoisonDockerImage:
-    tool: web_cache_poison
-    runtime_key: "WEB_CACHE_POISON_DOCKER_IMAGE"
-    unit: none
-    phase: standalone
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for Web cache poisoning. Any value outside the
-      shipped allowlist is silently pinned back to the default at scan start, with
-      a [guardrail] line recording it, so the field is open and the runtime is the
-      control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   webCachePoisonEnabled:
     tool: web_cache_poison
     runtime_key: "WEB_CACHE_POISON_ENABLED"
@@ -10874,21 +10921,6 @@ fields:
     group: headers
     meaning: >-
       Header/cookie lines for authenticated crawling
-  zapAjaxSpiderDockerImage:
-    tool: zap
-    runtime_key: "ZAP_AJAX_SPIDER_DOCKER_IMAGE"
-    unit: none
-    phase: resource_enum
-    traffic: active
-    roe_capped: false
-    mcp: settable
-    validator: docker_image
-    group: image
-    meaning: >-
-      The container image spawned for zap. Any value outside the shipped allowlist
-      is silently pinned back to the default at scan start, with a [guardrail]
-      line recording it, so the field is open and the runtime is the control.
-    values: ["caffix/amass:latest", "dolevf/graphql-cop:1.14", "frost19k/puredns:latest", "ghcr.io/zaproxy/zaproxy:stable", "jauderho/hakrawler:latest", "projectdiscovery/httpx:latest", "projectdiscovery/katana:latest", "projectdiscovery/naabu:latest", "projectdiscovery/nuclei:latest", "projectdiscovery/subfinder:latest", "projectdiscovery/tlsx:latest", "projectdiscovery/uncover:latest", "redamon-baddns:latest", "redamon-wcvs:latest", "sxcurity/gau:latest"]
   zapAjaxSpiderEnabled:
     tool: zap
     runtime_key: "ZAP_AJAX_SPIDER_ENABLED"
@@ -11130,6 +11162,16 @@ fields:
 # Runtime keys with no Prisma column. Not MCP-reachable, but the derived
 # cap list is a query over this file, so a rate that lives only here is in it.
 runtime_only:
+  AMASS_DOCKER_IMAGE:
+    source: internal
+    tool: amass
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for Amass. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
   AUTH_PROFILE:
     source: project_relation
     tool: auth_profile
@@ -11143,6 +11185,16 @@ runtime_only:
       browser and a credential stored as a column would leak. It arrives in the
       same API payload the settings load reads, so the pipeline sees it as a
       runtime key with no column behind it.
+  BADDNS_DOCKER_IMAGE:
+    source: internal
+    tool: baddns
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for BadDNS. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
   CENSYS_API_TOKEN:
     source: user_account
     tool: censys
@@ -11183,6 +11235,86 @@ runtime_only:
       The user's own API credential for this data source, fetched per scan from
       the user account. Never a project column, so it is not reachable from any
       project-scoped surface.
+  GAU_DOCKER_IMAGE:
+    source: internal
+    tool: gau
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for gau. Not a project setting: a scan always runs
+      the image RedAmon ships, and the scan-start chokepoint pins this key back to
+      that default whatever a settings dict carries, so no form, preset, API or MCP
+      write can point a scan at another image.
+  GAU_VERIFY_DOCKER_IMAGE:
+    source: internal
+    tool: gau
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The httpx image GAU's verification pass spawns. Not a project setting: a scan
+      always runs the image RedAmon ships, and the scan-start chokepoint pins this
+      key back to that default whatever a settings dict carries, so no form, preset,
+      API or MCP write can point a scan at another image.
+  GRAPHQL_COP_DOCKER_IMAGE:
+    source: internal
+    tool: graphql_cop
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for GraphQL Cop. Not a project setting: a scan
+      always runs the image RedAmon ships, and the scan-start chokepoint pins this
+      key back to that default whatever a settings dict carries, so no form, preset,
+      API or MCP write can point a scan at another image.
+  HAKRAWLER_DOCKER_IMAGE:
+    source: internal
+    tool: hakrawler
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for hakrawler. Not a project setting: a scan
+      always runs the image RedAmon ships, and the scan-start chokepoint pins this
+      key back to that default whatever a settings dict carries, so no form, preset,
+      API or MCP write can point a scan at another image.
+  HTTPX_DOCKER_IMAGE:
+    source: internal
+    tool: httpx
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for httpx. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
+  JSLUICE_VERIFY_DOCKER_IMAGE:
+    source: internal
+    tool: jsluice
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The httpx image jsluice's verification pass spawns. Not a project setting: a
+      scan always runs the image RedAmon ships, and the scan-start chokepoint pins
+      this key back to that default whatever a settings dict carries, so no form,
+      preset, API or MCP write can point a scan at another image.
+  KATANA_DOCKER_IMAGE:
+    source: internal
+    tool: katana
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for Katana. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
+  NAABU_DOCKER_IMAGE:
+    source: internal
+    tool: naabu
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for naabu. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
   NETLAS_API_KEY:
     source: user_account
     tool: netlas
@@ -11202,6 +11334,16 @@ runtime_only:
     meaning: >-
       Maximum results pulled from the Netlas API. No Prisma column; the memory
       governor still budgets it.
+  NUCLEI_DOCKER_IMAGE:
+    source: internal
+    tool: nuclei
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for Nuclei. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
   NVD_API_KEY:
     source: user_account
     tool: cve_lookup
@@ -11241,6 +11383,16 @@ runtime_only:
     meaning: >-
       The project whose settings were loaded. Written by the loader, never
       configured.
+  PUREDNS_DOCKER_IMAGE:
+    source: internal
+    tool: puredns
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for puredns. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
   SCOPE_GROUPS:
     source: internal
     tool: targeting
@@ -11271,6 +11423,16 @@ runtime_only:
       The user's own API credential for this data source, fetched per scan from
       the user account. Never a project column, so it is not reachable from any
       project-scoped surface.
+  SUBFINDER_DOCKER_IMAGE:
+    source: internal
+    tool: subfinder
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for subfinder. Not a project setting: a scan
+      always runs the image RedAmon ships, and the scan-start chokepoint pins this
+      key back to that default whatever a settings dict carries, so no form, preset,
+      API or MCP write can point a scan at another image.
   SUPPLY_CHAIN_IMPORT_MAX_BYTES:
     source: env
     tool: supply_chain
@@ -11297,6 +11459,26 @@ runtime_only:
     meaning: >-
       Whether a takeover candidate's CNAME is re-resolved before it is reported.
       No Prisma column.
+  TLSX_DOCKER_IMAGE:
+    source: internal
+    tool: tlsx
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for tlsx. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
+  UNCOVER_DOCKER_IMAGE:
+    source: internal
+    tool: uncover
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for uncover. Not a project setting: a scan always
+      runs the image RedAmon ships, and the scan-start chokepoint pins this key back
+      to that default whatever a settings dict carries, so no form, preset, API or
+      MCP write can point a scan at another image.
   UNCOVER_DRIFTNET_API_KEY:
     source: user_account
     tool: uncover
@@ -11451,6 +11633,26 @@ runtime_only:
       The user's own API credential for this data source, fetched per scan from
       the user account. Never a project column, so it is not reachable from any
       project-scoped surface.
+  WEB_CACHE_POISON_DOCKER_IMAGE:
+    source: internal
+    tool: web_cache_poison
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for Web cache poisoning. Not a project setting: a
+      scan always runs the image RedAmon ships, and the scan-start chokepoint pins
+      this key back to that default whatever a settings dict carries, so no form,
+      preset, API or MCP write can point a scan at another image.
+  ZAP_AJAX_SPIDER_DOCKER_IMAGE:
+    source: internal
+    tool: zap
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The container image spawned for ZAP Ajax Spider. Not a project setting: a scan
+      always runs the image RedAmon ships, and the scan-start chokepoint pins this
+      key back to that default whatever a settings dict carries, so no form, preset,
+      API or MCP write can point a scan at another image.
   ZOOMEYE_API_KEY:
     source: user_account
     tool: zoomeye

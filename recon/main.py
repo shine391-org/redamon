@@ -325,79 +325,10 @@ from recon.helpers.roe_scope import _is_roe_excluded, _filter_roe_excluded, _che
 
 
 
-def _merge_external_domain(aggregated: dict, entry: dict):
-    """Merge a single external domain entry into the aggregated dict."""
-    domain = entry.get("domain", "").strip().lower()
-    if not domain:
-        return
-    if domain not in aggregated:
-        aggregated[domain] = {
-            "domain": domain, "sources": [], "redirect_from_urls": [],
-            "redirect_to_urls": [], "status_codes_seen": [], "titles_seen": [],
-            "servers_seen": [], "ips_seen": [], "countries_seen": [], "times_seen": 0,
-        }
-    rec = aggregated[domain]
-    rec["times_seen"] += 1
-    for val, key in [
-        (entry.get("source"), "sources"),
-        (entry.get("url"), "redirect_to_urls"),
-        (entry.get("redirect_from_url"), "redirect_from_urls"),
-        (entry.get("title"), "titles_seen"),
-        (entry.get("server"), "servers_seen"),
-        (entry.get("ip"), "ips_seen"),
-        (entry.get("country"), "countries_seen"),
-    ]:
-        if val and val not in rec[key]:
-            rec[key].append(val)
-    sc = entry.get("status_code")
-    if sc is not None:
-        sc_str = str(sc)
-        if sc_str not in rec["status_codes_seen"]:
-            rec["status_codes_seen"].append(sc_str)
-
-
-def _aggregate_external_domains(combined_result: dict) -> list:
-    """Aggregate external domains from all pipeline sources."""
-    aggregated = {}
-    for e in combined_result.get("http_probe", {}).get("external_domains", []):
-        _merge_external_domain(aggregated, e)
-    for e in combined_result.get("urlscan", {}).get("external_domains", []):
-        _merge_external_domain(aggregated, e)
-    for e in combined_result.get("resource_enum", {}).get("external_domains", []):
-        _merge_external_domain(aggregated, e)
-    for e in combined_result.get("domain_discovery_external_domains", []):
-        _merge_external_domain(aggregated, e)
-    # Out-of-scope names diverted by merge_discovered_hostnames (certificate
-    # SANs, js_recon subdomains): recorded, never scanned.
-    for e in combined_result.get("discovered_external_domains", []):
-        _merge_external_domain(aggregated, e)
-    for e in _js_recon_external_domains(combined_result):
-        _merge_external_domain(aggregated, e)
-    return list(aggregated.values())
-
-
-def _js_recon_external_domains(combined_result: dict) -> list:
-    """Third-party hosts the target's JavaScript names, as external-domain entries.
-
-    The graph keeps no Endpoint for them, so this is their only record. JS recon
-    tests hosts against the root domain, which in IP mode is the synthetic
-    ip-targets name, so the target IPs come back as "external" and are dropped.
-    Only domain and source are passed: a URL a bundle names is not a redirect.
-    """
-    metadata = combined_result.get("metadata") or {}
-    targets = {
-        str(h).strip().lower()
-        for h in [*(combined_result.get("subdomains") or []),
-                  *(metadata.get("subdomain_filter") or []),
-                  *(metadata.get("expanded_ips") or [])]
-    }
-    entries = (combined_result.get("js_recon") or {}).get("external_domains") or []
-    return [
-        {"domain": e["domain"], "source": "js_recon"}
-        for e in entries
-        if isinstance(e, dict) and isinstance(e.get("domain"), str)
-        and e["domain"].strip().lower() not in targets
-    ]
+# The aggregation lives in a helper partial recon can import; re-exported here.
+from recon.helpers.external_domains import (  # noqa: E402
+    _aggregate_external_domains, _js_recon_external_domains, _merge_external_domain,
+)
 
 
 def should_skip_active_scans(recon_data: dict) -> tuple:
@@ -441,9 +372,38 @@ from recon.helpers.batch_groups import (  # noqa: E402
 )
 
 
+def _gate_injected_hosts(extra_hosts, known: list, target_info: dict, root_domain: str,
+                         settings: dict, wildcard_filter=None) -> dict:
+    """F1's gates on names another source found (urlscan), before DNS: the
+    gates merge_discovered_hostnames applies to late names. An EXACT group
+    takes none; an ENUMERATE group takes strict subdomains of its scan root
+    (the root itself is Include Root's decision). Then the RoE, the host-name
+    syntax and the wildcard-DNS check. Returns {host: source}."""
+    if (target_info.get("mode") or "enumerate") == "exact" or not extra_hosts:
+        return {}
+    from recon.helpers.target_helpers import _is_valid_injected_hostname
+    root = (root_domain or "").strip().lower()
+    have = {str(h).lower() for h in known}
+    picked: dict = {}
+    for item in extra_hosts:
+        host, source = (item if isinstance(item, (tuple, list)) else (item, "urlscan"))[:2]
+        h = str(host or "").strip().strip(".").lower()
+        if (h and h not in have and h not in picked and root and h.endswith("." + root)
+                and _is_valid_injected_hostname(h)):
+            picked[h] = source
+    kept = _filter_roe_excluded(sorted(picked), settings, label="urlscan host")
+    if kept and wildcard_filter is None:
+        from recon.helpers import wildcard_control
+
+        def wildcard_filter(names):
+            return wildcard_control.filter_late_names(names, [root], settings, label="urlscan").kept
+    kept = wildcard_filter(kept) if kept else []
+    return {h: picked[h] for h in kept}
+
+
 def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
                       settings: dict, dns_enabled: bool = True,
-                      resolver=None) -> dict:
+                      resolver=None, extra_hosts=None, wildcard_filter=None) -> dict:
     """Merge what discovery found with the hosts the operator named.
 
     Returns ``{subdomains, dns, status_map, include_root}``.
@@ -467,10 +427,15 @@ def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
       unconditionally - every-source-failed returns a TRUTHY dict with an empty
       subdomain list.
 
+    ``extra_hosts`` (F1) are names another source saw, as (host, source)
+    pairs: urlscan's recent ones. They pass the late-name gates, get resolved
+    with the rest, and are kept only with an address the scanner may probe;
+    the DNS entry keeps their `source`.
+
     Split out of run_domain_recon so it can be tested as the thing the pipeline
     calls; inlined, it was only reachable through the whole 750-line phase.
     """
-    from recon.main_recon_modules.ip_filter import is_never_scannable_ip
+    from recon.main_recon_modules.ip_filter import is_never_scannable_ip, is_non_routable_ip
 
     discovered_subs = []
     if recon_result:
@@ -485,9 +450,13 @@ def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
         # Discovery can list the root itself (a SAN, a passive source); with
         # Root off it is not a target, so it never reaches a scan.
         discovered_subs.remove(root_domain)
+    roe_excluded = settings.get('ROE_EXCLUDED_HOSTS') if settings.get('ROE_ENABLED') else None
     for host in target_info.get("full_subdomains") or []:
-        if host not in discovered_subs:
+        if host not in discovered_subs and not (roe_excluded and _is_roe_excluded(host, roe_excluded)):
             discovered_subs.append(host)
+    injected = _gate_injected_hosts(extra_hosts, discovered_subs, target_info, root_domain,
+                                    settings, wildcard_filter) if dns_enabled else {}
+    discovered_subs.extend(injected)
 
     discovered_dns = dict((recon_result or {}).get("dns") or {})
     resolved = dict(discovered_dns.get("subdomains") or {})
@@ -552,7 +521,31 @@ def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
             resolved.pop(host, None)
         discovered_dns["subdomains"] = resolved
 
-    status_map = (recon_result or {}).get("subdomain_status_map") or {}
+    # An injected name stays only with an address, and never a private one:
+    # history names a host, it does not vouch for where it points now.
+    for host, source in injected.items():
+        entry = resolved.get(host) or {}
+        addrs = list((entry.get("ips") or {}).get("ipv4") or []) + list((entry.get("ips") or {}).get("ipv6") or [])
+        if not addrs or any(is_non_routable_ip(a) for a in addrs):
+            if host in discovered_subs:
+                discovered_subs.remove(host)
+            resolved.pop(host, None)
+        else:
+            entry["source"] = source
+    if injected:
+        kept_injected = [h for h in injected if h in discovered_subs]
+        print(f"[+][URLScan] {len(kept_injected)} of {len(injected)} urlscan name(s) joined the scan")
+        discovered_dns["subdomains"] = resolved
+
+    status_map = dict((recon_result or {}).get("subdomain_status_map") or {})
+    if roe_excluded:
+        # The list was filtered above, but discovery's DNS map (and a later
+        # resolve) still hold the excluded hosts with their IPs, and the port
+        # scan, nuclei, takeover and the security checks read that map.
+        merged = {"subdomains": discovered_subs, "dns": discovered_dns,
+                  "subdomain_status_map": status_map}
+        _drop_roe_excluded_subdomains(merged, roe_excluded)
+        discovered_subs = merged["subdomains"]
     return {
         "subdomains": discovered_subs,
         "dns": discovered_dns,
@@ -560,6 +553,7 @@ def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
                        if s in set(discovered_subs)},
         "include_root": include_root,
         "wildcard_zones": dict((recon_result or {}).get("wildcard_zones") or {}),
+        "injected": [h for h in injected if h in discovered_subs],
     }
 
 
@@ -622,6 +616,34 @@ def save_recon_file(data: dict, output_file: Path):
     _shutdown.park()
 
 
+def _dns_names(result: dict) -> set:
+    return set(((result.get("dns") or {}).get("subdomains") or {}))
+
+
+def _late_names(result: dict, before: set, settings: dict, output_file: Path, *,
+                after_port_scan: bool, probe_http: bool, label: str) -> None:
+    """F2: names a step merged into dns.subdomains after GROUP 1 get their DNS;
+    after the port scan, their ports; after httpx, a probe of their own. The
+    graph gets their Subdomain -> IP edges and what was scanned."""
+    new = sorted(_dns_names(result) - set(before))
+    if not new:
+        return
+    from recon.helpers import late_names
+    if not after_port_scan:
+        if late_names.give_dns(result, new, settings):
+            save_recon_file(result, output_file)
+        return
+    sub = late_names.scan_late_names(result, new, settings, probe_http=probe_http, label=label)
+    if not sub:
+        return
+    save_recon_file(result, output_file)
+    _graph_update_bg("update_graph_from_domain_discovery", {**sub, "whois": {}}, USER_ID, PROJECT_ID)
+    if sub.get("port_scan"):
+        _graph_update_bg("update_graph_from_port_scan", sub, USER_ID, PROJECT_ID)
+    if sub.get("http_probe"):
+        _graph_update_bg("update_graph_from_http_probe", sub, USER_ID, PROJECT_ID)
+
+
 _TLS_HYGIENE_CHECK_SETTINGS = {
     "tls_expired": "SECURITY_CHECK_TLS_EXPIRED",
     "tls_self_signed": "SECURITY_CHECK_TLS_SELF_SIGNED",
@@ -629,6 +651,8 @@ _TLS_HYGIENE_CHECK_SETTINGS = {
     "tls_weak_version": "SECURITY_CHECK_TLS_WEAK_VERSION",
     "tls_weak_cipher": "SECURITY_CHECK_TLS_WEAK_CIPHER",
     "tls_wildcard_overbroad": "SECURITY_CHECK_TLS_WILDCARD_OVERBROAD",
+    # Item 5's certificate rule reads the same stored certificates.
+    "test_certificate": "SECURITY_CHECK_TEST_CERTIFICATES",
 }
 
 
@@ -1413,8 +1437,6 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                 save_recon_file(combined_result, output_file)
 
                 _graph_update_bg("update_graph_from_http_probe", combined_result, USER_ID, PROJECT_ID)
-                if 'urlscan' in combined_result:
-                    _graph_update_bg("update_graph_from_urlscan_enrichment", combined_result, USER_ID, PROJECT_ID)
             except Exception as e:
                 print(f"[!][Pipeline] http_probe failed: {e}")
                 combined_result["metadata"].setdefault("phase_errors", {})["http_probe"] = str(e)
@@ -1710,7 +1732,8 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             if _settings.get('URLSCAN_ENABLED'):
                 from recon.main_recon_modules.urlscan_enrich import run_urlscan_discovery_only
                 g1_futures["urlscan"] = g1_exec.submit(
-                    run_urlscan_discovery_only, root_domain, _settings
+                    run_urlscan_discovery_only, root_domain, _settings,
+                    target_info.get("org_domain") or root_domain
                 )
 
             for name, future in g1_futures.items():
@@ -1730,6 +1753,8 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                             print(f"[+][URLScan] Discovery complete")
                 except Exception as e:
                     print(f"[!][{name}] Failed: {e}")
+                    if name == "urlscan":
+                        _note_phase_error("urlscan")
         whois_scope.finish("whois")
 
         if not _settings.get('WHOIS_ENABLED', True):
@@ -1781,7 +1806,8 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             if _settings.get('URLSCAN_ENABLED'):
                 from recon.main_recon_modules.urlscan_enrich import run_urlscan_discovery_only
                 g1_futures["urlscan"] = g1_exec.submit(
-                    run_urlscan_discovery_only, root_domain, _settings
+                    run_urlscan_discovery_only, root_domain, _settings,
+                    target_info.get("org_domain") or root_domain
                 )
 
             g1_results = {}
@@ -1791,6 +1817,8 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                 except Exception as e:
                     print(f"[!][{name}] Failed: {e}")
                     g1_results[name] = None
+                    if name == "urlscan":
+                        _note_phase_error("urlscan")
 
         whois_scope.finish("whois")
 
@@ -1816,9 +1844,18 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             if recon_result.get("external_domains"):
                 combined_result["domain_discovery_external_domains"] = recon_result["external_domains"]
 
+        # F1: the names urlscan saw recently join the scan, only where
+        # discovery itself runs (never in filtered mode or with discovery off).
+        _urlscan_names = []
+        if discovery_enabled and g1_results.get("urlscan"):
+            from recon.main_recon_modules.urlscan_enrich import injectable_hosts
+            _urlscan_names = [(h, "urlscan") for h in injectable_hosts(g1_results["urlscan"], _settings)]
         merged = merge_group_hosts(
-            recon_result, target_info, root_domain, _settings, dns_enabled)
+            recon_result, target_info, root_domain, _settings, dns_enabled,
+            extra_hosts=_urlscan_names)
         discovered_subs = merged["subdomains"]
+        if merged.get("injected"):
+            combined_result["metadata"]["urlscan_injected_hosts"] = merged["injected"]
 
         combined_result["subdomains"] = discovered_subs
         combined_result["subdomain_count"] = len(discovered_subs)
@@ -1851,6 +1888,9 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     _graph_update_bg("update_graph_from_domain_discovery", combined_result, USER_ID, PROJECT_ID)
     if "urlscan" in combined_result:
         _graph_update_bg("update_graph_from_urlscan_discovery", combined_result, USER_ID, PROJECT_ID)
+        # Its own writer, right after discovery on the one graph worker: the
+        # findings never depend on httpx running.
+        _graph_update_bg("update_graph_from_urlscan_findings", combined_result, USER_ID, PROJECT_ID)
 
     # =====================================================================
     # GROUP 2b — Uncover Target Expansion (before port scan / OSINT)
@@ -1864,9 +1904,13 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                 # THIS group's root, not the module-level TARGET_DOMAIN: in a
                 # Domain batch the global is empty, so every group's expansion
                 # would be merged against the wrong (or no) domain.
+                _before = _dns_names(combined_result)
                 merge_uncover_into_pipeline(
                     combined_result, uncover_data, target_info["root_domain"],
                     settings=_settings)
+                # Before the port scan: their addresses are all it needs (F2).
+                _late_names(combined_result, _before, _settings, output_file,
+                            after_port_scan=False, probe_http=False, label="Uncover")
                 combined_result["metadata"]["modules_executed"].append("uncover_expansion")
                 save_recon_file(combined_result, output_file)
                 _graph_update_bg("update_graph_from_uncover", combined_result, USER_ID, PROJECT_ID)
@@ -2001,6 +2045,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             combined_result["metadata"]["modules_executed"].append("tlsx")
             if _settings.get('TLSX_INJECT_HOSTNAMES', True):
                 from recon.helpers.target_helpers import merge_discovered_hostnames
+                _before = _dns_names(combined_result)
                 # root_domain is THIS group's own root (batch mode empties
                 # metadata['root_domain'] precisely so a joined string can't be a
                 # target); merge applies the apex test against it and fails closed.
@@ -2012,6 +2057,9 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                     settings=_settings,
                     max_injected=_settings.get('TLSX_MAX_INJECTED_HOSTNAMES', 200),
                 )
+                # After the port scan, before httpx: ports, then GROUP 4 probes them.
+                _late_names(combined_result, _before, _settings, output_file,
+                            after_port_scan=True, probe_http=False, label="tlsx")
             save_recon_file(combined_result, output_file)
             _graph_update_bg("update_graph_from_tlsx", combined_result, USER_ID, PROJECT_ID)
         except Exception as e:
@@ -2094,8 +2142,6 @@ def run_domain_recon(target: str, bruteforce: bool = False,
 
                 # Background graph updates
                 _graph_update_bg("update_graph_from_http_probe", combined_result, USER_ID, PROJECT_ID)
-                if 'urlscan' in combined_result:
-                    _graph_update_bg("update_graph_from_urlscan_enrichment", combined_result, USER_ID, PROJECT_ID)
             except Exception as e:
                 print(f"[!][Pipeline] http_probe failed: {e}")
                 combined_result["metadata"].setdefault("phase_errors", {})["http_probe"] = str(e)
@@ -2119,11 +2165,15 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             )
             _san_names = collect_certificate_sans(combined_result)
             if _san_names:
+                _before = _dns_names(combined_result)
                 merge_discovered_hostnames(
                     combined_result, _san_names, source="certificate_san",
                     root_domain=root_domain, settings=_settings,
                     max_injected=_settings.get('TLSX_MAX_INJECTED_HOSTNAMES', 200),
                 )
+                # After httpx: these names get their own probe (F2).
+                _late_names(combined_result, _before, _settings, output_file,
+                            after_port_scan=True, probe_http=True, label="certificate SAN")
                 save_recon_file(combined_result, output_file)
         except Exception as e:
             print(f"[!][Pipeline] certificate SAN feedback failed: {e}")
@@ -2132,6 +2182,17 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     _run_ip_attribution(combined_result, _settings, output_file)
     _write_shodan_cves(combined_result)
     _write_netlas(combined_result)
+
+    # Item 5: which deleted-service pages urlscan recorded still describe their
+    # host, decided with this scan's DNS and live pages. Outside the httpx step
+    # (with httpx off the NXDOMAIN row still decides) and before Phase A, whose
+    # copies Subdomain Takeover reads urlscan.takeover_hosts from.
+    if (combined_result.get("urlscan") or {}).get("takeover_pages"):
+        from recon.main_recon_modules.urlscan_takeover import run_takeover_verdict
+        combined_result = run_takeover_verdict(combined_result, _settings)
+        if (combined_result.get("urlscan") or {}).get("takeover_findings"):
+            save_recon_file(combined_result, output_file)
+            _graph_update_bg("update_graph_from_urlscan_takeover", combined_result, USER_ID, PROJECT_ID)
 
     # Check if we should skip active scanning modules (resource_enum, vuln_scan)
     # These require live targets from http_probe to work
@@ -2161,6 +2222,12 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                 _note_phase_error("resource_enum")
                 save_recon_file(combined_result, output_file)
 
+    # urlscan's enrichment writer only MATCHes existing BaseURLs, which httpx,
+    # uncover and resource enumeration make: queued after GROUP 5's write, and
+    # outside the httpx step so it still runs when httpx is off or fails.
+    if 'urlscan' in combined_result:
+        _graph_update_bg("update_graph_from_urlscan_enrichment", combined_result, USER_ID, PROJECT_ID)
+
     # GROUP 4.5 — AI Surface Recon (runs after resource_enum)
     combined_result = _maybe_run_ai_surface(combined_result, _settings, output_file)
 
@@ -2170,10 +2237,15 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         print(f"\n[*][Pipeline] GROUP 5b: JS Recon")
         try:
             from recon.main_recon_modules.js_recon import run_js_recon
+            _before = _dns_names(combined_result)
             combined_result = run_js_recon(combined_result, settings=_settings)
             combined_result["metadata"]["modules_executed"].append("js_recon")
             save_recon_file(combined_result, output_file)
             _graph_update_bg("update_graph_from_js_recon", combined_result, USER_ID, PROJECT_ID)
+            # After httpx and resource enumeration: their own probe (F2), in
+            # time for the vulnerability scan.
+            _late_names(combined_result, _before, _settings, output_file,
+                        after_port_scan=True, probe_http=True, label="JS Recon")
         except Exception as e:
             print(f"[!][JsRecon] Error: {e}")
             _note_phase_error("js_recon")
@@ -2557,6 +2629,7 @@ _PHASE_FINDING_SOURCES = {
     "origin_discovery": ("origin_discovery",),
     "serialized_scan": ("serialized_scan",),
     "route_exposure": ("route_exposure",),
+    "urlscan": ("urlscan_leak", "urlscan"),
     **PASSIVE_CVE_SOURCES,
 }
 
@@ -2839,6 +2912,7 @@ def _run_pipeline():
     # ONCE per run, before any group: this is what lets a batch's groups
     # accumulate into a single graph instead of each wiping the last.
     _clear_recon_graph()
+    _start_urlscan_budget(groups or settings_scope_groups(_settings))
 
     if groups:
         return run_domain_batch(groups, start_time)
@@ -2851,6 +2925,20 @@ def _run_pipeline():
     if rc == 0:
         _prune_recon_findings()
     return rc
+
+
+def _start_urlscan_budget(groups) -> None:
+    """One urlscan search budget for the whole run, shared by every scope group
+    and every caller, with each root's first searches reserved up front."""
+    if not _settings.get('URLSCAN_ENABLED'):
+        return
+    try:
+        from recon.main_recon_modules.urlscan_enrich import start_search_budget
+        roots = [g.get("scanRoot") for g in groups or [] if isinstance(g, dict)]
+        budget = start_search_budget(_settings, [r for r in roots if r])
+        print(f"[*][URLScan] Search budget for this run: {budget.limit} search(es)")
+    except Exception as e:  # noqa: BLE001 - each search then gets a budget of its own
+        print(f"[!][URLScan] Could not start the run's search budget: {type(e).__name__}")
 
 
 # What run_domain_group's legacy branch (domain_discovery off) can re-check:
@@ -2879,7 +2967,7 @@ def _note_legacy_unrun_sources() -> None:
 
 
 def _drop_roe_excluded_subdomains(domain_result: dict, excluded: list) -> None:
-    """Remove RoE-excluded hosts from a loaded recon file, wherever it lists them."""
+    """Remove RoE-excluded hosts from a loaded recon file or a live merge, wherever it lists them."""
     subs = (domain_result.get('dns') or {}).get('subdomains') or {}
     status_map = domain_result.get('subdomain_status_map') or {}
     listed = domain_result.get('subdomains') or []
@@ -2892,7 +2980,7 @@ def _drop_roe_excluded_subdomains(domain_result: dict, excluded: list) -> None:
     domain_result['subdomains'] = [h for h in listed if h not in dropped]
     if 'subdomain_count' in domain_result:
         domain_result['subdomain_count'] = len(domain_result['subdomains'])
-    print(f"[RoE] Removed {len(dropped)} excluded subdomain(s) from loaded recon file")
+    print(f"[RoE] Removed {len(dropped)} excluded subdomain(s) from the DNS data")
 
 
 def _write_legacy_domain_nodes(domain_result: dict) -> None:

@@ -12,6 +12,7 @@ from urllib.parse import urlparse, parse_qs
 from graph_db.coverage_stamps import stamp_base_url_coverage
 from graph_db.cpe_resolver import _is_ip_address
 from graph_db.mixins.recon.scope import build_host_scope, host_in_scope, org_for_scan_root
+from graph_db.endpoint_paths import normalize_endpoint_path
 
 
 def stable_vuln_id(finding_type: str, url: str, ip_or_host: str = "",
@@ -63,6 +64,8 @@ def _ip_port_key(ip: str, port) -> str:
 _SECURITY_CHECK_EXTRA_FIELDS = (
     "detection_method", "waf_confidence", "waf_type", "ai_reasoning", "service",
     "control_check",
+    # Page Content checks (item 5): the catalog row that matched.
+    "family", "matched", "problem", "provider", "outcome",
 )
 
 #: Words nmap and the fingerprinters put after a product name without making
@@ -372,7 +375,7 @@ class VulnMixin:
                     # Determine scheme, host, path
                     scheme = parsed.scheme or "http"
                     host = parsed.netloc
-                    path = parsed.path or "/"
+                    path = normalize_endpoint_path(parsed.path or "/")
                     query_string = parsed.query
 
                     # Skip URLs that are not in scan scope (discovered subdomains only)
@@ -430,23 +433,22 @@ class VulnMixin:
                     # Parse and create Parameter nodes from query string
                     if query_string:
                         params = parse_qs(query_string, keep_blank_values=True)
-                        for param_name, param_values in params.items():
+                        for param_name in params:
                             param_key = (path, param_name, "query")
                             if param_key not in created_parameters:
-                                sample_value = param_values[0] if param_values else ""
-
+                                # No value: a DAST URL can be an archived one (urlscan's
+                                # are masked, GAU's are raw) and the resource writer owns
+                                # `sample_values` for what a crawler saw (B10, B15).
                                 session.run(
                                     """
                                     MERGE (p:Parameter {name: $name, position: $position, endpoint_path: $endpoint_path, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
                                     SET p.user_id = $user_id,
                                         p.project_id = $project_id,
-                                        p.sample_value = $sample_value,
                                         p.is_injectable = coalesce(p.is_injectable, false),
                                         p.updated_at = datetime()
                                     """,
                                     name=param_name, position="query", endpoint_path=path, baseurl=base_url,
                                     user_id=user_id, project_id=project_id,
-                                    sample_value=sample_value
                                 )
                                 stats["parameters_created"] += 1
                                 created_parameters.add(param_key)
@@ -508,7 +510,7 @@ class VulnMixin:
 
                         # Extract path from matched_at URL
                         matched_parsed = urlparse(matched_at)
-                        vuln_path = matched_parsed.path or "/"
+                        vuln_path = normalize_endpoint_path(matched_parsed.path or "/")
                         vuln_scheme = matched_parsed.scheme or "http"
                         vuln_host = matched_parsed.netloc or target_host
 

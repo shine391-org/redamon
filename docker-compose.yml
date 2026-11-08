@@ -412,9 +412,6 @@ services:
     environment:
       DOCKER_BROKER_UPSTREAM: /var/run/docker.sock
       DOCKER_BROKER_LISTEN: /var/run/broker/docker.sock
-      # Tool images the recon pipeline may run (V3 set is the broker default;
-      # operator extras flow through to keep parity with RECON_EXTRA_ALLOWED_IMAGES).
-      DOCKER_BROKER_ALLOWED_IMAGES: ${RECON_EXTRA_ALLOWED_IMAGES:-}
       # Host bind sources the tools legitimately mount: the shared scratch dir and
       # anything under the repo root (recon output, wordlists, custom templates).
       # Everything else (/, /etc, /root, the docker socket) is denied.
@@ -560,11 +557,6 @@ services:
       # (localhost:3000), not the `webapp` DNS name. Server-controlled, never the
       # client-supplied request.webapp_api_url (which would be an SSRF/key-leak).
       SPAWNED_WEBAPP_API_URL: http://localhost:3000
-      # V3: comma-separated extra tool Docker images the operator approves beyond
-      # the shipped allowlist (e.g. private-registry mirrors for air-gapped use:
-      # "myregistry.local/naabu:latest,myregistry.local/httpx:latest"). Empty =
-      # strict shipped-only. Forwarded to the recon pipeline by container_manager.
-      RECON_EXTRA_ALLOWED_IMAGES: ${RECON_EXTRA_ALLOWED_IMAGES:-}
       # Recon circuit breakers (recon/helpers/circuit_breaker.py). Only the exact
       # value "off" disables them: every failing dependency is then called for
       # every item again. Coverage recording and the prune guard stay on. Apply
@@ -576,6 +568,16 @@ services:
       # Test labs only: point Shodan / InternetDB at a stub API. Leave unset.
       SHODAN_API_BASE: ${SHODAN_API_BASE:-}
       SHODAN_INTERNETDB_BASE: ${SHODAN_INTERNETDB_BASE:-}
+      # urlscan lab only (testing/guinea_pigs/urlscan_lab): a fake urlscan and an
+      # extra CDN edge prefix, forwarded ONLY into the scans of the projects listed
+      # in REDAMON_LAB_PROJECT_IDS. Leave all three unset in a deployment.
+      URLSCAN_API_BASE: ${URLSCAN_API_BASE:-}
+      REDAMON_LAB_CDN_PREFIXES: ${REDAMON_LAB_CDN_PREFIXES:-}
+      REDAMON_LAB_PROJECT_IDS: ${REDAMON_LAB_PROJECT_IDS:-}
+      # HMAC key for secrets seen in URLs (urlscan Secret.value_hmac), generated in
+      # .env by redamon.sh. NO default on purpose: a fixed one would make the HMAC
+      # a public, reversible hash. Empty -> no value_hmac is written.
+      REDAMON_SECRET_HMAC_KEY: ${REDAMON_SECRET_HMAC_KEY:-}
       # Scan Timeline — Scan Scheduler worker (plan Section 7.2). It ticks here
       # (the orchestrator owns admission + spawn) and asks the webapp to run each
       # due schedule through the same start path a manual scan uses. Listed
@@ -908,13 +910,13 @@ services:
       # chat run (agentic/agent_in_the_loop). On by default; the webapp reads
       # the same switch. The tunables are bounded in code (a bad value warns).
       AGENT_IN_THE_LOOP_ENABLED: ${AGENT_IN_THE_LOOP_ENABLED:-true}
-      LOOP_STEP_DEADLINE_S: ${LOOP_STEP_DEADLINE_S:-900}
+      LOOP_STEP_DEADLINE_S: ${LOOP_STEP_DEADLINE_S:-3600}
       LOOP_LEASE_S: ${LOOP_LEASE_S:-90}
       LOOP_WAIT_MAX_S: ${LOOP_WAIT_MAX_S:-55}
       LOOP_PAGE_CHARS: ${LOOP_PAGE_CHARS:-40000}
       LOOP_ANSWER_MAX_CHARS: ${LOOP_ANSWER_MAX_CHARS:-262144}
       LOOP_MAX_OPEN_STEPS_PER_USER: ${LOOP_MAX_OPEN_STEPS_PER_USER:-16}
-      LOOP_NO_DRIVER_GRACE_S: ${LOOP_NO_DRIVER_GRACE_S:-300}
+      LOOP_NO_DRIVER_GRACE_S: ${LOOP_NO_DRIVER_GRACE_S:-1800}
       LOOP_DRIVER_SEEN_S: ${LOOP_DRIVER_SEEN_S:-60}
       LOOP_STATE_TTL_S: ${LOOP_STATE_TTL_S:-3600}
       # MCP tool servers (internal docker network)

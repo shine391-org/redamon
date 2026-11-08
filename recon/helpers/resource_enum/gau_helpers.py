@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, parse_qs
 
 from recon.helpers.docker_helpers import pull_image_or_use_local
-from .classification import classify_parameter, classify_endpoint
+from .classification import classify_parameter, classify_endpoint, infer_parameter_type
 
 
 def _is_arm64_host() -> bool:
@@ -302,8 +302,24 @@ def run_gau_discovery(
 
     urls_list = sorted(list(all_discovered_urls))
     print(f"[+][GAU] Discovered {len(urls_list)} total URLs")
+    return quarantine_archive_urls(urls_list, urls_by_domain, "GAU")
 
-    return urls_list, urls_by_domain
+
+def quarantine_archive_urls(urls_list: List[str], urls_by_domain: Dict[str, List[str]],
+                            label: str) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Drop the archive URLs that must never be requested (a leaked reset or
+    invite link, a secret, a state-changing link with a value, a web-shell
+    trace) before verification, method detection or a merge sees them. The
+    archives (Wayback, OTX, urlscan through GAU's own provider) hold the same
+    links urlscan does."""
+    from recon.helpers.url_leaks import split_quarantined
+    kept, quarantined = split_quarantined(urls_list)
+    if not quarantined:
+        return urls_list, urls_by_domain
+    dropped = set(quarantined)
+    print(f"[*][{label}] Quarantined {len(dropped)} URL(s) carrying tokens or one-time links: "
+          f"never requested or stored")
+    return kept, {d: [u for u in urls if u not in dropped] for d, urls in urls_by_domain.items()}
 
 
 def parse_gau_url_to_endpoint(url: str) -> Optional[Dict]:
@@ -333,13 +349,16 @@ def parse_gau_url_to_endpoint(url: str) -> Optional[Dict]:
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
 
-        # Extract query parameters (just the names, not values)
-        query_params = list(parse_qs(parsed.query).keys()) if parsed.query else []
+        # Query parameter names; their values only in memory, to infer each
+        # one's type: an archived value can be someone's token and is never stored.
+        values = parse_qs(parsed.query, keep_blank_values=True) if parsed.query else {}
+        query_params = list(values.keys())
 
         return {
             "base_url": base_url,
             "path": path,
-            "parameters": {"query": query_params} if query_params else {}
+            "parameters": {"query": query_params} if query_params else {},
+            "values": values,
         }
     except Exception:
         return None
@@ -401,14 +420,15 @@ def verify_gau_urls(
             "-rl", str(rate_limit),
         ]
 
+        # A URL counts as verified only when httpx says so: on a timeout the
+        # lines httpx already wrote are kept, and nothing else is.
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
-            print("[!][GAU] URL verification timeout")
-            return set(urls)
+            print("[!][GAU] URL verification timeout: keeping only the URLs verified so far")
         except Exception as e:
             print(f"[!][GAU] URL verification error: {e}")
-            return set(urls)
+            return set()
 
         # Parse results
         live_urls = set()
@@ -700,11 +720,20 @@ def merge_gau_into_by_base_url(
                 else:
                     existing_names = []
 
+                values = parsed.get("values") or {}
+                for existing in existing_query if isinstance(existing_query, list) else []:
+                    # A more specific type from the archive replaces a plain one.
+                    if isinstance(existing, dict) and existing.get('type') in (None, '', 'string'):
+                        inferred = infer_parameter_type(existing.get('name', ''),
+                                                        values.get(existing.get('name', ''), []))
+                        if inferred != 'string':
+                            existing['type'] = inferred
                 for param_name in new_query:
                     if param_name not in existing_names:
                         param_info = {
                             'name': param_name,
                             'category': classify_parameter(param_name),
+                            'type': infer_parameter_type(param_name, values.get(param_name, [])),
                             'source': 'gau'
                         }
                         if 'parameters' not in endpoints[path]:
@@ -716,10 +745,12 @@ def merge_gau_into_by_base_url(
             stats["gau_new"] += 1
 
             query_params = []
+            values = parsed.get("values") or {}
             for param_name in parsed["parameters"].get("query", []):
                 query_params.append({
                     'name': param_name,
                     'category': classify_parameter(param_name),
+                    'type': infer_parameter_type(param_name, values.get(param_name, [])),
                     'source': 'gau'
                 })
 

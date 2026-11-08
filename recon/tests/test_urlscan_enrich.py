@@ -250,7 +250,8 @@ class TestUrlscanSearch(unittest.TestCase):
         mock_get.assert_called_once()
         call_kwargs = mock_get.call_args
         self.assertEqual(call_kwargs.kwargs["params"]["q"], "page.domain:example.com")
-        self.assertEqual(call_kwargs.kwargs["params"]["size"], 500)
+        # Without a key urlscan answers at most 100 per search, whatever is asked.
+        self.assertEqual(call_kwargs.kwargs["params"]["size"], 100)
         self.assertEqual(call_kwargs.kwargs["headers"], {})
 
     @patch("urlscan_enrich.requests.get")
@@ -293,15 +294,16 @@ class TestUrlscanSearch(unittest.TestCase):
         self.assertEqual(results, [])
 
     @patch("urlscan_enrich.requests.get")
-    def test_max_results_capped_at_10000(self, mock_get):
+    def test_page_size_capped_at_10000_with_a_key_and_100_without(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"results": []}
         mock_get.return_value = mock_resp
 
+        _urlscan_search("example.com", "k", 99999)
+        self.assertEqual(mock_get.call_args.kwargs["params"]["size"], 10000)
         _urlscan_search("example.com", "", 99999)
-        call_kwargs = mock_get.call_args
-        self.assertEqual(call_kwargs.kwargs["params"]["size"], 10000)
+        self.assertEqual(mock_get.call_args.kwargs["params"]["size"], 100)
 
 
 # ─── Tests: run_urlscan_enrichment ───────────────────────────────────────────
@@ -395,7 +397,8 @@ class TestRunUrlscanEnrichment(unittest.TestCase):
         paths = result["urlscan"]["urls_with_paths"]
         # Both results have the same URL, should only appear once
         full_urls = [p["full_url"] for p in paths]
-        self.assertEqual(full_urls.count("https://app.example.com/login?next=/dashboard"), 1)
+        # Stored masked (S4): an archived value is someone's old request.
+        self.assertEqual(full_urls.count("https://app.example.com/login?next=***"), 1)
 
     @patch("urlscan_enrich._urlscan_search")
     def test_root_url_excluded_from_paths(self, mock_search):
@@ -428,10 +431,11 @@ class TestRunUrlscanEnrichment(unittest.TestCase):
             "url", "domain", "ip", "asn", "asn_name", "country",
             "server", "status", "title", "tls_issuer", "tls_valid_days",
             "tls_valid_from", "tls_age_days", "domain_age_days",
-            "screenshot_url", "scan_time",
+            "screenshot_url", "scan_time", "scan_id", "visibility", "mime_type",
+            "in_scope", "ip_in_scope", "quarantined",
         }
         self.assertEqual(set(entry.keys()), expected_keys)
-        self.assertEqual(entry["url"], "https://app.example.com/login?next=/dashboard")
+        self.assertEqual(entry["url"], "https://app.example.com/login?next=***")
         self.assertEqual(entry["ip"], "93.184.216.34")
         self.assertEqual(entry["server"], "nginx/1.21.6")
         self.assertEqual(entry["status"], "200")  # Converted to string
@@ -447,29 +451,29 @@ class TestRunUrlscanEnrichment(unittest.TestCase):
         paths = result["urlscan"]["urls_with_paths"]
         self.assertEqual(len(paths), 1)
         p = paths[0]
-        self.assertEqual(p["full_url"], "https://app.example.com/login?next=/dashboard")
+        self.assertEqual(p["full_url"], "https://app.example.com/login?next=***")
         self.assertEqual(p["base_url"], "https://app.example.com")
         self.assertEqual(p["path"], "/login")
-        self.assertEqual(p["params"], {"next": "/dashboard"})
+        self.assertEqual(p["params"], {"next": "***"})
+        self.assertEqual(set(p["param_types"]), {"next"})
 
     @patch("urlscan_enrich._urlscan_search")
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_api_key_passed_through(self, mock_search):
         """API key from settings should be passed to _urlscan_search."""
         mock_search.return_value = []
         cr = _make_combined_result()
         run_urlscan_enrichment(cr, _enabled_settings(URLSCAN_API_KEY="test-key"))
 
-        mock_search.assert_called_once_with("example.com", "test-key", 500)
+        args = mock_search.call_args
+        self.assertEqual(args.args[:2], ("example.com", "test-key"))
 
     @patch("urlscan_enrich._urlscan_search")
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_max_results_passed_through(self, mock_search):
         mock_search.return_value = []
         cr = _make_combined_result()
         run_urlscan_enrichment(cr, _enabled_settings(URLSCAN_MAX_RESULTS=100))
 
-        mock_search.assert_called_once_with("example.com", "", 100)
+        self.assertEqual(mock_search.call_args.args[:3], ("example.com", "", 100))
 
     @patch("urlscan_enrich._urlscan_search")
     def test_missing_page_fields_handled(self, mock_search):

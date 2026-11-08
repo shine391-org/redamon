@@ -270,6 +270,43 @@ def run_shodan(config: dict) -> dict:
     return run_per_root(roots, _one_root, "Shodan")
 
 
+def _graph_live_bases(graph_client, user_id: str, project_id: str, roots: list, config: dict) -> set:
+    """BaseURLs whose probed Endpoint answered, inside this run's scope."""
+    from recon.partial_recon_modules.graph_builders import graph_url_scope, url_host
+    with graph_client.driver.session() as session:
+        keep = graph_url_scope(session, user_id, project_id, roots, config.get("domain_groups"),
+                               apex_filter=False)
+        rows = session.run(
+            """
+            MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
+            WHERE e.status_code IS NOT NULL
+            RETURN DISTINCT b.url AS url, b.host AS host
+            """, uid=user_id, pid=project_id)
+        return {r["url"] for r in rows if r["url"] and keep(url_host(r["url"], r["host"] or ""))}
+
+
+def _graph_live_pages(graph_client, user_id: str, project_id: str, hosts: list) -> dict:
+    """{host: [page]} from the graph's probed Endpoints (the last httpx run),
+    in the shape urlscan_takeover.decide reads."""
+    hosts = sorted({str(h).lower() for h in hosts or [] if h})
+    if not hosts:
+        return {}
+    out: dict = {}
+    with graph_client.driver.session() as session:
+        rows = session.run(
+            """
+            MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
+            WHERE toLower(b.host) IN $hosts AND e.status_code IS NOT NULL
+            RETURN toLower(b.host) AS host, coalesce(e.final_url, e.url) AS final_url,
+                   e.title AS title, e.server AS server, e.status_code AS status,
+                   e.content_type AS content_type, e.cname AS cname
+            """, uid=user_id, pid=project_id, hosts=hosts)
+        for r in rows:
+            out.setdefault(r["host"], []).append({k: r[k] for k in (
+                "final_url", "title", "server", "status", "content_type", "cname")})
+    return out
+
+
 def run_urlscan(config: dict) -> dict:
     """
     Run partial URLScan.io passive enrichment, once per root.
@@ -279,7 +316,7 @@ def run_urlscan(config: dict) -> dict:
     Phase B (enrichment): enriches existing BaseURLs with screenshots/endpoints/parameters.
     A 429 is a rate-limited root (retried once); an empty answer is no_results.
     """
-    from recon.main_recon_modules.urlscan_enrich import run_urlscan_discovery_only
+    from recon.main_recon_modules.urlscan_enrich import run_urlscan_discovery_only, start_search_budget
 
     roots = scope_roots(config)
     user_id = os.environ.get("USER_ID", "")
@@ -295,15 +332,21 @@ def run_urlscan(config: dict) -> dict:
 
     # Force-enable URLScan for partial recon (user explicitly triggered it)
     settings["URLSCAN_ENABLED"] = True
+    # A partial run has its own search budget, every root's first page reserved.
+    start_search_budget(settings, roots)
 
     def _one_root(domain: str) -> str:
         # Run URLScan discovery (same function as full pipeline Phase A)
-        urlscan_data = run_urlscan_discovery_only(domain, settings)
+        from recon.partial_recon_modules.helpers import org_for_root
+        urlscan_data = run_urlscan_discovery_only(
+            domain, settings, org_for_root(domain, config.get("domain_groups") or []))
 
         if urlscan_data.get("rate_limited"):
             print(f"[!][Partial Recon] URLScan rate-limited for {domain}")
             return STATUS_RATE_LIMITED
-        if not urlscan_data or urlscan_data.get("results_count", 0) == 0:
+        if not urlscan_data or not (urlscan_data.get("results_count", 0)
+                                    or urlscan_data.get("redirect_entries")
+                                    or urlscan_data.get("findings")):
             print(f"[-][Partial Recon] URLScan returned no results for {domain}")
             return STATUS_NO_RESULTS
 
@@ -341,6 +384,47 @@ def run_urlscan(config: dict) -> dict:
                     project_id=project_id,
                 )
                 print(f"[+][Partial Recon] Enrichment graph update: {json.dumps(enrichment_stats, default=str)}")
+
+                findings_stats = graph_client.update_graph_from_urlscan_findings(
+                    recon_data=combined_result, user_id=user_id, project_id=project_id)
+                print(f"[+][Partial Recon] Findings graph update: {json.dumps(findings_stats, default=str)}")
+
+                # Item 5: a deleted-service page is kept only when the host still
+                # points to the provider and the page (the graph's last httpx
+                # run) or NXDOMAIN says so now.
+                pages = urlscan_data.get("takeover_pages") or []
+                if pages:
+                    from recon.main_recon_modules.urlscan_takeover import run_partial_verdict
+                    live = _graph_live_pages(graph_client, user_id, project_id,
+                                             [p.get("host") for p in pages])
+                    found, hosts = run_partial_verdict(pages, live)
+                    urlscan_data["takeover_findings"], urlscan_data["takeover_hosts"] = found, hosts
+                    print(f"[+][Partial Recon] Takeover verdict: {len(found)} of {len(pages)} host(s) kept")
+                    if found:
+                        graph_client.update_graph_from_urlscan_takeover(combined_result, user_id, project_id)
+
+                # urlscan's addresses get every module's labels (item 4a). A
+                # partial run has no httpx step: the live bases are the graph's.
+                rows = urlscan_data.get("urls_with_paths") or []
+                if rows:
+                    from urllib.parse import urlparse
+                    from recon.helpers.resource_enum.urlscan_helpers import merge_urlscan_into_by_base_url
+                    bases = _graph_live_bases(graph_client, user_id, project_id, roots, config)
+                    by_base, us_stats = merge_urlscan_into_by_base_url(rows, {}, bases)
+                    print(f"[+][Partial Recon] urlscan addresses on live bases: {us_stats['urlscan_new']}")
+                    if by_base:
+                        graph_client.update_graph_from_resource_enum({
+                            "domain": domain, "domains": list(roots),
+                            "subdomains": sorted({urlparse(b).hostname for b in by_base}),
+                            "resource_enum": {"by_base_url": by_base},
+                        }, user_id, project_id)
+
+                # The full run's ExternalDomain shape (HAS_EXTERNAL_DOMAIN, the
+                # *_seen lists), written additively over what is there.
+                from recon.helpers.external_domains import _aggregate_external_domains
+                combined_result["external_domains_aggregated"] = _aggregate_external_domains(combined_result)
+                if combined_result["external_domains_aggregated"]:
+                    graph_client.update_graph_from_external_domains(combined_result, user_id, project_id)
             else:
                 print("[!][Partial Recon] Neo4j not reachable, graph not updated")
         return STATUS_OK

@@ -154,7 +154,18 @@ class Corpus:
         return False
 
 
+#: The stricter request wins a merge, whichever source came first: a heap dump
+#: found by a crawler (GET) and by urlscan (HEAD) is probed with HEAD, never
+#: downloaded, and a backup is read by its magic bytes, not fetched whole.
+_REQUEST_STRICTNESS = {"head": 0, "backup": 1, "get": 2}
+
+
 def _merge(kept: Route, other: Route) -> None:
+    if _REQUEST_STRICTNESS.get(other.request, 2) < _REQUEST_STRICTNESS.get(kept.request, 2):
+        kept.request = other.request
+    if "backup" in (kept.generated_by, other.generated_by):
+        # The backup signatures fire only for routes generated_by 'backup'.
+        kept.generated_by = "backup"
     kept.sources = tuple(dict.fromkeys(kept.sources + other.sources))
     if kept.openapi_security is None:
         kept.openapi_security = other.openapi_security
@@ -233,7 +244,8 @@ def _read_resource_enum(corpus: Corpus, combined_result: dict) -> None:
                 if isinstance(meta, dict) else (),
                 declared_only=endpoint.get("declared_only") is True,
             )
-            if category == "forbidden":
+            # ffuf's own label says it answered 403; older data held it in `category`.
+            if "forbidden" in (category, endpoint.get("ffuf_category")):
                 route.discovery_status = route.discovery_status or 403
             if corpus.add(route):
                 _note_api_prefix(corpus, base, path)
@@ -268,7 +280,10 @@ def _read_js_recon(corpus: Corpus, combined_result: dict, *, routers: bool) -> N
         if not base:
             continue
         path = urlsplit(url).path or "/"
-        route = Route(baseurl=base, path=path, category=str(endpoint.get("category") or "endpoint"),
+        # JS Recon's own word ranks the route (admin_debug ranks like admin);
+        # `category` holds the shared one.
+        route = Route(baseurl=base, path=path,
+                      category=str(endpoint.get("js_recon_category") or endpoint.get("category") or "endpoint"),
                       sources=("js_recon",), js_only=True, router=is_router)
         # A route another source also saw is merged: it is no longer js_only.
         if corpus.add(route):
@@ -302,12 +317,67 @@ def _resolve(endpoint: dict) -> str:
     return urljoin(source, candidate)
 
 
+_VCS_PROOFS = {".git": ("/.git/HEAD", "/.git/config"), ".svn": ("/.svn/wc.db", "/.svn/entries"),
+               ".hg": ("/.hg/requires",)}
+
+
+def urlscan_handovers(path: str, file_kind: str) -> list:
+    """[(path, request, generated_by)] for a sensitive file urlscan saw: only the
+    kinds a signature here can prove, each requested the way its signature
+    needs. A kind with no signature is not requested at all (a 200 alone
+    proves nothing: many sites answer 200 to every path), and a web-shell
+    trace is quarantined, never requested."""
+    path = (path or "").split("?", 1)[0]
+    low = path.lower()
+    if not path.startswith("/") or "{" in path:
+        return []
+    if file_kind == "env":
+        return [(path, "get", "found")]
+    if file_kind == "vcs":
+        for folder, proofs in _VCS_PROOFS.items():
+            i = low.find("/" + folder)
+            if i >= 0:
+                prefix = path[:i]
+                return [(prefix + proof, "get", "found") for proof in proofs]
+        return []
+    if file_kind in ("db_dump", "backup"):
+        return [(path, "backup", "backup")]
+    if file_kind == "config":
+        return [(path, "get", "found")] if low.rstrip("/").endswith("/web.config") else []
+    if file_kind == "debug_page":
+        return [(path, "get", "found")]
+    if file_kind == "debug_console":
+        return [(path, "get", "found")] if "/_profiler" in low else []
+    if file_kind == "memory_dump":
+        return [(path, "head", "found")] if low.rstrip("/").endswith("/actuator/heapdump") else []
+    return []
+
+
+def _read_urlscan(corpus: Corpus, combined_result: dict) -> None:
+    """The sensitive files public urlscan visits opened (item 3), on a base that
+    is live in this scan: the scan proves from the content whether each one
+    is still exposed. Path only, never a query string."""
+    for f in (combined_result.get("urlscan") or {}).get("findings") or []:
+        if not isinstance(f, dict) or f.get("type") != "sensitive_file_seen":
+            continue
+        host = str(f.get("host") or "").lower()
+        own = base_of(str(f.get("url") or ""))
+        live = [b for b in corpus.bases if (urlsplit(b).hostname or "").lower() == host]
+        bases = [own] if own in live else live[:1]
+        for base in bases:
+            for path, request, generated_by in urlscan_handovers(str(f.get("path") or ""),
+                                                                 str(f.get("kind") or "")):
+                corpus.add(Route(baseurl=base, path=path, sources=("urlscan",),
+                                 request=request, generated_by=generated_by))
+
+
 def harvest(combined_result: dict, *, routers: bool = False) -> Corpus:
     """Build the route corpus. Never requests anything."""
     corpus = Corpus()
     _read_http_probe(corpus, combined_result)
     _read_resource_enum(corpus, combined_result)
     _read_js_recon(corpus, combined_result, routers=routers)
+    _read_urlscan(corpus, combined_result)
     # A base whose root page is parked or a default page serves no application.
     if corpus.dead_bases:
         corpus.routes = {k: r for k, r in corpus.routes.items() if r.baseurl not in corpus.dead_bases}

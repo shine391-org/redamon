@@ -40,6 +40,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # NOTE: import the module (not the names) so favicon-hash test patching of
 # AI_FAVICON_HASHES propagates through. The module-attribute access pattern
 # `_ai_catalog.AI_FAVICON_HASHES` always reads the current dict object.
+from helpers.system_resolvers import system_resolvers
 from helpers import ai_signal_catalog as _ai_catalog
 from helpers.ai_signal_catalog import (
     AI_HEADER_PATTERNS,
@@ -1013,6 +1014,11 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
     if HTTPX_PATHS:
         cmd.extend(["-path", ",".join(HTTPX_PATHS)])
 
+    # Resolve as the DNS step did (recon/helpers/system_resolvers.py).
+    resolvers = system_resolvers()
+    if resolvers:
+        cmd.extend(["-r", ",".join(resolvers)])
+
     # Custom headers
     if HTTPX_CUSTOM_HEADERS:
         for header in HTTPX_CUSTOM_HEADERS:
@@ -1261,6 +1267,19 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
                 ai_summary["title_matches"] = ai_summary.get("title_matches", 0) + 1
             if ai_fired.get("wappalyzer"):
                 ai_summary["wappalyzer_matches"] = ai_summary.get("wappalyzer_matches", 0) + 1
+
+            # A page that says what it is only in its title (a login form at
+            # `/`, Grafana at `/app`): its category, path rule first, read from
+            # the last hop, whose title httpx kept. A label, never a finding.
+            try:
+                from recon.helpers.resource_enum.classification import endpoint_category
+                from urllib.parse import urlsplit as _urlsplit
+                _hop = str(url_entry.get("final_url") or url)
+                _cat = endpoint_category(_urlsplit(_hop).path or "/", ["GET"], {}, url_entry.get("title"))
+                if _cat != "other":
+                    url_entry["category"] = _cat
+            except Exception:  # noqa: BLE001 - a label must never cost the probe
+                pass
 
             # Add to by_url
             by_url[url] = url_entry

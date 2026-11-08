@@ -147,7 +147,7 @@ All parameters are configured via the webapp project settings (stored in Postgre
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `KATANA_DOCKER_IMAGE` | `str` | `"projectdiscovery/katana:latest"` | Docker image to use |
+| `KATANA_DOCKER_IMAGE` | `str` | `"projectdiscovery/katana:latest"` | Fixed: the image RedAmon ships for this tool. Not a project setting. |
 | `KATANA_DEPTH` | `int` | `3` | Maximum crawl depth (how many links deep to follow) |
 | `KATANA_MAX_URLS` | `int` | `1000` | Maximum URLs to discover per target |
 | `KATANA_RATE_LIMIT` | `int` | `150` | Requests per second |
@@ -203,6 +203,16 @@ file is never an Endpoint.
 `resource_enum["archived_urls"]` lists the URLs only a web archive reported (GAU,
 URLScan, ParamSpider) and no live tool saw; js_recon leaves their JS out when
 `JS_RECON_INCLUDE_ARCHIVED_JS` is off.
+
+Archive URLs go through the quarantine first (`recon/helpers/url_leaks.py`): a URL
+carrying a one-time link, a secret, a state-changing value or a web-shell trace
+never reaches `discovered_urls`, and the Endpoint it would have made is written
+`quarantined` (no `full_url`, no parameter values). The remaining archive values
+are masked before they enter the lists DAST reads. urlscan's addresses join
+`by_base_url` only on bases that are live in this scan
+(`recon/helpers/resource_enum/urlscan_helpers.py`), before OpenAPI, so a
+Swagger address urlscan saw seeds the OpenAPI step; every source writes the same
+`Endpoint.category` and `Parameter.type` words (`classification.py`).
 
 **Default Exclude Patterns:**
 
@@ -273,7 +283,7 @@ GAU (GetAllUrls) provides passive URL discovery from historical archives. It run
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `GAU_ENABLED` | `bool` | `True` | Enable/disable GAU discovery |
-| `GAU_DOCKER_IMAGE` | `str` | `"sxcurity/gau:latest"` | Docker image to use |
+| `GAU_DOCKER_IMAGE` | `str` | `"sxcurity/gau:latest"` | Fixed: the image RedAmon ships for this tool. Not a project setting. |
 | `GAU_PROVIDERS` | `list` | `["wayback", "commoncrawl", "otx", "urlscan"]` | Data sources to query |
 | `GAU_MAX_URLS` | `int` | `1000` | Maximum URLs per domain (0 = unlimited) |
 | `GAU_TIMEOUT` | `int` | `60` | Timeout per provider in seconds |
@@ -301,10 +311,13 @@ GAU_BLACKLIST_EXTENSIONS = [
     "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif",
     "css", "woff", "woff2", "ttf", "eot", "otf",
     "mp3", "mp4", "avi", "mov", "wmv", "flv", "webm",
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-    "zip", "rar", "7z", "tar", "gz"
 ]
 ```
+
+Images, fonts and media only: archived documents, exports and archives (pdf,
+xlsx, zip...) are kept so the URL quarantine and URLScan's sensitive-file checks
+see them. A project saved with the older default (which also dropped them) keeps
+its own list.
 
 ### 4. URL Verification
 
@@ -313,7 +326,7 @@ GAU URLs are verified to check if they're still live before adding to results.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `GAU_VERIFY_URLS` | `bool` | `True` | Enable HTTP verification |
-| `GAU_VERIFY_DOCKER_IMAGE` | `str` | `"projectdiscovery/httpx:latest"` | httpx image for verification |
+| `GAU_VERIFY_DOCKER_IMAGE` | `str` | `"projectdiscovery/httpx:latest"` | Fixed: the image RedAmon ships for this tool. Not a project setting. |
 | `GAU_VERIFY_TIMEOUT` | `int` | `5` | Timeout per URL in seconds |
 | `GAU_VERIFY_RATE_LIMIT` | `int` | `100` | Requests per second |
 | `GAU_VERIFY_THREADS` | `int` | `50` | Concurrent verification threads |
@@ -510,7 +523,7 @@ Hakrawler is a DOM-aware web crawler that runs as a Docker container (`jauderho/
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `HAKRAWLER_ENABLED` | `bool` | `True` | Enable/disable Hakrawler crawling |
-| `HAKRAWLER_DOCKER_IMAGE` | `str` | `"jauderho/hakrawler:latest"` | Docker image to use |
+| `HAKRAWLER_DOCKER_IMAGE` | `str` | `"jauderho/hakrawler:latest"` | Fixed: the image RedAmon ships for this tool. Not a project setting. |
 | `HAKRAWLER_DEPTH` | `int` | `2` | Crawl depth (how many links deep to follow) |
 | `HAKRAWLER_THREADS` | `int` | `5` | Concurrent threads |
 | `HAKRAWLER_TIMEOUT` | `int` | `30` | Per-URL timeout in seconds |

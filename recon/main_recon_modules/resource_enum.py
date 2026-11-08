@@ -1436,11 +1436,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         if GAU_VERIFY_URLS and gau_urls_to_process:
             verified_urls = verify_gau_urls(
                 gau_urls_to_process,
-                GAU_VERIFY_DOCKER_IMAGE,
-                GAU_VERIFY_TIMEOUT,
-                GAU_VERIFY_RATE_LIMIT,
-                GAU_VERIFY_THREADS,
-                GAU_VERIFY_ACCEPT_STATUS
+                docker_image=GAU_VERIFY_DOCKER_IMAGE,
+                threads=GAU_VERIFY_THREADS,
+                timeout=GAU_VERIFY_TIMEOUT,
+                rate_limit=GAU_VERIFY_RATE_LIMIT,
+                accept_status=GAU_VERIFY_ACCEPT_STATUS,
             )
 
         # Detect HTTP methods for GAU URLs using OPTIONS probe
@@ -1548,6 +1548,20 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         if KITERUNNER_DETECT_METHODS and kr_stats.get('kr_with_multiple_methods', 0) > 0:
             print(f"[+][Kiterunner] Endpoints with multiple methods: {kr_stats['kr_with_multiple_methods']}")
 
+    # urlscan's addresses join by_base_url like the archive sources, labelled the
+    # same way, on bases live in this scan only, and BEFORE OpenAPI, which reads
+    # by_base_url for its seeds (a swagger address seen on urlscan becomes an
+    # import when auto-discover is on).
+    from recon.helpers.resource_enum.urlscan_helpers import (
+        live_bases, merge_urlscan_into_by_base_url, title_seed_urls)
+    urlscan_rows = (recon_data.get("urlscan") or {}).get("urls_with_paths") or []
+    if urlscan_rows:
+        organized_data['by_base_url'], us_stats = merge_urlscan_into_by_base_url(
+            urlscan_rows, organized_data['by_base_url'], live_bases(recon_data), target_domains)
+        print(f"[+][URLScan] by_base_url: {us_stats['urlscan_new']} new, "
+              f"{us_stats['urlscan_overlap']} shared with other sources, "
+              f"{us_stats['urlscan_not_live']} on bases not live in this scan (skipped)")
+
     # OpenAPI runs last, after every crawler has merged, so no tool in this
     # module ever requests a path known only from a specification. Fail-soft:
     # an OpenAPI failure costs the run its declarations, never its endpoints.
@@ -1561,8 +1575,12 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 for path in (data.get('endpoints') or {})
                 if SPEC_LIKE_PATH.search(path)
             ]
+            # A page titled Swagger UI or ReDoc is a seed whatever its path.
+            title_seeds = title_seed_urls(urlscan_rows,
+                                          (recon_data.get("http_probe") or {}).get("by_url") or {})
             print("\n[*][OpenAPI] Discovering and parsing API specifications...")
-            openapi_payload = run_openapi_discovery(recon_data, settings, seed_urls)
+            openapi_payload = run_openapi_discovery(recon_data, settings, seed_urls,
+                                                    title_seeds=title_seeds)
             organized_data['by_base_url'], oa_stats = merge_openapi_into_by_base_url(
                 openapi_payload, organized_data['by_base_url'])
             openapi_inventory = build_openapi_inventory(recon_data, openapi_payload, oa_stats)
@@ -1600,14 +1618,18 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         if urlscan_skipped:
             print(f"[-][ResourceEnum] URLScan skipped {urlscan_skipped} out-of-scope URLs")
 
-    # Combine all discovered URLs (deduplicated, in-scope only)
+    # Combine all discovered URLs (deduplicated, in-scope only). An archive URL's
+    # parameter values are someone's old request (a session, a token the
+    # quarantine's rules missed): nuclei DAST and the recon JSON get them
+    # masked, as urlscan's are.
+    from recon.helpers.url_leaks import mask_url
+    archive_masked = [m for m in (mask_url(u) for u in in_scope_gau + paramspider_urls) if m]
     jsluice_in_scope_urls = jsluice_result.get("urls", []) if JSLUICE_ENABLED else []
     ffuf_discovered_urls = [r["url"] for r in ffuf_results] if FFUF_ENABLED else []
     all_discovered_urls = sorted(set(
         katana_urls
         + hakrawler_urls
-        + in_scope_gau
-        + paramspider_urls
+        + archive_masked
         + urlscan_urls
         + jsluice_in_scope_urls
         + ffuf_discovered_urls
@@ -1618,7 +1640,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # JS_RECON_INCLUDE_ARCHIVED_JS is off.
     live_seen = set(katana_urls + hakrawler_urls + crawl_js_urls + jsluice_in_scope_urls
                     + ffuf_discovered_urls + zap_ajax_urls)
-    archived_only_urls = sorted(set(in_scope_gau + urlscan_urls + paramspider_urls) - live_seen)
+    archived_only_urls = sorted(
+        {mask_url(u) for u in set(in_scope_gau + urlscan_urls + paramspider_urls) - live_seen} - {""})
 
     # Build result structure
     resource_enum_result = {

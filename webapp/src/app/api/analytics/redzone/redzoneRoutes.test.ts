@@ -116,7 +116,7 @@ describe('/api/analytics/redzone/killChain', () => {
     expect(runCalls).toHaveLength(1)
     const c = runCalls[0].cypher
     expect(c).toMatch(/MATCH \(s:Subdomain \{project_id: \$pid\}\)/)
-    expect(c).toMatch(/-\[:RESOLVES_TO\]->\(ip:IP\)/)
+    expect(c).toMatch(/-\[dnsr:RESOLVES_TO\]->\(ip:IP\)\s+WHERE dnsr\.source IS NULL/)
     expect(c).toMatch(/-\[:HAS_PORT\]->\(p:Port\)/)
     expect(c).toMatch(/-\[:RUNS_SERVICE\]->\(svc:Service\)/)
     expect(c).toMatch(/-\[:USES_TECHNOLOGY\]->\(t:Technology\)/)
@@ -234,11 +234,28 @@ describe('/api/analytics/redzone/blastRadius', () => {
 // takeover: source filter + summary
 // ---------------------------------------------------------------------------
 describe('/api/analytics/redzone/takeover', () => {
-  test("Cypher filters Vulnerability by source='takeover_scan'", async () => {
+  test("Cypher reads the takeover scan and item 5's two deleted-service page types", async () => {
     runReturn = []
     await takeoverRoute.GET(makeRequest('p1'))
     const c = runCalls[0].cypher
-    expect(c).toMatch(/MATCH \(v:Vulnerability \{project_id: \$pid, source: 'takeover_scan'\}\)/)
+    expect(c).toMatch(/MATCH \(v:Vulnerability \{project_id: \$pid\}\)/)
+    expect(c).toContain("v.source = 'takeover_scan'")
+    expect(c).toContain("(v.source = 'urlscan_leak' AND v.type = 'takeover_page_seen')")
+    expect(c).toContain("(v.source = 'security_check' AND v.type = 'takeover_error_page')")
+  })
+
+  test('labels who found each row and maps a problem-page outcome onto the verdict scale', async () => {
+    runReturn = [
+      { id: 'a', source: 'takeover_scan', hostname: 'a.example.test', verdict: 'confirmed', provider: 'heroku' },
+      { id: 'b', source: 'urlscan_leak', hostname: 'b.example.test', outcome: 'likely_takeover', provider: 'surge', method: 'live_page' },
+      { id: 'c', source: 'security_check', hostname: 'c.example.test', outcome: 'dangling_dns', provider: 'netlify' },
+    ]
+    const res = await takeoverRoute.GET(makeRequest('p1'))
+    const body = await res.json()
+    expect(body.rows.map((r: { foundBy: string }) => r.foundBy))
+      .toEqual(['takeover scan', 'urlscan history', 'live check'])
+    expect(body.rows.map((r: { verdict: string }) => r.verdict)).toEqual(['confirmed', 'likely', 'manual_review'])
+    expect(body.meta.likely).toBe(1)
   })
 
   test('orders by verdict then confidence DESC', async () => {

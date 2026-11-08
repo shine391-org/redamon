@@ -202,7 +202,6 @@ export const reconPresetSchema = z.object({
 
   // -- Web Crawling: ZAP Ajax Spider --
   zapAjaxSpiderEnabled: bool,
-  zapAjaxSpiderDockerImage: str,
   zapAjaxSpiderSeedMode: str,
   zapAjaxSpiderMaxDuration: int,
   zapAjaxSpiderMaxCrawlDepth: int,
@@ -242,7 +241,6 @@ export const reconPresetSchema = z.object({
   jsluiceConcurrency: int,
   jsluiceParallelism: int,
   jsluiceVerifyUrls: bool,
-  jsluiceVerifyDockerImage: str,
   jsluiceVerifyTimeout: int,
   jsluiceVerifyRateLimit: int,
   jsluiceVerifyThreads: int,
@@ -309,7 +307,6 @@ export const reconPresetSchema = z.object({
 
   // -- GraphQL Cop (external Docker-based misconfig scanner) --
   graphqlCopEnabled: bool,
-  graphqlCopDockerImage: str,
   graphqlCopTimeout: int,
   graphqlCopForceScan: bool,
   graphqlCopDebug: bool,
@@ -441,7 +438,6 @@ export const reconPresetSchema = z.object({
   takeoverAiClassifier: bool,
   takeoverAiUseJev: bool,
   baddnsEnabled: bool,
-  baddnsDockerImage: str,
   baddnsModules: strArr,
   baddnsNameservers: strArr,
   baddnsRunTimeout: int,
@@ -478,7 +474,6 @@ export const reconPresetSchema = z.object({
   tlsxMaxTargets: int,
 
   webCachePoisonEnabled: bool,
-  webCachePoisonDockerImage: str,
   webCachePoisonScanProfile: str,
   webCachePoisonTimeout: int,
   webCachePoisonTimeoutPerReq: int,
@@ -572,6 +567,14 @@ export const reconPresetSchema = z.object({
   securityCheckCspUnsafeInline: bool,
   securityCheckInsecureFormAction: bool,
   securityCheckNoRateLimiting: bool,
+  securityCheckOpenConsoles: bool,
+  securityCheckDebugPages: bool,
+  securityCheckUnfinishedInstallers: bool,
+  securityCheckDevServers: bool,
+  securityCheckDirectoryListing: bool,
+  securityCheckDefacedPages: bool,
+  securityCheckTakeoverErrorPages: bool,
+  securityCheckTestCertificates: bool,
   securityCheckTimeout: int,
   securityCheckMaxWorkers: int,
 
@@ -580,6 +583,7 @@ export const reconPresetSchema = z.object({
   originDiscoveryKeyless: bool,
   originDiscoveryScanners: bool,
   originDiscoveryPassiveDns: bool,
+  originDiscoveryUrlscan: bool,
   originDiscoveryMaxCandidates: int,
   originDiscoveryMaxSearchCalls: int,
   originDiscoveryThreshold: int,
@@ -596,6 +600,16 @@ export const reconPresetSchema = z.object({
   shodanWorkers: int,
   urlscanEnabled: bool,
   urlscanMaxResults: int,
+  urlscanMaxSearches: int,
+  urlscanInjectMaxAgeDays: int,
+  urlscanMaxInjectedHosts: int,
+  urlscanLeakedLinks: bool,
+  urlscanSecretsInUrls: bool,
+  urlscanSensitiveFiles: bool,
+  urlscanDocumentLinks: bool,
+  urlscanRedirectSearch: bool,
+  urlscanTakeoverPages: bool,
+  urlscanProblemPages: bool,
   censysEnabled: bool,
   fofaEnabled: bool,
   fofaMaxResults: int,
@@ -804,7 +818,6 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 
 ## Web Crawling - ZAP Ajax Spider
 - zapAjaxSpiderEnabled: boolean - Enable browser-driven Ajax Spider crawling for modern SPAs and authenticated apps
-- zapAjaxSpiderDockerImage: string - Docker image used for the ZAP Ajax Spider runner
 - zapAjaxSpiderSeedMode: string - "base_urls" or "base_urls_and_endpoints" seed selection
 - zapAjaxSpiderMaxDuration: integer - Max Ajax Spider duration per seed in minutes
 - zapAjaxSpiderMaxCrawlDepth: integer - Max crawl depth per seed
@@ -844,7 +857,6 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - jsluiceConcurrency: integer
 - jsluiceParallelism: integer - Base URLs analyzed in parallel
 - jsluiceVerifyUrls: boolean - After extraction, run extracted URLs through httpx and a deny-list filter so only live, non-asset URLs reach the graph. Disable to keep all extracted URLs (legacy behavior).
-- jsluiceVerifyDockerImage: string - httpx Docker image used for verification
 - jsluiceVerifyTimeout: integer - Per-request httpx timeout in seconds
 - jsluiceVerifyRateLimit: integer - Max probe requests per second
 - jsluiceVerifyThreads: integer - httpx worker threads
@@ -904,7 +916,6 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 
 ## GraphQL Cop (external Docker-based misconfig scanner - Phase 2)
 - graphqlCopEnabled: boolean - Master toggle for graphql-cop (default false, opt-in)
-- graphqlCopDockerImage: string - Pinned image tag (default "dolevf/graphql-cop:1.14")
 - graphqlCopTimeout: integer - Per-endpoint timeout in seconds (default 120)
 - graphqlCopForceScan: boolean - -f flag: scan even if endpoint doesn't look GraphQL-like
 - graphqlCopDebug: boolean - -d flag: adds X-GraphQL-Cop-Test header per request
@@ -1037,7 +1048,6 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - takeoverAiClassifier: boolean - Use AI to disambiguate takeover findings from WAF "no host" block pages that match the same static fingerprint (requires aiInPipeline=true). For each finding the scanner probes the host, short-circuits on third-party vendor tokens, and otherwise asks the LLM to classify the body. AI-flagged collisions get score -40 (lands in manual_review). Default false.
 - takeoverAiUseJev: boolean - Engine for the takeover disambiguator: false uses the LLM in aiPipelineModel, true uses TypeSafe AI Jev (jev-1.13.0). Only when aiInPipeline=true; needs a Jev provider selected for the project (jevProviderId), else the hook uses its static fallback.
 - baddnsEnabled: boolean - Run the BadDNS sidecar (AGPL-3.0, isolated Docker container). Requires "docker compose --profile tools build baddns-scanner". Default false.
-- baddnsDockerImage: string - BadDNS image name. Default "redamon-baddns:latest" (built locally from baddns_scan/Dockerfile)
 - baddnsModules: string[] - Subset of BadDNS modules to run. Valid: cname, ns, mx, txt, spf, dmarc, wildcard, nsec, references, zonetransfer. (MTA-STS exists in baddns 2.1.0 but is not CLI-addressable due to an upstream validator regex bug -- omit.) Default: ["cname","ns","mx","txt","spf"]
 - baddnsNameservers: string[] - Optional custom DNS resolvers (e.g. ["1.1.1.1","8.8.8.8"]). Empty = system resolvers.
 - baddnsRunTimeout: integer - Hard wall clock for the BadDNS pass in seconds. Default 1800.
@@ -1073,7 +1083,6 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 
 ## Web Cache Poisoning (WCVS breadth engine + native 5-phase confirmation)
 - webCachePoisonEnabled: boolean - Master switch. Active scan: detects web cache poisoning + web cache deception on live BaseURLs/Endpoints. Sends header/param mutation probes plus repeated baseline/poison/clean fetches per URL. Default false.
-- webCachePoisonDockerImage: string - Docker image for the WCVS breadth engine (Hackmanit Web Cache Vulnerability Scanner), built locally. Default "redamon-wcvs:latest".
 - webCachePoisonScanProfile: string - "safe-confirm" (production, benign canaries, always isolated), "extended" (owned test targets), or "research" (lab only, enables CPDoS if allowed). Default "safe-confirm".
 - webCachePoisonTimeout: integer - WCVS subprocess timeout in seconds. Default 1800.
 - webCachePoisonTimeoutPerReq: integer - Native confirmation per-request timeout in seconds. Default 10.
@@ -1169,6 +1178,14 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - securityCheckCspUnsafeInline: boolean
 - securityCheckInsecureFormAction: boolean
 - securityCheckNoRateLimiting: boolean
+- securityCheckOpenConsoles: boolean - flag live consoles open without login, by page title (open_console). Default true.
+- securityCheckDebugPages: boolean - flag live debug pages that show code or settings, by page title (debug_page). Default true.
+- securityCheckUnfinishedInstallers: boolean - flag live install pages anyone can complete, by page title (unfinished_installer). Default true.
+- securityCheckDevServers: boolean - flag live sites served by a development server, by Server header (dev_server). Default true.
+- securityCheckDirectoryListing: boolean - flag live folder listings, by page title (directory_listing). Default true.
+- securityCheckDefacedPages: boolean - flag a live root page titled Hacked by (defaced_page). Default true.
+- securityCheckTakeoverErrorPages: boolean - flag live hosts showing a cloud provider's deleted-service page (takeover_error_page). Default true.
+- securityCheckTestCertificates: boolean - flag live hosts with a staging or default ingress certificate (test_certificate). Default true.
 - securityCheckTimeout: integer - Seconds
 - securityCheckMaxWorkers: integer
 
@@ -1177,6 +1194,7 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - originDiscoveryKeyless: boolean - Non-CDN subdomains + SPF/MX + crt.sh (no key needed)
 - originDiscoveryScanners: boolean - Favicon/cert pivots via Shodan/Censys/FOFA/ZoomEye/OTX/VirusTotal (each uses its own key)
 - originDiscoveryPassiveDns: boolean - SecurityTrails + ViewDNS DNS history
+- originDiscoveryUrlscan: boolean - Origin Discovery's urlscan source: old addresses from urlscan visits and the visits that loaded the site's own build file (at most 3 searches per scan); skipped while URLScan is off. Default true.
 - originDiscoveryMaxCandidates: integer - Cap on probed candidate IPs per fronted host
 - originDiscoveryMaxSearchCalls: integer - Per-scan budget of keyed scanner-search calls
 - originDiscoveryThreshold: integer - Weighted-similarity confidence (0-100) needed to confirm an origin
@@ -1199,7 +1217,17 @@ These do not run as part of the recon pipeline and are not gated by scanModules.
 - shodanPassiveCves: boolean - Passive CVE lookup via Shodan
 - shodanWorkers: integer - Parallel IP lookup workers
 - urlscanEnabled: boolean - URLScan.io
-- urlscanMaxResults: integer
+- urlscanMaxResults: integer - visits read per domain; capped at 10000 with a key, 1000 without
+- urlscanMaxSearches: integer - urlscan searches one scan may send, across every domain
+- urlscanInjectMaxAgeDays: integer - days: urlscan host names seen within this window join the scan like discovered subdomains (default 90)
+- urlscanMaxInjectedHosts: integer - the most urlscan host names joining one scan per domain, newest first; 0 adds none (default 200)
+- urlscanLeakedLinks: boolean - findings for the target's leaked password-reset, invite, payment and login links seen on urlscan (never opened)
+- urlscanSecretsInUrls: boolean - Secrets for passwords, API keys, tokens and JWTs written in URLs seen on urlscan, stored masked
+- urlscanSensitiveFiles: boolean - findings for sensitive files (.env, .git, dumps, backups, keys, logs, installers, debug consoles) seen on urlscan
+- urlscanDocumentLinks: boolean - marks documents opened by direct link (PDF, Office, CSV, archives, JSON, raw text) on their urlscan endpoints
+- urlscanRedirectSearch: boolean - one extra urlscan search per domain for visits that started on the target and ended on another site (open redirects, leaked links); +1 search
+- urlscanTakeoverPages: boolean - check urlscan's page titles for cloud providers' deleted-service pages, kept only when this scan's DNS and live pages confirm them; no extra searches. Default true.
+- urlscanProblemPages: boolean - check urlscan's titles, server names and certificates for open consoles, debug pages, installers, dev servers, listings, defacements and test certificates; no extra searches. Default true.
 - censysEnabled: boolean
 - fofaEnabled: boolean
 - fofaMaxResults: integer

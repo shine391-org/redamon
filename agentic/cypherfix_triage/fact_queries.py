@@ -232,9 +232,10 @@ RETURN collect(DISTINCT b.url) AS hosts
         "name": "gone_hosts",
         "description": "no live endpoint, no open port, nothing resolves",
         # RESOLVES_TO runs Subdomain -> IP, so each label reads its own end of
-        # it. Only forward DNS counts: Shodan's reverse-DNS and domain-DNS
-        # answers write the same edge with source 'shodan_rdns' / 'shodan_dns',
-        # and a PTR record does not say the host resolves today. A host the run
+        # it. Only forward DNS counts (no source): Shodan's reverse DNS and the
+        # passive sources (Censys, FOFA, OTX, ZoomEye) write the same edge with
+        # a source, and a PTR record or an old sighting does not say the host
+        # resolves today. A host the run
         # skipped was not re-checked, so its absence proves nothing.
         "query": _SKIPPED_HOSTS + """
 MATCH (n {user_id: $userId, project_id: $projectId})
@@ -247,10 +248,10 @@ WHERE (n:Subdomain OR n:IP)
     MATCH (n)-[:HAS_PORT]->(p:Port) WHERE toLower(coalesce(p.state, 'open')) = 'open'
   }
   AND NOT (n:Subdomain AND EXISTS {
-    MATCH (n)-[r:RESOLVES_TO]->(:IP) WHERE NOT coalesce(r.source, '') STARTS WITH 'shodan_'
+    MATCH (n)-[r:RESOLVES_TO]->(:IP) WHERE r.source IS NULL
   })
   AND NOT (n:IP AND EXISTS {
-    MATCH (n)<-[r:RESOLVES_TO]-(:Subdomain) WHERE NOT coalesce(r.source, '') STARTS WITH 'shodan_'
+    MATCH (n)<-[r:RESOLVES_TO]-(:Subdomain) WHERE r.source IS NULL
   })
   AND coalesce(n.is_live, false) = false
   AND NOT toLower(coalesce(n.name, n.address, '')) IN skipped
@@ -267,13 +268,13 @@ RETURN skipped AS hosts
     {
         "name": "name_ownership",
         "description": "the attribution tags of the IPs each DNS name currently resolves to",
-        # Forward DNS only, as in gone_hosts: a PTR answer Shodan recorded does
-        # not say the name points there today. An IP no run attributed yet
+        # Forward DNS only, as in gone_hosts: a PTR answer or a passive sighting
+        # does not say the name points there today. An IP no run attributed yet
         # comes back as '' and keeps the name's attribution unknown.
         "query": """
 MATCH (s:Subdomain {user_id: $userId, project_id: $projectId})-[r:RESOLVES_TO]->(ip:IP)
 WHERE ip.user_id = $userId AND ip.project_id = $projectId
-  AND NOT coalesce(r.source, '') STARTS WITH 'shodan_'
+  AND r.source IS NULL
 RETURN s.name AS name, collect(DISTINCT coalesce(ip.ownership, '')) AS tags
 """,
     },
@@ -366,8 +367,14 @@ RETURN v.id AS id, 'Vulnerability' AS label,
        v.triage_evidence_hash AS triage_evidence_hash,
        v.validation_status AS validation_status, v.validated_at AS validated_at,
        v.detection_method AS detection_method,
+       // A live takeover error page that only leaves the name dangling is not exploitable.
+       v.outcome AS outcome,
+       // An origin that served the site's own build file byte for byte.
+       v.file_match AS file_match,
        // route_exposure's secret_in_response is classed by its detector name.
        v.secret_types AS secret_types,
+       // urlscan history: the kind keys its detector (urlscan_leak:{type}:{kind}).
+       coalesce(v.link_kind, v.file_kind, v.problem, v.provider, v.family) AS finding_kind,
        toString(v.updated_at) AS seen_updated_at,
        // Host resolution, in the order of section 3.2.6.
        // A pattern comprehension takes ONE pattern, so each candidate is its
@@ -445,8 +452,12 @@ RETURN s.id AS id, 'Secret' AS label, coalesce(s.source, 'js_recon') AS source,
        s.triage_status AS triage_status, s.triage_source AS triage_source,
        s.triage_evidence_hash AS triage_evidence_hash,
        toString(s.updated_at) AS seen_updated_at,
+       // A urlscan Secret hangs off its Subdomain (the org's own name: its
+       // Domain), carrying base_url; the parent name covers an older node.
        coalesce(s.base_url,
-                head([(bu:BaseURL)-[:HAS_SECRET]->(s) | bu.url]), '') AS triage_host
+                head([(bu:BaseURL)-[:HAS_SECRET]->(s) | bu.url]),
+                head([(sd)-[:HAS_SECRET]->(s) WHERE sd:Subdomain OR sd:Domain | sd.name]),
+                '') AS triage_host
 """,
     },
     {

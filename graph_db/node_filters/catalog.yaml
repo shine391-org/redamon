@@ -102,7 +102,9 @@ kinds:
                  insecure_form_action, no_rate_limiting,
                  spf_missing, dmarc_missing, dnssec_missing, zone_transfer,
                  admin_port_exposed, database_exposed, redis_no_auth,
-                 kubernetes_api_exposed, smtp_open_relay]
+                 kubernetes_api_exposed, smtp_open_relay,
+                 open_console, debug_page, unfinished_installer, dev_server,
+                 directory_listing, defaced_page, takeover_error_page, test_certificate]
         value_groups:
           Direct IP access: [direct_ip_http, direct_ip_https, ip_api_exposed]
           TLS: [tls_expired, tls_expiring_soon, tls_self_signed, tls_hostname_mismatch,
@@ -115,6 +117,9 @@ kinds:
           DNS and mail: [spf_missing, dmarc_missing, dnssec_missing, zone_transfer]
           Exposed services: [admin_port_exposed, database_exposed, redis_no_auth,
                              kubernetes_api_exposed, smtp_open_relay]
+          Page content: [open_console, debug_page, unfinished_installer, dev_server,
+                         directory_listing, defaced_page, takeover_error_page, test_certificate]
+      problem:        { type: text, prop: problem, label: Problem page (catalog row) }
       missing_header: { type: text, prop: missing_header, label: Missing header }
       url:            { type: url, prop: url, label: URL }
       hostname:       { type: host, prop: hostname, label: Hostname }
@@ -158,13 +163,15 @@ kinds:
         type: enum
         prop: origin_discovery_method
         label: Discovery method
-        values: [subdomain, cert_san, favicon_hash, passive_dns, unknown]
+        values: [subdomain, cert_san, favicon_hash, passive_dns, ip_history, file_hash, file_name, unknown]
       match_method:  { type: enum, prop: match_method, label: Match method, values: [direct, host-header] }
       origin_source:
         type: enum
         prop: origin_source
         label: Origin source
-        values: [dns, crtsh, shodan, censys, fofa, zoomeye, otx, virustotal, securitytrails, viewdns, unknown]
+        values: [dns, crtsh, shodan, censys, fofa, zoomeye, otx, virustotal, securitytrails, viewdns,
+                 urlscan_history, urlscan_hash, urlscan_filename, unknown]
+      file_match:      { type: bool, prop: file_match, label: Served the site's own file }
       cdn_fronting:    { type: text, prop: cdn_fronting, label: CDN }
       html_similarity: { type: number, prop: html_similarity, label: HTML similarity (0-100) }
       cert_match:      { type: number, prop: cert_match, label: Certificate match (0-100) }
@@ -231,6 +238,56 @@ kinds:
     examples:
       - name: Manual review only
         all: [{ field: verdict, op: in, value: [manual_review] }]
+
+  vuln.urlscan:
+    group: vulnerability
+    label: urlscan history
+    graph_label: Vulnerability
+    select: [{ prop: source, in: [urlscan_leak] }]
+    sources: [urlscan_leak]
+    behaviour: finding
+    phase: 1
+    common: vulnerability
+    fields:
+      type:
+        type: enum
+        prop: type
+        label: Kind
+        values: [leaked_one_time_link, sensitive_file_seen, open_redirect_seen, takeover_page_seen,
+                 open_console_seen, debug_page_seen, installer_seen, dev_server_seen,
+                 directory_listing_seen, defaced_page_seen, test_certificate_seen]
+      link_kind:
+        type: enum
+        prop: link_kind
+        label: One-time link
+        values: [password_reset, account_setup, invite, payment, login_link]
+      file_kind:
+        type: enum
+        prop: file_kind
+        label: File kind
+        values: [env, vcs, private_key, db_dump, backup, log, config, debug_page, installer,
+                 web_shell_trace, file_manager, debug_console, memory_dump, salesforce_aura]
+      problem:
+        type: text
+        prop: problem
+        label: Problem page (catalog row)
+      outcome:
+        type: enum
+        prop: outcome
+        label: Takeover outcome
+        values: [likely_takeover, possible_takeover, dangling_dns]
+      provider:   { type: text, prop: provider, label: Takeover provider }
+      hostname:   { type: host, prop: hostname, label: Hostname }
+      url:        { type: url, prop: url, label: URL (masked) }
+      last_seen:  { type: text, prop: last_seen, label: Last seen on urlscan }
+    examples:
+      - name: Old directory listings
+        all: [{ field: type, op: in, value: [directory_listing_seen] }]
+    notes:
+      - >-
+        Seen in a public urlscan scan, never requested by RedAmon: a leaked link
+        or file is the public record itself. Whether a file is still online is
+        Route Exposure's job.
 
   vuln.vhost_sni:
     group: vulnerability
@@ -597,11 +654,11 @@ kinds:
     label: Secrets
     graph_label: Secret
     select: []
-    sources: [js_recon, jsluice]
+    sources: [js_recon, jsluice, urlscan]
     behaviour: finding
     phase: 1
     fields:
-      source:            { type: enum, prop: source, label: Found by, values: [js_recon, jsluice] }
+      source:            { type: enum, prop: source, label: Found by, values: [js_recon, jsluice, urlscan] }
       secret_type:       { type: text, prop: secret_type, label: Secret type }
       key_type:          { type: text, prop: key_type, label: Key category }
       severity:          { type: ordinal, scale: severity, normalizer: severity, label: Severity }
@@ -627,8 +684,10 @@ kinds:
     notes:
       - >-
         `jsluice` secrets come from resource enumeration's jsluice pass; everything
-        JS Recon finds is `js_recon`. Only JS Recon records a key category,
-        confidence, detection method and validation.
+        JS Recon finds is `js_recon`; `urlscan` secrets were written in a URL a
+        public urlscan scan recorded, and are stored masked (length and HMAC,
+        never the value). Only JS Recon records a key category, confidence,
+        detection method and validation.
 
   malpackage:
     group: other_findings
