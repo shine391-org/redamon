@@ -130,6 +130,33 @@ def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
 MAX_DECLARED_NUCLEI_URLS = 500
 
 
+#: General per-run budget for ordinary (observed, non-declared_only) endpoints
+#: sent to nuclei. Both nuclei passes read from the same builder, so this cap
+#: bounds the target fan-out of the detection pass. Parameter-bearing URLs are
+#: kept first; path-only URLs fill the remaining budget, so legitimate
+#: path-only routes keep coverage instead of being dropped wholesale.
+MAX_RESOURCE_ENUM_NUCLEI_URLS = 3000
+
+
+def _is_http_url(url: str) -> bool:
+    """True only for absolute http/https URLs with a host."""
+    try:
+        parsed = urlparse(url)
+    except (ValueError, TypeError):
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _endpoint_has_parameters(endpoint_info: dict) -> bool:
+    """True when any parameter bucket (query/body/path) is non-empty.
+
+    The buckets themselves are truthy dicts even when every bucket is empty,
+    so test the buckets, never ``bool(parameters)``.
+    """
+    parameters = (endpoint_info or {}).get("parameters") or {}
+    return any(bool(bucket) for bucket in parameters.values())
+
+
 def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
     """The URL with sample query values for GET-style scanning, else the bare path."""
     params = (endpoint_info.get("parameters") or {}).get("query") or []
@@ -147,11 +174,18 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
     """
     Build list of target URLs from resource_enum data.
 
-    A path that still holds a template (``/users/{id}``) is never a target. An
-    endpoint known only from an API specification (``declared_only``) is a
-    target only when it declares GET or HEAD, and at most
-    MAX_DECLARED_NUCLEI_URLS of them are, in (base URL, path) order; how many
-    were left out is recorded on the run's OpenAPI inventory.
+    A path that still holds a template (``/users/{id}``) is never a target, and
+    only absolute http/https URLs are targets (``mailto:`` and hostless strings
+    are counted as rejected, never sent). An endpoint known only from an API
+    specification (``declared_only``) is a target only when it declares GET or
+    HEAD, and at most MAX_DECLARED_NUCLEI_URLS of them are, in (base URL,
+    path) order; how many were left out is recorded on the run's OpenAPI
+    inventory.
+
+    Ordinary (observed) endpoints are bounded as well: at most
+    MAX_RESOURCE_ENUM_NUCLEI_URLS are selected per run, parameter-bearing
+    URLs first and path-only URLs filling the remaining budget, in (base URL,
+    path) order. Overflow is recorded on the run's summary.
 
     Args:
         resource_enum_data: Resource enumeration data with endpoints
@@ -160,30 +194,60 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
         Tuple of (base_urls, endpoint_urls_with_params)
     """
     base_urls = []
-    endpoint_urls = []
+    param_bearing = []
+    path_only = []
 
     if not resource_enum_data:
-        return base_urls, endpoint_urls
+        return base_urls, []
 
     by_base_url = resource_enum_data.get("by_base_url", {})
     declared = []
+    rejected_non_http = 0
 
     for base_url, base_data in by_base_url.items():
-        base_urls.append(base_url)
+        if _is_http_url(base_url):
+            base_urls.append(base_url)
+        else:
+            rejected_non_http += 1
 
         endpoints = base_data.get("endpoints", {})
         for path, endpoint_info in endpoints.items():
             if "{" in path:
                 continue
             url = _endpoint_url(base_url, path, endpoint_info)
+            if not _is_http_url(url):
+                rejected_non_http += 1
+                continue
             if endpoint_info.get("declared_only") is True:
                 methods = {str(m).upper() for m in endpoint_info.get("methods") or []}
                 if methods & {"GET", "HEAD"}:
                     declared.append((base_url, path, url))
                 continue
-            endpoint_urls.append(url)
+            if _endpoint_has_parameters(endpoint_info):
+                param_bearing.append((base_url, path, url))
+            else:
+                path_only.append((base_url, path, url))
+
+    param_bearing.sort(key=lambda item: (item[0], item[1]))
+    path_only.sort(key=lambda item: (item[0], item[1]))
+    observed_total = len(param_bearing) + len(path_only)
+    keep_params = param_bearing[:MAX_RESOURCE_ENUM_NUCLEI_URLS]
+    remaining = max(0, MAX_RESOURCE_ENUM_NUCLEI_URLS - len(keep_params))
+    observed_urls = [url for _, _, url in keep_params]
+    observed_urls.extend(url for _, _, url in path_only[:remaining])
+    overflow_observed = max(0, observed_total - MAX_RESOURCE_ENUM_NUCLEI_URLS)
+    if overflow_observed:
+        print(f"[-][Nuclei] {overflow_observed} observed endpoints not sent to nuclei "
+              f"(param-bearing first, cap {MAX_RESOURCE_ENUM_NUCLEI_URLS})")
+    if rejected_non_http:
+        print(f"[-][Nuclei] {rejected_non_http} non-HTTP targets rejected")
+    summary = resource_enum_data.get("summary")
+    if isinstance(summary, dict):
+        summary["nuclei_targets_dropped_budget"] = overflow_observed
+        summary["nuclei_targets_rejected_non_http"] = rejected_non_http
 
     declared.sort(key=lambda item: (item[0], item[1]))
+    endpoint_urls = observed_urls
     endpoint_urls.extend(url for _, _, url in declared[:MAX_DECLARED_NUCLEI_URLS])
     overflow = max(0, len(declared) - MAX_DECLARED_NUCLEI_URLS)
     if overflow:
@@ -367,7 +431,7 @@ def build_target_urls(
     if counts["resource_enum_base"]:
         parts.append(f"{counts['resource_enum_base']} resource_enum base URLs")
     if counts["resource_enum_endpoint"]:
-        parts.append(f"{counts['resource_enum_endpoint']} parameterized endpoints")
+        parts.append(f"{counts['resource_enum_endpoint']} resource_enum endpoints")
     if counts["httpx"]:
         parts.append(f"{counts['httpx']} additional httpx URLs")
     if counts["fallback_subdomain"]:
