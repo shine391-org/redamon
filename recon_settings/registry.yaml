@@ -2482,7 +2482,7 @@ fields:
       reachable at all when roeAllowDos permits the technique.
   engagementIdentityHeader:
     tool: engagement
-    runtime_key: null
+    runtime_key: ENGAGEMENT_IDENTITY_HEADER
     unit: none
     phase: standalone
     traffic: none

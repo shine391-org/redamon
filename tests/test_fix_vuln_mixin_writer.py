@@ -650,5 +650,55 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertEqual(len(session.links("d:Domain")), 2)
 
 
+class TestTechnologyCveOnlyInput(unittest.TestCase):
+    def _payload(self):
+        return {
+            "domain": "example.test",
+            "metadata": {"root_domain": "example.test"},
+            "technology_cves": {"by_technology": {
+                "Nginx:1.24.0": {"product": "nginx", "version": "1.24.0",
+                                 "cves": [{"id": "CVE-2026-0001", "severity": "HIGH"}]},
+            }},
+        }
+
+    def _assert_written(self, payload):
+        session = _Session([{"name": "Nginx", "version": "1.24.0"}])
+        stats = _writer(session).update_graph_from_vuln_scan(payload, U, P)
+        self.assertEqual(stats["errors"], [])
+        self.assertEqual(session.cve_links, [("Nginx", "1.24.0", "CVE-2026-0001")])
+        # A CVE backfill must not reset scan counters or attach unrelated URLs.
+        self.assertFalse(any("SET d.vuln_scan_timestamp" in q for q, _ in session.calls))
+        self.assertFalse(any("HAS_BASE_URL" in q for q, _ in session.calls))
+
+    def test_missing_scan_namespace_still_writes_cves(self):
+        self._assert_written(self._payload())
+
+    def test_empty_scan_namespace_still_writes_cves(self):
+        self._assert_written({**self._payload(), "vuln_scan": {}})
+
+    def test_null_scan_namespace_still_writes_cves(self):
+        self._assert_written({**self._payload(), "vuln_scan": None})
+
+    def test_no_scan_or_cve_data_still_stops_before_db_access(self):
+        session = _Session()
+        stats = _writer(session).update_graph_from_vuln_scan({"technology_cves": {}}, U, P)
+        self.assertTrue(stats["errors"])
+        self.assertEqual(session.calls, [])
+
+    def test_malformed_cve_container_does_not_raise(self):
+        # A non-dict container / by_technology degrades to no CVE data,
+        # not a crash (the gate runs before any DB access).
+        for bad in ({"technology_cves": "junk"}, {"technology_cves": ["x"]},
+                    {"technology_cves": 123},
+                    {"technology_cves": {"by_technology": "junk"}},
+                    {"technology_cves": {"by_technology": ["x"]}}):
+            session = _Session()
+            stats = _writer(session).update_graph_from_vuln_scan(bad, U, P)
+            self.assertIsInstance(stats, dict, bad)
+            self.assertTrue(stats["errors"], bad)
+            self.assertEqual(session.calls, [], bad)
+            self.assertEqual(session.cve_links, [], bad)
+
+
 if __name__ == "__main__":
     unittest.main()

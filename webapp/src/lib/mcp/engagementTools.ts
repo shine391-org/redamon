@@ -60,7 +60,7 @@ import { enforceRate, type McpContext } from '@/lib/mcp/tools'
 import { settingsFingerprint } from '@/lib/jobQueue'
 import { filterReconSettings, reconSettingsSelect } from '@/lib/reconSettings/filter'
 import { fieldsWhere, field } from '@/lib/reconSettings/registry'
-import { checkHeader, isInsideProjectFileRoot } from '@/lib/reconSettings/validators'
+import { checkIdentityHeader, isInsideProjectFileRoot } from '@/lib/reconSettings/validators'
 import { validateJevEngineChange } from '@/lib/reconSettings/jevEngine'
 import { JEV_PROVIDER_TYPES } from '@/lib/llmProviderKinds'
 import { normalizeUserSkillToggles, UserSkillError } from '@/lib/userSkills'
@@ -363,7 +363,7 @@ export async function createProject(ctx: McpContext, args: CreateProjectArgs) {
   }
 
   if (args.engagementIdentityHeader) {
-    const problem = checkHeader(args.engagementIdentityHeader)
+    const problem = checkIdentityHeader(args.engagementIdentityHeader)
     if (problem) {
       throw new McpToolError(`engagementIdentityHeader ${problem}.`, 'setting_rejected')
     }

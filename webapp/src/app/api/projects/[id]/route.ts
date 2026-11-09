@@ -20,6 +20,7 @@ import { internalKeyHeaders } from '@/lib/agentAuth'
 import { writeAudit } from '@/lib/audit'
 import { canonicalJson } from '@/lib/fingerprint'
 import { field, fieldsWhere } from '@/lib/reconSettings/registry'
+import { checkIdentityHeader } from '@/lib/reconSettings/validators'
 import { STALE_SAVE_MESSAGE } from '@/lib/projectVersion'
 import { JEV_ENGINE_SELECT, guardProjectWrite, recordProjectWrite } from '@/lib/projectWriteGuards'
 import { seedDomainNames, seedProjectDomains } from '@/lib/graphSeedDomains'
@@ -250,6 +251,19 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     // check and its audit row.
     const updateData: Record<string, any> = pickProjectColumns(rawUpdate)
     for (const key of NOT_WRITABLE_BY_SAVE) delete updateData[key]
+    // Identity-only fail-closed at the write: a present value is judged by
+    // checkIdentityHeader before any Prisma write below. An absent field is
+    // untouched, '' clears the setting, and a present null/non-string is
+    // refused (checkIdentityHeader requires a string), matching validateValue.
+    if ('engagementIdentityHeader' in updateData) {
+      const identity = updateData.engagementIdentityHeader
+      if (identity !== '' && identity !== undefined) {
+        const problem = checkIdentityHeader(identity)
+        if (problem) {
+          return NextResponse.json({ error: `engagementIdentityHeader ${problem}.` }, { status: 400 })
+        }
+      }
+    }
     if ('openapiSources' in updateData) updateData.openapiSources = cleanOpenApiSources(updateData.openapiSources)
     const openapiError = validateOpenApiSettings(updateData)
     if (openapiError) {

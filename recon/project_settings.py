@@ -838,6 +838,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # or None). Served only to internal/scanner callers, so it carries the
     # plaintext authValue/extraHeaders here. Consumed via helpers.auth_profile.
     'AUTH_PROFILE': None,
+    # Mandatory identity header ("Name: value") carried on every outgoing HTTP
+    # request so the target's operators can attribute the traffic to this
+    # engagement. Empty sends none. Validated on write (webapp
+    # checkIdentityHeader, the identity-only contract) and re-validated
+    # defensively on read by engagement_identity_header().
+    'ENGAGEMENT_IDENTITY_HEADER': '',
     'GRAPHQL_ENDPOINTS': '',
     'GRAPHQL_DEPTH_LIMIT': 10,
     'GRAPHQL_RETRY_COUNT': 3,
@@ -2224,6 +2230,7 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     # exclusions and the window at once. recon_settings.engagement is the one
     # implementation the agent and the orchestrator also call.
     settings['ROE_ENABLED'] = derive_roe_enabled(project)
+    settings['ENGAGEMENT_IDENTITY_HEADER'] = project.get('engagementIdentityHeader', DEFAULT_SETTINGS['ENGAGEMENT_IDENTITY_HEADER'])
     settings['ROE_EXCLUDED_HOSTS'] = project.get('roeExcludedHosts', DEFAULT_SETTINGS['ROE_EXCLUDED_HOSTS'])
     settings['ROE_TIME_WINDOW_ENABLED'] = project.get('roeTimeWindowEnabled', DEFAULT_SETTINGS['ROE_TIME_WINDOW_ENABLED'])
     settings['ROE_TIME_WINDOW_TIMEZONE'] = project.get('roeTimeWindowTimezone', DEFAULT_SETTINGS['ROE_TIME_WINDOW_TIMEZONE'])

@@ -251,6 +251,26 @@ def _compute_favicon_mmh3(body: bytes) -> Optional[int]:
         return None
 
 
+def _identity_headers(ctx) -> dict:
+    """Validated engagement identity headers for a target fetch (or {})."""
+    # No try/except: auth_profile is a mandatory repo module here (this file
+    # already imports recon.helpers.* at top level), and a helper failure
+    # must surface instead of silently dropping attribution.
+    from recon.helpers.auth_profile import identity_header_dict
+    return identity_header_dict(getattr(ctx, "settings", None) or {})
+
+
+def _target_headers(ctx, extra=None) -> dict:
+    """Base target headers with identity merged, existing names winning.
+
+    Case-insensitive: an identity ``user-agent`` (any casing) must not
+    duplicate the module's own ``User-Agent``.
+    """
+    from recon.helpers.auth_profile import merge_identity_headers
+    return merge_identity_headers({"User-Agent": _UA, **(extra or {})},
+                                  _identity_headers(ctx))
+
+
 def _favicon_hash_for_host(host: str, existing: Any, ctx: _RunCtx) -> Optional[int]:
     """Prefer the hash httpx already computed; self-fetch /favicon.ico otherwise.
 
@@ -269,7 +289,8 @@ def _favicon_hash_for_host(host: str, existing: Any, ctx: _RunCtx) -> Optional[i
         try:
             ctx.rate.wait()
             resp = requests.get(url, timeout=ctx.timeout, verify=False,
-                                headers={"User-Agent": _UA}, stream=True)
+                                headers=_target_headers(ctx),
+                                stream=True)
             if resp.status_code != 200:
                 resp.close()
                 continue
@@ -895,7 +916,7 @@ def _fetch(url: str, host_header: str, ctx: _RunCtx, allow_redirects: bool = Fal
     src>`` are where the site's own file is found) and the URL it ended on,
     which a relative src resolves against.
     """
-    headers = {"User-Agent": _UA}
+    headers = _target_headers(ctx)
     if host_header:
         headers["Host"] = host_header
     try:
@@ -976,7 +997,7 @@ def _file_sha256(url: str, host_header: str, ctx: _RunCtx, from_edge_ok: bool = 
     import hashlib
     if not is_url_safe_to_probe(url):
         return None
-    headers = {"User-Agent": _UA}
+    headers = _target_headers(ctx)
     if host_header:
         headers["Host"] = host_header
     try:

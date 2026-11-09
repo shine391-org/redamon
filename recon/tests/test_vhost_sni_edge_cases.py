@@ -555,7 +555,7 @@ class TestFindingMultiplicity:
             {"port": 8443, "scheme": "https"},
         ])
         # Mock curl: both ports return baseline 403/100 raw, but admin returns 200/5000 always
-        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout):
+        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout, identity_header=None):
             is_baseline = host_header is None and sni_hostname is None
             if is_baseline:
                 return {"status": 403, "size": 100}

@@ -718,6 +718,18 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     ARJUN_CUSTOM_HEADERS = _merge_auth(ARJUN_CUSTOM_HEADERS, settings, _auth_hosts)
     KITERUNNER_HEADERS = _merge_auth(KITERUNNER_HEADERS, settings, _auth_hosts)
 
+    # Engagement identity header: one append per tool's header set. It rides the
+    # tool's own -H path, so it is sent identically direct and through the
+    # capture proxy (the fail-open fallback cannot lose it), and it is deduped
+    # against anything the auth merge above already produced.
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    KATANA_CUSTOM_HEADERS = _append_identity(KATANA_CUSTOM_HEADERS, settings)
+    HAKRAWLER_CUSTOM_HEADERS = _append_identity(HAKRAWLER_CUSTOM_HEADERS, settings)
+    FFUF_CUSTOM_HEADERS = _append_identity(FFUF_CUSTOM_HEADERS, settings)
+    ZAP_AJAX_SPIDER_CUSTOM_HEADERS = _append_identity(ZAP_AJAX_SPIDER_CUSTOM_HEADERS, settings)
+    ARJUN_CUSTOM_HEADERS = _append_identity(ARJUN_CUSTOM_HEADERS, settings)
+    KITERUNNER_HEADERS = _append_identity(KITERUNNER_HEADERS, settings)
+
     # An EXACT group scans its listed hosts: Hakrawler must not follow links
     # into sibling subdomains, and ParamSpider keeps only the exact hosts.
     from recon.helpers.recon_scope import recon_scope
@@ -1099,7 +1111,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # Organize discovered endpoints
     if katana_urls:
         print("\n[*][Katana] Organizing endpoints...")
-    organized_data = organize_endpoints(katana_urls)
+    organized_data = organize_endpoints(katana_urls, settings=settings)
 
     # Mark all Katana endpoints with sources=['katana'] (array format)
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -1115,7 +1127,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     if HAKRAWLER_ENABLED and hakrawler_urls:
         print("\n[*][Hakrawler] Organizing and merging endpoints...")
-        hakrawler_organized = organize_endpoints(hakrawler_urls)
+        hakrawler_organized = organize_endpoints(hakrawler_urls, settings=settings)
         organized_data['by_base_url'], hakrawler_stats = merge_hakrawler_into_by_base_url(
             hakrawler_organized['by_base_url'],
             organized_data['by_base_url'],
@@ -1160,7 +1172,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 JSLUICE_EXTRACT_SECRETS,
                 JSLUICE_CONCURRENCY,
                 JSLUICE_PARALLELISM,
-                target_domains
+                target_domains,
+                settings=settings,
             )
 
             jsluice_urls_pre_verify_count = len(jsluice_result.get("urls", []))
@@ -1242,6 +1255,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                         url, AI_PIPELINE_MODEL, max_extensions=6,
                         cache=fp_cache, user_id=user_id, project_id=project_id,
                         engine=('jev' if FFUF_AI_USE_JEV else 'llm'),
+                        settings=settings,
                     )
                 # Union of per-target extensions (single ffuf job uses one -e list).
                 effective_extensions = sorted({e for exts in ai_per_target.values() for e in exts})

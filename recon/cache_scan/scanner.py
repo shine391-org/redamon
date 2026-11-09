@@ -34,8 +34,17 @@ _MAX_URLS = 200
 _MAX_VECTORS_PER_URL = 55
 
 
-def _build_retry_session(retry_count: int = 1, backoff: float = 0.5) -> requests.Session:
-    """requests.Session with retry/backoff on 429/5xx (Cloudflare-friendly)."""
+def _build_retry_session(retry_count: int = 1, backoff: float = 0.5,
+                         settings: dict | None = None) -> requests.Session:
+    """requests.Session with retry/backoff on 429/5xx (Cloudflare-friendly).
+
+    When ``settings`` is given, the validated engagement identity header is
+    set on the session, so every native-engine request (oracle, buster,
+    confirm — all of which take this session) is attributed. The WCVS
+    subprocess breadth engine is NOT covered: it is an external Docker tool
+    with no custom-header flag, so its traffic stays unattributed (see the
+    covered-path inventory in the identity fix notes).
+    """
     retry = Retry(
         total=max(0, min(5, int(retry_count))),
         backoff_factor=max(0.0, min(5.0, float(backoff))),
@@ -48,6 +57,9 @@ def _build_retry_session(retry_count: int = 1, backoff: float = 0.5) -> requests
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({"User-Agent": "RedAmon-CachePoison/1.0"})
+    if settings is not None:
+        from recon.helpers.auth_profile import add_identity_headers, identity_header_dict
+        add_identity_headers(session.headers, identity_header_dict(settings))
     # Never store a cookie. Every probe must be a stateless client: a cookie the
     # poison response sets (a site remembering utm_source) would ride on the "clean"
     # victim read and make the origin replay the canary with no cache involved, and
@@ -250,7 +262,7 @@ def _scan_one_url(url, wcvs_by_url, combined_result, settings, min_conf,
     because Sessions are not safe to share across threads. Reads combined_result
     and wcvs_by_url only (no mutation), so workers never race.
     """
-    session = _build_retry_session()
+    session = _build_retry_session(settings=settings)
     try:
         # Phase 1b: cache oracle (header detection + silent-cache frozen-Date fallback)
         behavioral = bool(settings.get("WEB_CACHE_POISON_BEHAVIORAL_ORACLE", True))

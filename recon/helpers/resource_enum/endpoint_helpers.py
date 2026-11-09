@@ -12,7 +12,8 @@ from .katana_helpers import fetch_forms_from_urls
 
 
 def organize_endpoints(
-    discovered_urls: List[str]
+    discovered_urls: List[str],
+    settings=None
 ) -> Dict:
     """
     Organize discovered URLs into structured endpoint data.
@@ -27,7 +28,7 @@ def organize_endpoints(
     by_base_url = {}  # base_url -> {path -> endpoint_info}
 
     # Fetch forms directly from discovered URLs (since http_probe doesn't keep body)
-    all_forms = fetch_forms_from_urls(discovered_urls, max_urls=100)
+    all_forms = fetch_forms_from_urls(discovered_urls, max_urls=100, settings=settings)
 
     # Process each discovered URL
     for url in discovered_urls:

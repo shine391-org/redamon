@@ -609,6 +609,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 project_id=os.environ.get('PROJECT_ID', ''),
                 fallback_urls=fallback_urls,
                 engine=('jev' if NUCLEI_TAGS_AI_USE_JEV else 'llm'),
+                settings=settings,
             )
             if ai_tags != NUCLEI_TAGS:
                 ai_tags_used = True
@@ -773,6 +774,11 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         from recon.helpers.auth_profile import merge_auth_headers as _merge_auth
         _nuclei_hosts = sorted({_urlparse(u).hostname for u in scan_urls if _urlparse(u).hostname})
         _nuclei_auth = _merge_auth([], settings, _nuclei_hosts)
+        # Engagement identity header: appended AFTER the scope-gated auth lines
+        # so the ordering (auth first, identity last) is stable, deduped, and
+        # the header rides the tool's -H path (direct AND capture proxy alike).
+        from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+        _nuclei_auth = _append_identity(_nuclei_auth, settings)
 
         try:
             findings = []
@@ -1184,6 +1190,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 ai_engine=('jev' if WAF_AI_USE_JEV else 'llm'),
                 roe_excluded_hosts=(settings.get('ROE_EXCLUDED_HOSTS') or None)
                 if settings.get('ROE_ENABLED') else None,
+                settings=settings,
             )
 
             # Merge security checks into vuln_scan results

@@ -52,6 +52,7 @@ def get_ai_extensions(
     user_id: str = '',
     project_id: str = '',
     engine: str = 'llm',
+    settings: Optional[dict] = None,
 ) -> List[str]:
     """
     Probe the target with HEAD, ask the agent for fitting extensions,
@@ -79,7 +80,9 @@ def get_ai_extensions(
     print(f"[*][{_TAG}] Planning extensions for {clean_url}")
 
     try:
-        head_resp = requests.head(clean_url, allow_redirects=True, timeout=HEAD_TIMEOUT)
+        from recon.helpers.auth_profile import identity_header_dict, merge_identity_headers
+        head_resp = requests.head(clean_url, allow_redirects=True, timeout=HEAD_TIMEOUT,
+                                  headers=merge_identity_headers({}, identity_header_dict(settings)) or None)
         headers = dict(head_resp.headers)
     except Exception as e:
         print(f"[!][{_TAG}] HEAD request failed for {clean_url}: {e}. Using safe fallback.")

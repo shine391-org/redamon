@@ -49,8 +49,38 @@ export const SEVERITY_VALUES: readonly string[] = Object.freeze([
  * annotating it: Host re-points a request at a different virtual host,
  * Authorization and Cookie attach a credential the engagement did not
  * authorise, and Proxy-* redirects the whole exchange.
+ *
+ * This is the shared contract for every `http_header` field. It is NOT
+ * extended for the engagement identity header: the framing headers below
+ * are refused only there, by checkIdentityHeader, because that is the one
+ * field the recon side re-validates as an identity line
+ * (auth_profile.engagement_identity_header). Tightening this shared set
+ * would silently change the accepted contract of unrelated custom-header
+ * fields (arjunCustomHeaders, katana custom headers, ...) whose values
+ * recon only sanitizes for control characters.
  */
 const FORBIDDEN_HEADERS = new Set(['host', 'authorization', 'cookie', 'proxy-authorization'])
+
+/**
+ * Extra names refused only for the engagement identity header, mirroring
+ * recon's `_IDENTITY_FORBIDDEN_NAMES` in auth_profile.py: the framing
+ * headers (Content-Length, Transfer-Encoding, Connection) would let the
+ * value rewrite the request body boundaries, and X-Redamon-Ctx is the
+ * capture-proxy routing tag a project must never spoof (recon refuses it
+ * in sanitize_header_name for every header it builds). Proxy-* is refused
+ * by the shared check already.
+ */
+const IDENTITY_FORBIDDEN_HEADERS = new Set([
+  'content-length', 'transfer-encoding', 'connection', 'x-redamon-ctx',
+])
+
+/**
+ * Every C0 control except TAB, plus DEL — the same set recon's
+ * `_CONTROL_CHARS_RE` in auth_profile.py refuses on the raw identity line.
+ * Identity-only: the shared header contract accepts these today and must
+ * not change under a tightening aimed at one field.
+ */
+const IDENTITY_CONTROL_RE = /[\x00-\x08\x0a-\x1f\x7f]/
 
 /**
  * Directories a path-valued setting may resolve inside.
@@ -132,19 +162,34 @@ export function isSafeFileName(raw: unknown): boolean {
 }
 
 /** One header line, as `Name: value`. */
-export function checkHeader(raw: unknown): string | null {
+function checkHeaderLine(raw: unknown, extraForbidden: ReadonlySet<string>,
+                        maxNameLength: number, identity = false): string | null {
   if (typeof raw !== 'string') return 'must be a string'
   if (/[\r\n]/.test(raw)) {
-    // A CR or LF splits one header into two and lets the caller write the rest
-    // of the request, which is request splitting rather than configuration.
+    // Checked on the RAW input, before any trim: a value such as
+    // "X-BB: v\r\n" or "  \nX-BB: v" must be refused outright, not trimmed
+    // into a valid-looking line.
     return 'must not contain a carriage return or newline'
+  }
+  if (identity && IDENTITY_CONTROL_RE.test(raw)) {
+    // Raw, before any trim, like recon: TAB is the only C0 control a field
+    // value may carry. Checked on the whole line, so a control in the name
+    // or the value is refused either way.
+    return 'must not contain control characters'
+  }
+  if (identity && raw.includes(';;')) {
+    // Raw, before any trim: hakrawler joins every header (including the
+    // internal routing tag) with ';;', so this delimiter could split or
+    // spoof a second header. Recon refuses it on the raw line too.
+    return 'must not contain the tool-join delimiter ;;'
   }
   if (raw.includes('\0')) return 'must not contain a NUL byte'
   const colon = raw.indexOf(':')
   if (colon <= 0) return "must be 'Name: value'"
   const name = raw.slice(0, colon).trim().toLowerCase()
   if (!/^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) return 'has an invalid header name'
-  if (FORBIDDEN_HEADERS.has(name) || name.startsWith('proxy-')) {
+  if (name.length > maxNameLength) return `has a header name longer than ${maxNameLength} characters`
+  if (FORBIDDEN_HEADERS.has(name) || extraForbidden.has(name) || name.startsWith('proxy-')) {
     return `may not set the '${name}' header, which changes where the request goes or what it carries`
   }
   // A header with no value is a line the tools will send and the target will
@@ -152,8 +197,30 @@ export function checkHeader(raw: unknown): string | null {
   // not. The length bound is the one most servers enforce anyway: a longer
   // line is rejected by the target, not by us, and looks like a scan failure.
   if (raw.slice(colon + 1).trim() === '') return 'has no value'
+  // Raw length, not trimmed: both layers cap the line as written, so a
+  // line made long by leading/trailing spaces is refused here as in recon.
   if (raw.length > 4096) return 'is longer than 4096 characters'
   return null
+}
+
+export function checkHeader(raw: unknown): string | null {
+  // The shared contract, unchanged: no name-length cap beyond the token
+  // rule, and the framing headers are NOT refused here (see above).
+  return checkHeaderLine(raw, new Set(), Number.POSITIVE_INFINITY)
+}
+
+/**
+ * The engagement identity header (`engagementIdentityHeader` only).
+ *
+ * Stricter than checkHeader in exactly the ways recon's
+ * engagement_identity_header is stricter, so a value the UI accepts is a
+ * value recon will actually send: framing/reserved names refused, header
+ * name capped at recon's MAX_HEADER_NAME_LEN (256), whole line capped at
+ * RAW 4096 on both layers, raw C0 controls (except TAB) and the ';;'
+ * tool-join delimiter refused on the raw input before any trim.
+ */
+export function checkIdentityHeader(raw: unknown): string | null {
+  return checkHeaderLine(raw, IDENTITY_FORBIDDEN_HEADERS, 256, true)
 }
 
 const STATUS_CODE_RE = /^[0-9]{3}(-[0-9]{3})?$/
@@ -204,7 +271,11 @@ export interface ValidationContext {
 function checkScalar(validator: string, value: unknown, ctx: ValidationContext): string | null {
   switch (validator) {
     case 'http_header':
-      return checkHeader(value)
+      // The identity field shares the http_header validator name in the
+      // registry, but its accepted contract is the stricter identity one
+      // (framing/reserved names, name length) — dispatch is by field key so
+      // every other http_header field keeps the shared contract.
+      return ctx.key === 'engagementIdentityHeader' ? checkIdentityHeader(value) : checkHeader(value)
     case 'project_file':
       return isInsideProjectFileRoot(value, ctx.projectId ?? '') || value === ''
         ? null

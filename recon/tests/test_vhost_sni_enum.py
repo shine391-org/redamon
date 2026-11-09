@@ -759,7 +759,7 @@ def _mock_curl_responses(responses_by_call):
         (hostname, port) -> {"status": 200, "size": 4823}  # L7
         ("sni:" + hostname, port) -> {...}  # L4
     """
-    def side_effect(scheme, host_header, sni_hostname, target, port, timeout):
+    def side_effect(scheme, host_header, sni_hostname, target, port, timeout, identity_header=None):
         if sni_hostname:
             key = (f"sni:{sni_hostname}", port)
         elif host_header:
@@ -1251,7 +1251,7 @@ class TestControlProbeIntegration:
         UNKNOWN_DEFAULT = {"status": 403, "size": 700, "body_hash": "perm_frontend_default"}
         BASELINE = {"status": 301, "size": 549, "body_hash": "redirect_to_self"}
 
-        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout):
+        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout, identity_header=None):
             if host_header is None and sni_hostname is None:
                 return BASELINE
             return UNKNOWN_DEFAULT  # control AND candidate alike
@@ -1274,7 +1274,7 @@ class TestControlProbeIntegration:
         BASELINE = {"status": 301, "size": 549, "body_hash": "redirect"}
         ADMIN_PANEL = {"status": 200, "size": 5400, "body_hash": "real_admin_html"}
 
-        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout):
+        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout, identity_header=None):
             if host_header is None and sni_hostname is None:
                 return BASELINE
             if host_header == "admin.example.com":
@@ -1307,7 +1307,7 @@ class TestControlProbeIntegration:
         # is the only thing standing between us and 12 false-positive findings.
         SAME_SHAPE = {"status": 200, "size": 5000}
 
-        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout):
+        def fake_curl(scheme, host_header, sni_hostname, target, port, timeout, identity_header=None):
             if host_header is None and sni_hostname is None:
                 return BASELINE
             return SAME_SHAPE
