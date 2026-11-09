@@ -1333,6 +1333,13 @@ class CoverageReport:
     # ((source, (host, ...)), ...): hosts only that source gave up on. Each is
     # also in skipped_hosts; a host some note cut for every source is not here.
     source_hosts: tuple = ()
+    # True when a run cut coverage by SELECTION (a subset of targets/templates)
+    # but recorded no plan id for it: the selection is unknown, so the prune
+    # must fail closed rather than trust a host-level cut it cannot account for.
+    selection_unknown: bool = False
+    # The plan ids of every selection cut, so a caller can prove the plan was
+    # persisted before trusting the cut.
+    selection_plan_ids: tuple = ()
 
     @property
     def degraded(self) -> bool:
@@ -1360,6 +1367,18 @@ class CoverageReport:
 
     def gaps_json(self) -> str:
         return json.dumps(list(self.gaps), sort_keys=True, separators=(",", ":"))
+
+    def selection_json(self) -> dict:
+        """The bounded selection block the coverage record carries for the API
+        reader: what this run selected, whether the plan was persisted, and
+        whether any cut could not be accounted for (unknown -> fail closed).
+        Never a URL, template body or credential."""
+        return {
+            "recorded": bool(self.selection_plan_ids),
+            "selection_unknown": self.selection_unknown,
+            "plan_ids": list(self.selection_plan_ids),
+            "exhaustive": not self.selection_unknown and bool(self.selection_plan_ids),
+        }
 
 
 _notes: list[dict] = []
@@ -1389,7 +1408,8 @@ def _norm_host(value: Any) -> str:
 def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[str] = (),
                   host_source: str = "", nuclei_truncated: bool = False, reason: str = "",
                   entries: Iterable[dict] = (), source_only_hosts: bool = False,
-                  aliases: Iterable[str] = ()) -> None:
+                  aliases: Iterable[str] = (), plan_id: str = "",
+                  selection: bool = False) -> None:
     """Record, for the run, what ``module`` could not check. Never raises.
 
     ``sources``: finding sources cut as a whole - the prune leaves every one of
@@ -1403,6 +1423,10 @@ def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[s
     ``host_source`` are but listed under their one gap, so the coverage
     record names the provider once. ``entries``: breaker report entries of a
     module that writes no findings; recorded as gaps, no prune effect.
+    ``selection``: the cut is a SELECTED SUBSET of targets/templates, not an
+    unreachable host; ``plan_id`` names the persisted plan that proves it, and
+    a selection note with no plan id marks the run's coverage unknown (the
+    prune then fails closed).
     A fault here marks the accumulator broken, which makes the prune fail closed.
     """
     try:
@@ -1414,6 +1438,8 @@ def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[s
             "source_only_hosts": bool(source_only_hosts),
             "aliases": sorted({_token(a) for a in aliases if _token(a)}),
             "nuclei_truncated": bool(nuclei_truncated),
+            "selection": bool(selection),
+            "plan_id": _token(plan_id),
             "reason": _detail(reason),
             "entries": [
                 {
@@ -1430,12 +1456,41 @@ def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[s
         _mark_accumulator_broken()
 
 
+def note_selection_cut(module: str, *, sources: Iterable[str], hosts: Iterable[str] = (),
+                       plan_id: str = "", reason: str = "") -> None:
+    """Record that a run checked only a SELECTED SUBSET on these hosts.
+
+    The cut is host-level and per-source: another tool that re-checked the
+    same host keeps its own findings, so a Nuclei selection never resets
+    security_check or CVE coverage (the sources are named, one per call).
+    ``hosts`` empty means the selection applied to the whole source, which is
+    recorded as a source-level cut instead. A missing ``plan_id`` marks the
+    selection unknown - the prune must not trust it.
+    """
+    names = sorted({_token(s) for s in sources if _token(s)})
+    keys = sorted({h for h in (_norm_host(x) for x in hosts) if h})
+    try:
+        if names and not keys:
+            note_degraded(module, sources=names, plan_id=plan_id, selection=True,
+                          reason=reason or "selected targets/templates")
+            return
+        for name in names:
+            note_degraded(module, hosts=keys, host_source=name, source_only_hosts=True,
+                          plan_id=plan_id, selection=True,
+                          reason=reason or "selected targets/templates")
+    except Exception:  # noqa: BLE001
+        _mark_accumulator_broken()
+
+
+
 def _aggregate(notes: list[dict]) -> CoverageReport:
     degraded_sources: set[str] = set()
     skipped_hosts: set[str] = set()
     every_source_hosts: set[str] = set()
     per_source_hosts: dict[str, set[str]] = {}
     truncated = False
+    selection_unknown = False
+    selection_plan_ids: list[str] = []
     merged: dict[tuple[str, str], dict] = {}
 
     def _gap(source: str, module: str, reason: str, skipped: int = 0, hosts: int = 0) -> None:
@@ -1453,6 +1508,15 @@ def _aggregate(notes: list[dict]) -> CoverageReport:
         module = note["module"]
         aliases = note.get("aliases") or []
         truncated = truncated or note["nuclei_truncated"]
+        # A selection cut is proven only by its persisted plan id. Without one
+        # the run cannot say what it selected, so the coverage is unknown.
+        if note.get("selection"):
+            plan_id = note.get("plan_id") or ""
+            if plan_id:
+                if plan_id not in selection_plan_ids:
+                    selection_plan_ids.append(plan_id)
+            else:
+                selection_unknown = True
         for source in note["sources"]:
             degraded_sources.add(source)
             _gap(source, module, note["reason"] or "coverage cut")
@@ -1478,7 +1542,8 @@ def _aggregate(notes: list[dict]) -> CoverageReport:
         (source, tuple(sorted(hosts - every_source_hosts)))
         for source, hosts in per_source_hosts.items() if hosts - every_source_hosts))
     return CoverageReport(frozenset(degraded_sources), tuple(sorted(skipped_hosts)),
-                          truncated, gaps, source_hosts)
+                          truncated, gaps, source_hosts, selection_unknown,
+                          tuple(selection_plan_ids))
 
 
 def coverage_report() -> CoverageReport:

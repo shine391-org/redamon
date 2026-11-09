@@ -89,6 +89,7 @@ from recon.main_recon_modules.ai_surface_recon import run_ai_surface_recon
 from recon.main_recon_modules.vuln_scan import run_vuln_scan
 from recon.main_recon_modules.add_mitre import run_mitre_enrichment
 from recon.helpers.isolated_result import TopLevelKeys
+from recon.helpers.selection_coverage import KEY as SELECTION_KEY
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -2504,6 +2505,8 @@ def _write_coverage_record(domain: str, group=None) -> bool:
                 "gaps_json": json.dumps(gaps, sort_keys=True, separators=(",", ":")),
                 "skipped_hosts": report.stored_skipped_hosts(),
                 "nuclei_truncated": report.nuclei_truncated,
+                "selection_json": json.dumps(report.selection_json(), sort_keys=True,
+                                             separators=(",", ":")),
                 "org_domain": _org_for_root(domain),
             }, run_started_at=_RUN_STARTED_AT)
         if not matched:
@@ -2539,6 +2542,25 @@ def _note_unchecked_dns_orgs() -> None:
                 "vuln_scan", sources=["security_check"], reason=f"dns checks not run for {org}")
 
 
+def _persisted_selection_plans() -> list:
+    """The selection plans this run durably persisted in its recon artifact.
+
+    Read from the canonical artifact: an absent or unreadable file means the
+    plan was never written before the tool launched - the prune must not
+    trust any selection cut that has no matching plan (fail closed).
+    """
+    try:
+        path = recon_output_file(OUTPUT_DIR, PROJECT_ID)
+        if not path.exists():
+            return []
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 - an unreadable artifact means no plan
+        return []
+    plan = data.get(SELECTION_KEY) if isinstance(data, dict) else None
+    return [plan] if isinstance(plan, dict) else []
+
+
 def _prune_recon_findings():
     """Remove the findings this run stopped reporting. AFTER a successful run.
 
@@ -2571,8 +2593,23 @@ def _prune_recon_findings():
     try:
         from recon.helpers import circuit_breaker
         report = circuit_breaker.coverage_report()
+        selective = bool(report.selection_plan_ids)
     except Exception:  # noqa: BLE001 - unknown coverage means no prune
         print("[!][graph-db] Finding prune skipped: this run's coverage is unknown")
+        return
+    # A selection cut without its persisted plan means the run cannot say what
+    # it selected - fail closed instead of trusting an unaccounted host cut.
+    if report.selection_unknown:
+        print("[!][graph-db] Finding prune skipped: a selection cut has no persisted plan")
+        return
+    plans = _persisted_selection_plans()
+    persisted_ids = []
+    for plan in plans:
+        if plan.get("plan_id"):
+            persisted_ids.append(plan["plan_id"])
+        persisted_ids.extend(plan.get("plan_ids") or [])
+    if report.selection_plan_ids and not set(report.selection_plan_ids) <= set(persisted_ids):
+        print("[!][graph-db] Finding prune skipped: the selection plan was not persisted")
         return
     sources = [s for s in RECON_FINDING_SOURCES if s not in report.degraded_sources]
     keep_hosts = report.skipped_hostnames()
@@ -2605,7 +2642,8 @@ def _prune_recon_findings():
                 for keep, batch in batches.items():
                     graph_client.prune_unseen_findings(
                         USER_ID, PROJECT_ID, batch, _RUN_STARTED_AT,
-                        keep_hosts=keep)
+                        keep_hosts=keep,
+                        keep_unproven=selective)
     except Exception as e:
         # Never fail a completed scan over housekeeping: a finding that should
         # have been pruned is visible and wrong, which beats losing the run.

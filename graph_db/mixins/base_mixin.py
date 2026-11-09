@@ -225,7 +225,8 @@ class BaseMixin:
         return stats
 
     def prune_unseen_findings(self, user_id: str, project_id: str,
-                              sources, run_started_at: str, keep_hosts=()) -> dict:
+                              sources, run_started_at: str, keep_hosts=(),
+                              keep_unproven=False) -> dict:
         """Ingest-then-prune: remove a source's findings it stopped reporting.
 
         WHY THIS REPLACED CLEAR-THEN-INGEST
@@ -271,13 +272,22 @@ class BaseMixin:
             checks = " OR ".join(
                 f"coalesce(toLower(toStringOrNull(n.{f})), '') =~ rx" for f in _KEEP_HOST_FIELDS)
             keep_clause = f"\n          AND NOT any(rx IN $keep_patterns WHERE {checks})"
+        unproven_clause = ""
+        if keep_unproven:
+            unproven_clause = """
+          AND NOT (coalesce(n.host, '') = '' AND coalesce(n.hostname, '') = ''
+                   AND coalesce(n.matched_at, '') = '' AND coalesce(n.url, '') = ''
+                   AND coalesce(n.base_url, '') = '' AND coalesce(n.source_url, '') = ''
+                   AND coalesce(n.endpoint, '') = '' AND coalesce(n.matched_ip, '') = ''
+                   AND coalesce(n.ip_address, '') = '' AND coalesce(n.probe_url, '') = '')"""
+
 
         query = f"""
         MATCH (n)
         WHERE n.user_id = $uid AND n.project_id = $pid
           AND ({_FINDING_LABEL_PREDICATE})
           AND coalesce(n.source, '') IN $sources
-          AND (n.updated_at IS NULL OR n.updated_at < datetime($since)){keep_clause}
+          AND (n.updated_at IS NULL OR n.updated_at < datetime($since)){keep_clause}{unproven_clause}
         // The write lock BEFORE `keep` reads n:Muted: a mute that committed
         // first is then kept, and one that starts later waits for the delete
         // and matches nothing. Without it a mute can land between the read
