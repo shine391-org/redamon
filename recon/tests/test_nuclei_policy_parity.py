@@ -512,6 +512,20 @@ class TestExecuteNucleiPassEmptySelectionFatal:
             vs._execute_nuclei_pass(["docker", "run"], str(out), label="DAST")
         assert "no templates provided for scan" in str(excinfo.value)
 
+    def test_empty_selection_fatal_carries_the_loader_error(self, monkeypatch, tmp_path):
+        """A bad explicit template path fatals identically; the record keeps both lines."""
+        monkeypatch.setattr(vs.subprocess, "Popen", lambda *a, **k: self._proc([
+            "[ERR] Could not find template '/x/y.yaml': could not find file: open /x/y.yaml: no such file or directory\n",
+            "[FTL] Could not run nuclei: no templates provided for scan\n",
+        ]))
+        out = tmp_path / "o.jsonl"
+        out.write_text("")
+        with pytest.raises(NucleiEmptySelectionError) as excinfo:
+            vs._execute_nuclei_pass(["docker", "run"], str(out), label="DETECTION")
+        message = str(excinfo.value)
+        assert "Could not find template" in message
+        assert "no templates provided for scan" in message
+
     def test_a_generic_failure_still_returns_instead_of_raising(self, monkeypatch, tmp_path):
         """The marker must not swallow an ordinary non-zero exit."""
         monkeypatch.setattr(vs.subprocess, "Popen", lambda *a, **k: self._proc(
@@ -529,6 +543,12 @@ class TestExecuteNucleiPassEmptySelectionFatal:
         (["[INF] Loaded 8000 templates", "[WRN] nothing to report"], None),
         ([], None),
         (None, None),
+        # A bad explicit template path fatals with the same message; nuclei's
+        # own loader error must ride along so the record is distinguishable.
+        (["[ERR] Could not find template '/x/y.yaml': could not find file: open /x/y.yaml: no such file or directory",
+          "[FTL] Could not run nuclei: no templates provided for scan"],
+         "[ERR] Could not find template '/x/y.yaml': could not find file: open /x/y.yaml: no such file or directory"
+         "\n[FTL] Could not run nuclei: no templates provided for scan"),
     ])
     def test_no_templates_fatal_detector(self, lines, expected):
         assert vs._nuclei_no_templates_fatal(lines) == expected

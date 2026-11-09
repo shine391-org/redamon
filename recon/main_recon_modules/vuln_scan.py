@@ -151,17 +151,27 @@ _NUCLEI_NO_TEMPLATES_MARKER = "no templates provided for scan"
 
 
 def _nuclei_no_templates_fatal(lines):
-    """The nuclei fatal line proving the effective selection was empty, or None.
+    """The nuclei fatal proving the effective selection was empty, or None.
 
-    Distinct from a generic non-zero exit: it means every template the policy
-    picked was then removed (by the exclusions, or by an empty/missing template
-    source), so the pass had nothing to run. The caller records ``policy_empty``
-    rather than a scan failure.
+    Returns the matching fatal line, prefixed with nuclei's own loader error
+    when there is one (a bad explicit template path), so the recorded
+    ``policy_empty`` detail distinguishes an exclusion-emptied pool from a
+    misconfigured template path. Distinct from a generic non-zero exit: it means
+    the pass had nothing to run.
     """
+    fatal = None
+    loader_error = None
     for line in lines or ():
         if _NUCLEI_NO_TEMPLATES_MARKER in line:
-            return line
-    return None
+            fatal = line
+        elif fatal is None and loader_error is None and (
+                "Could not find template" in line or "could not find file" in line):
+            loader_error = line
+    if fatal is None:
+        return None
+    if loader_error:
+        return f"{loader_error}\n{fatal}"
+    return fatal
 
 
 def _nuclei_coverage(at: str, passes, findings=()) -> dict:
