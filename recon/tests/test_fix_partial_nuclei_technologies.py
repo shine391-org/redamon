@@ -265,9 +265,10 @@ def test_user_url_on_an_unloaded_baseurl_reads_the_graph(monkeypatch, fake_graph
     assert lookups.call_args.args[0] == ["https://api.example.test:8443"]
     entry = by_url["https://api.example.test:8443/v1"]
     assert entry["technologies"] == ["Express"] and entry["server"] == "envoy"
-    # The fields the injection always wrote are unchanged.
+    # F01 preserves fingerprint inheritance, but a supplied seed is unmeasured.
     assert (entry["host"], entry["status_code"], entry["content_type"]) == (
-        "api.example.test", 200, "text/html")
+        "api.example.test", None, "")
+    assert entry["provenance"] == "supplied"
 
 
 def test_user_url_with_no_graph_fingerprint_gets_empty_fields(monkeypatch, fake_graph_module):

@@ -21,7 +21,8 @@ from recon.helpers.resource_enum.classification import classify_endpoint
 import tempfile
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
+from recon.helpers.target_helpers import http_url_rejection, admit_http_urls
 
 
 def _fuzz_single_target(
@@ -294,25 +295,35 @@ def _build_fuzz_targets(
     - Base path fuzz: https://target.com/api/v1/FUZZ (from crawlers)
     """
     fuzz_targets = []
+    target_urls = admit_http_urls(target_urls, "ffuf_seed")
+
+    def directory_target(base_url, prefix=""):
+        # Split path/query before inserting the directory placeholder. Preserve
+        # query context (P0 contract), path case/escapes and matrix parameters;
+        # a fragment is client-only, never part of an HTTP request target.
+        parsed = urlsplit(base_url)
+        path = parsed.path.rstrip('/')
+        if prefix:
+            path += '/' + prefix
+        return urlunsplit(parsed._replace(path=path + '/FUZZ', fragment=""))
 
     for base_url in target_urls:
-        base = base_url.rstrip('/')
-        fuzz_targets.append(f"{base}/FUZZ")
+        fuzz_targets.append(directory_target(base_url))
 
     if discovered_base_paths:
-        seen_targets = set(fuzz_targets)
         for base_url in target_urls:
-            base = base_url.rstrip('/')
             for path in discovered_base_paths:
-                path = path.strip('/').rstrip('/')
+                if not isinstance(path, str) or '?' in path or '#' in path:
+                    continue
+                path = path.strip('/')
                 if not path:
                     continue
-                target = f"{base}/{path}/FUZZ"
-                if target not in seen_targets:
+                target = directory_target(base_url, path)
+                if http_url_rejection(target) is None:
                     fuzz_targets.append(target)
-                    seen_targets.add(target)
 
-    return fuzz_targets
+    # Deduplicate identical generated tasks, never different query contexts.
+    return list(dict.fromkeys(fuzz_targets))
 
 
 def select_base_paths(

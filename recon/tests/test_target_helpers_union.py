@@ -53,6 +53,16 @@ TH = _load_module(
 # Unit: build_target_urls -- union semantics
 # ---------------------------------------------------------------------------
 
+
+def test_supplied_urls_remain_unmeasured_without_replacing_observations():
+    data = {'http_probe': {'by_url': {'https://app.example.test': {'status_code': 401}}}}
+    TH.add_supplied_http_targets(data, ['https://app.example.test', 'https://[2001:db8::1]:8443/App?q=1'])
+    assert data['http_probe']['by_url']['https://app.example.test'] == {'status_code': 401}
+    supplied = data['http_probe']['by_url']['https://[2001:db8::1]:8443/App?q=1']
+    assert supplied['host'] == '2001:db8::1'
+    assert supplied['status_code'] is None and supplied['provenance'] == 'supplied'
+    assert TH.build_target_urls_from_httpx(data['http_probe']) == sorted(data['http_probe']['by_url'])
+
 class TestBuildTargetUrlsUnion(unittest.TestCase):
     """The new behavior: every available source contributes, deduplicated."""
 

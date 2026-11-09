@@ -72,11 +72,12 @@ def run_katana(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")  # BaseURL or None
 
@@ -115,14 +116,8 @@ def run_katana(config: dict) -> None:
         print(f"[*][Partial Recon] Adding {len(user_urls)} user-provided URLs to crawl targets")
         for url in user_urls:
             if url not in recon_data["http_probe"]["by_url"]:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                recon_data["http_probe"]["by_url"][url] = {
-                    "url": url,
-                    "host": parsed.netloc.split(":")[0],
-                    "status_code": 200,
-                    "content_type": "text/html",
-                }
+                from recon.helpers.target_helpers import add_supplied_http_targets
+                add_supplied_http_targets(recon_data, [url])
 
     # Build target URLs as the UNION of every available source (deduplicated):
     #   - BaseURLs from httpx (verified live, scheme already chosen)
@@ -345,11 +340,12 @@ def run_hakrawler(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")
 
@@ -388,14 +384,8 @@ def run_hakrawler(config: dict) -> None:
         print(f"[*][Partial Recon] Adding {len(user_urls)} user-provided URLs to crawl targets")
         for url in user_urls:
             if url not in recon_data["http_probe"]["by_url"]:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                recon_data["http_probe"]["by_url"][url] = {
-                    "url": url,
-                    "host": parsed.netloc.split(":")[0],
-                    "status_code": 200,
-                    "content_type": "text/html",
-                }
+                from recon.helpers.target_helpers import add_supplied_http_targets
+                add_supplied_http_targets(recon_data, [url])
 
     # Union target-builder (see Katana for full rationale): BaseURLs ∪ uncovered
     # Subdomains ∪ user URLs, deduplicated. Uncovered subs get both schemes.
@@ -614,11 +604,12 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")
 
@@ -692,14 +683,8 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
         print(f"[*][Partial Recon] Adding {len(user_urls)} user-provided URLs to crawl targets")
         for url in user_urls:
             if url not in recon_data["http_probe"]["by_url"]:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                recon_data["http_probe"]["by_url"][url] = {
-                    "url": url,
-                    "host": parsed.netloc.split(":")[0],
-                    "status_code": 200,
-                    "content_type": "text/html",
-                }
+                from recon.helpers.target_helpers import add_supplied_http_targets
+                add_supplied_http_targets(recon_data, [url])
 
     ips, hostnames, _ = extract_targets_from_recon(recon_data)
     target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=False)
@@ -968,11 +953,12 @@ def run_ffuf(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")
 
@@ -1011,14 +997,8 @@ def run_ffuf(config: dict) -> None:
         print(f"[*][Partial Recon] Adding {len(user_urls)} user-provided URLs to fuzz targets")
         for url in user_urls:
             if url not in recon_data["http_probe"]["by_url"]:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                recon_data["http_probe"]["by_url"][url] = {
-                    "url": url,
-                    "host": parsed.netloc.split(":")[0],
-                    "status_code": 200,
-                    "content_type": "text/html",
-                }
+                from recon.helpers.target_helpers import add_supplied_http_targets
+                add_supplied_http_targets(recon_data, [url])
 
     # Union target-builder: BaseURLs ∪ uncovered Subdomains ∪ user URLs (see
     # Katana for full rationale). New subs get both schemes; httpx-covered hosts
@@ -1555,11 +1535,12 @@ def run_jsluice(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")  # BaseURL or None
 

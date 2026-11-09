@@ -53,7 +53,8 @@ def run_webcachepoison(config: dict) -> None:
     user_targets = config.get("user_targets") or {}
     raw_user_urls = user_targets.get("urls") or []
     url_attach_to = user_targets.get("url_attach_to")
-    user_urls = [u.strip() for u in raw_user_urls if u and u.strip()]
+    # Preserve raw input for shared admission; never strip forbidden controls.
+    user_urls = [u for u in raw_user_urls if u]
 
     print(f"\n{'=' * 50}")
     print("[*][Partial Recon] Web Cache Poisoning Scanning")
@@ -120,10 +121,8 @@ def run_webcachepoison(config: dict) -> None:
 
     # Inject user-provided URLs as live targets (http_probe.by_url entries).
     for u in user_urls:
-        recon_data["http_probe"]["by_url"].setdefault(u, {
-            "url": u, "host": urlparse(u).hostname or "", "status_code": 200,
-            "content_type": "", "headers": {},
-        })
+        from recon.helpers.target_helpers import add_supplied_http_targets
+        add_supplied_http_targets(recon_data, [u])
 
     # Guard: no targets at all -> nothing to do.
     baseurl_count = len(recon_data["http_probe"]["by_url"])
