@@ -92,7 +92,7 @@ def _pipeline_patches(target_urls=None):
         patch("recon.main_recon_modules.vuln_scan.extract_targets_from_recon",
               side_effect=lambda rd: ([], ["example.com"], {})),
         patch("recon.main_recon_modules.vuln_scan.build_target_urls",
-              side_effect=lambda h, i, r, scan_all_ips=False, **kw: target_urls),
+              side_effect=lambda h, i, r, scan_all_ips=False: target_urls),
     ]
 
 

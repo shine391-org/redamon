@@ -72,7 +72,6 @@ from recon.helpers import (
     # Target extraction
     extract_targets_from_recon,
     build_target_urls,
-    select_dast_target_urls,
     # Nuclei helpers
     build_nuclei_command,
     parse_nuclei_finding,
@@ -577,10 +576,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
     if run_nuclei:
         # Build target URLs using httpx/naabu data if available
-        # Nuclei detection is the explicit opt-in consumer for the observed
-        # endpoint budget; generic build_target_urls callers stay uncapped.
-        target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=NUCLEI_SCAN_ALL_IPS,
-                                        apply_observed_budget=True)
+        target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=NUCLEI_SCAN_ALL_IPS)
 
         # Initialize the per-scan AI context for the false-positive response
         # filter. Consumed by is_false_positive() in _execute_nuclei_pass().
@@ -625,8 +621,6 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
         # For DAST mode, we need URLs with parameters from resource_enum
         dast_urls = []
-        dast_stats = {"dast_targets_selected": 0, "dast_targets_rejected_non_http": 0,
-                      "dast_targets_filtered_non_param": 0, "dast_targets_dropped_budget": 0}
         if NUCLEI_DAST_MODE:
             print(f"[*][Nuclei] DAST Mode: ENABLED (active fuzzing for XSS, SQLi, etc.)")
 
@@ -634,18 +628,12 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             resource_enum_data = recon_data.get("resource_enum")
             if resource_enum_data:
                 discovered_urls = resource_enum_data.get("discovered_urls", [])
-                # Bounded, deterministic selection: scheme/host/port/control
-                # admission, param-in-query filter, per-pass cap, explicit
-                # dropped/rejected accounting. Not a global request cap.
-                dast_urls, dast_stats = select_dast_target_urls(discovered_urls)
+                # Filter for URLs with parameters
+                dast_urls = [url for url in discovered_urls if '?' in url and '=' in url]
                 if dast_urls:
                     print(f"[*][Nuclei] Using {len(dast_urls)} URLs with parameters from resource_enum")
                 else:
                     print(f"[!][Nuclei] No URLs with parameters found in resource_enum - DAST scan may not find vulnerabilities")
-                if dast_stats["dast_targets_rejected_non_http"]:
-                    print(f"[!][Nuclei] DAST: {dast_stats['dast_targets_rejected_non_http']} non-HTTP/invalid URLs rejected")
-                if dast_stats["dast_targets_dropped_budget"]:
-                    print(f"[!][Nuclei] DAST: {dast_stats['dast_targets_dropped_budget']} parameterized URLs dropped (per-pass cap)")
             else:
                 print(f"[!][Nuclei] resource_enum not found - run resource_enum before vuln_scan for DAST mode")
     
@@ -904,9 +892,6 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "dast_mode": NUCLEI_DAST_MODE,
                     "dast_pass_executed": do_dast_pass,
                     "dast_urls_discovered": len(dast_urls) if NUCLEI_DAST_MODE else 0,
-                    "dast_urls_rejected_non_http": dast_stats["dast_targets_rejected_non_http"] if NUCLEI_DAST_MODE else 0,
-                    "dast_urls_filtered_non_param": dast_stats["dast_targets_filtered_non_param"] if NUCLEI_DAST_MODE else 0,
-                    "dast_urls_dropped_budget": dast_stats["dast_targets_dropped_budget"] if NUCLEI_DAST_MODE else 0,
                     "katana_crawl_depth": KATANA_DEPTH if NUCLEI_DAST_MODE else None,
                     "total_urls_scanned": len(scan_urls),
                     "total_hostnames": len(hostnames),
