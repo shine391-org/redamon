@@ -1,0 +1,917 @@
+{
+  "base": {
+    "totals": {
+      "tests": 812,
+      "passed": 786,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 14,
+      "xfail": 12
+    },
+    "files": [
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "rc": 0,
+        "seconds": 5.404,
+        "tests": 68,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 3,
+        "xfail": 0,
+        "passed": 65
+      },
+      {
+        "file": "recon/tests/test_no_b_large_inputs.py",
+        "rc": 0,
+        "seconds": 1.228,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_declared_only_consumers.py",
+        "rc": 0,
+        "seconds": 1.54,
+        "tests": 20,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 20
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "rc": 0,
+        "seconds": 1.263,
+        "tests": 40,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 3,
+        "xfail": 5,
+        "passed": 32
+      },
+      {
+        "file": "recon/tests/test_nuclei_coverage.py",
+        "rc": 0,
+        "seconds": 1.133,
+        "tests": 10,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 10
+      },
+      {
+        "file": "recon/tests/test_nuclei_ai_planner.py",
+        "rc": 0,
+        "seconds": 1.145,
+        "tests": 29,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 29
+      },
+      {
+        "file": "recon/tests/test_nuclei_ai_vuln_scan_wiring.py",
+        "rc": 0,
+        "seconds": 1.143,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_nuclei_runtime_cap.py",
+        "rc": 0,
+        "seconds": 1.379,
+        "tests": 13,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 13
+      },
+      {
+        "file": "recon/tests/test_fix_nuclei_coverage.py",
+        "rc": 0,
+        "seconds": 1.536,
+        "tests": 20,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 20
+      },
+      {
+        "file": "recon/tests/test_regression_nuclei_crash_partial_output.py",
+        "rc": 0,
+        "seconds": 1.152,
+        "tests": 7,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 7
+      },
+      {
+        "file": "recon/tests/test_regression_nuclei_early_return_checks.py",
+        "rc": 0,
+        "seconds": 1.504,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_fix_partial_nuclei_technologies.py",
+        "rc": 0,
+        "seconds": 1.33,
+        "tests": 13,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 13
+      },
+      {
+        "file": "recon/tests/test_coverage_prune.py",
+        "rc": 0,
+        "seconds": 2.006,
+        "tests": 21,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 21
+      },
+      {
+        "file": "tests/test_recon_coverage_graph.py",
+        "rc": 0,
+        "seconds": 1.043,
+        "tests": 19,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 19
+      },
+      {
+        "file": "tests/test_js_recon_graph_ingestion.py",
+        "rc": 0,
+        "seconds": 0.913,
+        "tests": 27,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 27
+      },
+      {
+        "file": "recon/tests/test_js_recon_validation_states.py",
+        "rc": 0,
+        "seconds": 1.443,
+        "tests": 148,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 148
+      },
+      {
+        "file": "recon/tests/test_js_recon_host_health.py",
+        "rc": 0,
+        "seconds": 1.266,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_jev_resource_enum_flow.py",
+        "rc": 0,
+        "seconds": 1.341,
+        "tests": 4,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 4
+      },
+      {
+        "file": "recon/tests/test_ffuf.py",
+        "rc": 0,
+        "seconds": 1.265,
+        "tests": 28,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 1,
+        "passed": 27
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "rc": 0,
+        "seconds": 2.209,
+        "tests": 30,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 8,
+        "xfail": 2,
+        "passed": 20
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "rc": 0,
+        "seconds": 4.605,
+        "tests": 181,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 4,
+        "passed": 177
+      },
+      {
+        "file": "recon/tests/test_js_recon_timeout.py",
+        "rc": 0,
+        "seconds": 31.341,
+        "tests": 4,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 4
+      },
+      {
+        "file": "recon/tests/test_js_recon_download_guard.py",
+        "rc": 0,
+        "seconds": 1.264,
+        "tests": 10,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 10
+      },
+      {
+        "file": "recon/tests/test_js_recon_ssrf.py",
+        "rc": 0,
+        "seconds": 1.24,
+        "tests": 7,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 7
+      },
+      {
+        "file": "recon/tests/test_catchall_probe.py",
+        "rc": 0,
+        "seconds": 1.195,
+        "tests": 45,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 45
+      },
+      {
+        "file": "recon/tests/test_jev_ffuf_base_paths.py",
+        "rc": 0,
+        "seconds": 1.189,
+        "tests": 40,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 40
+      },
+      {
+        "file": "recon/tests/test_nuclei_cve_findings_reach_graph.py",
+        "rc": 0,
+        "seconds": 1.151,
+        "tests": 8,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 8
+      }
+    ],
+    "exceptions": [
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "test": "tests.test_target_helpers_union.TestAemTemplateSmoke::test_both_raw_probes_present",
+        "type": "pytest.skip",
+        "reason": "aem-json-exposure.yml not present in repo root (template was an ad-hoc working artifact, not a permanent fixture)"
+      },
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "test": "tests.test_target_helpers_union.TestAemTemplateSmoke::test_matchers_unchanged",
+        "type": "pytest.skip",
+        "reason": "aem-json-exposure.yml not present in repo root (template was an ad-hoc working artifact, not a permanent fixture)"
+      },
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "test": "tests.test_target_helpers_union.TestAemTemplateSmoke::test_template_parses",
+        "type": "pytest.skip",
+        "reason": "aem-json-exposure.yml not present in repo root (template was an ad-hoc working artifact, not a permanent fixture)"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestRunVulnScanTwoPass::test_dast_off_runs_only_detection",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestRunVulnScanTwoPass::test_dast_on_with_params_runs_two_passes",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestRunVulnScanTwoPass::test_dast_on_without_params_falls_back_to_single_pass",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestRunVulnScanTwoPass::test_dast_pass_gets_force_dast_pass_flag",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestRunVulnScanTwoPass::test_findings_from_both_passes_merged",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestSmokeNucleiBehavior::test_dast_alone_loads_dast_templates",
+        "type": "pytest.skip",
+        "reason": "nuclei not on PATH"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestSmokeNucleiBehavior::test_dast_with_detection_tags_fatals",
+        "type": "pytest.skip",
+        "reason": "nuclei not on PATH"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestSmokeNucleiBehavior::test_exclude_tags_fuzz_is_noop_for_dast",
+        "type": "pytest.skip",
+        "reason": "nuclei not on PATH"
+      },
+      {
+        "file": "recon/tests/test_ffuf.py",
+        "test": "tests.test_ffuf::test_ffuf_run_builds_correct_command",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_builds_correct_command",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_no_rate_limit_flag_when_zero",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_scope_filtering",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_timeout_handling",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_no_output_file",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_malformed_json",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_temp_dir_cleanup",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_urls_written_to_temp_file",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_custom_headers_empty",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_multi_method_parallel",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_does_not_replay_mutating_methods",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_does_not_send_custom_headers_cross_origin",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_keeps_404_as_not_hittable",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_marks_accepted_status_hittable",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      }
+    ]
+  },
+  "candidate": {
+    "totals": {
+      "tests": 837,
+      "passed": 816,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 14,
+      "xfail": 7
+    },
+    "files": [
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "rc": 0,
+        "seconds": 5.484,
+        "tests": 68,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 3,
+        "xfail": 0,
+        "passed": 65
+      },
+      {
+        "file": "recon/tests/test_no_b_large_inputs.py",
+        "rc": 0,
+        "seconds": 1.225,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_declared_only_consumers.py",
+        "rc": 0,
+        "seconds": 1.477,
+        "tests": 20,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 20
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "rc": 0,
+        "seconds": 1.154,
+        "tests": 40,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 3,
+        "xfail": 0,
+        "passed": 37
+      },
+      {
+        "file": "recon/tests/test_nuclei_coverage.py",
+        "rc": 0,
+        "seconds": 1.091,
+        "tests": 10,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 10
+      },
+      {
+        "file": "recon/tests/test_nuclei_ai_planner.py",
+        "rc": 0,
+        "seconds": 1.106,
+        "tests": 29,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 29
+      },
+      {
+        "file": "recon/tests/test_nuclei_ai_vuln_scan_wiring.py",
+        "rc": 0,
+        "seconds": 1.133,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_nuclei_runtime_cap.py",
+        "rc": 0,
+        "seconds": 1.488,
+        "tests": 13,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 13
+      },
+      {
+        "file": "recon/tests/test_fix_nuclei_coverage.py",
+        "rc": 0,
+        "seconds": 1.518,
+        "tests": 20,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 20
+      },
+      {
+        "file": "recon/tests/test_regression_nuclei_crash_partial_output.py",
+        "rc": 0,
+        "seconds": 1.096,
+        "tests": 7,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 7
+      },
+      {
+        "file": "recon/tests/test_regression_nuclei_early_return_checks.py",
+        "rc": 0,
+        "seconds": 1.502,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_fix_partial_nuclei_technologies.py",
+        "rc": 0,
+        "seconds": 1.328,
+        "tests": 13,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 13
+      },
+      {
+        "file": "recon/tests/test_coverage_prune.py",
+        "rc": 0,
+        "seconds": 1.903,
+        "tests": 21,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 21
+      },
+      {
+        "file": "tests/test_recon_coverage_graph.py",
+        "rc": 0,
+        "seconds": 0.994,
+        "tests": 19,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 19
+      },
+      {
+        "file": "tests/test_js_recon_graph_ingestion.py",
+        "rc": 0,
+        "seconds": 0.92,
+        "tests": 27,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 27
+      },
+      {
+        "file": "recon/tests/test_js_recon_validation_states.py",
+        "rc": 0,
+        "seconds": 1.437,
+        "tests": 148,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 148
+      },
+      {
+        "file": "recon/tests/test_js_recon_host_health.py",
+        "rc": 0,
+        "seconds": 1.223,
+        "tests": 5,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 5
+      },
+      {
+        "file": "recon/tests/test_jev_resource_enum_flow.py",
+        "rc": 0,
+        "seconds": 1.362,
+        "tests": 4,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 4
+      },
+      {
+        "file": "recon/tests/test_ffuf.py",
+        "rc": 0,
+        "seconds": 1.411,
+        "tests": 28,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 1,
+        "passed": 27
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "rc": 0,
+        "seconds": 2.101,
+        "tests": 30,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 8,
+        "xfail": 2,
+        "passed": 20
+      },
+      {
+        "file": "recon/tests/test_recon_quality_baseline.py",
+        "rc": 0,
+        "seconds": 1.457,
+        "tests": 25,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 25
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "rc": 0,
+        "seconds": 4.737,
+        "tests": 181,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 4,
+        "passed": 177
+      },
+      {
+        "file": "recon/tests/test_js_recon_timeout.py",
+        "rc": 0,
+        "seconds": 31.173,
+        "tests": 4,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 4
+      },
+      {
+        "file": "recon/tests/test_js_recon_download_guard.py",
+        "rc": 0,
+        "seconds": 1.223,
+        "tests": 10,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 10
+      },
+      {
+        "file": "recon/tests/test_js_recon_ssrf.py",
+        "rc": 0,
+        "seconds": 1.176,
+        "tests": 7,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 7
+      },
+      {
+        "file": "recon/tests/test_catchall_probe.py",
+        "rc": 0,
+        "seconds": 1.192,
+        "tests": 45,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 45
+      },
+      {
+        "file": "recon/tests/test_jev_ffuf_base_paths.py",
+        "rc": 0,
+        "seconds": 1.204,
+        "tests": 40,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 40
+      },
+      {
+        "file": "recon/tests/test_nuclei_cve_findings_reach_graph.py",
+        "rc": 0,
+        "seconds": 1.2,
+        "tests": 8,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfail": 0,
+        "passed": 8
+      }
+    ],
+    "exceptions": [
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "test": "tests.test_target_helpers_union.TestAemTemplateSmoke::test_both_raw_probes_present",
+        "type": "pytest.skip",
+        "reason": "aem-json-exposure.yml not present in repo root (template was an ad-hoc working artifact, not a permanent fixture)"
+      },
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "test": "tests.test_target_helpers_union.TestAemTemplateSmoke::test_matchers_unchanged",
+        "type": "pytest.skip",
+        "reason": "aem-json-exposure.yml not present in repo root (template was an ad-hoc working artifact, not a permanent fixture)"
+      },
+      {
+        "file": "recon/tests/test_target_helpers_union.py",
+        "test": "tests.test_target_helpers_union.TestAemTemplateSmoke::test_template_parses",
+        "type": "pytest.skip",
+        "reason": "aem-json-exposure.yml not present in repo root (template was an ad-hoc working artifact, not a permanent fixture)"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestSmokeNucleiBehavior::test_dast_alone_loads_dast_templates",
+        "type": "pytest.skip",
+        "reason": "nuclei not on PATH"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestSmokeNucleiBehavior::test_dast_with_detection_tags_fatals",
+        "type": "pytest.skip",
+        "reason": "nuclei not on PATH"
+      },
+      {
+        "file": "recon/tests/test_nuclei_two_pass.py",
+        "test": "tests.test_nuclei_two_pass.TestSmokeNucleiBehavior::test_exclude_tags_fuzz_is_noop_for_dast",
+        "type": "pytest.skip",
+        "reason": "nuclei not on PATH"
+      },
+      {
+        "file": "recon/tests/test_ffuf.py",
+        "test": "tests.test_ffuf::test_ffuf_run_builds_correct_command",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_builds_correct_command",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_no_rate_limit_flag_when_zero",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_scope_filtering",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_timeout_handling",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_no_output_file",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_malformed_json",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_temp_dir_cleanup",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_urls_written_to_temp_file",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_custom_headers_empty",
+        "type": "pytest.skip",
+        "reason": "stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen."
+      },
+      {
+        "file": "recon/tests/test_arjun.py",
+        "test": "tests.test_arjun::test_run_discovery_multi_method_parallel",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_does_not_replay_mutating_methods",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_does_not_send_custom_headers_cross_origin",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_keeps_404_as_not_hittable",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      },
+      {
+        "file": "recon/tests/test_js_recon.py",
+        "test": "tests.test_js_recon.TestEndpointValidationHelpers::test_validate_extracted_endpoints_marks_accepted_status_hittable",
+        "type": "pytest.xfail",
+        "reason": "Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report"
+      }
+    ]
+  }
+}

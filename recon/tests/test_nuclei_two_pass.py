@@ -378,7 +378,10 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
             "NUCLEI_CONCURRENCY": 25,
             "NUCLEI_TIMEOUT": 10,
             "NUCLEI_RETRIES": 1,
-            "NUCLEI_TAGS": [],
+            # Empty selection intentionally skips detection; two-pass callers need
+            # an explicit nonempty detection selection, not the old default-all.
+            "NUCLEI_TAGS": ["cve"],
+            "NUCLEI_MAX_RUNTIME": 0,
             "NUCLEI_EXCLUDE_TAGS": [],
             "NUCLEI_NEW_TEMPLATES_ONLY": False,
             "NUCLEI_HEADLESS": False,
@@ -403,7 +406,21 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         def _stub_build_target_urls(hostnames, ips, recon_data, scan_all_ips=False):
             return target_urls
 
+        from pathlib import Path
+        self.generated_targets = {}
+
+        def capture_generated_command(**kwargs):
+            # Observe actual caller files BEFORE the engine removes its tempdir;
+            # leave the command builder and safety/header logic real.
+            filename = Path(kwargs["targets_file"])
+            self.generated_targets[filename.name] = filename.read_text().splitlines()
+            self.assertIsNotNone(build_nuclei_command)
+            assert build_nuclei_command is not None
+            return build_nuclei_command(**kwargs)
+
         return [
+            patch("recon.main_recon_modules.vuln_scan.build_nuclei_command", side_effect=capture_generated_command),
+            patch("helpers.proxy_routing.get_capture_routing", return_value=(None, None)),
             patch("recon.main_recon_modules.vuln_scan.is_docker_installed", return_value=True),
             patch("recon.main_recon_modules.vuln_scan.is_docker_running", return_value=True),
             patch("recon.main_recon_modules.vuln_scan.pull_nuclei_docker_image", return_value=None),
@@ -420,7 +437,6 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         for p in patches:
             p.stop()
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_dast_off_runs_only_detection(self):
         from recon.main_recon_modules import vuln_scan as vs
         recon_data = self._recon_data()
@@ -436,7 +452,6 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         finally:
             self._stop_patches(patches)
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_dast_on_with_params_runs_two_passes(self):
         from recon.main_recon_modules import vuln_scan as vs
         recon_data = self._recon_data(
@@ -455,10 +470,13 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
                 self.assertEqual(exec_mock.call_count, 2)
                 labels = [c.kwargs.get("label") for c in exec_mock.call_args_list]
                 self.assertEqual(labels, ["DETECTION", "DAST"])  # ordered
+                self.assertEqual(self.generated_targets["targets_detection.txt"], ["https://example.com"])
+                self.assertEqual(self.generated_targets["targets_dast.txt"], [
+                    "https://example.com/api?id=1", "https://example.com/search?q=test",
+                ])
         finally:
             self._stop_patches(patches)
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_dast_on_without_params_falls_back_to_single_pass(self):
         from recon.main_recon_modules import vuln_scan as vs
         recon_data = self._recon_data(dast_urls=[])  # empty
@@ -474,7 +492,6 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         finally:
             self._stop_patches(patches)
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_findings_from_both_passes_merged(self):
         from recon.main_recon_modules import vuln_scan as vs
         recon_data = self._recon_data(dast_urls=["https://example.com/api?x=1"])
@@ -504,7 +521,10 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         patches = self._patch_pipeline()
         self._start_patches(patches)
         try:
-            def fake_exec(cmd, output_file, label):
+            def fake_exec(cmd, output_file, label, runtime_cap=0, container_name=None):
+                self.assertEqual(runtime_cap, settings["NUCLEI_MAX_RUNTIME"])
+                self.assertIsInstance(container_name, str)
+                self.assertTrue(container_name and container_name.startswith("redamon-nuclei-"))
                 if label == "DETECTION":
                     return ([d_finding], [], 1.0, 0)
                 else:
@@ -525,7 +545,6 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         finally:
             self._stop_patches(patches)
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
     def test_dast_pass_gets_force_dast_pass_flag(self):
         """Confirm pass B's command is built with force_dast_pass=True."""
         from recon.main_recon_modules import vuln_scan as vs
