@@ -1,6 +1,6 @@
 import { INVALID_REASON_TEXT, groupHostsByScanRoot } from './domainBatch'
 import { resolveScopeGroups } from './scopeGroups'
-import { REGEX_GITHUB_ORG } from '@/lib/reconSettings/validators'
+import { REGEX_GITHUB_ORG, checkIdentityHeader } from '@/lib/reconSettings/validators'
 
 // === IP / Network ===
 export const REGEX_IPV4 = /^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$/
@@ -273,6 +273,20 @@ export function validateProjectForm(data: Record<string, unknown>): ValidationEr
   for (const host of roeExcluded) {
     if (host.trim() && !isValidIpOrCidr(host) && !isValidDomain(host)) {
       errors.push({ field: 'roeExcludedHosts', message: `Invalid excluded host: ${host}. Must be IP, CIDR, or domain.` })
+    }
+  }
+
+  // Engagement identity header: the same identity-only contract the server
+  // enforces at every write (checkIdentityHeader), so the form refuses what
+  // the routes would. Empty clears the setting and an absent field is not
+  // judged; a present non-string (including null) is refused, as on save.
+  if ('engagementIdentityHeader' in data) {
+    const identity = data.engagementIdentityHeader
+    if (identity !== '' && identity !== undefined) {
+      const problem = checkIdentityHeader(identity)
+      if (problem) {
+        errors.push({ field: 'engagementIdentityHeader', message: `Invalid engagement identity header: ${problem}` })
+      }
     }
   }
 

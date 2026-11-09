@@ -190,6 +190,14 @@ class Prober:
         self.refused = 0
         self._controls: dict = {}
         self._profile = _profile(self.settings)
+        # Engagement identity (attribution, not a credential): merged per
+        # request in send(), below any caller-supplied header of the same
+        # name. Computed once here so workers do not re-validate per probe.
+        # No try/except: auth_profile is a mandatory repo module, and an
+        # import/helper failure must surface instead of silently dropping
+        # attribution from every request this Prober sends.
+        from recon.helpers.auth_profile import identity_header_dict
+        self._identity_headers = identity_header_dict(self.settings)
 
     # -- auth ----------------------------------------------------------------
 
@@ -252,8 +260,10 @@ class Prober:
             return None
         if self.scope is not None and not self.scope.allow_host(url):
             return None
-        request_headers = {"User-Agent": DEFAULT_BROWSER_UA, "Accept": "*/*"}
-        request_headers.update(headers or {})
+        from recon.helpers.auth_profile import merge_identity_headers
+        request_headers = merge_identity_headers(
+            {"User-Agent": DEFAULT_BROWSER_UA, "Accept": "*/*", **(headers or {})},
+            self._identity_headers)
         if range_bytes:
             request_headers["Range"] = f"bytes=0-{int(range_bytes) - 1}"
         with_auth = bool(auth)

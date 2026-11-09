@@ -1978,7 +1978,7 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
           .describe('Single-domain mode only. Empty: the domain is fully enumerated. Otherwise '
             + 'prefixes ("www.", "eu.api.") naming the ONLY hosts scanned, with no discovery; '
             + '"." puts the domain itself in scope as well.'),
-        engagementIdentityHeader: z.string().max(400).optional()
+        engagementIdentityHeader: z.string().max(4096).optional()
           .describe('"Name: value", sent with every request so the target can attribute it to you.'),
         settings: z.record(z.string(), z.unknown()).optional()
           .describe(

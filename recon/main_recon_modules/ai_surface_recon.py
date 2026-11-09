@@ -243,7 +243,7 @@ def _first_sse_json(text: str) -> dict | None:
     return None
 
 
-def _mcp_enumerate(url: str, timeout: float) -> dict | None:
+def _mcp_enumerate(url: str, timeout: float, extra_headers: dict | None = None) -> dict | None:
     """Use the MCP SDK to list tools/resources/prompts. Async -> own loop."""
     async def _go():
         from mcp import ClientSession
@@ -254,7 +254,26 @@ def _mcp_enumerate(url: str, timeout: float) -> dict | None:
             from mcp.client.streamable_http import streamable_http_client as _client
         except ImportError:
             from mcp.client.streamable_http import streamablehttp_client as _client
-        async with _client(url) as conn:
+        from contextlib import AsyncExitStack
+        import inspect
+        import mcp.client.streamable_http as transport
+        async with AsyncExitStack() as stack:
+            kwargs = {}
+            if extra_headers:
+                parameters = inspect.signature(_client).parameters
+                if 'http_client' in parameters:
+                    # Use the HTTP implementation bundled with this SDK version.
+                    http_module = getattr(transport, 'httpx2', None)
+                    if http_module is None:
+                        import httpx as http_module
+                    client = await stack.enter_async_context(http_module.AsyncClient(
+                        headers=extra_headers, timeout=timeout, follow_redirects=False))
+                    kwargs['http_client'] = client
+                elif 'headers' in parameters:
+                    kwargs['headers'] = extra_headers
+                else:
+                    raise RuntimeError('MCP transport cannot preserve request headers')
+            conn = await stack.enter_async_context(_client(url, **kwargs))
             read, write = conn[0], conn[1]  # tolerate 2- or 3-tuple
             async with ClientSession(read, write) as s:
                 init = await s.initialize()
@@ -361,7 +380,7 @@ def _probe_mcp(base_url: str, session: requests.Session, timeout: float,
     tools_out = []
     findings = []
     if list_tools and not mcp["auth_required"]:
-        enum = _mcp_enumerate(det["url"], timeout)
+        enum = _mcp_enumerate(det["url"], timeout, extra_headers=dict(session.headers))
         if enum:
             mcp["server_name"] = enum.get("server_name") or mcp.get("server_name")
             mcp["server_version"] = enum.get("server_version") or mcp.get("server_version")
@@ -536,7 +555,8 @@ def _cache_spec(spec, base_url, path, specs_dir: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 # Workload 4 — Julius probe pack
 # --------------------------------------------------------------------------- #
-def _probe_julius(base_url: str, timeout: float, ua: str) -> dict:
+def _probe_julius(base_url: str, timeout: float, ua: str,
+                  identity_headers: dict | None = None) -> dict:
     from recon.helpers.probe_pack_engine import load_probe_packs, run_probe_packs
     probes = load_probe_packs(_JULIUS_DIR)
     if not probes:
@@ -544,7 +564,8 @@ def _probe_julius(base_url: str, timeout: float, ua: str) -> dict:
     parsed = urlparse(base_url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     results = run_probe_packs(base_url, probes, target_port=port,
-                              timeout=timeout, user_agent=ua)
+                              timeout=timeout, user_agent=ua,
+                              extra_headers=identity_headers or {})
     if not results:
         return {}
     top = results[0]
@@ -678,6 +699,14 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     julius_on = settings.get("AI_SURFACE_RECON_JULIUS_PROBE_PACK_ENABLED", True)
     latency_on = settings.get("AI_SURFACE_RECON_LATENCY_BASELINE_ENABLED", True)
 
+    # Engagement identity header (mandatory attribution, validated in
+    # auth_profile.engagement_identity_header). Attached unconditionally to
+    # every target-reaching request this module makes; the third-party
+    # enrichment/validators elsewhere are NOT touched.
+    from recon.helpers.auth_profile import add_identity_headers as _add_identity
+    from recon.helpers.auth_profile import identity_header_dict as _identity_dict
+    identity_headers = _identity_dict(settings)
+
     candidates = _gather_candidates(combined_result, settings)
     # RoE host exclusion. A filter that cannot run cannot tell an excluded host
     # from an allowed one, so nothing is probed; the source is reported
@@ -707,6 +736,7 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     def _analyze(base_url: str, cand: dict) -> tuple:
         session = requests.Session()
         session.headers.update({"User-Agent": ua})
+        _add_identity(session.headers, identity_headers)
         # Authenticated-session profile: attach the operator's auth headers when
         # this base_url is in scope (no-op otherwise). AI endpoints frequently sit
         # behind login; without this they answer 401 and look absent.
@@ -735,7 +765,7 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
                 if oa:
                     rec["openapi"] = oa
             if julius_on:
-                jl = _probe_julius(base_url, timeout, ua)
+                jl = _probe_julius(base_url, timeout, ua, identity_headers)
                 if jl:
                     rec["julius"] = jl
         except Exception as e:
@@ -767,6 +797,7 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     if vectordb_on and not roe_filter_failed:
         vsession = requests.Session()
         vsession.headers.update({"User-Agent": ua})
+        _add_identity(vsession.headers, identity_headers)
         vector_db = _confirm_vector_dbs(combined_result, vsession, timeout)
 
     summary = {

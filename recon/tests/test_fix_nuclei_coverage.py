@@ -64,7 +64,7 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
     monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["www.example.com"], {}))
     monkeypatch.setattr(vs, "build_target_urls",
-                        lambda h, i, rd, scan_all_ips=False: ["https://www.example.com"])
+                        lambda h, i, rd, scan_all_ips=False, **kw: ["https://www.example.com"])
     monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
     monkeypatch.setattr(vs, "_execute_nuclei_pass", fake_pass)
     monkeypatch.setattr(vs, "run_security_checks", fake_security)

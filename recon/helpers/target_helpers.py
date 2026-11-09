@@ -95,28 +95,61 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
 # URL Building from httpx Data
 # =============================================================================
 
+def _is_http_url(url: str) -> bool:
+    """True only for absolute http/https URLs with a real host.
+
+    Uses ``hostname`` (not ``netloc``) so hostless strings such as
+    ``https://:8080/x`` or ``https://user@/x`` are rejected, and guards
+    ``hostname`` access itself: malformed bracketed hosts
+    (``https://[::1/x``) raise ``ValueError`` there, not in ``urlparse``.
+    Any whitespace/control character anywhere rejects the URL: a newline
+    would split one entry of the newline-delimited nuclei target files
+    into two.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    if any(ord(c) <= 0x20 or ord(c) == 0x7F for c in url):
+        return False
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        # Accessing .port validates it: a non-numeric or out-of-range port
+        # (``:abc``, ``:99999``) raises ValueError here, not in urlparse.
+        _ = parsed.port
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return parsed.scheme in ("http", "https") and bool(host)
+
+
 def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
     """
     Build list of target URLs from httpx scan results.
     Uses live URLs discovered by httpx for more accurate targeting.
-    
+
+    Only absolute http/https URLs with a host are admitted: a synthetic
+    non-HTTP entry in ``by_url`` (e.g. a ``mailto:`` string) is rejected
+    here so it can never enter the final union, regardless of its
+    ``status_code``.
+
     Args:
         httpx_data: httpx scan results containing live URLs
-        
+
     Returns:
         List of live URLs to scan
     """
     urls = []
-    
+
     if httpx_data:
         # Use live URLs from httpx (already verified to be responding)
         by_url = httpx_data.get("by_url", {})
         for url, url_data in by_url.items():
+            if not _is_http_url(url):
+                continue
             status_code = url_data.get("status_code")
             # Include URLs with successful responses (not server errors)
             if status_code and status_code < 500:
                 urls.append(url)
-    
+
     return sorted(list(set(urls)))
 
 
@@ -124,10 +157,40 @@ def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
 # URL Building from Resource Enumeration Data
 # =============================================================================
 
-#: Endpoints known only from an API specification sent to nuclei per run. Both
-#: nuclei passes (main detection and DAST) read this function, so the cap bounds
-#: both; a specification can declare thousands of operations.
+#: Declared-only GET/HEAD endpoints admitted by the resource-enum builder.
+#: Retained for generic callers too; DAST has a separate admission path.
 MAX_DECLARED_NUCLEI_URLS = 500
+
+
+#: Per-run budget for ordinary (observed, non-declared_only) endpoints sent
+#: to nuclei. This is EXPLICIT OPT-IN ONLY: ``build_target_urls_from_resource_enum``
+#: and ``build_target_urls`` apply it only when the caller passes
+#: ``apply_observed_budget=True`` (the Nuclei detection consumer in vuln_scan).
+#: Generic callers (discovery, web_crawling, parameter_discovery, cache
+#: scanners) get the full observed list by default, so they are not silently
+#: capped. Parameter-bearing URLs are kept first; path-only URLs fill the
+#: remaining budget, so legitimate path-only routes keep coverage instead of
+#: being dropped wholesale. This is a *per-builder* cap, NOT a global cap: it
+#: does not bound resource_enum base URLs, httpx URLs, fallback subdomain/IP
+#: URLs in the final union, nor the separate DAST list (which has its own
+#: per-call cap, MAX_DAST_NUCLEI_URLS). Do not read it as a total
+#: request-budget promise.
+MAX_RESOURCE_ENUM_NUCLEI_URLS = 3000
+
+#: Per-DAST-pass cap for parameterized URLs selected from
+#: ``resource_enum.discovered_urls``. Bounds that one pass's target list;
+#: it is not a global aggregate HTTP-request cap.
+MAX_DAST_NUCLEI_URLS = 3000
+
+
+def _endpoint_has_parameters(endpoint_info: dict) -> bool:
+    """True when any parameter bucket (query/body/path) is non-empty.
+
+    The buckets themselves are truthy dicts even when every bucket is empty,
+    so test the buckets, never ``bool(parameters)``.
+    """
+    parameters = (endpoint_info or {}).get("parameters") or {}
+    return any(bool(bucket) for bucket in parameters.values())
 
 
 def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
@@ -143,18 +206,33 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
     return f"{base_url}{path}?{'&'.join(parts)}" if parts else f"{base_url}{path}"
 
 
-def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> Tuple[List[str], List[str]]:
+def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict],
+                                         apply_observed_budget: bool = False) -> Tuple[List[str], List[str]]:
     """
     Build list of target URLs from resource_enum data.
 
-    A path that still holds a template (``/users/{id}``) is never a target. An
-    endpoint known only from an API specification (``declared_only``) is a
-    target only when it declares GET or HEAD, and at most
-    MAX_DECLARED_NUCLEI_URLS of them are, in (base URL, path) order; how many
-    were left out is recorded on the run's OpenAPI inventory.
+    A path that still holds a template (``/users/{id}``) is never a target, and
+    only absolute http/https URLs with a host are targets (``mailto:`` and
+    hostless strings are counted as rejected, never sent). An endpoint known
+    only from an API specification (``declared_only``) is a target only when it
+    declares GET or HEAD, and at most MAX_DECLARED_NUCLEI_URLS of them are, in
+    (base URL, path) order; how many were left out is recorded on the run's
+    OpenAPI inventory. The declared-only cap is backwards-compatible behavior
+    and applies to every caller.
+
+    Ordinary (observed) endpoints are bounded ONLY when the caller explicitly
+    opts in with ``apply_observed_budget=True`` (the Nuclei detection
+    consumer): at most MAX_RESOURCE_ENUM_NUCLEI_URLS are selected per run,
+    parameter-bearing (any query/body/path bucket non-empty) URLs first and
+    path-only URLs filling the remaining budget, in deterministic (base URL,
+    path) order. Without the opt-in every observed endpoint is returned, so
+    generic callers are not silently capped. Overflow (opt-in only) is
+    recorded on the run's summary. The cap, when applied, bounds this
+    builder's endpoint list only -- see MAX_RESOURCE_ENUM_NUCLEI_URLS.
 
     Args:
         resource_enum_data: Resource enumeration data with endpoints
+        apply_observed_budget: Explicit Nuclei opt-in for the observed cap.
 
     Returns:
         Tuple of (base_urls, endpoint_urls_with_params)
@@ -167,23 +245,60 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
 
     by_base_url = resource_enum_data.get("by_base_url", {})
     declared = []
+    rejected_non_http = 0
+    param_bearing = []
+    path_only = []
 
     for base_url, base_data in by_base_url.items():
-        base_urls.append(base_url)
+        if _is_http_url(base_url):
+            base_urls.append(base_url)
+        else:
+            rejected_non_http += 1
 
         endpoints = base_data.get("endpoints", {})
         for path, endpoint_info in endpoints.items():
             if "{" in path:
                 continue
             url = _endpoint_url(base_url, path, endpoint_info)
+            if not _is_http_url(url):
+                rejected_non_http += 1
+                continue
             if endpoint_info.get("declared_only") is True:
                 methods = {str(m).upper() for m in endpoint_info.get("methods") or []}
                 if methods & {"GET", "HEAD"}:
                     declared.append((base_url, path, url))
                 continue
-            endpoint_urls.append(url)
+            if _endpoint_has_parameters(endpoint_info):
+                param_bearing.append((base_url, path, url))
+            else:
+                path_only.append((base_url, path, url))
+
+    param_bearing.sort(key=lambda item: (item[0], item[1]))
+    path_only.sort(key=lambda item: (item[0], item[1]))
+    if apply_observed_budget:
+        observed_total = len(param_bearing) + len(path_only)
+        keep_params = param_bearing[:MAX_RESOURCE_ENUM_NUCLEI_URLS]
+        remaining = max(0, MAX_RESOURCE_ENUM_NUCLEI_URLS - len(keep_params))
+        observed_urls = [url for _, _, url in keep_params]
+        observed_urls.extend(url for _, _, url in path_only[:remaining])
+        overflow_observed = max(0, observed_total - MAX_RESOURCE_ENUM_NUCLEI_URLS)
+        if overflow_observed:
+            print(f"[-][Nuclei] {overflow_observed} observed endpoints not sent to nuclei "
+                  f"(param-bearing first, cap {MAX_RESOURCE_ENUM_NUCLEI_URLS})")
+    else:
+        # Generic callers: param-bearing first for determinism, but no cap.
+        observed_urls = [url for _, _, url in param_bearing]
+        observed_urls.extend(url for _, _, url in path_only)
+        overflow_observed = 0
+    if rejected_non_http:
+        print(f"[-][Nuclei] {rejected_non_http} non-HTTP targets rejected")
+    summary = resource_enum_data.get("summary")
+    if isinstance(summary, dict):
+        summary["nuclei_targets_dropped_budget"] = overflow_observed
+        summary["nuclei_targets_rejected_non_http"] = rejected_non_http
 
     declared.sort(key=lambda item: (item[0], item[1]))
+    endpoint_urls = observed_urls
     endpoint_urls.extend(url for _, _, url in declared[:MAX_DECLARED_NUCLEI_URLS])
     overflow = max(0, len(declared) - MAX_DECLARED_NUCLEI_URLS)
     if overflow:
@@ -195,6 +310,60 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
             groups[-1]["declared_not_sent_to_nuclei"] = overflow
 
     return base_urls, endpoint_urls
+
+
+def select_dast_target_urls(discovered_urls, cap: int = MAX_DAST_NUCLEI_URLS):
+    """Bounded, deterministic DAST target selection from discovered URLs.
+
+    Only absolute http/https URLs with a valid host/port, no whitespace/control
+    characters, and a query string containing ``=`` are selected (the DAST
+    pass fuzzes parameters, so path-only URLs are not DAST targets -- they
+    remain detection targets). Duplicates are removed, the survivors are
+    sorted, and at most ``cap`` are returned. This bounds this one DAST pass;
+    it is not a global aggregate HTTP-request cap.
+
+    Returns ``(selected, stats)`` where stats explicitly accounts for every
+    input: ``dast_targets_rejected_non_http`` (scheme/host/port/control or
+    non-string), ``dast_targets_filtered_non_param`` (valid HTTP but no
+    ``=`` in the query), ``dast_targets_dropped_budget`` (valid param URLs
+    over ``cap``), and ``dast_targets_selected``.
+    """
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = MAX_DAST_NUCLEI_URLS
+    cap = max(0, cap)
+    rejected = 0
+    non_param = 0
+    seen = set()
+    candidates = []
+    for url in discovered_urls or []:
+        if not _is_http_url(url):
+            rejected += 1
+            continue
+        # The '=' must be in the query, not merely somewhere in the string
+        # (e.g. a path segment ``/a=b`` is not a fuzzable parameter).
+        try:
+            query = urlparse(url).query
+        except (ValueError, TypeError, AttributeError):
+            rejected += 1
+            continue
+        if "=" not in query:
+            non_param += 1
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        candidates.append(url)
+    candidates.sort()
+    selected = candidates[:cap]
+    stats = {
+        "dast_targets_selected": len(selected),
+        "dast_targets_rejected_non_http": rejected,
+        "dast_targets_filtered_non_param": non_param,
+        "dast_targets_dropped_budget": max(0, len(candidates) - len(selected)),
+    }
+    return selected, stats
 
 
 # =============================================================================
@@ -252,6 +421,7 @@ def build_target_urls(
     ips: Set[str],
     recon_data: Optional[dict] = None,
     scan_all_ips: bool = False,
+    apply_observed_budget: bool = False,
 ) -> List[str]:
     """
     Build the list of target URLs for nuclei scanning as the UNION of every
@@ -269,12 +439,22 @@ def build_target_urls(
     hostname (httpx already picked the working scheme; re-scanning the other
     scheme would just waste rate-limit budget).
 
+    Only absolute http/https URLs with a host are admitted from any source.
+    The observed-endpoint cap inside source 1 (MAX_RESOURCE_ENUM_NUCLEI_URLS)
+    is explicit opt-in only (``apply_observed_budget=True``, the Nuclei
+    detection consumer); by default this generic builder returns every
+    observed endpoint. The declared-only GET/HEAD cap
+    (MAX_DECLARED_NUCLEI_URLS) applies regardless, for backwards
+    compatibility. Sources 2-4 are never capped here, so the size of this
+    union is not globally bounded.
+
     Args:
         hostnames: Set of hostnames/subdomains discovered via DNS.
         ips: Set of IPs discovered via DNS.
         recon_data: Full recon data dict with optional 'resource_enum' and
                     'http_probe' keys.
         scan_all_ips: Whether to include IP addresses (default False).
+        apply_observed_budget: Nuclei-only opt-in for the observed cap.
 
     Returns:
         Sorted, deduplicated list of URLs to scan.
@@ -292,7 +472,8 @@ def build_target_urls(
     # Source 1: resource_enum (BaseURLs + parameterized endpoint URLs)
     resource_enum_data = recon_data.get("resource_enum") if recon_data else None
     if resource_enum_data:
-        base_urls, endpoint_urls = build_target_urls_from_resource_enum(resource_enum_data)
+        base_urls, endpoint_urls = build_target_urls_from_resource_enum(
+            resource_enum_data, apply_observed_budget=apply_observed_budget)
         for u in base_urls:
             if u not in url_set:
                 url_set.add(u)
@@ -363,11 +544,20 @@ def build_target_urls(
             if len(url_set) > before:
                 counts["fallback_ip"] += 1
 
+    # Final admission gate for the union: every source above is already
+    # scheme-checked (resource_enum builder, httpx builder), and the
+    # fallback URLs are constructed http/https, but re-check the merged set
+    # so no source added later -- or a malformed hostname producing a
+    # whitespace/control-bearing string -- can leak a non-HTTP target into
+    # the nuclei target file. This is scheme admission only; it imposes no
+    # cap on the union size (see MAX_RESOURCE_ENUM_NUCLEI_URLS).
+    url_set = {u for u in url_set if _is_http_url(u)}
+
     parts = []
     if counts["resource_enum_base"]:
         parts.append(f"{counts['resource_enum_base']} resource_enum base URLs")
     if counts["resource_enum_endpoint"]:
-        parts.append(f"{counts['resource_enum_endpoint']} parameterized endpoints")
+        parts.append(f"{counts['resource_enum_endpoint']} resource_enum endpoints")
     if counts["httpx"]:
         parts.append(f"{counts['httpx']} additional httpx URLs")
     if counts["fallback_subdomain"]:

@@ -272,7 +272,7 @@ def test_takeover_disambiguation_isolates_per_finding_failures():
         {"hostname": "ok.example.com", "takeover_provider": "heroku"},
     ]
     call_count = {"n": 0}
-    def probe(hostname, timeout=10):
+    def probe(hostname, timeout=10, settings=None):
         call_count["n"] += 1
         if hostname == "broken.example.com":
             raise RuntimeError("simulated weird non-RequestException")

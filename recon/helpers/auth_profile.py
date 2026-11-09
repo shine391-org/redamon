@@ -314,6 +314,131 @@ def profile_from_settings(settings: Optional[dict]) -> Optional[dict]:
     return profile
 
 
+def engagement_identity_header(settings: Optional[dict]) -> Optional[str]:
+    """The validated ``engagementIdentityHeader`` line ("Name: value"), or None.
+
+    One place, so every HTTP tool path gets the same answer: this is a
+    mandatory-attribution header, not a credential, so it is attached
+    unconditionally (no scope gate — an identity header only makes sense on
+    traffic the operator wants attributed, and scope-gating it would drop it on
+    exactly the out-of-scope hosts where attribution matters most). It rides
+    the tool's own ``-H`` set, so it is sent identically on the direct path and
+    through the capture proxy, and survives the proxy's fail-open fallback.
+
+    Validated on write by the webapp (checkIdentityHeader) and re-validated here:
+    the value crosses a DB boundary and a scan that silently sent a forged or
+    split header would be worse than one that sent none. Host / Authorization /
+    Cookie / Proxy-* are refused — an identity header that changes where the
+    request goes or what it carries is not an identity header.
+    """
+    raw = (settings or {}).get('ENGAGEMENT_IDENTITY_HEADER')
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    # CR/LF (and every other C0 control, plus the tool-join delimiters) are
+    # checked on the ORIGINAL input, before any strip: a value such as
+    # "X-BB: v\r\n" or "  \nX-BB: v" must be refused outright, not trimmed
+    # into a valid-looking line. Stripping first would silently launder a
+    # split attempt into a header the operator never wrote.
+    if ('\r' in raw or '\n' in raw or _CONTROL_CHARS_RE.search(raw)
+            or any(d in raw for d in _TOOL_JOIN_DELIMITERS)):
+        return None
+    line = raw.strip()
+    # Mirror the webapp's checkIdentityHeader bound on the RAW value (before
+    # strip): a value that could not be saved through the UI must not become
+    # sendable by arriving via the DB, even padded with spaces.
+    if len(raw) > 4096:
+        return None
+    if ':' not in line:
+        return None
+    name, value = line.split(':', 1)
+    name = sanitize_header_name(name)
+    value = sanitize_header_value(value)
+    if (not name or not value or name.lower() in _IDENTITY_FORBIDDEN_NAMES
+            or name.lower().startswith('proxy-')):
+        return None
+    return f"{name}: {value}"
+
+
+def identity_header_dict(settings: Optional[dict]) -> Dict[str, str]:
+    """The validated engagement identity line as a ``{name: value}`` dict.
+
+    The dict-shaped twin of :func:`engagement_identity_header` for the Python
+    ``requests``/``urllib`` paths, so callers do not each re-implement the
+    split. Empty dict when unset or invalid. Callers merging into an existing
+    header dict must go through :func:`merge_identity_headers` (or
+    :func:`add_identity_headers` for a session header mapping), which honors
+    the case-insensitive existing-header-wins rule of
+    :func:`append_engagement_identity`.
+    """
+    line = engagement_identity_header(settings)
+    if not line:
+        return {}
+    name, value = line.split(':', 1)
+    return {name.strip(): value.strip()}
+
+
+def merge_identity_headers(existing, identity) -> Dict[str, str]:
+    """New dict: ``existing`` plus ``identity``, existing names win.
+
+    HTTP header names are case-insensitive, so a plain ``dict.setdefault`` /
+    ``update`` would send the same header twice under different casings
+    (``X-Bug-Bounty`` from the identity line plus ``x-bug-bounty`` from the
+    caller). Comparison here is case-insensitive and the existing key's
+    casing and value are preserved; identity entries whose name matches an
+    existing name in any casing are dropped. Inputs are not mutated.
+    """
+    out = {}
+    existing_names = set()
+    for name, value in dict(existing or {}).items():
+        out[name] = value
+        existing_names.add(str(name).lower())
+    for name, value in dict(identity or {}).items():
+        if str(name).lower() not in existing_names:
+            out[name] = value
+    return out
+
+
+def add_identity_headers(headers, identity) -> None:
+    """Add ``identity`` entries to a header mapping in place, existing wins.
+
+    For ``requests`` session headers (a ``CaseInsensitiveDict``, whose
+    ``update`` would silently replace an existing header under a different
+    casing): only names absent in every casing are set.
+    """
+    existing_names = {str(name).lower() for name in headers}
+    for name, value in dict(identity or {}).items():
+        if str(name).lower() not in existing_names:
+            headers[name] = value
+
+
+# Mirrors the webapp's checkIdentityHeader forbidden set (validators.ts):
+# names that change where the request goes or what it carries, plus the
+# proxy-* family. The wider framing set lives only on the identity field on
+# both layers; generic custom headers keep the shared contract.
+_IDENTITY_FORBIDDEN_NAMES = frozenset({
+    'host', 'authorization', 'cookie', 'proxy-authorization',
+    'x-redamon-ctx', 'content-length', 'transfer-encoding', 'connection',
+})
+
+
+def append_engagement_identity(headers: Optional[Iterable[str]],
+                                settings: Optional[dict]) -> List[str]:
+    """``headers`` plus the engagement identity line, deduplicated.
+
+    The identity header is appended once, after any auth-session lines: if the
+    operator (or a tool profile) already sends the same header name, THEIR line
+    wins and ours is dropped — never sent twice, which some servers treat as a
+    malformed request. Returns a new list; the input is not mutated.
+    """
+    out = [h for h in (headers or []) if h]
+    line = engagement_identity_header(settings)
+    if line:
+        name = line.split(':', 1)[0].strip().lower()
+        if not any(h.split(':', 1)[0].strip().lower() == name for h in out):
+            out.append(line)
+    return out
+
+
 def merge_auth_headers(custom_headers: Optional[Iterable[str]], settings: Optional[dict],
                        hosts: Iterable[str]) -> List[str]:
     """Prepend the profile's in-scope auth lines to a tool's ``custom_headers``.

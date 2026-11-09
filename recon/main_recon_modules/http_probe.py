@@ -891,6 +891,10 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
     from recon.helpers.auth_profile import merge_auth_headers_ex as _merge_auth_ex
     HTTPX_CUSTOM_HEADERS, _has_auth = _merge_auth_ex(HTTPX_CUSTOM_HEADERS, settings,
                                                      probe_hosts or [])
+    # Engagement identity header rides the same -H set: sent direct and through
+    # the capture proxy alike, deduped against an operator line of the same name.
+    from recon.helpers.auth_profile import append_engagement_identity as _append_identity
+    HTTPX_CUSTOM_HEADERS = _append_identity(HTTPX_CUSTOM_HEADERS, settings)
     HTTPX_MATCH_CODES = settings.get('HTTPX_MATCH_CODES', [])
     HTTPX_FILTER_CODES = settings.get('HTTPX_FILTER_CODES', [])
 

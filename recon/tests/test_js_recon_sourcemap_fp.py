@@ -196,7 +196,7 @@ class TestDiscovery(unittest.TestCase):
     def _discover(self, fetch_result):
         data, reason = fetch_result
 
-        def fake_fetch(url, timeout=10, outcome=None):
+        def fake_fetch(url, timeout=10, outcome=None, identity_headers=None):
             if outcome is not None:
                 outcome["reason"] = reason
             return data
@@ -219,7 +219,7 @@ class TestDiscovery(unittest.TestCase):
         js_files = [{"url": JS, "content": "x;\n//# sourceMappingURL=http://build.example.internal:8080/app.js.map",
                      "headers": {}}]
 
-        def fake_fetch(url, timeout=10, outcome=None):
+        def fake_fetch(url, timeout=10, outcome=None, identity_headers=None):
             outcome["reason"] = "unsafe"
             return None
 
@@ -308,7 +308,7 @@ class TestPseudoFiles(unittest.TestCase):
         self.assertEqual(files[0]["url"], f"{JS}#src/config.ts")
 
     def test_discovery_hands_the_pseudo_files_to_the_caller(self):
-        def fake_fetch(url, timeout=10, outcome=None):
+        def fake_fetch(url, timeout=10, outcome=None, identity_headers=None):
             if outcome is not None:
                 outcome["reason"] = "ok"
             return APP_MAP
@@ -333,7 +333,7 @@ ANALYSIS = {
 
 class TestSourceMapSourcesFeedTheDetectors(unittest.TestCase):
     def _run(self, source_map=APP_MAP):
-        def fake_fetch(url, timeout=10, outcome=None):
+        def fake_fetch(url, timeout=10, outcome=None, identity_headers=None):
             if outcome is not None:
                 outcome["reason"] = "ok"
             return source_map

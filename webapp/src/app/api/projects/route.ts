@@ -19,6 +19,7 @@ import { contentLengthProblem } from '@/lib/roe/upload'
 import { internalError } from '@/lib/routeErrors'
 import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
 import { projectModelProblem } from '@/lib/agentInTheLoop'
+import { checkIdentityHeader } from '@/lib/reconSettings/validators'
 
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8080'
 const SOFT_GUARDRAIL_TIMEOUT_MS = 10_000
@@ -136,6 +137,20 @@ export async function POST(request: NextRequest) {
     const loopProblem = projectModelProblem(optionalParams)
     if (loopProblem) {
       return NextResponse.json({ error: loopProblem, code: 'loop_model_not_allowed' }, { status: 400 })
+    }
+
+    // Identity-only fail-closed at the write, checked on the raw params
+    // before the sanitizer below (which would silently drop a null) and
+    // before any Prisma write. Absent is untouched, '' clears, and a
+    // present null/non-string is refused, matching validateValue.
+    if ('engagementIdentityHeader' in optionalParams) {
+      const identity = optionalParams.engagementIdentityHeader
+      if (identity !== '' && identity !== undefined) {
+        const problem = checkIdentityHeader(identity)
+        if (problem) {
+          return NextResponse.json({ error: `engagementIdentityHeader ${problem}.` }, { status: 400 })
+        }
+      }
     }
 
     // Domain batch: the groups are ALWAYS re-derived here from the raw host list.

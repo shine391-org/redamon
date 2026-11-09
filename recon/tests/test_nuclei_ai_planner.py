@@ -369,7 +369,7 @@ def test_get_ai_tags_head_probe_caps_at_limit():
     _reset_candidates_cache()
     nt._candidates_cache = ['cve']
     head_calls = []
-    def _fake_head(url, allow_redirects, timeout):
+    def _fake_head(url, allow_redirects, timeout, headers=None):
         head_calls.append(url)
         return _mock_head(server='Apache')
     with mock.patch('recon.helpers.ai_planner.nuclei_tags.requests.head', side_effect=_fake_head), \

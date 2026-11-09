@@ -318,7 +318,8 @@ def run_katana_crawler(
 
 def fetch_forms_from_urls(
     urls: List[str],
-    max_urls: int = 50
+    max_urls: int = 50,
+    settings=None
 ) -> List[Dict]:
     """
     Fetch HTML from URLs and extract forms.
@@ -358,15 +359,15 @@ def fetch_forms_from_urls(
 
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_context))
 
+    from recon.helpers.auth_profile import identity_header_dict, merge_identity_headers
+    _base_headers = merge_identity_headers({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }, identity_header_dict(settings))
+
     for url in html_urls:
         try:
-            request = urllib.request.Request(
-                url,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                }
-            )
+            request = urllib.request.Request(url, headers=dict(_base_headers))
             response = opener.open(request, timeout=10)
             content_type = response.headers.get('Content-Type', '')
 
