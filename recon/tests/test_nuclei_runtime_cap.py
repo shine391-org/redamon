@@ -17,9 +17,12 @@ from recon.main_recon_modules import vuln_scan
 
 
 def _cmd(**kw):
+    # F03: the builder refuses an empty selection, so the shared fixture
+    # carries an explicit template selection.
     return build_nuclei_command(
         targets_file="/tmp/redamon/t.txt", output_file="/tmp/redamon/o.jsonl",
-        docker_image="projectdiscovery/nuclei:latest", **kw)
+        docker_image="projectdiscovery/nuclei:latest",
+        templates=["http/cves/"], **kw)
 
 
 class TestBuildNucleiCommand:

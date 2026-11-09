@@ -26,8 +26,11 @@ PROFILE = {'authType': 'cookie', 'authValue': 'sid=abc123',
 
 
 def _nuclei(**kw):
+    # F03: the builder refuses an empty selection, so the shared fixture
+    # carries an explicit template selection.
     args = dict(targets_file="/targets/t.txt", output_file="/output/o.jsonl",
-                docker_image="projectdiscovery/nuclei:latest")
+                docker_image="projectdiscovery/nuclei:latest",
+                templates=["http/cves/"])
     args.update(kw)
     return build_nuclei_command(**args)
 

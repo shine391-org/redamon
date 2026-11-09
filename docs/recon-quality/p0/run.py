@@ -16,6 +16,10 @@ import xml.etree.ElementTree as ET
 
 IMAGE = "sha256:6990dc80a76d739d02c0a1a79c3cde50bee27ce39f129d48d1f3e58e1ebd5ae1"
 FILES = [
+    "recon/tests/test_nuclei_policy_parity.py",
+    "recon/tests/test_auth_no_cross_host_leak.py",
+    "recon/tests/test_engagement_identity_header.py",
+    "recon/tests/test_nuclei_runtime_cap.py",
     "recon/tests/test_target_helpers_union.py",
     "recon/tests/test_no_b_large_inputs.py",
     "recon/tests/test_declared_only_consumers.py",
@@ -23,7 +27,6 @@ FILES = [
     "recon/tests/test_nuclei_coverage.py",
     "recon/tests/test_nuclei_ai_planner.py",
     "recon/tests/test_nuclei_ai_vuln_scan_wiring.py",
-    "recon/tests/test_nuclei_runtime_cap.py",
     "recon/tests/test_fix_nuclei_coverage.py",
     "recon/tests/test_regression_nuclei_crash_partial_output.py",
     "recon/tests/test_regression_nuclei_early_return_checks.py",

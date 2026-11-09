@@ -120,6 +120,7 @@ class TestOutgoingHeader:
         cmd = nuclei_helpers.build_nuclei_command(
             targets_file='/targets/t.txt', output_file='/output/o.jsonl',
             docker_image='projectdiscovery/nuclei:latest',
+            templates=['http/cves/'],
             auth_headers=append_engagement_identity(
                 [], dict(SETTINGS, ENGAGEMENT_IDENTITY_HEADER=IDENTITY)))
         assert cmd.count('-H') >= 1
@@ -134,6 +135,7 @@ class TestOutgoingHeader:
             cmd = nuclei_helpers.build_nuclei_command(
                 targets_file='/targets/t.txt', output_file='/output/o.jsonl',
                 docker_image='projectdiscovery/nuclei:latest',
+                templates=['http/cves/'],
                 auth_headers=append_engagement_identity(
                     [], dict(SETTINGS, ENGAGEMENT_IDENTITY_HEADER=IDENTITY)))
         assert IDENTITY in cmd

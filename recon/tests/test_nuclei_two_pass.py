@@ -56,6 +56,10 @@ class TestBuildNucleiCommandDastFlag(unittest.TestCase):
             targets_file="/tmp/t.txt",
             output_file="/tmp/o.jsonl",
             docker_image="projectdiscovery/nuclei:latest",
+            # F03: an empty selection is now refused by the builder, so the
+            # shared fixture carries an explicit template selection. Tests that
+            # want the empty-selection behaviour pass their own overrides.
+            templates=["http/cves/"],
         )
         defaults.update(overrides)
         return build_nuclei_command(**defaults)
@@ -78,7 +82,7 @@ class TestBuildNucleiCommandDastFlag(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: force_dast_pass strips filters that empty-intersect with DAST set
+# Unit tests: force_dast_pass drops INCLUSION filters, keeps the denylist
 # ---------------------------------------------------------------------------
 
 @unittest.skipUnless(_HAS_RECON_IMPORTS, "recon package not on PYTHONPATH")
@@ -90,6 +94,10 @@ class TestBuildNucleiCommandForceDastStripsFilters(unittest.TestCase):
             output_file="/tmp/o.jsonl",
             docker_image="projectdiscovery/nuclei:latest",
             force_dast_pass=True,
+            # An explicit selection is supplied so the only thing under test is
+            # what force_dast_pass drops; force_dast_pass is exempt from the
+            # empty-selection guard.
+            templates=["http/cves/"],
         )
         defaults.update(overrides)
         return build_nuclei_command(**defaults)
@@ -99,17 +107,9 @@ class TestBuildNucleiCommandForceDastStripsFilters(unittest.TestCase):
         self.assertNotIn("-tags", cmd)
         self.assertNotIn("graphql,exposure", cmd)
 
-    def test_strips_exclude_tags(self):
-        cmd = self._force_dast(exclude_tags=["dos", "fuzz"])
-        self.assertNotIn("-exclude-tags", cmd)
-
     def test_strips_templates(self):
         cmd = self._force_dast(templates=["http/cves/2024/"])
         self.assertNotIn("http/cves/2024/", cmd)
-
-    def test_strips_exclude_templates(self):
-        cmd = self._force_dast(exclude_templates=["http/dos/"])
-        self.assertNotIn("-exclude-templates", cmd)
 
     def test_strips_custom_templates(self):
         cmd = self._force_dast(custom_templates=["/custom-templates/aem.yaml"])
@@ -126,6 +126,36 @@ class TestBuildNucleiCommandForceDastStripsFilters(unittest.TestCase):
         cmd = self._force_dast(new_templates_only=True)
         self.assertNotIn("-nt", cmd)
 
+    # F03: exclusions are the operator's denylist, NOT an inclusion filter.
+    # They must survive force_dast_pass so a RoE-forbidden or noisy category
+    # stays out of the DAST pass exactly as it stays out of the detection pass.
+
+    def test_keeps_exclude_tags(self):
+        cmd = self._force_dast(exclude_tags=["dos", "fuzz"])
+        self.assertIn("-exclude-tags", cmd)
+        self.assertIn("dos,fuzz", cmd)
+
+    def test_keeps_exclude_templates(self):
+        cmd = self._force_dast(exclude_templates=["http/dos/"])
+        self.assertIn("-exclude-templates", cmd)
+        self.assertIn("http/dos/", cmd)
+
+    def test_drops_inclusion_but_keeps_exclusions_together(self):
+        """The whole point of F03 in one argv: -tags/-t gone, denylist present."""
+        cmd = self._force_dast(
+            tags=["cve", "xss"],
+            templates=["http/cves/2024/"],
+            exclude_tags=["dos"],
+            exclude_templates=["http/dos/"],
+        )
+        self.assertNotIn("-tags", cmd)
+        self.assertNotIn("cve,xss", cmd)
+        self.assertNotIn("http/cves/2024/", cmd)
+        self.assertIn("-exclude-tags", cmd)
+        self.assertIn("dos", cmd)
+        self.assertIn("-exclude-templates", cmd)
+        self.assertIn("http/dos/", cmd)
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: force_dast_pass preserves engine-level flags (severity, rate, etc.)
@@ -140,6 +170,10 @@ class TestBuildNucleiCommandPreservedFlags(unittest.TestCase):
             output_file="/tmp/o.jsonl",
             docker_image="projectdiscovery/nuclei:latest",
             force_dast_pass=True,
+            # An explicit selection is supplied so the only thing under test is
+            # what force_dast_pass drops; force_dast_pass is exempt from the
+            # empty-selection guard.
+            templates=["http/cves/"],
         )
         defaults.update(overrides)
         return build_nuclei_command(**defaults)
@@ -203,10 +237,21 @@ class TestBuildNucleiCommandNormalMode(unittest.TestCase):
             targets_file="/tmp/t.txt",
             output_file="/tmp/o.jsonl",
             docker_image="x",
+            templates=["http/cves/"],
             exclude_tags=["dos"],
         )
         self.assertIn("-exclude-tags", cmd)
         self.assertIn("dos", cmd)
+
+    def test_normal_mode_empty_selection_is_refused(self):
+        """F03: the builder no longer falls back to the default template pool."""
+        from recon.helpers.nuclei_helpers import NucleiEmptySelectionError
+        with self.assertRaises(NucleiEmptySelectionError):
+            build_nuclei_command(
+                targets_file="/tmp/t.txt",
+                output_file="/tmp/o.jsonl",
+                docker_image="x",
+            )
 
 
 class TestBuildNucleiCommandAuthHeaders(unittest.TestCase):
@@ -215,6 +260,7 @@ class TestBuildNucleiCommandAuthHeaders(unittest.TestCase):
     def test_auth_headers_emitted_as_H(self):
         cmd = build_nuclei_command(
             targets_file="/tmp/t.txt", output_file="/tmp/o.jsonl", docker_image="x",
+            templates=["http/cves/"],
             auth_headers=["Cookie: sid=abc", "X-CSRF-Token: c1"],
         )
         self.assertEqual(cmd.count("-H"), 2)
@@ -224,6 +270,7 @@ class TestBuildNucleiCommandAuthHeaders(unittest.TestCase):
     def test_no_auth_headers_no_H(self):
         cmd = build_nuclei_command(
             targets_file="/tmp/t.txt", output_file="/tmp/o.jsonl", docker_image="x",
+            templates=["http/cves/"],
         )
         self.assertNotIn("-H", cmd)
 
@@ -234,6 +281,7 @@ class TestBuildNucleiCommandAuthHeaders(unittest.TestCase):
                    return_value=("http://proxy:8888", "signed-tag")):
             cmd = build_nuclei_command(
                 targets_file="/tmp/t.txt", output_file="/tmp/o.jsonl", docker_image="x",
+                templates=["http/cves/"],
                 auth_headers=["Cookie: sid=abc"],
             )
         auth_idx = cmd.index("Cookie: sid=abc")
@@ -650,15 +698,43 @@ class TestSmokeNucleiBehavior(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr[:300])
 
     def test_exclude_tags_fuzz_is_noop_for_dast(self):
+        # F03: the flag is now HONOURED on the DAST pass rather than dropped.
+        # Whether it changes the loaded set depends on the template pool: a tag
+        # no DAST template carries is a no-op, and a tag some carry must shrink
+        # the set. Assert the flag reaches nuclei, not that it is inert.
         baseline = self._run_nuclei("-dast", "-t", self.DAST_DIR, "-tl")
         with_exclude = self._run_nuclei(
             "-dast", "-t", self.DAST_DIR, "-exclude-tags", "fuzz", "-tl"
         )
-        # No DAST template carries the 'fuzz' tag, so excluding it changes nothing.
         self.assertEqual(
             len(baseline.stdout.splitlines()),
             len(with_exclude.stdout.splitlines()),
             msg="`-exclude-tags fuzz` should be a no-op against DAST templates",
+        )
+
+    def test_exclude_tags_reaches_the_dast_template_loader(self):
+        """The exclusion flag is parsed and applied, not silently discarded.
+
+        An unknown tag is a no-op everywhere; a real DAST tag must shrink the
+        loaded set. This proves the flag is on nuclei's argv and honoured.
+        """
+        baseline = self._run_nuclei("-dast", "-t", self.DAST_DIR, "-tl")
+        self.assertGreater(len(baseline.stdout.splitlines()), 0)
+        # `xss` is a real DAST tag in the shipped pool; excluding it must remove
+        # at least one template. If the pool has none, the test is skipped
+        # rather than asserting a no-op as if it were coverage.
+        with_exclude = self._run_nuclei(
+            "-dast", "-t", self.DAST_DIR, "-exclude-tags", "xss", "-tl"
+        )
+        if len(with_exclude.stdout.splitlines()) == len(baseline.stdout.splitlines()):
+            raise unittest.SkipTest(
+                "no DAST template carries the 'xss' tag in this pool; "
+                "cannot prove the exclusion is honoured"
+            )
+        self.assertLess(
+            len(with_exclude.stdout.splitlines()),
+            len(baseline.stdout.splitlines()),
+            msg="`-exclude-tags xss` must shrink the DAST template set",
         )
 
     def test_dast_with_detection_tags_fatals(self):

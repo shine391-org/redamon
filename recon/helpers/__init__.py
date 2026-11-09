@@ -40,6 +40,7 @@ from .target_helpers import (
 # Nuclei-specific helpers
 from .nuclei_helpers import (
     build_nuclei_command,
+    NucleiEmptySelectionError,
     parse_nuclei_finding,
     is_false_positive,
     set_fp_ai_ctx,
@@ -102,6 +103,7 @@ __all__ = [
     "build_target_urls",
     # Nuclei
     "build_nuclei_command",
+    "NucleiEmptySelectionError",
     "parse_nuclei_finding",
     "is_false_positive",
     "set_fp_ai_ctx",

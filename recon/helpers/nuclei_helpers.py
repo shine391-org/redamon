@@ -13,6 +13,15 @@ from typing import List, Optional
 from .docker_helpers import NUCLEI_TEMPLATES_VOLUME
 
 
+class NucleiEmptySelectionError(ValueError):
+    """Raised when a Nuclei command would carry no template selection.
+
+    Distinct from a plain ValueError so a caller can catch the refusal
+    explicitly and record ``policy_empty``/``not_executed`` instead of
+    treating it as a generic build failure.
+    """
+
+
 def get_host_path(container_path: str) -> str:
     """
     Convert container path to host path for Docker-in-Docker volume mounts.
@@ -85,12 +94,19 @@ def build_nuclei_command(
     """
     if force_dast_pass:
         dast_mode = True
+        # Inclusion policy only. A DAST pass selects Nuclei's own ``-dast``
+        # template set, so any explicit include filter (templates/tags/custom/
+        # -nt) would empty-intersect with it and fatal with "no templates
+        # provided for scan". Those are dropped.
+        #
+        # Exclusions are the operator's denylist and are NOT an inclusion
+        # filter: a RoE-forbidden or noisy category must stay out of the DAST
+        # pass exactly as it stays out of the detection pass. Dropping them
+        # here is the policy leak this fix closes.
         templates = None
-        exclude_templates = None
         custom_templates = None
         selected_custom_templates = None
         tags = None
-        exclude_tags = None
         new_templates_only = False
     # Docker command with volume mounts
     # Convert container paths to host paths for sibling container volume mounts
@@ -163,6 +179,11 @@ def build_nuclei_command(
     host_custom_templates = os.environ.get("HOST_CUSTOM_TEMPLATES_PATH", "")
     custom_selected = bool(selected_custom_templates) and bool(host_custom_templates)
     explicit_t_paths = bool(templates) or bool(custom_templates)
+    # Whether the command will carry ANY -t. An explicit template path or a
+    # selected custom template bounds the scan even when no branch above added
+    # the built-in pool, so the fail-closed guard below keys off this flag
+    # rather than off which branch ran.
+    cmd_has_template_selection = False
 
     if custom_selected:
         if tags and not explicit_t_paths:
@@ -190,9 +211,34 @@ def build_nuclei_command(
                         "a path-list file). Rename to .yaml or re-upload via the UI."
                     )
             cmd.extend(["-t", f"/custom-templates/{normalized_path}"])
-    elif tags and not explicit_t_paths:
+        cmd_has_template_selection = True
+    elif explicit_t_paths:
+        # An explicit template path (``templates`` or ``custom_templates``)
+        # was already emitted above and bounds the scan on its own. No built-in
+        # pool is added, and the fail-closed guard must not fire.
+        cmd_has_template_selection = True
+    elif tags:
         # Tags-only scan: point nuclei at the built-in pool explicitly.
         cmd.extend(["-t", "/root/nuclei-templates/"])
+        cmd_has_template_selection = True
+
+    # Fail closed (defence in depth). This is a guard on the SELECTION, not on
+    # which branch above ran: an explicit -t (a template path or a custom
+    # template) already bounds the scan, so it must not trip the guard. Only a
+    # command that would carry no -t at all is refused -- omitting it lets
+    # nuclei fall back to its whole default pool, which is the opposite of the
+    # caller's selection and can silently turn an empty policy into an
+    # unbounded scan. ``vuln_scan`` already refuses this combination before
+    # reaching here; a future caller that does not gets a refusal instead of a
+    # surprise. ``force_dast_pass`` is exempt: its template set is Nuclei's own
+    # -dast pool, not the default pool.
+    if not force_dast_pass and not cmd_has_template_selection:
+        raise NucleiEmptySelectionError(
+            "no Nuclei templates selected: pass tags, an explicit template "
+            "path or a custom template (or use force_dast_pass, whose "
+            "template set is Nuclei's own -dast pool). Refusing to fall back "
+            "to the default template pool."
+        )
 
     # Tags
     if tags:
