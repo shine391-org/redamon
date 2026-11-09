@@ -17,9 +17,11 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from .classification import classify_endpoint, classify_parameter, infer_parameter_type
+from .arjun_contract import arjun_url_host, reconcile_arjun_schema
+from recon.helpers.openapi.scope import _normalize_scope_host
 
 
 def arjun_binary_check() -> bool:
@@ -44,6 +46,7 @@ def _run_arjun_single_method(
     disable_redirects: bool,
     custom_headers: List[str],
     allowed_hosts: Set[str],
+    execution: Dict | None = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Run Arjun for a single HTTP method. Called in parallel by run_arjun_discovery().
@@ -54,7 +57,12 @@ def _run_arjun_single_method(
     tmp_dir = tempfile.mkdtemp(prefix="redamon_arjun_")
     results = []
     external_domains = []
+    execution = execution if execution is not None else {}
+    execution.update(method=method, status='failed', input_count=len(target_urls),
+                     timed_out=False, return_code=None, output_state='missing')
 
+    from recon.helpers.resource_enum import tool_health
+    started, stderr = time.time(), ""
     try:
         urls_file = os.path.join(tmp_dir, "urls.txt")
         output_file = os.path.join(tmp_dir, "results.json")
@@ -105,8 +113,6 @@ def _run_arjun_single_method(
             env["HTTP_PROXY"] = _cap_url
             env["HTTPS_PROXY"] = _cap_url
 
-        from recon.helpers.resource_enum import tool_health
-        started = time.time()
         stdout, stderr = "", ""
         timed_out = False
         proc = subprocess.Popen(
@@ -139,6 +145,8 @@ def _run_arjun_single_method(
                 for line in stderr_lines[-3:]:
                     print(f"[!][Arjun/{method}] {line}")
 
+        execution.update(timed_out=timed_out, return_code=proc.returncode,
+                         status='partial' if timed_out or proc.returncode != 0 else 'complete')
         # Parse output file (full results or partial after graceful shutdown)
         if not os.path.exists(output_file):
             if not timed_out:
@@ -146,9 +154,6 @@ def _run_arjun_single_method(
             else:
                 print(f"[-][Arjun/{method}] No partial results saved before timeout")
             # A crash also leaves no file: the exit code and stderr tell it apart.
-            tool_health.check_empty("arjun", seeds=len(target_urls), return_code=proc.returncode,
-                                    stderr=stderr, elapsed_s=time.time() - started,
-                                    timed_out=timed_out)
             return [], []
 
         with open(output_file, 'r') as f:
@@ -158,67 +163,61 @@ def _run_arjun_single_method(
                     print(f"[-][Arjun/{method}] No parameters found")
                 else:
                     print(f"[-][Arjun/{method}] Output file empty after timeout")
-                tool_health.check_empty("arjun", seeds=len(target_urls), return_code=proc.returncode,
-                                        stderr=stderr, elapsed_s=time.time() - started,
-                                        timed_out=timed_out)
                 return [], []
 
         try:
             arjun_output = json.loads(content)
+            execution['output_state'] = 'parsed'
         except json.JSONDecodeError:
-            if not timed_out:
-                print(f"[!][Arjun/{method}] Failed to parse JSON output")
-                return [], []
-            # Arjun may have been killed mid-write — try to salvage truncated JSON
-            try:
-                # Close unclosed brackets and braces in correct order
-                stack = []
-                in_string = False
-                escape_next = False
-                for ch in content:
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if ch == '\\' and in_string:
-                        escape_next = True
-                        continue
-                    if ch == '"':
-                        in_string = not in_string
-                        continue
-                    if in_string:
-                        continue
-                    if ch in ('{', '['):
-                        stack.append('}' if ch == '{' else ']')
-                    elif ch in ('}', ']') and stack:
-                        stack.pop()
-                # Close unclosed string if truncated mid-value
-                salvaged = content
-                if in_string:
-                    salvaged += '"'
-                # Strip trailing comma before closing (e.g. '{"a": 1,' -> '{"a": 1}')
-                salvaged = salvaged.rstrip().rstrip(',')
-                salvaged += ''.join(reversed(stack))
-                arjun_output = json.loads(salvaged)
-                print(f"[*][Arjun/{method}] Recovered partial JSON output")
-            except Exception as e:
-                print(f"[!][Arjun/{method}] Failed to recover partial JSON: {e}")
-                return [], []
+            execution.update(status='partial', output_state='malformed')
+            # Recover complete URL records only. Never invent a parameter name by
+            # closing a truncated string/array. A kill can occur without TimeoutExpired.
+            arjun_output = {}
+            decoder = json.JSONDecoder()
+            offset = 1 if content.startswith('{') else len(content)
+            while offset < len(content):
+                try:
+                    while content[offset:offset + 1] in (' ', '\n', '\r', '\t', ','):
+                        offset += 1
+                    key, offset = decoder.raw_decode(content, offset)
+                    while content[offset:offset + 1].isspace():
+                        offset += 1
+                    if content[offset:offset + 1] != ':':
+                        break
+                    offset += 1
+                    while content[offset:offset + 1].isspace():
+                        offset += 1
+                    value, offset = decoder.raw_decode(content, offset)
+                    arjun_output[key] = value
+                except (ValueError, TypeError, IndexError):
+                    break
+            if arjun_output:
+                execution['output_state'] = 'salvaged'
+
+        if not isinstance(arjun_output, dict):
+            execution.update(status='failed', output_state='invalid_schema')
+            return [], []
 
         total_params = 0
         for url, url_data in arjun_output.items():
+            if not isinstance(url_data, dict):
+                execution['status'] = 'partial'
+                continue
             params = url_data.get('params', [])
-            discovered_method = url_data.get('method', method)
-
+            if not isinstance(params, list) or any(not isinstance(p, str) or not p for p in params):
+                execution['status'] = 'partial'
+                continue
+            params = list(dict.fromkeys(params))
+            # The subprocess invocation, not untrusted output, proves the method.
+            discovered_method = method
             if not params:
                 continue
-
-            try:
-                parsed = urlparse(url)
-                host = parsed.netloc.split(':')[0] if ':' in parsed.netloc else parsed.netloc
-            except Exception:
+            host = arjun_url_host(url)
+            if not host:
+                execution['status'] = 'partial'
                 continue
 
-            if allowed_hosts and host not in allowed_hosts:
+            if host not in {_normalize_scope_host(h) for h in allowed_hosts}:
                 external_domains.append({
                     "domain": host,
                     "source": "arjun",
@@ -230,6 +229,7 @@ def _run_arjun_single_method(
                 "url": url,
                 "params": params,
                 "method": discovered_method,
+                "execution_status": execution["status"],
             })
             total_params += len(params)
 
@@ -241,13 +241,24 @@ def _run_arjun_single_method(
             print(f"[+][Arjun/{method}] {len(results)} URLs with params, {total_params} params discovered")
 
     except Exception as e:
+        execution.update(status="failed", error_class=type(e).__name__)
         print(f"[!][Arjun/{method}] Error: {e}")
     finally:
+        if not results or execution['status'] != 'complete':
+            verdict = tool_health.check_empty("arjun", seeds=len(target_urls),
+                                              return_code=execution['return_code'], stderr=stderr,
+                                              elapsed_s=time.time() - started,
+                                              timed_out=execution['timed_out'],
+                                              raised=execution['status'] != 'complete')
+            if verdict in (tool_health.FAILURE, tool_health.UNDECIDED):
+                execution['status'] = 'partial'
         try:
             shutil.rmtree(tmp_dir)
         except Exception:
             pass
 
+    for result in results:
+        result["execution_status"] = execution["status"]
     return results, external_domains
 
 
@@ -292,8 +303,19 @@ def run_arjun_discovery(
         print("[-][Arjun] No target URLs provided")
         return [], {"external_domains": []}
 
+    normalized_hosts = {_normalize_scope_host(h) for h in allowed_hosts} - {''}
+    supplied_count = len(target_urls)
+    target_urls = [u for u in target_urls if arjun_url_host(u) and arjun_url_host(u) in normalized_hosts]
+    rejected_inputs = supplied_count - len(target_urls)
+    if not target_urls:
+        return [], {"external_domains": [], "execution": [], "status": "not_executed",
+                    "rejected_inputs": rejected_inputs, "coverage_scope": "selected_inputs"}
     if not methods:
         methods = ['GET']
+    methods = list(dict.fromkeys(str(m).upper() for m in methods))
+    if any(m not in ('GET', 'POST', 'JSON', 'XML') for m in methods):
+        return [], {"external_domains": [], "execution": [], "status": "not_executed",
+                    "reason": "unsupported_method", "coverage_scope": "selected_inputs"}
 
     print(f"\n[*][Arjun] Starting parameter discovery on {len(target_urls)} endpoints")
     print(f"[*][Arjun] Methods: {', '.join(methods)} ({'parallel' if len(methods) > 1 else 'single'})")
@@ -302,13 +324,14 @@ def run_arjun_discovery(
 
     all_results = []
     all_external_domains = []
+    executions = {method: {"method": method, "status": "failed"} for method in methods}
 
     if len(methods) == 1:
         # Single method — run directly, no thread overhead
         results, ext = _run_arjun_single_method(
             target_urls, methods[0], threads, timeout, scan_timeout,
             chunk_size, rate_limit, stable, passive, disable_redirects,
-            custom_headers, allowed_hosts,
+            custom_headers, allowed_hosts, executions[methods[0]],
         )
         all_results.extend(results)
         all_external_domains.extend(ext)
@@ -321,7 +344,7 @@ def run_arjun_discovery(
                     _run_arjun_single_method,
                     target_urls, method, threads, timeout, scan_timeout,
                     chunk_size, rate_limit, stable, passive, disable_redirects,
-                    custom_headers, allowed_hosts,
+                    custom_headers, allowed_hosts, executions[method],
                 )
 
             for method, future in futures.items():
@@ -337,12 +360,16 @@ def run_arjun_discovery(
     if all_external_domains:
         print(f"[*][Arjun] Filtered {len(all_external_domains)} out-of-scope results")
 
-    return all_results, {"external_domains": all_external_domains}
+    return all_results, {"external_domains": all_external_domains,
+                         "execution": list(executions.values()),
+                         "coverage_scope": "selected_inputs", "rejected_inputs": rejected_inputs,
+                         "status": "complete" if not rejected_inputs and all(e['status'] == 'complete' for e in executions.values()) else "partial"}
 
 
 def merge_arjun_into_by_base_url(
     arjun_results: List[Dict],
     by_base_url: Dict,
+    allowed_hosts: Set[str] | None = None,
 ) -> Tuple[Dict, Dict[str, int]]:
     """
     Merge Arjun parameter discovery results into existing by_base_url structure.
@@ -358,148 +385,66 @@ def merge_arjun_into_by_base_url(
     Returns:
         Tuple of (updated by_base_url, merge stats)
     """
-    stats = {
-        "arjun_total": len(arjun_results),
-        "arjun_new_endpoints": 0,
-        "arjun_existing_enriched": 0,
-        "arjun_params_discovered": 0,
-    }
-
+    stats = {"arjun_total": len(arjun_results), "arjun_new_endpoints": 0,
+             "arjun_existing_enriched": 0, "arjun_params_discovered": 0}
     for result in arjun_results:
         url = result.get('url', '')
         params = result.get('params', [])
-        discovered_method = result.get('method', 'GET').upper()
-
-        if not url or not params:
+        mode = str(result.get('method', 'GET')).upper()
+        if not arjun_url_host(url) or not isinstance(params, list) or not params:
             continue
-
-        # Parse URL into base_url + path
-        try:
-            parsed = urlparse(url)
-            base = f"{parsed.scheme}://{parsed.netloc}"
-            path = parsed.path or '/'
-        except Exception:
+        if mode not in ('GET', 'POST', 'JSON', 'XML'):
             continue
-
-        # Determine parameter position based on method
-        if discovered_method in ('POST', 'JSON', 'XML'):
-            param_position = 'body'
-        else:
-            param_position = 'query'
-
-        # Initialize base URL if not exists
-        if base not in by_base_url:
-            by_base_url[base] = {
-                'base_url': base,
-                'endpoints': {},
-                'summary': {
-                    'total_endpoints': 0,
-                    'total_parameters': 0,
-                    'methods': {},
-                    'categories': {}
-                }
-            }
-
-        endpoints = by_base_url[base]['endpoints']
-        new_params_count = 0
-
-        if path in endpoints:
-            # Endpoint exists — enrich with discovered parameters
-            endpoint = endpoints[path]
-
-            # Migrate sources field (backward compat)
-            existing_sources = endpoint.get('sources', [])
-            if not existing_sources:
-                old_source = endpoint.get('source', '')
-                if old_source:
-                    existing_sources = [old_source]
-            if 'arjun' not in existing_sources:
-                existing_sources.append('arjun')
-            endpoint['sources'] = existing_sources
-            endpoint.pop('source', None)
-
-            # Add method if not present
-            if discovered_method not in endpoint.get('methods', []):
-                endpoint.setdefault('methods', []).append(discovered_method)
-                by_base_url[base]['summary']['methods'][discovered_method] = \
-                    by_base_url[base]['summary']['methods'].get(discovered_method, 0) + 1
-
-            # Add discovered parameters
-            existing_param_names = {
-                p['name'] for p in endpoint['parameters'].get(param_position, [])
-            }
-
-            for param_name in params:
-                if param_name in existing_param_names:
-                    continue  # Skip duplicate
-
-                param_info = {
-                    'name': param_name,
-                    'type': infer_parameter_type(param_name, []),
-                    'sample_values': [],
-                    'category': classify_parameter(param_name),
-                }
-                endpoint['parameters'][param_position].append(param_info)
-                new_params_count += 1
-                existing_param_names.add(param_name)
-
-            # Update parameter_count
-            if 'parameter_count' in endpoint:
-                endpoint['parameter_count'][param_position] = len(endpoint['parameters'][param_position])
-                endpoint['parameter_count']['total'] = (
-                    len(endpoint['parameters'].get('query', []))
-                    + len(endpoint['parameters'].get('body', []))
-                    + len(endpoint['parameters'].get('path', []))
-                )
-
-            # Update base URL summary
-            by_base_url[base]['summary']['total_parameters'] += new_params_count
-
-            if new_params_count > 0:
-                stats["arjun_existing_enriched"] += 1
-
-        else:
-            # New endpoint from Arjun
-            stats["arjun_new_endpoints"] += 1
-
-            # Build parameter list
-            param_list = []
-            for param_name in params:
-                param_info = {
-                    'name': param_name,
-                    'type': infer_parameter_type(param_name, []),
-                    'sample_values': [],
-                    'category': classify_parameter(param_name),
-                }
-                param_list.append(param_info)
-                new_params_count += 1
-
-            parameters = {'query': [], 'body': [], 'path': []}
-            parameters[param_position] = param_list
-
-            category = classify_endpoint(path, [discovered_method], parameters)
-
-            endpoints[path] = {
-                'methods': [discovered_method],
-                'parameters': parameters,
-                'sources': ['arjun'],
-                'category': category,
-                'parameter_count': {
-                    'query': len(parameters['query']),
-                    'body': len(parameters['body']),
-                    'path': 0,
-                    'total': len(param_list),
-                },
-            }
-
-            # Update summary
-            by_base_url[base]['summary']['total_endpoints'] += 1
-            by_base_url[base]['summary']['total_parameters'] += new_params_count
-            by_base_url[base]['summary']['methods'][discovered_method] = \
-                by_base_url[base]['summary']['methods'].get(discovered_method, 0) + 1
-            by_base_url[base]['summary']['categories'][category] = \
-                by_base_url[base]['summary']['categories'].get(category, 0) + 1
-
-        stats["arjun_params_discovered"] += new_params_count
-
+        params = list(dict.fromkeys(p for p in params if isinstance(p, str) and p))
+        if not params:
+            continue
+        if allowed_hosts is not None and arjun_url_host(url) not in {_normalize_scope_host(h) for h in allowed_hosts}:
+            continue
+        parsed = urlsplit(url)
+        base, path = f"{parsed.scheme}://{parsed.netloc}", parsed.path or '/'
+        position = 'body' if mode in ('POST', 'JSON', 'XML') else 'query'
+        method = 'POST' if mode in ('JSON', 'XML') else mode
+        base_data = by_base_url.setdefault(base, {'base_url': base, 'endpoints': {}})
+        endpoints = base_data.setdefault('endpoints', {})
+        is_new = path not in endpoints
+        endpoint = endpoints.setdefault(path, {
+            'methods': [], 'parameters': {'query': [], 'body': [], 'path': []},
+            'sources': [],
+        })
+        sources = endpoint.setdefault('sources', [])
+        old_source = endpoint.pop('source', None)
+        if old_source and old_source not in sources:
+            sources.append(old_source)
+        if 'arjun' not in sources:
+            sources.append('arjun')
+        if method not in endpoint.setdefault('methods', []):
+            endpoint['methods'].append(method)
+        buckets = endpoint.setdefault('parameters', {})
+        for key in ('query', 'body', 'path'):
+            buckets.setdefault(key, [])
+        existing = {p['name']: p for p in buckets[position]}
+        added = 0
+        for name in params:
+            if name not in existing:
+                info = {'name': name, 'arjun_only': True, 'type': infer_parameter_type(name, []),
+                        'sample_values': [], 'category': classify_parameter(name)}
+                buckets[position].append(info)
+                existing[name] = info
+                added += 1
+            info = existing[name]
+            # Location is the legacy bucket; method/mode are additive evidence,
+            # never a claim that POST parameters were tested on the GET variant.
+            for key, value in (('arjun_methods', method), ('arjun_modes', mode)):
+                if value not in info.setdefault(key, []):
+                    info[key].append(value)
+        evidence = {'url': url, 'method': method, 'mode': mode,
+                    'position': position, 'params': params,
+                    'execution_status': result.get('execution_status', 'unknown')}
+        if evidence not in endpoint.setdefault('arjun_evidence', []):
+            endpoint['arjun_evidence'].append(evidence)
+        endpoint.setdefault('category', classify_endpoint(path, endpoint['methods'], buckets))
+        stats['arjun_params_discovered'] += added
+        stats['arjun_new_endpoints'] += int(is_new)
+        stats['arjun_existing_enriched'] += int(not is_new and added > 0)
+    reconcile_arjun_schema(by_base_url)
     return by_base_url, stats

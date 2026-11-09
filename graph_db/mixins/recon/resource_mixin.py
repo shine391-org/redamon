@@ -143,6 +143,13 @@ class ResourceMixin:
                         param_count = endpoint_info.get("parameter_count", {})
 
                         for method in methods:
+                            if endpoint_info.get('arjun_evidence'):
+                                param_count = {
+                                    position: sum(not p.get('arjun_only') or method in p.get('arjun_methods', [])
+                                                  for p in endpoint_info.get('parameters', {}).get(position, []))
+                                    for position in ('query', 'body', 'path')
+                                }
+                                param_count['total'] = sum(param_count.values())
                             endpoint_key = (base_url, path, method)
                             if endpoint_key in created_endpoints:
                                 continue
@@ -299,10 +306,13 @@ class ResourceMixin:
                                     p.sample_values = $sample_values,
                                     p.is_injectable = coalesce(p.is_injectable, false),
                                     p.source = 'resource_enum',
+                                    p.arjun_methods = COALESCE($arjun_methods, p.arjun_methods),
+                                    p.arjun_modes = COALESCE($arjun_modes, p.arjun_modes),
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
                                     p.ai_tool_arg_path = COALESCE($ai_tool_arg_path, p.ai_tool_arg_path),
                                     p.updated_at = datetime()
                                 """,
+                                arjun_methods=param.get("arjun_methods"), arjun_modes=param.get("arjun_modes"),
                                 name=param_name, position="query", endpoint_path=path, baseurl=base_url,
                                 user_id=user_id, project_id=project_id,
                                 param_type=param.get("type", "string"),
@@ -314,8 +324,9 @@ class ResourceMixin:
                             stats["parameters_created"] += 1
                             created_parameters.add(param_key)
 
-                            # Create relationship: Endpoint -[:HAS_PARAMETER]-> Parameter
-                            for method in methods:
+                            # New Arjun-only query parameters apply to its tested
+                            # method, not every request variant at the same path.
+                            for method in (param.get('arjun_methods', []) if param.get('arjun_only') else methods):
                                 session.run(
                                     """
                                     MATCH (e:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
@@ -353,10 +364,13 @@ class ResourceMixin:
                                     p.required = $required,
                                     p.is_injectable = coalesce(p.is_injectable, false),
                                     p.source = 'resource_enum',
+                                    p.arjun_methods = COALESCE($arjun_methods, p.arjun_methods),
+                                    p.arjun_modes = COALESCE($arjun_modes, p.arjun_modes),
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
                                     p.ai_tool_arg_path = COALESCE($ai_tool_arg_path, p.ai_tool_arg_path),
                                     p.updated_at = datetime()
                                 """,
+                                arjun_methods=param.get("arjun_methods"), arjun_modes=param.get("arjun_modes"),
                                 name=param_name, position="path", endpoint_path=path, baseurl=base_url,
                                 user_id=user_id, project_id=project_id,
                                 param_type=param.get("type", "string"),
@@ -409,10 +423,13 @@ class ResourceMixin:
                                     p.required = $required,
                                     p.is_injectable = coalesce(p.is_injectable, false),
                                     p.source = 'resource_enum',
+                                    p.arjun_methods = COALESCE($arjun_methods, p.arjun_methods),
+                                    p.arjun_modes = COALESCE($arjun_modes, p.arjun_modes),
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
                                     p.ai_tool_arg_path = COALESCE($ai_tool_arg_path, p.ai_tool_arg_path),
                                     p.updated_at = datetime()
                                 """,
+                                arjun_methods=param.get("arjun_methods"), arjun_modes=param.get("arjun_modes"),
                                 name=param_name, position="body", endpoint_path=path, baseurl=base_url,
                                 user_id=user_id, project_id=project_id,
                                 param_type=param.get("type", "string"),

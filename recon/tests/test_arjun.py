@@ -18,6 +18,22 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def _popen_adapter(callback):
+    """Keep the original command assertions, but exercise the current Popen API."""
+    def spawn(cmd, **kwargs):
+        proc = mock.MagicMock()
+        try:
+            completed = callback(cmd, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            proc.communicate.side_effect = [exc, ('', '')]
+            proc.returncode = -15
+        else:
+            proc.communicate.return_value = (completed.stdout, completed.stderr)
+            proc.returncode = completed.returncode
+        return proc
+    return spawn
+
+
 # ===========================================================================
 # merge_arjun_into_by_base_url tests
 # ===========================================================================
@@ -395,7 +411,6 @@ def test_merge_parameter_type_inference():
 # run_arjun_discovery tests (mocked subprocess)
 # ===========================================================================
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_builds_correct_command():
     """Verify the subprocess command is built correctly with all flags."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -411,7 +426,7 @@ def test_run_discovery_builds_correct_command():
                     json.dump({}, f)
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         run_arjun_discovery(
             target_urls=['https://example.com'],
             methods=['POST'],
@@ -465,7 +480,6 @@ def test_run_discovery_builds_correct_command():
     print("PASS: test_run_discovery_builds_correct_command")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_no_rate_limit_flag_when_zero():
     """--rate-limit flag should NOT be added when rate_limit is 0."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -480,7 +494,7 @@ def test_run_discovery_no_rate_limit_flag_when_zero():
                     json.dump({}, f)
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         run_arjun_discovery(
             target_urls=['https://example.com'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -494,7 +508,6 @@ def test_run_discovery_no_rate_limit_flag_when_zero():
     print("PASS: test_run_discovery_no_rate_limit_flag_when_zero")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_scope_filtering():
     """Out-of-scope results should be filtered into external_domains."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -512,7 +525,7 @@ def test_run_discovery_scope_filtering():
                     json.dump(arjun_output, f)
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         results, meta = run_arjun_discovery(
             target_urls=['https://example.com/api'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -552,7 +565,6 @@ def test_run_discovery_empty_targets():
     print("PASS: test_run_discovery_empty_targets")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_timeout_handling():
     """Subprocess timeout should be caught and return empty results."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -560,7 +572,7 @@ def test_run_discovery_timeout_handling():
     def mock_subprocess_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, kwargs.get('timeout', 60))
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         results, meta = run_arjun_discovery(
             target_urls=['https://example.com'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -570,12 +582,13 @@ def test_run_discovery_timeout_handling():
         )
 
     assert results == []
-    assert meta == {"external_domains": []}
+    assert meta["external_domains"] == []
+    assert meta["status"] == "partial"
+    assert meta["execution"][0]["timed_out"] is True
 
     print("PASS: test_run_discovery_timeout_handling")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_no_output_file():
     """If arjun produces no output file, should return empty results gracefully."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -584,7 +597,7 @@ def test_run_discovery_no_output_file():
         # Don't create the output file
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         results, meta = run_arjun_discovery(
             target_urls=['https://example.com'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -598,7 +611,6 @@ def test_run_discovery_no_output_file():
     print("PASS: test_run_discovery_no_output_file")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_malformed_json():
     """Malformed JSON in output file should be handled gracefully."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -610,7 +622,7 @@ def test_run_discovery_malformed_json():
                     f.write("{invalid json")
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         results, meta = run_arjun_discovery(
             target_urls=['https://example.com'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -624,7 +636,6 @@ def test_run_discovery_malformed_json():
     print("PASS: test_run_discovery_malformed_json")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_temp_dir_cleanup():
     """Temp directory should be cleaned up even on errors."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -641,7 +652,7 @@ def test_run_discovery_temp_dir_cleanup():
         raise RuntimeError("simulated crash")
 
     with mock.patch('recon.helpers.resource_enum.arjun_helpers.tempfile.mkdtemp', side_effect=tracking_mkdtemp):
-        with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+        with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
             results, meta = run_arjun_discovery(
                 target_urls=['https://example.com'],
                 methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -657,7 +668,6 @@ def test_run_discovery_temp_dir_cleanup():
     print("PASS: test_run_discovery_temp_dir_cleanup")
 
 
-@pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
 def test_run_discovery_urls_written_to_temp_file():
     """Target URLs should be written to temp file for -i flag."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -676,7 +686,7 @@ def test_run_discovery_urls_written_to_temp_file():
             json.dump({}, f)
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         run_arjun_discovery(
             target_urls=['https://a.com', 'https://b.com/path', 'http://c.com:8080'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -690,7 +700,6 @@ def test_run_discovery_urls_written_to_temp_file():
     print("PASS: test_run_discovery_urls_written_to_temp_file")
 
 
-@pytest.mark.skip(reason="stale mock target: arjun_helpers switched subprocess.run -> subprocess.Popen, so these mocks miss and real arjun spawns and hangs. Rewrite to patch Popen.")
 def test_run_discovery_custom_headers_empty():
     """Empty custom headers should NOT add --headers flag."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -705,7 +714,7 @@ def test_run_discovery_custom_headers_empty():
                     json.dump({}, f)
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         run_arjun_discovery(
             target_urls=['https://example.com'],
             methods=['GET'], threads=2, timeout=15, scan_timeout=600,
@@ -719,7 +728,6 @@ def test_run_discovery_custom_headers_empty():
     print("PASS: test_run_discovery_custom_headers_empty")
 
 
-@pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
 def test_run_discovery_multi_method_parallel():
     """Multiple methods should each spawn a subprocess and results should merge."""
     from recon.helpers.resource_enum.arjun_helpers import run_arjun_discovery
@@ -742,7 +750,7 @@ def test_run_discovery_multi_method_parallel():
                     json.dump(output, f)
         return subprocess.CompletedProcess(cmd, 0, '', '')
 
-    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.run', side_effect=mock_subprocess_run):
+    with mock.patch('recon.helpers.resource_enum.arjun_helpers.subprocess.Popen', side_effect=_popen_adapter(mock_subprocess_run)):
         results, meta = run_arjun_discovery(
             target_urls=['https://example.com/api'],
             methods=['GET', 'POST'],

@@ -342,6 +342,8 @@ Additional properties present on this node type, not yet described:
 - value (string): sample value if captured
 - sample_values (list[string]): values a crawler saw; never written for an archived (urlscan, GAU, ParamSpider) parameter
 - sample_value (string): a raw value only an older urlscan writer stored; no longer written, and the one-off urlscan backfill removes it
+- arjun_methods (list[string]): HTTP methods on which Arjun reported this parameter; evidence from the latest Arjun merge, not complete request coverage or a restriction on observations from other sources. Missing means unknown
+- arjun_modes (list[string]): Arjun input formats (GET, POST, JSON, XML); JSON/XML use the POST Endpoint with body position, not a synthetic JSON/XML HTTP method
 
 ### Technology & Security Nodes
 
