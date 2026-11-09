@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "base": "104f66cc5943a2eb5265edf190f39c4184b5e1ee",
+  "head_at_capture": "104f66cc5943a2eb5265edf190f39c4184b5e1ee",
+  "branch": "test/recon-quality-p0-baseline",
+  "dependency_commits": [],
+  "dependency_note": "HOLD approval has no source commit; no cherry-picks required",
+  "git_status_at_capture": "M recon/tests/test_nuclei_two_pass.py\n?? docs/recon-quality/\n?? recon/tests/fixtures/recon_quality/\n?? recon/tests/test_recon_quality_baseline.py",
+  "source_archive": {
+    "base": "104f66cc5943a2eb5265edf190f39c4184b5e1ee",
+    "fresh_archive_sha256": "b05b48d25248fa719fcb8631b4e470e7c03b959ea1e2bfcb85967df206cbb92f",
+    "archive_bytes": 251269120,
+    "old_missing_count": 0,
+    "changed": [
+      "docs/assets/agent.gif",
+      "docs/assets/exploit.gif",
+      "docs/assets/insights.gif",
+      "docs/assets/new_project.gif",
+      "docs/assets/recon-pipeline.gif",
+      "docs/assets/recon.gif",
+      "docs/assets/redamon-graph.gif",
+      "docs/assets/settings.gif"
+    ]
+  },
+  "images": [
+    {
+      "Id": "sha256:6990dc80a76d739d02c0a1a79c3cde50bee27ce39f129d48d1f3e58e1ebd5ae1",
+      "RepoDigests": [
+        "redamon-recon@sha256:6990dc80a76d739d02c0a1a79c3cde50bee27ce39f129d48d1f3e58e1ebd5ae1"
+      ],
+      "Architecture": "amd64",
+      "Os": "linux"
+    },
+    {
+      "Id": "sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb",
+      "RepoDigests": [
+        "projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb"
+      ],
+      "Architecture": "amd64",
+      "Os": "linux"
+    }
+  ],
+  "runner": {
+    "path": "docs/recon-quality/p0/run.py",
+    "sha256": "483408e95acadc5509f070c066edabbf1f4a380f6b571c45ab2bfac1a0067100",
+    "python": "3.11.18",
+    "pytest": "9.2.0",
+    "source_mount": "/work:ro",
+    "network": "none",
+    "docker_socket_mounted": false,
+    "root_filesystem": "read-only",
+    "tmpdir": "per-file host scratch mounted /scratch:rw",
+    "seed": 0,
+    "one_file_per_container": true,
+    "image_source_precedence": "PYTHONPATH=/work:/work/recon; cwd=/work",
+    "scope": "28 selected files, not the complete repository gate"
+  },
+  "templates": {
+    "schema_version": 1,
+    "algorithm": "sha256 canonical JSON sorted file entries; sort_keys=True,separators=(comma,colon)",
+    "tree_sha256": "fb00f0f3b95e0fdce796135771fa130707447511ee417f253aa24c40722c6db7",
+    "archive_sha256": "fe56c1bbf144fe75d113706025da79c498c4291ae124e718c41a6bcc3701ecc4",
+    "archive_bytes": 10834756,
+    "file_count": 14434,
+    "snapshot": "nuclei-templates.tar.gz (task review attachment)",
+    "source": "read-only nuclei-templates Docker volume; frozen prior attempt; independently archive/tree verified in recovery",
+    "used_by_unit_tests": false
+  },
+  "fixtures": {
+    "cases": 27,
+    "seed": 0,
+    "synthetic": true,
+    "corpus_sha256": "3dfbf29c7b2c7de49b48e7f2af08e62b118b2b65fa9d211939ceeb782a350107"
+  },
+  "results": {
+    "base": {
+      "tests": 812,
+      "passed": 786,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 14,
+      "xfail": 12
+    },
+    "candidate": {
+      "tests": 837,
+      "passed": 816,
+      "failed": 0,
+      "errors": 0,
+      "skipped": 14,
+      "xfail": 7
+    }
+  },
+  "candidate_commit_note": "This manifest records pre-P0 HEAD, not a self-referential commit hash; exact delivery SHA is in the kanban handoff. Production source equals base."
+}
