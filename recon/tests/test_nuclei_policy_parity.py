@@ -308,6 +308,233 @@ class TestEmptySelectionGuardAtTheCaller:
 
 
 # ---------------------------------------------------------------------------
+# 3b. The empty-selection refusal is caught at BOTH call sites
+# ---------------------------------------------------------------------------
+
+def _nuclei_finding(url="https://example.com/api?id=1"):
+    """A minimal parsed finding, shaped like parse_nuclei_finding() output."""
+    return {
+        "template_id": "cve-2024-x", "template_path": "http/cves/x.yaml",
+        "name": "X", "description": "", "severity": "high", "category": "cve",
+        "tags": ["cve"], "reference": [], "cves": [], "cvss_score": None,
+        "cvss_metrics": "", "cwe_id": [], "target": url, "matched_at": url,
+        "matcher_name": "", "extracted_results": [], "curl_command": "",
+        "request": "", "response": "", "timestamp": "2026-01-01T00:00:00", "raw": {},
+    }
+
+
+class TestEmptySelectionRefusalAtBothCallSites:
+    """DoD 3/5: neither pass may let an empty selection escape the caller.
+
+    The builder refuses a command with no template selection, and nuclei itself
+    fatals with "no templates provided for scan" when the exclusions remove
+    every template the policy picked. Both are ``NucleiEmptySelectionError`` and
+    both must be recorded as ``policy_empty`` with the enrichment still running.
+    """
+
+    def _patch_pipeline(self, monkeypatch, pass_impl):
+        monkeypatch.setattr(vs, "is_docker_installed", lambda: True)
+        monkeypatch.setattr(vs, "is_docker_running", lambda: True)
+        monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
+        monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
+        monkeypatch.setattr(vs, "extract_targets_from_recon",
+                            lambda rd: ([], ["example.com"], {}))
+        monkeypatch.setattr(vs, "build_target_urls",
+                            lambda h, i, rd, scan_all_ips=False: ["https://example.com"])
+        monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
+        monkeypatch.setattr(vs, "_execute_nuclei_pass", pass_impl)
+        monkeypatch.delenv("HOST_CUSTOM_TEMPLATES_PATH", raising=False)
+
+    def test_detection_build_refusal_keeps_cve_and_security_checks(self, monkeypatch):
+        """The guard at the DETECTION call site is caught structurally.
+
+        ``NUCLEI_SELECTED_CUSTOM_TEMPLATES`` makes the caller's pre-refusal
+        believe a custom template is available, but without
+        ``HOST_CUSTOM_TEMPLATES_PATH`` the builder cannot emit it, so
+        ``build_nuclei_command`` raises ``NucleiEmptySelectionError``. That
+        refusal must not propagate out of ``run_vuln_scan`` and skip the CVE
+        lookup and the security checks.
+        """
+        calls = {"cve": 0, "security": 0}
+
+        def fake_cve(**kwargs):
+            calls["cve"] += 1
+            return {"technology_cves": {"summary": {"total_cves": 0}}}
+
+        def fake_security(**kwargs):
+            calls["security"] += 1
+            return {"security_checks": {"findings": [{"check": "spf_missing"}]}}
+
+        self._patch_pipeline(monkeypatch, lambda *a, **k: ([], [], 1.0, 0))
+        monkeypatch.setattr(vs, "run_cve_lookup", fake_cve)
+        monkeypatch.setattr(vs, "run_security_checks", fake_security)
+
+        out = vs.run_vuln_scan(
+            _recon(),
+            settings=_settings(
+                NUCLEI_TAGS=[], NUCLEI_TEMPLATES=[], NUCLEI_CUSTOM_TEMPLATES=[],
+                NUCLEI_SELECTED_CUSTOM_TEMPLATES=["x.yaml"],
+                NUCLEI_DAST_MODE=False,
+                CVE_LOOKUP_ENABLED=True, SECURITY_CHECK_ENABLED=True,
+            ),
+        )
+
+        assert calls == {"cve": 1, "security": 1}
+        meta = out["vuln_scan"]["scan_metadata"]
+        assert meta["detection_not_executed"]["pass"] == "DETECTION"
+        assert meta["detection_not_executed"]["state"] == "not_executed"
+        assert meta["detection_not_executed"]["reason"] == "policy_empty"
+        assert "no nuclei templates selected" in meta["detection_not_executed"]["detail"].lower()
+        reasons = [row["reason"] for row in meta["coverage"]["hosts"].values()]
+        assert any("policy_empty" in (r or "") for r in reasons)
+
+    def test_detection_runtime_empty_selection_keeps_enrichment(self, monkeypatch):
+        """nuclei's own fatal at the DETECTION call site is policy_empty, not a crash."""
+        calls = {"cve": 0, "security": 0}
+
+        def fake_cve(**kwargs):
+            calls["cve"] += 1
+            return {"technology_cves": {"summary": {"total_cves": 0}}}
+
+        def fake_security(**kwargs):
+            calls["security"] += 1
+            return {"security_checks": {"findings": [{"check": "spf_missing"}]}}
+
+        def fatal_pass(cmd, output_file, label, runtime_cap=0, container_name=None):
+            raise NucleiEmptySelectionError(
+                "[FTL] Could not run nuclei: no templates provided for scan")
+
+        self._patch_pipeline(monkeypatch, fatal_pass)
+        monkeypatch.setattr(vs, "run_cve_lookup", fake_cve)
+        monkeypatch.setattr(vs, "run_security_checks", fake_security)
+
+        out = vs.run_vuln_scan(
+            _recon(),
+            settings=_settings(NUCLEI_DAST_MODE=False, CVE_LOOKUP_ENABLED=True,
+                               SECURITY_CHECK_ENABLED=True),
+        )
+
+        assert calls == {"cve": 1, "security": 1}
+        meta = out["vuln_scan"]["scan_metadata"]
+        assert meta["detection_not_executed"]["reason"] == "policy_empty"
+        assert "no templates provided for scan" in meta["detection_not_executed"]["detail"]
+
+    def test_dast_runtime_empty_selection_is_recorded_as_policy_empty(self, monkeypatch):
+        """DoD 3: the DAST policy_empty path is reachable, not defensive-only.
+
+        The operator's exclusions remove every template from Nuclei's -dast
+        pool, so nuclei fatals with "no templates provided for scan". That must
+        be recorded as ``dast_not_executed/policy_empty`` rather than a generic
+        ``failed``; the DETECTION findings are kept and nothing falls back to the
+        full template pool.
+        """
+        state = {"passes": []}
+
+        def fake_pass(cmd, output_file, label, runtime_cap=0, container_name=None):
+            state["passes"].append(label)
+            if label == "DAST":
+                raise NucleiEmptySelectionError(
+                    "[FTL] Could not run nuclei: no templates provided for scan")
+            return ([_nuclei_finding()], [], 1.0, 0)
+
+        self._patch_pipeline(monkeypatch, fake_pass)
+
+        out = vs.run_vuln_scan(
+            _recon(dast_urls=["https://example.com/api?id=1"]),
+            settings=_settings(),
+        )
+
+        assert state["passes"] == ["DETECTION", "DAST"]
+        meta = out["vuln_scan"]["scan_metadata"]
+        assert meta["dast_not_executed"]["pass"] == "DAST"
+        assert meta["dast_not_executed"]["state"] == "not_executed"
+        assert meta["dast_not_executed"]["reason"] == "policy_empty"
+        assert "no templates provided for scan" in meta["dast_not_executed"]["detail"]
+        assert meta["dast_pass_executed"] is False
+        # DETECTION findings survive; the DAST pass contributed nothing.
+        assert out["vuln_scan"]["summary"]["total_findings"] == 1
+        assert "cve-2024-x" in out["vuln_scan"]["by_template"]
+        reasons = [row["reason"] for row in meta["coverage"]["hosts"].values()]
+        assert any("policy_empty" in (r or "") for r in reasons)
+        # No fallback: the DAST argv never gained an inclusion filter.
+        assert "dast_urls_dropped_budget" not in meta
+
+    def test_dast_builder_refusal_still_recorded(self, monkeypatch):
+        """The builder's own refusal keeps the same policy_empty record."""
+        state = {"passes": []}
+
+        def fake_pass(cmd, output_file, label, runtime_cap=0, container_name=None):
+            state["passes"].append(label)
+            return ([], [], 1.0, 0)
+
+        self._patch_pipeline(monkeypatch, fake_pass)
+
+        real_build = vs.build_nuclei_command
+
+        def refusing_build(**kwargs):
+            if kwargs.get("force_dast_pass"):
+                raise NucleiEmptySelectionError("no Nuclei templates selected")
+            return real_build(**kwargs)
+
+        monkeypatch.setattr(vs, "build_nuclei_command", refusing_build)
+
+        out = vs.run_vuln_scan(
+            _recon(dast_urls=["https://example.com/api?id=1"]),
+            settings=_settings(),
+        )
+
+        assert state["passes"] == ["DETECTION"]
+        meta = out["vuln_scan"]["scan_metadata"]
+        assert meta["dast_not_executed"]["reason"] == "policy_empty"
+        assert meta["dast_pass_executed"] is False
+
+
+class TestExecuteNucleiPassEmptySelectionFatal:
+    """The executor surfaces nuclei's empty-selection fatal as the refusal."""
+
+    @staticmethod
+    def _proc(lines, rc=1):
+        class _P:
+            returncode = rc
+            stdout = iter(lines)
+
+            def wait(self):
+                return rc
+
+        return _P()
+
+    def test_empty_selection_fatal_raises(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vs.subprocess, "Popen", lambda *a, **k: self._proc(
+            ["[FTL] Could not run nuclei: no templates provided for scan\n"]))
+        out = tmp_path / "o.jsonl"
+        out.write_text("")
+        with pytest.raises(NucleiEmptySelectionError) as excinfo:
+            vs._execute_nuclei_pass(["docker", "run"], str(out), label="DAST")
+        assert "no templates provided for scan" in str(excinfo.value)
+
+    def test_a_generic_failure_still_returns_instead_of_raising(self, monkeypatch, tmp_path):
+        """The marker must not swallow an ordinary non-zero exit."""
+        monkeypatch.setattr(vs.subprocess, "Popen", lambda *a, **k: self._proc(
+            ["[FTL] Could not run nuclei: connection refused\n"]))
+        out = tmp_path / "o.jsonl"
+        out.write_text("")
+        findings, fps, duration, rc = vs._execute_nuclei_pass(
+            ["docker", "run"], str(out), label="DETECTION")
+        assert rc == 1
+        assert findings == []
+
+    @pytest.mark.parametrize("lines,expected", [
+        (["[FTL] Could not run nuclei: no templates provided for scan"],
+         "[FTL] Could not run nuclei: no templates provided for scan"),
+        (["[INF] Loaded 8000 templates", "[WRN] nothing to report"], None),
+        ([], None),
+        (None, None),
+    ])
+    def test_no_templates_fatal_detector(self, lines, expected):
+        assert vs._nuclei_no_templates_fatal(lines) == expected
+
+
+# ---------------------------------------------------------------------------
 # 4. Takeover: a separate explicit-template contract, not the global denylist
 # ---------------------------------------------------------------------------
 

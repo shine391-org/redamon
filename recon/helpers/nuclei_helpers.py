@@ -14,11 +14,16 @@ from .docker_helpers import NUCLEI_TEMPLATES_VOLUME
 
 
 class NucleiEmptySelectionError(ValueError):
-    """Raised when a Nuclei command would carry no template selection.
+    """Raised when a Nuclei pass would run with no template selection.
 
-    Distinct from a plain ValueError so a caller can catch the refusal
-    explicitly and record ``policy_empty``/``not_executed`` instead of
-    treating it as a generic build failure.
+    Two paths raise it: the builder refuses a command that would carry no
+    template selection (falling back to the whole default pool is the opposite
+    of the caller's policy), and the pass executor reports nuclei's own
+    "no templates provided for scan" fatal, which means the exclusions removed
+    every template the selection picked. Distinct from a plain ValueError so a
+    caller can catch the refusal explicitly and record
+    ``policy_empty``/``not_executed`` instead of treating it as a generic build
+    or scan failure.
     """
 
 
