@@ -156,12 +156,29 @@ class TestJsReconEndpointValidation:
             ep, 'https://example.test/api/v1/x', lines)
         assert 'X-Bug-Bounty' not in headers
 
-    def test_validate_extracted_endpoints_appends_identity_to_lines(self):
-        # The wiring: custom_header_lines get the identity appended before
-        # _parse_endpoint_validation_headers, in that module's settings flow.
-        src = __import__('inspect').getsource(
-            js_recon._validate_extracted_endpoints)
-        assert 'append_engagement_identity' in src
+    def test_validate_extracted_endpoints_sends_identity_on_probe(self):
+        # Runtime invocation with a capturing request_func: deleting the
+        # append inside _validate_extracted_endpoints must fail this test.
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, dict(kwargs.get('headers') or {})))
+            resp = mock.Mock(status_code=404)
+            return resp
+
+        ep = {'full_url': 'https://example.test/api/v1/x',
+              'method': 'GET', 'source_js': 'https://example.test/app.js'}
+        scope = js_recon._ProbeScope(hosts=frozenset({'example.test'}))
+        settings = dict(SETTINGS, JS_RECON_VALIDATE_ENDPOINTS=True,
+                        JS_RECON_ENDPOINT_CUSTOM_HEADERS=[])
+        with mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True), \
+             mock.patch.object(js_recon, '_js_skip', return_value=False):
+            out = js_recon._validate_extracted_endpoints(
+                [ep], settings, scope, request_func=fake_request)
+        assert calls, 'endpoint validation made no request'
+        for method, url, headers in calls:
+            assert headers.get('X-Bug-Bounty') == 'researcher-7f3', (method, url, headers)
+        assert out[0]['validation_status'] == 'not_hittable'
 
 
 class TestSourcemapFetches:
@@ -186,20 +203,63 @@ class TestSourcemapFetches:
                                     identity_headers={'X-Bug-Bounty': 'researcher-7f3'})
         assert g.call_args.kwargs['headers']['X-Bug-Bounty'] == 'researcher-7f3'
 
-    def test_discovery_computes_identity_once_from_settings(self):
-        src = __import__('inspect').getsource(
-            sm.discover_and_analyze_sourcemaps)
-        assert '_identity_request_headers(settings)' in src
+    def test_discovery_passes_identity_to_fetch(self):
+        # Runtime invocation: deleting the identity plumbing in
+        # discover_and_analyze_sourcemaps must fail this test.
+        seen = []
+
+        def fake_fetch(url, timeout=0, outcome=None, **kwargs):
+            seen.append(kwargs.get('identity_headers') or {})
+            return None
+
+        with mock.patch.object(sm, '_fetch_sourcemap', side_effect=fake_fetch):
+            sm.discover_and_analyze_sourcemaps(
+                [{'url': 'https://example.test/app.js', 'content': ''}],
+                dict(SETTINGS, JS_RECON_CONCURRENCY=1))
+        assert seen, 'sourcemap discovery made no fetch'
+        for headers in seen:
+            assert headers.get('X-Bug-Bounty') == 'researcher-7f3', headers
 
 
 class TestAiSurfaceRecon:
     def test_sessions_and_julius_receive_identity(self):
-        # The wiring points: run_ai_surface_recon computes identity_headers
-        # from settings and updates both sessions + passes it to Julius.
-        src = __import__('inspect').getsource(ai_surface_recon.run_ai_surface_recon)
-        assert 'engagement_identity_header' in src
-        assert src.count('session.headers.update(identity_headers)') == 2
-        assert '_probe_julius(base_url, timeout, ua, identity_headers)' in src
+        # Runtime invocation: run_ai_surface_recon with capturing probes
+        # must put the identity on the chat session it builds; deleting
+        # the _add_identity wiring must fail this test.
+        seen = {}
+
+        def fake_chat(base_url, cand, session, timeout, latency_on):
+            seen['session_headers'] = dict(session.headers)
+            return {}
+
+        class _Scope:
+            def skip_if_down(self, url):
+                return False
+
+            def finish(self, *a, **k):
+                pass
+
+        settings = dict(SETTINGS,
+                        AI_SURFACE_RECON_ENABLED=True,
+                        AI_SURFACE_RECON_CHAT_SHAPE_PROBE_ENABLED=True,
+                        AI_SURFACE_RECON_MCP_HANDSHAKE_ENABLED=False,
+                        AI_SURFACE_RECON_MCP_LIST_TOOLS_ENABLED=False,
+                        AI_SURFACE_RECON_MCP_YARA_ENABLED=False,
+                        AI_SURFACE_RECON_OPENAPI_DISCOVERY_ENABLED=False,
+                        AI_SURFACE_RECON_MODEL_LIST_ENABLED=False,
+                        AI_SURFACE_RECON_VECTOR_DB_READ_ENABLED=False,
+                        AI_SURFACE_RECON_JULIUS_PROBE_PACK_ENABLED=False,
+                        AI_SURFACE_RECON_LATENCY_BASELINE_ENABLED=False)
+        with mock.patch.object(ai_surface_recon, '_gather_candidates',
+                               return_value={'https://example.test': {}}), \
+             mock.patch.object(ai_surface_recon, '_probe_chat', side_effect=fake_chat), \
+             mock.patch('recon.helpers.roe_scope._check_roe_time_window',
+                        return_value=(True, 'ok')), \
+             mock.patch('recon.helpers.roe_scope._filter_roe_excluded',
+                        side_effect=lambda hosts, settings, label=None: list(hosts)), \
+             mock.patch('recon.helpers.circuit_breaker.scope', return_value=_Scope()):
+            ai_surface_recon.run_ai_surface_recon({'metadata': {}}, settings=settings)
+        assert seen.get('session_headers', {}).get('X-Bug-Bounty') == 'researcher-7f3', seen
 
     def test_probe_pack_session_carries_extra_headers(self):
         # A real probe (not an empty pack) so the session actually requests:
@@ -239,9 +299,49 @@ class TestOpenapiDiscovery:
         assert headers.get('X-Bug-Bounty') == 'researcher-7f3'
         assert headers.get('Accept') == 'application/json'
 
-    def test_discovery_source_wires_identity(self):
-        src = __import__('inspect').getsource(openapi_discovery)
-        assert 'append_engagement_identity(' in src
+    def test_discovery_fetch_carries_identity_on_the_wire(self):
+        # Runtime invocation through the real Fetcher: deleting the
+        # append in enqueue must fail this test.
+        import json as _json
+        import socket as _socket
+        calls = []
+
+        class _Resp:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, body):
+                self.body = _json.dumps(body).encode()
+
+            def iter_content(self, chunk_size):
+                yield self.body
+
+            def close(self):
+                pass
+
+        document = {'openapi': '3.0.3', 'info': {'title': 'Fx', 'version': '1'},
+                    'paths': {'/widgets': {'get': {'responses': {}}}}}
+
+        def fake_get(self, url, **kwargs):
+            calls.append((url, dict(kwargs.get('headers') or {})))
+            return _Resp(document)
+
+        openapi_discovery._reset_pacer()
+        try:
+            with mock.patch.object(_socket, 'getaddrinfo',
+                            lambda host, *a, **k: [(_socket.AF_INET, _socket.SOCK_STREAM, 6, '', ('198.51.100.10', 0))]), \
+                 mock.patch('requests.Session.get', fake_get):
+                result = openapi_discovery.run_openapi_discovery(
+                    {'domain': 'example.com'},
+                    {'TARGET_DOMAIN': 'example.com',
+                     'OPENAPI_SOURCES': [{'url': 'https://api.example.com/spec'}],
+                     'ENGAGEMENT_IDENTITY_HEADER': IDENTITY}, [])
+        finally:
+            openapi_discovery._reset_pacer()
+        assert calls, 'openapi discovery made no fetch'
+        for url, headers in calls:
+            assert headers.get('X-Bug-Bounty') == 'researcher-7f3', (url, headers)
+        assert result['documents'], result
 
 
 class TestThirdPartyUncovered:

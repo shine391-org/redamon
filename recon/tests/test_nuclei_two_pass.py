@@ -400,7 +400,7 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
         def _stub_extract_targets(recon_data):
             return ([], ["example.com"], {})
 
-        def _stub_build_target_urls(hostnames, ips, recon_data, scan_all_ips=False):
+        def _stub_build_target_urls(hostnames, ips, recon_data, scan_all_ips=False, **kw):
             return target_urls
 
         return [

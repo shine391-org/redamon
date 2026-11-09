@@ -1111,7 +1111,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # Organize discovered endpoints
     if katana_urls:
         print("\n[*][Katana] Organizing endpoints...")
-    organized_data = organize_endpoints(katana_urls)
+    organized_data = organize_endpoints(katana_urls, settings=settings)
 
     # Mark all Katana endpoints with sources=['katana'] (array format)
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -1127,7 +1127,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     if HAKRAWLER_ENABLED and hakrawler_urls:
         print("\n[*][Hakrawler] Organizing and merging endpoints...")
-        hakrawler_organized = organize_endpoints(hakrawler_urls)
+        hakrawler_organized = organize_endpoints(hakrawler_urls, settings=settings)
         organized_data['by_base_url'], hakrawler_stats = merge_hakrawler_into_by_base_url(
             hakrawler_organized['by_base_url'],
             organized_data['by_base_url'],
@@ -1255,6 +1255,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                         url, AI_PIPELINE_MODEL, max_extensions=6,
                         cache=fp_cache, user_id=user_id, project_id=project_id,
                         engine=('jev' if FFUF_AI_USE_JEV else 'llm'),
+                        settings=settings,
                     )
                 # Union of per-target extensions (single ffuf job uses one -e list).
                 effective_extensions = sorted({e for exts in ai_per_target.values() for e in exts})

@@ -97,12 +97,8 @@ def _js_failed(url, exc) -> None:
 
 def _identity_request_headers(settings) -> dict:
     """The validated engagement identity line as a header dict (or {})."""
-    from recon.helpers.auth_profile import engagement_identity_header
-    line = engagement_identity_header(settings)
-    if not line:
-        return {}
-    name, value = line.split(':', 1)
-    return {name.strip(): value.strip()}
+    from recon.helpers.auth_profile import identity_header_dict
+    return identity_header_dict(settings)
 
 
 def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
@@ -114,11 +110,12 @@ def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
     legitimate CDN redirects to public hosts still resolve. Returns the final
     ``requests.Response`` or ``None`` if a hop is unsafe / exceeds the hop cap.
 
-    ``extra_headers`` (engagement identity) is merged into every hop after the
-    caller's per-request headers, so attribution survives a redirect.
+    ``extra_headers`` (engagement identity) is merged into every hop with
+    the caller's per-request headers taking precedence (case-insensitively),
+    so attribution survives a redirect without ever duplicating a name.
     """
-    merged = dict(headers or {})
-    merged.update(extra_headers or {})
+    from recon.helpers.auth_profile import merge_identity_headers
+    merged = merge_identity_headers(headers or {}, extra_headers or {})
     current = url
     for _hop in range(max_redirects + 1):
         if not _download_allowed(current):

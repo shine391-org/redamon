@@ -73,14 +73,10 @@ def _roe_excluded(url: str, settings: dict) -> bool:
 def _identity_request_headers(settings) -> dict:
     """The validated engagement identity line as a header dict (or {})."""
     try:
-        from recon.helpers.auth_profile import engagement_identity_header
+        from recon.helpers.auth_profile import identity_header_dict
     except ImportError:  # spawned-container path
-        from auth_profile import engagement_identity_header
-    line = engagement_identity_header(settings)
-    if not line:
-        return {}
-    name, value = line.split(':', 1)
-    return {name.strip(): value.strip()}
+        from auth_profile import identity_header_dict
+    return identity_header_dict(settings)
 
 
 def _missing_key_control(map_url: str, timeout: int,
@@ -93,9 +89,11 @@ def _missing_key_control(map_url: str, timeout: int,
     if not is_url_safe_to_probe(control):
         return 'failed'
     try:
+        from recon.helpers.auth_profile import merge_identity_headers
         resp = requests.get(control, timeout=timeout,
-                            headers={**{'User-Agent': DEFAULT_BROWSER_UA},
-                                     **(identity_headers or {})},
+                            headers=merge_identity_headers(
+                                {'User-Agent': DEFAULT_BROWSER_UA},
+                                identity_headers or {}),
                             allow_redirects=False, verify=False)
     except requests.RequestException:
         return 'failed'
@@ -230,8 +228,9 @@ def _fetch_sourcemap(url: str, timeout: int = 10, outcome: Optional[dict] = None
         outcome['reason'] = 'unsafe'
         return None
 
-    headers = {'User-Agent': DEFAULT_BROWSER_UA}
-    headers.update(identity_headers or {})
+    from recon.helpers.auth_profile import merge_identity_headers
+    headers = merge_identity_headers({'User-Agent': DEFAULT_BROWSER_UA},
+                                     identity_headers or {})
     head_timeout = min(timeout, 5)
 
     try:

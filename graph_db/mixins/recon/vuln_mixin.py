@@ -338,7 +338,13 @@ class VulnMixin:
 
         vuln_scan_data = recon_data.get("vuln_scan") or {}
         technology_cves = recon_data.get("technology_cves") or {}
-        if not vuln_scan_data and not technology_cves.get("by_technology"):
+        # Malformed CVE container: treat as absent rather than raising.
+        if not isinstance(technology_cves, dict):
+            technology_cves = {}
+        by_technology = technology_cves.get("by_technology") or {}
+        if not isinstance(by_technology, dict):
+            by_technology = {}
+        if not vuln_scan_data and not by_technology:
             stats["errors"].append("No vuln_scan data found in recon_data")
             return stats
 
@@ -705,8 +711,6 @@ class VulnMixin:
             # =========================================================================
             # Process technology_cves - CVE, MitreData, and Capec nodes
             # =========================================================================
-            by_technology = technology_cves.get("by_technology", {})
-
             cves_created = 0
             mitre_stats = {"nodes": 0, "capec": 0, "rels": 0}  # Shared stats for MITRE processing
             cve_relationships_created = 0

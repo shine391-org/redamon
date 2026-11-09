@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Any, Set, Tuple
 from urllib.parse import quote, urlparse
+import contextvars
 import concurrent.futures
 
 from recon.helpers import catchall
@@ -51,6 +52,14 @@ _HH_SCOPE = None
 # exclusions no control may be sent to, for the same span.
 _CONTROL_CACHE: Optional[catchall.ControlCache] = None
 _ROE_EXCLUDED: Tuple[str, ...] = ()
+# Validated engagement identity headers for the run (attribution). Held in a
+# ContextVar, not a process global: two run_security_checks calls in
+# parallel threads must never see each other's headers. run_security_checks
+# sets it for its own span; every ThreadPoolExecutor submit below goes
+# through _submit_scoped so worker threads inherit the submitting run's
+# context (executor workers do not inherit contextvars on their own).
+_IDENTITY_HEADERS: contextvars.ContextVar = contextvars.ContextVar(
+    'redamon_security_check_identity_headers', default={})
 
 
 def _hh_alive(url) -> None:
@@ -75,7 +84,34 @@ def _hh_failed(url, exc) -> None:
         pass
 
 
+def _with_identity(kwargs: dict) -> dict:
+    """Merge the run's identity headers into a request's kwargs (caller wins).
+
+    Existing header names win case-insensitively (HTTP names are
+    case-insensitive): a caller ``x-bug-bounty`` suppresses the identity
+    ``X-Bug-Bounty`` instead of sending both casings.
+    """
+    identity = _IDENTITY_HEADERS.get()
+    if not identity:
+        return kwargs
+    from recon.helpers.auth_profile import merge_identity_headers
+    kwargs = dict(kwargs)
+    kwargs['headers'] = merge_identity_headers(kwargs.get('headers') or {}, identity)
+    return kwargs
+
+
+def _submit_scoped(executor, fn, *args):
+    """Submit ``fn`` to ``executor`` in the caller's context.
+
+    ThreadPoolExecutor workers start with an empty context, so without this
+    every check dispatched from run_security_checks would lose the run's
+    identity headers (and run with none, or worse, a stale one).
+    """
+    return executor.submit(contextvars.copy_context().run, fn, *args)
+
+
 def _hh_get(url, *args, **kwargs):
+    kwargs = _with_identity(kwargs)
     try:
         resp = requests.get(url, *args, **kwargs)
     except Exception as exc:
@@ -86,6 +122,7 @@ def _hh_get(url, *args, **kwargs):
 
 
 def _hh_post(url, *args, **kwargs):
+    kwargs = _with_identity(kwargs)
     try:
         resp = requests.post(url, *args, **kwargs)
     except Exception as exc:
@@ -96,6 +133,7 @@ def _hh_post(url, *args, **kwargs):
 
 
 def _hh_request(method, url, *args, **kwargs):
+    kwargs = _with_identity(kwargs)
     try:
         resp = requests.request(method, url, *args, **kwargs)
     except Exception as exc:
@@ -1049,7 +1087,7 @@ def run_direct_ip_checks(
 
     # Run IP checks in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ip = {executor.submit(check_single_ip, ip): ip for ip in ips}
+        future_to_ip = {_submit_scoped(executor, check_single_ip, ip): ip for ip in ips}
         for future in concurrent.futures.as_completed(future_to_ip):
             try:
                 ip_findings = future.result()
@@ -1225,7 +1263,7 @@ def run_tls_checks(
 
     # Run checks in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_host = {executor.submit(check_single_host, h): h for h in hostnames}
+        future_to_host = {_submit_scoped(executor, check_single_host, h): h for h in hostnames}
         for future in concurrent.futures.as_completed(future_to_host):
             try:
                 host_findings = future.result()
@@ -2141,7 +2179,7 @@ def run_auth_checks(
         return host_findings
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_host = {executor.submit(check_single_host, h): h for h in hostnames}
+        future_to_host = {_submit_scoped(executor, check_single_host, h): h for h in hostnames}
         for future in concurrent.futures.as_completed(future_to_host):
             try:
                 host_findings = future.result()
@@ -2786,7 +2824,7 @@ def run_port_service_checks(
         return ip_findings
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ip = {executor.submit(check_single_ip, ip, ports): ip for ip, ports in ips_to_check}
+        future_to_ip = {_submit_scoped(executor, check_single_ip, ip, ports): ip for ip, ports in ips_to_check}
         for future in concurrent.futures.as_completed(future_to_ip):
             try:
                 ip_findings = future.result()
@@ -2941,7 +2979,7 @@ def run_app_security_checks(
         return host_findings
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_host = {executor.submit(check_single_host, h): h for h in hostnames}
+        future_to_host = {_submit_scoped(executor, check_single_host, h): h for h in hostnames}
         for future in concurrent.futures.as_completed(future_to_host):
             try:
                 host_findings = future.result()
@@ -3205,7 +3243,7 @@ def run_rate_limit_checks(
         return host_findings
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_host = {executor.submit(check_single_host, h): h for h in hostnames}
+        future_to_host = {_submit_scoped(executor, check_single_host, h): h for h in hostnames}
         for future in concurrent.futures.as_completed(future_to_host):
             try:
                 host_findings = future.result()
@@ -3266,7 +3304,7 @@ def run_security_headers_checks(
 
     # Run checks in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_host = {executor.submit(check_single_host, h): h for h in hostnames}
+        future_to_host = {_submit_scoped(executor, check_single_host, h): h for h in hostnames}
         for future in concurrent.futures.as_completed(future_to_host):
             try:
                 host_findings = future.result()
@@ -3349,6 +3387,7 @@ def run_security_checks(
     ai_project_id: str = '',
     ai_engine: str = 'llm',
     roe_excluded_hosts: Optional[List[str]] = None,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run all enabled security checks on recon data.
@@ -3375,6 +3414,8 @@ def run_security_checks(
     _HH_SCOPE = _cb.scope((), label="SecurityCheck", unit="host(s)")
     _CONTROL_CACHE = catchall.ControlCache()
     _ROE_EXCLUDED = tuple(h for h in (roe_excluded_hosts or ()) if isinstance(h, str) and h.strip())
+    from recon.helpers.auth_profile import identity_header_dict as _identity_dict
+    _identity_token = _IDENTITY_HEADERS.set(_identity_dict(settings or {}))
     try:
         return _run_security_checks(
             recon_data, enabled_checks, timeout, tls_expiry_days, max_workers,
@@ -3386,6 +3427,7 @@ def run_security_checks(
         _HH_SCOPE = None
         _CONTROL_CACHE = None
         _ROE_EXCLUDED = ()
+        _IDENTITY_HEADERS.reset(_identity_token)
 
 
 def _run_security_checks(recon_data, enabled_checks, timeout, tls_expiry_days, max_workers,

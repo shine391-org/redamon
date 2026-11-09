@@ -285,7 +285,8 @@ def run_probe_packs(
     """
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent})
-    session.headers.update(extra_headers or {})
+    from recon.helpers.auth_profile import add_identity_headers
+    add_identity_headers(session.headers, extra_headers or {})
 
     ordered = probes
     if target_port:

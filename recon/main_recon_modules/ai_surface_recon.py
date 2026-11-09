@@ -703,15 +703,9 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     # auth_profile.engagement_identity_header). Attached unconditionally to
     # every target-reaching request this module makes; the third-party
     # enrichment/validators elsewhere are NOT touched.
-    try:
-        from recon.helpers.auth_profile import engagement_identity_header as _identity_line
-        _line = _identity_line(settings)
-    except Exception:
-        _line = None
-    identity_headers = {}
-    if _line:
-        _name, _val = _line.split(':', 1)
-        identity_headers = {_name.strip(): _val.strip()}
+    from recon.helpers.auth_profile import add_identity_headers as _add_identity
+    from recon.helpers.auth_profile import identity_header_dict as _identity_dict
+    identity_headers = _identity_dict(settings)
 
     candidates = _gather_candidates(combined_result, settings)
     # RoE host exclusion. A filter that cannot run cannot tell an excluded host
@@ -742,7 +736,7 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     def _analyze(base_url: str, cand: dict) -> tuple:
         session = requests.Session()
         session.headers.update({"User-Agent": ua})
-        session.headers.update(identity_headers)
+        _add_identity(session.headers, identity_headers)
         # Authenticated-session profile: attach the operator's auth headers when
         # this base_url is in scope (no-op otherwise). AI endpoints frequently sit
         # behind login; without this they answer 401 and look absent.
@@ -803,7 +797,7 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     if vectordb_on and not roe_filter_failed:
         vsession = requests.Session()
         vsession.headers.update({"User-Agent": ua})
-        vsession.headers.update(identity_headers)
+        _add_identity(vsession.headers, identity_headers)
         vector_db = _confirm_vector_dbs(combined_result, vsession, timeout)
 
     summary = {

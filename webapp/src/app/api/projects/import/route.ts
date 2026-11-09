@@ -33,6 +33,7 @@ import { validateSerializedScanChange } from '@/lib/reconSettings/serializedScan
 import { skillToggleWarnings, trimImportedSkillToggles } from '@/lib/userSkills'
 import { declaredBodyTooLarge } from '@/lib/roe/upload'
 import { internalError } from '@/lib/routeErrors'
+import { checkIdentityHeader } from '@/lib/reconSettings/validators'
 import { DEFAULT_IMPORT_MAX_UPLOAD_BYTES } from './limits'
 import { SCHEMA_DEFAULT_AGENT_MODEL, isLoopModel } from '@/lib/agentInTheLoop'
 
@@ -262,6 +263,20 @@ export async function POST(request: NextRequest) {
     // a nested write past that relation's own import checks (node filters
     // arriving armed, a run that never goes stale). Export writes columns only.
     const projectFields = pickProjectColumns(bundleFields)
+    // Identity-only fail-closed, before the project create below (the first
+    // production write of this import — there is no transaction wrapping
+    // the create and what follows, so refusing here is what keeps a bad
+    // bundle from writing anything). Absent is untouched, '' clears, and a
+    // present null/non-string is refused, matching validateValue.
+    if ('engagementIdentityHeader' in projectFields) {
+      const identity = projectFields.engagementIdentityHeader
+      if (identity !== '' && identity !== undefined) {
+        const problem = checkIdentityHeader(identity)
+        if (problem) {
+          return NextResponse.json({ error: `engagementIdentityHeader ${problem}.` }, { status: 400 })
+        }
+      }
+    }
     // Provider ids are account-scoped, even when the importing account owns one.
     delete projectFields.jevProviderId
 
@@ -347,8 +362,8 @@ export async function POST(request: NextRequest) {
     if (isLoopModel(projectFields.aiPipelineModel)) delete projectFields.aiPipelineModel
 
     // Create new project under the specified user
-    // The bundle's column values are not type-checked here (they never were);
-    // pickProjectColumns has already removed everything that is not a column.
+    // pickProjectColumns has already removed everything that is not a column;
+    // the identity header was checked above, before this first write.
     const newProject = await prisma.project.create({
       data: { ...projectFields, userId } as Prisma.ProjectUncheckedCreateInput,
     })

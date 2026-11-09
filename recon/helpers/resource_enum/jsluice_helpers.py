@@ -602,12 +602,13 @@ def _is_js_url(url: str) -> bool:
 
 def _identity_request_headers(settings) -> dict:
     """The engagement identity line as a requests/urllib header dict (or {})."""
-    from recon.helpers.auth_profile import engagement_identity_header
-    line = engagement_identity_header(settings)
-    if not line:
-        return {}
-    name, value = line.split(':', 1)
-    return {name.strip(): value.strip()}
+    from recon.helpers.auth_profile import identity_header_dict
+    return identity_header_dict(settings)
+
+
+def _merge_identity_headers(headers, identity) -> dict:
+    from recon.helpers.auth_profile import merge_identity_headers
+    return merge_identity_headers(headers, identity)
 
 
 def _download_js_files(
@@ -643,11 +644,10 @@ def _download_js_files(
         try:
             request = urllib.request.Request(
                 url,
-                headers={
+                headers=_merge_identity_headers({
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': '*/*',
-                    **extra_headers,
-                }
+                }, extra_headers)
             )
             response = opener.open(request, timeout=10)
             _jsl_alive(url)  # any response is life

@@ -685,6 +685,20 @@ class TestTechnologyCveOnlyInput(unittest.TestCase):
         self.assertTrue(stats["errors"])
         self.assertEqual(session.calls, [])
 
+    def test_malformed_cve_container_does_not_raise(self):
+        # A non-dict container / by_technology degrades to no CVE data,
+        # not a crash (the gate runs before any DB access).
+        for bad in ({"technology_cves": "junk"}, {"technology_cves": ["x"]},
+                    {"technology_cves": 123},
+                    {"technology_cves": {"by_technology": "junk"}},
+                    {"technology_cves": {"by_technology": ["x"]}}):
+            session = _Session()
+            stats = _writer(session).update_graph_from_vuln_scan(bad, U, P)
+            self.assertIsInstance(stats, dict, bad)
+            self.assertTrue(stats["errors"], bad)
+            self.assertEqual(session.calls, [], bad)
+            self.assertEqual(session.cve_links, [], bad)
+
 
 if __name__ == "__main__":
     unittest.main()

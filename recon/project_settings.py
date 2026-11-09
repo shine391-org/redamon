@@ -840,8 +840,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'AUTH_PROFILE': None,
     # Mandatory identity header ("Name: value") carried on every outgoing HTTP
     # request so the target's operators can attribute the traffic to this
-    # engagement. Empty sends none. Validated on write (webapp checkHeader) and
-    # re-validated defensively on read by engagement_identity_header().
+    # engagement. Empty sends none. Validated on write (webapp
+    # checkIdentityHeader, the identity-only contract) and re-validated
+    # defensively on read by engagement_identity_header().
     'ENGAGEMENT_IDENTITY_HEADER': '',
     'GRAPHQL_ENDPOINTS': '',
     'GRAPHQL_DEPTH_LIMIT': 10,

@@ -325,7 +325,7 @@ def engagement_identity_header(settings: Optional[dict]) -> Optional[str]:
     the tool's own ``-H`` set, so it is sent identically on the direct path and
     through the capture proxy, and survives the proxy's fail-open fallback.
 
-    Validated on write by the webapp (checkHeader) and re-validated here:
+    Validated on write by the webapp (checkIdentityHeader) and re-validated here:
     the value crosses a DB boundary and a scan that silently sent a forged or
     split header would be worse than one that sent none. Host / Authorization /
     Cookie / Proxy-* are refused — an identity header that changes where the
@@ -334,12 +334,21 @@ def engagement_identity_header(settings: Optional[dict]) -> Optional[str]:
     raw = (settings or {}).get('ENGAGEMENT_IDENTITY_HEADER')
     if not isinstance(raw, str) or not raw.strip():
         return None
-    if _CONTROL_CHARS_RE.search(raw) or any(d in raw for d in _TOOL_JOIN_DELIMITERS):
+    # CR/LF (and every other C0 control, plus the tool-join delimiters) are
+    # checked on the ORIGINAL input, before any strip: a value such as
+    # "X-BB: v\r\n" or "  \nX-BB: v" must be refused outright, not trimmed
+    # into a valid-looking line. Stripping first would silently launder a
+    # split attempt into a header the operator never wrote.
+    if ('\r' in raw or '\n' in raw or _CONTROL_CHARS_RE.search(raw)
+            or any(d in raw for d in _TOOL_JOIN_DELIMITERS)):
         return None
     line = raw.strip()
-    if len(line) > MAX_HEADER_VALUE_LEN + MAX_HEADER_NAME_LEN:
+    # Mirror the webapp's checkIdentityHeader bound on the RAW value (before
+    # strip): a value that could not be saved through the UI must not become
+    # sendable by arriving via the DB, even padded with spaces.
+    if len(raw) > 4096:
         return None
-    if line.count(':') < 1:
+    if ':' not in line:
         return None
     name, value = line.split(':', 1)
     name = sanitize_header_name(name)
@@ -350,8 +359,62 @@ def engagement_identity_header(settings: Optional[dict]) -> Optional[str]:
     return f"{name}: {value}"
 
 
-# Mirrors the webapp's checkHeader FORBIDDEN_HEADERS: names that change where
-# the request goes or what it carries, plus the proxy-* family.
+def identity_header_dict(settings: Optional[dict]) -> Dict[str, str]:
+    """The validated engagement identity line as a ``{name: value}`` dict.
+
+    The dict-shaped twin of :func:`engagement_identity_header` for the Python
+    ``requests``/``urllib`` paths, so callers do not each re-implement the
+    split. Empty dict when unset or invalid. Callers merging into an existing
+    header dict must go through :func:`merge_identity_headers` (or
+    :func:`add_identity_headers` for a session header mapping), which honors
+    the case-insensitive existing-header-wins rule of
+    :func:`append_engagement_identity`.
+    """
+    line = engagement_identity_header(settings)
+    if not line:
+        return {}
+    name, value = line.split(':', 1)
+    return {name.strip(): value.strip()}
+
+
+def merge_identity_headers(existing, identity) -> Dict[str, str]:
+    """New dict: ``existing`` plus ``identity``, existing names win.
+
+    HTTP header names are case-insensitive, so a plain ``dict.setdefault`` /
+    ``update`` would send the same header twice under different casings
+    (``X-Bug-Bounty`` from the identity line plus ``x-bug-bounty`` from the
+    caller). Comparison here is case-insensitive and the existing key's
+    casing and value are preserved; identity entries whose name matches an
+    existing name in any casing are dropped. Inputs are not mutated.
+    """
+    out = {}
+    existing_names = set()
+    for name, value in dict(existing or {}).items():
+        out[name] = value
+        existing_names.add(str(name).lower())
+    for name, value in dict(identity or {}).items():
+        if str(name).lower() not in existing_names:
+            out[name] = value
+    return out
+
+
+def add_identity_headers(headers, identity) -> None:
+    """Add ``identity`` entries to a header mapping in place, existing wins.
+
+    For ``requests`` session headers (a ``CaseInsensitiveDict``, whose
+    ``update`` would silently replace an existing header under a different
+    casing): only names absent in every casing are set.
+    """
+    existing_names = {str(name).lower() for name in headers}
+    for name, value in dict(identity or {}).items():
+        if str(name).lower() not in existing_names:
+            headers[name] = value
+
+
+# Mirrors the webapp's checkIdentityHeader forbidden set (validators.ts):
+# names that change where the request goes or what it carries, plus the
+# proxy-* family. The wider framing set lives only on the identity field on
+# both layers; generic custom headers keep the shared contract.
 _IDENTITY_FORBIDDEN_NAMES = frozenset({
     'host', 'authorization', 'cookie', 'proxy-authorization',
     'x-redamon-ctx', 'content-length', 'transfer-encoding', 'connection',

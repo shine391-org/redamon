@@ -69,15 +69,28 @@ class TestOutgoingHeader:
             {'ENGAGEMENT_IDENTITY_HEADER': f' {IDENTITY} '}) == IDENTITY
 
     def test_httpx_command_carries_it(self):
+        # Runtime invocation: deleting the append inside build_httpx_command
+        # must fail this test (a helper-only assertion would not).
         settings = dict(SETTINGS, ENGAGEMENT_IDENTITY_HEADER=IDENTITY,
                         HTTPX_CUSTOM_HEADERS=[])
-        import inspect
-        src = inspect.getsource(http_probe.build_httpx_command) if hasattr(
-            http_probe, 'build_httpx_command') else None
-        # The append happens before cmd construction; assert via the helper the
-        # module calls, which is the wiring this file pins.
-        merged = append_engagement_identity([], settings)
-        assert merged == [IDENTITY]
+        cmd = http_probe.build_httpx_command(
+            targets_file='/tmp/fake-targets.txt',
+            output_file='/tmp/fake-output.json',
+            settings=settings,
+        )
+        assert '-H' in cmd
+        idx = cmd.index('-H')
+        assert IDENTITY in cmd[idx:idx + 3]
+        assert cmd.count(IDENTITY) == 1
+
+    def test_httpx_command_without_identity_has_no_h(self):
+        cmd = http_probe.build_httpx_command(
+            targets_file='/tmp/fake-targets.txt',
+            output_file='/tmp/fake-output.json',
+            settings=dict(SETTINGS, HTTPX_CUSTOM_HEADERS=[]),
+        )
+        assert IDENTITY not in cmd
+        assert '-H' not in cmd
 
     def test_nuclei_auth_headers_get_the_identity_without_any_auth_profile(self):
         # No AUTH_PROFILE: identity must still be attached — an identity header
@@ -176,6 +189,20 @@ class TestHostSafetyAndDuplicates:
         settings = dict(SETTINGS, ENGAGEMENT_IDENTITY_HEADER=IDENTITY)
         out = append_engagement_identity(['x-bug-bounty: lower'], settings)
         assert out == ['x-bug-bounty: lower']
+
+    def test_raw_length_boundary_4096(self):
+        # RAW length (before strip) is the bound, matching the TS check.
+        exact = 'X-BB: ' + 'a' * 4090
+        assert len(exact) == 4096
+        assert engagement_identity_header({'ENGAGEMENT_IDENTITY_HEADER': exact}) is not None
+        over = 'X-BB: ' + 'a' * 4091
+        assert engagement_identity_header({'ENGAGEMENT_IDENTITY_HEADER': over}) is None
+
+    def test_padded_raw_over_4096_refused_even_if_stripped_fits(self):
+        padded = ' ' * 10 + IDENTITY  # stripped is short, raw <=4096 here
+        assert engagement_identity_header({'ENGAGEMENT_IDENTITY_HEADER': padded}) == IDENTITY
+        big_pad = ' ' * 4100 + IDENTITY
+        assert engagement_identity_header({'ENGAGEMENT_IDENTITY_HEADER': big_pad}) is None
 
     def test_input_list_not_mutated(self):
         settings = dict(SETTINGS, ENGAGEMENT_IDENTITY_HEADER=IDENTITY)

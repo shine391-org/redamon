@@ -389,6 +389,7 @@ def run_subdomain_takeover(
                         user_id=os.environ.get("USER_ID", ""),
                         project_id=os.environ.get("PROJECT_ID", ""),
                         engine=("jev" if ai_use_jev else "llm"),
+                        settings=settings,
                     )
                 except Exception as e:
                     # Never let AI failure abort the takeover scan -- emit warning
@@ -994,7 +995,7 @@ def _lookup_cname_from_dns(dns_data: dict, hostname: str) -> Optional[str]:
     return None
 
 
-def _probe_for_ai_disambiguation(hostname: str, timeout: int = 10):
+def _probe_for_ai_disambiguation(hostname: str, timeout: int = 10, settings: Optional[dict] = None):
     """
     Probe `hostname` and capture the response so the AI classifier has
     something to look at. Returns (status_code, headers_dict, body_text)
@@ -1011,7 +1012,10 @@ def _probe_for_ai_disambiguation(hostname: str, timeout: int = 10):
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     schemes = ("https", "http")
-    headers_base = {"User-Agent": "Mozilla/5.0 (compatible; RedAmon/4.7)"}
+    from recon.helpers.auth_profile import identity_header_dict, merge_identity_headers
+    headers_base = merge_identity_headers(
+        {"User-Agent": "Mozilla/5.0 (compatible; RedAmon/4.7)"},
+        identity_header_dict(settings))
     for scheme in schemes:
         try:
             r = requests.get(
@@ -1040,6 +1044,7 @@ def _apply_ai_waf_disambiguation(
     user_id: str,
     project_id: str,
     engine: str = "llm",
+    settings: Optional[dict] = None,
 ) -> None:
     """
     For each takeover finding, probe the hostname, short-circuit on
@@ -1064,7 +1069,7 @@ def _apply_ai_waf_disambiguation(
             if not hostname:
                 continue
 
-            status, headers, body = _probe_for_ai_disambiguation(hostname)
+            status, headers, body = _probe_for_ai_disambiguation(hostname, settings=settings)
             if status is None:
                 # Probe failed (DNS/connect) -- can't classify, leave the
                 # finding to the static pipeline. Most NXDOMAIN takeover

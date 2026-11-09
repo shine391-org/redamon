@@ -197,7 +197,7 @@ def run_katana(config: dict) -> None:
     print(f"[+][Partial Recon] Katana found {len(katana_urls)} URLs")
 
     # Organize discovered URLs into by_base_url structure
-    organized_data = organize_endpoints(katana_urls)
+    organized_data = organize_endpoints(katana_urls, settings=settings)
 
     # Mark all endpoints with sources=['katana']
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -468,7 +468,7 @@ def run_hakrawler(config: dict) -> None:
     print(f"[+][Partial Recon] Hakrawler found {len(hakrawler_urls)} URLs")
 
     # Organize discovered URLs into by_base_url structure
-    organized_data = organize_endpoints(hakrawler_urls)
+    organized_data = organize_endpoints(hakrawler_urls, settings=settings)
 
     # Mark all endpoints with sources=['hakrawler']
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -1136,6 +1136,7 @@ def run_ffuf(config: dict) -> None:
                 url, AI_PIPELINE_MODEL, max_extensions=6,
                 cache=fp_cache, user_id=ai_user_id, project_id=ai_project_id,
                 engine=('jev' if FFUF_AI_USE_JEV else 'llm'),
+                settings=settings,
             )
         effective_extensions = sorted({e for exts in ai_per_target.values() for e in exts})
         print(f"[*][Partial Recon][FFuf] AI selected {len(effective_extensions)} unique extensions: {effective_extensions}")
