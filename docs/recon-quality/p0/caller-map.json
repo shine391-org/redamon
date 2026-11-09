@@ -1,0 +1,451 @@
+{
+  "base": "104f66cc5943a2eb5265edf190f39c4184b5e1ee",
+  "method": "AST direct calls; dynamic dispatch expanded in CALLERS.md",
+  "calls": [
+    {
+      "path": "recon/cache_scan/scanner.py",
+      "line": 144,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 634,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 639,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 694,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 718,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 725,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 747,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 936,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 991,
+      "callee": "_merge_isolated_result"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 993,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 999,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1229,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1247,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1315,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1347,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1355,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1372,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1421,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1437,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1444,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1457,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1465,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1471,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1484,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1496,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1510,
+      "callee": "run_vuln_scan"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1512,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1520,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1526,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1560,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1884,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1915,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 1991,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2020,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2028,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2063,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2120,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2141,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2149,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2177,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2194,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2208,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2217,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2223,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2243,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2261,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2312,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2317,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2324,
+      "callee": "save_recon_file"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2804,
+      "callee": "merge_batch_outputs"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2824,
+      "callee": "_prune_recon_findings"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2896,
+      "callee": "_write_coverage_record"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2897,
+      "callee": "_prune_recon_findings"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 2926,
+      "callee": "_prune_recon_findings"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 3273,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 3330,
+      "callee": "run_vuln_scan"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 3351,
+      "callee": "update_graph_from_vuln_scan"
+    },
+    {
+      "path": "recon/main.py",
+      "line": 3460,
+      "callee": "_write_coverage_record"
+    },
+    {
+      "path": "recon/main_recon_modules/resource_enum.py",
+      "line": 689,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/main_recon_modules/resource_enum.py",
+      "line": 1265,
+      "callee": "run_ffuf_discovery"
+    },
+    {
+      "path": "recon/main_recon_modules/resource_enum.py",
+      "line": 1373,
+      "callee": "run_arjun_discovery"
+    },
+    {
+      "path": "recon/main_recon_modules/subdomain_takeover.py",
+      "line": 662,
+      "callee": "build_nuclei_command"
+    },
+    {
+      "path": "recon/main_recon_modules/vuln_scan.py",
+      "line": 579,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/main_recon_modules/vuln_scan.py",
+      "line": 797,
+      "callee": "build_nuclei_command"
+    },
+    {
+      "path": "recon/main_recon_modules/vuln_scan.py",
+      "line": 837,
+      "callee": "build_nuclei_command"
+    },
+    {
+      "path": "recon/main_recon_modules/vuln_scan.py",
+      "line": 1230,
+      "callee": "run_vuln_scan"
+    },
+    {
+      "path": "recon/main_recon_modules/vuln_scan.py",
+      "line": 1254,
+      "callee": "run_vuln_scan"
+    },
+    {
+      "path": "recon/partial_recon_modules/endpoint_ai_classification.py",
+      "line": 186,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/openapi_recon.py",
+      "line": 159,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/osint_enrichment.py",
+      "line": 416,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/parameter_discovery.py",
+      "line": 164,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/parameter_discovery.py",
+      "line": 282,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/partial_recon_modules/parameter_discovery.py",
+      "line": 443,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/parameter_discovery.py",
+      "line": 686,
+      "callee": "run_arjun_discovery"
+    },
+    {
+      "path": "recon/partial_recon_modules/parameter_discovery.py",
+      "line": 775,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/vulnerability_scanning.py",
+      "line": 169,
+      "callee": "run_vuln_scan"
+    },
+    {
+      "path": "recon/partial_recon_modules/vulnerability_scanning.py",
+      "line": 262,
+      "callee": "update_graph_from_vuln_scan"
+    },
+    {
+      "path": "recon/partial_recon_modules/vulnerability_scanning.py",
+      "line": 726,
+      "callee": "update_graph_from_vuln_scan"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 134,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 232,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 403,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 503,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 705,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 854,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 1027,
+      "callee": "build_target_urls"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 1147,
+      "callee": "run_ffuf_discovery"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 1202,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 1496,
+      "callee": "update_graph_from_resource_enum"
+    },
+    {
+      "path": "recon/partial_recon_modules/web_crawling.py",
+      "line": 1789,
+      "callee": "update_graph_from_resource_enum"
+    }
+  ]
+}
