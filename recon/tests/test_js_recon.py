@@ -994,16 +994,19 @@ class TestEndpointValidationHelpers(unittest.TestCase):
 
         self.assertEqual(url, '')
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
-    def test_validate_extracted_endpoints_marks_accepted_status_hittable(self):
+    @mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True)
+    def test_validate_extracted_endpoints_marks_accepted_status_hittable(self, _mock=None):
         calls = []
 
         class Response:
             status_code = 403
 
+        class Missing:
+            status_code = 404
+
         def request_func(method, url, **kwargs):
             calls.append((method, url, kwargs))
-            return Response()
+            return Missing() if '/rdm-' in url else Response()
 
         endpoints = [{
             'path': '/admin',
@@ -1026,12 +1029,15 @@ class TestEndpointValidationHelpers(unittest.TestCase):
         self.assertEqual(calls[0][2]['headers']['Cookie'], 'session=abc123')
         self.assertFalse(calls[0][2]['allow_redirects'])
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
-    def test_validate_extracted_endpoints_does_not_replay_mutating_methods(self):
+    @mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True)
+    def test_validate_extracted_endpoints_does_not_replay_mutating_methods(self, _mock=None):
         calls = []
 
         class Response:
             status_code = 204
+
+        class Missing:
+            status_code = 404
 
         endpoints = [{
             'path': '/api/user/123',
@@ -1043,14 +1049,15 @@ class TestEndpointValidationHelpers(unittest.TestCase):
             endpoints,
             {'JS_RECON_VALIDATE_ENDPOINTS': True},
             _EXAMPLE_SCOPE,
-            request_func=lambda method, url, **kwargs: calls.append((method, url, kwargs)) or Response(),
+            request_func=lambda method, url, **kwargs: calls.append((method, url, kwargs)) or (
+                Missing() if '/rdm-' in url else Response()),
         )
 
         self.assertEqual(validated[0]['validation_status'], 'hittable')
         self.assertEqual(calls[0][0], 'OPTIONS')
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
-    def test_validate_extracted_endpoints_does_not_send_custom_headers_cross_origin(self):
+    @mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True)
+    def test_validate_extracted_endpoints_does_not_send_custom_headers_cross_origin(self, _mock=None):
         calls = []
 
         class Response:
@@ -1081,8 +1088,8 @@ class TestEndpointValidationHelpers(unittest.TestCase):
         self.assertNotIn('Authorization', headers)
         self.assertEqual(headers['User-Agent'], 'Mozilla/5.0 (compatible; RedAmon-JsRecon/1.0)')
 
-    @pytest.mark.xfail(strict=True, reason="Part H triage (bucket-3): behavior/mapping/shape drifted from this assertion post-refactor; correctness unconfirmed - see green-up report")
-    def test_validate_extracted_endpoints_keeps_404_as_not_hittable(self):
+    @mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True)
+    def test_validate_extracted_endpoints_keeps_404_as_not_hittable(self, _mock=None):
         class Response:
             status_code = 404
 
@@ -1104,6 +1111,49 @@ class TestEndpointValidationHelpers(unittest.TestCase):
         self.assertEqual(validated[0]['status_code'], 404)
         self.assertEqual(validated[0]['resolved_url'], 'https://api.example.com/missing')
         self.assertEqual(validated[0]['validation_error'], '')
+
+    @mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True)
+    def test_validation_timeout_is_unknown_keeps_evidence(self, _mock=None):
+        """Timeout là unknown với lớp lỗi, raw candidate và evidence giữ nguyên;
+        endpoint không bị xóa khỏi kết quả validation."""
+        endpoints = [{
+            'full_url': 'https://api.example.com/slow',
+            'method': 'GET',
+        }]
+
+        def request_func(method, url, **kwargs):
+            raise requests.Timeout("connect timeout")
+
+        validated = js_recon._validate_extracted_endpoints(
+            endpoints, {'JS_RECON_VALIDATE_ENDPOINTS': True}, _EXAMPLE_SCOPE,
+            request_func=request_func,
+        )
+
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0]['validation_status'], 'unknown')
+        self.assertEqual(validated[0]['validation_error'], 'Timeout')
+        self.assertEqual(validated[0]['resolved_url'], 'https://api.example.com/slow')
+        self.assertNotIn('status_code', validated[0])
+
+    @mock.patch.object(js_recon, 'is_url_safe_to_probe', return_value=True)
+    def test_validation_connection_error_is_unknown_keeps_evidence(self, _mock=None):
+        """Lỗi kết nối cũng là unknown (không dead) và giữ evidence."""
+        endpoints = [{
+            'full_url': 'https://api.example.com/down',
+            'method': 'GET',
+        }]
+
+        def request_func(method, url, **kwargs):
+            raise requests.ConnectionError("refused")
+
+        validated = js_recon._validate_extracted_endpoints(
+            endpoints, {'JS_RECON_VALIDATE_ENDPOINTS': True}, _EXAMPLE_SCOPE,
+            request_func=request_func,
+        )
+
+        self.assertEqual(validated[0]['validation_status'], 'unknown')
+        self.assertEqual(validated[0]['validation_error'], 'ConnectionError')
+        self.assertEqual(validated[0]['resolved_url'], 'https://api.example.com/down')
 
     def test_validate_extracted_endpoints_uploaded_relative_is_unvalidated(self):
         calls = []

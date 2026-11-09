@@ -67,7 +67,11 @@ class GraphClient(JsReconMixin):
 
 
 class TestJsReconGraphIngestion(unittest.TestCase):
-    def test_only_confirmed_dead_endpoints_are_dropped_with_validation_metadata_and_id(self):
+    def test_all_endpoints_are_ingested_as_observations_only_hittable_is_verified(self):
+        """not_hittable (404), unknown (timeout) và catch_all (SPA shell) đều
+        được viết vào graph như observation kèm evidence; không endpoint nào
+        bị xóa vì validation_status. Reader lọc verified surface bằng
+        validation_status == 'hittable'."""
         client = GraphClient()
         recon_data = {
             "domain": "example.com",
@@ -85,17 +89,35 @@ class TestJsReconGraphIngestion(unittest.TestCase):
                         "resolved_url": "https://example.com/api/live",
                     },
                     {
-                        "path": "/api/dead",
+                        "path": "/api/missing",
                         "method": "GET",
                         "source_js": "https://example.com/app.js",
                         "base_url": "https://example.com",
+                        "full_url": "https://example.com/missing",
                         "validation_status": "not_hittable",
+                        "status_code": 404,
+                        "resolved_url": "https://example.com/missing",
+                        "validation_error": "",
                     },
                     {
-                        "path": "/api/unknown",
+                        "path": "/api/slow",
                         "method": "GET",
                         "source_js": "https://example.com/app.js",
                         "base_url": "https://example.com",
+                        "full_url": "https://example.com/slow",
+                        "validation_status": "unknown",
+                        "validation_error": "Timeout",
+                        "resolved_url": "https://example.com/slow",
+                    },
+                    {
+                        "path": "/api/spa",
+                        "method": "GET",
+                        "source_js": "https://example.com/app.js",
+                        "base_url": "https://example.com",
+                        "full_url": "https://example.com/spa",
+                        "validation_status": "catch_all",
+                        "status_code": 200,
+                        "resolved_url": "https://example.com/spa",
                     },
                 ],
             },
@@ -108,27 +130,23 @@ class TestJsReconGraphIngestion(unittest.TestCase):
             if "MERGE (e:Endpoint" in query
         ]
         ingested_paths = {kwargs["path"] for kwargs in endpoint_calls}
-        # 'hittable' and the un-probed 'unknown' endpoint are ingested; only the
-        # probe-confirmed 'not_hittable' endpoint is dropped.
-        self.assertEqual(stats["endpoints_created"], 2)
-        self.assertEqual(ingested_paths, {"/api/live", "/api/unknown"})
-        self.assertNotIn("/api/dead", ingested_paths)
+        self.assertEqual(stats["endpoints_created"], 4)
+        self.assertEqual(
+            ingested_paths, {"/api/live", "/api/missing", "/api/slow", "/api/spa"})
 
-        live_call = next(k for k in endpoint_calls if k["path"] == "/api/live")
-        expected_hash = hashlib.sha256(
-            "https://example.com:POST:/api/live".encode()
-        ).hexdigest()[:16]
-        self.assertEqual(live_call["id"], f"endpoint-u1-p1-js-{expected_hash}")
-        self.assertEqual(live_call["validation_status"], "hittable")
-        self.assertEqual(live_call["status_code"], 200)
-        self.assertEqual(live_call["resolved_url"], "https://example.com/api/live")
-        link_calls = [
-            (query, kwargs) for query, kwargs in client.driver.session_obj.calls
-            if "MERGE (file)-[r:HAS_ENDPOINT]->(n)" in query
-        ]
-        self.assertEqual(len(link_calls), 2)
-        self.assertIn("MATCH (n:Endpoint {path: $path, method: $method, baseurl: $baseurl", link_calls[0][0])
-        self.assertNotIn("MATCH (n:Endpoint {id: $nid})", link_calls[0][0])
+        # Evidence của not_hittable và unknown được giữ qua artifact->graph.
+        missing_call = next(k for k in endpoint_calls if k["path"] == "/api/missing")
+        self.assertEqual(missing_call["validation_status"], "not_hittable")
+        self.assertEqual(missing_call["status_code"], 404)
+        self.assertEqual(missing_call["resolved_url"], "https://example.com/missing")
+        slow_call = next(k for k in endpoint_calls if k["path"] == "/api/slow")
+        self.assertEqual(slow_call["validation_status"], "unknown")
+        self.assertEqual(slow_call["validation_error"], "Timeout")
+        self.assertEqual(slow_call["resolved_url"], "https://example.com/slow")
+
+        # Không query xóa gì, và không có lỗi ghi.
+        for query, _ in client.driver.session_obj.calls:
+            self.assertNotRegex(query, r"\bDELETE\b|\bREMOVE\s+\w+:")
         self.assertEqual(stats["errors"], [])
 
     def test_a_template_literal_endpoint_keeps_its_template(self):
@@ -226,9 +244,10 @@ class TestJsReconGraphIngestion(unittest.TestCase):
         self.assertEqual({k["path"] for k in endpoint_calls}, {"/api/a", "/api/b"})
         self.assertEqual(stats["errors"], [])
 
-    def test_a_catch_all_endpoint_is_dropped_like_a_dead_one(self):
+    def test_a_catch_all_endpoint_is_kept_as_catch_all_like_observation(self):
         # The host answered a made-up path the same way (an SPA shell), so the
-        # path's "hittable" status proved nothing: no Endpoint node for it.
+        # path's "hittable" status proved nothing: it is kept as a
+        # catch_all_like observation instead of being deleted.
         client = GraphClient()
         ep = {"method": "GET", "source_js": "https://example.com/app.js", "base_url": "https://example.com"}
         recon_data = {
@@ -248,10 +267,11 @@ class TestJsReconGraphIngestion(unittest.TestCase):
             kwargs for query, kwargs in client.driver.session_obj.calls
             if "MERGE (e:Endpoint" in query
         ]
-        self.assertEqual({k["path"] for k in endpoint_calls}, {"/api/v1"})
-        self.assertEqual(stats["endpoints_created"], 1)
+        self.assertEqual({k["path"] for k in endpoint_calls}, {"/api/read", "/api/v1"})
+        self.assertEqual(stats["endpoints_created"], 2)
         linked_paths = {k.get("path") for q, k in client.driver.session_obj.calls if "HAS_ENDPOINT" in q}
-        self.assertNotIn("/api/read", linked_paths)
+        self.assertIn("/api/read", linked_paths)
+        self.assertIn("/api/v1", linked_paths)
 
 
 class TestJsReconFindingPackageFields(unittest.TestCase):
