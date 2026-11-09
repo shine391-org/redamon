@@ -130,17 +130,46 @@ def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
 MAX_DECLARED_NUCLEI_URLS = 500
 
 
+from urllib.parse import quote as _q
+
+
 def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
-    """The URL with sample query values for GET-style scanning, else the bare path."""
+    """The URL with sample query values for GET-style scanning, else the bare path.
+
+    Preserve a raw discovered sample URL verbatim when one is available so that
+    its original encoding (and any decoded/ambiguous characters) is not
+    re-encoded or lost. Only rebuild the query string from decoded parameter
+    tuples when no sample URL exists, encoding each component so the result
+    round-trips through the standard parsers without double-encoding.
+    """
+    endpoint_info = endpoint_info or {}
+    sample_urls = endpoint_info.get("sample_urls") or []
+    if isinstance(sample_urls, str):
+        sample_urls = [sample_urls]
+    if sample_urls and isinstance(sample_urls[0], str) and sample_urls[0].strip():
+        return sample_urls[0]
+    single = endpoint_info.get("sample_url")
+    if isinstance(single, str) and single.strip():
+        return single
+
     params = (endpoint_info.get("parameters") or {}).get("query") or []
     parts = []
     for param in params:
         name = param.get("name")
         if not name:
             continue
-        sample_values = param.get("sample_values") or []
-        parts.append(f"{name}={sample_values[0] if sample_values else '1'}")
-    return f"{base_url}{path}?{'&'.join(parts)}" if parts else f"{base_url}{path}"
+        sample_values = param.get("sample_values")
+        if sample_values:
+            # Preserve an explicit empty value rather than substituting '1'.
+            value = sample_values[0]
+            if value is None:
+                value = ""
+        else:
+            value = "1"
+        parts.append(f"{_q(str(name), safe='')}={_q(str(value), safe='')}")
+    if not parts:
+        return f"{base_url}{path}"
+    return f"{base_url}{path}?{'&'.join(parts)}"
 
 
 def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> Tuple[List[str], List[str]]:
