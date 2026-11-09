@@ -136,3 +136,45 @@ def test_a_host_no_pass_targeted_gets_no_row(pipeline):
     recon["http_probe"]["by_url"]["https://other.example.com"] = {"status_code": 200}
     cov = _coverage(vs.run_vuln_scan(recon, settings=_settings()))
     assert _row(cov, "other.example.com") is None
+
+
+# --- F07: a selective run never completes an origin it only partly checked ---
+
+def test_a_partial_scope_selection_never_marks_a_host_complete(pipeline):
+    """A run that selected a subset of its baseline (a partial run's explicit
+    target/template limit) is never ``complete``, however cleanly the selected
+    pass exited."""
+    pipeline["result"] = ([_finding(f"https://{APP}/login?next=1")], [], 3.0, 0)
+    cov = _coverage(vs.run_vuln_scan(
+        _recon(), settings=_settings(),
+        selection_hint={"scope": "partial", "reason": "selected targets/templates"}))
+    assert _row(cov, APP) == {"status": "partial", "inputs": 2, "outputs": 1,
+                              "reason": "selected targets/templates"}
+    assert _row(cov, WWW) == {"status": "partial", "inputs": 1, "outputs": 0,
+                              "reason": "selected targets/templates"}
+
+
+def test_ai_pruned_tags_never_mark_a_host_complete(pipeline, monkeypatch):
+    """The production selective path: the AI tag selector pruned a tag, so the
+    run re-checked only part of its configured baseline."""
+    monkeypatch.setattr("recon.helpers.ai_planner.nuclei_tags.get_ai_tags",
+                        lambda **kw: ["cve"])
+    pipeline["result"] = ([], [], 3.0, 0)
+    cov = _coverage(vs.run_vuln_scan(
+        _recon(), settings=_settings(NUCLEI_TAGS=["cve", "xss"], NUCLEI_AI_TAGS=True)))
+    assert _row(cov, APP) == {"status": "partial", "inputs": 2, "outputs": 0,
+                              "reason": "selected targets/templates"}
+    assert _row(cov, WWW)["status"] == "partial"
+
+
+def test_the_coverage_helper_downgrades_a_clean_pass_when_not_exhaustive():
+    """The downgrade itself: one clean pass is still partial for a run whose
+    selection was a strict subset of its configured baseline."""
+    cov = vs._nuclei_coverage("2026-01-01T00:00:00+00:00",
+                              [(TARGETS, "complete", None, True)], [], exhaustive=False)
+    assert cov["hosts"][base_url_key(f"https://{APP}")]["status"] == "partial"
+    assert cov["hosts"][base_url_key(f"https://{APP}")]["reason"] == "selected targets/templates"
+    # An exhaustive run keeps the plain reading of the same pass.
+    clean = vs._nuclei_coverage("2026-01-01T00:00:00+00:00",
+                                [(TARGETS, "complete", None, True)], [])
+    assert clean["hosts"][base_url_key(f"https://{APP}")]["status"] == "complete"

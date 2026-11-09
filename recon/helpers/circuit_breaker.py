@@ -1372,12 +1372,18 @@ class CoverageReport:
         """The bounded selection block the coverage record carries for the API
         reader: what this run selected, whether the plan was persisted, and
         whether any cut could not be accounted for (unknown -> fail closed).
-        Never a URL, template body or credential."""
+        Never a URL, template body or credential.
+
+        ``exhaustive`` is True only when the run cut NOTHING: no selection was
+        recorded and none was unknown. A recorded plan means a cut, so a
+        selective run is never exhaustive - the field answers "did this run
+        check everything it was configured to check?", not "is there a plan?".
+        """
         return {
             "recorded": bool(self.selection_plan_ids),
             "selection_unknown": self.selection_unknown,
             "plan_ids": list(self.selection_plan_ids),
-            "exhaustive": not self.selection_unknown and bool(self.selection_plan_ids),
+            "exhaustive": not self.selection_unknown and not self.selection_plan_ids,
         }
 
 

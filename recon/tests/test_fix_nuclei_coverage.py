@@ -151,7 +151,8 @@ class TestThePruneKeepsUncheckedNucleiFindings:
             def verify_connection(self):
                 return True
 
-            def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
+            def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
+                                      keep_unproven=False):
                 prunes.append(list(sources))
 
         monkeypatch.setattr("graph_db.Neo4jClient", _Graph())

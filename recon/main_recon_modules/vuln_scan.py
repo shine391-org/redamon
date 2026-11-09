@@ -88,6 +88,7 @@ from recon.helpers.selection_coverage import (
     KEY as SELECTION_KEY,
     build_plan,
     is_exhaustive,
+    persist_plan,
     plan_hosts,
     record_outcome,
 )
@@ -430,7 +431,7 @@ SEVERITY_COLORS = {
 
 
 def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = None,
-                  selection_hint: dict = None) -> dict:
+                  selection_hint: dict = None, plan_output_file: Path = None) -> dict:
     """
     Run nuclei scan on all URLs derived from recon data.
 
@@ -438,6 +439,12 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         recon_data: Domain reconnaissance data dictionary
         output_file: Optional path to save incremental results
         settings: Settings dictionary from main.py
+        selection_hint: Optional partial-run marker (scope/deferred) that makes
+            the plan non-exhaustive
+        plan_output_file: Optional path the selection plan is MERGED into before
+            the first pass launches. Used by the isolated wrapper, which runs on
+            a deep copy in a fan-out thread and must not overwrite the canonical
+            artifact with that copy; the merge is locked against save_recon_file.
 
     Returns:
         Updated recon_data with nuclei results added
@@ -870,7 +877,13 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         )
         recon_data[SELECTION_KEY] = selection_plan
         _note_selection_cut(selection_plan)
-        if output_file:
+        if plan_output_file is not None:
+            # Isolated path: this runs in a fan-out thread, so the plan is
+            # MERGED into the canonical artifact under the shared save lock
+            # instead of overwriting it with this deep copy (another tool's
+            # results may have merged a moment earlier). See persist_plan.
+            persist_plan(plan_output_file, recon_data[SELECTION_KEY])
+        elif output_file:
             with open(output_file, 'w') as f:
                 json.dump(recon_data, f, indent=2)
             fix_file_ownership(output_file)
@@ -1383,7 +1396,8 @@ def enrich_recon_file(recon_file: Path) -> dict:
 
 
 
-def run_vuln_scan_isolated(combined_result: dict, settings: dict) -> TopLevelKeys:
+def run_vuln_scan_isolated(combined_result: dict, settings: dict,
+                           output_file: Path = None) -> TopLevelKeys:
     """
     Thread-safe isolated wrapper for Nuclei vuln scanning.
 
@@ -1391,11 +1405,20 @@ def run_vuln_scan_isolated(combined_result: dict, settings: dict) -> TopLevelKey
     file saves), and returns a TopLevelKeys holding vuln_scan and, when the CVE
     lookup ran, its technology_cves. Used by Group 6 Phase A fan-out in main.py
     so Nuclei and GraphQL can run concurrently without racing on shared state.
+
+    ``output_file`` is the group's canonical artifact. The selection plan is
+    merged into it BEFORE the Nuclei pass launches - from this fan-out thread,
+    under the same lock save_recon_file takes - so a cancellation or a crash
+    keeps the planned-input accounting. The scan itself still runs on the deep
+    copy and the incremental saves stay with the fan-out's merged result, which
+    is what main.py persists once the future completes.
     """
     snapshot = copy.deepcopy(combined_result)
     # output_file=None => skip the function's own incremental saves (main.py
-    # persists the merged result after the fan-out completes).
-    run_vuln_scan(snapshot, output_file=None, settings=settings)
+    # persists the merged result after the fan-out completes); plan_output_file
+    # carries the plan to disk before the pass launches instead.
+    run_vuln_scan(snapshot, output_file=None, settings=settings,
+                  plan_output_file=output_file)
     result = TopLevelKeys(vuln_scan=snapshot.get("vuln_scan", {}))
     for key in _VULN_SCAN_RESULT_KEYS[1:]:
         if key in snapshot:

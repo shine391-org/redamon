@@ -30,7 +30,8 @@ from recon.main import save_recon_file, _merge_isolated_result  # noqa: E402
 from recon.helpers import circuit_breaker as cb  # noqa: E402
 from recon.helpers.output_paths import merge_batch_outputs, recon_output_file  # noqa: E402
 from recon.helpers.selection_coverage import (  # noqa: E402
-    KEY, build_plan, is_exhaustive, merge_plans, plan_hosts, plan_ids, record_outcome,
+    KEY, build_plan, is_exhaustive, merge_plans, merge_selection_blocks,
+    plan_hosts, plan_ids, record_outcome, selection_block,
 )
 from recon.main_recon_modules import vuln_scan as vs  # noqa: E402
 
@@ -115,7 +116,8 @@ class TestSelectionPlan:
 
 class TestPlumbing:
     def _stub(self, monkeypatch, plans):
-        def fake(recon_data, output_file=None, settings=None, selection_hint=None):
+        def fake(recon_data, output_file=None, settings=None, selection_hint=None,
+                 plan_output_file=None):
             recon_data[KEY] = copy.deepcopy(plans[recon_data["domain"]])
             return recon_data
         monkeypatch.setattr(vs, "run_vuln_scan", fake)
@@ -171,6 +173,73 @@ class TestPlumbing:
         assert merged_plan["scope"] == "full"  # no partial_scope hint
 
 
+class TestPlanPersistedBeforeLaunch:
+    """DoD 8 on the PRODUCTION domain path: run_domain_recon runs vuln_scan
+    through the isolated wrapper in a fan-out thread, and the plan must reach
+    the canonical artifact before the Nuclei pass launches."""
+
+    SETTINGS = {"NUCLEI_ENABLED": True, "NUCLEI_TAGS": ["cve"],
+                "NUCLEI_AUTO_UPDATE_TEMPLATES": False, "CVE_LOOKUP_ENABLED": False,
+                "SECURITY_CHECK_ENABLED": False, "NUCLEI_MAX_RUNTIME": 0}
+
+    def test_the_isolated_wrapper_writes_the_plan_before_the_pass_launches(self, tmp_path):
+        target = tmp_path / "recon_p1.json"
+        # Another tool's results already merged by the time Nuclei launches.
+        target.write_text(json.dumps({"domain": "example.com",
+                                      "graphql_scan": {"findings": [1]},
+                                      "metadata": {"root_domain": "example.com"}}))
+        seen = {}
+
+        def fake_pass(cmd, output_file, label, runtime_cap=0, container_name=None):
+            seen["at_launch"] = json.loads(target.read_text())
+            return [], [], 1.0, 0
+
+        recon = {"domain": "example.com", "metadata": {"root_domain": "example.com"},
+                 "http_probe": {"by_url": {"https://app.example.com": {"status_code": 200}}}}
+        with mock.patch.object(vs, "is_docker_installed", lambda: True), \
+                mock.patch.object(vs, "is_docker_running", lambda: True), \
+                mock.patch.object(vs, "pull_nuclei_docker_image", lambda image: True), \
+                mock.patch.object(vs, "ensure_templates_volume", lambda image, auto: True), \
+                mock.patch.object(vs, "extract_targets_from_recon",
+                                  lambda rd: ([], ["app.example.com"], {})), \
+                mock.patch.object(vs, "build_target_urls",
+                                  lambda h, i, rd, scan_all_ips=False: ["https://app.example.com"]), \
+                mock.patch.object(vs, "set_fp_ai_ctx", lambda **kw: None), \
+                mock.patch.object(vs, "_execute_nuclei_pass", fake_pass):
+            combined = copy.deepcopy(recon)
+            returned = vs.run_vuln_scan_isolated(combined, dict(self.SETTINGS),
+                                                 output_file=target)
+
+        assert "at_launch" in seen, "the detection pass never launched"
+        on_disk = seen["at_launch"]
+        # The plan was on disk BEFORE the pass launched - not after the future.
+        assert on_disk[KEY]["plan_id"]
+        assert on_disk[KEY]["targets"]["count"] == 1
+        # ...and the merge preserved the other tool's freshly merged results.
+        assert on_disk["graphql_scan"] == {"findings": [1]}
+        # The wrapper still hands the plan to the fan-in, and the deep-copy
+        # contract holds.
+        assert returned[KEY]["plan_id"] == on_disk[KEY]["plan_id"]
+        assert combined == recon
+
+    def test_without_an_output_file_the_wrapper_does_not_write_a_plan(self, tmp_path):
+        """The legacy call (no output_file) keeps the old behaviour: no plan
+        write, and the caller's own save persists the merged result."""
+        written = []
+        real_persist = vs.persist_plan
+
+        def spy(output_file, plan):
+            written.append(output_file)
+            return real_persist(output_file, plan)
+
+        with mock.patch.object(vs, "persist_plan", spy), \
+                mock.patch.object(vs, "run_vuln_scan",
+                                  lambda rd, output_file=None, settings=None,
+                                  selection_hint=None, plan_output_file=None: rd):
+            vs.run_vuln_scan_isolated({"domain": "example.com", "metadata": {}}, {})
+        assert written == []
+
+
 # --------------------------------------------------------------------- graph writer -> API coverage reader
 
 class TestGraphWriterAndApiReader:
@@ -207,12 +276,21 @@ class TestGraphWriterAndApiReader:
         client.update_graph_from_vuln_scan(recon_data, "u1", "p1")
         (query, params), = [c for c in calls if "vuln_scan_selection_json" in c[0]]
         assert "vuln_scan_selection_json" in query
-        assert json.loads(params["selection_json"])["plan_id"] == plan["plan_id"]
+        # The bounded block, the same shape the coverage record carries: ids and
+        # flags only, never the plan's target hosts or template bodies.
+        block = json.loads(params["selection_json"])
+        assert block["plan_ids"] == [plan["plan_id"]]
+        assert block["recorded"] is True
+        assert block["exhaustive"] is False
+        assert "a.example" not in params["selection_json"]
 
-    def test_selection_gap_is_readable_by_the_api_coverage_reader(self):
-        # A selective run writes a gap {source, module, reason, hosts} into the
-        # coverage record - exactly what webapp/src/lib/scanCoverage.ts
-        # parseCoverageGaps reads (arbitrary extra keys tolerated).
+    def test_the_selection_block_reaches_the_coverage_record_reader(self):
+        # The block the API coverage reader parses is the one the coverage
+        # record carries: _write_coverage_record stamps report.selection_json()
+        # and update_graph_coverage persists it as recon_selection_json on the
+        # Domain (asserted in tests/test_recon_coverage_graph.py); the webapp
+        # reader merges that with vuln_scan_selection_json using the same
+        # merge_selection_blocks rules.
         cb.note_selection_cut("vuln_scan", sources=["nuclei"],
                               hosts=["a.example.com:443"], plan_id="P-GAP",
                               reason="AI tag pruning removed xss")
@@ -221,8 +299,49 @@ class TestGraphWriterAndApiReader:
         assert any(g.get("source") == "nuclei" and g.get("module") == "vuln_scan"
                    for g in gaps)
         assert report.selection_plan_ids == ("P-GAP",)
-        # The plan id lets the prune prove the plan was persisted.
-        assert report.selection_json()["plan_ids"] == ["P-GAP"]
+        block = report.selection_json()
+        assert block["plan_ids"] == ["P-GAP"]
+        assert block["recorded"] is True
+        assert block["selection_unknown"] is False
+        # A recorded plan means a cut, so a selective run is never exhaustive.
+        assert block["exhaustive"] is False
+
+    def test_a_run_that_cut_nothing_reports_exhaustive(self):
+        # No cut noted, no plan id: the run checked its whole configured
+        # baseline. "exhaustive" answers that, not "is there a plan?".
+        report = cb.coverage_report()
+        assert report.selection_plan_ids == ()
+        assert report.selection_json() == {"recorded": False, "selection_unknown": False,
+                                           "plan_ids": [], "exhaustive": True}
+
+    def test_merge_selection_blocks_matches_the_reader_rules(self):
+        a = {"recorded": True, "selection_unknown": False, "plan_ids": ["P1"],
+             "exhaustive": False}
+        b = {"recorded": True, "selection_unknown": False, "plan_ids": ["P2"],
+             "exhaustive": True}
+        merged = merge_selection_blocks(json.dumps(a), json.dumps(b))
+        assert merged == {"recorded": True, "selection_unknown": False,
+                          "plan_ids": ["P1", "P2"], "exhaustive": False}
+        # An unknown cut on either side makes the whole run unknown.
+        unknown = merge_selection_blocks(a, {"recorded": False, "selection_unknown": True,
+                                             "plan_ids": [], "exhaustive": False})
+        assert unknown["selection_unknown"] is True
+        assert unknown["exhaustive"] is False
+        # Malformed input is dropped, never trusted.
+        assert merge_selection_blocks("{not json", a) == a
+        assert merge_selection_blocks(None, None) is None
+
+    def test_selection_block_is_bounded(self):
+        # The graph writer's block: ids and flags only, never a URL or template.
+        plan = build_plan(module="vuln_scan", targets=["https://a.example/x"],
+                          templates={"tags": ["cve"]}, exhaustive=False,
+                          reason="AI pruning removed 1 tag(s)")
+        block = selection_block(plan)
+        assert block == {"recorded": True, "selection_unknown": False,
+                         "plan_ids": [plan["plan_id"]], "exhaustive": False}
+        assert "a.example" not in json.dumps(block)
+        assert selection_block(None) == {"recorded": False, "selection_unknown": False,
+                                         "plan_ids": [], "exhaustive": False}
 
 
 # --------------------------------------------------------------------- prune: same host /b kept, missing manifest fail-closed
@@ -341,6 +460,19 @@ class TestSameHostPrune:
         recon_main.OUTPUT_DIR = tmp_path
         cb.note_selection_cut("vuln_scan", sources=["nuclei"],
                               hosts=["a.example.com:443"], plan_id="", reason="r")
+        recon_main._prune_recon_findings()
+        assert graph.prunes == []
+
+    def test_a_stopped_run_never_prunes(self, recon_main, graph, tmp_path, monkeypatch):
+        # DoD 3: cancellation is fail-closed. A stopped run's killed tools
+        # returned empty results, which would read as "gone".
+        recon_main.OUTPUT_DIR = tmp_path
+
+        class _Stopped:
+            def stop_requested(self):
+                return True
+
+        monkeypatch.setattr(recon_main, "_shutdown", _Stopped())
         recon_main._prune_recon_findings()
         assert graph.prunes == []
 

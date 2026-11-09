@@ -20,6 +20,8 @@ pruning, a partial run's explicit limits, a deferred task) is a cut.
 from __future__ import annotations
 
 import copy
+import json
+import threading
 import uuid
 from typing import Any, Iterable, Optional
 
@@ -31,6 +33,13 @@ from recon.helpers.coverage_stamps import run_started_at
 #: the Domain-batch merge, the graph writer and the API coverage reader.
 KEY = "selection_coverage"
 SCHEMA_VERSION = 1
+
+#: The one lock every writer of the canonical recon artifact takes. The
+#: isolated vuln_scan wrapper persists its selection plan from a fan-out
+#: thread while the main thread keeps saving the merged result; a plan write
+#: that bypassed this lock could interleave with a save into a corrupt file,
+#: or clobber a tool whose results merged a moment earlier.
+ARTIFACT_SAVE_LOCK = threading.Lock()
 
 #: Plan statuses, worst-first, for merging several groups' plans.
 STATUS_ORDER = ("failed", "partial", "planned", "complete")
@@ -208,3 +217,111 @@ def summarize(plans: Iterable[dict]) -> dict:
         "targets_count": sum(int((p.get("targets") or {}).get("count") or 0) for p in plans),
         "reasons": sorted({p["reason"] for p in plans if isinstance(p.get("reason"), str)}),
     }
+
+
+# ---------------------------------------------------------------------------
+# The bounded block the coverage record and the graph writer carry for the API
+# coverage reader. One shape, so a reader can merge the per-run record with the
+# per-group plan write without guessing which writer produced which field.
+# ---------------------------------------------------------------------------
+
+def selection_block(plan, *, selection_unknown: bool = False) -> dict:
+    """The bounded block for one recorded selection plan.
+
+    ``recorded``: a plan exists. ``selection_unknown``: a selection cut had no
+    plan id, so the run cannot say what it selected (the prune fails closed).
+    ``plan_ids``: every plan id behind the block. ``exhaustive``: the run cut
+    nothing - a recorded plan that was itself exhaustive, and no unknown cut.
+    Never a URL, a template body or a credential.
+    """
+    plan = plan if isinstance(plan, dict) else {}
+    ids = plan_ids(plan)
+    return {
+        "recorded": bool(plan) or bool(ids),
+        "selection_unknown": bool(selection_unknown),
+        "plan_ids": ids,
+        "exhaustive": (not selection_unknown) and is_exhaustive(plan),
+    }
+
+
+def parse_selection_block(raw) -> Optional[dict]:
+    """Parse a stored selection block (JSON string or dict); None when malformed.
+
+    Lenient about extra keys, strict about the ones the reader relies on: an
+    unparseable value is dropped rather than trusted, because an imported graph
+    bundle is untrusted input.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    raw_ids = raw.get("plan_ids")
+    if raw_ids is None:
+        raw_ids = []
+    if not isinstance(raw_ids, list):
+        return None
+    ids = [p for p in raw_ids if isinstance(p, str) and p]
+    return {
+        "recorded": bool(raw.get("recorded")),
+        "selection_unknown": bool(raw.get("selection_unknown")),
+        "plan_ids": ids,
+        "exhaustive": bool(raw.get("exhaustive")),
+    }
+
+
+def merge_selection_blocks(old, new) -> Optional[dict]:
+    """Merge two selection blocks (a run's groups, or the record and the plan).
+
+    ``recorded`` and ``selection_unknown`` are OR-ed (either writer saw it),
+    ``plan_ids`` are unioned without duplication, and ``exhaustive`` holds only
+    when both sides cut nothing - one selective group makes the whole run
+    selective. Returns None only when neither side parses.
+    """
+    old_b = parse_selection_block(old)
+    new_b = parse_selection_block(new)
+    if old_b is None:
+        return new_b
+    if new_b is None:
+        return old_b
+    ids = list(old_b["plan_ids"])
+    for pid in new_b["plan_ids"]:
+        if pid not in ids:
+            ids.append(pid)
+    return {
+        "recorded": old_b["recorded"] or new_b["recorded"],
+        "selection_unknown": old_b["selection_unknown"] or new_b["selection_unknown"],
+        "plan_ids": ids,
+        "exhaustive": old_b["exhaustive"] and new_b["exhaustive"],
+    }
+
+
+def persist_plan(output_file, plan) -> bool:
+    """Merge ``plan`` into the canonical artifact at ``output_file``.
+
+    The isolated vuln_scan wrapper calls this BEFORE its Nuclei pass launches,
+    from a fan-out thread. The read-modify-write is under ``ARTIFACT_SAVE_LOCK``,
+    the same lock ``save_recon_file`` holds, so it can neither interleave with
+    the main thread's saves nor clobber a tool whose results merged a moment
+    earlier; a plan is never worth failing a scan over, so a write failure
+    returns False and the prune then fails closed on the missing manifest.
+    """
+    if not isinstance(plan, dict) or not plan:
+        return False
+    try:
+        with ARTIFACT_SAVE_LOCK:
+            try:
+                with open(output_file, "r") as f:
+                    data = json.load(f)
+            except Exception:  # noqa: BLE001 - absent or unreadable: start fresh
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data[KEY] = plan
+            with open(output_file, "w") as f:
+                json.dump(data, f, indent=2)
+        return True
+    except Exception:  # noqa: BLE001 - the prune fails closed without the plan
+        return False

@@ -12,11 +12,16 @@ vi.mock('@/app/api/graph/neo4j', () => ({
 }))
 
 import {
-  currentScanRoots, gapInScope, parseCoverageGaps, readDegradedSourceCount, skippedHostInScope,
+  currentScanRoots, gapInScope, parseCoverageGaps, parseSelectionBlock, readDegradedSourceCount,
+  readSelectionCoverage, skippedHostInScope,
 } from './scanCoverage'
 
 const records = (gapsPerDomain: unknown[]) => ({
   records: gapsPerDomain.map(g => ({ get: (_k: string) => g })),
+})
+
+const selectionRecords = (rows: Array<{ selection?: unknown, plan?: unknown }>) => ({
+  records: rows.map(r => ({ get: (k: string) => (k === 'plan' ? r.plan : r.selection) })),
 })
 
 describe('parseCoverageGaps', () => {
@@ -79,6 +84,97 @@ describe('readDegradedSourceCount', () => {
     run.mockResolvedValue({ records: [] })
     await readDegradedSourceCount('p1')
     expect(close).toHaveBeenCalledOnce()
+  })
+})
+
+describe('readSelectionCoverage', () => {
+  beforeEach(() => {
+    run.mockReset()
+    close.mockReset()
+  })
+
+  test('returns null when no Domain carries a coverage record', async () => {
+    run.mockResolvedValue({ records: [] })
+    expect(await readSelectionCoverage('p1')).toBeNull()
+  })
+
+  test('returns null when neither property is present', async () => {
+    run.mockResolvedValue(selectionRecords([{}]))
+    expect(await readSelectionCoverage('p1')).toBeNull()
+  })
+
+  test('reads the per-run record', async () => {
+    run.mockResolvedValue(selectionRecords([{
+      selection: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false }),
+    }]))
+    expect(await readSelectionCoverage('p1')).toEqual(
+      { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false })
+  })
+
+  test('merges the per-run record with the per-group plan write', async () => {
+    run.mockResolvedValue(selectionRecords([{
+      selection: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false }),
+      plan: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P2'], exhaustive: true }),
+    }]))
+    expect(await readSelectionCoverage('p1')).toEqual(
+      { recorded: true, selection_unknown: false, plan_ids: ['P1', 'P2'], exhaustive: false })
+  })
+
+  test('an unknown cut on either side makes the whole run unknown', async () => {
+    run.mockResolvedValue(selectionRecords([{
+      selection: JSON.stringify(
+        { recorded: false, selection_unknown: true, plan_ids: [], exhaustive: false }),
+    }]))
+    expect(await readSelectionCoverage('p1')).toEqual(
+      { recorded: false, selection_unknown: true, plan_ids: [], exhaustive: false })
+  })
+
+  test('fails closed to null on an unparseable block', async () => {
+    run.mockResolvedValue(selectionRecords([{ selection: '{bad' }]))
+    expect(await readSelectionCoverage('p1')).toBeNull()
+  })
+
+  test('returns null and never throws on a query error', async () => {
+    run.mockRejectedValue(new Error('neo4j down'))
+    expect(await readSelectionCoverage('p1')).toBeNull()
+  })
+
+  test('always closes the session', async () => {
+    run.mockResolvedValue({ records: [] })
+    await readSelectionCoverage('p1')
+    expect(close).toHaveBeenCalledOnce()
+  })
+})
+
+describe('parseSelectionBlock', () => {
+  test('parses a JSON string block', () => {
+    expect(parseSelectionBlock(
+      '{"recorded":true,"selection_unknown":false,"plan_ids":["P1"],"exhaustive":false}'))
+      .toEqual({ recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false })
+  })
+  test('accepts an already-parsed object', () => {
+    expect(parseSelectionBlock({ recorded: true, plan_ids: ['P1'] }))
+      .toEqual({ recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false })
+  })
+  test('dedupes plan ids', () => {
+    const block = parseSelectionBlock({ plan_ids: ['P1', 'P1', 'P2'] })
+    expect(block).not.toBeNull()
+    expect(block!.plan_ids).toEqual(['P1', 'P2'])
+  })
+  test('rejects malformed JSON', () => {
+    expect(parseSelectionBlock('{not json')).toBeNull()
+  })
+  test('rejects a non-object', () => {
+    expect(parseSelectionBlock([])).toBeNull()
+  })
+  test('rejects a non-array plan_ids', () => {
+    expect(parseSelectionBlock({ plan_ids: 'P1' })).toBeNull()
+  })
+  test('rejects a non-string plan id', () => {
+    expect(parseSelectionBlock({ plan_ids: [1] })).toBeNull()
   })
 })
 

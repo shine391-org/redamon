@@ -23,8 +23,8 @@ import copy
 import re
 from pathlib import Path
 from datetime import datetime
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 
 # Add project root to path for imports (needed for graph_db, utils modules)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -89,7 +89,13 @@ from recon.main_recon_modules.ai_surface_recon import run_ai_surface_recon
 from recon.main_recon_modules.vuln_scan import run_vuln_scan
 from recon.main_recon_modules.add_mitre import run_mitre_enrichment
 from recon.helpers.isolated_result import TopLevelKeys
-from recon.helpers.selection_coverage import KEY as SELECTION_KEY
+from recon.helpers.selection_coverage import KEY as SELECTION_KEY, ARTIFACT_SAVE_LOCK
+
+#: The one lock every writer of the canonical recon artifact takes. The
+#: isolated vuln_scan wrapper persists its selection plan from a fan-out
+#: thread (recon.helpers.selection_coverage.persist_plan) while the main thread
+#: saves here; both must be serialized or the two writes interleave.
+_save_lock = ARTIFACT_SAVE_LOCK
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -598,9 +604,6 @@ def build_scan_type() -> str:
     if "vuln_scan" in SCAN_MODULES:
         modules.append("vuln_scan")
     return "_".join(modules) if modules else "custom"
-
-
-_save_lock = threading.Lock()
 
 
 def save_recon_file(data: dict, output_file: Path):
@@ -2280,7 +2283,13 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         phase_a_tools: dict = {}
         if "vuln_scan" in SCAN_MODULES:
             from recon.main_recon_modules.vuln_scan import run_vuln_scan_isolated
-            phase_a_tools['vuln_scan'] = run_vuln_scan_isolated
+            # The group's canonical artifact: the wrapper merges its selection
+            # plan into it BEFORE the Nuclei pass launches, so a cancellation
+            # or a crash keeps the planned-input accounting. The wrapper still
+            # works on a deep copy and leaves the incremental saves to the
+            # fan-out's merged result.
+            phase_a_tools['vuln_scan'] = partial(
+                run_vuln_scan_isolated, output_file=output_file)
         if _settings.get('GRAPHQL_SECURITY_ENABLED', False):
             from recon.graphql_scan import run_graphql_scan_isolated
             phase_a_tools['graphql_scan'] = run_graphql_scan_isolated

@@ -13,7 +13,7 @@ from graph_db.coverage_stamps import stamp_base_url_coverage
 from graph_db.cpe_resolver import _is_ip_address
 from graph_db.mixins.recon.scope import build_host_scope, host_in_scope, org_for_scan_root
 from graph_db.endpoint_paths import normalize_endpoint_path
-from recon.helpers.selection_coverage import KEY as SELECTION_KEY
+from recon.helpers.selection_coverage import KEY as SELECTION_KEY, selection_block
 
 
 def stable_vuln_id(finding_type: str, url: str, ip_or_host: str = "",
@@ -1288,7 +1288,7 @@ class VulnMixin:
                         medium_count=summary.get("medium", 0),
                         low_count=summary.get("low", 0),
                         selection_json=json.dumps(
-                            recon_data.get(SELECTION_KEY) or {},
+                            selection_block(recon_data.get(SELECTION_KEY)),
                             sort_keys=True, separators=(",", ":"),
                         ),
                     )

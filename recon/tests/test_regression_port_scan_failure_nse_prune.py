@@ -113,7 +113,8 @@ class TestRegressionPortScanFailure:
             def verify_connection(self):
                 return True
 
-            def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
+            def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
+                                      keep_unproven=False):
                 prunes.append(list(sources))
 
         _ip_run(recon_main, monkeypatch, _boom)
