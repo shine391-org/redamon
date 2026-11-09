@@ -1,0 +1,551 @@
+{
+  "schema_version": 1,
+  "seed": 0,
+  "synthetic": true,
+  "note": "No engagement material. auth_ref is a label, never a credential. Unknown is not dead; declarations are not observations. Native legacy projection in tests is intentionally lossy.",
+  "cases": [
+    {
+      "id": "app-prefix-a",
+      "origin": "https://a.example.test",
+      "path": "/api/items",
+      "raw_url": "https://a.example.test/api/items",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "app-prefix-b",
+      "origin": "https://b.example.test:8443",
+      "path": "/console/items",
+      "raw_url": "https://b.example.test:8443/console/items",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "query-encoding",
+      "origin": "https://a.example.test",
+      "path": "/api/search",
+      "raw_url": "https://a.example.test/api/search?q=a%26b%3D%23%20%25%2B%E9%9B%AA",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [
+          {
+            "name": "q",
+            "sample_values": [
+              "a&b=# %+雪"
+            ]
+          }
+        ],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "duplicate-keys",
+      "origin": "https://a.example.test",
+      "path": "/api/dup",
+      "raw_url": "https://a.example.test/api/dup?k=1&k=2&empty=&K=3",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [
+          {
+            "name": "k",
+            "sample_values": [
+              "1",
+              "2"
+            ]
+          },
+          {
+            "name": "empty",
+            "sample_values": [
+              ""
+            ]
+          },
+          {
+            "name": "K",
+            "sample_values": [
+              "3"
+            ]
+          }
+        ],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "post-body-auth",
+      "origin": "https://a.example.test",
+      "path": "/api/submit",
+      "raw_url": "https://a.example.test/api/submit",
+      "method": "POST",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "synthetic-session-A",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [
+          {
+            "name": "message"
+          }
+        ],
+        "path": []
+      },
+      "body_schema": {
+        "content_type": "application/json",
+        "example": {
+          "message": "synthetic-only"
+        }
+      }
+    },
+    {
+      "id": "declared-get",
+      "origin": "https://a.example.test",
+      "path": "/openapi/items",
+      "raw_url": "https://a.example.test/openapi/items",
+      "method": "GET",
+      "provenance": [
+        "openapi"
+      ],
+      "validation": {
+        "state": "unvalidated",
+        "status_code": null
+      },
+      "auth_ref": "anonymous",
+      "declared_only": true,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "declared-post",
+      "origin": "https://a.example.test",
+      "path": "/openapi/submit",
+      "raw_url": "https://a.example.test/openapi/submit",
+      "method": "POST",
+      "provenance": [
+        "openapi"
+      ],
+      "validation": {
+        "state": "unvalidated",
+        "status_code": null
+      },
+      "auth_ref": "anonymous",
+      "declared_only": true,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "declared-template",
+      "origin": "https://a.example.test",
+      "path": "/openapi/users/{id}",
+      "raw_url": "https://a.example.test/openapi/users/{id}",
+      "method": "GET",
+      "provenance": [
+        "openapi"
+      ],
+      "validation": {
+        "state": "unvalidated",
+        "status_code": null
+      },
+      "auth_ref": "anonymous",
+      "declared_only": true,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "http-401",
+      "origin": "https://a.example.test",
+      "path": "/status/401",
+      "raw_url": "https://a.example.test/status/401",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 401
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "http-403",
+      "origin": "https://a.example.test",
+      "path": "/status/403",
+      "raw_url": "https://a.example.test/status/403",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 403
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "http-404",
+      "origin": "https://a.example.test",
+      "path": "/status/404",
+      "raw_url": "https://a.example.test/status/404",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 404
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "http-405",
+      "origin": "https://a.example.test",
+      "path": "/status/405",
+      "raw_url": "https://a.example.test/status/405",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 405
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "timeout-unknown",
+      "origin": "https://a.example.test",
+      "path": "/unknown/timeout",
+      "raw_url": "https://a.example.test/unknown/timeout",
+      "method": "GET",
+      "provenance": [
+        "jsluice"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null,
+        "error_class": "Timeout"
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "challenge-unknown",
+      "origin": "https://b.example.test:8443",
+      "path": "/unknown/challenge",
+      "raw_url": "https://b.example.test:8443/unknown/challenge",
+      "method": "GET",
+      "provenance": [
+        "jsluice"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": 403,
+        "challenge": true
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "kiterunner-only",
+      "origin": "https://a.example.test",
+      "path": "/kr/only",
+      "raw_url": "https://a.example.test/kr/only",
+      "method": "GET",
+      "provenance": [
+        "kiterunner"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "js-only",
+      "origin": "https://b.example.test:8443",
+      "path": "/js/only",
+      "raw_url": "https://b.example.test:8443/js/only",
+      "method": "GET",
+      "provenance": [
+        "jsluice"
+      ],
+      "validation": {
+        "state": "unvalidated",
+        "status_code": null
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "slash",
+      "origin": "https://a.example.test",
+      "path": "/api/items/",
+      "raw_url": "https://a.example.test/api/items/",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "encoded-slash",
+      "origin": "https://a.example.test",
+      "path": "/api/a%2Fb",
+      "raw_url": "https://a.example.test/api/a%2Fb",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "ipv4",
+      "origin": "http://192.0.2.10:8080",
+      "path": "/api",
+      "raw_url": "http://192.0.2.10:8080/api",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "ipv6",
+      "origin": "http://[2001:db8::1]:8080",
+      "path": "/api",
+      "raw_url": "http://[2001:db8::1]:8080/api",
+      "method": "GET",
+      "provenance": [
+        "katana"
+      ],
+      "validation": {
+        "state": "observed",
+        "status_code": 200
+      },
+      "auth_ref": "anonymous",
+      "declared_only": false,
+      "parameters": {
+        "query": [],
+        "body": [],
+        "path": []
+      }
+    },
+    {
+      "id": "mailto",
+      "raw_url": "mailto:synthetic@example.test",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    },
+    {
+      "id": "javascript",
+      "raw_url": "javascript:alert(1)",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    },
+    {
+      "id": "tel",
+      "raw_url": "tel:+15555550100",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    },
+    {
+      "id": "hostless",
+      "raw_url": "https:///missing",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    },
+    {
+      "id": "bad-port",
+      "raw_url": "https://a.example.test:bogus/x",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    },
+    {
+      "id": "bad-bracket",
+      "raw_url": "https://[invalid/x",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    },
+    {
+      "id": "control",
+      "raw_url": "https://a.example.test/\r\nX-Synthetic:1",
+      "provenance": [
+        "synthetic-malformed"
+      ],
+      "validation": {
+        "state": "unknown",
+        "status_code": null
+      },
+      "http_eligible": false
+    }
+  ]
+}

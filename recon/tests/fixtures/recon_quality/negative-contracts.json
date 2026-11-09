@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "type": "future_negative_regressions_not_baseline_approval",
+  "cases": [
+    {
+      "id": "F01-ffuf-query",
+      "input": "https://a.example.test/api?q=1",
+      "legacy": "https://a.example.test/api?q=1/FUZZ",
+      "required": "https://a.example.test/api/FUZZ?q=1",
+      "owner": "F01; F11 ownership separately"
+    },
+    {
+      "id": "F02-query",
+      "fixture": "query-encoding",
+      "required": "decode query pairs round-trips a&b=# %+雪; raw encoding preserved"
+    },
+    {
+      "id": "F03-dast-deny",
+      "required": "DAST keeps operator exclude tags/templates; empty detection selection remains fail-closed"
+    },
+    {
+      "id": "F05-unknown",
+      "fixture": "timeout-unknown",
+      "required": "preserve candidate/unknown evidence through graph; never assert dead from timeout"
+    },
+    {
+      "id": "F07-selective-prune",
+      "required": "rc=0 on /a never proves /b tested; no prune for missing manifest/unknown coverage"
+    }
+  ]
+}
