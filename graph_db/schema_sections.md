@@ -298,6 +298,7 @@ Additional properties present on this node type, not yet described:
 - Endpoint probe (set by js_recon on endpoints it extracted from JavaScript, when JS_RECON_VALIDATE_ENDPOINTS is on):
   - validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get) or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme). "not_hittable" (dead) and "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell) are never written: the endpoint is dropped
   - js_status_code (integer): the status js_recon's own probe got; status_code stays http_probe's when both probed
+  - validation_error (string): set by js_recon on endpoints it extracted from JavaScript when JS_RECON_VALIDATE_ENDPOINTS is on; empty string when no validation error; otherwise a short reason such as "validation_disabled", "unsupported_scheme", "unresolved_url", "out_of_scope", "skipped_unknown", "ssrf_blocked", or the exception type name
 - Anonymous status (set by the route exposure scan):
   - anon_status (integer): the status an anonymous GET of this route got; compare with status_code to see a route that answers without credentials
   - anon_status_at (datetime): when anon_status was measured
