@@ -347,6 +347,11 @@ def build_target_urls_from_resource_enum(
     sources_present = set()
     templated_paths = 0
     non_relative_paths = 0
+    # The declared-only counters accumulate across calls, so every key the
+    # report exposes is present from the first call: an absence reads as a
+    # measured zero, never as an unmeasured value.
+    if declared_report is not None:
+        declared_report.setdefault("declared_only_non_get_head", 0)
 
     for base_url, base_data in by_base_url.items():
         if http_url_rejection(base_url) is not None:
@@ -381,7 +386,8 @@ def build_target_urls_from_resource_enum(
                 if methods & {"GET", "HEAD"}:
                     declared.append((base_url, path, url))
                 elif declared_report is not None:
-                    declared_report["declared_only_non_get_head"] += 1
+                    declared_report["declared_only_non_get_head"] = (
+                        declared_report.get("declared_only_non_get_head", 0) + 1)
                 continue
             endpoint_urls.append(url)
 

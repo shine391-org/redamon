@@ -299,3 +299,41 @@ def test_declared_report_names_what_the_cap_excluded(capsys):
     declared = [u for u in urls if '/d' in u]
     assert len(observed) == 2
     assert len(declared) == MAX_DECLARED_NUCLEI_URLS == 500
+
+
+# F08 regression, characterised on the rejected F08 candidate 2e408ea3: the
+# sole runtime caller (recon/main_recon_modules/vuln_scan.py) passes a
+# freshly-built empty declared_report, and an OpenAPI-declared non-GET/HEAD
+# path made the first write a bare `+=` on a key nothing had initialised --
+# KeyError, so run_vuln_scan aborted before the vulnerability phase ran.
+# Accepted G1 d1e515bd predates the declared_report parameter entirely, so it
+# is not a control for this crash (an unexpected-keyword failure there says
+# nothing about it).
+def test_an_empty_declared_report_survives_a_declared_only_post_path():
+    from recon.helpers.target_helpers import build_target_urls
+    recon_data = {'resource_enum': {'by_base_url': {'https://api.example.com': {'endpoints': {
+        # merge_openapi_into_by_base_url writes declared_only=True entries that
+        # carry the specification's own methods.
+        '/v1/users': {'methods': ['POST'], 'sources': ['openapi'], 'declared_only': True,
+                      'parameters': {'query': [], 'body': [], 'path': []}},
+    }}}}}
+    declared_report = {}
+    urls = build_target_urls(['api.example.com'], [], recon_data, scan_all_ips=False,
+                             admission_report={}, declared_report=declared_report)
+    assert declared_report['declared_only_non_get_head'] == 1
+    assert declared_report['declared_only_total'] == 0
+    assert declared_report['declared_only_get_head'] == 0
+    # The declared POST route is still not a request target; the host is.
+    assert urls == ['https://api.example.com']
+
+
+def test_the_declared_report_exposes_every_counter_even_at_zero():
+    # A reader must be able to tell "measured zero" from "not measured": every
+    # other counter is written on every call, so this one is too.
+    report = {}
+    build_target_urls_from_resource_enum(
+        {'by_base_url': {'https://a.example.com': {'endpoints': {
+            '/health': _endpoint(['GET'], True)}}}},
+        declared_report=report)
+    assert report['declared_only_non_get_head'] == 0
+    assert report['declared_only_get_head'] == 1

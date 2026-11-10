@@ -467,7 +467,9 @@ def merge_ffuf_into_by_base_url(
                 }
             }
 
-        status = result.get("status", 200)
+        # ffuf's own measured status, kept as None when the producer's record
+        # carries none: an unmeasured response is not a 200.
+        status = result.get("status")
         method = "GET"
         # The shared word in `category` (what every module writes); ffuf's own
         # label, which Route Exposure reads for its 403 hint, in `ffuf_category`.
@@ -501,8 +503,12 @@ def merge_ffuf_into_by_base_url(
     return existing_by_base_url, stats
 
 
-def _classify_ffuf_endpoint(path: str, status: int, content_type: str) -> str:
-    """Classify an FFuf-discovered endpoint by path and response characteristics."""
+def _classify_ffuf_endpoint(path: str, status: Optional[int], content_type: str) -> str:
+    """Classify an FFuf-discovered endpoint by path and response characteristics.
+
+    ``status`` is None when ffuf's record carried no status: the path still
+    classifies, and no status-derived label is invented for it.
+    """
     path_lower = path.lower()
 
     if status in (301, 302, 307, 308):

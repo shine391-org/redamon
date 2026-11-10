@@ -349,6 +349,32 @@ def test_ffuf_merge_new_base_url():
     print("PASS: test_ffuf_merge_new_base_url")
 
 
+def test_ffuf_merge_without_a_status_records_none_not_a_fabricated_200():
+    """A record with no status is unmeasured, not a 200.
+
+    The declared Endpoint.ffuf_status is "absent when no observation exists,
+    never a fabricated 200"; the producer must not invent one on the way in.
+    """
+    from recon.helpers.resource_enum.ffuf_helpers import merge_ffuf_into_by_base_url
+
+    merged, _stats = merge_ffuf_into_by_base_url(
+        [{"url": "https://example.com/admin", "length": 10}], {})
+
+    admin_ep = merged["https://example.com"]["endpoints"]["/admin"]
+    assert admin_ep["ffuf_metadata"]["status"] is None
+    # The path still classifies; no status-derived label is invented for it.
+    assert admin_ep["ffuf_category"] == "admin"
+    print("PASS: test_ffuf_merge_without_a_status_records_none_not_a_fabricated_200")
+
+
+def test_ffuf_classification_without_a_status_never_claims_a_redirect_or_403():
+    from recon.helpers.resource_enum.ffuf_helpers import _classify_ffuf_endpoint
+
+    assert _classify_ffuf_endpoint("/moved", None, "") == "directory"
+    assert _classify_ffuf_endpoint("/forbidden", None, "") == "directory"
+    print("PASS: test_ffuf_classification_without_a_status_never_claims_a_redirect_or_403")
+
+
 def test_ffuf_merge_overlap_adds_source():
     """Overlapping endpoint should add 'ffuf' to sources without duplicating."""
     from recon.helpers.resource_enum.ffuf_helpers import merge_ffuf_into_by_base_url
