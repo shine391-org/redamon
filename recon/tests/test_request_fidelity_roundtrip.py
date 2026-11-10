@@ -51,6 +51,54 @@ def test_raw_control_observation_is_refused_without_fabricated_recovery():
     assert url is None
 
 
+def test_graph_projection_marks_unrecoverable_fidelity(monkeypatch):
+    from recon.partial_recon_modules import graph_builders as gb
+
+    monkeypatch.setattr(gb, "graph_url_scope", lambda *a, **k: lambda host: True)
+
+    class Session:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def run(self, query, *args, **kwargs):
+            if "collect(DISTINCT {name: p.name, sample_values:" not in query:
+                return iter([])
+            return iter([{"base": "https://a.example.test", "host": "a.example.test",
+                          "path": "/search", "method": "GET",
+                          "params": [{"name": "q", "sample_values": ["a%20b"],
+                                      "sample_values_encoding": "percent-encoded"}]}])
+
+    class Driver:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def session(self):
+            return Session()
+
+    class Client:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def verify_connection(self):
+            return True
+        @property
+        def driver(self):
+            return Driver()
+
+    import graph_db
+    monkeypatch.setattr(graph_db, "Neo4jClient", lambda: Client())
+    data = gb._build_serialized_data_from_graph(
+        "a.example.test", "u", "p", settings={}, domain_groups=[])
+    endpoint = data["resource_enum"]["by_base_url"]["https://a.example.test"]["endpoints"]["/search"]
+    assert endpoint["fidelity_unknown"] is True
+    assert endpoint["parameters"]["query"][0]["sample_values_encoding"] == "percent-encoded"
+    assert th._endpoint_url("https://a.example.test", "/search", endpoint) == (
+        "https://a.example.test/search?q=a%20b")
+
+
 def test_legacy_name_keyed_projection_is_accepted_without_invented_values():
     url = th._endpoint_url("https://api.example.test", "/search", {
         "parameters": {"q": {"sample_values": ["a&b"]}}})
