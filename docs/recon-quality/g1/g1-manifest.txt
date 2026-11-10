@@ -1,0 +1,123 @@
+# G1 combined-candidate manifest
+base: 104f66cc5943a2eb5265edf190f39c4184b5e1ee
+p0_accepted: adc34b10d49b37daf8fa56f7043dd9291b809be3
+integration_branch: integration/recon-quality-g1-review
+integration_head: 36bd8759bbfc994a01df4e7f14df550428b24fe9
+image: sha256:6990dc80a76d739d02c0a1a79c3cde50bee27ce39f129d48d1f3e58e1ebd5ae1
+
+## accepted fix commits (merged in order)
+61b3d45b fix(recon): enforce HTTP admission and consumer seed contracts | parent=70d93f6c05a02987a110233f4d9364e56fcba502
+f2f26e9b fix(recon): F02 query fidelity round-trip encoding + preserve sample URLs | parent=14141db331c8892a9ef161b6896999310e0a1157
+941c6858 fix(f03): keep nuclei's loader error in the empty-selection record | parent=969e46de051e39380007d9cdda57ea2f8ca28dc0
+dadd7666 fix(recon): F04 prune-only AI tag selection, policy after AI, selection metadata | parent=1a212aa3422b2d0f01b3fd5d7e9b50af06349d88
+63eb9f52 fix(recon): js_recon timeout/connection error là unknown, giữ evidence | parent=34a6165992b2e22d22d6f1f29776e30becb2a2c1
+bcc85db3 fix(recon): preserve Arjun scope and partial execution evidence | parent=ca2b8cce629c0504fc4b58803496d8d6b30ccb3a
+0cdf1454 fix(recon): F07 review round 3 - close the four candidate-only regressions | parent=8ffe88b2bad34193a70fbce5cbad6af64447d758
+
+## merge commits
+36bd8759 Merge commit '0cdf1454' into integration/recon-quality-g1-review
+f187df58 Merge commit 'bcc85db3' into integration/recon-quality-g1-review
+80c54d41 Merge commit '63eb9f52' into integration/recon-quality-g1-review
+903b94a2 Merge commit 'dadd7666' into integration/recon-quality-g1-review
+ff022719 Merge commit '941c6858' into integration/recon-quality-g1-review
+6e13b1e1 Merge commit 'f2f26e9b' into integration/recon-quality-g1-review
+ac493111 Merge commit '61b3d45b' into integration/recon-quality-g1-review
+
+## files changed vs P0 (name-status)
+A	docs/recon-quality/f01/README.md
+A	docs/recon-quality/f01/manifest.json
+A	docs/recon-quality/f06/README.md
+M	graph_db/mixins/base_mixin.py
+M	graph_db/mixins/recon/domain_mixin.py
+M	graph_db/mixins/recon/js_recon_mixin.py
+M	graph_db/mixins/recon/resource_mixin.py
+M	graph_db/mixins/recon/vuln_mixin.py
+M	graph_db/schema_catalog.py
+M	graph_db/schema_sections.md
+M	recon/helpers/__init__.py
+M	recon/helpers/ai_planner/nuclei_tags.py
+M	recon/helpers/circuit_breaker.py
+M	recon/helpers/nuclei_helpers.py
+M	recon/helpers/output_paths.py
+A	recon/helpers/resource_enum/arjun_contract.py
+M	recon/helpers/resource_enum/arjun_helpers.py
+M	recon/helpers/resource_enum/ffuf_helpers.py
+A	recon/helpers/selection_coverage.py
+M	recon/helpers/target_helpers.py
+M	recon/main.py
+M	recon/main_recon_modules/js_recon.py
+M	recon/main_recon_modules/resource_enum.py
+M	recon/main_recon_modules/vuln_scan.py
+M	recon/partial_recon_modules/cache_scanning.py
+M	recon/partial_recon_modules/helpers.py
+M	recon/partial_recon_modules/parameter_discovery.py
+M	recon/partial_recon_modules/vulnerability_scanning.py
+M	recon/partial_recon_modules/web_crawling.py
+M	recon/tests/test_arjun.py
+A	recon/tests/test_arjun_scope_and_partial_evidence.py
+M	recon/tests/test_auth_no_cross_host_leak.py
+M	recon/tests/test_coverage_prune.py
+M	recon/tests/test_declared_only_consumers.py
+M	recon/tests/test_domain_batch_org_checks.py
+M	recon/tests/test_engagement_identity_header.py
+M	recon/tests/test_fix_nuclei_coverage.py
+M	recon/tests/test_fix_partial_nuclei_technologies.py
+M	recon/tests/test_graphql_phase1.py
+A	recon/tests/test_http_admission_callers.py
+M	recon/tests/test_js_recon.py
+M	recon/tests/test_js_recon_host_health.py
+M	recon/tests/test_legacy_no_discovery.py
+M	recon/tests/test_no_b_large_inputs.py
+M	recon/tests/test_nuclei_ai_planner.py
+A	recon/tests/test_nuclei_ai_pruning_contract.py
+M	recon/tests/test_nuclei_ai_vuln_scan_wiring.py
+M	recon/tests/test_nuclei_coverage.py
+A	recon/tests/test_nuclei_policy_parity.py
+M	recon/tests/test_nuclei_runtime_cap.py
+M	recon/tests/test_nuclei_two_pass.py
+M	recon/tests/test_passive_source_prune.py
+M	recon/tests/test_recon_quality_baseline.py
+M	recon/tests/test_regression_js_recon_no_input_prune.py
+M	recon/tests/test_regression_nmap_coverage_scope.py
+M	recon/tests/test_regression_nuclei_early_return_checks.py
+M	recon/tests/test_regression_port_scan_failure_nse_prune.py
+A	recon/tests/test_selection_coverage_roundtrip.py
+M	recon/tests/test_stop_pipeline.py
+M	recon/tests/test_target_helpers_union.py
+M	recon/tests/test_vuln_scan_isolated_cves.py
+M	tests/gvm_flow_fake.py
+M	tests/test_graph_db_refactor.py
+M	tests/test_js_recon_graph_ingestion.py
+M	tests/test_recon_coverage_graph.py
+M	webapp/src/lib/reconDelta.test.ts
+M	webapp/src/lib/reconDelta.ts
+M	webapp/src/lib/scanCoverage.test.ts
+M	webapp/src/lib/scanCoverage.ts
+
+## merge conflict resolutions (integration worktree only)
+1. recon/tests/test_recon_quality_baseline.py: kept F01's P0-baseline edit (query-encoding -> [] and ffuf contract inverted). F02/F03/F04/F05/F07 made no change to this file.
+2. recon/main_recon_modules/vuln_scan.py (F03 x F01): kept BOTH - dast_pass_executed = do_dast_pass and dast_not_executed is None (F03) AND http_admission metadata (F01).
+3. recon/main_recon_modules/vuln_scan.py (F07 x F03): kept F07's _nuclei_coverage(exhaustive=...) signature AND F03's _nuclei_no_templates_fatal helper (both are used).
+4. recon/partial_recon_modules/parameter_discovery.py (F06 x F01): kept F01's raw-byte validation (no .strip()) AND F06's typed_host_ok scope check on the parsed host.
+5. docs/recon-quality/p0/run.py: kept F01's file ordering.
+
+## combined test run (45 files, one container each, --network none, read-only source)
+totals: tests=1204 passed=1188 failed=4 errors=0 skipped=11 xfail=1
+failing:
+  recon/tests/test_declared_only_consumers.py::test_declared_only_paths_need_get_or_head_and_observed_ones_do_not  (pass base/P0/F01, FAIL F02-alone+combined)
+  recon/tests/test_http_admission_callers.py::test_invalid_composed_declared_urls_do_not_consume_the_500_valid_slots  (pass F01-alone, FAIL combined)
+  recon/tests/test_recon_quality_baseline.py::test_characterize_native_builder_projection[query-encoding]  (pass P0/F01-alone, FAIL combined)
+  recon/tests/test_recon_quality_baseline.py::test_negative_probe_query_fidelity_is_not_approved_baseline  (pass P0, FAIL combined)
+
+## receiver evidence (loopback only, no external target)
+repro_receiver.py     : generated target verbatim on wire + query decodes to original + identity header present -> PASS
+repro_receiver2.py    : rebuilt query round-trips (decoded value/empty/key case/order) -> PASS
+test_engagement_identity_gaps_receiver.py : 21 passed / 0 failed (wire-level header/auth)
+
+## key file hashes (sha256)
+de3ed704069804ded1182eb55d0d62ae52098d92a769c55b533632fff965fe67  recon/helpers/target_helpers.py
+e166b0ed8b1ec39f2bde6294f239f6cdaa68d86cfad6f15f131ca6adb04247e8  recon/main_recon_modules/vuln_scan.py
+93f50eb3ba3f3147b9af6cd1585a9a0fab1305d5801e026855a6342106fcc030  recon/partial_recon_modules/parameter_discovery.py
+5d0f3a20427808be9cf6bdee78aced000b9c689637afea064943fabd083eabb2  recon/tests/test_recon_quality_baseline.py
+2a0116ad1f1c930fae05eac25dc81a30d46596fe24479e366863ee7b04beadee  recon/tests/test_declared_only_consumers.py
+35978bf8f9c046a2c2c111d8447d0b6f7ad4eec73906d83a736c461d60a16b26  recon/tests/test_http_admission_callers.py
