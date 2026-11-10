@@ -72,7 +72,8 @@ def _builder_queries(builder):
 
 @pytest.mark.parametrize('builder,markers', [
     # nuclei's partial run: parameterised URLs for DAST and the main pass.
-    (graph_builders._build_vuln_scan_data_from_graph, ["WHERE p.position = 'query'"]),
+    # Query buckets now select all positions explicitly; Python keeps them typed.
+    (graph_builders._build_vuln_scan_data_from_graph, ["e.request_fidelity_json AS request_fidelity_json"]),
     # cache poisoning and the GraphQL scanner (which takes the POST ones).
     (graph_builders._build_graphql_data_from_graph, ["OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)"]),
     (graph_builders._build_serialized_data_from_graph, ["collect(DISTINCT {name: p.name, sample_values"]),

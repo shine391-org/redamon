@@ -274,12 +274,21 @@ def merge_openapi_into_by_base_url(payload: Dict, by_base_url: Dict) -> Tuple[Di
                     incoming[location].append(_parameter(param['name'], param, param.get('required')))
                 else:
                     stats['openapi_parameters_dropped'] += 1
+        # Keep method-specific examples before the compatibility name union.
+        # Two operations may use the same key with different encoding/values.
+        entry.setdefault('query_by_method', {})[method] = incoming['query']
         for position, params in incoming.items():
+            for param in params:
+                param['methods'] = [method]
             have = {p.get('name') for p in entry['parameters'][position]}
             for param in params:
                 if param['name'] not in have:
                     entry['parameters'][position].append(param)
                     have.add(param['name'])
+                else:
+                    old = next(p for p in entry['parameters'][position] if p.get('name') == param['name'])
+                    if old.get('methods'):
+                        old['methods'] = sorted(set(old['methods'] + [method]))
 
         meta = _operation_metadata(spec, operation.get('source_url'))
         per_method = entry.setdefault('openapi', {})

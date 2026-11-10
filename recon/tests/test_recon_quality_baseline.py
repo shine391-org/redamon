@@ -31,6 +31,10 @@ def native_resource(rows):
             "declared_only": row["declared_only"], "sources": row["provenance"],
             "status_code": row["validation"]["status_code"],
         }
+        # Corpus parameter samples are explicitly decoded, unlike legacy graph
+        # values; model the current producer marker rather than guessing '%'.
+        for param in by_base[row["origin"]]["endpoints"][row["path"]]["parameters"].get("query", []):
+            param["sample_values_encoding"] = "decoded-observation"
     return {"by_base_url": by_base, "discovered_urls": [r["raw_url"] for r in rows]}
 
 
@@ -69,7 +73,10 @@ def test_characterize_native_builder_projection(case_id):
 
 def test_query_fidelity_roundtrip_is_the_approved_contract():
     row = CASES["query-encoding"]
-    rebuilt = th._endpoint_url(row["origin"], row["path"], {"parameters": row["parameters"]})
+    params = copy.deepcopy(row["parameters"])
+    for param in params["query"]:
+        param["sample_values_encoding"] = "decoded-observation"
+    rebuilt = th._endpoint_url(row["origin"], row["path"], {"parameters": params})
     desired_pairs = parse_qsl(urlsplit(row["raw_url"]).query, keep_blank_values=True)
     assert desired_pairs == [("q", "a&b=# %+雪")]
     # F02 contract: rebuilding a decoded observation must preserve the request

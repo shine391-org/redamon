@@ -74,6 +74,43 @@ def write_openapi_source_status(tx, user_id: str, project_id: str, org: str,
     )
 
 
+def _request_fidelity_json(endpoint, method):
+    """Versioned query observation, not a reconstructed request/body/auth blob.
+
+    Parameter nodes are name-keyed across methods and cannot retain duplicate
+    keys/order. Keep the producer's ordered query list and raw URL references on
+    each method-specific Endpoint instead; never infer encoding from a '%' sign.
+    """
+    fields = ("name", "sample_values", "sample_values_encoding", "methods")
+    params = endpoint.get("parameters") or {}
+    query = (endpoint.get("query_by_method") or {}).get(method, params.get("query", []))
+    legacy = not isinstance(query, list) or ("query" not in params and bool(params))
+    query = query if isinstance(query, list) else []
+    query = [{k: p[k] for k in fields if k in p} for p in query
+             if isinstance(p, dict) and (not p.get("methods") or method in p["methods"])
+             and (not p.get("arjun_only") or method in p.get("arjun_methods", []))]
+    samples = endpoint.get("sample_urls") or []
+    if isinstance(samples, str):
+        samples = [samples]
+    if not samples and endpoint.get("sample_url"):
+        samples = [endpoint["sample_url"]]
+    sample_methods = endpoint.get("sample_url_methods") or {}
+    if sample_methods:
+        samples = [url for url in samples if method in sample_methods.get(url, [])]
+    elif len(endpoint.get("methods") or []) > 1 and samples:
+        # Old aggregate URLs have no method attribution. Retain that uncertainty
+        # instead of replaying a GET sample as if it had been observed for POST.
+        legacy = True
+        samples = []
+    legacy = legacy or (not samples and (
+        endpoint.get("query_fidelity_unknown_without_raw") or
+        any(p.get("sample_values_encoding") not in ("percent-encoded", "decoded-observation") for p in query)))
+    return json.dumps({"version": 1, "method": method, "query": query,
+                       "sample_urls": samples,
+                       "fidelity_unknown": bool(endpoint.get("fidelity_unknown")) or legacy},
+                      ensure_ascii=True, separators=(",", ":"))
+
+
 class ResourceMixin:
     def update_graph_from_resource_enum(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         """
@@ -138,7 +175,7 @@ class ResourceMixin:
                 for path, endpoint_info in endpoints.items():
                     path = normalize_endpoint_path(path)
                     try:
-                        methods = endpoint_info.get("methods", ["GET"])
+                        methods = endpoint_info.get("methods") or [endpoint_info.get("method") or "GET"]
                         category = endpoint_info.get("category", "other")
                         param_count = endpoint_info.get("parameter_count", {})
 
@@ -212,6 +249,7 @@ class ResourceMixin:
                                     e.body_param_count = $body_count,
                                     e.path_param_count = $path_count,
                                     e.urls_found = $urls_found,
+                                    e.request_fidelity_json = $request_fidelity_json,
                                     e.source = 'resource_enum',
                                     e.sources = CASE
                                         WHEN e.sources IS NULL THEN $sources
@@ -242,6 +280,7 @@ class ResourceMixin:
                                 body_count=param_count.get('body', 0),
                                 path_count=param_count.get('path', 0),
                                 urls_found=endpoint_info.get('urls_found', 1),
+                                request_fidelity_json=_request_fidelity_json(endpoint_info, method),
                                 sources=ep_sources,
                                 ai_interface_type=ai_interface_type,
                                 is_ai_rag_ingest=is_ai_rag_ingest,
@@ -297,6 +336,7 @@ class ResourceMixin:
                                                   THEN p.type ELSE $param_type END,
                                     p.category = $category,
                                     p.sample_values = $sample_values,
+                                    p.sample_values_encoding = $sample_values_encoding,
                                     p.is_injectable = coalesce(p.is_injectable, false),
                                     p.source = 'resource_enum',
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
@@ -308,6 +348,7 @@ class ResourceMixin:
                                 param_type=param.get("type", "string"),
                                 category=param.get("category", "other"),
                                 sample_values=sample_values[:5],  # Limit sample values
+                                sample_values_encoding=param.get("sample_values_encoding"),
                                 is_ai_prompt_injectable=is_ai_prompt_injectable,
                                 ai_tool_arg_path=ai_tool_arg_path,
                             )
@@ -316,6 +357,8 @@ class ResourceMixin:
 
                             # Create relationship: Endpoint -[:HAS_PARAMETER]-> Parameter
                             for method in methods:
+                                if param.get('methods') and method not in param['methods']:
+                                    continue
                                 session.run(
                                     """
                                     MATCH (e:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
@@ -350,6 +393,7 @@ class ResourceMixin:
                                                   THEN p.type ELSE $param_type END,
                                     p.category = $category,
                                     p.sample_values = $sample_values,
+                                    p.sample_values_encoding = $sample_values_encoding,
                                     p.required = $required,
                                     p.is_injectable = coalesce(p.is_injectable, false),
                                     p.source = 'resource_enum',
@@ -362,6 +406,7 @@ class ResourceMixin:
                                 param_type=param.get("type", "string"),
                                 category=param.get("category", "other"),
                                 sample_values=(param.get("sample_values") or [])[:5],
+                                sample_values_encoding=param.get("sample_values_encoding"),
                                 required=param.get("required", True),
                                 is_ai_prompt_injectable=param.get("is_ai_prompt_injectable"),
                                 ai_tool_arg_path=param.get("ai_tool_arg_path"),
@@ -370,6 +415,8 @@ class ResourceMixin:
                             created_parameters.add(param_key)
 
                             for method in methods:
+                                if param.get('methods') and method not in param['methods']:
+                                    continue
                                 session.run(
                                     """
                                     MATCH (e:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
