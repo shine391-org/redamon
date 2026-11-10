@@ -153,6 +153,7 @@
         "status_codes",
         "severity",
         "scan_modules",
+        "planner_mode",
         "hostname",
         "hostname_list",
         "url",

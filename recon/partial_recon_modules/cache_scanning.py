@@ -20,6 +20,7 @@ from recon.partial_recon_modules.helpers import (
     include_root_for,
     partial_settings,
     scope_roots,
+    apply_settings_overrides,
 )
 
 
@@ -45,8 +46,8 @@ def run_webcachepoison(config: dict) -> None:
     settings["WEB_CACHE_POISON_ENABLED"] = True
 
     # Apply settings_overrides from modal checkboxes (bypass DB settings).
-    for key, value in (config.get("settings_overrides") or {}).items():
-        settings[key] = value
+    # Only allowlisted keys may override; unrelated settings are preserved.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
 
     include_root_domain = _should_include_root_domain(settings)
 

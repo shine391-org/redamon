@@ -42,6 +42,11 @@ export const SEVERITY_VALUES: readonly string[] = Object.freeze([
   'info', 'low', 'medium', 'high', 'critical', 'unknown',
 ])
 
+/** Planner mode vocabulary: off | shadow | enforce, default off. */
+export const PLANNER_MODE_VALUES: readonly string[] = Object.freeze([
+  'off', 'shadow', 'enforce',
+])
+
 /**
  * Headers a caller may not set, whatever the field.
  *
@@ -295,6 +300,10 @@ function checkScalar(validator: string, value: unknown, ctx: ValidationContext):
       return typeof value === 'string' && SCAN_MODULE_VALUES.includes(value)
         ? null
         : `must be one of ${SCAN_MODULE_VALUES.join(', ')}`
+    case 'planner_mode':
+      return typeof value === 'string' && PLANNER_MODE_VALUES.includes(value)
+        ? null
+        : `must be one of ${PLANNER_MODE_VALUES.join(', ')}`
     case 'json_object':
       return value !== null && typeof value === 'object' ? null : 'must be an object'
     case 'attack_skill_config':

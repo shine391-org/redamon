@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from recon.partial_recon_modules.graph_builders import _build_graphql_data_from_graph
-from recon.partial_recon_modules.helpers import partial_settings, scope_roots, root_orgs
+from recon.partial_recon_modules.helpers import partial_settings, scope_roots, root_orgs, apply_settings_overrides
 
 
 def run_graphqlscan(config: dict) -> None:
@@ -37,10 +37,9 @@ def run_graphqlscan(config: dict) -> None:
     # Force-enable so DB toggle doesn't override an explicit partial-recon request
     settings['GRAPHQL_SECURITY_ENABLED'] = True
 
-    # Apply settings_overrides from modal checkboxes (bypass DB settings)
-    settings_overrides = config.get("settings_overrides") or {}
-    for key, value in settings_overrides.items():
-        settings[key] = value
+    # Apply settings_overrides from modal checkboxes (bypass DB settings).
+    # Only allowlisted keys may override; unrelated settings are preserved.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
 
     # Parse user-provided custom URLs (Partial Recon modal textarea)
     user_targets = config.get("user_targets") or {}

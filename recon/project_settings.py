@@ -65,6 +65,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'AI_IN_PIPELINE': False,
     'AI_PIPELINE_MODEL': 'claude-opus-4-6',
 
+    # Planner controls (F09). plannerMode off|shadow|enforce, default off;
+    # per-consumer enable controls only honoured when mode is shadow/enforce.
+    'PLANNER_MODE': 'off',
+    'PLANNER_MANIFEST_ENABLED': False,
+    'PLANNER_CONSUMER_AI_TAGS': False,
+    'PLANNER_CONSUMER_TARGET_SELECTION': False,
+    'PLANNER_CONSUMER_TWO_PASS': False,
+
     # WHOIS/DNS
     'WHOIS_ENABLED': True,
     'WHOIS_MAX_RETRIES': 6,
@@ -1652,6 +1660,14 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['NUCLEI_AI_TAGS'] = project.get('nucleiAiTags', DEFAULT_SETTINGS['NUCLEI_AI_TAGS'])
     settings['NUCLEI_TAGS_AI_USE_JEV'] = project.get('nucleiTagsAiUseJev', DEFAULT_SETTINGS['NUCLEI_TAGS_AI_USE_JEV'])
     settings['NUCLEI_AI_RESPONSE_FILTER'] = project.get('nucleiAiResponseFilter', DEFAULT_SETTINGS['NUCLEI_AI_RESPONSE_FILTER'])
+
+    # Planner controls (F09). Read from the project row so they are honoured at
+    # runtime and never dormant keys: off is patched legacy behaviour.
+    settings['PLANNER_MODE'] = project.get('plannerMode', DEFAULT_SETTINGS['PLANNER_MODE'])
+    settings['PLANNER_MANIFEST_ENABLED'] = project.get('plannerManifestEnabled', DEFAULT_SETTINGS['PLANNER_MANIFEST_ENABLED'])
+    settings['PLANNER_CONSUMER_AI_TAGS'] = project.get('plannerConsumerAiTags', DEFAULT_SETTINGS['PLANNER_CONSUMER_AI_TAGS'])
+    settings['PLANNER_CONSUMER_TARGET_SELECTION'] = project.get('plannerConsumerTargetSelection', DEFAULT_SETTINGS['PLANNER_CONSUMER_TARGET_SELECTION'])
+    settings['PLANNER_CONSUMER_TWO_PASS'] = project.get('plannerConsumerTwoPass', DEFAULT_SETTINGS['PLANNER_CONSUMER_TWO_PASS'])
 
     # Subdomain Takeover Scanner
     settings['SUBDOMAIN_TAKEOVER_ENABLED'] = project.get('subdomainTakeoverEnabled', DEFAULT_SETTINGS['SUBDOMAIN_TAKEOVER_ENABLED'])

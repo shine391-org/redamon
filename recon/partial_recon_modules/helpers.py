@@ -751,3 +751,46 @@ def _is_host_in_scope(
     if host in roots:
         return host in included
     return any(host.endswith(f".{root}") for root in roots)
+
+
+#: Settings a partial recon run may override from modal checkboxes. Every other
+#: key is rejected, so an override can never clobber an unrelated setting and no
+#: dormant runtime key is introduced by an override. plannerMode is validated
+#: against its enum with the off default; the planner consumer flags are booleans.
+PARTIAL_SETTINGS_ALLOWLIST: dict[str, dict] = {
+    # force-enables a partial recon explicitly asks for
+    'NUCLEI_ENABLED': {'type': 'bool', 'default': False},
+    'SUBDOMAIN_TAKEOVER_ENABLED': {'type': 'bool', 'default': False},
+    'GVM_ENABLED': {'type': 'bool', 'default': False},
+    # planner controls (F09)
+    'PLANNER_MODE': {'type': 'enum', 'values': ('off', 'shadow', 'enforce'),
+                     'default': 'off'},
+    'PLANNER_MANIFEST_ENABLED': {'type': 'bool', 'default': False},
+    'PLANNER_CONSUMER_AI_TAGS': {'type': 'bool', 'default': False},
+    'PLANNER_CONSUMER_TARGET_SELECTION': {'type': 'bool', 'default': False},
+    'PLANNER_CONSUMER_TWO_PASS': {'type': 'bool', 'default': False},
+}
+
+
+def apply_settings_overrides(settings: dict, overrides: dict) -> dict:
+    """Apply ``settings_overrides`` against the partial allowlist.
+
+    Unknown keys are dropped (never silently written). ``PLANNER_MODE`` is
+    validated against its enum and falls back to the off default on a bad value.
+    Unrelated settings are preserved: only allowlisted keys are touched.
+    Returns a copy.
+    """
+    out = dict(settings)
+    for key, value in (overrides or {}).items():
+        spec = PARTIAL_SETTINGS_ALLOWLIST.get(key)
+        if spec is None:
+            continue  # unknown override key: rejected, setting preserved
+        kind = spec.get('type')
+        if kind == 'enum':
+            values = spec.get('values', ())
+            out[key] = value if value in values else spec.get('default')
+        elif kind == 'bool':
+            out[key] = bool(value)
+        else:
+            out[key] = value
+    return out

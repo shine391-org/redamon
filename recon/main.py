@@ -90,6 +90,7 @@ from recon.main_recon_modules.vuln_scan import run_vuln_scan
 from recon.main_recon_modules.add_mitre import run_mitre_enrichment
 from recon.helpers.isolated_result import TopLevelKeys
 from recon.helpers.selection_coverage import KEY as SELECTION_KEY, ARTIFACT_SAVE_LOCK
+from recon.helpers.planner_manifest import maybe_write_pre_dispatch_manifest
 
 #: The one lock every writer of the canonical recon artifact takes. The
 #: isolated vuln_scan wrapper persists its selection plan from a fan-out
@@ -1530,6 +1531,13 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     if not skip_active_scans:
         if "vuln_scan" in SCAN_MODULES:
             print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
+            # F09: run-scoped plan manifest before dispatch. Default off, never
+            # fails the scan; the pointer is recorded so the ScanJob row can keep
+            # pointer + digest + bounded summary (never the full manifest).
+            _manifest_ptr = maybe_write_pre_dispatch_manifest(settings, output_file)
+            if _manifest_ptr:
+                combined_result.setdefault("metadata", {}).setdefault(
+                    "planner_manifest_pointers", []).append(_manifest_ptr)
             try:
                 combined_result = run_vuln_scan(combined_result, output_file=output_file, settings=settings)
                 combined_result["metadata"]["modules_executed"].append("vuln_scan")

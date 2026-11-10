@@ -11159,6 +11159,80 @@ fields:
       when the host is short of RAM, so the effective value can be below what is
       written here.
 
+  plannerMode:
+    tool: planner
+    runtime_key: "PLANNER_MODE"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: null
+    validator: planner_mode
+    values: ["off", "shadow", "enforce"]
+    meaning: >-
+      Planner mode for run-scoped plan generation and dispatch. off is the patched
+      legacy behaviour: no planner optimization, no changed executable commands,
+      safety fixes still enforced. shadow plans and writes the run-scoped manifest
+      but does not change what is dispatched. enforce applies the enabled consumer
+      optimizations. Default off.
+  plannerManifestEnabled:
+    tool: planner
+    runtime_key: "PLANNER_MANIFEST_ENABLED"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: null
+    meaning: >-
+      Write a run-scoped plan manifest before dispatch, scoped to tenant/project/
+      run/group. Never a project-wide file that later runs can overwrite. Default
+      false.
+  plannerConsumerAiTags:
+    tool: planner
+    runtime_key: "PLANNER_CONSUMER_AI_TAGS"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: null
+    meaning: >-
+      Enable the AI tag-selection consumer (Nuclei tag pruning) for this project.
+      Only honoured when plannerMode is shadow or enforce. Default false.
+  plannerConsumerTargetSelection:
+    tool: planner
+    runtime_key: "PLANNER_CONSUMER_TARGET_SELECTION"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: null
+    meaning: >-
+      Enable the target-selection consumer (run-scoped manifest of selected
+      targets/templates). Only honoured when plannerMode is shadow or enforce.
+      Default false.
+  plannerConsumerTwoPass:
+    tool: planner
+    runtime_key: "PLANNER_CONSUMER_TWO_PASS"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: null
+    meaning: >-
+      Enable the two-pass DAST consumer. Only honoured when plannerMode is shadow
+      or enforce. Default false.
+
+
 # Runtime keys with no Prisma column. Not MCP-reachable, but the derived
 # cap list is a query over this file, so a rate that lives only here is in it.
 runtime_only:

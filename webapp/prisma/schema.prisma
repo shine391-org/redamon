@@ -464,6 +464,21 @@ model Project {
   jevProviderId               String?  @map("jev_provider_id")
   jevProvider                 UserLlmProvider? @relation("ProjectJevProvider", fields: [jevProviderId], references: [id], onDelete: SetNull)
 
+  // ========== PLANNER CONTROLS (F09) ==========
+  /// plannerMode: off | shadow | enforce, default off. off is the patched legacy
+  /// behaviour — no planner optimization, no changed commands, safety fixes still
+  /// enforced. shadow plans and writes the run-scoped manifest but does not change
+  /// what is dispatched. enforce applies the selected consumer optimizations.
+  plannerMode                 String   @default("off") @map("planner_mode")
+  /// Write a run-scoped plan manifest before dispatch. off by default; the manifest
+  /// is scoped to tenant/project/run/group and never a project-wide file.
+  plannerManifestEnabled      Boolean  @default(false) @map("planner_manifest_enabled")
+  /// Per-consumer enable controls. Each gates one optimization consumer; a flag is
+  /// only honoured when plannerMode is shadow or enforce.
+  plannerConsumerAiTags       Boolean  @default(false) @map("planner_consumer_ai_tags")
+  plannerConsumerTargetSelection Boolean  @default(false) @map("planner_consumer_target_selection")
+  plannerConsumerTwoPass      Boolean  @default(false) @map("planner_consumer_two_pass")
+
   // ========== RECON PRESET ==========
   reconPresetId               String?  @map("recon_preset_id")
   /// { name, fingerprint } of the preset last loaded; the UI shows its badge while the saved settings still match the fingerprint
@@ -1801,6 +1816,15 @@ model ScanJob {
   /// document in force, which a later replace would otherwise erase. Null when
   /// the project had no document.
   roeTextSha256      String?      @map("roe_text_sha256")
+  /// Pointer to the run-scoped plan manifest written before dispatch: tenant/
+  /// project/run/group-scoped file path. The full manifest is never stored in
+  /// this row — only the pointer, its sha256 digest and a bounded summary.
+  planManifestPath   String?      @map("plan_manifest_path")
+  planManifestSha256 String?      @map("plan_manifest_sha256")
+  /// Bounded summary of the plan manifest (schema/planner version, run/group/
+  /// scope, settings/template hash prefixes, task/reason summaries). Never the
+  /// full manifest and never credentials or raw auth headers.
+  planManifestSummary Json?     @map("plan_manifest_summary")
   createdAt          DateTime     @default(now()) @map("created_at")
   updatedAt          DateTime     @updatedAt @map("updated_at")
 

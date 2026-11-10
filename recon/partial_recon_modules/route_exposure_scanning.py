@@ -23,6 +23,7 @@ from recon.partial_recon_modules.helpers import (
     partial_settings,
     root_orgs,
     scope_roots,
+    apply_settings_overrides,
 )
 
 
@@ -71,8 +72,8 @@ def run_route_exposure_partial(config: dict) -> None:
     settings = partial_settings(config)
     # Force-enable so the DB toggle doesn't override an explicit partial-recon run.
     settings["ROUTE_EXPOSURE_ENABLED"] = True
-    for key, value in (config.get("settings_overrides") or {}).items():
-        settings[key] = value
+    # Only allowlisted keys may override; unrelated settings are preserved.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
 
     user_targets = config.get("user_targets") or {}
     url_attach_to = user_targets.get("url_attach_to")
