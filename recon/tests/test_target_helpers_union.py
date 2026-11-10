@@ -371,16 +371,16 @@ class TestBuildNucleiCommandStatsFlags(unittest.TestCase):
         return self.NH.build_nuclei_command(**defaults)
 
     def test_stats_flag_present(self):
-        cmd = self._basic_cmd()
+        cmd = self._basic_cmd(tags=["cve"])
         self.assertIn("-stats", cmd)
 
     def test_stats_interval_is_30(self):
-        cmd = self._basic_cmd()
+        cmd = self._basic_cmd(tags=["cve"])
         i = cmd.index("-stats-interval")
         self.assertEqual(cmd[i + 1], "30")
 
     def test_stats_present_in_dast_mode_too(self):
-        cmd = self._basic_cmd(dast_mode=True)
+        cmd = self._basic_cmd(dast_mode=True, tags=["cve"])
         self.assertIn("-stats", cmd)
         self.assertIn("-stats-interval", cmd)
 
@@ -390,13 +390,16 @@ class TestBuildNucleiCommandStatsFlags(unittest.TestCase):
 
     # --- Include-tags-empty-means-custom-only behavior ----------------
 
-    def test_tags_empty_no_custom_does_not_load_builtin_pool(self):
-        """Empty tags + no custom templates -> -t /root/nuclei-templates/ NOT added.
-        (Caller is expected to refuse this combination, but the builder must not
-        silently fall back to scanning all 8000 templates.)"""
-        cmd = self._basic_cmd(tags=None, selected_custom_templates=None)
-        self.assertNotIn("/root/nuclei-templates/", cmd)
-        self.assertNotIn("-tags", cmd)
+    def test_tags_empty_no_custom_is_refused_not_silently_defaulted(self):
+        """F03: empty tags + no custom is a REFUSAL, not a pass-through.
+
+        Previously the builder omitted -t and let nuclei fall back to its whole
+        default pool. It now raises so an empty policy cannot become an
+        unbounded scan.
+        """
+        with self.assertRaises(self.NH.NucleiEmptySelectionError):
+            self._basic_cmd(tags=None, selected_custom_templates=None,
+                            templates=None)
 
     def test_tags_set_loads_builtin_pool(self):
         """Tags non-empty -> built-in pool added so the filter has something to match."""

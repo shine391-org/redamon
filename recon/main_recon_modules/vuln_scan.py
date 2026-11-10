@@ -74,6 +74,7 @@ from recon.helpers import (
     build_target_urls,
     # Nuclei helpers
     build_nuclei_command,
+    NucleiEmptySelectionError,
     parse_nuclei_finding,
     is_false_positive,
     set_fp_ai_ctx,
@@ -141,6 +142,36 @@ def _nuclei_pass_outcome(returncode, duration, runtime_cap, parsed) -> tuple:
     if runtime_cap and duration >= runtime_cap:
         return "partial", "runtime cap"
     return ("partial" if parsed else "failed"), f"nuclei exited {returncode}"
+
+
+# Nuclei's own fatal when its template loader ends up with zero templates after
+# the policy is applied. Matched as a substring so the surrounding level prefix
+# ([FTL]/[ERR]) and minor wording changes do not hide it.
+_NUCLEI_NO_TEMPLATES_MARKER = "no templates provided for scan"
+
+
+def _nuclei_no_templates_fatal(lines):
+    """The nuclei fatal proving the effective selection was empty, or None.
+
+    Returns the matching fatal line, prefixed with nuclei's own loader error
+    when there is one (a bad explicit template path), so the recorded
+    ``policy_empty`` detail distinguishes an exclusion-emptied pool from a
+    misconfigured template path. Distinct from a generic non-zero exit: it means
+    the pass had nothing to run.
+    """
+    fatal = None
+    loader_error = None
+    for line in lines or ():
+        if _NUCLEI_NO_TEMPLATES_MARKER in line:
+            fatal = line
+        elif fatal is None and loader_error is None and (
+                "Could not find template" in line or "could not find file" in line):
+            loader_error = line
+    if fatal is None:
+        return None
+    if loader_error:
+        return f"{loader_error}\n{fatal}"
+    return fatal
 
 
 def _nuclei_coverage(at: str, passes, findings=()) -> dict:
@@ -304,6 +335,17 @@ def _execute_nuclei_pass(cmd: list, output_file: str, label: str,
     # were not re-checked, so their findings are kept. A run truncated by the
     # cap is recorded above.
     if process.returncode != 0 and not truncated["hit"]:
+        # Nuclei fatals with "no templates provided for scan" when the policy
+        # leaves its loader zero templates: every template the selection picked
+        # was then removed by the exclusions. That is a policy-empty outcome,
+        # not a scan failure, so raise the same refusal the builder uses and let
+        # the caller record ``policy_empty`` (keeping the previous findings)
+        # instead of a generic exit-1. No partial output exists for this fatal --
+        # nuclei stops at load time, before any request.
+        fatal = _nuclei_no_templates_fatal(stderr_lines)
+        if fatal:
+            _keep_nuclei_findings(f"nuclei {label} pass not executed: policy_empty")
+            raise NucleiEmptySelectionError(fatal)
         if parsed_lines:
             print(f"[!][Nuclei] {label} pass stopped (exit {process.returncode}) after "
                   f"{parsed_lines} result(s) - previous Nuclei findings are kept")
@@ -790,83 +832,139 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
             # ---- Pass A: DETECTION ----
             start_time = datetime.now()
-            d_duration = 0
             coverage_passes = []
+            # Set only when a pass was attempted and refused. The metadata block
+            # is outside this ``if run_nuclei:`` scope, so both must be bound on
+            # every path -- including the Nuclei-disabled early return.
+            dast_not_executed = None
+            detection_not_executed = None
             if skip_detection_pass:
                 print("[*][Nuclei] DETECTION pass skipped (no tags + no custom templates)")
-                d_findings, d_fps = [], []
+                d_findings, d_fps, d_duration = [], [], 0
                 coverage_passes.append((target_urls, "failed", "no Nuclei templates selected", False))
             else:
                 detection_container = f"redamon-nuclei-detection-{uuid.uuid4().hex[:12]}"
-                detection_cmd = build_nuclei_command(
-                    targets_file=detection_targets_file,
-                    output_file=detection_output_file,
-                    docker_image=NUCLEI_DOCKER_IMAGE,
-                    severity=NUCLEI_SEVERITY,
-                    templates=NUCLEI_TEMPLATES,
-                    exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
-                    custom_templates=NUCLEI_CUSTOM_TEMPLATES,
-                    selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
-                    tags=NUCLEI_TAGS,
-                    exclude_tags=NUCLEI_EXCLUDE_TAGS,
-                    rate_limit=NUCLEI_RATE_LIMIT,
-                    bulk_size=NUCLEI_BULK_SIZE,
-                    concurrency=NUCLEI_CONCURRENCY,
-                    timeout=NUCLEI_TIMEOUT,
-                    retries=NUCLEI_RETRIES,
-                    dast_mode=False,
-                    new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
-                    headless=NUCLEI_HEADLESS,
-                    system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
-                    follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
-                    max_redirects=NUCLEI_MAX_REDIRECTS,
-                    interactsh=NUCLEI_INTERACTSH,
-                    auth_headers=_nuclei_auth,
-                    container_name=detection_container,
-                    max_host_error=NUCLEI_MAX_HOST_ERROR,
-                )
-                d_findings, d_fps, d_duration, d_rc = _execute_nuclei_pass(
-                    detection_cmd, detection_output_file, label="DETECTION",
-                    runtime_cap=NUCLEI_MAX_RUNTIME, container_name=detection_container,
-                )
-                coverage_passes.append((target_urls, *_nuclei_pass_outcome(
-                    d_rc, d_duration, NUCLEI_MAX_RUNTIME, d_findings or d_fps), True))
+                try:
+                    detection_cmd = build_nuclei_command(
+                        targets_file=detection_targets_file,
+                        output_file=detection_output_file,
+                        docker_image=NUCLEI_DOCKER_IMAGE,
+                        severity=NUCLEI_SEVERITY,
+                        templates=NUCLEI_TEMPLATES,
+                        exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
+                        custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+                        selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+                        tags=NUCLEI_TAGS,
+                        exclude_tags=NUCLEI_EXCLUDE_TAGS,
+                        rate_limit=NUCLEI_RATE_LIMIT,
+                        bulk_size=NUCLEI_BULK_SIZE,
+                        concurrency=NUCLEI_CONCURRENCY,
+                        timeout=NUCLEI_TIMEOUT,
+                        retries=NUCLEI_RETRIES,
+                        dast_mode=False,
+                        new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
+                        headless=NUCLEI_HEADLESS,
+                        system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
+                        follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
+                        max_redirects=NUCLEI_MAX_REDIRECTS,
+                        interactsh=NUCLEI_INTERACTSH,
+                        auth_headers=_nuclei_auth,
+                        container_name=detection_container,
+                        max_host_error=NUCLEI_MAX_HOST_ERROR,
+                    )
+                    d_findings, d_fps, d_duration, d_rc = _execute_nuclei_pass(
+                        detection_cmd, detection_output_file, label="DETECTION",
+                        runtime_cap=NUCLEI_MAX_RUNTIME, container_name=detection_container,
+                    )
+                except NucleiEmptySelectionError as exc:
+                    # Both the builder's fail-closed refusal and nuclei's own
+                    # "no templates provided for scan" fatal mean the policy left
+                    # this pass nothing to run. Record it explicitly, keep the
+                    # previous findings, and continue -- the CVE lookup and the
+                    # security checks below must still run.
+                    print(f"[!][Nuclei] DETECTION pass not executed (policy_empty): {exc}")
+                    _keep_nuclei_findings("nuclei DETECTION pass not executed: policy_empty")
+                    d_findings, d_fps, d_duration = [], [], 0
+                    detection_not_executed = {
+                        "pass": "DETECTION",
+                        "state": "not_executed",
+                        "reason": "policy_empty",
+                        "detail": str(exc),
+                    }
+                    coverage_passes.append((target_urls, "failed",
+                                            "policy_empty: no Nuclei templates selected", False))
+                else:
+                    coverage_passes.append((target_urls, *_nuclei_pass_outcome(
+                        d_rc, d_duration, NUCLEI_MAX_RUNTIME, d_findings or d_fps), True))
             findings.extend(d_findings)
             false_positives_filtered.extend(d_fps)
 
             # ---- Pass B: DAST (additive) ----
             dast_duration = 0
             if do_dast_pass:
-                dast_container = f"redamon-nuclei-dast-{uuid.uuid4().hex[:12]}"
-                dast_cmd = build_nuclei_command(
-                    targets_file=dast_targets_file,
-                    output_file=dast_output_file,
-                    docker_image=NUCLEI_DOCKER_IMAGE,
-                    severity=NUCLEI_SEVERITY,
-                    rate_limit=NUCLEI_RATE_LIMIT,
-                    bulk_size=NUCLEI_BULK_SIZE,
-                    concurrency=NUCLEI_CONCURRENCY,
-                    timeout=NUCLEI_TIMEOUT,
-                    retries=NUCLEI_RETRIES,
-                    headless=NUCLEI_HEADLESS,
-                    system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
-                    follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
-                    max_redirects=NUCLEI_MAX_REDIRECTS,
-                    interactsh=NUCLEI_INTERACTSH,
-                    force_dast_pass=True,
-                    auth_headers=_nuclei_auth,
-                    container_name=dast_container,
-                    max_host_error=NUCLEI_MAX_HOST_ERROR,
-                )
-                b_findings, b_fps, b_duration, b_rc = _execute_nuclei_pass(
-                    dast_cmd, dast_output_file, label="DAST",
-                    runtime_cap=NUCLEI_MAX_RUNTIME, container_name=dast_container,
-                )
-                coverage_passes.append((dast_urls, *_nuclei_pass_outcome(
-                    b_rc, b_duration, NUCLEI_MAX_RUNTIME, b_findings or b_fps), True))
-                findings.extend(b_findings)
-                false_positives_filtered.extend(b_fps)
-                dast_duration = b_duration
+                # Inclusion filters are deliberately NOT passed: a DAST pass
+                # selects Nuclei's own ``-dast`` template set, so an explicit
+                # -t/-tags would empty-intersect with it and fatal. The
+                # operator's EXCLUSIONS are passed explicitly -- they are the
+                # denylist, not an inclusion filter, and must constrain the
+                # DAST pass exactly as they constrain the detection pass.
+                # ``force_dast_pass`` drops the inclusion filters in the
+                # builder; it no longer drops these.
+                dast_exclude_tags = NUCLEI_EXCLUDE_TAGS
+                dast_exclude_templates = NUCLEI_EXCLUDE_TEMPLATES
+                try:
+                    dast_container_name = f"redamon-nuclei-dast-{uuid.uuid4().hex[:12]}"
+                    dast_cmd = build_nuclei_command(
+                        targets_file=dast_targets_file,
+                        output_file=dast_output_file,
+                        docker_image=NUCLEI_DOCKER_IMAGE,
+                        severity=NUCLEI_SEVERITY,
+                        exclude_templates=dast_exclude_templates,
+                        exclude_tags=dast_exclude_tags,
+                        rate_limit=NUCLEI_RATE_LIMIT,
+                        bulk_size=NUCLEI_BULK_SIZE,
+                        concurrency=NUCLEI_CONCURRENCY,
+                        timeout=NUCLEI_TIMEOUT,
+                        retries=NUCLEI_RETRIES,
+                        headless=NUCLEI_HEADLESS,
+                        system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
+                        follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
+                        max_redirects=NUCLEI_MAX_REDIRECTS,
+                        interactsh=NUCLEI_INTERACTSH,
+                        force_dast_pass=True,
+                        auth_headers=_nuclei_auth,
+                        container_name=dast_container_name,
+                        max_host_error=NUCLEI_MAX_HOST_ERROR,
+                    )
+                    b_findings, b_fps, b_duration, b_rc = _execute_nuclei_pass(
+                        dast_cmd, dast_output_file, label="DAST",
+                        runtime_cap=NUCLEI_MAX_RUNTIME, container_name=dast_container_name,
+                    )
+                except NucleiEmptySelectionError as exc:
+                    # The policy left the DAST pass nothing to run: either the
+                    # builder refused, or nuclei fatals with "no templates
+                    # provided for scan" because the operator's exclusions
+                    # removed every template from its -dast pool. That is a
+                    # policy-empty outcome, not a scan failure, so it is recorded
+                    # as such; the previous findings are kept and there is NO
+                    # fallback to the full template pool.
+                    print(f"[!][Nuclei] DAST pass not executed (policy_empty): {exc}")
+                    _keep_nuclei_findings("nuclei DAST pass not executed: policy_empty")
+                    b_findings, b_fps, b_duration = [], [], 0
+                    dast_not_executed = {
+                        "pass": "DAST",
+                        "state": "not_executed",
+                        "reason": "policy_empty",
+                        "detail": str(exc),
+                    }
+                    coverage_passes.append((dast_urls, "failed",
+                                            "policy_empty: no templates provided for scan", False))
+                else:
+                    coverage_passes.append((dast_urls, *_nuclei_pass_outcome(
+                        b_rc, b_duration, NUCLEI_MAX_RUNTIME, b_findings or b_fps), True))
+                    findings.extend(b_findings)
+                    false_positives_filtered.extend(b_fps)
+                    dast_duration = b_duration
 
             duration = d_duration + dast_duration
 
@@ -894,9 +992,24 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "exclude_tags": NUCLEI_EXCLUDE_TAGS,
                     "rate_limit": NUCLEI_RATE_LIMIT,
                     "dast_mode": NUCLEI_DAST_MODE,
-                    "dast_pass_executed": do_dast_pass,
+                    "dast_pass_executed": do_dast_pass and dast_not_executed is None,
                     "http_admission": recon_data.get("metadata", {}).get("http_admission", {}),
                     "dast_urls_discovered": len(dast_urls) if NUCLEI_DAST_MODE else 0,
+                    # F03: the DAST pass is a separate consumer of the operator's
+                    # denylist. Record what it actually received and whether the
+                    # builder was asked to drop it, so a policy regression is
+                    # visible in the artifact rather than only in the argv.
+                    "dast_exclude_tags": NUCLEI_EXCLUDE_TAGS,
+                    "dast_exclude_templates": NUCLEI_EXCLUDE_TEMPLATES,
+                    # Absent means no DAST pass was attempted: nothing was
+                    # skipped, so there is no policy state to report.
+                    **({"dast_not_executed": dast_not_executed}
+                       if dast_not_executed is not None else {}),
+                    # Same contract for the DETECTION pass: present only when the
+                    # builder's fail-closed refusal or nuclei's "no templates
+                    # provided for scan" fatal left it nothing to run.
+                    **({"detection_not_executed": detection_not_executed}
+                       if detection_not_executed is not None else {}),
                     "katana_crawl_depth": KATANA_DEPTH if NUCLEI_DAST_MODE else None,
                     "total_urls_scanned": len(scan_urls),
                     "total_hostnames": len(hostnames),
