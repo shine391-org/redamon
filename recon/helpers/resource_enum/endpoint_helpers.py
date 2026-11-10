@@ -56,6 +56,8 @@ def organize_endpoints(
                         'path': []
                     },
                     'sample_urls': [],
+                    'sample_url_methods': {},
+                    'query_fidelity_unknown_without_raw': True,
                     'urls_found': 0
                 }
 
@@ -65,6 +67,7 @@ def organize_endpoints(
             # Keep sample URLs (max 3)
             if len(endpoint['sample_urls']) < 3:
                 endpoint['sample_urls'].append(url)
+                endpoint.setdefault('sample_url_methods', {})[url] = ['GET']
 
             # Parse query parameters
             if query_string:
@@ -93,6 +96,7 @@ def organize_endpoints(
                             'name': param_name,
                             'type': infer_parameter_type(param_name, sample_values),
                             'sample_values': sample_values,
+                            'sample_values_encoding': 'decoded-observation',
                             'category': classify_parameter(param_name)
                         }
                         endpoint['parameters']['query'].append(param_info)
@@ -128,6 +132,10 @@ def organize_endpoints(
             }
 
         endpoint = by_base_url[base_url][path]
+        if action_url in endpoint.get('sample_urls', []):
+            applicable = endpoint.setdefault('sample_url_methods', {}).setdefault(action_url, [])
+            if method not in applicable:
+                applicable.append(method)
 
         # Add method if not present
         if method not in endpoint['methods']:

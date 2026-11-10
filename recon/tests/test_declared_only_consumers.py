@@ -82,7 +82,8 @@ def _builder_queries(builder):
 
 @pytest.mark.parametrize('builder,markers', [
     # nuclei's partial run: parameterised URLs for DAST and the main pass.
-    (graph_builders._build_vuln_scan_data_from_graph, ["WHERE p.position = 'query'"]),
+    # Query buckets now select all positions explicitly; Python keeps them typed.
+    (graph_builders._build_vuln_scan_data_from_graph, ["e.request_fidelity_json AS request_fidelity_json"]),
     # cache poisoning and the GraphQL scanner (which takes the POST ones).
     (graph_builders._build_graphql_data_from_graph, ["OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)"]),
     (graph_builders._build_serialized_data_from_graph, ["collect(DISTINCT {name: p.name, sample_values"]),
@@ -250,7 +251,14 @@ def test_declared_only_paths_need_get_or_head_and_observed_ones_do_not():
         '/orders': _endpoint(['POST'], True),
         '/health': _endpoint(['HEAD'], True),
         '/login': _endpoint(['POST'], False),
-        '/search': _endpoint(['GET'], True, query=[('q', 'a%20b'), ('page', None)]),
+        # OpenAPI producer values are explicitly percent-encoded; the marker
+        # prevents the declared-only caller from encoding them a second time.
+        '/search': {**_endpoint(['GET'], True, query=[('q', 'a%20b'), ('page', None)]),
+                    'parameters': {'query': [
+                        {'name': 'q', 'sample_values': ['a%20b'],
+                         'sample_values_encoding': 'percent-encoded'},
+                        {'name': 'page', 'sample_values': []},
+                    ]}},
     }}}})
     assert sorted(urls) == ['https://a.example.com/health', 'https://a.example.com/login',
                             'https://a.example.com/search?q=a%20b&page=1']

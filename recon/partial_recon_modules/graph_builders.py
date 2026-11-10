@@ -1232,34 +1232,41 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
             if services:
                 recon_data["nmap_scan"] = {"services_detected": services}
 
-            # 4) Endpoints with parameters (for DAST mode). run_vuln_scan keeps
-            #    only URLs carrying `?` and `=`. The crawlers' raw URLs are not
-            #    stored (resource_enum writes no `full_url`), so rebuild each one
-            #    from its query Parameters the way build_target_urls_from_resource_enum
-            #    does: first sample value, else "1".
+            # 4) Request observations for DAST. Raw query order/duplicates and
+            # encoding survive the resource writer; legacy graph data is unknown.
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
-                      -[:HAS_PARAMETER]->(p:Parameter)
-                WHERE p.position = 'query' AND p.name IS NOT NULL AND e.path IS NOT NULL
+                WHERE e.path IS NOT NULL
                   AND NOT """ + declared_only_unsafe("e") + """ AND NOT """ + quarantined("e") + """
-                WITH b, e, p ORDER BY p.name
+                OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
+                WHERE p.name IS NOT NULL
                 RETURN b.url AS baseurl, e.path AS path, """ + ARCHIVE_ONLY + """ AS archive_only,
-                       collect(DISTINCT [p.name, coalesce(head(p.sample_values), '1')]) AS params
+                       coalesce(e.method, 'GET') AS method,
+                       e.request_fidelity_json AS request_fidelity_json,
+                       collect(DISTINCT {name: p.name, sample_values: coalesce(p.sample_values, []),
+                           position: p.position, sample_values_encoding: p.sample_values_encoding}) AS params
                 """,
                 uid=user_id, pid=project_id,
             )
             discovered_urls = []
             archived_urls = []
+            from recon.helpers.target_helpers import _endpoint_url
             for record in result:
                 base = record["baseurl"]
-                params = [(name, str(value)) for name, value in (record["params"] or []) if name]
-                if base and params and keep(url_host(base)):
-                    url = f"{base}{record['path']}?{urlencode(params)}"
-                    discovered_urls.append(url)
-                    if record.get("archive_only"):
-                        archived_urls.append(url)
+                if not base or not keep(url_host(base)):
+                    continue
+                endpoint = _request_endpoint_from_graph(record)
+                endpoints = recon_data["resource_enum"].setdefault("by_base_url", {}).setdefault(
+                    base, {"endpoints": {}})["endpoints"]
+                _merge_request_endpoint(endpoints, record["path"], endpoint)
+                urls = endpoint.get("sample_urls") or [_endpoint_url(base, record["path"], endpoint)]
+                for url in urls:
+                    if url and "?" in url:
+                        discovered_urls.append(url)
+                        if record.get("archive_only"):
+                            archived_urls.append(url)
             # URLs other writers store whole (JS Recon, urlscan) still count.
             result = session.run(
                 """
@@ -1418,6 +1425,58 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
     return recon_data
 
 
+
+def _request_endpoint_from_graph(record):
+    """Read persisted observation; a legacy Parameter projection is lossy.
+
+    No fallback may manufacture decoded provenance or promote a missing
+    parameter position to query. A versioned endpoint snapshot overrides only
+    its query bucket; body/path parameters retain their graph positions.
+    """
+    import json
+    method = record.get("method") or "GET"
+    endpoint = {"method": method, "methods": [method],
+                "parameters": {"query": [], "body": [], "path": []}}
+    for p in record.get("params") or []:
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        position = p.get("position")
+        if position not in endpoint["parameters"]:
+            endpoint["fidelity_unknown"] = True
+            continue
+        param = {"name": p["name"], "sample_values": p.get("sample_values") or [],
+                 "methods": [method]}
+        if p.get("sample_values_encoding"):
+            param["sample_values_encoding"] = p["sample_values_encoding"]
+        endpoint["parameters"][position].append(param)
+    snapshot = None
+    try:
+        snapshot = json.loads(record.get("request_fidelity_json") or "null")
+    except (ValueError, TypeError):
+        pass
+    if (isinstance(snapshot, dict) and snapshot.get("version") == 1
+            and snapshot.get("method") == method and isinstance(snapshot.get("query"), list)):
+        endpoint["parameters"]["query"] = snapshot["query"]
+        endpoint["sample_urls"] = snapshot.get("sample_urls") or []
+        if snapshot.get("fidelity_unknown"):
+            endpoint["fidelity_unknown"] = True
+    elif endpoint["parameters"]["query"] or record.get("params"):
+        endpoint["fidelity_unknown"] = True
+        endpoint["fidelity_unknown_reasons"] = ["legacy_graph_order_duplicates_encoding"]
+    return endpoint
+
+
+def _merge_request_endpoint(endpoints, path, endpoint):
+    """Retain method-specific variants instead of last-row-wins projection."""
+    old = endpoints.get(path)
+    if old is None:
+        endpoints[path] = endpoint
+        return
+    variants = old.setdefault("request_variants", [dict(old)])
+    variants.append(endpoint)
+    old["methods"] = sorted(set(old["methods"] + endpoint["methods"]))
+
+
 def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                                       settings: dict = None, domain_groups: list = None) -> dict:
     """Build recon_data for the serialized-object scan from the existing graph.
@@ -1533,7 +1592,9 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                 WHERE p.name IS NOT NULL
                 RETURN b.url AS base, b.host AS host, e.path AS path,
                        coalesce(e.method, 'GET') AS method,
-                       collect(DISTINCT {name: p.name, sample_values: coalesce(p.sample_values, [])}) AS params
+                       e.request_fidelity_json AS request_fidelity_json,
+                       collect(DISTINCT {name: p.name, sample_values: coalesce(p.sample_values, []),
+                           position: p.position, sample_values_encoding: p.sample_values_encoding}) AS params
                 """,
                 uid=user_id, pid=project_id,
             )
@@ -1541,15 +1602,9 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                 base = record["base"]
                 if not base or not keep(url_host(base, record["host"] or "")):
                     continue
-                params = {}
-                for p in record["params"] or []:
-                    name = p.get("name")
-                    if not name:
-                        continue
-                    samples = [s for s in (p.get("sample_values") or []) if isinstance(s, str)]
-                    params[str(name)] = {"sample_values": samples}
+                endpoint = _request_endpoint_from_graph(record)
                 endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
-                endpoints[record["path"]] = {"method": record["method"], "parameters": params}
+                _merge_request_endpoint(endpoints, record["path"], endpoint)
 
             # 4) Form field names (values are not persisted in the graph) -> forms.
             result = session.run(

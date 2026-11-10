@@ -124,10 +124,10 @@ class _Session:
         # match the serialized builder's map key, not the bare property name
         elif "sample_values: coalesce" in cypher:
             for url, host in BASEURLS:
-                rows.append({"base": url, "host": host, "path": "/api/load", "method": "GET",
+                rows.append({"base": url, "baseurl": url, "host": host, "path": "/api/load", "method": "GET",
                              # the OPTIONAL MATCH yields one null-name row for an
                              # endpoint with no Parameter; the builder must skip it
-                             "params": [{"name": "data", "sample_values": ["rO0ABXNy"]},
+                             "params": [{"name": "data", "sample_values": ["rO0ABXNy"], "position": "query", "sample_values_encoding": None},
                                         {"name": None, "sample_values": []}]})
         elif "openapi_security AS openapi_security" in cypher:
             for url, host in BASEURLS:
@@ -404,8 +404,13 @@ class TestSerializedBuilder:
 
     def test_parameters_keep_their_sample_values(self, graph):
         eps = self.build()["resource_enum"]["by_base_url"]["https://www.alpha.test"]["endpoints"]
-        assert eps["/api/load"] == {"method": "GET",
-                                    "parameters": {"data": {"sample_values": ["rO0ABXNy"]}}}
+        # Legacy graph samples have no encoding provenance: do not invent decoded.
+        assert eps["/api/load"] == {
+            "method": "GET", "methods": ["GET"],
+            "parameters": {"query": [{"name": "data", "sample_values": ["rO0ABXNy"],
+                                      "methods": ["GET"]}], "body": [], "path": []},
+            "fidelity_unknown": True,
+            "fidelity_unknown_reasons": ["legacy_graph_order_duplicates_encoding"]}
 
     def test_forms_carry_field_names_only(self, graph):
         forms = [f for f in self.build()["resource_enum"]["forms"]

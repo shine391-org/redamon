@@ -206,7 +206,7 @@ MAX_DECLARED_NUCLEI_URLS = 500
 from urllib.parse import quote as _q
 
 
-def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
+def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> Optional[str]:
     """The URL with sample query values for GET-style scanning, else the bare path.
 
     Preserve a raw discovered sample URL verbatim when one is available so that
@@ -215,7 +215,14 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
     tuples when no sample URL exists, encoding each component so the result
     round-trips through the standard parsers without double-encoding.
     """
-    endpoint_info = endpoint_info or {}
+    if endpoint_info is None:
+        endpoint_info = {}
+    variants = endpoint_info.get("request_variants") or []
+    if variants:
+        # The path-keyed legacy schema cannot flatten method variants safely.
+        # Retain all variants in the artifact, and prefer the GET/HEAD projection
+        # for this URL-only consumer without relabeling a POST observation.
+        endpoint_info = next((v for v in variants if v.get("method") in ("GET", "HEAD")), variants[0])
     sample_urls = endpoint_info.get("sample_urls") or []
     if isinstance(sample_urls, str):
         sample_urls = [sample_urls]
@@ -225,9 +232,48 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
     if isinstance(single, str) and single.strip():
         return single
 
-    params = (endpoint_info.get("parameters") or {}).get("query") or []
-    parts = []
+    if endpoint_info.get("query_fidelity_unknown_without_raw"):
+        endpoint_info["fidelity_unknown"] = True
+    parameters = endpoint_info.get("parameters")
+    if isinstance(parameters, dict):
+        method = endpoint_info.get("method") or next(
+            (m for m in endpoint_info.get("methods", []) if m in ("GET", "HEAD")),
+            next(iter(endpoint_info.get("methods") or []), None))
+        raw_params = (endpoint_info.get("query_by_method") or {}).get(method, parameters.get("query"))
+        if raw_params is None:
+            if any(k not in ("body", "path") for k in parameters):
+                endpoint_info["fidelity_unknown"] = True
+                endpoint_info.setdefault("fidelity_unknown_reasons", []).append("legacy_name_keyed_order_duplicates_encoding")
+            # A pre-F01 name-keyed projection had no "query" bucket.
+            raw_params = [{"name": name, **value} if isinstance(value, dict) else {"name": name}
+                          for name, value in parameters.items()
+                          if name not in ("body", "path")]
+    else:
+        raw_params = []
+    params = raw_params or []
+    # A name-keyed/aggregated projection cannot recover source order or
+    # duplicate keys. Keep that loss explicit rather than claiming fidelity.
+    if endpoint_info.get("fidelity_unknown"):
+        endpoint_info.setdefault("fidelity", []).append("fidelity_unknown")
+    # Older serialized projections keyed parameters by name. Accept that shape
+    # without inventing values, and never treat an encoded value as decoded.
+    normalized_params = []
     for param in params:
+        if isinstance(param, str):
+            param = {"name": param}
+        if not isinstance(param, dict):
+            continue
+        if "name" not in param and isinstance(param.get("sample_values"), dict):
+            # Name-keyed legacy projection: {"q": {"sample_values": [...]}}.
+            for name, value in param.items():
+                if isinstance(value, dict):
+                    normalized_params.append({**value, "name": name})
+                else:
+                    normalized_params.append({"name": name})
+            continue
+        normalized_params.append(param)
+    parts = []
+    for param in normalized_params:
         name = param.get("name")
         if not name:
             continue
@@ -239,13 +285,33 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
                 value = ""
         else:
             value = "1"
-        parts.append(f"{_q(str(name), safe='')}={_q(str(value), safe='')}")
+        encoding = param.get("sample_values_encoding")
+        if encoding not in ("percent-encoded", "decoded-observation"):
+            # Legacy samples have mixed producer encodings. Keep the legacy
+            # percent tokens (no heuristic unquote), but do not claim this is a
+            # recovered request. Raw observations/new producers avoid this lane.
+            endpoint_info["fidelity_unknown"] = True
+            reasons = endpoint_info.setdefault("fidelity_unknown_reasons", [])
+            if "legacy_sample_encoding_order_duplicates" not in reasons:
+                reasons.append("legacy_sample_encoding_order_duplicates")
+            if "fidelity_unknown" not in endpoint_info.setdefault("fidelity", []):
+                endpoint_info["fidelity"].append("fidelity_unknown")
+        if any(ord(c) <= 31 or 127 <= ord(c) <= 159 for c in str(name) + str(value)):
+            return None
+        if encoding == "percent-encoded":
+            # OpenAPI's producer already serialized this example.
+            encoded_value = str(value)
+        else:
+            encoded_value = _q(str(value), safe='' if encoding == 'decoded-observation' else '%')
+        parts.append(f"{_q(str(name), safe='')}={encoded_value}")
     if not parts:
         return f"{base_url}{path}"
     return f"{base_url}{path}?{'&'.join(parts)}"
 
 
-def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict], report=None) -> Tuple[List[str], List[str]]:
+def build_target_urls_from_resource_enum(
+        resource_enum_data: Optional[dict], report: Optional[dict] = None
+) -> Tuple[List[str], List[str]]:
     """
     Build list of target URLs from resource_enum data.
 
@@ -263,6 +329,7 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict], rep
     """
     base_urls = []
     endpoint_urls = []
+    rejected_endpoints = {}
 
     if not resource_enum_data:
         return base_urls, endpoint_urls
@@ -289,7 +356,7 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict], rep
             if report is not None:
                 report.setdefault("resource_enum_path", {"admitted": 0, "rejected": {}})["admitted"] += 1
             url = _endpoint_url(base_url, path, endpoint_info)
-            reason = http_url_rejection(url)
+            reason = "control_or_whitespace" if url is None else http_url_rejection(url)
             if reason:
                 rejected_endpoints[reason] = rejected_endpoints.get(reason, 0) + 1
                 continue

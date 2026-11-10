@@ -325,6 +325,7 @@ Additional properties present on this node type, not yet described:
 - resolved_url (string)
 - tls_cipher (string)
 - urls_found (integer)
+- request_fidelity_json (string): version 1 method-specific query observation; raw sample URLs plus ordered query entries with explicit sample_values_encoding. Not a body/auth blob. Missing/invalid snapshots use a legacy fidelity_unknown projection; never infer encoding from percent signs.
 - word_count (float)
 Additional properties present on this node type, not yet described:
 - _js_recon_created
@@ -342,6 +343,7 @@ Additional properties present on this node type, not yet described:
 - type (string): what its values are, the same words from every module: "integer", "path", "email", "url" (its value is a web address, plain or URL-encoded), "datetime", "boolean", "string". Archive sources (GAU, urlscan) infer it from values kept only in memory; ParamSpider from the name
 - category (string): the same words from every module: "id_params", "file_params", "search_params", "auth_params", "redirect_params", "command_params", "other". A `redirect_params` or `url`-typed parameter is an open-redirect / SSRF candidate
 - value (string): sample value if captured
+- sample_values_encoding (string): percent-encoded (OpenAPI) or decoded-observation (parsed query). Missing is unknown, not evidence that values are decoded.
 - sample_values (list[string]): values a crawler saw; never written for an archived (urlscan, GAU, ParamSpider) parameter
 - sample_value (string): a raw value only an older urlscan writer stored; no longer written, and the one-off urlscan backfill removes it
 - arjun_methods (list[string]): HTTP methods on which Arjun reported this parameter; evidence from the latest Arjun merge, not complete request coverage or a restriction on observations from other sources. Missing means unknown

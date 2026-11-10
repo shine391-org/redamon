@@ -31,6 +31,10 @@ def native_resource(rows):
             "declared_only": row["declared_only"], "sources": row["provenance"],
             "status_code": row["validation"]["status_code"],
         }
+        # Corpus parameter samples are explicitly decoded, unlike legacy graph
+        # values; model the current producer marker rather than guessing '%'.
+        for param in by_base[row["origin"]]["endpoints"][row["path"]]["parameters"].get("query", []):
+            param["sample_values_encoding"] = "decoded-observation"
     return {"by_base_url": by_base, "discovered_urls": [r["raw_url"] for r in rows]}
 
 
@@ -58,9 +62,8 @@ def test_characterize_native_builder_projection(case_id):
     if row["id"] in {"declared-post", "declared-template"}:
         assert urls == []  # not executable GET targets; declaration still in corpus
     elif row["id"] == "query-encoding":
-        # F01 rejects the malformed raw-whitespace URI produced by the legacy
-        # interpolation. Raw observation survives; F02 owns correct encoding.
-        assert urls == []
+        # F02 rebuilds decoded observations with component-safe query encoding.
+        assert urls == ["https://a.example.test/api/search?q=a%26b%3D%23%20%25%2B%E9%9B%AA"]
     elif row["id"] == "duplicate-keys":
         assert urls == ["https://a.example.test/api/dup?k=1&empty=&K=3"]
     else:
@@ -68,13 +71,17 @@ def test_characterize_native_builder_projection(case_id):
     # This captures admission only, not method/auth/validation fidelity or coverage.
 
 
-def test_negative_probe_query_fidelity_is_not_approved_baseline():
+def test_query_fidelity_roundtrip_is_the_approved_contract():
     row = CASES["query-encoding"]
-    rebuilt = th._endpoint_url(row["origin"], row["path"], {"parameters": row["parameters"]})
+    params = copy.deepcopy(row["parameters"])
+    for param in params["query"]:
+        param["sample_values_encoding"] = "decoded-observation"
+    rebuilt = th._endpoint_url(row["origin"], row["path"], {"parameters": params})
     desired_pairs = parse_qsl(urlsplit(row["raw_url"]).query, keep_blank_values=True)
     assert desired_pairs == [("q", "a&b=# %+雪")]
-    assert parse_qsl(urlsplit(rebuilt).query, keep_blank_values=True) != desired_pairs
-    # F02 must replace this defect probe with equality against the desired contract.
+    # F02 contract: rebuilding a decoded observation must preserve the request
+    # value, while serializing delimiters only in the query component.
+    assert parse_qsl(urlsplit(rebuilt).query, keep_blank_values=True) == desired_pairs
 
 
 def test_ffuf_seed_path_meets_f01_contract():
