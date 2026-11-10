@@ -13,7 +13,6 @@ from graph_db.coverage_stamps import stamp_base_url_coverage
 from graph_db.cpe_resolver import _is_ip_address
 from graph_db.mixins.recon.scope import build_host_scope, host_in_scope, org_for_scan_root
 from graph_db.endpoint_paths import normalize_endpoint_path
-from recon.helpers.selection_coverage import KEY as SELECTION_KEY, selection_block
 
 
 def stable_vuln_id(finding_type: str, url: str, ip_or_host: str = "",
@@ -329,6 +328,9 @@ class VulnMixin:
         Returns:
             Dictionary with statistics about created/updated nodes/relationships
         """
+        # Lazy on purpose: see graph_db/mixins/recon/domain_mixin.py::merge_coverage.
+        from recon.helpers.selection_coverage import KEY as SELECTION_KEY, selection_block
+
         stats = {
             "endpoints_created": 0,
             "parameters_created": 0,

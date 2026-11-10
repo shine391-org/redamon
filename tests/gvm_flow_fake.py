@@ -84,7 +84,8 @@ class FakeGraph:
         return {"vulnerabilities_deleted": 0, "technologies_deleted": 0,
                 "cves_deleted": 0, "technologies_cleaned": 0}
 
-    def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
+    def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
+                              keep_unproven=False):
         self.log.append(("prune", list(sources), since, sorted(keep_hosts)))
         return {"pruned": 0, "stale": 0, "revived": 0}
 

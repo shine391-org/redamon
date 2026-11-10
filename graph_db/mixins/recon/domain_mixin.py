@@ -9,7 +9,6 @@ from urllib.parse import urlparse, parse_qs
 
 from graph_db.cpe_resolver import _is_ip_address
 from graph_db.mixins.recon.scope import home_domain, org_for_scan_root, project_orgs
-from recon.helpers.selection_coverage import merge_selection_blocks
 
 # The first clause of every read-modify-write on an org Domain (GDB-11). Several
 # scan roots share one org Domain and up to twelve partial recons run at once,
@@ -59,6 +58,11 @@ def merge_coverage(stored: dict, record: dict, scan_root: str, run_started_at) -
     gap entry carries the scan root it came from, so a reader can drop a
     removed root's entries (§4.11.7).
     """
+    # Lazy on purpose: `graph_db/mixins` can be on sys.path (tests do this),
+    # where `import recon` resolves to THIS package (graph_db/mixins/recon)
+    # rather than the top-level recon package, so a module-level import would
+    # fail. At the call sites below `recon` is the real package.
+    from recon.helpers.selection_coverage import merge_selection_blocks
     import json as _json
     try:
         gaps = _json.loads(record.get("gaps_json") or "[]")

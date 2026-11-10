@@ -33,6 +33,8 @@
 - recon_coverage_run (string): the start of the full recon run that wrote the coverage record; the groups of one run merge into it, a new run replaces it
 - recon_skipped_hosts (list[string]): host:port targets this run skipped as unreachable (first 500, sorted); their findings were kept, not re-checked
 - recon_nuclei_truncated (boolean): a Nuclei pass hit NUCLEI_MAX_RUNTIME and was stopped; its partial findings were kept
+- recon_selection_json (string): JSON block of this run's selection accounting (`recorded`, `selection_unknown`, `plan_ids`, `exhaustive`), written by the coverage record; `exhaustive` is true only when the run cut nothing and no cut was unknown, so a selective run is never exhaustive
+- vuln_scan_selection_json (string): the same bounded selection block for the vuln_scan pass, written by the vuln_scan graph writer from the selection plan persisted in the recon artifact; absent when no plan was recorded
 - is_wildcard_zone (boolean): RedAmon's wildcard control probed random names under this domain and they resolved, so the zone answers EVERY name (wildcard DNS); false when they did not resolve; absent when it was never checked (DNS resolution off, or the probe failed). Names that only resolve through the wildcard are not kept as Subdomains
 - wildcard_ips (list[string]): the addresses the wildcard answers with (empty when the zone is no wildcard)
 Additional properties present on this node type, not yet described:

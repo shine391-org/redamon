@@ -124,7 +124,9 @@ class TestCoverageOnTheOrg:
         monkeypatch.setattr(main, '_RUN_STARTED_AT', '2026-10-22T10:00:00')
         monkeypatch.setattr(main, '_settings', {'SCOPE_GROUPS': [_group('api.example.com', 'example.com')]})
         report = mock.Mock(gaps_json=lambda: json.dumps([{'module': 'naabu'}]),
-                           stored_skipped_hosts=lambda: [], nuclei_truncated=False)
+                           stored_skipped_hosts=lambda: [], nuclei_truncated=False,
+                           selection_json=lambda: {"recorded": False, "selection_unknown": False,
+                                                   "plan_ids": [], "exhaustive": True})
         group = mock.Mock(report=lambda: report)
         assert main._write_coverage_record('api.example.com', group) is True
         args, kwargs = client.update_graph_coverage.call_args
@@ -132,6 +134,8 @@ class TestCoverageOnTheOrg:
         record = args[3]
         assert record['org_domain'] == 'example.com'
         assert json.loads(record['gaps_json']) == [{'module': 'naabu', 'root': 'api.example.com'}]
+        assert json.loads(record['selection_json']) == {
+            "recorded": False, "selection_unknown": False, "plan_ids": [], "exhaustive": True}
         assert kwargs == {'run_started_at': '2026-10-22T10:00:00'}
 
     def test_ip_mode_stamps_the_mock_root(self, monkeypatch):
