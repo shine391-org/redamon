@@ -754,14 +754,24 @@ def _is_host_in_scope(
 
 
 #: Settings a partial recon run may override from modal checkboxes. Every other
-#: key is rejected, so an override can never clobber an unrelated setting and no
-#: dormant runtime key is introduced by an override. plannerMode is validated
-#: against its enum with the off default; the planner consumer flags are booleans.
+#: key is rejected — observably, never silently — so an override can never
+#: clobber an unrelated setting and no dormant runtime key is introduced by an
+#: override. plannerMode is validated strictly against its enum with the off
+#: default; boolean toggles must be real booleans (no truthiness coercion).
+#:
+#: The vuln-scan trio (CVE_LOOKUP_ENABLED / MITRE_ENABLED /
+#: SECURITY_CHECK_ENABLED) is exactly what the Partial Recon modal emits
+#: (PartialReconModal.tsx) and what run_nuclei -> run_vuln_scan consumes; the
+#: previous blind override loop supported them and the allowlist must keep that
+#: contract.
 PARTIAL_SETTINGS_ALLOWLIST: dict[str, dict] = {
     # force-enables a partial recon explicitly asks for
-    'NUCLEI_ENABLED': {'type': 'bool', 'default': False},
+    'NUCLEI_ENABLED': {'type': 'bool', 'default': True},
     'SUBDOMAIN_TAKEOVER_ENABLED': {'type': 'bool', 'default': False},
-    'GVM_ENABLED': {'type': 'bool', 'default': False},
+    # vuln-scan follow-up stages the modal can turn off individually
+    'CVE_LOOKUP_ENABLED': {'type': 'bool', 'default': True},
+    'MITRE_ENABLED': {'type': 'bool', 'default': True},
+    'SECURITY_CHECK_ENABLED': {'type': 'bool', 'default': True},
     # planner controls (F09)
     'PLANNER_MODE': {'type': 'enum', 'values': ('off', 'shadow', 'enforce'),
                      'default': 'off'},
@@ -772,11 +782,17 @@ PARTIAL_SETTINGS_ALLOWLIST: dict[str, dict] = {
 }
 
 
-def apply_settings_overrides(settings: dict, overrides: dict) -> dict:
+def apply_settings_overrides(settings: dict, overrides: dict,
+                             log=print) -> dict:
     """Apply ``settings_overrides`` against the partial allowlist.
 
-    Unknown keys are dropped (never silently written). ``PLANNER_MODE`` is
-    validated against its enum and falls back to the off default on a bad value.
+    Unknown keys and invalid values are REJECTED observably: a line naming the
+    key is printed (via ``log``) so the caller sees that the value did not
+    apply, and the original setting is preserved untouched — never a silently
+    coerced or silently dropped override. ``PLANNER_MODE`` is validated
+    strictly against its enum; on a bad value the original setting wins, and
+    when the setting was absent the off default applies. Booleans must be real
+    booleans: ``"false"`` never becomes ``True`` through truthiness coercion.
     Unrelated settings are preserved: only allowlisted keys are touched.
     Returns a copy.
     """
@@ -784,13 +800,26 @@ def apply_settings_overrides(settings: dict, overrides: dict) -> dict:
     for key, value in (overrides or {}).items():
         spec = PARTIAL_SETTINGS_ALLOWLIST.get(key)
         if spec is None:
-            continue  # unknown override key: rejected, setting preserved
+            log(f"[!][Partial Recon] settings_overrides rejected: {key} "
+                f"(not a supported partial override; saved setting preserved)")
+            continue
         kind = spec.get('type')
         if kind == 'enum':
             values = spec.get('values', ())
-            out[key] = value if value in values else spec.get('default')
+            if value in values:
+                out[key] = value
+            else:
+                log(f"[!][Partial Recon] settings_overrides rejected: {key}="
+                    f"{value!r} (must be one of {', '.join(values)}; "
+                    f"saved setting preserved)")
+                out.setdefault(key, spec.get('default'))
         elif kind == 'bool':
-            out[key] = bool(value)
+            if isinstance(value, bool):
+                out[key] = value
+            else:
+                log(f"[!][Partial Recon] settings_overrides rejected: {key}="
+                    f"{value!r} (must be a boolean; saved setting preserved)")
+                out.setdefault(key, spec.get('default'))
         else:
             out[key] = value
     return out
