@@ -34,6 +34,7 @@ class RecordingGraph:
     def __init__(self):
         self.nodes = {}
         self.params = {}
+        self.edges = set()
         self.calls = []
         self.result_artifact = None
         self.driver = self
@@ -66,6 +67,12 @@ class RecordingGraph:
             node = self.params.setdefault(key, {'name': kwargs['name'], 'position': kwargs['position']})
             for prop, arg in re.findall(r'p\.(\w+)\s*=\s*\$(\w+)', query):
                 node[prop] = copy.deepcopy(kwargs[arg])
+        elif 'MERGE (e)-[:HAS_PARAMETER]->(p)' in query:
+            method = kwargs.get('method')
+            if method is None:
+                method = re.search(r"method: '([^']+)'", query)[1]
+            self.edges.add((kwargs['baseurl'], kwargs['path'], method,
+                            kwargs['param_name'], kwargs['position']))
         elif 'RETURN count(*) AS linked' in query:
             return Result([{'linked': 0}])
         elif "RETURN d.name AS name" in query:
@@ -82,6 +89,8 @@ class RecordingGraph:
                 row['params'] = []
                 for (pb, pp, _, _), param in self.params.items():
                     if (pb, pp) != (base, path):
+                        continue
+                    if (base, path, method, param['name'], param['position']) not in self.edges:
                         continue
                     if "WHERE p.position = 'query'" in query and param['position'] != 'query':
                         continue
@@ -185,8 +194,9 @@ def test_graph_position_and_post_method_are_not_promoted(monkeypatch):
         'body': [_param('secret', name='token')], 'path': [_param('7', name='id')], 'query': []}})
     data = gb._build_serialized_data_from_graph('example.com', 'u', 'p', settings={})
     ep = data['resource_enum']['by_base_url'][BASE]['endpoints']['/search']
-    assert ep['methods'] == ['POST'] and ep['method'] == 'POST'
-    assert ep['parameters']['query'] == []
+    assert ep['method'] == 'POST'
+    assert ep['parameters']['query'] == []  # old reader wrongly promoted body/path here
+    assert ep['methods'] == ['POST']
     assert [p['name'] for p in ep['parameters']['body']] == ['token']
     assert [p['name'] for p in ep['parameters']['path']] == ['id']
     assert th._endpoint_url(BASE, '/search', ep) == BASE + '/search'
