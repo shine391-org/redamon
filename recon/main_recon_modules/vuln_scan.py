@@ -635,9 +635,20 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         # AI tag pruning (cascade-gated; replaces NUCLEI_TAGS with a tech-aware
         # subset chosen by an LLM based on http_probe fingerprint). Applies to
         # the detection pass only; the DAST pass ignores tags by design.
+        # F04 pruning contract: the result must be a subset of the
+        # policy-filtered saved selection. vuln_scan re-clamps defensively so
+        # a mocked/legacy/planner implementation cannot expand the selection
+        # (no 'takeover', no tech tags, no out-of-whitelist tags), and records
+        # saved/effective/added/removed + reason in scan_metadata.
         ai_tags_used = False
+        ai_selection = None
         if NUCLEI_AI_TAGS and NUCLEI_TAGS:
-            from recon.helpers.ai_planner.nuclei_tags import get_ai_tags
+            from recon.helpers.ai_planner.nuclei_tags import (
+                get_ai_tags,
+                policy_filtered_selection,
+                selection_report,
+            )
+            saved_tags = policy_filtered_selection(NUCLEI_TAGS, NUCLEI_EXCLUDE_TAGS)
             tech_fp = _build_tech_fingerprint(recon_data.get('http_probe', {}))
             fallback_urls = (
                 target_urls if not tech_fp['technologies'] and not tech_fp['servers']
@@ -652,13 +663,28 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 fallback_urls=fallback_urls,
                 engine=('jev' if NUCLEI_TAGS_AI_USE_JEV else 'llm'),
                 settings=settings,
+                exclude_tags=NUCLEI_EXCLUDE_TAGS,
             )
-            if ai_tags != NUCLEI_TAGS:
+            # Defensive clamp at the consumer: only saved, non-excluded tags.
+            saved_set = set(saved_tags)
+            clamped = [t for t in dict.fromkeys(ai_tags) if t in saved_set]
+            ai_succeeded = clamped != saved_tags
+            ai_selection = selection_report(
+                NUCLEI_TAGS, clamped,
+                exclude_tags=NUCLEI_EXCLUDE_TAGS,
+                ai_succeeded=ai_succeeded,
+            )
+            # A helper that returned the policy-filtered selection verbatim
+            # means the AI fell back; anything else is a real prune.
+            if clamped != saved_tags:
                 ai_tags_used = True
-                print(f"[*][Nuclei-AI] Tag pruning: {len(NUCLEI_TAGS)} -> {len(ai_tags)} tags")
-                print(f"[*][Nuclei-AI] Selected: {ai_tags}")
-                NUCLEI_TAGS = ai_tags
+                print(f"[*][Nuclei-AI] Tag pruning: {len(NUCLEI_TAGS)} -> {len(clamped)} tags")
+                print(f"[*][Nuclei-AI] Selected: {clamped}")
+                print("[*][Nuclei-AI] Removed: " + str(ai_selection['removed_tags'])
+                      + " (reason=" + ai_selection['reason'] + ")")
+                NUCLEI_TAGS = clamped
             else:
+                NUCLEI_TAGS = saved_tags
                 print(f"[*][Nuclei-AI] Falling back to user tags (no signal or LLM unavailable)")
 
         # For DAST mode, we need URLs with parameters from resource_enum
@@ -989,6 +1015,12 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "severity_filter": NUCLEI_SEVERITY,
                     "tags_filter": NUCLEI_TAGS,
                     "tags_ai_selected": ai_tags_used,
+                    "tags_saved": (ai_selection or {}).get("saved_tags", NUCLEI_TAGS),
+                    "tags_policy_saved": (ai_selection or {}).get("policy_saved_tags", NUCLEI_TAGS),
+                    "tags_effective": (ai_selection or {}).get("effective_tags", NUCLEI_TAGS),
+                    "tags_added": (ai_selection or {}).get("added_tags", []),
+                    "tags_removed": (ai_selection or {}).get("removed_tags", []),
+                    "tags_selection_reason": (ai_selection or {}).get("reason", "ai_disabled"),
                     "exclude_tags": NUCLEI_EXCLUDE_TAGS,
                     "rate_limit": NUCLEI_RATE_LIMIT,
                     "dast_mode": NUCLEI_DAST_MODE,

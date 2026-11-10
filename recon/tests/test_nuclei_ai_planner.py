@@ -214,7 +214,10 @@ def test_get_ai_tags_empty_fingerprint_head_probe_succeeds():
             model='claude-haiku-4-5',
             fallback_urls=['https://example.com/'],
         )
-    assert result == ['cve', 'apache']
+    # F04 pruning contract: AI may only keep tags from the saved selection.
+    # 'apache' was never selected, so it is dropped even though it is a
+    # valid candidate.
+    assert result == ['cve']
     print("PASS: test_get_ai_tags_empty_fingerprint_head_probe_succeeds")
 
 
@@ -332,7 +335,7 @@ def test_get_ai_tags_max_tags_enforced():
                     return_value=_mock_resp(json_data={'tags': ['cve', 'xss', 'sqli', 'rce', 'lfi']})):
         result = get_ai_tags(
             tech_fingerprint={'technologies': ['x'], 'servers': []},
-            current_tags=['cve'],
+            current_tags=['cve', 'xss', 'sqli', 'rce', 'lfi'],
             model='claude-haiku-4-5',
             max_tags=3,
         )
@@ -390,6 +393,9 @@ def test_get_ai_tags_success_round_trip():
     """End-to-end happy path: fingerprint -> POST -> validate -> return."""
     _reset_candidates_cache()
     nt._candidates_cache = ['cve', 'xss', 'sqli', 'wordpress', 'apache', 'php']
+    # F04 pruning contract: the AI response is a PRUNE of the saved selection,
+    # so the payload advertises the policy-filtered saved tags and any
+    # unselected tag the model returns is dropped.
     with mock.patch('recon.helpers.ai_planner.nuclei_tags.requests.post',
                     return_value=_mock_resp(json_data={
                         'tags': ['cve', 'wordpress', 'apache', 'php', 'xss']
@@ -404,7 +410,7 @@ def test_get_ai_tags_success_round_trip():
             user_id='u1',
             project_id='p1',
         )
-    assert result == ['cve', 'wordpress', 'apache', 'php', 'xss']
+    assert result == ['cve', 'xss']
     # Confirm payload structure
     call_args = post_mock.call_args
     payload = call_args.kwargs['json']

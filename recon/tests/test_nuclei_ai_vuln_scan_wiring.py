@@ -130,7 +130,8 @@ class TestVulnScanAIWiring(unittest.TestCase):
         captured = {}
         def fake_get_ai_tags(**kwargs):
             captured.update(kwargs)
-            return ["cve", "wordpress", "apache", "php"]
+            # F04: a prune returns only tags from the saved selection.
+            return ["cve", "xss"]
         try:
             with patch.object(vs, "_execute_nuclei_pass", return_value=([], [], 1.0, 0)), \
                  patch("recon.helpers.ai_planner.nuclei_tags.get_ai_tags",
@@ -147,13 +148,24 @@ class TestVulnScanAIWiring(unittest.TestCase):
             self.assertIn("apache", servers)
             # No fallback_urls because tech IS available
             self.assertIsNone(captured["fallback_urls"])
+            # Operator exclusions are handed to the helper so policy is
+            # applied after the AI decision.
+            self.assertEqual(captured["exclude_tags"], [])
             # build_nuclei_command must receive the AI-pruned tags, NOT the originals
             cmd_kwargs = cmd_mock.call_args.kwargs
-            self.assertEqual(cmd_kwargs["tags"], ["cve", "wordpress", "apache", "php"])
-            # Metadata flag flipped on
+            self.assertEqual(cmd_kwargs["tags"], ["cve", "xss"])
+            # Metadata records saved/effective/added/removed + reason
             md = rd["vuln_scan"]["scan_metadata"]
-            self.assertEqual(md["tags_filter"], ["cve", "wordpress", "apache", "php"])
+            self.assertEqual(md["tags_filter"], ["cve", "xss"])
             self.assertTrue(md["tags_ai_selected"])
+            self.assertEqual(md["tags_saved"], settings["NUCLEI_TAGS"])
+            self.assertEqual(md["tags_effective"], ["cve", "xss"])
+            self.assertEqual(md["tags_added"], [])
+            self.assertEqual(
+                md["tags_removed"],
+                [t for t in settings["NUCLEI_TAGS"] if t not in ("cve", "xss")],
+            )
+            self.assertEqual(md["tags_selection_reason"], "ai_pruned")
         finally:
             self._stop(patches)
         print("PASS: test_ai_on_with_tech_calls_get_ai_tags_and_replaces_list")
