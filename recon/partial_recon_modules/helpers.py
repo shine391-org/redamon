@@ -430,13 +430,9 @@ def _is_valid_hostname(value: str) -> bool:
 
 
 def _is_valid_url(value: str) -> bool:
-    """Check if value looks like a valid HTTP/HTTPS URL."""
-    from urllib.parse import urlparse
-    try:
-        parsed = urlparse(value)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-    except Exception:
-        return False
+    """Pure HTTP URI admission; scope and SSRF guards still apply separately."""
+    from recon.helpers.target_helpers import http_url_rejection
+    return http_url_rejection(value) is None
 
 
 def admits_partial_host(groups: list, host: str) -> bool:
@@ -528,10 +524,11 @@ def filter_partial_user_input(config: dict, settings: dict) -> list:
         if "urls" in targets:
             kept = []
             for u in targets["urls"] if isinstance(targets["urls"], list) else []:
-                if isinstance(u, str) and host_ok(_url_host(u)):
-                    kept.append(u.strip())
+                if _is_valid_url(u) and host_ok(_url_host(u)):
+                    kept.append(u)
                 else:
-                    refused.append(f"url {str(u)[:120]!r}")
+                    from recon.helpers.target_helpers import http_url_rejection
+                    refused.append(f"url rejected ({http_url_rejection(u) or 'out_of_scope'})")
             targets["urls"] = kept
         if "ips" in targets:
             kept = []

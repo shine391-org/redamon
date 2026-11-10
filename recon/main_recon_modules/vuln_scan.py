@@ -629,7 +629,11 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             if resource_enum_data:
                 discovered_urls = resource_enum_data.get("discovered_urls", [])
                 # Filter for URLs with parameters
-                dast_urls = [url for url in discovered_urls if '?' in url and '=' in url]
+                from recon.helpers.target_helpers import admit_http_urls
+                admission = recon_data.setdefault("metadata", {}).setdefault("http_admission", {})
+                valid_urls = admit_http_urls(discovered_urls, "resource_enum_dast", admission)
+                from urllib.parse import urlparse
+                dast_urls = [url for url in valid_urls if '=' in urlparse(url).query]
                 if dast_urls:
                     print(f"[*][Nuclei] Using {len(dast_urls)} URLs with parameters from resource_enum")
                 else:
@@ -891,6 +895,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "rate_limit": NUCLEI_RATE_LIMIT,
                     "dast_mode": NUCLEI_DAST_MODE,
                     "dast_pass_executed": do_dast_pass,
+                    "http_admission": recon_data.get("metadata", {}).get("http_admission", {}),
                     "dast_urls_discovered": len(dast_urls) if NUCLEI_DAST_MODE else 0,
                     "katana_crawl_depth": KATANA_DEPTH if NUCLEI_DAST_MODE else None,
                     "total_urls_scanned": len(scan_urls),

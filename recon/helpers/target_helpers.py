@@ -10,6 +10,79 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 
+def http_url_rejection(url) -> Optional[str]:
+    """Pure syntax admission, NOT a scope/SSRF/response validator.
+
+    Never normalize the input: urllib silently removes some controls. Existing
+    scope, auth, RoE and redirect guards remain the consumers' responsibility.
+    """
+    if not isinstance(url, str) or not url:
+        return "empty_or_non_string"
+    if any(ord(c) <= 32 or 127 <= ord(c) <= 159 or c.isspace() for c in url):
+        return "control_or_whitespace"
+    if "\\" in url:
+        return "ambiguous_authority"
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return "non_http_scheme"
+        host = parsed.hostname
+        if not parsed.netloc or not host:
+            return "missing_host"
+        if parsed.username is not None or parsed.password is not None:
+            return "userinfo_not_supported"
+        port = parsed.port  # validates numeric range and malformed authorities
+        if parsed.netloc.endswith(":") or (port is not None and port == 0):
+            return "invalid_port"
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+            if not parsed.netloc.startswith("[") or not re.fullmatch(r"\[[^\]]+\](?::[0-9]+)?", parsed.netloc):
+                return "malformed_authority"
+        else:
+            # Validate IDNs and internal underscore labels without rewriting.
+            ascii_host = host.encode('idna').decode('ascii')
+            if len(ascii_host.rstrip('.')) > 253 or not re.fullmatch(r"[A-Za-z0-9_~-]+(?:\.[A-Za-z0-9_~-]+)*\.?", ascii_host):
+                return "invalid_host"
+    except (ValueError, TypeError, AttributeError, UnicodeError):
+        return "malformed_authority"
+    return None
+
+
+def admit_http_urls(urls, source: str, report: Optional[dict] = None) -> List[str]:
+    """Keep exact valid strings; aggregate reasons without copying secrets/URLs.
+
+    Raw observations stay in the producer artifact. report is a disposition
+    summary, not proof that any admitted input was reached or responded.
+    """
+    kept = []
+    rejected = {}
+    for url in urls:
+        reason = http_url_rejection(url)
+        if reason:
+            rejected[reason] = rejected.get(reason, 0) + 1
+        else:
+            kept.append(url)
+    if report is not None:
+        report[source] = {"admitted": len(kept), "rejected": rejected}
+    elif rejected:
+        print(f"[*][HTTP admission] {source}: {rejected}")
+    return kept
+
+
+def add_supplied_http_targets(recon_data: dict, urls) -> None:
+    """Represent explicit partial seeds as supplied, never observed HTTP 200.
+
+    Retain invalid raw strings for disposition reporting; parsing only follows
+    syntax admission. Do not replace existing measured HTTP evidence.
+    """
+    by_url = recon_data.setdefault("http_probe", {}).setdefault("by_url", {})
+    for url in urls:
+        by_url.setdefault(url, {"url": url, "host": (
+            urlparse(url).hostname if http_url_rejection(url) is None else ""),
+            "status_code": None, "content_type": "", "headers": {},
+            "provenance": "supplied"})
+
+
 # =============================================================================
 # Target Extraction from Recon Data
 # =============================================================================
@@ -95,7 +168,7 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
 # URL Building from httpx Data
 # =============================================================================
 
-def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
+def build_target_urls_from_httpx(httpx_data: Optional[dict], report=None) -> List[str]:
     """
     Build list of target URLs from httpx scan results.
     Uses live URLs discovered by httpx for more accurate targeting.
@@ -114,10 +187,10 @@ def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
         for url, url_data in by_url.items():
             status_code = url_data.get("status_code")
             # Include URLs with successful responses (not server errors)
-            if status_code and status_code < 500:
+            if (isinstance(status_code, int) and 0 < status_code < 500) or (status_code is None and url_data.get("provenance") == "supplied"):
                 urls.append(url)
     
-    return sorted(list(set(urls)))
+    return sorted(set(admit_http_urls(urls, "httpx_or_supplied", report)))
 
 
 # =============================================================================
@@ -143,7 +216,7 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
     return f"{base_url}{path}?{'&'.join(parts)}" if parts else f"{base_url}{path}"
 
 
-def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> Tuple[List[str], List[str]]:
+def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict], report=None) -> Tuple[List[str], List[str]]:
     """
     Build list of target URLs from resource_enum data.
 
@@ -167,15 +240,30 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
 
     by_base_url = resource_enum_data.get("by_base_url", {})
     declared = []
+    rejected_endpoints = {}
 
     for base_url, base_data in by_base_url.items():
+        if http_url_rejection(base_url) is not None:
+            continue
         base_urls.append(base_url)
 
         endpoints = base_data.get("endpoints", {})
         for path, endpoint_info in endpoints.items():
+            # Endpoint keys are relative paths, never arbitrary URI schemes.
+            if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+                if report is not None:
+                    bucket = report.setdefault("resource_enum_path", {"admitted": 0, "rejected": {}})["rejected"]
+                    bucket["not_relative_path"] = bucket.get("not_relative_path", 0) + 1
+                continue
             if "{" in path:
                 continue
+            if report is not None:
+                report.setdefault("resource_enum_path", {"admitted": 0, "rejected": {}})["admitted"] += 1
             url = _endpoint_url(base_url, path, endpoint_info)
+            reason = http_url_rejection(url)
+            if reason:
+                rejected_endpoints[reason] = rejected_endpoints.get(reason, 0) + 1
+                continue
             if endpoint_info.get("declared_only") is True:
                 methods = {str(m).upper() for m in endpoint_info.get("methods") or []}
                 if methods & {"GET", "HEAD"}:
@@ -194,6 +282,11 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
             # This run's own group: a batch group's file holds only its own.
             groups[-1]["declared_not_sent_to_nuclei"] = overflow
 
+    admit_http_urls(list(by_base_url), "resource_enum_base", report)
+    if report is not None:
+        report["resource_enum_endpoint"] = {"admitted": len(endpoint_urls), "rejected": rejected_endpoints}
+    elif rejected_endpoints:
+        print(f"[*][HTTP admission] resource_enum_endpoint: {rejected_endpoints}")
     return base_urls, endpoint_urls
 
 
@@ -252,6 +345,7 @@ def build_target_urls(
     ips: Set[str],
     recon_data: Optional[dict] = None,
     scan_all_ips: bool = False,
+    admission_report: Optional[dict] = None,
 ) -> List[str]:
     """
     Build the list of target URLs for nuclei scanning as the UNION of every
@@ -280,6 +374,7 @@ def build_target_urls(
         Sorted, deduplicated list of URLs to scan.
     """
     url_set: Set[str] = set()
+    admission = {}
     counts = {
         "resource_enum_base": 0,
         "resource_enum_endpoint": 0,
@@ -292,7 +387,7 @@ def build_target_urls(
     # Source 1: resource_enum (BaseURLs + parameterized endpoint URLs)
     resource_enum_data = recon_data.get("resource_enum") if recon_data else None
     if resource_enum_data:
-        base_urls, endpoint_urls = build_target_urls_from_resource_enum(resource_enum_data)
+        base_urls, endpoint_urls = build_target_urls_from_resource_enum(resource_enum_data, admission)
         for u in base_urls:
             if u not in url_set:
                 url_set.add(u)
@@ -305,7 +400,7 @@ def build_target_urls(
     # Source 2: httpx live URLs (BaseURLs verified by httpx)
     httpx_data = recon_data.get("http_probe") if recon_data else None
     if httpx_data:
-        for u in build_target_urls_from_httpx(httpx_data):
+        for u in build_target_urls_from_httpx(httpx_data, admission):
             if u not in url_set:
                 url_set.add(u)
                 counts["httpx"] += 1
@@ -318,6 +413,10 @@ def build_target_urls(
     # This catches newly discovered subdomains that haven't been probed yet.
     for hostname in sorted(hostnames):
         if not hostname or hostname.lower() in covered_hosts:
+            continue
+        if http_url_rejection(f"http://{hostname}") is not None or any(c in hostname for c in '/?#@:'):
+            reasons = admission.setdefault("fallback_hostname", {"admitted": 0, "rejected": {}})["rejected"]
+            reasons["invalid_host"] = reasons.get("invalid_host", 0) + 1
             continue
         # Skip MOCK hostnames. When an IP has no PTR record, recon/main.py
         # labels it with the IP's dots turned into dashes ("192.88.99.10" ->
@@ -354,6 +453,12 @@ def build_target_urls(
         for ip in sorted(ips):
             if not ip or ip in covered_hosts:
                 continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                reasons = admission.setdefault("fallback_ip", {"admitted": 0, "rejected": {}})["rejected"]
+                reasons["invalid_ip"] = reasons.get("invalid_ip", 0) + 1
+                continue
             # IPv6 literals need brackets in URLs: http://[::1]/ not http://::1/.
             # An IPv6 contains ':' (IPv4 does not).
             ip_for_url = f"[{ip}]" if ":" in ip else ip
@@ -367,7 +472,7 @@ def build_target_urls(
     if counts["resource_enum_base"]:
         parts.append(f"{counts['resource_enum_base']} resource_enum base URLs")
     if counts["resource_enum_endpoint"]:
-        parts.append(f"{counts['resource_enum_endpoint']} parameterized endpoints")
+        parts.append(f"{counts['resource_enum_endpoint']} endpoint URLs")
     if counts["httpx"]:
         parts.append(f"{counts['httpx']} additional httpx URLs")
     if counts["fallback_subdomain"]:
@@ -380,7 +485,13 @@ def build_target_urls(
     else:
         print(f"[*][Targets] No targets available")
 
-    return sorted(url_set)
+    urls = sorted(set(admit_http_urls(sorted(url_set), "final_union", admission)))
+    if admission_report is not None:
+        admission_report.update(admission)
+    for source, disposition in admission.items():
+        if disposition["rejected"]:
+            print(f"[*][HTTP admission] {source}: {disposition['rejected']}")
+    return urls
 
 
 

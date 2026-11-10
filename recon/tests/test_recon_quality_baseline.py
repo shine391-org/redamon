@@ -58,7 +58,9 @@ def test_characterize_native_builder_projection(case_id):
     if row["id"] in {"declared-post", "declared-template"}:
         assert urls == []  # not executable GET targets; declaration still in corpus
     elif row["id"] == "query-encoding":
-        assert urls == ["https://a.example.test/api/search?q=a&b=# %+雪"]
+        # F01 rejects the malformed raw-whitespace URI produced by the legacy
+        # interpolation. Raw observation survives; F02 owns correct encoding.
+        assert urls == []
     elif row["id"] == "duplicate-keys":
         assert urls == ["https://a.example.test/api/dup?k=1&empty=&K=3"]
     else:
@@ -75,10 +77,10 @@ def test_negative_probe_query_fidelity_is_not_approved_baseline():
     # F02 must replace this defect probe with equality against the desired contract.
 
 
-def test_negative_probe_ffuf_seed_path_is_not_approved_baseline():
+def test_ffuf_seed_path_meets_f01_contract():
     contract = json.loads((FIXTURES / "negative-contracts.json").read_text())["cases"][0]
-    assert _build_fuzz_targets([contract["input"]]) == [contract["legacy"]]
-    assert contract["legacy"] != contract["required"]  # F01 regression to invert
+    assert _build_fuzz_targets([contract["input"]]) == [contract["required"]]
+    assert contract["legacy"] != contract["required"]
 
 
 def test_negative_fixture_inputs_remain_raw_not_validated():

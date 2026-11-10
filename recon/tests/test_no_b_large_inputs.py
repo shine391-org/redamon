@@ -40,6 +40,15 @@ def test_large_observed_inputs_preserved_above_3000():
     assert len(set(urls)) == n
 
 
+def test_http_admission_does_not_budget_mixed_observed_and_invalid_inputs():
+    resource = _observed_data(3001)
+    resource['by_base_url']['mailto:a@example.test'] = {'endpoints': {'/x': {}}}
+    before = __import__('copy').deepcopy(resource)
+    urls = th.build_target_urls(set(), set(), {'resource_enum': resource})
+    assert len(urls) == 3002  # every observed endpoint plus its BaseURL
+    assert resource == before
+
+
 def test_declared_only_500_cap_still_holds():
     endpoints = {
         f"/d{i:05d}": {"declared_only": True, "methods": ["GET"], "parameters": {}}

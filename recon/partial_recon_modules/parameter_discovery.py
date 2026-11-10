@@ -223,11 +223,12 @@ def run_kiterunner(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")
 
@@ -266,14 +267,8 @@ def run_kiterunner(config: dict) -> None:
         print(f"[*][Partial Recon] Adding {len(user_urls)} user-provided URLs to scan targets")
         for url in user_urls:
             if url not in recon_data["http_probe"]["by_url"]:
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                recon_data["http_probe"]["by_url"][url] = {
-                    "url": url,
-                    "host": parsed.netloc.split(":")[0],
-                    "status_code": 200,
-                    "content_type": "text/html",
-                }
+                from recon.helpers.target_helpers import add_supplied_http_targets
+                add_supplied_http_targets(recon_data, [url])
 
     # Union target-builder: BaseURLs ∪ uncovered Subdomains ∪ user URLs.
     # New subdomains get http(s)://<sub> fallback; httpx-covered hosts keep
@@ -560,11 +555,12 @@ def run_arjun(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            entry = entry.strip()
+            # Validate raw URI bytes before any whitespace/control normalization.
             if entry and _is_valid_url(entry):
                 user_urls.append(entry)
             elif entry:
-                print(f"[!][Partial Recon] Skipping invalid URL: {entry}")
+                from recon.helpers.target_helpers import http_url_rejection
+                print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
 
         url_attach_to = user_targets.get("url_attach_to")
 
@@ -635,6 +631,9 @@ def run_arjun(config: dict) -> None:
                 print("[!][Partial Recon] Neo4j not reachable, cannot fetch graph inputs")
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
+
+    from recon.helpers.target_helpers import admit_http_urls
+    arjun_target_urls = admit_http_urls(arjun_target_urls, "partial_arjun_graph")
 
     # Add user-provided URLs to target list
     if user_urls:

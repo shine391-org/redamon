@@ -27,6 +27,16 @@ UNSAFE = "(coalesce(e.openapi_declared_only, e.openapi_declared, false) AND NOT 
 MODULES = Path(graph_builders.__file__).parent
 
 
+def test_admission_does_not_promote_declared_post_or_reject_observed_status():
+    resource = {'by_base_url': {'https://api.example.test': {'endpoints': {
+        '/declared-post': {'declared_only': True, 'methods': ['POST']},
+        '/observed-404': {'methods': ['GET'], 'status_codes': [404]},
+        '/declared-get': {'declared_only': True, 'methods': ['GET']},
+    }}}}
+    _, urls = build_target_urls_from_resource_enum(resource)
+    assert urls == ['https://api.example.test/observed-404', 'https://api.example.test/declared-get']
+
+
 def test_the_predicates():
     assert declared_only('e') == 'coalesce(e.openapi_declared_only, e.openapi_declared, false)'
     assert declared_only_unsafe('e') == UNSAFE
