@@ -850,15 +850,15 @@ class JsReconMixin:
             endpoint_scope = js_endpoint_scope(recon_data)
             for ep in js_recon_data.get("endpoints", []):
                 try:
-                    # Drop only endpoints a probe positively judged: dead
-                    # ('not_hittable'), or answered exactly like a made-up path
-                    # on a catch-all host ('catch_all', an SPA shell). 'hittable',
-                    # 'unvalidated' (probing off, unresolved upload-relative URL,
-                    # or unsupported scheme) and a missing status are all
-                    # ingested, so disabling endpoint probing keeps the prior
-                    # "ingest every extracted endpoint" behavior.
-                    if ep.get("validation_status") in ("not_hittable", "catch_all"):
-                        continue
+                    # Mọi extracted endpoint đều được ingest: 'hittable' là
+                    # verified surface, còn 'not_hittable' (server trả status
+                    # không chấp nhận, ví dụ 404), 'catch_all' (host trả mọi
+                    # đường dẫn không tồn tại giống nhau, ví dụ SPA shell) và
+                    # 'unknown' (validation timeout/transport lỗi) được giữ
+                    # làm observation kèm evidence. Một validation status không
+                    # bao giờ xóa raw candidate, và một câu trả lời negativa không
+                    # chán ý định route không có ý nghĩa bảo mật. Reader muốn
+                    # verified surface lọc theo validation_status == 'hittable'.
 
                     path = ep.get("path", "")
                     method = ep.get("method", "GET")
@@ -903,6 +903,7 @@ class JsReconMixin:
                             e.js_status_code = $status_code,
                             e.resolved_url = $resolved_url,
                             e.validation_status = $validation_status,
+                            e.validation_error = $validation_error,
                             e.endpoint_type = $ep_type,
                             e.path_template = $path_template,
                             e._js_recon_created = true,
@@ -920,6 +921,7 @@ class JsReconMixin:
                             e.status_code = COALESCE(e.status_code, $status_code),
                             e.resolved_url = CASE WHEN $resolved_url <> '' THEN $resolved_url ELSE e.resolved_url END,
                             e.validation_status = COALESCE($validation_status, e.validation_status),
+                            e.validation_error = COALESCE($validation_error, e.validation_error),
                             e.updated_at = datetime()
                         SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                         // JS Recon's own word, on create AND on match: an endpoint
@@ -938,6 +940,7 @@ class JsReconMixin:
                         status_code=ep.get("status_code"),
                         resolved_url=ep.get("resolved_url", ""),
                         validation_status=ep.get("validation_status"),
+                        validation_error=ep.get("validation_error", ""),
                         ep_type=ep.get("type", "rest"),
                         # `parameterized` is this property being set.
                         path_template=ep.get("path_template") if ep.get("parameterized") else None,

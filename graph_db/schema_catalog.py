@@ -434,7 +434,7 @@ Additional properties present on this node type, not yet described:
   - page_class_confidence (integer): 0-100; 100 when the pre-filter placed the page
   - page_class_source (string): "jev_classifier", or "prefilter" where Jev gave no answer
 - Endpoint probe (set by js_recon on endpoints it extracted from JavaScript, when JS_RECON_VALIDATE_ENDPOINTS is on):
-  - validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get) or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme). "not_hittable" (dead) and "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell) are never written: the endpoint is dropped
+  - validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get - the only "verified" value), "not_hittable" (the server answered a non-accepted status such as 404; kept as a negative observation), "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell; kept as a catch_all_like observation), "unknown" (no verdict: a validation timeout or connection error, with the error class in validation_error; kept as an observation), or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme, out of scope, or SSRF-blocked). "unknown" is not "dead": a timed-out or failed probe keeps its raw candidate and its evidence
   - js_status_code (integer): the status js_recon's own probe got; status_code stays http_probe's when both probed
 - Anonymous status (set by the route exposure scan):
   - anon_status (integer): the status an anonymous GET of this route got; compare with status_code to see a route that answers without credentials

@@ -1421,8 +1421,12 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
             endpoint['validation_error'] = 'out_of_scope'
             return
         if _js_skip(resolved_url):
+            # Host đã được một module khác đánh là unreachable (đã đạt ngưỡng
+            # circuit breaker). Endpoint không bị chán: ghi skipped_unknown -
+            # "chưa xác định" chứ không phải "dead" - và giữ raw candidate
+            # (resolved_url) để artifact->graph roundtrip không mất evidence.
             endpoint['validation_status'] = 'unvalidated'
-            endpoint['validation_error'] = 'host_unreachable'
+            endpoint['validation_error'] = 'skipped_unknown'
             return
         # STRIDE I14: endpoints come from the target's JavaScript and are
         # attacker-influenced. Refuse to probe URLs that resolve to cloud
@@ -1452,15 +1456,15 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
                 'hittable' if status_code in accepted_statuses else 'not_hittable'
             )
             endpoint['validation_error'] = ''
-        except requests.Timeout as exc:
+        except requests.RequestException as exc:
+            # Timeout/transport lỗi là "chưa có kết luận", không phải route chết:
+            # unknown + lớp lỗi, giữ raw candidate và evidence (resolved_url,
+            # status_code nếu có). Circuit breaker (_js_failed) vẫn đếm lỗi kết
+            # nối theo host, nhưng một endpoint đơn lẻ không tự làm cả host Down.
             _js_failed(resolved_url, exc)
-            endpoint['validation_status'] = 'not_hittable'
-            endpoint['validation_error'] = 'timeout'
-            return
-        except Exception as exc:
-            _js_failed(resolved_url, exc)
-            endpoint['validation_status'] = 'not_hittable'
+            endpoint['validation_status'] = 'unknown'
             endpoint['validation_error'] = type(exc).__name__
+            print(f"[!][JsRecon] {resolved_url} -- validation {type(exc).__name__}")
             return
 
         if endpoint['validation_status'] != 'hittable':

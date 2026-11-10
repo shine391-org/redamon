@@ -80,7 +80,7 @@ class TestEndpointValidationGate:
                 endpoints, self._settings(), jr._ProbeScope(roots=("example.test",)), request_func=requester,
             )
         by_url = {e["full_url"]: e for e in out}
-        assert by_url["https://dead.example.test/api"]["validation_error"] == "host_unreachable"
+        assert by_url["https://dead.example.test/api"]["validation_error"] == "skipped_unknown"
         assert by_url["https://dead.example.test/api"]["validation_status"] == "unvalidated"
         assert [u for u in probed if "/rdm-" not in u] == ["https://live.example.test/api"]
         assert not [u for u in probed if "dead.example.test" in u]      # no control either
@@ -117,3 +117,59 @@ class TestRunLevelReporting:
         assert "dead.example.test" in report.skipped_hostnames()
         # Host-level, not source-level: js_recon still prunes for other hosts.
         assert "js_recon" not in report.degraded_sources
+
+
+class TestEndpointValidationSingleFailure:
+    """Một endpoint đơn lẻ bị lỗi không được sai lệch thành cả hostDown;
+    nếu ngưỡng circuit breaker hợp lý thì ghi skipped_unknown và giữ evidence."""
+
+    def _settings(self):
+        return {"JS_RECON_VALIDATE_ENDPOINTS": True, "JS_RECON_ENDPOINT_CONCURRENCY": 1}
+
+    def test_a_single_endpoint_timeout_is_unknown_and_host_stays_up(self):
+        endpoints = [{"full_url": "https://slow.example.test/api"}]
+
+        def requester(method, url, **kw):
+            raise requests.Timeout("slow")
+
+        with mock.patch.object(jr, "is_url_safe_to_probe", return_value=True):
+            out = jr._validate_extracted_endpoints(
+                endpoints, self._settings(), jr._ProbeScope(roots=("example.test",)),
+                request_func=requester,
+            )
+
+        ep = out[0]
+        assert ep["validation_status"] == "unknown"
+        assert ep["validation_error"] == "Timeout"
+        assert ep["resolved_url"] == "https://slow.example.test/api"   # evidence giữ nguyên
+        assert not cb.host_health.is_down("https://slow.example.test/x.js")  # không whole-host-dead
+
+    def test_threshold_reached_then_skipped_unknown_keeps_evidence(self):
+        # Đẩy host xuống bằng 3 connection failure (đạt ngưỡng INTERNAL_THRESHOLD)
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(jr, "_safe_redirect_get",
+                               side_effect=requests.ConnectionError("refused")):
+            jr._download_js_files([f"https://dead.example.test/{i}.js" for i in range(3)],
+                                  Path(d), max_files=10, concurrency=1, timeout=100)
+        assert cb.host_health.is_down("https://dead.example.test/x.js")
+
+        # Endpoint sau đó bị skip: skipped_unknown, giữ evidence (resolved_url),
+        # không gửi probe nào đến host đã down.
+        endpoints = [{"full_url": "https://dead.example.test/api"}]
+        probed = []
+
+        def requester(method, url, **kw):
+            probed.append(url)
+            return _resp(200)
+
+        with mock.patch.object(jr, "is_url_safe_to_probe", return_value=True):
+            out = jr._validate_extracted_endpoints(
+                endpoints, self._settings(), jr._ProbeScope(roots=("example.test",)),
+                request_func=requester,
+            )
+
+        ep = out[0]
+        assert ep["validation_status"] == "unvalidated"
+        assert ep["validation_error"] == "skipped_unknown"
+        assert ep["resolved_url"] == "https://dead.example.test/api"
+        assert probed == []
