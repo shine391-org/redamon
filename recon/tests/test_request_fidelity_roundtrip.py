@@ -13,6 +13,17 @@ def _url(params, **extra):
     return th._endpoint_url("https://api.example.test", "/search", {"parameters": {"query": params}, **extra})
 
 
+def test_openapi_producer_marks_encoded_sample_values():
+    from recon.helpers.resource_enum import openapi_helpers as oh
+
+    class Param(dict):
+        pass
+
+    entry = oh._parameter('q', Param(schema={'type': 'string', 'example': 'a b'}), required=False)
+    assert entry['sample_values'] == ['a%20b']
+    assert entry['sample_values_encoding'] == 'percent-encoded'
+
+
 def test_openapi_encoded_sample_is_not_double_encoded():
     url = _url([{"name": "q", "sample_values": ["a%20b"], "sample_values_encoding": "percent-encoded"}])
     assert url == "https://api.example.test/search?q=a%20b"
