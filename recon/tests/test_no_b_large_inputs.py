@@ -110,7 +110,10 @@ def test_detection_actual_target_file_keeps_more_than_3000(monkeypatch):
     n = 3001
     state, result = _run_pipeline(monkeypatch, _observed_data(n), dast=False)
     assert [p["label"] for p in state["passes"]] == ["DETECTION"]
-    assert state["builder_kwargs"] == [{}]
+    kwargs = state["builder_kwargs"][0]
+    # The caller passes output accounting dicts (no budget/cap keys); nothing is
+    # truncated and no per-origin cap is introduced.
+    assert set(kwargs) <= {"admission_report", "declared_report"}
     targets = set(state["passes"][0]["targets"])
     expected = {f"https://a.example.com/p{i:05d}?q=1" for i in range(n)}
     assert expected <= targets
@@ -128,7 +131,8 @@ def test_dast_actual_target_file_keeps_large_list_order_and_variants(monkeypatch
     state, result = _run_pipeline(monkeypatch, resource, dast=True)
     assert [p["label"] for p in state["passes"]] == ["DETECTION", "DAST"]
     assert state["passes"][1]["targets"] == expected
-    assert state["builder_kwargs"] == [{}]
+    kwargs = state["builder_kwargs"][0]
+    assert set(kwargs) <= {"admission_report", "declared_report"}
     meta = result["vuln_scan"]["scan_metadata"]
     assert meta["dast_pass_executed"] is True
     assert meta["dast_urls_discovered"] == len(expected)

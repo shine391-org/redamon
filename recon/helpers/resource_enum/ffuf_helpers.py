@@ -140,7 +140,10 @@ def _fuzz_single_target(
 
                 results.append({
                     "url": url,
-                    "status": entry.get("status", 0),
+                    # ffuf reports a status for every matched response; when the
+                    # producer's JSON omits it we keep None so a reader can tell
+                    # "not measured" from a fabricated 200.
+                    "status": entry.get("status"),
                     "length": entry.get("length", 0),
                     "words": entry.get("words", 0),
                     "lines": entry.get("lines", 0),
@@ -242,7 +245,10 @@ def run_ffuf_discovery(
     # on that host; Endpoints are assets, which the prune never touches.
     from recon.helpers import circuit_breaker as _cb
     _scope = _cb.scope((), label="FFuf", unit="target(s)")
+    fuzz_targets_built = len(fuzz_targets)
+    before_skip = len(fuzz_targets)
     fuzz_targets = [u for u in fuzz_targets if not _scope.skip_if_down(u)]
+    fuzz_targets_skipped = before_skip - len(fuzz_targets)
 
     output_dir = tempfile.mkdtemp(prefix="redamon_ffuf_")
 
@@ -280,7 +286,17 @@ def run_ffuf_discovery(
     if external_domain_entries:
         print(f"[+][FFuf] Filtered {len(external_domain_entries)} out-of-scope URLs")
 
-    return unique_results, {"external_domains": external_domain_entries}
+    # F08: the run's own accounting, so the caller can persist the raw metadata
+    # AFTER this temp directory is gone rather than reconstructing it.
+    return unique_results, {
+        "external_domains": external_domain_entries,
+        "fuzz_targets_built": fuzz_targets_built,
+        "fuzz_targets_skipped_unreachable": fuzz_targets_skipped,
+        "fuzz_targets_run": len(fuzz_targets),
+        "results_raw": len(all_results),
+        "results_unique": len(unique_results),
+        "temp_output_removed": True,
+    }
 
 
 def _build_fuzz_targets(

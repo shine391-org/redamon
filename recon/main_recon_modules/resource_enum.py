@@ -725,6 +725,33 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     ARJUN_CUSTOM_HEADERS = _merge_auth(ARJUN_CUSTOM_HEADERS, settings, _auth_hosts)
     KITERUNNER_HEADERS = _merge_auth(KITERUNNER_HEADERS, settings, _auth_hosts)
 
+    # F08: the auth context each producer ran under, as a REFERENCE. The header
+    # values themselves never enter the artifact; a profile id/name is enough to
+    # tell "this observation was authenticated" from "this one was anonymous".
+    from recon.helpers.auth_profile import profile_from_settings as _profile_of
+    _auth_profile = _profile_of(settings)
+    AUTH_REF = (f"auth_profile:{_auth_profile.get('id') or _auth_profile.get('name') or 'unnamed'}"
+                if _auth_profile else "anonymous")
+
+    # F08: the discovery inventory. It records raw observations and producer
+    # evidence; it never gates discovery, so a failure to account is logged and
+    # dropped rather than costing the run its coverage.
+    from recon.helpers import discovery_inventory as _di
+    from recon.helpers import discovery_adapters as _da
+    _inventory = _di.new_inventory()
+
+    def _record(label, builder, *args, **kwargs):
+        try:
+            return builder(_inventory, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - accounting never costs coverage
+            print(f"[!][ResourceEnum] discovery inventory: {label} not recorded "
+                  f"({type(exc).__name__}: {exc})")
+            return _inventory
+
+    def _merged_keys():
+        return _da.keys_of(organized_data.get("by_base_url") or {})
+
+
     # Engagement identity header: one append per tool's header set. It rides the
     # tool's own -H path, so it is sent identically direct and through the
     # capture proxy (the fail-open fallback cannot lose it), and it is deduped
@@ -924,6 +951,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     ffuf_meta = {}
     arjun_results = []
     arjun_meta = {}
+    # F08: Arjun's own input accounting, initialized so the inventory can report
+    # a run where Arjun never ran as "not executed" rather than as absent.
+    arjun_target_urls = []
+    arjun_unexecuted = []
+    sources_before_arjun = []
     jsluice_result = {"urls": [], "secrets": [], "external_domains": []}
     zap_ajax_urls = []
     zap_ajax_meta = {"external_domains": []}
@@ -1125,6 +1157,13 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         for path, endpoint in base_data['endpoints'].items():
             endpoint['sources'] = ['katana']
 
+    # F08: Katana's own URLs are observations of the requests it made. Katana
+    # organizes the first by_base_url, so every one of its URLs is a first
+    # sighting; the disposition is computed anyway so a shared helper cannot
+    # silently mislabel a later source.
+    _record("katana", _da.observe_crawl, source="katana", urls=katana_urls,
+            auth_ref=AUTH_REF, existing_keys=_merged_keys())
+
     # Merge Hakrawler results if available
     hakrawler_stats = {
         "hakrawler_total": 0,
@@ -1144,6 +1183,10 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         print(f"[+][Hakrawler] Total endpoints: {hakrawler_stats['hakrawler_total']}")
         print(f"[+][Hakrawler] New endpoints: {hakrawler_stats['hakrawler_new']}")
         print(f"[+][Hakrawler] Overlap with Katana: {hakrawler_stats['hakrawler_overlap']}")
+
+    # F08: Hakrawler's observations, including the ones that only overlapped.
+    _record("hakrawler", _da.observe_crawl, source="hakrawler", urls=hakrawler_urls,
+            auth_ref=AUTH_REF, existing_keys=_merged_keys())
 
     # jsluice post-crawl JS analysis (runs after crawlers complete)
     jsluice_stats = {
@@ -1222,6 +1265,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         else:
             print("[-][jsluice] Skipped: the crawl returned no URLs to take JavaScript files from")
 
+    # F08: jsluice's extracted URLs are observations of what it read in the JS.
+    _record("jsluice", _da.observe_crawl, source="jsluice",
+            urls=jsluice_result.get("urls") or [], auth_ref=AUTH_REF,
+            existing_keys=_merged_keys())
+
     # FFuf directory fuzzing (runs after crawlers and jsluice, before GAU merge)
     ffuf_stats = {
         "ffuf_total": 0,
@@ -1292,13 +1340,35 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
             if ffuf_results:
                 print("\n[*][FFuf] Merging discovered endpoints into results...")
+                keys_before_ffuf = _merged_keys()
                 organized_data['by_base_url'], ffuf_stats = merge_ffuf_into_by_base_url(
                     ffuf_results,
                     organized_data['by_base_url'],
                 )
+                # F08: every FFuf result is an observation, including the ones
+                # that only overlapped an endpoint a crawler already had.
+                _record("ffuf", _da.observe_ffuf, results=ffuf_results,
+                        existing_keys=keys_before_ffuf, auth_ref=AUTH_REF)
+                # F08: FFuf's raw metadata outlives its temp directory. The
+                # record carries no response body and no header value.
+                _record("ffuf-raw", _di.record_raw_evidence, source="ffuf", record={
+                    "targets": ffuf_meta.get("fuzz_targets_run"),
+                    "targets_built": ffuf_meta.get("fuzz_targets_built"),
+                    "targets_skipped_unreachable": ffuf_meta.get("fuzz_targets_skipped_unreachable"),
+                    "results": len(ffuf_results),
+                    "results_raw": ffuf_meta.get("results_raw"),
+                    "external_domains": len(ffuf_meta.get("external_domains") or []),
+                    "smart_fuzz_base_paths": len(discovered_base_paths or []),
+                    "extensions": len(effective_extensions or []),
+                    "wordlist": FFUF_WORDLIST if FFUF_ENABLED else None,
+                    "temp_output_removed": True,
+                })
                 print(f"[+][FFuf] Total: {ffuf_stats['ffuf_total']} endpoints")
                 print(f"[+][FFuf] New endpoints: {ffuf_stats['ffuf_new']}")
                 print(f"[+][FFuf] Overlap with crawlers: {ffuf_stats['ffuf_overlap']}")
+                for reason, count in sorted((_di.summary_of(_inventory)["producers"]
+                                             .get("ffuf", {}).get("rejected") or {}).items()):
+                    print(f"[*][FFuf] Not recorded ({reason}): {count}")
         else:
             print("[!][FFuf] ffuf binary not found in PATH, skipping")
 
@@ -1337,10 +1407,13 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
         if zap_ajax_urls:
             print("\n[*][ZAP Ajax] Merging discovered URLs into results...")
+            keys_before_zap = _merged_keys()
             organized_data['by_base_url'], zap_ajax_stats = merge_zap_ajax_into_by_base_url(
                 zap_ajax_urls,
                 organized_data['by_base_url'],
             )
+            _record("zap_ajax_spider", _da.observe_crawl, source="zap_ajax_spider",
+                    urls=zap_ajax_urls, auth_ref=AUTH_REF, existing_keys=keys_before_zap)
         print(f"[+][ZAP Ajax] Total URLs: {zap_ajax_stats['zap_ajax_spider_total']}")
         print(f"[+][ZAP Ajax] Parsed: {zap_ajax_stats['zap_ajax_spider_parsed']}")
         print(f"[+][ZAP Ajax] New endpoints: {zap_ajax_stats['zap_ajax_spider_new']}")
@@ -1370,6 +1443,15 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
             arjun_target_urls, arjun_unexecuted = select_arjun_targets(arjun_target_urls, ARJUN_MAX_ENDPOINTS)
 
+            # F08: the producer set as it stood when Arjun's input was built.
+            sources_before_arjun = sorted({
+                source
+                for base_data in organized_data['by_base_url'].values()
+                for endpoint in (base_data.get('endpoints') or {}).values()
+                for source in (endpoint.get('sources') or [])
+                if isinstance(source, str) and source
+            })
+
             arjun_results, arjun_meta = run_arjun_discovery(
                 arjun_target_urls,
                 ARJUN_METHODS,
@@ -1389,11 +1471,25 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
             if arjun_results:
                 print("\n[*][Arjun] Merging discovered parameters into results...")
+                keys_before_arjun = _merged_keys()
                 organized_data['by_base_url'], arjun_stats = merge_arjun_into_by_base_url(
                     arjun_results,
                     organized_data['by_base_url'],
                     allowed_hosts=target_domains,
                 )
+                # F08: Arjun's per-URL parameter evidence, including a partial
+                # execution whose parameter list is incomplete.
+                _record("arjun", _da.observe_arjun, results=arjun_results,
+                        existing_keys=keys_before_arjun, auth_ref=AUTH_REF)
+                # F08: the salvaged/truncated output outlives the temp dir.
+                _record("arjun-raw", _di.record_raw_evidence, source="arjun", record={
+                    "targets": len(arjun_target_urls),
+                    "unexecuted": len(arjun_unexecuted),
+                    "results": len(arjun_results),
+                    "executions": [e.get("status") for e in (arjun_meta.get("execution") or [])],
+                    "output_states": [e.get("output_state") for e in (arjun_meta.get("execution") or [])],
+                    "temp_output_removed": True,
+                })
                 print(f"[+][Arjun] Total URLs with params: {arjun_stats['arjun_total']}")
                 print(f"[+][Arjun] New endpoints: {arjun_stats['arjun_new_endpoints']}")
                 print(f"[+][Arjun] Existing endpoints enriched: {arjun_stats['arjun_existing_enriched']}")
@@ -1463,6 +1559,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             )
 
         # Merge GAU into by_base_url (use in-scope URLs only)
+        # F08: the pre-merge keys decide each URL's disposition.
+        keys_before_gau = _merged_keys()
         print("\n[*][GAU] Merging endpoints into results...")
         organized_data['by_base_url'], gau_stats = merge_gau_into_by_base_url(
             gau_urls_to_process,
@@ -1470,6 +1568,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             verified_urls,
             url_methods
         )
+        _record("gau", _da.observe_crawl, source="gau", urls=gau_urls_to_process,
+                auth_ref=AUTH_REF, existing_keys=keys_before_gau)
+        if out_of_scope_count:
+            _record("gau-scope", _di.reject, source="gau", reason="out_of_scope",
+                    count=out_of_scope_count)
 
         # Add out-of-scope count to stats
         gau_stats['gau_out_of_scope'] = out_of_scope_count
@@ -1499,12 +1602,20 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     if PARAMSPIDER_ENABLED and paramspider_urls:
         print("\n[*][ParamSpider] Merging parameterized endpoints into results...")
+        keys_before_paramspider = _merged_keys()
         organized_data['by_base_url'], paramspider_stats = merge_paramspider_into_by_base_url(
             paramspider_urls,
             organized_data['by_base_url'],
             target_domains,
             exact=_exact_group,
         )
+        _record("paramspider", _da.observe_crawl, source="paramspider",
+                urls=paramspider_urls, auth_ref=AUTH_REF,
+                existing_keys=keys_before_paramspider)
+        if paramspider_stats.get('paramspider_out_of_scope'):
+            _record("paramspider-scope", _di.reject, source="paramspider",
+                    reason="out_of_scope",
+                    count=paramspider_stats['paramspider_out_of_scope'])
 
         print(f"[+][ParamSpider] Total URLs: {paramspider_stats['paramspider_total']}")
         if paramspider_stats['paramspider_out_of_scope'] > 0:
@@ -1539,11 +1650,14 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             )
 
         print("\n[*][Kiterunner] Merging API endpoints into results...")
+        keys_before_kr = _merged_keys()
         organized_data['by_base_url'], kr_stats = merge_kiterunner_into_by_base_url(
             kr_results,
             organized_data['by_base_url'],
             kr_url_methods
         )
+        _record("kiterunner", _da.observe_kiterunner, results=kr_results,
+                existing_keys=keys_before_kr, auth_ref=AUTH_REF)
 
         print(f"[+][Kiterunner] Total: {kr_stats['kr_total']} endpoints")
         print(f"[+][Kiterunner] Parsed: {kr_stats['kr_parsed']}")
@@ -1562,8 +1676,12 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         live_bases, merge_urlscan_into_by_base_url, title_seed_urls)
     urlscan_rows = (recon_data.get("urlscan") or {}).get("urls_with_paths") or []
     if urlscan_rows:
+        keys_before_urlscan = _merged_keys()
         organized_data['by_base_url'], us_stats = merge_urlscan_into_by_base_url(
             urlscan_rows, organized_data['by_base_url'], live_bases(recon_data), target_domains)
+        _record("urlscan", _da.observe_crawl, source="urlscan",
+                urls=[row.get("full_url", "") for row in urlscan_rows if row.get("full_url")],
+                auth_ref=AUTH_REF, existing_keys=keys_before_urlscan)
         print(f"[+][URLScan] by_base_url: {us_stats['urlscan_new']} new, "
               f"{us_stats['urlscan_overlap']} shared with other sources, "
               f"{us_stats['urlscan_not_live']} on bases not live in this scan (skipped)")
@@ -1587,9 +1705,15 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             print("\n[*][OpenAPI] Discovering and parsing API specifications...")
             openapi_payload = run_openapi_discovery(recon_data, settings, seed_urls,
                                                     title_seeds=title_seeds)
+            keys_before_openapi = _merged_keys()
             organized_data['by_base_url'], oa_stats = merge_openapi_into_by_base_url(
                 openapi_payload, organized_data['by_base_url'])
             openapi_inventory = build_openapi_inventory(recon_data, openapi_payload, oa_stats)
+            # F08: a declaration is not an observation. Recorded as declared, so
+            # a later reader cannot mistake a filled template for a request that
+            # was made.
+            _record("openapi", _da.observe_openapi, payload=openapi_payload,
+                    existing_keys=keys_before_openapi, auth_ref=AUTH_REF)
             print(f"[+][OpenAPI] Documents: {len(openapi_payload['documents'])}")
             print(f"[+][OpenAPI] Operations: {oa_stats['openapi_operations']}")
             print(f"[+][OpenAPI] New endpoints: {oa_stats['openapi_new']}")
@@ -1802,7 +1926,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     resource_enum_result["summary"].update(reconcile_arjun_schema(organized_data["by_base_url"]))
 
-    # Aggregate methods and categories across all base URLs
+    # F08: rebuild every summary counter from the members that are actually
+    # there. The incremental mergers drift (FFuf never updates
+    # total_parameters; an Arjun-created base starts at zero), and a counter no
+    # longer matching the artifact is a claim the run cannot support.
+    resource_enum_result["summary"].update(_di.recompute_counts(organized_data["by_base_url"]))
     for base_data in organized_data['by_base_url'].values():
         for method, count in base_data['summary']['methods'].items():
             resource_enum_result['summary']['methods'][method] = \
@@ -1810,6 +1938,57 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         for category, count in base_data['summary']['categories'].items():
             resource_enum_result['summary']['categories'][category] = \
                 resource_enum_result['summary']['categories'].get(category, 0) + count
+
+    # F08: the discovery inventory. Producer observations were recorded at each
+    # merge; here the run records the composition of the structures consumers
+    # read, so a source a consumer never saw is named rather than missing.
+    by_base_url_sources = sorted({
+        source
+        for base_data in organized_data['by_base_url'].values()
+        for endpoint in (base_data.get('endpoints') or {}).values()
+        for source in (endpoint.get('sources') or [])
+        if isinstance(source, str) and source
+    })
+    # Arjun ran before the late merges, so its input is the source set as it
+    # stood then. The pipeline's own ordering is what makes the late producers
+    # absent; the adapter records that, it does not change it.
+    late_sources = {"gau", "paramspider", "kiterunner", "urlscan", "openapi"}
+    arjun_sources_present = [s for s in sources_before_arjun if s not in late_sources]
+    arjun_sources_absent = sorted(late_sources - set(sources_before_arjun))
+    crawl_sources_present = sorted(
+        source for source, count in (
+            ("katana", len(katana_urls)),
+            ("hakrawler", len(hakrawler_urls)),
+        ) if count
+    )
+    _record("inputs", _da.record_input_facts,
+            discovered_url_sources={
+                "katana": len(katana_urls),
+                "hakrawler": len(hakrawler_urls) if HAKRAWLER_ENABLED else 0,
+                "gau": len(in_scope_gau) if GAU_ENABLED else 0,
+                "urlscan": len(urlscan_urls),
+                "paramspider": len(paramspider_urls) if PARAMSPIDER_ENABLED else 0,
+                "jsluice": len(jsluice_in_scope_urls) if JSLUICE_ENABLED else 0,
+                "ffuf": len(ffuf_discovered_urls) if FFUF_ENABLED else 0,
+                "zap_ajax_spider": len(zap_ajax_urls) if ZAP_AJAX_SPIDER_ENABLED else 0,
+            },
+            discovered_urls_total=len(all_discovered_urls),
+            by_base_url_sources=by_base_url_sources,
+            by_base_url_endpoints=resource_enum_result['summary']['total_endpoints'],
+            arjun={
+                "targets": len(arjun_target_urls) if ARJUN_ENABLED else 0,
+                "unexecuted": len(arjun_unexecuted) if ARJUN_ENABLED else 0,
+                "sources_present": arjun_sources_present,
+                "sources_absent": arjun_sources_absent,
+            },
+            js_recon={
+                "input_count": len(all_discovered_urls) + len(crawl_js_urls),
+                "sources_present": crawl_sources_present,
+                "sources_absent": sorted(late_sources),
+            })
+    _di.reconcile(_inventory, organized_data['by_base_url'],
+                  resource_enum_result['summary'])
+    recon_data['discovery_inventory'] = _inventory
 
     # AI Surface Recon — endpoint + parameter classifier.
     # Annotates every endpoint and parameter in organized_data['by_base_url']
@@ -1842,10 +2021,16 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # Add to recon_data
     recon_data['resource_enum'] = resource_enum_result
 
-    # Save incrementally
+    # Save incrementally. F08: atomic, so a stop between the truncate and the
+    # last write cannot leave a half-written artifact that downstream readers
+    # would take for a run that found nothing.
     if output_file:
-        with open(output_file, 'w') as f:
-            json.dump(recon_data, f, indent=2)
+        try:
+            from recon.helpers.atomic_io import atomic_write_json
+            atomic_write_json(output_file, recon_data)
+        except Exception as e:  # noqa: BLE001 - an unwritable artifact is fatal here
+            print(f"[!][ResourceEnum] could not write {output_file}: {type(e).__name__}: {e}")
+            raise
 
     # Print summary
     print(f"\n{'=' * 70}")

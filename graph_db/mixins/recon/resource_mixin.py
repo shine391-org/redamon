@@ -201,6 +201,16 @@ class ResourceMixin:
                             ai_interface_type = endpoint_info.get("ai_interface_type")
                             is_ai_rag_ingest = endpoint_info.get("is_ai_rag_ingest")
 
+                            # F08: FFuf's own measurement outlives the fold. The
+                            # graph keeps ffuf_category already; status, length
+                            # and content_type are raw producer evidence written
+                            # as flat additive properties so a reader can tell
+                            # what ffuf measured without parsing the inventory.
+                            ffuf_metadata = endpoint_info.get("ffuf_metadata") or {}
+                            ffuf_status = ffuf_metadata.get("status")
+                            ffuf_length = ffuf_metadata.get("length")
+                            ffuf_content_type = ffuf_metadata.get("content_type")
+
                             # `source` (singular) is the high-level phase tag
                             # ('resource_enum', 'vuln_scan', 'js_recon', etc.)
                             # used by report queries to bucket by stage.
@@ -264,6 +274,9 @@ class ResourceMixin:
                                     END,
                                     e.ai_interface_type = COALESCE($ai_interface_type, e.ai_interface_type),
                                     e.is_ai_rag_ingest = COALESCE($is_ai_rag_ingest, e.is_ai_rag_ingest),
+                                    e.ffuf_status = coalesce($ffuf_status, e.ffuf_status),
+                                    e.ffuf_length = coalesce($ffuf_length, e.ffuf_length),
+                                    e.ffuf_content_type = coalesce($ffuf_content_type, e.ffuf_content_type),
                                     e.openapi_declared = coalesce($oa_declared, e.openapi_declared),
                                     e.openapi_path_templates = coalesce($oa_templates, e.openapi_path_templates),
                                     e.openapi_operation_id = coalesce($oa_operation_id, e.openapi_operation_id),
@@ -289,6 +302,9 @@ class ResourceMixin:
                                 urls_found=endpoint_info.get('urls_found', 1),
                                 request_fidelity_json=_request_fidelity_json(endpoint_info, method),
                                 sources=ep_sources,
+                                ffuf_status=ffuf_status,
+                                ffuf_length=ffuf_length,
+                                ffuf_content_type=ffuf_content_type,
                                 ai_interface_type=ai_interface_type,
                                 is_ai_rag_ingest=is_ai_rag_ingest,
                                 **oa,

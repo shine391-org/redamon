@@ -310,7 +310,8 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> Optional[str
 
 
 def build_target_urls_from_resource_enum(
-        resource_enum_data: Optional[dict], report: Optional[dict] = None
+        resource_enum_data: Optional[dict], report: Optional[dict] = None,
+        declared_report: Optional[dict] = None,
 ) -> Tuple[List[str], List[str]]:
     """
     Build list of target URLs from resource_enum data.
@@ -323,6 +324,11 @@ def build_target_urls_from_resource_enum(
 
     Args:
         resource_enum_data: Resource enumeration data with endpoints
+        report: admission counters, as ``build_target_urls`` has always taken
+        declared_report: F08 accounting of the declared-only decision. The
+            cap and the GET/HEAD rule are unchanged; this only names what they
+            excluded, so an absence in a consumer is not read as an absence in
+            the target.
 
     Returns:
         Tuple of (base_urls, endpoint_urls_with_params)
@@ -337,6 +343,10 @@ def build_target_urls_from_resource_enum(
     by_base_url = resource_enum_data.get("by_base_url", {})
     declared = []
     rejected_endpoints = {}
+    # F08: which producers the consumer's own input actually carried.
+    sources_present = set()
+    templated_paths = 0
+    non_relative_paths = 0
 
     for base_url, base_data in by_base_url.items():
         if http_url_rejection(base_url) is not None:
@@ -347,12 +357,18 @@ def build_target_urls_from_resource_enum(
         for path, endpoint_info in endpoints.items():
             # Endpoint keys are relative paths, never arbitrary URI schemes.
             if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+                non_relative_paths += 1
                 if report is not None:
                     bucket = report.setdefault("resource_enum_path", {"admitted": 0, "rejected": {}})["rejected"]
                     bucket["not_relative_path"] = bucket.get("not_relative_path", 0) + 1
                 continue
             if "{" in path:
+                templated_paths += 1
                 continue
+            sources_present.update(
+                s for s in (endpoint_info.get("sources") or [])
+                if isinstance(s, str) and s
+            )
             if report is not None:
                 report.setdefault("resource_enum_path", {"admitted": 0, "rejected": {}})["admitted"] += 1
             url = _endpoint_url(base_url, path, endpoint_info)
@@ -364,6 +380,8 @@ def build_target_urls_from_resource_enum(
                 methods = {str(m).upper() for m in endpoint_info.get("methods") or []}
                 if methods & {"GET", "HEAD"}:
                     declared.append((base_url, path, url))
+                elif declared_report is not None:
+                    declared_report["declared_only_non_get_head"] += 1
                 continue
             endpoint_urls.append(url)
 
@@ -377,6 +395,25 @@ def build_target_urls_from_resource_enum(
         if groups:
             # This run's own group: a batch group's file holds only its own.
             groups[-1]["declared_not_sent_to_nuclei"] = overflow
+
+    if declared_report is not None:
+        declared_report["declared_only_total"] = (
+            declared_report.get("declared_only_total", 0) + len(declared))
+        declared_report["declared_only_get_head"] = (
+            declared_report.get("declared_only_get_head", 0) + len(declared))
+        declared_report["declared_only_admitted"] = (
+            declared_report.get("declared_only_admitted", 0)
+            + len(declared[:MAX_DECLARED_NUCLEI_URLS]))
+        declared_report["declared_only_cap_dropped"] = (
+            declared_report.get("declared_only_cap_dropped", 0) + overflow)
+        declared_report["declared_only_cap"] = MAX_DECLARED_NUCLEI_URLS
+        declared_report["templated_paths_skipped"] = (
+            declared_report.get("templated_paths_skipped", 0) + templated_paths)
+        declared_report["non_relative_paths_skipped"] = (
+            declared_report.get("non_relative_paths_skipped", 0) + non_relative_paths)
+        declared_report["sources_present"] = sorted(sources_present)
+        declared_report["admitted_endpoints"] = len(endpoint_urls)
+        declared_report["admitted_bases"] = len(base_urls)
 
     admit_http_urls(list(by_base_url), "resource_enum_base", report)
     if report is not None:
@@ -442,6 +479,7 @@ def build_target_urls(
     recon_data: Optional[dict] = None,
     scan_all_ips: bool = False,
     admission_report: Optional[dict] = None,
+    declared_report: Optional[dict] = None,
 ) -> List[str]:
     """
     Build the list of target URLs for nuclei scanning as the UNION of every
@@ -483,7 +521,8 @@ def build_target_urls(
     # Source 1: resource_enum (BaseURLs + parameterized endpoint URLs)
     resource_enum_data = recon_data.get("resource_enum") if recon_data else None
     if resource_enum_data:
-        base_urls, endpoint_urls = build_target_urls_from_resource_enum(resource_enum_data, admission)
+        base_urls, endpoint_urls = build_target_urls_from_resource_enum(
+            resource_enum_data, admission, declared_report)
         for u in base_urls:
             if u not in url_set:
                 url_set.add(u)

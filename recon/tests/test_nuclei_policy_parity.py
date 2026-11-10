@@ -204,7 +204,8 @@ def captured(monkeypatch):
     monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
     monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
     monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["example.com"], {}))
-    monkeypatch.setattr(vs, "build_target_urls", lambda h, i, rd, scan_all_ips=False: ["https://example.com"])
+    monkeypatch.setattr(vs, "build_target_urls", lambda h, i, rd, scan_all_ips=False,
+                        admission_report=None, declared_report=None: ["https://example.com"])
     monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
     monkeypatch.setattr(vs, "build_nuclei_command", spy_build)
     monkeypatch.setattr(vs, "_execute_nuclei_pass", fake_pass)
@@ -293,7 +294,8 @@ class TestEmptySelectionGuardAtTheCaller:
         monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
         monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
         monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["example.com"], {}))
-        monkeypatch.setattr(vs, "build_target_urls", lambda h, i, rd, scan_all_ips=False: ["https://example.com"])
+        monkeypatch.setattr(vs, "build_target_urls", lambda h, i, rd, scan_all_ips=False,
+                        admission_report=None, declared_report=None: ["https://example.com"])
         monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
         monkeypatch.setattr(vs, "_execute_nuclei_pass", lambda *a, **k: ([], [], 1.0, 0))
         monkeypatch.setattr(vs, "run_security_checks", fake_security)
@@ -340,7 +342,8 @@ class TestEmptySelectionRefusalAtBothCallSites:
         monkeypatch.setattr(vs, "extract_targets_from_recon",
                             lambda rd: ([], ["example.com"], {}))
         monkeypatch.setattr(vs, "build_target_urls",
-                            lambda h, i, rd, scan_all_ips=False: ["https://example.com"])
+                            lambda h, i, rd, scan_all_ips=False,
+                            admission_report=None, declared_report=None: ["https://example.com"])
         monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
         monkeypatch.setattr(vs, "_execute_nuclei_pass", pass_impl)
         monkeypatch.delenv("HOST_CUSTOM_TEMPLATES_PATH", raising=False)

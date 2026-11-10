@@ -277,3 +277,25 @@ def test_the_cap_keeps_every_observed_url_and_the_first_declared_ones(capsys):
     assert declared == [f'https://a.example.com/d{i:04d}' for i in range(500)]
     assert data['openapi']['groups'][0]['declared_not_sent_to_nuclei'] == 1500
     assert '[-][OpenAPI] 1500 declared endpoints not sent to nuclei (cap 500)' in capsys.readouterr().out
+
+
+# F08: declared_only accounting names what the cap excluded, so a consumer's
+# absence is not read as an absence in the target.
+def test_declared_report_names_what_the_cap_excluded(capsys):
+    endpoints = {f'/d{i:04d}': _endpoint(['GET'], True) for i in range(600)}
+    endpoints.update({f'/o{i}': _endpoint(['GET']) for i in range(2)})
+    data = {'by_base_url': {'https://a.example.com': {'endpoints': endpoints}},
+            'openapi': {'groups': [{'root': 'example.com'}]}}
+    report = {}
+    _, urls = build_target_urls_from_resource_enum(data, declared_report=report)
+    assert report["declared_only_total"] == 600
+    assert report["declared_only_get_head"] == 600
+    assert report["declared_only_admitted"] == MAX_DECLARED_NUCLEI_URLS
+    assert report["declared_only_cap_dropped"] == 100
+    assert report["declared_only_cap"] == MAX_DECLARED_NUCLEI_URLS
+    assert report["admitted_endpoints"] == 502
+    assert report["sources_present"] == []
+    observed = [u for u in urls if '/o' in u]
+    declared = [u for u in urls if '/d' in u]
+    assert len(observed) == 2
+    assert len(declared) == MAX_DECLARED_NUCLEI_URLS == 500

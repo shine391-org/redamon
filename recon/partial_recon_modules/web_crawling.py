@@ -31,6 +31,8 @@ from recon.partial_recon_modules.graph_builders import (
 from recon.partial_recon_modules.user_inputs import _create_user_subdomains_in_graph
 from recon.helpers import build_target_urls, extract_targets_from_recon
 from recon.helpers.auth_profile import merge_auth_headers
+from recon.helpers.auth_profile import profile_from_settings as _profile_of
+from recon.helpers import discovery_inventory as _di, discovery_adapters as _da
 
 
 def run_katana(config: dict) -> None:
@@ -1122,6 +1124,11 @@ def run_ffuf(config: dict) -> None:
         print(f"[*][Partial Recon][FFuf] AI selected {len(effective_extensions)} unique extensions: {effective_extensions}")
         print(f"[*][Partial Recon][FFuf] Static FFUF_EXTENSIONS list ({FFUF_EXTENSIONS}) is being ignored.")
 
+    _auth_profile = _profile_of(settings)
+    AUTH_REF = (f"auth_profile:{_auth_profile.get('id') or _auth_profile.get('name') or 'unnamed'}"
+                if _auth_profile else "anonymous")
+    _inventory = _di.new_inventory()
+
     # Run FFuf discovery
     print(f"[*][Partial Recon] Running FFuf directory fuzzing on {len(target_urls)} URLs...")
     ffuf_results, ffuf_meta = run_ffuf_discovery(
@@ -1150,7 +1157,21 @@ def run_ffuf(config: dict) -> None:
     by_base_url = {}
     ffuf_stats = {"ffuf_total": 0, "ffuf_new": 0, "ffuf_overlap": 0}
     if ffuf_results:
+        keys_before_ffuf = _da.keys_of(by_base_url)
         by_base_url, ffuf_stats = merge_ffuf_into_by_base_url(ffuf_results, by_base_url)
+        _da.observe_ffuf(_inventory, results=ffuf_results, existing_keys=keys_before_ffuf,
+                         auth_ref=AUTH_REF)
+        _di.record_raw_evidence(_inventory, source="ffuf", record={
+            "targets": ffuf_meta.get("fuzz_targets_run"),
+            "targets_built": ffuf_meta.get("fuzz_targets_built"),
+            "results": len(ffuf_results),
+            "results_raw": ffuf_meta.get("results_raw"),
+            "external_domains": len(ffuf_meta.get("external_domains") or []),
+            "smart_fuzz_base_paths": len(discovered_base_paths or []),
+            "extensions": len(effective_extensions or []),
+            "wordlist": FFUF_WORDLIST,
+            "temp_output_removed": True,
+        })
         print(f"[+][Partial Recon] FFuf total: {ffuf_stats['ffuf_total']} endpoints")
         print(f"[+][Partial Recon] FFuf new: {ffuf_stats['ffuf_new']}")
 
@@ -1172,6 +1193,11 @@ def run_ffuf(config: dict) -> None:
         },
         "external_domains": ffuf_meta.get("external_domains", []),
     }
+
+    # F08: the partial FFuf run's own inventory, so a partial run's evidence is
+    # not treated as a full run's. Reconcile against what this run actually had.
+    _di.reconcile(_inventory, by_base_url, result["resource_enum"]["summary"])
+    result["discovery_inventory"] = _inventory
 
     # Update the graph database
     print(f"[*][Partial Recon] Updating graph database...")

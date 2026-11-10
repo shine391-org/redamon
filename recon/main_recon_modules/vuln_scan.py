@@ -581,6 +581,11 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
     from recon.helpers.coverage_stamps import run_started_at
     coverage_at = run_started_at()
 
+    # F08: the detection consumer's own input accounting, bound on every path
+    # (the metadata block below is outside the ``if run_nuclei:`` scope).
+    _target_admission: dict = {}
+    _declared_report: dict = {}
+
     if not NUCLEI_ENABLED:
         print("[*][Nuclei] Vulnerability scanner disabled -- skipping")
         # Initialize empty vuln_scan structure so downstream code doesn't break
@@ -727,8 +732,15 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             run_nuclei = False
 
     if run_nuclei:
-        # Build target URLs using httpx/naabu data if available
-        target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=NUCLEI_SCAN_ALL_IPS)
+        # Build target URLs using httpx/naabu data if available. F08: the
+        # builder's own admission report and declared-only accounting are kept
+        # so the inventory can say which sources this consumer's input carried
+        # and which it refused, instead of leaving the gap silent.
+        _target_admission = {}
+        _declared_report = {}
+        target_urls = build_target_urls(
+            hostnames, ips, recon_data, scan_all_ips=NUCLEI_SCAN_ALL_IPS,
+            admission_report=_target_admission, declared_report=_declared_report)
 
         # Initialize the per-scan AI context for the false-positive response
         # filter. Consumed by is_false_positive() in _execute_nuclei_pass().
@@ -1171,6 +1183,9 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "dast_mode": NUCLEI_DAST_MODE,
                     "dast_pass_executed": do_dast_pass and dast_not_executed is None,
                     "http_admission": recon_data.get("metadata", {}).get("http_admission", {}),
+                    # F08: the detection consumer's own input accounting.
+                    "target_admission": _target_admission,
+                    "declared_only": _declared_report,
                     "dast_urls_discovered": len(dast_urls) if NUCLEI_DAST_MODE else 0,
                     # F03: the DAST pass is a separate consumer of the operator's
                     # denylist. Record what it actually received and whether the

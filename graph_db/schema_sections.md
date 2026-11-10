@@ -244,6 +244,9 @@ Additional properties present on this node type, not yet described:
 - baseurl (string): the BaseURL it belongs to ("https://api.example.com:443"); with path and method, its key. Build its address as `e.baseurl + e.path`
 - category (string): the same words from every module: "authentication", "admin", "api", "upload", "file_access", "search", "dynamic", "static", "other". The path decides; a page that says what it is only in its title (a login form at "/", Grafana at "/app") gets "authentication" or "admin" from the title. A later source that only knows "other" never overwrites a specific one
 - ffuf_category (string): ffuf's own label ("redirect", "forbidden", "admin", "config", "backup", "api", "auth", "directory"); "forbidden" means ffuf saw a 403
+- ffuf_status (integer): ffuf's own measured status for this endpoint, when FFuf ran; absent when no observation exists, never a fabricated 200
+- ffuf_length (integer): ffuf's measured response length, absent when not measured
+- ffuf_content_type (string): ffuf's measured content type, absent when not measured
 - js_recon_category (string): JS Recon's own label ("api_documentation", "admin_debug", "authentication", "api", "file_upload", "graphql", "websocket", "api_config", "endpoint")
 - sources (list[string]): the tools that found it ("katana", "gau", "urlscan", "ffuf", "jsluice"...); an archive-only Endpoint (only urlscan, GAU or ParamSpider) may no longer exist
 - openapi_declared (boolean): Declared by an API specification (OpenAPI/Swagger) document recon imported; a declaration does not establish reachability or authorization

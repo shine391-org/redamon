@@ -613,11 +613,31 @@ def save_recon_file(data: dict, output_file: Path):
     after the save instead of starting the next phase: a phase that runs in
     Python (OSINT calls, security checks) would otherwise send new traffic until
     the stopper ends the process.
+
+    F08: the write is atomic (sibling temp file + ``os.replace``). A plain
+    ``open(path, "w")`` truncates first, so a kill mid-write leaves a shorter or
+    empty artifact that the orchestrator and the GVM scanner read as a run that
+    produced nothing. Atomic swap means a reader sees the previous complete
+    artifact or the new one, never a partial.
     """
+    from recon.helpers.atomic_io import atomic_write_json
     with _save_lock:
-        with open(output_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(output_file, data)
     _shutdown.park()
+
+
+def finalize_discovery_inventory(result: dict) -> None:
+    """F08: fold every consumer disposition into the inventory, then reconcile.
+
+    Called after the scans, because Nuclei's detection consumer only exists once
+    vuln_scan has built its target list. Never fails the run: an accounting
+    error is logged, and the inventory stays as resource_enum built it.
+    """
+    try:
+        from recon.helpers.discovery_adapters import finalize_inventory
+        finalize_inventory(result)
+    except Exception as e:  # noqa: BLE001 - accounting never fails a scan
+        print(f"[!][Pipeline] discovery inventory not finalized: {type(e).__name__}: {e}")
 
 
 def _dns_names(result: dict) -> set:
@@ -1566,6 +1586,10 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     except Exception as e:
         print(f"[!][Pipeline] external_domains aggregation failed: {e}")
 
+    # F08: consumer dispositions (Nuclei detection/DAST) are only knowable now.
+    finalize_discovery_inventory(combined_result)
+    save_recon_file(combined_result, output_file)
+
     # Wait for all background graph DB updates to finish
     _graph_wait_all()
 
@@ -2424,6 +2448,11 @@ def run_domain_recon(target: str, bruteforce: bool = False,
 
     print(f"[+][Pipeline] Output saved: {output_file}")
     print(f"{'=' * 70}")
+
+    # F08: consumer dispositions (Nuclei detection/DAST) are only knowable now
+    # that vuln_scan has built its target list.
+    finalize_discovery_inventory(combined_result)
+    save_recon_file(combined_result, output_file)
 
     return combined_result
 

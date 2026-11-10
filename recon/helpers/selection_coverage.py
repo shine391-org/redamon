@@ -320,8 +320,11 @@ def persist_plan(output_file, plan) -> bool:
             if not isinstance(data, dict):
                 data = {}
             data[KEY] = plan
-            with open(output_file, "w") as f:
-                json.dump(data, f, indent=2)
+            # F08: atomic, same reason as save_recon_file — the plan is read by
+            # the prune, and a half-written plan is indistinguishable from no
+            # plan (which fails closed, but silently).
+            from recon.helpers.atomic_io import atomic_write_json
+            atomic_write_json(output_file, data)
         return True
     except Exception:  # noqa: BLE001 - the prune fails closed without the plan
         return False

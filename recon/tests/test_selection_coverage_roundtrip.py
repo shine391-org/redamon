@@ -203,7 +203,9 @@ class TestPlanPersistedBeforeLaunch:
                 mock.patch.object(vs, "extract_targets_from_recon",
                                   lambda rd: ([], ["app.example.com"], {})), \
                 mock.patch.object(vs, "build_target_urls",
-                                  lambda h, i, rd, scan_all_ips=False: ["https://app.example.com"]), \
+                                  lambda h, i, rd, scan_all_ips=False,
+                                     admission_report=None,
+                                     declared_report=None: ["https://app.example.com"]), \
                 mock.patch.object(vs, "set_fp_ai_ctx", lambda **kw: None), \
                 mock.patch.object(vs, "_execute_nuclei_pass", fake_pass):
             combined = copy.deepcopy(recon)

@@ -28,7 +28,8 @@ _SLUG_SAFE = re.compile(r'[^a-z0-9.-]')
 #: plan per group; the canonical artifact must describe the whole batch, so
 #: these are combined explicitly instead of first-group-wins.
 from recon.helpers.selection_coverage import KEY as SELECTION_KEY, merge_plans  # noqa: E402
-_SPECIAL_MERGE_KEYS = (SELECTION_KEY,)
+from recon.helpers.discovery_inventory import KEY as DISCOVERY_KEY, merge_inventories  # noqa: E402
+_SPECIAL_MERGE_KEYS = (SELECTION_KEY, DISCOVERY_KEY)
 
 BATCH_SEPARATOR = '__'
 
@@ -162,6 +163,15 @@ def _merge_group_into(merged: dict[str, Any], group: dict[str, Any]) -> None:
         if key == SELECTION_KEY:
             existing = merged.get(key)
             merged[key] = merge_plans([existing, value] if isinstance(existing, dict) else [value])
+            continue
+        if key == DISCOVERY_KEY:
+            # Each group's inventory is its own; folding them with the generic
+            # dict/list merge would concatenate observation lists and could
+            # duplicate a raw record two groups both saw.
+            existing = merged.get(key)
+            merged[key] = merge_inventories(
+                existing if isinstance(existing, dict) else None,
+                value if isinstance(value, dict) else None)
             continue
         if key not in merged:
             merged[key] = value
