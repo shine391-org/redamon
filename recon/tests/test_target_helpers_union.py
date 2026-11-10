@@ -53,6 +53,20 @@ TH = _load_module(
 # Unit: build_target_urls -- union semantics
 # ---------------------------------------------------------------------------
 
+
+def test_explicit_decoded_query_contract_preserves_observation_and_union():
+    import copy
+    from urllib.parse import parse_qsl, urlsplit
+    value = 'a&b=# %+雪'
+    ep = {'parameters': {'query': [{'name': 'q', 'sample_values': [value],
+                                   'sample_values_encoding': 'decoded-observation'}]}}
+    resource = {'by_base_url': {'https://a.example.test': {'endpoints': {'/search': ep}}}}
+    before = copy.deepcopy(resource)
+    _, urls = TH.build_target_urls_from_resource_enum(resource)
+    assert len(urls) == 1
+    assert parse_qsl(urlsplit(urls[0]).query, keep_blank_values=True) == [('q', value)]
+    assert resource == before  # metadata is needed only for ambiguous legacy shapes
+
 class TestBuildTargetUrlsUnion(unittest.TestCase):
     """The new behavior: every available source contributes, deduplicated."""
 
