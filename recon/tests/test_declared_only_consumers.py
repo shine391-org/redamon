@@ -240,7 +240,14 @@ def test_declared_only_paths_need_get_or_head_and_observed_ones_do_not():
         '/orders': _endpoint(['POST'], True),
         '/health': _endpoint(['HEAD'], True),
         '/login': _endpoint(['POST'], False),
-        '/search': _endpoint(['GET'], True, query=[('q', 'a%20b'), ('page', None)]),
+        # OpenAPI producer values are explicitly percent-encoded; the marker
+        # prevents the declared-only caller from encoding them a second time.
+        '/search': {**_endpoint(['GET'], True, query=[('q', 'a%20b'), ('page', None)]),
+                    'parameters': {'query': [
+                        {'name': 'q', 'sample_values': ['a%20b'],
+                         'sample_values_encoding': 'percent-encoded'},
+                        {'name': 'page', 'sample_values': []},
+                    ]}},
     }}}})
     assert sorted(urls) == ['https://a.example.com/health', 'https://a.example.com/login',
                             'https://a.example.com/search?q=a%20b&page=1']

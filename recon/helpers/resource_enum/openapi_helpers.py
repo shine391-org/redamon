@@ -125,6 +125,10 @@ def _parameter(name, schema_or_param, required, *, sample=True):
     if sample:
         value = _declared_value(schema_or_param)
         entry['sample_values'] = [] if value is None else [encode_value(value)]
+        # OpenAPI examples are serialized by encode_value before they cross
+        # the producer boundary.  Keep that fact with the value so consumers
+        # do not mistake an encoded sample for a decoded observation.
+        entry['sample_values_encoding'] = 'percent-encoded'
     return entry
 
 

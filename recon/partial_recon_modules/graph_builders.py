@@ -1541,15 +1541,22 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                 base = record["base"]
                 if not base or not keep(url_host(base, record["host"] or "")):
                     continue
-                params = {}
+                params = []
                 for p in record["params"] or []:
                     name = p.get("name")
                     if not name:
                         continue
                     samples = [s for s in (p.get("sample_values") or []) if isinstance(s, str)]
-                    params[str(name)] = {"sample_values": samples}
+                    params.append({"name": str(name), "sample_values": samples,
+                                   "sample_values_encoding": "decoded-observation"})
                 endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
-                endpoints[record["path"]] = {"method": record["method"], "parameters": params}
+                endpoints[record["path"]] = {
+                    "method": record["method"],
+                    "parameters": {"query": params},
+                    # DISTINCT/name-keyed graph projection cannot prove source
+                    # order or duplicate-key fidelity.
+                    "fidelity_unknown": bool(params),
+                }
 
             # 4) Form field names (values are not persisted in the graph) -> forms.
             result = session.run(

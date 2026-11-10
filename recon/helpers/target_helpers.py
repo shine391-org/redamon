@@ -153,6 +153,10 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
         return single
 
     params = (endpoint_info.get("parameters") or {}).get("query") or []
+    # A name-keyed/aggregated projection cannot recover source order or
+    # duplicate keys. Keep that loss explicit rather than claiming fidelity.
+    if endpoint_info.get("fidelity_unknown"):
+        endpoint_info.setdefault("fidelity", []).append("fidelity_unknown")
     parts = []
     for param in params:
         name = param.get("name")
@@ -166,13 +170,25 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
                 value = ""
         else:
             value = "1"
-        parts.append(f"{_q(str(name), safe='')}={_q(str(value), safe='')}")
+        if param.get("sample_values_encoding") == "percent-encoded":
+            # OpenAPI's producer already serialized this example.
+            encoded_value = str(value)
+        elif any(ord(c) <= 31 or 127 <= ord(c) <= 159 for c in str(value)):
+            # A decoded observation must never contain raw control characters.
+            # Reject it rather than emitting an invalid request URL or
+            # fabricating a percent-encoded recovery the producer did not record.
+            return None
+        else:
+            encoded_value = _q(str(value), safe='')
+        parts.append(f"{_q(str(name), safe='')}={encoded_value}")
     if not parts:
         return f"{base_url}{path}"
     return f"{base_url}{path}?{'&'.join(parts)}"
 
 
-def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> Tuple[List[str], List[str]]:
+def build_target_urls_from_resource_enum(
+        resource_enum_data: Optional[dict], report: Optional[dict] = None
+) -> Tuple[List[str], List[str]]:
     """
     Build list of target URLs from resource_enum data.
 
@@ -190,6 +206,7 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
     """
     base_urls = []
     endpoint_urls = []
+    rejected_endpoints = {}
 
     if not resource_enum_data:
         return base_urls, endpoint_urls
@@ -205,6 +222,10 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
             if "{" in path:
                 continue
             url = _endpoint_url(base_url, path, endpoint_info)
+            if url is None:
+                rejected_endpoints["control_or_whitespace"] = rejected_endpoints.get(
+                    "control_or_whitespace", 0) + 1
+                continue
             if endpoint_info.get("declared_only") is True:
                 methods = {str(m).upper() for m in endpoint_info.get("methods") or []}
                 if methods & {"GET", "HEAD"}:
@@ -223,6 +244,11 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
             # This run's own group: a batch group's file holds only its own.
             groups[-1]["declared_not_sent_to_nuclei"] = overflow
 
+    if report is not None:
+        report["resource_enum_endpoint"] = {
+            "admitted": len(endpoint_urls), "rejected": rejected_endpoints}
+    elif rejected_endpoints:
+        print(f"[*][HTTP admission] resource_enum_endpoint: {rejected_endpoints}")
     return base_urls, endpoint_urls
 
 

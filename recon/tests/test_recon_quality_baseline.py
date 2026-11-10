@@ -58,7 +58,8 @@ def test_characterize_native_builder_projection(case_id):
     if row["id"] in {"declared-post", "declared-template"}:
         assert urls == []  # not executable GET targets; declaration still in corpus
     elif row["id"] == "query-encoding":
-        assert urls == ["https://a.example.test/api/search?q=a&b=# %+雪"]
+        # F02 rebuilds decoded observations with component-safe query encoding.
+        assert urls == ["https://a.example.test/api/search?q=a%26b%3D%23%20%25%2B%E9%9B%AA"]
     elif row["id"] == "duplicate-keys":
         assert urls == ["https://a.example.test/api/dup?k=1&empty=&K=3"]
     else:
@@ -66,13 +67,14 @@ def test_characterize_native_builder_projection(case_id):
     # This captures admission only, not method/auth/validation fidelity or coverage.
 
 
-def test_negative_probe_query_fidelity_is_not_approved_baseline():
+def test_query_fidelity_roundtrip_is_the_approved_contract():
     row = CASES["query-encoding"]
     rebuilt = th._endpoint_url(row["origin"], row["path"], {"parameters": row["parameters"]})
     desired_pairs = parse_qsl(urlsplit(row["raw_url"]).query, keep_blank_values=True)
     assert desired_pairs == [("q", "a&b=# %+雪")]
-    assert parse_qsl(urlsplit(rebuilt).query, keep_blank_values=True) != desired_pairs
-    # F02 must replace this defect probe with equality against the desired contract.
+    # F02 contract: rebuilding a decoded observation must preserve the request
+    # value, while serializing delimiters only in the query component.
+    assert parse_qsl(urlsplit(rebuilt).query, keep_blank_values=True) == desired_pairs
 
 
 def test_negative_probe_ffuf_seed_path_is_not_approved_baseline():
