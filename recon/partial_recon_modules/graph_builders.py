@@ -1547,8 +1547,11 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                     if not name:
                         continue
                     samples = [s for s in (p.get("sample_values") or []) if isinstance(s, str)]
+                    # Keep the producer's encoding marker through the projection;
+                    # unmarked samples remain decoded observations.
+                    encoding = p.get("sample_values_encoding") or "decoded-observation"
                     params.append({"name": str(name), "sample_values": samples,
-                                   "sample_values_encoding": "decoded-observation"})
+                                   "sample_values_encoding": encoding})
                 endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
                 endpoints[record["path"]] = {
                     "method": record["method"],

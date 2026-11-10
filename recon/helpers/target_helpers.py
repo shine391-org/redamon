@@ -152,13 +152,40 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
     if isinstance(single, str) and single.strip():
         return single
 
-    params = (endpoint_info.get("parameters") or {}).get("query") or []
+    parameters = endpoint_info.get("parameters")
+    if isinstance(parameters, dict):
+        raw_params = parameters.get("query")
+        if raw_params is None:
+            # A pre-F01 name-keyed projection had no "query" bucket.
+            raw_params = [{"name": name, **value} if isinstance(value, dict) else {"name": name}
+                          for name, value in parameters.items()
+                          if name not in ("body", "path")]
+    else:
+        raw_params = []
+    params = raw_params or []
     # A name-keyed/aggregated projection cannot recover source order or
     # duplicate keys. Keep that loss explicit rather than claiming fidelity.
     if endpoint_info.get("fidelity_unknown"):
         endpoint_info.setdefault("fidelity", []).append("fidelity_unknown")
-    parts = []
+    # Older serialized projections keyed parameters by name. Accept that shape
+    # without inventing values, and never treat an encoded value as decoded.
+    normalized_params = []
     for param in params:
+        if isinstance(param, str):
+            param = {"name": param}
+        if not isinstance(param, dict):
+            continue
+        if "name" not in param and isinstance(param.get("sample_values"), dict):
+            # Name-keyed legacy projection: {"q": {"sample_values": [...]}}.
+            for name, value in param.items():
+                if isinstance(value, dict):
+                    normalized_params.append({**value, "name": name})
+                else:
+                    normalized_params.append({"name": name})
+            continue
+        normalized_params.append(param)
+    parts = []
+    for param in normalized_params:
         name = param.get("name")
         if not name:
             continue

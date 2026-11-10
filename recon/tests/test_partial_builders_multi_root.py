@@ -404,8 +404,11 @@ class TestSerializedBuilder:
 
     def test_parameters_keep_their_sample_values(self, graph):
         eps = self.build()["resource_enum"]["by_base_url"]["https://www.alpha.test"]["endpoints"]
-        assert eps["/api/load"] == {"method": "GET",
-                                    "parameters": {"data": {"sample_values": ["rO0ABXNy"]}}}
+        assert eps["/api/load"] == {
+            "method": "GET",
+            "parameters": {"query": [{"name": "data", "sample_values": ["rO0ABXNy"],
+                                      "sample_values_encoding": "decoded-observation"}]},
+            "fidelity_unknown": True}
 
     def test_forms_carry_field_names_only(self, graph):
         forms = [f for f in self.build()["resource_enum"]["forms"]

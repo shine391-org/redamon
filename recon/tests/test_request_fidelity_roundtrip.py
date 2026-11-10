@@ -51,6 +51,12 @@ def test_raw_control_observation_is_refused_without_fabricated_recovery():
     assert url is None
 
 
+def test_legacy_name_keyed_projection_is_accepted_without_invented_values():
+    url = th._endpoint_url("https://api.example.test", "/search", {
+        "parameters": {"q": {"sample_values": ["a&b"]}}})
+    assert parse_qsl(urlsplit(url).query, keep_blank_values=True) == [("q", "a&b")]
+
+
 def test_full_and_partial_use_the_same_observation_contract():
     observation = [{"name": "q", "sample_values": ["a&b=# %+雪"]}]
     full = _url(observation)
