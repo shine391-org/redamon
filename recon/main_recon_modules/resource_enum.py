@@ -38,6 +38,11 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from recon.helpers.resource_enum.arjun_contract import (
+    arjun_settings, arjun_url_host, select_arjun_targets, record_arjun_selection, reconcile_arjun_schema,
+)
+
+
 # Settings are passed from main.py to avoid multiple database queries
 
 # Import from helpers (shared with vuln_scan)
@@ -531,19 +536,21 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     ZAP_AJAX_SPIDER_PARALLELISM = settings.get('ZAP_AJAX_SPIDER_PARALLELISM', 1)
     ZAP_AJAX_SPIDER_MAX_SEEDS = settings.get('ZAP_AJAX_SPIDER_MAX_SEEDS', 250)
 
+    # Shared conservative fallbacks; resolved project values always win.
+    settings = {**settings, **arjun_settings(settings)}
     # Arjun settings
     ARJUN_ENABLED = settings.get('ARJUN_ENABLED', False)
-    ARJUN_THREADS = settings.get('ARJUN_THREADS', 2)
-    ARJUN_TIMEOUT = settings.get('ARJUN_TIMEOUT', 15)
-    ARJUN_SCAN_TIMEOUT = settings.get('ARJUN_SCAN_TIMEOUT', 600)
-    ARJUN_METHODS = settings.get('ARJUN_METHODS', ['GET'])
-    ARJUN_MAX_ENDPOINTS = settings.get('ARJUN_MAX_ENDPOINTS', 50)
-    ARJUN_CHUNK_SIZE = settings.get('ARJUN_CHUNK_SIZE', 500)
-    ARJUN_RATE_LIMIT = settings.get('ARJUN_RATE_LIMIT', 0)
-    ARJUN_STABLE = settings.get('ARJUN_STABLE', False)
-    ARJUN_PASSIVE = settings.get('ARJUN_PASSIVE', False)
-    ARJUN_DISABLE_REDIRECTS = settings.get('ARJUN_DISABLE_REDIRECTS', False)
-    ARJUN_CUSTOM_HEADERS = settings.get('ARJUN_CUSTOM_HEADERS', [])
+    ARJUN_THREADS = settings['ARJUN_THREADS']
+    ARJUN_TIMEOUT = settings['ARJUN_TIMEOUT']
+    ARJUN_SCAN_TIMEOUT = settings['ARJUN_SCAN_TIMEOUT']
+    ARJUN_METHODS = settings['ARJUN_METHODS']
+    ARJUN_MAX_ENDPOINTS = settings['ARJUN_MAX_ENDPOINTS']
+    ARJUN_CHUNK_SIZE = settings['ARJUN_CHUNK_SIZE']
+    ARJUN_RATE_LIMIT = settings['ARJUN_RATE_LIMIT']
+    ARJUN_STABLE = settings['ARJUN_STABLE']
+    ARJUN_PASSIVE = settings['ARJUN_PASSIVE']
+    ARJUN_DISABLE_REDIRECTS = settings['ARJUN_DISABLE_REDIRECTS']
+    ARJUN_CUSTOM_HEADERS = settings['ARJUN_CUSTOM_HEADERS']
 
     # GAU settings - disable in IP mode (archives index by domain, not IP)
     ip_mode = recon_data.get("metadata", {}).get("ip_mode", False)
@@ -1361,14 +1368,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             if not arjun_target_urls:
                 arjun_target_urls = list(target_urls)
 
-            # Cap to max endpoints (most interesting first — API/dynamic endpoints)
-            if len(arjun_target_urls) > ARJUN_MAX_ENDPOINTS:
-                # Prioritize API and dynamic endpoints over static ones
-                api_urls = [u for u in arjun_target_urls if any(p in u.lower() for p in ['/api/', '/v1/', '/v2/', '/graphql', '/rest/'])]
-                dynamic_urls = [u for u in arjun_target_urls if u not in api_urls and any(u.lower().endswith(e) for e in ['.php', '.asp', '.aspx', '.jsp'])]
-                other_urls = [u for u in arjun_target_urls if u not in api_urls and u not in dynamic_urls]
-                arjun_target_urls = (api_urls + dynamic_urls + other_urls)[:ARJUN_MAX_ENDPOINTS]
-                print(f"[*][Arjun] Capped to {ARJUN_MAX_ENDPOINTS} endpoints (API: {len(api_urls)}, dynamic: {len(dynamic_urls)}, other: {len(other_urls)})")
+            arjun_target_urls, arjun_unexecuted = select_arjun_targets(arjun_target_urls, ARJUN_MAX_ENDPOINTS)
 
             arjun_results, arjun_meta = run_arjun_discovery(
                 arjun_target_urls,
@@ -1385,11 +1385,14 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 target_domains,
             )
 
+            record_arjun_selection(arjun_meta, arjun_unexecuted)
+
             if arjun_results:
                 print("\n[*][Arjun] Merging discovered parameters into results...")
                 organized_data['by_base_url'], arjun_stats = merge_arjun_into_by_base_url(
                     arjun_results,
                     organized_data['by_base_url'],
+                    allowed_hosts=target_domains,
                 )
                 print(f"[+][Arjun] Total URLs with params: {arjun_stats['arjun_total']}")
                 print(f"[+][Arjun] New endpoints: {arjun_stats['arjun_new_endpoints']}")
@@ -1397,6 +1400,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 print(f"[+][Arjun] Parameters discovered: {arjun_stats['arjun_params_discovered']}")
         else:
             print("[!][Arjun] arjun binary not found in PATH, skipping")
+            arjun_meta = {"status": "not_executed", "reason": "binary_missing", "coverage_scope": "selected_inputs"}
+            record_arjun_selection(arjun_meta, [])
 
     # Merge GAU results if available
     gau_stats = {
@@ -1723,6 +1728,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             'arjun_passive': ARJUN_PASSIVE if ARJUN_ENABLED else None,
             'arjun_params_discovered': arjun_stats['arjun_params_discovered'],
             'arjun_stats': arjun_stats,
+            'arjun_execution': arjun_meta,
             # General
             'proxy_used': False,
             'target_urls_count': len(target_urls),
@@ -1793,6 +1799,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             + arjun_meta.get("external_domains", [])
         ),
     }
+
+    resource_enum_result["summary"].update(reconcile_arjun_schema(organized_data["by_base_url"]))
 
     # Aggregate methods and categories across all base URLs
     for base_data in organized_data['by_base_url'].values():

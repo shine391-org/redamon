@@ -8,6 +8,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from recon.helpers.resource_enum.arjun_contract import (
+    arjun_settings, arjun_url_host, select_arjun_targets, record_arjun_selection, reconcile_arjun_schema,
+)
+
+
 from recon.partial_recon_modules.helpers import (
     typed_host_ok,
     root_orgs,
@@ -536,6 +541,7 @@ def run_arjun(config: dict) -> None:
 
     # Force-enable Arjun since the user explicitly chose to run it
     settings['ARJUN_ENABLED'] = True
+    settings = {**settings, **arjun_settings(settings)}
 
     print(f"\n{'=' * 50}")
     print(f"[*][Partial Recon] Arjun Parameter Discovery (only)")
@@ -555,9 +561,15 @@ def run_arjun(config: dict) -> None:
 
     if user_targets:
         for entry in user_targets.get("urls", []):
-            # Validate raw URI bytes before any whitespace/control normalization.
+            # F01: validate raw URI bytes before any whitespace/control normalization.
+            # F06: additionally require a typed host within the run's scope roots
+            # (Arjun is a scope-enforcing consumer; bare URI admission is not enough).
             if entry and _is_valid_url(entry):
-                user_urls.append(entry)
+                host = arjun_url_host(entry)
+                if host and typed_host_ok(host, roots, config.get("domain_groups")):
+                    user_urls.append(entry)
+                else:
+                    print(f"[!][Partial Recon] Skipping URL outside scope: {entry}")
             elif entry:
                 from recon.helpers.target_helpers import http_url_rejection
                 print(f"[!][Partial Recon] URL rejected: {http_url_rejection(entry)}")
@@ -643,40 +655,35 @@ def run_arjun(config: dict) -> None:
                 arjun_target_urls.append(url)
             from urllib.parse import urlparse
             parsed = urlparse(url)
-            host = parsed.netloc.split(":")[0]
+            host = arjun_url_host(url)
             if host:
                 target_domains.add(host)
 
-    # Also add the roots themselves to target_domains for scope filtering
-    target_domains.update(roots)
+    # Graph inputs already passed graph_url_scope; use their actual parsed hosts,
+    # not only BaseURL.host (which may be absent). No new root/suffix permission.
+    target_domains.update(arjun_url_host(u) for u in arjun_target_urls if arjun_url_host(u))
 
     if not arjun_target_urls:
         print("[!][Partial Recon] No URLs to test (graph has no BaseURLs/Endpoints and no valid user URLs provided).")
         print("[!][Partial Recon] Run Katana or Hakrawler first to discover endpoints, or provide URLs manually.")
         sys.exit(1)
 
-    # Cap to max endpoints (most interesting first -- API/dynamic endpoints)
-    ARJUN_MAX_ENDPOINTS = settings.get('ARJUN_MAX_ENDPOINTS', 50)
-    if len(arjun_target_urls) > ARJUN_MAX_ENDPOINTS:
-        api_urls = [u for u in arjun_target_urls if any(p in u.lower() for p in ['/api/', '/v1/', '/v2/', '/graphql', '/rest/'])]
-        dynamic_urls = [u for u in arjun_target_urls if u not in api_urls and any(u.lower().endswith(e) for e in ['.php', '.asp', '.aspx', '.jsp'])]
-        other_urls = [u for u in arjun_target_urls if u not in api_urls and u not in dynamic_urls]
-        arjun_target_urls = (api_urls + dynamic_urls + other_urls)[:ARJUN_MAX_ENDPOINTS]
-        print(f"[*][Partial Recon] Capped to {ARJUN_MAX_ENDPOINTS} endpoints (API: {len(api_urls)}, dynamic: {len(dynamic_urls)}, other: {len(other_urls)})")
+    arjun_target_urls, arjun_unexecuted = select_arjun_targets(
+        arjun_target_urls, settings['ARJUN_MAX_ENDPOINTS'])
 
     print(f"[+][Partial Recon] Total {len(arjun_target_urls)} URLs to test with Arjun")
 
     # Extract Arjun settings
-    ARJUN_METHODS = settings.get('ARJUN_METHODS', ['GET', 'POST'])
-    ARJUN_THREADS = settings.get('ARJUN_THREADS', 2)
-    ARJUN_TIMEOUT = settings.get('ARJUN_TIMEOUT', 15)
-    ARJUN_SCAN_TIMEOUT = settings.get('ARJUN_SCAN_TIMEOUT', 600)
-    ARJUN_CHUNK_SIZE = settings.get('ARJUN_CHUNK_SIZE', 500)
-    ARJUN_RATE_LIMIT = settings.get('ARJUN_RATE_LIMIT', 0)
-    ARJUN_STABLE = settings.get('ARJUN_STABLE', False)
-    ARJUN_PASSIVE = settings.get('ARJUN_PASSIVE', False)
-    ARJUN_DISABLE_REDIRECTS = settings.get('ARJUN_DISABLE_REDIRECTS', False)
-    ARJUN_CUSTOM_HEADERS = merge_auth_headers(settings.get('ARJUN_CUSTOM_HEADERS', []), settings, sorted(target_domains))
+    ARJUN_METHODS = settings['ARJUN_METHODS']
+    ARJUN_THREADS = settings['ARJUN_THREADS']
+    ARJUN_TIMEOUT = settings['ARJUN_TIMEOUT']
+    ARJUN_SCAN_TIMEOUT = settings['ARJUN_SCAN_TIMEOUT']
+    ARJUN_CHUNK_SIZE = settings['ARJUN_CHUNK_SIZE']
+    ARJUN_RATE_LIMIT = settings['ARJUN_RATE_LIMIT']
+    ARJUN_STABLE = settings['ARJUN_STABLE']
+    ARJUN_PASSIVE = settings['ARJUN_PASSIVE']
+    ARJUN_DISABLE_REDIRECTS = settings['ARJUN_DISABLE_REDIRECTS']
+    ARJUN_CUSTOM_HEADERS = merge_auth_headers(settings['ARJUN_CUSTOM_HEADERS'], settings, sorted(target_domains))
     from recon.helpers.auth_profile import append_engagement_identity as _append_identity
     ARJUN_CUSTOM_HEADERS = _append_identity(ARJUN_CUSTOM_HEADERS, settings)
 
@@ -697,6 +704,8 @@ def run_arjun(config: dict) -> None:
         target_domains,
     )
 
+    record_arjun_selection(arjun_meta, arjun_unexecuted)
+
     # Merge Arjun results into by_base_url structure
     by_base_url = {}
     arjun_stats = {
@@ -711,6 +720,7 @@ def run_arjun(config: dict) -> None:
         by_base_url, arjun_stats = merge_arjun_into_by_base_url(
             arjun_results,
             {},  # Start with empty -- Arjun is the only source for this partial run
+            allowed_hosts=target_domains,
         )
         print(f"[+][Partial Recon] URLs with params: {arjun_stats['arjun_total']}")
         print(f"[+][Partial Recon] New endpoints: {arjun_stats['arjun_new_endpoints']}")
@@ -754,14 +764,10 @@ def run_arjun(config: dict) -> None:
         "jsluice_secrets": [],
         "scan_metadata": {
             "arjun_stats": arjun_stats,
+            "arjun_execution": arjun_meta,
             "external_domains": arjun_meta.get("external_domains", []),
         },
-        "summary": {
-            "total_endpoints": sum(
-                len(bd['endpoints']) for bd in by_base_url.values()
-            ),
-            "total_base_urls": len(by_base_url),
-        },
+        "summary": reconcile_arjun_schema(by_base_url),
         "external_domains": arjun_meta.get("external_domains", []),
     }
 
@@ -797,7 +803,7 @@ def run_arjun(config: dict) -> None:
                                     """,
                                     parent_url=url_attach_to, url=base_url,
                                     uid=user_id, pid=project_id,
-                                    host=parsed.netloc.split(":")[0],
+                                    host=arjun_url_host(url),
                                 )
                             print(f"[+][Partial Recon] Linked user URLs to {url_attach_to} via DISCOVERED_FROM")
                         elif needs_user_input:
@@ -829,7 +835,7 @@ def run_arjun(config: dict) -> None:
                                     """,
                                     ui_id=user_input_id, url=base_url,
                                     uid=user_id, pid=project_id,
-                                    host=parsed.netloc.split(":")[0],
+                                    host=arjun_url_host(url),
                                 )
                             graph_client.update_user_input_status(
                                 user_input_id, "completed", stats
