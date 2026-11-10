@@ -39,6 +39,7 @@ REASON_BY_DISPOSITION = {
     "retained_catch_all": "the host answers a made-up path the same way; retained as catch_all_like",
     "retained_unknown": "js_recon's probe timed out or hit a transport error; unknown is not dead",
     "retained_unvalidated": "js_recon did not probe this endpoint",
+    "not_merged": "the producer observed it, but this run's own merge did not add it to by_base_url (blacklisted, unverified, out of scope, or a base not live in this scan)",
 }
 
 
@@ -57,21 +58,30 @@ def keys_of(by_base_url: dict) -> Set[Tuple[str, str]]:
 
 def observe_crawl(inventory: dict, *, source: str, urls: Iterable[str],
                   auth_ref: str = "", disposition: str = "merged_new",
-                  existing_keys: Optional[Set[Tuple[str, str]]] = None) -> dict:
+                  existing_keys: Optional[Set[Tuple[str, str]]] = None,
+                  merged_keys: Optional[Set[Tuple[str, str]]] = None,
+                  auth_revision: str = "") -> dict:
     """One observation per URL a crawler reported (katana/hakrawler/GAU/...).
 
     A crawler's URL is an observation of a request it made, so its validation
     status is ``observed``; the status code is the crawler's own, when it kept
-    one, and ``None`` otherwise — never a fabricated 200. With ``existing_keys``
-    the disposition is per URL (this producer's first sighting, or an overlap of
-    an earlier one); without it every URL gets ``disposition``.
+    one, and ``None`` otherwise — never a fabricated 200.
+
+    ``merged_keys`` is the ``(origin, path)`` set the caller's merge actually
+    produced. A URL the merge skipped (blacklisted, unverified, out of scope, a
+    base not live in this scan) is still an observation, but its disposition is
+    ``not_merged`` rather than a first sighting the structure does not contain.
+    Every input, including a non-string or empty one, is accounted for: a
+    malformed URL becomes a rejected ledger entry with a stable positional ref.
     """
-    for url in urls or ():
+    for index, url in enumerate(urls or ()):
+        ref = di.safe_input_ref(source, index)
         if not isinstance(url, str) or not url:
+            di.reject_input(inventory, source, "non_string_or_empty_url", ref)
             continue
         origin, path = di.origin_of(url), di.path_of(url)
         if not origin:
-            di.reject(inventory, source, "non_http_url")
+            di.reject_input(inventory, source, "non_http_url", ref)
             continue
         query = []
         try:
@@ -86,44 +96,54 @@ def observe_crawl(inventory: dict, *, source: str, urls: Iterable[str],
                 query.append({"name": name, "type": "string", "position": "query",
                               "sample_values": [value] if value else [],
                               "sample_values_encoding": "decoded-observation"})
-        this_disposition = disposition
-        if existing_keys is not None:
+        if merged_keys is not None and (origin, path) not in merged_keys:
+            this_disposition = "not_merged"
+        elif existing_keys is not None:
             this_disposition = ("overlap_existing" if (origin, path) in existing_keys
                                 else "merged_new")
+        else:
+            this_disposition = disposition
         di.add_observation(inventory, di.observation(
             source=source, raw={"url": url}, origin=origin, path=path, method="GET",
-            query=query, auth_profile_ref=auth_ref,
+            query=query, auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
             validation={"status": "observed"}, disposition=this_disposition,
             raw_locator=f"{source}:{origin}{path}",
-        ))
+        ), ref=ref)
     return inventory
 
 
 def observe_ffuf(inventory: dict, *, results: Sequence[dict], existing_keys: Set[Tuple[str, str]],
-                 auth_ref: str = "") -> dict:
+                 auth_ref: str = "", merged_keys: Optional[Set[Tuple[str, str]]] = None,
+                 auth_revision: str = "") -> dict:
     """One observation per FFuf result, including overlaps the merge folds away.
 
     FFuf reports only responses that matched its filters, so every result is an
     observation. The status is FFuf's own; a result without one is ``unknown``,
-    not 200.
+    not 200. A non-dict result is a rejected input, not a silent skip.
     """
     for index, result in enumerate(results or ()):
+        ref = di.safe_input_ref("ffuf", index)
         if not isinstance(result, dict):
+            di.reject_input(inventory, "ffuf", "malformed_result", ref)
             continue
         url = result.get("url", "")
         origin, path = di.origin_of(url), di.path_of(url)
         if not origin:
-            di.reject(inventory, "ffuf", "non_http_url")
+            di.reject_input(inventory, "ffuf", "non_http_url", ref)
             continue
         status = result.get("status")
         validation: Dict[str, Any] = {
             "status": "observed" if isinstance(status, int) else "unknown"}
         if isinstance(status, int):
             validation["status_code"] = status
-        disposition = "overlap_existing" if (origin, path) in existing_keys else "merged_new"
+        if merged_keys is not None and (origin, path) not in merged_keys:
+            disposition = "not_merged"
+        else:
+            disposition = "overlap_existing" if (origin, path) in existing_keys else "merged_new"
         di.add_observation(inventory, di.observation(
             source="ffuf", raw=result, origin=origin, path=path, method="GET",
-            auth_profile_ref=auth_ref, validation=validation, disposition=disposition,
+            auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
+            validation=validation, disposition=disposition,
             raw_locator=f"ffuf:{index}",
             evidence={
                 "status_code": status if isinstance(status, int) else None,
@@ -134,12 +154,13 @@ def observe_ffuf(inventory: dict, *, results: Sequence[dict], existing_keys: Set
                 "redirect_location": result.get("redirect_location") or "",
                 "input_fuzz": result.get("input_fuzz") or "",
             },
-        ))
+        ), ref=ref)
     return inventory
 
 
 def observe_arjun(inventory: dict, *, results: Sequence[dict], existing_keys: Set[Tuple[str, str]],
-                  auth_ref: str = "") -> dict:
+                  auth_ref: str = "", merged_keys: Optional[Set[Tuple[str, str]]] = None,
+                  auth_revision: str = "") -> dict:
     """One observation per Arjun result: a parameter discovery on a real URL.
 
     Arjun's execution status is its own and is carried verbatim. ``partial``
@@ -147,66 +168,79 @@ def observe_arjun(inventory: dict, *, results: Sequence[dict], existing_keys: Se
     incomplete — that is ``unknown`` evidence, not a complete observation.
     """
     for index, result in enumerate(results or ()):
+        ref = di.safe_input_ref("arjun", index)
         if not isinstance(result, dict):
+            di.reject_input(inventory, "arjun", "malformed_result", ref)
             continue
         url = result.get("url", "")
         origin, path = di.origin_of(url), di.path_of(url)
         params = [p for p in (result.get("params") or []) if isinstance(p, str) and p]
         mode = str(result.get("method") or "GET").upper()
         if not origin or not params:
-            if origin:
-                di.reject(inventory, "arjun", "no_parameters")
-            else:
-                di.reject(inventory, "arjun", "non_http_url")
+            reason = "no_parameters" if origin else "non_http_url"
+            di.reject_input(inventory, "arjun", reason, ref)
             continue
         position = "body" if mode in ("POST", "JSON", "XML") else "query"
         execution = str(result.get("execution_status") or "unknown")
         validation = {"status": "observed" if execution == "complete" else "unknown"}
         if execution != "complete":
             validation["error"] = "execution_incomplete"
-        disposition = "param_enrich_existing" if (origin, path) in existing_keys else "param_new_endpoint"
+        if merged_keys is not None and (origin, path) not in merged_keys:
+            disposition = "not_merged"
+        else:
+            disposition = "param_enrich_existing" if (origin, path) in existing_keys else "param_new_endpoint"
         di.add_observation(inventory, di.observation(
             source="arjun", raw=result, origin=origin, path=path, method=mode,
             body=[{"name": name, "type": "string", "position": "body"} for name in params]
             if position == "body" else [],
             query=[{"name": name, "type": "string", "position": "query"} for name in params]
             if position == "query" else [],
-            auth_profile_ref=auth_ref, validation=validation, disposition=disposition,
+            auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
+            validation=validation, disposition=disposition,
             raw_locator=f"arjun:{index}",
             evidence={"error": execution},
-        ))
+        ), ref=ref)
     return inventory
 
 
 def observe_kiterunner(inventory: dict, *, results: Sequence[dict],
-                       existing_keys: Set[Tuple[str, str]], auth_ref: str = "") -> dict:
+                       existing_keys: Set[Tuple[str, str]], auth_ref: str = "",
+                       merged_keys: Optional[Set[Tuple[str, str]]] = None,
+                       auth_revision: str = "") -> dict:
     """One observation per Kiterunner endpoint, with its detected methods."""
     for index, result in enumerate(results or ()):
+        ref = di.safe_input_ref("kiterunner", index)
         if not isinstance(result, dict):
+            di.reject_input(inventory, "kiterunner", "malformed_result", ref)
             continue
         url, path = result.get("url", ""), result.get("path", "")
         origin = di.origin_of(url)
         if not origin or not path:
-            di.reject(inventory, "kiterunner", "missing_url_or_path")
+            di.reject_input(inventory, "kiterunner", "missing_url_or_path", ref)
             continue
         status = result.get("status")
         validation: Dict[str, Any] = {
             "status": "observed" if isinstance(status, int) else "unknown"}
         if isinstance(status, int):
             validation["status_code"] = status
-        disposition = "overlap_existing" if (origin, path) in existing_keys else "merged_new"
+        if merged_keys is not None and (origin, path) not in merged_keys:
+            disposition = "not_merged"
+        else:
+            disposition = "overlap_existing" if (origin, path) in existing_keys else "merged_new"
         di.add_observation(inventory, di.observation(
             source="kiterunner", raw=result, origin=origin, path=path,
             method=result.get("method") or "GET", auth_profile_ref=auth_ref,
+            auth_profile_revision=auth_revision,
             validation=validation, disposition=disposition,
             raw_locator=f"kiterunner:{index}",
             evidence={"status_code": status if isinstance(status, int) else None},
-        ))
+        ), ref=ref)
     return inventory
 
 
 def observe_openapi(inventory: dict, *, payload: dict, existing_keys: Set[Tuple[str, str]],
-                    auth_ref: str = "") -> dict:
+                    auth_ref: str = "", merged_keys: Optional[Set[Tuple[str, str]]] = None,
+                    auth_revision: str = "") -> dict:
     """Declared operations and fetched specification documents.
 
     A declaration is NOT an observation of the concrete path. The template is
@@ -216,16 +250,18 @@ def observe_openapi(inventory: dict, *, payload: dict, existing_keys: Set[Tuple[
     from recon.helpers.resource_enum.openapi_helpers import concrete_path
 
     for index, operation in enumerate((payload or {}).get("operations") or []):
+        ref = di.safe_input_ref("openapi", index)
         if not isinstance(operation, dict):
+            di.reject_input(inventory, "openapi", "malformed_operation", ref)
             continue
         try:
             base, template = operation["baseurl"], operation["path"]
         except (KeyError, TypeError):
-            di.reject(inventory, "openapi", "malformed_operation")
+            di.reject_input(inventory, "openapi", "malformed_operation", ref)
             continue
         origin = di.origin_of(base)
         if not origin or not isinstance(template, str) or not template:
-            di.reject(inventory, "openapi", "malformed_operation")
+            di.reject_input(inventory, "openapi", "malformed_operation", ref)
             continue
         spec = operation.get("operation") if isinstance(operation.get("operation"), dict) else {}
         declared = [p for p in spec.get("parameters") or [] if isinstance(p, dict)]
@@ -233,7 +269,7 @@ def observe_openapi(inventory: dict, *, payload: dict, existing_keys: Set[Tuple[
         try:
             path = concrete_path(template, path_params)
         except Exception:  # noqa: BLE001 - a malformed template is a rejected declaration
-            di.reject(inventory, "openapi", "unfillable_template")
+            di.reject_input(inventory, "openapi", "unfillable_template", ref)
             continue
         method = str(operation.get("method") or "GET").upper()
         query = [{"name": p.get("name"), "type": "string", "position": "query",
@@ -242,84 +278,91 @@ def observe_openapi(inventory: dict, *, payload: dict, existing_keys: Set[Tuple[
         overlap = (origin, path) in existing_keys
         di.add_observation(inventory, di.observation(
             source="openapi", raw=operation, origin=origin, path=path, method=method,
-            query=query, auth_profile_ref=auth_ref,
+            query=query, auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
             validation={"status": "observed" if overlap else "declared"},
             disposition="declared_observed_overlap" if overlap else "declared_only_new",
             raw_locator=f"openapi:operation:{index}",
             evidence={"input_fuzz": template if path != template else ""},
-        ))
+        ), ref=ref)
         if path != template:
             # The template is the declaration; the filled path is an example.
             # Both are kept, and neither is presented as requested.
             di.add_observation(inventory, di.observation(
                 source="openapi", raw={"template": template, "baseurl": base},
                 origin=origin, path=template, method=method, query=query,
-                auth_profile_ref=auth_ref,
-                validation={"status": "declared"},                disposition="declared_only_template",
+                auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
+                validation={"status": "declared"},
+                disposition="declared_only_template",
                 raw_locator=f"openapi:template:{index}",
-            ))
+            ), ref=f"{ref}:template")
 
     for index, document in enumerate((payload or {}).get("documents") or []):
+        ref = di.safe_input_ref("openapi:document", index)
         if not isinstance(document, dict):
+            di.reject_input(inventory, "openapi", "malformed_document", ref)
             continue
         try:
             parts = urlsplit(document["url"])
             origin, path = di.origin_of(document["url"]), (parts.path or "/")
         except (KeyError, TypeError, ValueError):
-            di.reject(inventory, "openapi", "malformed_document")
+            di.reject_input(inventory, "openapi", "malformed_document", ref)
             continue
         if not origin:
-            di.reject(inventory, "openapi", "malformed_document")
+            di.reject_input(inventory, "openapi", "malformed_document", ref)
             continue
         di.add_observation(inventory, di.observation(
             source="openapi", raw=document, origin=origin, path=path, method="GET",
-            auth_profile_ref=auth_ref, validation={"status": "observed"},
-            disposition="spec_document_observed",
+            auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
+            validation={"status": "observed"}, disposition="spec_document_observed",
             raw_locator=f"openapi:document:{index}",
             evidence={"input_fuzz": str(document.get("version") or "")},
-        ))
+        ), ref=ref)
     return inventory
 
 
 def observe_js_endpoints(inventory: dict, *, endpoints: Sequence[dict],
-                         auth_ref: str = "") -> dict:
+                         auth_ref: str = "", auth_revision: str = "") -> dict:
     """One observation per js_recon candidate, with its validation state.
 
     js_recon retains candidates whose probe failed or never ran. Those are
     evidence with a state, not deletions, so each gets the state it earned and
-    no state is upgraded to "verified".
+    no state is upgraded to "verified". A non-dict candidate, or one with no
+    path, is a rejected input with a stable ref rather than a silent skip.
     """
     for index, endpoint in enumerate(endpoints or ()):
+        ref = di.safe_input_ref("js_recon", index)
         if not isinstance(endpoint, dict):
+            di.reject_input(inventory, "js_recon", "malformed_endpoint", ref)
             continue
         base = endpoint.get("base_url") or ""
         origin = di.origin_of(base)
         path = endpoint.get("path") or ""
         if not path:
+            di.reject_input(inventory, "js_recon", "missing_path", ref)
             continue
         if not origin:
             # An uploaded relative path has no host; it is still an observation.
             di.add_observation(inventory, di.observation(
                 source="js_recon", raw=endpoint, origin="", path=path,
                 method=endpoint.get("method") or "GET",
-                auth_profile_ref=auth_ref,
+                auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
                 validation=_js_validation(endpoint),
                 disposition=_js_disposition(endpoint),
                 raw_locator=f"js_recon:{index}",
                 evidence={"error": endpoint.get("validation_error") or ""},
-            ))
+            ), ref=ref)
             continue
         status = endpoint.get("status_code")
         di.add_observation(inventory, di.observation(
             source="js_recon", raw=endpoint, origin=origin, path=path,
             method=endpoint.get("method") or "GET",
-            auth_profile_ref=auth_ref,
+            auth_profile_ref=auth_ref, auth_profile_revision=auth_revision,
             validation=_js_validation(endpoint),
             disposition=_js_disposition(endpoint),
             raw_locator=f"js_recon:{index}",
             evidence={"status_code": status if isinstance(status, int) else None,
                       "error": endpoint.get("validation_error") or ""},
-        ))
+        ), ref=ref)
     return inventory
 
 
@@ -532,7 +575,8 @@ def finalize_inventory(recon_data: dict) -> dict:
 def build_partial_inventory(*, source: str, observations: Sequence[dict],
                             rejected: Optional[dict] = None,
                             by_base_url: Optional[dict] = None,
-                            summary: Optional[dict] = None) -> dict:
+                            summary: Optional[dict] = None,
+                            raw_evidence: Optional[dict] = None) -> dict:
     """An inventory for a partial run, which has no resource_enum phase.
 
     A partial run's own tool is its only producer, so the inventory is honest
@@ -543,6 +587,8 @@ def build_partial_inventory(*, source: str, observations: Sequence[dict],
         di.add_observation(inventory, obs)
     for reason, count in (rejected or {}).items():
         di.reject(inventory, source, reason, count)
+    if raw_evidence:
+        di.record_raw_evidence(inventory, source, raw_evidence)
     inventory["inputs"] = {
         "discovered_url_sources": {source: len(observations or [])},
         "discovered_urls_total": len(observations or []),

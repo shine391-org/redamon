@@ -1160,7 +1160,7 @@ def run_ffuf(config: dict) -> None:
         keys_before_ffuf = _da.keys_of(by_base_url)
         by_base_url, ffuf_stats = merge_ffuf_into_by_base_url(ffuf_results, by_base_url)
         _da.observe_ffuf(_inventory, results=ffuf_results, existing_keys=keys_before_ffuf,
-                         auth_ref=AUTH_REF)
+                         merged_keys=_da.keys_of(by_base_url), auth_ref=AUTH_REF)
         _di.record_raw_evidence(_inventory, source="ffuf", record={
             "targets": ffuf_meta.get("fuzz_targets_run"),
             "targets_built": ffuf_meta.get("fuzz_targets_built"),
@@ -1194,10 +1194,17 @@ def run_ffuf(config: dict) -> None:
         "external_domains": ffuf_meta.get("external_domains", []),
     }
 
-    # F08: the partial FFuf run's own inventory, so a partial run's evidence is
-    # not treated as a full run's. Reconcile against what this run actually had.
-    _di.reconcile(_inventory, by_base_url, result["resource_enum"]["summary"])
-    result["discovery_inventory"] = _inventory
+    # F08: wire the actual partial inventory caller so a partial run's evidence
+    # survives the same identity/ref/rejection accounting as a full run, rather
+    # than being treated as an unaccounted observation set.
+    result["discovery_inventory"] = _da.build_partial_inventory(
+        source="ffuf",
+        observations=_inventory["producers"].get("ffuf", {}).get("observations") or [],
+        rejected=_inventory["producers"].get("ffuf", {}).get("rejected") or {},
+        raw_evidence=_inventory["producers"].get("ffuf", {}).get("raw_evidence"),
+        by_base_url=by_base_url,
+        summary=result["resource_enum"]["summary"],
+    )
 
     # Update the graph database
     print(f"[*][Partial Recon] Updating graph database...")
