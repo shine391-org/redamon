@@ -87,6 +87,10 @@ class TestSyntax(unittest.TestCase):
         # lazy `stable_vuln_id` import: a top-level graph_db.mixins.* import here
         # breaks tests that load osint_mixin with graph_db stubbed as a MagicMock.
         ("graph_db/mixins/osint_mixin.py", "update_graph_from_origin_discovery"),
+        # lazy `selection_coverage` import: a top-level `recon.helpers.*` import
+        # breaks tests that put `graph_db/mixins` on sys.path, where `import recon`
+        # resolves to THIS package (graph_db/mixins/recon) and has no `helpers`.
+        ("graph_db/mixins/recon/vuln_mixin.py", "update_graph_from_vuln_scan"),
     }
 
     def test_no_inline_imports_in_methods(self):

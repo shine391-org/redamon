@@ -24,6 +24,12 @@ from typing import Any, Optional
 # edited straight into the database rather than through the form.
 _SLUG_SAFE = re.compile(r'[^a-z0-9.-]')
 
+#: Keys whose merge is not a generic dict/list fold. The Domain batch runs one
+#: plan per group; the canonical artifact must describe the whole batch, so
+#: these are combined explicitly instead of first-group-wins.
+from recon.helpers.selection_coverage import KEY as SELECTION_KEY, merge_plans  # noqa: E402
+_SPECIAL_MERGE_KEYS = (SELECTION_KEY,)
+
 BATCH_SEPARATOR = '__'
 
 
@@ -153,6 +159,10 @@ def _merge_group_into(merged: dict[str, Any], group: dict[str, Any]) -> None:
     unexpected type never overwrites data another group already contributed.
     """
     for key, value in group.items():
+        if key == SELECTION_KEY:
+            existing = merged.get(key)
+            merged[key] = merge_plans([existing, value] if isinstance(existing, dict) else [value])
+            continue
         if key not in merged:
             merged[key] = value
             continue

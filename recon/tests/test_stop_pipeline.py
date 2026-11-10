@@ -68,7 +68,8 @@ class _Graph:
     def backfill_passive_cve_hosts(self, *a):
         return None
 
-    def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
+    def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
+                              keep_unproven=False):
         self.prunes.append(list(sources))
 
 

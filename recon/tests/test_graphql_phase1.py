@@ -133,8 +133,11 @@ class TestRunVulnScanIsolated(unittest.TestCase):
 
     def _make_stub(self):
         """Return a patched run_vuln_scan that writes a marker to recon_data."""
-        def fake_run_vuln_scan(recon_data, output_file=None, settings=None):
-            recon_data['vuln_scan'] = {'findings': ['marker'], '_received_output_file': output_file}
+        def fake_run_vuln_scan(recon_data, output_file=None, settings=None,
+                               selection_hint=None, plan_output_file=None):
+            recon_data['vuln_scan'] = {'findings': ['marker'],
+                                       '_received_output_file': output_file,
+                                       '_received_plan_output_file': plan_output_file}
             return recon_data
         return fake_run_vuln_scan
 
@@ -147,11 +150,13 @@ class TestRunVulnScanIsolated(unittest.TestCase):
             self.assertNotIn('vuln_scan', combined, "original combined_result must not be mutated")
 
     def test_isolated_passes_output_file_none(self):
-        """run_vuln_scan_isolated must skip incremental saves (output_file=None)."""
+        """run_vuln_scan_isolated must skip incremental saves (output_file=None),
+        and with no plan output file requested it must not persist a plan."""
         with patch('recon.main_recon_modules.vuln_scan.run_vuln_scan', side_effect=self._make_stub()):
             from recon.main_recon_modules.vuln_scan import run_vuln_scan_isolated
             result = run_vuln_scan_isolated({'domain': 'example.com'}, {})
             self.assertIsNone(result['vuln_scan']['_received_output_file'])
+            self.assertIsNone(result['vuln_scan']['_received_plan_output_file'])
 
     def test_isolated_returns_the_vuln_scan_key_and_nothing_it_did_not_write(self):
         from recon.helpers.isolated_result import TopLevelKeys
@@ -159,12 +164,15 @@ class TestRunVulnScanIsolated(unittest.TestCase):
             from recon.main_recon_modules.vuln_scan import run_vuln_scan_isolated
             result = run_vuln_scan_isolated({'domain': 'example.com', 'http_probe': {}}, {})
             self.assertIsInstance(result, TopLevelKeys)
-            self.assertEqual(result, {'vuln_scan': {'findings': ['marker'], '_received_output_file': None}})
+            self.assertEqual(result, {'vuln_scan': {'findings': ['marker'],
+                                                    '_received_output_file': None,
+                                                    '_received_plan_output_file': None}})
 
     def test_isolated_returns_empty_namespace_when_key_missing(self):
         """If run_vuln_scan doesn't add vuln_scan (e.g. Nuclei disabled early return),
         wrapper returns an empty vuln_scan instead of raising."""
-        def no_op(recon_data, output_file=None, settings=None):
+        def no_op(recon_data, output_file=None, settings=None, selection_hint=None,
+                  plan_output_file=None):
             return recon_data
         with patch('recon.main_recon_modules.vuln_scan.run_vuln_scan', side_effect=no_op):
             from recon.main_recon_modules.vuln_scan import run_vuln_scan_isolated

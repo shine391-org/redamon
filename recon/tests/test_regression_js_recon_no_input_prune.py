@@ -213,7 +213,8 @@ def _prunes(rm, monkeypatch):
         def verify_connection(self):
             return True
 
-        def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
+        def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
+                                  keep_unproven=False):
             calls.append((list(sources), tuple(keep_hosts)))
 
     monkeypatch.setattr("graph_db.Neo4jClient", _Graph())

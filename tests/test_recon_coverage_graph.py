@@ -211,10 +211,31 @@ class TestUpdateGraphCoverage(unittest.TestCase):
                          ("example.com", "u1", "p1"))
         self.assertNotIn("MERGE", lock_q + write_q)
         for prop in ("recon_coverage_at", "recon_coverage_gaps", "recon_skipped_hosts",
-                     "recon_nuclei_truncated", "recon_coverage_roots", "recon_coverage_run"):
+                     "recon_nuclei_truncated", "recon_coverage_roots", "recon_coverage_run",
+                     "recon_selection_json"):
             self.assertIn(f"d.{prop}", write_q)
         self.assertEqual(write_p["roots"], ["api.example.com"])
         self.assertEqual(write_p["run"], "RUN1")
+
+    def test_it_writes_the_selection_block_the_reader_parses(self):
+        """F07/DoD 4: the coverage record's selection_json is persisted on the
+        Domain as recon_selection_json - the property the API coverage reader
+        reads - instead of being dropped by merge_coverage."""
+        client = _TxClient(self.STORED)
+        rec = dict(self.RECORD, selection_json=json.dumps(
+            {"recorded": True, "selection_unknown": False, "plan_ids": ["P1"],
+             "exhaustive": False}))
+        self.assertEqual(client.update_graph_coverage("u1", "p1", "example.com", rec, "RUN1"), 1)
+        (_, _, _), (write_q, write_p, _) = client.driver.calls
+        self.assertIn("d.recon_selection_json", write_q)
+        self.assertEqual(json.loads(write_p["selection_json"])["plan_ids"], ["P1"])
+
+    def test_a_run_without_a_selection_block_writes_null(self):
+        client = _TxClient(self.STORED)
+        client.update_graph_coverage("u1", "p1", "example.com", dict(self.RECORD), "RUN1")
+        (_, _, _), (write_q, write_p, _) = client.driver.calls
+        self.assertIn("d.recon_selection_json", write_q)
+        self.assertIsNone(write_p["selection_json"])
 
     def test_without_an_org_the_scan_root_is_its_own_domain(self):
         client = _TxClient(self.STORED)
@@ -270,6 +291,36 @@ class TestMergeCoverage(unittest.TestCase):
         out = self._merge(stored, {"gaps_json": "[]"}, "b", None)
         self.assertEqual(out["roots"], ["b"])
         self.assertEqual(out["skipped_hosts"], [])
+
+    def test_the_selection_block_survives_the_merge(self):
+        """F07/DoD 4: a later group's selection block merges with the stored one
+        (recorded OR-ed, plan ids unioned, exhaustive only when every group cut
+        nothing) instead of first-group-wins."""
+        stored = {"run": "R", "gaps": "[]", "skipped": [], "truncated": False,
+                  "roots": ["a.ex.com"],
+                  "selection": json.dumps({"recorded": True, "selection_unknown": False,
+                                           "plan_ids": ["P1"], "exhaustive": False})}
+        out = self._merge(stored, {"gaps_json": "[]", "selection_json": json.dumps(
+            {"recorded": True, "selection_unknown": False, "plan_ids": ["P2"],
+             "exhaustive": True})}, "ex.com", "R")
+        self.assertEqual(json.loads(out["selection_json"]),
+                         {"recorded": True, "selection_unknown": False,
+                          "plan_ids": ["P1", "P2"], "exhaustive": False})
+
+    def test_the_first_group_of_a_run_replaces_the_selection_block(self):
+        stored = {"run": "OLD", "gaps": "[]", "skipped": [], "truncated": False,
+                  "roots": ["old.test"],
+                  "selection": json.dumps({"recorded": True, "selection_unknown": False,
+                                           "plan_ids": ["P-OLD"], "exhaustive": False})}
+        out = self._merge(stored, {"gaps_json": "[]", "selection_json": json.dumps(
+            {"recorded": True, "selection_unknown": False, "plan_ids": ["P-NEW"],
+             "exhaustive": True})}, "a.ex.com", "NEW")
+        self.assertEqual(json.loads(out["selection_json"])["plan_ids"], ["P-NEW"])
+
+    def test_no_selection_block_is_absent_not_an_empty_object(self):
+        out = self._merge({"run": "R", "gaps": "[]", "skipped": [], "truncated": False,
+                           "roots": ["a"]}, {"gaps_json": "[]"}, "b", "R")
+        self.assertNotIn("selection_json", out)
 
     def test_the_merge_never_reads_the_clock(self):
         # run_timestamp() changes on every call; keying on it made every group

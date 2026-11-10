@@ -51,11 +51,18 @@ def merge_coverage(stored: dict, record: dict, scan_root: str, run_started_at) -
 
     The first group of a run (recon_coverage_run is not this run's start)
     overwrites; a later group of the same run merges: gaps and skipped hosts
-    are unioned, nuclei truncation is OR-ed, and recon_coverage_roots lists
-    every scan root that stamped. Pure, because the unit of work that calls it
-    is retried. Each gap entry carries the scan root it came from, so a reader
-    can drop a removed root's entries (§4.11.7).
+    are unioned, nuclei truncation is OR-ed, recon_coverage_roots lists
+    every scan root that stamped, and the selection blocks merge (recorded /
+    unknown OR-ed, plan ids unioned, exhaustive only when every group cut
+    nothing). Pure, because the unit of work that calls it is retried. Each
+    gap entry carries the scan root it came from, so a reader can drop a
+    removed root's entries (§4.11.7).
     """
+    # Lazy on purpose: `graph_db/mixins` can be on sys.path (tests do this),
+    # where `import recon` resolves to THIS package (graph_db/mixins/recon)
+    # rather than the top-level recon package, so a module-level import would
+    # fail. At the call sites below `recon` is the real package.
+    from recon.helpers.selection_coverage import merge_selection_blocks
     import json as _json
     try:
         gaps = _json.loads(record.get("gaps_json") or "[]")
@@ -75,10 +82,15 @@ def merge_coverage(stored: dict, record: dict, scan_root: str, run_started_at) -
         skipped = _merge_unique(list(stored.get("skipped") or []), skipped)
         truncated = truncated or bool(stored.get("truncated"))
         roots = _merge_unique(list(stored.get("roots") or []), [scan_root])
+        selection = merge_selection_blocks(stored.get("selection"), record.get("selection_json"))
     else:
         roots = [scan_root]
-    return {"gaps_json": _json.dumps(gaps), "skipped_hosts": skipped,
-            "nuclei_truncated": truncated, "roots": roots}
+        selection = merge_selection_blocks(None, record.get("selection_json"))
+    out = {"gaps_json": _json.dumps(gaps), "skipped_hosts": skipped,
+           "nuclei_truncated": truncated, "roots": roots}
+    if selection is not None:
+        out["selection_json"] = _json.dumps(selection, sort_keys=True, separators=(",", ":"))
+    return out
 
 
 class DomainMixin:
@@ -131,7 +143,9 @@ class DomainMixin:
 
         ``record``: {"at": ISO-8601, "gaps_json": JSON array string (each entry
         carries "root"), "skipped_hosts": [host:port, ...],
-        "nuclei_truncated": bool, "org_domain": org}.
+        "nuclei_truncated": bool, "org_domain": org, "selection_json": JSON
+        object string (the bounded selection block; merged across the run's
+        groups, read by the API coverage reader)}.
         """
         org_key = str(record.get("org_domain") or domain or "").strip().lower()
         scan_root = domain
@@ -145,7 +159,8 @@ class DomainMixin:
                 {ORG_DOMAIN_LOCK}
                 RETURN elementId(d) AS eid, d.recon_coverage_run AS run,
                        d.recon_coverage_gaps AS gaps, d.recon_skipped_hosts AS skipped,
-                       d.recon_nuclei_truncated AS truncated, d.recon_coverage_roots AS roots
+                       d.recon_nuclei_truncated AS truncated, d.recon_coverage_roots AS roots,
+                       d.recon_selection_json AS selection
                 """,
                 org=org_key, user_id=user_id, project_id=project_id,
             ).single()
@@ -161,12 +176,14 @@ class DomainMixin:
                     d.recon_skipped_hosts = $skipped_hosts,
                     d.recon_nuclei_truncated = $nuclei_truncated,
                     d.recon_coverage_roots = $roots,
-                    d.recon_coverage_run = $run
+                    d.recon_coverage_run = $run,
+                    d.recon_selection_json = $selection_json
                 RETURN count(d) AS n
                 """,
                 eid=stored["eid"], user_id=user_id, project_id=project_id, at=record["at"],
                 gaps_json=merged["gaps_json"], skipped_hosts=merged["skipped_hosts"],
                 nuclei_truncated=merged["nuclei_truncated"], roots=merged["roots"], run=run,
+                selection_json=merged.get("selection_json"),
             ).single()
             return int(written["n"]) if written else 0
 

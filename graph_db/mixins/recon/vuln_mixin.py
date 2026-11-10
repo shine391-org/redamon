@@ -328,6 +328,9 @@ class VulnMixin:
         Returns:
             Dictionary with statistics about created/updated nodes/relationships
         """
+        # Lazy on purpose: see graph_db/mixins/recon/domain_mixin.py::merge_coverage.
+        from recon.helpers.selection_coverage import KEY as SELECTION_KEY, selection_block
+
         stats = {
             "endpoints_created": 0,
             "parameters_created": 0,
@@ -1274,6 +1277,7 @@ class VulnMixin:
                             d.vuln_scan_high_count = $high_count,
                             d.vuln_scan_medium_count = $medium_count,
                             d.vuln_scan_low_count = $low_count,
+                            d.vuln_scan_selection_json = $selection_json,
                             d.updated_at = datetime()
                         """,
                         root_domain=root_domain, user_id=user_id, project_id=project_id,
@@ -1284,7 +1288,11 @@ class VulnMixin:
                         critical_count=summary.get("critical", 0),
                         high_count=summary.get("high", 0),
                         medium_count=summary.get("medium", 0),
-                        low_count=summary.get("low", 0)
+                        low_count=summary.get("low", 0),
+                        selection_json=json.dumps(
+                            selection_block(recon_data.get(SELECTION_KEY)),
+                            sort_keys=True, separators=(",", ":"),
+                        ),
                     )
                 except Exception as e:
                     stats["errors"].append(f"Domain update failed: {e}")

@@ -84,6 +84,11 @@ export const VOLATILE_PROPERTIES = new Set([
   // Which scan roots stamped the org Domain this run, and the run that did.
   'recon_coverage_roots',
   'recon_coverage_run',
+  // The bounded selection block (what the run selected, whether its plan was
+  // recorded, and whether any cut was unknown). Restamped every run, so it is
+  // run metadata, not a change to the target.
+  'recon_selection_json',
+  'vuln_scan_selection_json',
   // Per-tool run stamps on the org Domain: the latest run wins, so every run
   // read as "changed" while nothing about the target did.
   'scan_timestamp',
@@ -240,6 +245,19 @@ export interface SecurityLenses {
 }
 
 /**
+ * What a run's coverage record says it SELECTED, read from the Domain's
+ * `recon_selection_json` (the per-run record, merged across the run's groups)
+ * and `vuln_scan_selection_json` (the per-group plan write). `null` when
+ * nothing was recorded or either value cannot be trusted (fail closed).
+ */
+export interface SelectionCoverage {
+  recorded: boolean
+  selection_unknown: boolean
+  plan_ids: string[]
+  exhaustive: boolean
+}
+
+/**
  * What the newer version's run could not fully re-check (circuit breakers), read
  * from its `Domain` coverage record. `null` when no coverage was recorded or the
  * record could not be trusted (fail closed).
@@ -248,6 +266,56 @@ export interface ReconCoverage {
   sources: string[]
   skippedHosts: number
   nucleiTruncated: boolean
+  selection: SelectionCoverage | null
+}
+
+/**
+ * Parse a stored selection block, or null when it is not an object with a
+ * `plan_ids` array of strings. An imported snapshot is untrusted, so anything
+ * malformed is rejected rather than trusted or coerced.
+ */
+export function parseSelectionBlock(raw: unknown): SelectionCoverage | null {
+  let value = raw
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch {
+      return null
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const obj = value as Record<string, unknown>
+  const rawIds = obj.plan_ids === undefined ? [] : obj.plan_ids
+  if (!Array.isArray(rawIds)) return null
+  const planIds: string[] = []
+  for (const id of rawIds) {
+    if (typeof id !== 'string' || !id) return null
+    if (!planIds.includes(id)) planIds.push(id)
+  }
+  return {
+    recorded: obj.recorded === true,
+    selection_unknown: obj.selection_unknown === true,
+    plan_ids: planIds,
+    exhaustive: obj.exhaustive === true,
+  }
+}
+
+/** Merge two selection blocks: recorded/unknown OR-ed, ids unioned, exhaustive
+ *  only when both sides cut nothing. */
+export function mergeSelectionBlocks(
+  a: SelectionCoverage | null,
+  b: SelectionCoverage | null,
+): SelectionCoverage | null {
+  if (a === null) return b
+  if (b === null) return a
+  const planIds = [...a.plan_ids]
+  for (const id of b.plan_ids) if (!planIds.includes(id)) planIds.push(id)
+  return {
+    recorded: a.recorded || b.recorded,
+    selection_unknown: a.selection_unknown || b.selection_unknown,
+    plan_ids: planIds,
+    exhaustive: a.exhaustive && b.exhaustive,
+  }
 }
 
 export interface ReconDelta {
@@ -287,9 +355,11 @@ export function extractReconCoverage(
   const sources = new Set<string>()
   const hosts = new Set<string>()
   let nucleiTruncated = false
+  let selection: SelectionCoverage | null = null
 
   for (const d of domains) {
-    const raw = (d.properties || {})['recon_coverage_gaps']
+    const props = d.properties || {}
+    const raw = props['recon_coverage_gaps']
     if (raw === undefined || raw === null) continue
     sawRecord = true
     let parsed: unknown = raw
@@ -307,15 +377,25 @@ export function extractReconCoverage(
       if (typeof source !== 'string' || source.length === 0 || source.length > 64) return null
       if (gapInScope(entry as CoverageGap, roots)) sources.add(source)
     }
-    const skipped = (d.properties || {})['recon_skipped_hosts']
+    const skipped = props['recon_skipped_hosts']
     if (Array.isArray(skipped)) {
       for (const h of skipped) if (typeof h === 'string' && skippedHostInScope(h, roots)) hosts.add(h)
     }
-    if ((d.properties || {})['recon_nuclei_truncated'] === true) nucleiTruncated = true
+    if (props['recon_nuclei_truncated'] === true) nucleiTruncated = true
+    // The selection block: the per-run coverage record first, then the per-group
+    // plan write. A block that is present but malformed fails closed, exactly
+    // like a malformed gaps value.
+    for (const key of ['recon_selection_json', 'vuln_scan_selection_json']) {
+      const rawSel = props[key]
+      if (rawSel === undefined || rawSel === null) continue
+      const parsed = parseSelectionBlock(rawSel)
+      if (parsed === null) return null
+      selection = mergeSelectionBlocks(selection, parsed)
+    }
   }
 
   if (!sawRecord) return null
-  return { sources: [...sources].sort(), skippedHosts: hosts.size, nucleiTruncated }
+  return { sources: [...sources].sort(), skippedHosts: hosts.size, nucleiTruncated, selection }
 }
 
 function toDeltaNode(node: FormattedNode, key: string, nodeId: string | null): DeltaNode {

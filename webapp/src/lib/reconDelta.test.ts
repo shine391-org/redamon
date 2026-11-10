@@ -15,6 +15,7 @@ import {
   buildDeltaOverlay,
   IDENTITY_KEYS,
   VOLATILE_PROPERTIES,
+  parseSelectionBlock,
 } from './reconDelta'
 import { COVERAGE_STAMP_PROPERTIES } from './coverageStamps'
 import type { FormattedGraphData, FormattedNode } from '@/app/api/graph/format'
@@ -394,6 +395,7 @@ describe('recon coverage (circuit breakers)', () => {
       sources: ['nuclei', 'shodan'],
       skippedHosts: 2,
       nucleiTruncated: true,
+      selection: null,
     })
   })
 
@@ -418,7 +420,8 @@ describe('recon coverage (circuit breakers)', () => {
       recon_skipped_hosts: ['x.api.example.test:443', 'y.old.example.test:443'],
     })])
     const delta = computeReconDelta(graph([]), to, {}, new Set(['api.example.test']))
-    expect(delta.coverage).toEqual({ sources: ['shodan', 'urlscan'], skippedHosts: 1, nucleiTruncated: false })
+    expect(delta.coverage).toEqual({ sources: ['shodan', 'urlscan'], skippedHosts: 1,
+                                    nucleiTruncated: false, selection: null })
     // With no scope to compare against nothing is dropped.
     expect(computeReconDelta(graph([]), to).coverage?.sources).toEqual(['nuclei', 'shodan', 'urlscan'])
   })
@@ -441,5 +444,56 @@ describe('recon coverage (circuit breakers)', () => {
     })])
     const delta = computeReconDelta(before, after)
     expect(delta.changedNodes).toHaveLength(0)
+  })
+
+  test('the selection block reaches the reader from the coverage record', () => {
+    const to = graph([domain({
+      recon_coverage_gaps: '[]',
+      recon_selection_json: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false }),
+    })])
+    expect(computeReconDelta(graph([]), to).coverage?.selection).toEqual(
+      { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false })
+  })
+
+  test('the per-group plan write merges with the record', () => {
+    const to = graph([domain({
+      recon_coverage_gaps: '[]',
+      recon_selection_json: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false }),
+      vuln_scan_selection_json: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P2'], exhaustive: true }),
+    })])
+    expect(computeReconDelta(graph([]), to).coverage?.selection).toEqual(
+      { recorded: true, selection_unknown: false, plan_ids: ['P1', 'P2'], exhaustive: false })
+  })
+
+  test('a malformed selection block fails closed (null), never a partial read', () => {
+    const to = graph([domain({ recon_coverage_gaps: '[]', recon_selection_json: '{not json' })])
+    expect(computeReconDelta(graph([]), to).coverage).toBeNull()
+  })
+
+  test('the selection block never makes a Domain read as changed', () => {
+    const before = graph([domain({
+      recon_selection_json: '{"recorded":false,"plan_ids":[]}',
+    })])
+    const after = graph([domain({
+      recon_selection_json: JSON.stringify(
+        { recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false }),
+    })])
+    expect(computeReconDelta(before, after).changedNodes).toHaveLength(0)
+  })
+})
+
+describe('parseSelectionBlock', () => {
+  test('parses a JSON string block', () => {
+    expect(parseSelectionBlock(
+      '{"recorded":true,"selection_unknown":false,"plan_ids":["P1"],"exhaustive":false}'))
+      .toEqual({ recorded: true, selection_unknown: false, plan_ids: ['P1'], exhaustive: false })
+  })
+  test('rejects a malformed block', () => {
+    expect(parseSelectionBlock('{not json')).toBeNull()
+    expect(parseSelectionBlock({ plan_ids: 'P1' })).toBeNull()
+    expect(parseSelectionBlock(null)).toBeNull()
   })
 })

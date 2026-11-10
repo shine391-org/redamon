@@ -30,13 +30,15 @@ TECH_CVES = {"by_technology": {"nginx/1.18.0": {"cves": [{"id": "CVE-2021-23017"
 VULN = {"findings": ["marker"], "summary": {"total_findings": 1}}
 
 
-def _both_keys(recon_data, output_file=None, settings=None):
+def _both_keys(recon_data, output_file=None, settings=None, selection_hint=None,
+               plan_output_file=None):
     recon_data["vuln_scan"] = dict(VULN)
     recon_data["technology_cves"] = copy.deepcopy(TECH_CVES)
     return recon_data
 
 
-def _vuln_only(recon_data, output_file=None, settings=None):
+def _vuln_only(recon_data, output_file=None, settings=None, selection_hint=None,
+               plan_output_file=None):
     recon_data["vuln_scan"] = dict(VULN)
     return recon_data
 

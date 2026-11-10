@@ -85,10 +85,20 @@ from recon.helpers import (
 )
 from recon.helpers.security_checks import page_content_enabled
 from recon.helpers.isolated_result import TopLevelKeys
+from recon.helpers.selection_coverage import (
+    KEY as SELECTION_KEY,
+    build_plan,
+    is_exhaustive,
+    persist_plan,
+    plan_hosts,
+    record_outcome,
+)
 
 # Every top-level key run_vuln_scan writes; the security checks nest inside
 # vuln_scan. technology_cves exists only when the CVE lookup ran.
-_VULN_SCAN_RESULT_KEYS = ("vuln_scan", "technology_cves")
+# selection_coverage is the persisted plan of what this run selected; it is
+# written BEFORE the tool launches and carried through every merge boundary.
+_VULN_SCAN_RESULT_KEYS = ("vuln_scan", "technology_cves", SELECTION_KEY)
 
 
 def _nuclei_watch_stats(line: str, label: str, state: dict) -> None:
@@ -174,12 +184,14 @@ def _nuclei_no_templates_fatal(lines):
     return fatal
 
 
-def _nuclei_coverage(at: str, passes, findings=()) -> dict:
+def _nuclei_coverage(at: str, passes, findings=(), exhaustive: bool = True) -> dict:
     """``{"at", "hosts"}`` from ``passes = [(urls, status, reason, ran)]``.
 
     A host's inputs are the URLs the passes that ran sent it; it is complete
     only when every pass that targeted it completed, failed only when every
-    one failed, partial otherwise.
+    one failed, partial otherwise. A run whose selection is a strict subset of
+    its configured baseline never says "complete": an origin covered only in
+    part is partial, however cleanly the selected pass exited.
     """
     from collections import Counter, defaultdict
     from recon.helpers.coverage_stamps import base_url_key, coverage_row
@@ -198,7 +210,17 @@ def _nuclei_coverage(at: str, passes, findings=()) -> dict:
 
     hosts = {}
     for key, seen in sorted(statuses.items()):
-        status = next(iter(seen)) if len(seen) == 1 else "partial"
+        if len(seen) == 1:
+            status = next(iter(seen))
+        else:
+            status = "partial"
+        # A selective run (AI-pruned tags, partial-run limits, a deferred pass)
+        # re-checked only part of what the host could have been checked for,
+        # so even a clean selected pass is partial, never complete.
+        if not exhaustive and status == "complete":
+            status = "partial"
+            if "selected targets/templates" not in reasons[key]:
+                reasons[key] = list(reasons[key]) + ["selected targets/templates"]
         hosts[key] = coverage_row(status, inputs[key], found[key], ", ".join(reasons[key]))
     return {"at": at, "hosts": hosts}
 
@@ -208,6 +230,83 @@ def _record_unrun_nuclei(recon_data: dict, coverage: dict) -> None:
     record naming no host has nothing to stamp."""
     if coverage["hosts"]:
         recon_data["vuln_scan"] = {"scan_metadata": {"coverage": coverage}}
+
+
+def _selection_plan(*, targets, saved_tags, effective_tags, ai_pruned=False,
+                    partial_scope=False, deferred=False, severity=None, exclude_tags=None,
+                    templates=None, exclude_templates=None, custom_templates=None,
+                    selected_custom_templates=None, dast_targets=None, dast_mode=False) -> dict:
+    """The persisted plan of what THIS Nuclei run selected (F07).
+
+    ``exhaustive`` is True only when the effective selection is exactly the
+    configured baseline: no AI pruning removed a tag, no partial-run limit
+    narrowed the targets, and no pass was deferred. The operator's saved
+    tags/templates/severity are the baseline by design - counting them as a
+    selection would make every default run selective and disable the prune.
+
+    The plan is written BEFORE the first pass launches, so a cancellation or
+    crash keeps the accounting; it is a plan, never a result checkpoint.
+    """
+    saved = list(saved_tags or [])
+    effective = list(effective_tags or [])
+    removed = [t for t in saved if t not in set(effective)]
+    templates_block = {
+        "tags": effective,
+        "tags_saved": saved,
+        "tags_removed": removed,
+        "exclude_tags": list(exclude_tags or []),
+        "templates": list(templates or []),
+        "exclude_templates": list(exclude_templates or []),
+        "custom_templates": list(custom_templates or []),
+        "selected_custom_templates": list(selected_custom_templates or []),
+        "severity": list(severity or []),
+        "ai_pruned": bool(ai_pruned),
+    }
+    reasons = []
+    if ai_pruned:
+        reasons.append(f"AI tag pruning removed {len(removed)} tag(s)")
+    if partial_scope:
+        reasons.append("partial run: targets/templates limited to the requested scope")
+    if deferred:
+        reasons.append("a planned pass was deferred")
+    exhaustive = not reasons
+    plan = build_plan(
+        module="vuln_scan",
+        targets=list(targets or []),
+        templates=templates_block,
+        exhaustive=exhaustive,
+        reason="; ".join(reasons) or None,
+        scope="partial" if partial_scope else "full",
+    )
+    plan["passes"] = [
+        {"name": "detection", "targets": len(list(targets or [])),
+         "templates": "tags" if effective else "none", "ran": not deferred},
+    ]
+    if dast_mode and dast_targets:
+        plan["passes"].append({"name": "dast", "targets": len(list(dast_targets)),
+                               "templates": "dast", "ran": True})
+    return plan
+
+
+def _note_selection_cut(plan: dict) -> None:
+    """Record a non-exhaustive run's selection cut for the prune.
+
+    The cut is host-level and per-source, so a Nuclei selection never resets
+    the security_check or CVE coverage of the same host. It carries the plan
+    id, which is what makes the cut provable; without one the accumulator
+    marks the run's coverage unknown and the prune fails closed.
+    """
+    if is_exhaustive(plan):
+        return
+    try:
+        from recon.helpers import circuit_breaker
+        circuit_breaker.note_selection_cut(
+            "vuln_scan", sources=["nuclei"], hosts=plan_hosts(plan),
+            plan_id=plan.get("plan_id") or "", reason=plan.get("reason") or "",
+        )
+    except Exception:  # noqa: BLE001 - a plan is never worth failing a scan over
+        pass
+
 
 
 def _live_web_urls(recon_data: dict) -> list:
@@ -373,7 +472,8 @@ SEVERITY_COLORS = {
 }
 
 
-def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = None) -> dict:
+def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = None,
+                  selection_hint: dict = None, plan_output_file: Path = None) -> dict:
     """
     Run nuclei scan on all URLs derived from recon data.
 
@@ -381,6 +481,12 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         recon_data: Domain reconnaissance data dictionary
         output_file: Optional path to save incremental results
         settings: Settings dictionary from main.py
+        selection_hint: Optional partial-run marker (scope/deferred) that makes
+            the plan non-exhaustive
+        plan_output_file: Optional path the selection plan is MERGED into before
+            the first pass launches. Used by the isolated wrapper, which runs on
+            a deep copy in a fan-out thread and must not overwrite the canonical
+            artifact with that copy; the merge is locked against save_recon_file.
 
     Returns:
         Updated recon_data with nuclei results added
@@ -405,6 +511,10 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
     NUCLEI_MAX_RUNTIME = settings.get('NUCLEI_MAX_RUNTIME', 86400)
     NUCLEI_MAX_HOST_ERROR = settings.get('NUCLEI_MAX_HOST_ERROR', 30)
     NUCLEI_TAGS = settings.get('NUCLEI_TAGS', ['cve', 'xss', 'sqli', 'rce', 'lfi', 'ssrf', 'xxe', 'ssti'])
+    # The configured baseline, captured before the AI tag selector may prune
+    # it: F07 compares the effective selection against this to decide whether
+    # the run covered everything it was configured to cover.
+    saved_nuclei_tags = list(NUCLEI_TAGS or [])
     NUCLEI_EXCLUDE_TAGS = settings.get('NUCLEI_EXCLUDE_TAGS', ['dos', 'fuzz'])
     NUCLEI_DAST_MODE = settings.get('NUCLEI_DAST_MODE', False)
     NUCLEI_NEW_TEMPLATES_ONLY = settings.get('NUCLEI_NEW_TEMPLATES_ONLY', False)
@@ -815,6 +925,41 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
     if run_nuclei:
         nuclei_temp_dir.mkdir(parents=True, exist_ok=True)
 
+        # ---- F07: the selection plan, persisted BEFORE any pass launches.
+        # A cancellation or a crash keeps this accounting; it is a plan, never
+        # a result checkpoint. ``selection_hint`` comes from a partial run and
+        # marks the run as target/template-limited.
+        _partial_scope = bool(selection_hint and selection_hint.get("scope") == "partial")
+        _deferred = bool(selection_hint and selection_hint.get("deferred"))
+        selection_plan = _selection_plan(
+            targets=target_urls,
+            saved_tags=saved_nuclei_tags,
+            effective_tags=NUCLEI_TAGS,
+            ai_pruned=ai_tags_used,
+            partial_scope=_partial_scope,
+            deferred=_deferred,
+            severity=NUCLEI_SEVERITY,
+            exclude_tags=NUCLEI_EXCLUDE_TAGS,
+            templates=NUCLEI_TEMPLATES,
+            exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
+            custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+            selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+            dast_targets=dast_urls if do_dast_pass else None,
+            dast_mode=bool(do_dast_pass and NUCLEI_DAST_MODE),
+        )
+        recon_data[SELECTION_KEY] = selection_plan
+        _note_selection_cut(selection_plan)
+        if plan_output_file is not None:
+            # Isolated path: this runs in a fan-out thread, so the plan is
+            # MERGED into the canonical artifact under the shared save lock
+            # instead of overwriting it with this deep copy (another tool's
+            # results may have merged a moment earlier). See persist_plan.
+            persist_plan(plan_output_file, recon_data[SELECTION_KEY])
+        elif output_file:
+            with open(output_file, 'w') as f:
+                json.dump(recon_data, f, indent=2)
+            fix_file_ownership(output_file)
+
         # Detection pass targets
         detection_targets_file = str(nuclei_temp_dir / "targets_detection.txt")
         with open(detection_targets_file, 'w') as f:
@@ -1047,7 +1192,10 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "total_hostnames": len(hostnames),
                     "total_ips": len(ips),
                     "false_positives_filtered": len(false_positives_filtered),
-                    "coverage": _nuclei_coverage(coverage_at, coverage_passes, findings),
+                    "coverage": _nuclei_coverage(
+                        coverage_at, coverage_passes, findings,
+                        exhaustive=bool(selection_plan.get("exhaustive", False)),
+                    ),
                 },
                 "discovered_urls": {
                     "base_urls": sorted(target_urls),
@@ -1151,6 +1299,15 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         
             # Add to recon data
             recon_data["vuln_scan"] = nuclei_results
+
+            # F07: record what the passes actually proved, so the plan is not
+            # just a launch-time intent. A failed pass cuts its source (see
+            # _keep_nuclei_findings) regardless of this status.
+            recon_data[SELECTION_KEY] = record_outcome(
+                recon_data[SELECTION_KEY],
+                "partial" if _deferred else "complete",
+                completed=int(len(findings or [])),
+            )
         
             # Save incrementally if output file provided
             if output_file:
@@ -1389,7 +1546,8 @@ def enrich_recon_file(recon_file: Path) -> dict:
 
 
 
-def run_vuln_scan_isolated(combined_result: dict, settings: dict) -> TopLevelKeys:
+def run_vuln_scan_isolated(combined_result: dict, settings: dict,
+                           output_file: Path = None) -> TopLevelKeys:
     """
     Thread-safe isolated wrapper for Nuclei vuln scanning.
 
@@ -1397,11 +1555,20 @@ def run_vuln_scan_isolated(combined_result: dict, settings: dict) -> TopLevelKey
     file saves), and returns a TopLevelKeys holding vuln_scan and, when the CVE
     lookup ran, its technology_cves. Used by Group 6 Phase A fan-out in main.py
     so Nuclei and GraphQL can run concurrently without racing on shared state.
+
+    ``output_file`` is the group's canonical artifact. The selection plan is
+    merged into it BEFORE the Nuclei pass launches - from this fan-out thread,
+    under the same lock save_recon_file takes - so a cancellation or a crash
+    keeps the planned-input accounting. The scan itself still runs on the deep
+    copy and the incremental saves stay with the fan-out's merged result, which
+    is what main.py persists once the future completes.
     """
     snapshot = copy.deepcopy(combined_result)
     # output_file=None => skip the function's own incremental saves (main.py
-    # persists the merged result after the fan-out completes).
-    run_vuln_scan(snapshot, output_file=None, settings=settings)
+    # persists the merged result after the fan-out completes); plan_output_file
+    # carries the plan to disk before the pass launches instead.
+    run_vuln_scan(snapshot, output_file=None, settings=settings,
+                  plan_output_file=output_file)
     result = TopLevelKeys(vuln_scan=snapshot.get("vuln_scan", {}))
     for key in _VULN_SCAN_RESULT_KEYS[1:]:
         if key in snapshot:

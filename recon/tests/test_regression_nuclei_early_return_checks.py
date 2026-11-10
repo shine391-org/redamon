@@ -128,7 +128,8 @@ class TestRegressionNucleiEarlyReturns:
             def verify_connection(self):
                 return True
 
-            def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=()):
+            def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
+                                      keep_unproven=False):
                 prunes.extend(sources)
 
         with mock.patch('recon.project_settings.get_settings', return_value=dict(stub)), \

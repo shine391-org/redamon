@@ -20,6 +20,14 @@ export interface CoverageGap {
   [key: string]: unknown
 }
 
+/** The bounded selection block a Domain's coverage record carries. */
+export interface SelectionCoverage {
+  recorded: boolean
+  selection_unknown: boolean
+  plan_ids: string[]
+  exhaustive: boolean
+}
+
 /**
  * Parse a `recon_coverage_gaps` value into an array of gaps, or `null` when it
  * is not a JSON array of objects with a string `source` of <=64 chars. An
@@ -77,6 +85,107 @@ export function skippedHostInScope(hostPort: string, roots: ReadonlySet<string> 
   const host = hostPort.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase()
   for (const r of roots) if (host === r || host.endsWith(`.${r}`)) return true
   return false
+}
+
+/**
+ * Parse a `recon_selection_json` / `vuln_scan_selection_json` value into a
+ * bounded block, or `null` when it is not an object with a `plan_ids` array of
+ * strings. An imported/exported bundle is untrusted, so anything malformed is
+ * rejected rather than trusted or coerced.
+ */
+export function parseSelectionBlock(raw: unknown): SelectionCoverage | null {
+  let value = raw
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch {
+      return null
+    }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const obj = value as Record<string, unknown>
+  const rawIds = obj.plan_ids === undefined ? [] : obj.plan_ids
+  if (!Array.isArray(rawIds)) return null
+  const planIds: string[] = []
+  for (const id of rawIds) {
+    if (typeof id !== 'string' || !id) return null
+    if (!planIds.includes(id)) planIds.push(id)
+  }
+  return {
+    recorded: obj.recorded === true,
+    selection_unknown: obj.selection_unknown === true,
+    plan_ids: planIds,
+    exhaustive: obj.exhaustive === true,
+  }
+}
+
+/** Merge two blocks: recorded/unknown OR-ed, plan ids unioned, exhaustive only
+ *  when both sides cut nothing. */
+export function mergeSelectionBlocks(
+  a: SelectionCoverage | null,
+  b: SelectionCoverage | null,
+): SelectionCoverage | null {
+  if (a === null) return b
+  if (b === null) return a
+  const planIds = [...a.plan_ids]
+  for (const id of b.plan_ids) if (!planIds.includes(id)) planIds.push(id)
+  return {
+    recorded: a.recorded || b.recorded,
+    selection_unknown: a.selection_unknown || b.selection_unknown,
+    plan_ids: planIds,
+    exhaustive: a.exhaustive && b.exhaustive,
+  }
+}
+
+/**
+ * The project's current run selection block, or `null` when coverage is
+ * unknown.
+ *
+ * Reads `recon_selection_json` (the per-run record, merged across the run's
+ * groups) and `vuln_scan_selection_json` (the per-group plan write) from every
+ * covered `Domain` and merges them. Returns `null` when no Domain carries a
+ * coverage record, when neither property is present, or when any block fails to
+ * parse. Never throws.
+ */
+export async function readSelectionCoverage(
+  projectId: string,
+): Promise<SelectionCoverage | null> {
+  let session
+  try {
+    session = getGraphSession()
+  } catch {
+    return null
+  }
+  try {
+    const res = await session.run(
+      `MATCH (d:Domain {project_id: $pid})
+       WHERE d.recon_coverage_at IS NOT NULL
+       RETURN d.recon_selection_json AS selection, d.vuln_scan_selection_json AS plan`,
+      { pid: projectId },
+    )
+    if (!res.records.length) return null
+    let merged: SelectionCoverage | null = null
+    let sawRecord = false
+    for (const record of res.records) {
+      for (const key of ['selection', 'plan']) {
+        const raw = record.get(key)
+        if (raw === undefined || raw === null) continue
+        sawRecord = true
+        const parsed = parseSelectionBlock(raw)
+        if (parsed === null) return null // fail closed on any unparseable block
+        merged = mergeSelectionBlocks(merged, parsed)
+      }
+    }
+    return sawRecord ? merged : null
+  } catch {
+    return null
+  } finally {
+    try {
+      await session.close()
+    } catch {
+      /* already closed */
+    }
+  }
 }
 
 /**

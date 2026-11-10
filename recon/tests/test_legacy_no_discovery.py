@@ -119,7 +119,7 @@ class TestTheLegacyBranch:
         degraded = cb.coverage_report().degraded_sources
         assert NOT_RUN <= degraded
         prunes = []
-        graph.prune_unseen_findings = lambda u, p, sources, since, keep_hosts=(): prunes.append(set(sources))
+        graph.prune_unseen_findings = lambda u, p, sources, since, keep_hosts=(), keep_unproven=False: prunes.append(set(sources))
         graph.backfill_passive_cve_hosts = lambda *a: None
         assert rm._COVERAGE_WRITE_FAILED is False
         rm._prune_recon_findings()
