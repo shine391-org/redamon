@@ -399,8 +399,9 @@ urlscan properties (from the newest public urlscan visit of this base URL; a vis
 - page_class (string): "app", "login_only", "parked", "default", "placeholder" or "error"
 - page_class_confidence (integer): 0-100; 100 when the pre-filter placed the page
 - page_class_source (string): "jev_classifier", or "prefilter" where Jev gave no answer
-- validation_status (string): "hittable" (an accepted status that a made-up path next to it did not also get) or "unvalidated" (probing off, an upload-relative URL with no host, an unsupported scheme). "not_hittable" (dead) and "catch_all" (the host answers a made-up path the same way, e.g. an SPA shell) are never written: the endpoint is dropped
+- validation_status (string): "hittable" is the only verified state for JS endpoint validation: an accepted response status not classified as catch-all by the control probe. "not_hittable" is a retained negative observation (an unaccepted response status, including 404), not proof that the route is dead or has no security meaning. "catch_all" is a retained catch_all_like observation (the host answers a made-up path the same way, e.g. an SPA shell), not verified surface. "unknown" is a retained inconclusive observation after a timeout or transport error, with the exception class in validation_error; unknown is not dead. "unvalidated" means no endpoint probe was performed: validation disabled, unsupported scheme/WebSocket, unresolved URL (including upload-relative paths without a host), out-of-scope URL, SSRF guard rejection, or circuit-breaker skip. "skipped_unknown" is a validation_error reason on "unvalidated", not a separate validation_status, and does not prove the host or route dead. Validation outcomes do not drop raw candidates: these observations are retained subject to graph ingestion's path/base URL and scope guards; candidate retention does not imply verified surface. Readers seeking JS-verified endpoints must filter validation_status = "hittable"
 - js_status_code (integer): the status js_recon's own probe got; status_code stays http_probe's when both probed
+- validation_error (string): set by js_recon on endpoints it extracted from JavaScript, including when JS_RECON_VALIDATE_ENDPOINTS is off; empty string when no validation error; otherwise a short reason such as "validation_disabled", "unsupported_scheme", "unresolved_url", "out_of_scope", "skipped_unknown", "ssrf_blocked", or the exception type name
 - anon_status (integer): the status an anonymous GET of this route got; compare with status_code to see a route that answers without credentials
 - anon_status_at (datetime): when anon_status was measured
 - generated_by (string): on an Endpoint the route exposure scan created, the generator that found it ("seed", "version", "sibling", "catalog", "cross_host"); such an Endpoint carries source "route_exposure" and was answering 2xx with content
@@ -435,7 +436,7 @@ Additional properties present on this node type, not yet described:
 - GraphQL enrichment (set by graphql_scan when endpoint is a GraphQL endpoint):
 - graphql-cop capability flags (set by the external scanner, Phase 2):
 - Page type (set by http_probe when the project's Jev page-type hook is on):
-- Endpoint probe (set by js_recon on endpoints it extracted from JavaScript, when JS_RECON_VALIDATE_ENDPOINTS is on):
+- Endpoint probe (set by js_recon on endpoints it extracted from JavaScript; validation_status and validation_error are also set when probing is off):
 - Anonymous status (set by the route exposure scan):
 - Path template (set by js_recon when the JS built the URL from a template literal):
 - _js_recon_created
