@@ -18,7 +18,9 @@ def _observed_data(n: int) -> dict:
             "https://a.example.com": {
                 "endpoints": {
                     f"/p{i:05d}": {
-                        "parameters": {"query": [{"name": "q", "sample_values": ["1"]}]},
+                        # Synthetic values model the current decoded producer contract.
+                        "parameters": {"query": [{"name": "q", "sample_values": ["1"],
+                                                   "sample_values_encoding": "decoded-observation"}]},
                     }
                     for i in range(n)
                 }

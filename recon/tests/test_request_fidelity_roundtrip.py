@@ -216,6 +216,20 @@ def test_raw_controls_still_rejected():
     assert th._endpoint_url(BASE, '/search', {'parameters': {'query': [_param('x\ny')]}}) is None
 
 
+def test_aggregated_observation_without_raw_cannot_claim_order_or_duplicates(monkeypatch):
+    raw = BASE + '/search?k=1&k=2&empty='
+    monkeypatch.setattr(eh, 'fetch_forms_from_urls', lambda *a, **k: [])
+    endpoint = eh.organize_endpoints([raw])['by_base_url'][BASE]['endpoints']['/search']
+    endpoint.pop('sample_urls')
+    assert not endpoint.get('fidelity_unknown')
+    graph, _ = _record(monkeypatch, endpoint)
+    data = gb._build_serialized_data_from_graph('example.com', 'u', 'p', settings={})
+    ep = data['resource_enum']['by_base_url'][BASE]['endpoints']['/search']
+    assert ep['fidelity_unknown']
+    th._endpoint_url(BASE, '/search', ep)
+    assert 'fidelity_unknown' in ep['fidelity']
+
+
 def test_method_specific_examples_survive_graph_without_last_row_wins(monkeypatch):
     payload = {'operations': [{'baseurl': BASE, 'path': '/search', 'method': m, 'operation': {
         'parameters': [{'name': 'q', 'in': 'query', 'schema': {'type': 'string', 'example': v}}]}}
