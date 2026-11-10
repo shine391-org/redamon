@@ -180,8 +180,8 @@ def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> Optional[str
     params = raw_params or []
     # A name-keyed/aggregated projection cannot recover source order or
     # duplicate keys. Keep that loss explicit rather than claiming fidelity.
-    if endpoint_info.get("fidelity_unknown"):
-        endpoint_info.setdefault("fidelity", []).append("fidelity_unknown")
+    if endpoint_info.get("fidelity_unknown") and "fidelity_unknown" not in endpoint_info.setdefault("fidelity", []):
+        endpoint_info["fidelity"].append("fidelity_unknown")
     # Older serialized projections keyed parameters by name. Accept that shape
     # without inventing values, and never treat an encoded value as decoded.
     normalized_params = []
