@@ -85,7 +85,13 @@ REQUIRED_MANIFEST_KEYS = (
     "template_hashes", "tasks", "reason", "created_at",
 )
 #: Keys the reader treats as known (required plus explicitly allowed extras).
-KNOWN_MANIFEST_KEYS = set(REQUIRED_MANIFEST_KEYS) | {"input_accounting", "status"}
+KNOWN_MANIFEST_KEYS = set(REQUIRED_MANIFEST_KEYS) | {
+    "input_accounting", "status",
+    # Planner (F10) shadow-manifest accounting -- additive, backward
+    # compatible; a manifest written without them still reads as known.
+    "plan_id", "disposition_counts", "input_count", "oversize",
+    "task_count", "template_count",
+}
 
 #: Manifest bounding: explicit limits with observable markers, never silent truncation.
 MANIFEST_MAX_STRING_CHARS = 2000

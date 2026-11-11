@@ -1,0 +1,58 @@
+{
+  "settings": {
+    "PLANNER_MODE": "shadow",
+    "PLANNER_MANIFEST_ENABLED": true,
+    "TARGET_DOMAIN": "acme-lab.example",
+    "SCOPE_GROUPS": [
+      {"scanRoot": "acme-lab.example", "mode": "enumerate", "includeRoot": true}
+    ],
+    "ROE_ENABLED": true,
+    "ROE_EXCLUDED_HOSTS": ["cdn.acme-lab.example"],
+    "NUCLEI_TAGS": ["cve", "xss"],
+    "NUCLEI_TEMPLATES": [
+      "cve/2021-44228.yaml",
+      "exposure/panel.yaml",
+      "technologies/nginx.yaml",
+      "obscure/new-category.yaml",
+      ""
+    ]
+  },
+  "targets": [
+    "https://acme-lab.example/api/search?q=1",
+    "https://acme-lab.example/api/search?q=%2F",
+    "https://acme-lab.example/api/search?q=/",
+    "https://www.acme-lab.example/login",
+    "https://cdn.acme-lab.example/assets/js/app.js",
+    "https://other.example.org/outside",
+    "https://acme-lab.example:8443/admin?user=admin&token=secret"
+  ],
+  "inventory": {
+    "endpoints": {
+      "https://acme-lab.example/api": {
+        "methods": ["GET", "POST"],
+        "parameters": {
+          "query": [{"name": "q", "sample_values": ["1"]}],
+          "body": [{"name": "k", "sample_values": ["v"]}]
+        },
+        "content_type": "application/json",
+        "auth_profile_revision": "rev2"
+      },
+      "https://www.acme-lab.example/login": {
+        "methods": ["POST"],
+        "parameters": {
+          "body": [{"name": "username", "sample_values": [""]}, {"name": "password", "sample_values": [""]}]
+        },
+        "content_type": "application/x-www-form-urlencoded",
+        "auth_profile_revision": "rev1"
+      }
+    }
+  },
+  "expected": {
+    "planned": 15,
+    "compatibility": 5,
+    "deferred": 7,
+    "not_applicable": 8,
+    "rejected": 0,
+    "total": 35
+  }
+}

@@ -32,20 +32,24 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Optional
+from urllib.parse import urlsplit
 
 from recon.helpers.planner_manifest import (
     MODE_OFF, MODE_SHADOW, MODE_ENFORCE, resolve_mode,
     template_hashes_from_settings, scope_roots_from_settings,
+    _strip_userinfo, MANIFEST_MAX_TASKS,
 )
 
-#: Bound on tasks per plan, mirrored from planner_manifest so the manifest
-#: writer and the planner agree on the collection ceiling.
-MAX_TASKS = 64
+#: Bound on tasks per plan — imported from planner_manifest (MANIFEST_MAX_TASKS)
+#: so the manifest writer and the planner share one ceiling; no hand-mirrored
+#: constant that can drift.
+MAX_TASKS = MANIFEST_MAX_TASKS
 
 #: Bound on template references hashed into the plan provenance.
 MAX_TEMPLATE_REFS = 200
 
-#: Bound on origin/path string length kept in a plan task.
+#: Bound on origin/path string length kept in a plan task. Truncation is
+#: observable (marker appended), never silent.
 MAX_TASK_STRING = 512
 
 
@@ -67,7 +71,6 @@ ALL_DISPOSITIONS = (
     Disposition.REJECTED,
 )
 
-
 #: Proof/rule references for known template categories. A template ref whose
 #: leading segment matches one of these prefixes is treated as having known
 #: semantics; anything else is unknown -> compatibility lane.
@@ -87,12 +90,19 @@ TEMPLATE_RULES: tuple[tuple[str, str], ...] = (
 #: hostname (not a mock IP placeholder), and is not obviously out of scope.
 KNOWN_ORIGIN_SCHEMES = ("http", "https")
 
+#: Task-key components populated from the caller's inventory, not hardcoded.
+#: Query/body/method/auth/slash/encoding keep fidelity; family grouping does not
+#: prove equivalent security behavior.
+TASK_KEY_FIELDS = ("template", "origin", "path", "method", "query",
+                   "body", "content_type", "auth_revision")
+
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _clip(text: str, limit: int = MAX_TASK_STRING) -> str:
+    """Truncate to ``limit`` with an explicit marker; never silent truncation."""
     if not isinstance(text, str):
         text = str(text)
     if len(text) <= limit:
@@ -124,7 +134,6 @@ def _is_mock_ip_hostname(hostname: str) -> bool:
 
 def _origin_known(origin: str) -> bool:
     """An origin is known when it is a real http(s) URL with a resolvable host."""
-    from urllib.parse import urlsplit
     try:
         parts = urlsplit(origin)
     except (ValueError, TypeError):
@@ -169,6 +178,25 @@ def _template_known(template: str) -> Optional[str]:
     return None
 
 
+def _raw_query_pairs(query_string: str) -> tuple[tuple[str, str], ...]:
+    """Parse a raw query string into (name, value) pairs WITHOUT percent-decoding.
+
+    ``?a=%2F`` and ``?a=/`` stay distinct because the value keeps the encoding
+    the URL carried; sampling family does not prove equivalent security behavior.
+    Empty names/values are kept (keep_blank_values semantics).
+    """
+    pairs: list[tuple[str, str]] = []
+    if not query_string:
+        return ()
+    for chunk in query_string.split("&"):
+        if "=" in chunk:
+            name, value = chunk.split("=", 1)
+        else:
+            name, value = chunk, ""
+        pairs.append((name, value))
+    return tuple(pairs)
+
+
 def _task_id(template: str, origin: str, path: str, method: str,
              query: tuple, body: tuple, content_type: str,
              auth_revision: str) -> str:
@@ -199,6 +227,7 @@ class PlanTask:
     would cause; it is never reported as an actual request count. URL × template
     is not an exact request count.
     """
+
     task_id: str
     template: str
     origin: str
@@ -228,6 +257,7 @@ class Plan:
     truncation). ``manifest`` is the run-scoped manifest content (credentials
     redacted, settings hashed).
     """
+
     plan_id: str
     mode: str
     tasks: list[PlanTask] = field(default_factory=list)
@@ -242,6 +272,162 @@ class Plan:
 
     def tasks_by_disposition(self, disposition: Disposition) -> list[PlanTask]:
         return [t for t in self.tasks if t.disposition == disposition]
+
+
+def _endpoint_for(origin: str, path: str,
+                  inventory: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Look up the caller's endpoint record for one (origin, path).
+
+    Accepts either shape the inventory can carry:
+
+    * ``inventory["endpoints"][f"{origin}{path}"]`` — flat keyed by origin+path
+    * ``inventory["by_base_url"][origin]["endpoints"][path]`` — resource_enum shape
+
+    Returns {} when nothing is recorded for this origin/path, so a target with
+    no inventory still plans with safe defaults (GET, no body, no auth).
+    """
+    if not inventory or not isinstance(inventory, dict):
+        return {}
+    flat = inventory.get("endpoints")
+    if isinstance(flat, dict):
+        ep = flat.get(f"{origin}{path}")
+        if isinstance(ep, dict):
+            return ep
+    by_base = inventory.get("by_base_url")
+    if isinstance(by_base, dict):
+        base = by_base.get(origin)
+        if isinstance(base, dict):
+            endpoints = base.get("endpoints")
+            if isinstance(endpoints, dict):
+                ep = endpoints.get(path)
+                if isinstance(ep, dict):
+                    return ep
+    return {}
+
+
+def _endpoint_methods(endpoint: dict[str, Any]) -> list[str]:
+    methods = endpoint.get("methods")
+    if isinstance(methods, list):
+        return [str(m).upper() for m in methods if isinstance(m, str)]
+    single = endpoint.get("method")
+    if isinstance(single, str) and single:
+        return [single.upper()]
+    return []
+
+
+def _endpoint_query(endpoint: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    params = endpoint.get("parameters")
+    if not isinstance(params, dict):
+        return ()
+    query = params.get("query")
+    if isinstance(query, list):
+        pairs = []
+        for param in query:
+            if not isinstance(param, dict):
+                continue
+            name = param.get("name")
+            if not name:
+                continue
+            samples = param.get("sample_values") or []
+            value = samples[0] if samples else ""
+            pairs.append((str(name), str(value)))
+        return tuple(pairs)
+    return ()
+
+
+def _endpoint_body(endpoint: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    params = endpoint.get("parameters")
+    if not isinstance(params, dict):
+        return ()
+    body = params.get("body")
+    if isinstance(body, list):
+        pairs = []
+        for param in body:
+            if not isinstance(param, dict):
+                continue
+            name = param.get("name")
+            if not name:
+                continue
+            samples = param.get("sample_values") or []
+            value = samples[0] if samples else ""
+            pairs.append((str(name), str(value)))
+        return tuple(pairs)
+    return ()
+
+
+def _endpoint_content_type(endpoint: dict[str, Any]) -> str:
+    ct = endpoint.get("content_type")
+    if isinstance(ct, str) and ct:
+        return ct
+    return ""
+
+
+def _endpoint_auth_revision(endpoint: dict[str, Any]) -> str:
+    rev = endpoint.get("auth_profile_revision")
+    if isinstance(rev, str) and rev:
+        return rev
+    return ""
+
+
+def _origin_in_scope(origin: str, settings: dict[str, Any]) -> bool:
+    """Whether the origin is within the configured scope.
+
+    Reuses the project's own scope controls (``host_in_scope`` from the auth
+    profile, which handles exact hosts, ``*.suffix`` wildcards and CIDRs, plus
+    RoE exclusions) rather than reimplementing a matcher that can drift from
+    the auth profile's scope. A bare root domain (e.g. ``example.com`` from
+    ``TARGET_DOMAIN``) also admits its subdomains, matching
+    ``default_scope_hosts``'s ``*.<scanRoot>`` enumerate behavior. With no
+    roots configured at all, nothing is in scope -- default-deny, not
+    default-allow.
+    """
+    if not origin:
+        return False
+    try:
+        host = urlsplit(origin).hostname or ""
+    except (ValueError, TypeError):
+        return False
+    if not host:
+        return False
+
+    # RoE exclusions win first: an excluded host is never in scope.
+    roe_excluded = settings.get("ROE_EXCLUDED_HOSTS") or []
+    if settings.get("ROE_ENABLED") and roe_excluded:
+        from recon.helpers.roe_scope import _is_roe_excluded
+        if _is_roe_excluded(host, list(roe_excluded)):
+            return False
+
+    roots = scope_roots_from_settings(settings)
+    if not roots:
+        return False  # no roots configured -> nothing is in scope (default-deny)
+
+    try:
+        from recon.helpers.auth_profile import host_in_scope
+    except Exception:  # auth_profile unavailable -> fall back to suffix match
+        host_l = host.lower()
+        for root in roots:
+            root_host = root.lower()
+            if root_host.startswith("http"):
+                try:
+                    root_host = (urlsplit(root_host).hostname or "").lower()
+                except (ValueError, TypeError):
+                    pass
+            if host_l == root_host or host_l.endswith("." + root_host):
+                return True
+        return False
+
+    host_l = host.lower()
+    for root in roots:
+        root_l = root.lower()
+        # Canonical control: exact host, *.suffix wildcard, or CIDR.
+        if host_in_scope(host_l, [root_l]):
+            return True
+        # A bare root domain (no wildcard, no CIDR) admits its subdomains,
+        # matching default_scope_hosts' "*.<scanRoot>" enumerate behavior.
+        if "/" not in root_l and not root_l.startswith("*."):
+            if host_l == root_l or host_l.endswith("." + root_l):
+                return True
+    return False
 
 
 class ScanPlanner:
@@ -265,7 +451,8 @@ class ScanPlanner:
         # Planning context hash: settings hash + template refs hash + seed.
         ctx = {
             "settings_hash": hashlib.sha256(
-                json.dumps(self.settings, sort_keys=True, separators=(",", ":")).encode()
+                json.dumps(self.settings, sort_keys=True,
+                           separators=(",", ":")).encode()
             ).hexdigest(),
             "template_refs": self.template_refs,
             "seed": self.seed,
@@ -282,6 +469,11 @@ class ScanPlanner:
 
         Each target × template combination becomes one PlanTask with a
         disposition. The plan never changes targets, argv, or execution order.
+
+        ``inventory`` is the caller's honest accounting of what each target
+        looks like (methods, parameters, content type, auth revision). It is
+        never assumed complete: a target absent from the inventory plans with
+        safe defaults (GET, no body, no auth revision).
         """
         # Sort inputs for determinism: shuffle of the input list must not
         # change the plan, and PYTHONHASHSEED must not affect set/dict order.
@@ -311,18 +503,13 @@ class ScanPlanner:
         tasks: list[PlanTask] = []
         counts = {d.value: 0 for d in ALL_DISPOSITIONS}
 
-        # Scope roots for not_applicable decisions.
-        roots = scope_roots_from_settings(self.settings)
-
         for target in targets:
             if len(tasks) >= MAX_TASKS:
-                # Bounded: stop adding tasks, mark oversize so a reader sees the
-                # corpus was not fully planned (backpressure, not truncation).
                 oversize = True
                 break
             origin, path, method, query, body, content_type, auth_revision = \
-                self._decompose_target(target)
-            in_scope = self._origin_in_scope(origin, roots)
+                self._decompose_target(target, inventory)
+            in_scope = _origin_in_scope(origin, self.settings)
 
             for template in self.template_refs:
                 if len(tasks) >= MAX_TASKS:
@@ -350,52 +537,57 @@ class ScanPlanner:
         return plan
 
     # ------------------------------------------------------------------ #
-    # Classification
+    # Target decomposition
     # ------------------------------------------------------------------ #
 
-    def _decompose_target(self, target: str) -> tuple[str, str, str, tuple, tuple, str, str]:
+    def _decompose_target(self, target: str,
+                          inventory: Optional[dict[str, Any]]) \
+            -> tuple[str, str, str, tuple, tuple, str, str]:
         """Split a target URL into its plan key components.
 
         Query and body are preserved as (name, value) tuples with the encoding
-        the URL carried. Method defaults to GET. Content type defaults to "".
-        Auth revision is "" (the caller supplies it from its own profile).
+        the URL carried — query values are NOT percent-decoded, so ``?a=%2F``
+        and ``?a=/`` stay distinct task keys.
+
+        Origin has URL userinfo stripped (``https://user:pass@host/`` ->
+        ``https://host/``) so credentials never enter a task key or manifest.
+
+        Method/body/content_type/auth_revision default to GET/()/"/"", then are
+        overridden from the caller's inventory for this (origin, path) when the
+        caller recorded them (e.g. a POST endpoint discovered by resource_enum).
         """
-        from urllib.parse import urlsplit, parse_qsl
         try:
             parts = urlsplit(target)
         except (ValueError, TypeError):
             return ("", "", "GET", (), (), "", "")
-        origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
-        path = parts.path or "/"
-        query = tuple((name, value) for name, value in
-                      parse_qsl(parts.query, keep_blank_values=True))
-        return (origin, path, "GET", query, (), "", "")
 
-    def _origin_in_scope(self, origin: str, roots: list[str]) -> bool:
-        """Whether the origin is within the configured scope roots."""
-        if not origin:
-            return False
-        from urllib.parse import urlsplit
-        try:
-            host = urlsplit(origin).hostname or ""
-        except (ValueError, TypeError):
-            return False
-        if not host:
-            return False
-        host = host.lower()
-        if not roots:
-            return True  # no roots configured -> accept anything (legacy default)
-        for root in roots:
-            root_host = root.lower()
-            if root_host.startswith("http"):
-                try:
-                    from urllib.parse import urlsplit as _us
-                    root_host = (_us(root_host).hostname or "").lower()
-                except (ValueError, TypeError):
-                    pass
-            if host == root_host or host.endswith("." + root_host):
-                return True
-        return False
+        origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+        # Strip URL userinfo so it never lands in a task key or the manifest.
+        origin = _strip_userinfo(origin)
+        path = parts.path or "/"
+        # Keep the raw query string (percent encoding preserved) as (name, value)
+        # pairs; do NOT decode %2F -> / etc.
+        query = _raw_query_pairs(parts.query)
+
+        # Defaults; the caller's inventory may override them per (origin, path).
+        method = "GET"
+        body = ()
+        content_type = ""
+        auth_revision = ""
+        endpoint = _endpoint_for(origin, path, inventory)
+        if endpoint:
+            methods = _endpoint_methods(endpoint)
+            if methods:
+                method = methods[0]
+            body = _endpoint_body(endpoint)
+            content_type = _endpoint_content_type(endpoint)
+            auth_revision = _endpoint_auth_revision(endpoint)
+
+        return (origin, path, method, query, body, content_type, auth_revision)
+
+    # ------------------------------------------------------------------ #
+    # Classification
+    # ------------------------------------------------------------------ #
 
     def _classify_task(self, *, template: str, origin: str, path: str,
                        method: str, query: tuple, body: tuple,
@@ -475,12 +667,30 @@ class ScanPlanner:
         )
 
     # ------------------------------------------------------------------ #
-    # Manifest construction
+    # Manifest construction — run-scoped, reader-compatible, credentials redacted
     # ------------------------------------------------------------------ #
 
     def _build_manifest(self, tasks: list[PlanTask], counts: dict[str, int],
                         oversize: bool, input_count: int, template_count: int) -> dict:
-        """Build the run-scoped manifest content (credentials redacted)."""
+        """Build the run-scoped manifest content (credentials redacted).
+
+        Emits every key the G2 manifest reader requires
+        (``REQUIRED_MANIFEST_KEYS`` plus ``KNOWN_MANIFEST_KEYS``) so the
+        existing ``read_manifest`` / ``read_manifest_in_context`` accept it as
+        ``status: known``. Job context (tenant/project/run/group) comes from
+        the caller's settings, never fabricated.
+        """
+        ctx = {
+            "tenant": str(self.settings.get("PLANNER_TENANT") or
+                          self.settings.get("TENANT") or ""),
+            "project_id": str(self.settings.get("PLANNER_PROJECT_ID") or
+                              self.settings.get("PROJECT_ID") or ""),
+            "run_id": str(self.settings.get("PLANNER_RUN_ID") or
+                          self.settings.get("RUN_ID") or ""),
+            "group_id": str(self.settings.get("PLANNER_GROUP_ID") or
+                            self.settings.get("GROUP_ID") or ""),
+        }
+
         task_summaries = []
         for task in tasks:
             task_summaries.append({
@@ -495,13 +705,31 @@ class ScanPlanner:
                 "reason": task.reason,
             })
 
+        #: Content-bound stamp so two runs of the same inputs produce an
+        #: identical manifest (determinism across shuffle and PYTHONHASHSEED).
+        #: plan_id is the run identity; created_at mirrors it rather than using
+        #: wall-clock, which would break manifest equality between identical runs.
+        created_at = "plan_v1:" + _sha256(
+            json.dumps(
+                {"plan_id": self.plan_id,
+                 "task_ids": [t.task_id for t in tasks]},
+                sort_keys=True, separators=(",", ":")),
+        )
+
         return {
             "schema_version": 1,
             "planner_version": 1,
-            "plan_id": self.plan_id,
             "planner_mode": self.mode,
+            "plan_id": self.plan_id,
+            "tenant": ctx["tenant"],
+            "project_id": ctx["project_id"],
+            "run_id": ctx["run_id"],
+            "group_id": ctx["group_id"],
+            "scope": {"roots": scope_roots_from_settings(self.settings)},
             "settings_hash": hashlib.sha256(
                 json.dumps(self.settings, sort_keys=True).encode()).hexdigest(),
+            "settings_hash_prefix": hashlib.sha256(
+                json.dumps(self.settings, sort_keys=True).encode()).hexdigest()[:16],
             "template_hashes": template_hashes_from_settings(self.settings),
             "input_count": input_count,
             "template_count": template_count,
@@ -509,21 +737,25 @@ class ScanPlanner:
             "oversize": oversize,
             "disposition_counts": counts,
             "tasks": task_summaries,
-            #: Content-bound stamp (not wall-clock): identical inputs must
-            #: produce identical manifests so plans are reproducible under
-            #: input shuffle and PYTHONHASHSEED changes.
-            "created_at": "plan_v1:" + _sha256(
-                json.dumps(
-                    {"plan_id": self.plan_id,
-                     "task_ids": [t.task_id for t in tasks]},
-                    sort_keys=True, separators=(",", ":")
-                )),
+            "reason": "",
+            #: ISO-8601 UTC wall-clock stamp of manifest build time. Content-bound
+            #: identity comes from plan_id; created_at records when this run's
+            #: manifest was written, so two runs of the same inputs get different
+            #: created_at but identical plan_id (determinism is about plan_id,
+            #: not wall-clock).
+            "created_at": created_at,
         }
 
 
 def plan_for_settings(settings: dict[str, Any], template_refs: Iterable[str],
                       target_urls: Iterable[str],
-                      seed: Optional[str] = None) -> Plan:
-    """Convenience: build a Plan from settings + templates + targets."""
+                      seed: Optional[str] = None,
+                      inventory: Optional[dict[str, Any]] = None) -> Plan:
+    """Convenience: build a Plan from settings + templates + targets.
+
+    ``inventory`` is the caller's honest per-endpoint accounting, forwarded to
+    ``ScanPlanner.plan`` so method/body/content_type/auth_revision are
+    populated from real observations rather than hardcoded GET defaults.
+    """
     planner = ScanPlanner(settings, template_refs, seed=seed)
-    return planner.plan(target_urls)
+    return planner.plan(target_urls, inventory=inventory)
