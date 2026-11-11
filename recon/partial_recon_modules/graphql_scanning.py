@@ -38,8 +38,8 @@ def run_graphqlscan(config: dict) -> None:
     settings['GRAPHQL_SECURITY_ENABLED'] = True
 
     # Apply settings_overrides from modal checkboxes (bypass DB settings).
-    # Only allowlisted keys may override; unrelated settings are preserved.
-    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
+    # Validate local scanner controls; public admission is separately restricted.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides"))
 
     # Parse user-provided custom URLs (Partial Recon modal textarea)
     user_targets = config.get("user_targets") or {}

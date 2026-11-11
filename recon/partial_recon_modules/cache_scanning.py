@@ -46,8 +46,8 @@ def run_webcachepoison(config: dict) -> None:
     settings["WEB_CACHE_POISON_ENABLED"] = True
 
     # Apply settings_overrides from modal checkboxes (bypass DB settings).
-    # Only allowlisted keys may override; unrelated settings are preserved.
-    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
+    # Validate local scanner controls; public admission is separately restricted.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides"))
 
     include_root_domain = _should_include_root_domain(settings)
 

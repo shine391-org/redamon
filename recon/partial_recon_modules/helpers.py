@@ -753,17 +753,11 @@ def _is_host_in_scope(
     return any(host.endswith(f".{root}") for root in roots)
 
 
-#: Settings a partial recon run may override from modal checkboxes. Every other
-#: key is rejected — observably, never silently — so an override can never
-#: clobber an unrelated setting and no dormant runtime key is introduced by an
-#: override. plannerMode is validated strictly against its enum with the off
-#: default; boolean toggles must be real booleans (no truthiness coercion).
-#:
-#: The vuln-scan trio (CVE_LOOKUP_ENABLED / MITRE_ENABLED /
-#: SECURITY_CHECK_ENABLED) is exactly what the Partial Recon modal emits
-#: (PartialReconModal.tsx) and what run_nuclei -> run_vuln_scan consumes; the
-#: previous blind override loop supported them and the allowlist must keep that
-#: contract.
+#: Local dispatch controls, NOT the public partial-request allowlist. HTTP/CLI
+#: admission still accepts only the three modal enrichment booleans. The seven
+#: local entry points historically also accepted scanner tuning; their typed
+#: registered controls are resolved below without exposing scope, RoE, identity,
+#: internal images or account credentials as overrides.
 PARTIAL_SETTINGS_ALLOWLIST: dict[str, dict] = {
     # force-enables a partial recon explicitly asks for
     'NUCLEI_ENABLED': {'type': 'bool', 'default': False},
@@ -782,44 +776,114 @@ PARTIAL_SETTINGS_ALLOWLIST: dict[str, dict] = {
 }
 
 
-def apply_settings_overrides(settings: dict, overrides: dict,
-                             log=print) -> dict:
-    """Apply ``settings_overrides`` against the partial allowlist.
+# These are the scanners reached by the seven replaced local callers. Resolve
+# their public tuning from the canonical registry, rather than maintaining a
+# second list of hundreds of keys/types/bounds. KATANA_DEPTH is additionally
+# consumed by vuln_scan. Runtime-only keys deliberately do not qualify.
+_LOCAL_OVERRIDE_TOOLS = frozenset({
+    'nuclei', 'takeover', 'baddns', 'subjack', 'vhost_sni',
+    'web_cache_poison', 'graphql', 'graphql_cop', 'route_exposure',
+    'serialized_scan', 'cve_lookup', 'mitre', 'security_check',
+    'pipeline_ai', 'waf',
+})
 
-    Unknown keys and invalid values are REJECTED observably: a line naming the
-    key is printed (via ``log``) so the caller sees that the value did not
-    apply, and the original setting is preserved untouched — never a silently
-    coerced or silently dropped override. ``PLANNER_MODE`` is validated
-    strictly against its enum; on a bad value the original setting wins, and
-    when the setting was absent the off default applies. Booleans must be real
-    booleans: ``"false"`` never becomes ``True`` through truthiness coercion.
-    Unrelated settings are preserved: only allowlisted keys are touched.
-    Returns a copy.
+
+def _local_override_specs() -> dict:
+    from recon_settings.loader import by_runtime_key
+    specs = {
+        key: entry for key, entry in by_runtime_key().items()
+        if entry.get('mcp') == 'settable'
+        and (entry.get('tool') in _LOCAL_OVERRIDE_TOOLS or key == 'KATANA_DEPTH')
+    }
+    # Preserve the documented partial NUCLEI_ENABLED=False fallback and the
+    # strict planner enum independently of registry storage representation.
+    specs.update(PARTIAL_SETTINGS_ALLOWLIST)
+    return specs
+
+
+def _override_rejection(value, spec: dict, settings: dict):
+    """Return a fixed reason, never a raw value (which may be a credential)."""
+    import math
+
+    kind = spec['type']
+    if kind in ('bool', 'boolean'):
+        valid = type(value) is bool
+    elif kind == 'enum':
+        valid = type(value) is str and value in spec['values']
+    elif kind == 'int':
+        valid = type(value) is int
+    elif kind == 'float':
+        valid = type(value) is int or (type(value) is float and math.isfinite(value))
+    elif kind == 'string':
+        valid = type(value) is str
+    elif kind == 'string-list':
+        valid = type(value) is list and all(type(item) is str for item in value)
+    else:
+        valid = False
+    if not valid:
+        return 'invalid type or enum'
+    bounds = spec.get('bounds')
+    if bounds and not bounds['min'] <= value <= bounds['max']:
+        return 'outside registered bounds'
+    if spec.get('values') and kind != 'enum':
+        values = value if kind == 'string-list' else [value]
+        if any(item not in spec['values'] for item in values):
+            return 'outside registered choices'
+    validator = spec.get('validator')
+    if validator in ('project_file', 'project_file_name'):
+        from recon.project_settings import _inside_allowed_root, _is_safe_basename
+        values = value if isinstance(value, list) else [value]
+        check = (_is_safe_basename if validator == 'project_file_name' else
+                 lambda item: _inside_allowed_root(item, settings.get('PROJECT_ID', '')))
+        if any(not check(item) for item in values if item or kind != 'string'):
+            return 'outside permitted project files'
+    if spec.get('roe_capped'):
+        # Overrides are applied AFTER the loader's rate cap. Do not let local
+        # tuning re-open the ceiling or turn a zero-means-unlimited rate loose.
+        ceiling = settings.get('ROE_GLOBAL_MAX_RPS', 0)
+        if ceiling and (value > ceiling or
+                        (value == 0 and spec.get('zero_means') == 'unlimited')):
+            return 'exceeds engagement ceiling'
+    return None
+
+
+def apply_settings_overrides(settings: dict, overrides: dict, *, log=print) -> dict:
+    """Copy saved settings and apply valid local scanner/planner controls.
+
+    Public admission remains a separate three-boolean contract. Unsupported,
+    unsafe and invalid overrides preserve saved values and produce bounded,
+    value-free diagnostics. Invalid core controls absent from saved settings use
+    their documented fallback; absent controls are otherwise not manufactured.
+    Neither input is mutated, including accepted list-valued tuning.
     """
+    import re
+
     out = dict(settings)
-    for key, value in (overrides or {}).items():
-        spec = PARTIAL_SETTINGS_ALLOWLIST.get(key)
-        if spec is None:
-            log(f"[!][Partial Recon] settings_overrides rejected: {key} "
-                f"(not a supported partial override; saved setting preserved)")
+    if overrides is None:
+        return out
+    if not isinstance(overrides, dict):
+        log('[!][Partial Recon] settings_overrides rejected: expected an object')
+        return out
+    if not overrides:
+        return out
+    specs = _local_override_specs()
+    rejected = 0
+    for key, value in overrides.items():
+        spec = specs.get(key)
+        reason = ('not a supported local override' if spec is None else
+                  _override_rejection(value, spec, settings))
+        if reason:
+            rejected += 1
+            if rejected <= 16:
+                safe_key = (key if isinstance(key, str) and
+                            re.fullmatch(r'[A-Z][A-Z0-9_]{0,95}', key) else '<invalid-key>')
+                log(f'[!][Partial Recon] settings_overrides rejected: {safe_key} '
+                    f'({reason}; saved setting preserved)')
+            if key in PARTIAL_SETTINGS_ALLOWLIST:
+                out.setdefault(key, PARTIAL_SETTINGS_ALLOWLIST[key]['default'])
             continue
-        kind = spec.get('type')
-        if kind == 'enum':
-            values = spec.get('values', ())
-            if value in values:
-                out[key] = value
-            else:
-                log(f"[!][Partial Recon] settings_overrides rejected: {key}="
-                    f"{value!r} (must be one of {', '.join(values)}; "
-                    f"saved setting preserved)")
-                out.setdefault(key, spec.get('default'))
-        elif kind == 'bool':
-            if isinstance(value, bool):
-                out[key] = value
-            else:
-                log(f"[!][Partial Recon] settings_overrides rejected: {key}="
-                    f"{value!r} (must be a boolean; saved setting preserved)")
-                out.setdefault(key, spec.get('default'))
-        else:
-            out[key] = value
+        out[key] = list(value) if isinstance(value, list) else value
+    if rejected > 16:
+        log(f'[!][Partial Recon] settings_overrides: {rejected} rejected in total '
+            '(first 16 reasons shown)')
     return out

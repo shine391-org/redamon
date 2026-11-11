@@ -72,8 +72,8 @@ def run_route_exposure_partial(config: dict) -> None:
     settings = partial_settings(config)
     # Force-enable so the DB toggle doesn't override an explicit partial-recon run.
     settings["ROUTE_EXPOSURE_ENABLED"] = True
-    # Only allowlisted keys may override; unrelated settings are preserved.
-    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
+    # Validate local scanner controls; public admission is separately restricted.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides"))
 
     user_targets = config.get("user_targets") or {}
     url_attach_to = user_targets.get("url_attach_to")

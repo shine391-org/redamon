@@ -25,11 +25,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(os.environ.get('RECON_TEST_REPO', Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "recon"))
 
@@ -233,11 +234,11 @@ _SYNTHETIC_GRAPH = {
 
 
 def _run_caller(caller_module, entry, tool_module_path, tool_name,
-                extra_patches=None, config_extra=None):
+                extra_patches=None, config_extra=None, saved=None):
     captured: dict = {}
     patches = [
         patch.object(caller_module, "partial_settings",
-                     return_value={k: True for k in TOGGLE_KEYS}),
+                     return_value=dict(saved) if saved is not None else {k: True for k in TOGGLE_KEYS}),
         patch(tool_module_path + "." + tool_name,
               side_effect=_capture_settings(captured), create=True),
     ]
@@ -317,8 +318,8 @@ def test_inventory_vhost_caller_preserves_toggles():
 # subset of the registry's known runtime keys, and every allowlisted key must
 # exist in recon DEFAULT_SETTINGS with a type-consistent default (so
 # 'absent -> default' never invents a dormant key). create/update/import/
-# preset/MCP writers all persist through the same registry-validated path;
-# the shared contract is the registry plus this allowlist.
+# preset/MCP mutation behavior is NOT proven by these structural/read checks.
+# Actual mutation handler tests are owned by the settings-boundary worker.
 # ---------------------------------------------------------------------------
 def test_partial_allowlist_keys_exist_in_registry():
     registry = json.loads((REPO / "recon_settings" / "registry.json").read_text())
@@ -364,12 +365,11 @@ def test_webapp_registry_parity_files_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Handler-level tests with disposable fakes (DoD requirement: create/update/
-# import/preset/MCP/partial settings boundaries through actual handlers).
+# Read/validator controls only. These do not execute create/update/import/
+# preset/MCP mutation handlers and must not be counted as writer acceptance.
 # ---------------------------------------------------------------------------
-def test_handler_fetch_project_settings_create_update_boundary():
-    """Exercise project_settings.fetch_project_settings using a disposable fake
-    webapp API response representing project create/update persistence."""
+def test_loader_fetch_project_settings_parses_saved_response():
+    """Exercise the loader GET/read path, not create/update persistence."""
     import requests
     from unittest.mock import MagicMock
     from recon.project_settings import fetch_project_settings
@@ -410,9 +410,8 @@ def test_handler_fetch_project_settings_create_update_boundary():
     assert settings["NUCLEI_ENABLED"] is True
 
 
-def test_handler_validate_partial_overrides_boundary():
-    """Exercise recon_orchestrator.batch_scope.validate_partial_overrides handler
-    for valid and invalid overrides at the orchestrator boundary."""
+def test_pure_validate_partial_overrides_boundary():
+    """Exercise the pure admission validator, not the HTTP endpoint."""
     from recon_orchestrator.batch_scope import validate_partial_overrides, PartialScopeError
     import pytest
 
@@ -434,9 +433,8 @@ def test_handler_validate_partial_overrides_boundary():
     assert "must be true/false" in excinfo.value.detail
 
 
-def test_handler_mcp_preset_registry_boundaries():
-    """Exercise settings registry lookup and validation handlers used by
-    MCP (update_recon_settings, describe_recon_settings) and preset application."""
+def test_loader_registry_lookup_controls():
+    """Registry lookup alone is not evidence of MCP/preset mutation behavior."""
     from recon_settings.loader import load_registry, by_runtime_key, bounds_for
 
     registry = load_registry()
