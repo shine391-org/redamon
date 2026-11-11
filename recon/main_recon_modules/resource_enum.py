@@ -732,6 +732,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     _auth_profile = _profile_of(settings)
     AUTH_REF = (f"auth_profile:{_auth_profile.get('id') or _auth_profile.get('name') or 'unnamed'}"
                 if _auth_profile else "anonymous")
+    # A stable revision marker the caller already holds: two observations under
+    # the same profile name but a different revision are different contexts.
+    AUTH_REVISION = (str(_auth_profile.get("updatedAt")
+                         or _auth_profile.get("lastValidatedAt") or "")
+                     if _auth_profile else "")
 
     # F08: the discovery inventory. It records raw observations and producer
     # evidence; it never gates discovery, so a failure to account is logged and
@@ -1162,7 +1167,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # sighting; the disposition is computed anyway so a shared helper cannot
     # silently mislabel a later source.
     _record("katana", _da.observe_crawl, source="katana", urls=katana_urls,
-            auth_ref=AUTH_REF, existing_keys=_merged_keys())
+            auth_ref=AUTH_REF, auth_revision=AUTH_REVISION,
+            existing_keys=_merged_keys(), merged_keys=_merged_keys())
 
     # Merge Hakrawler results if available
     hakrawler_stats = {
@@ -1186,7 +1192,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     # F08: Hakrawler's observations, including the ones that only overlapped.
     _record("hakrawler", _da.observe_crawl, source="hakrawler", urls=hakrawler_urls,
-            auth_ref=AUTH_REF, existing_keys=_merged_keys())
+            auth_ref=AUTH_REF, auth_revision=AUTH_REVISION,
+            existing_keys=_merged_keys(), merged_keys=_merged_keys())
 
     # jsluice post-crawl JS analysis (runs after crawlers complete)
     jsluice_stats = {
@@ -1268,7 +1275,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # F08: jsluice's extracted URLs are observations of what it read in the JS.
     _record("jsluice", _da.observe_crawl, source="jsluice",
             urls=jsluice_result.get("urls") or [], auth_ref=AUTH_REF,
-            existing_keys=_merged_keys())
+            auth_revision=AUTH_REVISION,
+            existing_keys=_merged_keys(), merged_keys=_merged_keys())
 
     # FFuf directory fuzzing (runs after crawlers and jsluice, before GAU merge)
     ffuf_stats = {
@@ -1348,7 +1356,9 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 # F08: every FFuf result is an observation, including the ones
                 # that only overlapped an endpoint a crawler already had.
                 _record("ffuf", _da.observe_ffuf, results=ffuf_results,
-                        existing_keys=keys_before_ffuf, auth_ref=AUTH_REF)
+                        existing_keys=keys_before_ffuf,
+                        merged_keys=_merged_keys(), auth_ref=AUTH_REF,
+                        auth_revision=AUTH_REVISION)
                 # F08: FFuf's raw metadata outlives its temp directory. The
                 # record carries no response body and no header value.
                 _record("ffuf-raw", _di.record_raw_evidence, source="ffuf", record={
@@ -1480,7 +1490,9 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 # F08: Arjun's per-URL parameter evidence, including a partial
                 # execution whose parameter list is incomplete.
                 _record("arjun", _da.observe_arjun, results=arjun_results,
-                        existing_keys=keys_before_arjun, auth_ref=AUTH_REF)
+                        existing_keys=keys_before_arjun,
+                        merged_keys=_merged_keys(), auth_ref=AUTH_REF,
+                        auth_revision=AUTH_REVISION)
                 # F08: the salvaged/truncated output outlives the temp dir.
                 _record("arjun-raw", _di.record_raw_evidence, source="arjun", record={
                     "targets": len(arjun_target_urls),
@@ -1569,7 +1581,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             url_methods
         )
         _record("gau", _da.observe_crawl, source="gau", urls=gau_urls_to_process,
-                auth_ref=AUTH_REF, existing_keys=keys_before_gau)
+                auth_ref=AUTH_REF, auth_revision=AUTH_REVISION,
+                existing_keys=keys_before_gau, merged_keys=_merged_keys())
         if out_of_scope_count:
             _record("gau-scope", _di.reject, source="gau", reason="out_of_scope",
                     count=out_of_scope_count)
@@ -1610,8 +1623,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             exact=_exact_group,
         )
         _record("paramspider", _da.observe_crawl, source="paramspider",
-                urls=paramspider_urls, auth_ref=AUTH_REF,
-                existing_keys=keys_before_paramspider)
+                urls=paramspider_urls, auth_ref=AUTH_REF, auth_revision=AUTH_REVISION,
+                existing_keys=keys_before_paramspider, merged_keys=_merged_keys())
         if paramspider_stats.get('paramspider_out_of_scope'):
             _record("paramspider-scope", _di.reject, source="paramspider",
                     reason="out_of_scope",
@@ -1657,7 +1670,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             kr_url_methods
         )
         _record("kiterunner", _da.observe_kiterunner, results=kr_results,
-                existing_keys=keys_before_kr, auth_ref=AUTH_REF)
+                existing_keys=keys_before_kr, merged_keys=_merged_keys(),
+                auth_ref=AUTH_REF, auth_revision=AUTH_REVISION)
 
         print(f"[+][Kiterunner] Total: {kr_stats['kr_total']} endpoints")
         print(f"[+][Kiterunner] Parsed: {kr_stats['kr_parsed']}")
@@ -1681,7 +1695,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             urlscan_rows, organized_data['by_base_url'], live_bases(recon_data), target_domains)
         _record("urlscan", _da.observe_crawl, source="urlscan",
                 urls=[row.get("full_url", "") for row in urlscan_rows if row.get("full_url")],
-                auth_ref=AUTH_REF, existing_keys=keys_before_urlscan)
+                auth_ref=AUTH_REF, auth_revision=AUTH_REVISION,
+                existing_keys=keys_before_urlscan, merged_keys=_merged_keys())
         print(f"[+][URLScan] by_base_url: {us_stats['urlscan_new']} new, "
               f"{us_stats['urlscan_overlap']} shared with other sources, "
               f"{us_stats['urlscan_not_live']} on bases not live in this scan (skipped)")
@@ -1713,7 +1728,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             # a later reader cannot mistake a filled template for a request that
             # was made.
             _record("openapi", _da.observe_openapi, payload=openapi_payload,
-                    existing_keys=keys_before_openapi, auth_ref=AUTH_REF)
+                    existing_keys=keys_before_openapi, merged_keys=_merged_keys(),
+                    auth_ref=AUTH_REF, auth_revision=AUTH_REVISION)
             print(f"[+][OpenAPI] Documents: {len(openapi_payload['documents'])}")
             print(f"[+][OpenAPI] Operations: {oa_stats['openapi_operations']}")
             print(f"[+][OpenAPI] New endpoints: {oa_stats['openapi_new']}")

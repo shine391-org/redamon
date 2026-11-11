@@ -50,6 +50,28 @@ from urllib.parse import urlsplit
 KEY = "discovery_inventory"
 SCHEMA_VERSION = 1
 
+#: Version of the context-aware observation identity. A reader comparing
+#: identities across two artifacts must not silently mix two versions, so the
+#: version is part of the identity string and of the hashed material.
+OBSERVATION_ID_VERSION = 1
+REJECTED_ID_VERSION = 1
+
+#: Per-producer cap on the retained INPUT ledger. The ledger accounts for every
+#: input a producer received; past the cap the total keeps growing and the
+#: surplus is counted, so backpressure is observable rather than silent.
+MAX_INPUT_LEDGER_PER_SOURCE = 1000
+
+#: Dispositions that imply the observation was merged into ``by_base_url``.
+#: An observation carrying one of these that the structure lacks is a real
+#: identity mismatch. The remaining dispositions are evidence the structure is
+#: not expected to carry: js_recon candidates, declared-only templates, spec
+#: documents, and rows the caller's own merge skipped.
+MERGED_DISPOSITIONS = frozenset({
+    "merged_new", "overlap_existing",
+    "param_new_endpoint", "param_enrich_existing",
+    "declared_only_new", "declared_observed_overlap",
+})
+
 #: Producer tools that write observations. A tool not listed here cannot be
 #: blamed for an absence: an unlisted producer is an unknown producer.
 PRODUCERS = (
@@ -114,6 +136,123 @@ def _sha(raw: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
 
 
+def _producer(inventory: dict, source: str) -> dict:
+    """The per-producer block, including its input ledger.
+
+    One shape, built in one place: ``add_observation``, ``reject``,
+    ``reject_input`` and ``record_raw_evidence`` all used to repeat it, and a
+    new accounting field added to one of them would have silently differed from
+    the others.
+    """
+    return inventory["producers"].setdefault(source, {
+        "observations": [], "observations_total": 0, "truncated": None,
+        "rejected": {}, "raw_evidence": {},
+        "input_ledger": {"total": 0, "entries": [], "truncated": None},
+    })
+
+
+def observation_id(obs: dict) -> str:
+    """Versioned, context-aware identity of one observation.
+
+    Distinct from ``raw_ref`` on purpose. ``raw_ref`` is a hash of the raw
+    producer record, so the SAME record observed under two request contexts
+    (another auth profile, another method, another parameter schema) collapses
+    to one identity and the second context is lost. This identity is built from
+    the request context instead: producer, origin, path, method, the parameter
+    schema with its encoding marker, and the auth profile reference/revision.
+
+    Raw values are never hashed. Query samples, bodies and headers can carry a
+    credential, so they stay in the raw record (hashed as ``raw_ref``, never
+    copied) and only their NAMES, positions, types and encoding markers enter
+    the identity.
+    """
+    params = []
+    for param in obs.get("parameters") or []:
+        if not isinstance(param, dict):
+            continue
+        params.append({
+            "name": param.get("name"),
+            "position": param.get("position"),
+            "type": param.get("type"),
+            "encoding": param.get("sample_values_encoding"),
+        })
+    parts = {
+        "v": OBSERVATION_ID_VERSION,
+        "source": obs.get("source", ""),
+        "origin": obs.get("origin", ""),
+        "path": obs.get("path", ""),
+        "method": obs.get("method", ""),
+        "parameters": params,
+        "auth_ref": obs.get("auth_profile_ref", ""),
+        "auth_revision": obs.get("auth_profile_revision", ""),
+    }
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=True, default=str)
+    return "obs_v1:" + hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
+
+
+def rejected_identity(source: str, ref: str, reason: str) -> str:
+    """Stable identity for one rejected input.
+
+    Built from the producer, the input's stable reference and the reason - never
+    from the input's own value, which is the thing that made it malformed and
+    may be a credential.
+    """
+    parts = {"v": REJECTED_ID_VERSION, "source": source, "ref": ref, "reason": reason}
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=True)
+    return "rej_v1:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def safe_input_ref(source: str, index: int) -> str:
+    """A stable, safe reference for one input position.
+
+    Positional, so it carries no target text at all: a producer that received a
+    malformed URL still accounts for it without echoing the value into the
+    artifact.
+    """
+    return f"{source}:input:{int(index)}"
+
+
+def _ledger_add(producer: dict, entry: dict) -> None:
+    """Append one input to the producer's ledger, bounding it explicitly."""
+    ledger = producer.setdefault("input_ledger",
+                                 {"total": 0, "entries": [], "truncated": None})
+    ledger["total"] += 1
+    if len(ledger["entries"]) < MAX_INPUT_LEDGER_PER_SOURCE:
+        ledger["entries"].append(entry)
+        return
+    truncated = ledger.get("truncated")
+    if truncated is None:
+        truncated = ledger["truncated"] = {
+            "limit": MAX_INPUT_LEDGER_PER_SOURCE, "dropped": 0,
+            "reason": "input_ledger_cap_evidence_only",
+        }
+    truncated["dropped"] += 1
+
+
+def ledger_identities(inventory: dict) -> Dict[str, set]:
+    """Every identity the producers' input ledgers assert, by disposition.
+
+    ``retained`` are observation identities the producer says it kept;
+    ``rejected`` are the identities of inputs it refused. A reconciliation that
+    only compares counts cannot tell these two sets apart from the observations
+    that actually survived, which is the gap this exposes.
+    """
+    retained: set = set()
+    rejected: set = set()
+    for data in (inventory.get("producers") or {}).values():
+        for entry in ((data or {}).get("input_ledger") or {}).get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            identity = entry.get("identity")
+            if not identity:
+                continue
+            if entry.get("disposition") == "rejected":
+                rejected.add(identity)
+            else:
+                retained.add(identity)
+    return {"retained": retained, "rejected": rejected}
+
+
 def origin_of(url: str) -> str:
     """``scheme://host[:port]`` for an HTTP(S) URL, else ``""``.
 
@@ -173,6 +312,11 @@ def new_inventory() -> dict:
             "inventory_distinct_endpoints": None,
             "summary_total_parameters": None,
             "inventory_distinct_parameters": None,
+            "observed_distinct_endpoints": None,
+            "observed_identities": 0,
+            "ledger_identities": 0,
+            "unaccounted_identities": [],
+            "identity_match": None,
             "match": None,
             "mismatches": [],
             "overlap_note": (
@@ -232,12 +376,18 @@ def observation(
     query: Iterable = (),
     body: Iterable = (),
     auth_profile_ref: str = "",
+    auth_profile_revision: str = "",
     validation: Optional[dict] = None,
     disposition: str = "",
     evidence: Optional[dict] = None,
     raw_locator: str = "",
 ) -> dict:
-    """One versioned observation. ``raw`` is hashed, never stored."""
+    """One versioned observation. ``raw`` is hashed, never stored.
+
+    ``auth_profile_revision`` is the profile's own revision marker (a version or
+    timestamp the caller already holds), never a header value: two observations
+    under the same profile NAME but different revisions are different contexts.
+    """
     if source not in PRODUCERS:
         raise ValueError(f"unknown discovery producer {source!r}")
     method = method_of(method)
@@ -265,6 +415,8 @@ def observation(
     if auth_profile_ref:
         # A reference only: profile id/name, never a header value or credential.
         entry["auth_profile_ref"] = _clip(str(auth_profile_ref), 128)
+    if auth_profile_revision:
+        entry["auth_profile_revision"] = _clip(str(auth_profile_revision), 64)
     state = {"status": "unknown"}
     if isinstance(validation, dict):
         status = validation.get("status")
@@ -287,19 +439,28 @@ def observation(
             continue
     if kept_evidence:
         entry["evidence"] = kept_evidence
+    entry["observation_id"] = observation_id(entry)
     return entry
 
 
-def add_observation(inventory: dict, obs: dict) -> dict:
-    """Append one observation, bounding the producer's retention explicitly."""
+def add_observation(inventory: dict, obs: dict, ref: Optional[str] = None) -> dict:
+    """Append one observation, bounding the producer's retention explicitly.
+
+    Every append is also an input the producer received, so the input ledger
+    records it with a stable reference whether or not the observation cap keeps
+    it: a dropped observation is backpressure the artifact must show, not a
+    silent absence.
+    """
     if not isinstance(obs, dict) or not obs.get("raw_ref"):
         return inventory
     source = obs.get("source", "")
-    producer = inventory["producers"].setdefault(source, {
-        "observations": [], "observations_total": 0, "truncated": None,
-        "rejected": {}, "raw_evidence": {},
-    })
+    producer = _producer(inventory, source)
     producer["observations_total"] += 1
+    _ledger_add(producer, {
+        "ref": _clip(str(ref or f"{source}:observation:{obs.get('observation_id')}"), 256),
+        "identity": obs.get("observation_id") or "",
+        "disposition": "retained",
+    })
     limit = MAX_OBSERVATIONS_PER_SOURCE
     if len(producer["observations"]) >= limit:
         # Bounded retention, observable: the count of what was not copied.
@@ -340,13 +501,34 @@ def add_observation(inventory: dict, obs: dict) -> dict:
 
 
 def reject(inventory: dict, source: str, reason: str, count: int = 1) -> dict:
-    """Record an input a producer refused, so an absence is never silent."""
-    producer = inventory["producers"].setdefault(source, {
-        "observations": [], "observations_total": 0, "truncated": None,
-        "rejected": {}, "raw_evidence": {},
-    })
+    """Record inputs a producer refused, so an absence is never silent.
+
+    Aggregate form: the caller counted a group of inputs it did not retain and
+    names the reason. Per-input accounting is ``reject_input``.
+    """
+    producer = _producer(inventory, source)
     bucket = producer["rejected"]
     bucket[reason] = bucket.get(reason, 0) + int(count or 0)
+    return inventory
+
+
+def reject_input(inventory: dict, source: str, reason: str, ref: str) -> dict:
+    """Account for ONE malformed/rejected input by stable safe identity.
+
+    The reference is positional (``safe_input_ref``) or supplied by the adapter;
+    the input's own value is never hashed or stored, because a malformed value is
+    exactly where a credential would be echoed into the artifact.
+    """
+    producer = _producer(inventory, source)
+    bucket = producer["rejected"]
+    bucket[reason] = bucket.get(reason, 0) + 1
+    safe_ref = _clip(str(ref), 256)
+    _ledger_add(producer, {
+        "ref": safe_ref,
+        "identity": rejected_identity(source, safe_ref, reason),
+        "disposition": "rejected",
+        "reason": _clip(reason, 128),
+    })
     return inventory
 
 
@@ -356,10 +538,7 @@ def record_raw_evidence(inventory: dict, source: str, record: dict) -> dict:
     ``record`` must contain no response body and no header value: this lives in
     the recon artifact, which is not a secrets store.
     """
-    producer = inventory["producers"].setdefault(source, {
-        "observations": [], "observations_total": 0, "truncated": None,
-        "rejected": {}, "raw_evidence": {},
-    })
+    producer = _producer(inventory, source)
     cleaned = {}
     for key, value in (record or {}).items():
         if value is None:
@@ -464,23 +643,33 @@ def recompute_counts(by_base_url: dict) -> dict:
 
 
 def reconcile(inventory: dict, by_base_url: dict, summary: Optional[dict] = None) -> dict:
-    """Compare the inventory's distinct identities with the run's own summary.
+    """Reconcile the inventory against the run's own summary, BY IDENTITY.
 
-    Equality of counts is NOT the test: the summary counts graph-shaped nodes
-    while the inventory counts raw observations, and overlap is expected. What
-    this checks is that every summary number can be recomputed from the
-    inventory, and that a mismatch is reported rather than absorbed.
+    Equality of counts is NOT the test and never was sufficient: a synthetic
+    input ``/lost`` and a structural output ``/different`` with matching totals
+    reconcile clean under a counter comparison. Three things are checked here:
+
+    1. every summary counter can be recomputed from the structure;
+    2. every identity the producers' INPUT LEDGERS assert as retained is an
+       observation that actually survived (the cap or a merge dropped none
+       silently), and every retained observation was an input (none is phantom);
+    3. every observation whose disposition says it was merged into
+       ``by_base_url`` is present in the structure, so an observation lost
+       between the producer and the merge is named by identity.
     """
     distinct = set()
     parameters = 0
-    for base_data in (by_base_url or {}).values():
+    structure_keys = set()
+    for base, base_data in (by_base_url or {}).items():
         if not isinstance(base_data, dict):
             continue
+        origin = base_data.get("base_url") or origin_of(base)
         for path, endpoint in (base_data.get("endpoints") or {}).items():
+            structure_keys.add((origin, path))
             if not isinstance(endpoint, dict):
                 continue
             for method in dict.fromkeys(endpoint.get("methods") or ["GET"]):
-                distinct.add((base_data.get("base_url", ""), path, method))
+                distinct.add((origin, path, method))
             params = endpoint.get("parameters") or {}
             parameters += sum(len(params.get(position) or [])
                               for position in ("query", "body", "path"))
@@ -495,13 +684,74 @@ def reconcile(inventory: dict, by_base_url: dict, summary: Optional[dict] = None
                     "field": key, "claimed": claimed, "recomputed": actual,
                     "reason": "summary_counter_drift",
                 })
+
+    # (2) ledger identities against the observations that survived.
+    observed_identities = set()
+    observed_endpoints = set()
+    ledger = ledger_identities(inventory)
+    ledger_truncated = []
+    for source, data in (inventory.get("producers") or {}).items():
+        data = data or {}
+        for obs in data.get("observations") or []:
+            if not isinstance(obs, dict):
+                continue
+            identity = obs.get("observation_id")
+            if identity:
+                observed_identities.add(identity)
+            observed_endpoints.add((obs.get("origin", ""), obs.get("path", ""),
+                                    obs.get("method", "")))
+        trunc = (data.get("input_ledger") or {}).get("truncated")
+        if isinstance(trunc, dict) and trunc.get("dropped"):
+            ledger_truncated.append({
+                "source": source, "limit": trunc.get("limit"),
+                "dropped": trunc.get("dropped"), "reason": trunc.get("reason"),
+            })
+    unaccounted = sorted(ledger["retained"] - observed_identities)
+    phantom = sorted(observed_identities - ledger["retained"] - ledger["rejected"])
+    for identity in unaccounted:
+        mismatches.append({
+            "field": "input_ledger", "identity": identity,
+            "reason": "ledger_retained_but_observation_absent",
+        })
+    for identity in phantom:
+        mismatches.append({
+            "field": "observation_id", "identity": identity,
+            "reason": "observation_without_input_ledger_entry",
+        })
+
+    # (3) a merged observation the structure lacks is a lost identity.
+    for source, data in (inventory.get("producers") or {}).items():
+        for obs in (data or {}).get("observations") or []:
+            if not isinstance(obs, dict):
+                continue
+            if obs.get("disposition") not in MERGED_DISPOSITIONS:
+                continue
+            key = (obs.get("origin", ""), obs.get("path", ""))
+            if key not in structure_keys:
+                mismatches.append({
+                    "field": "observation_not_in_structure",
+                    "identity": obs.get("observation_id"),
+                    "source": source,
+                    "origin": obs.get("origin"),
+                    "path": obs.get("path"),
+                    "method": obs.get("method"),
+                    "disposition": obs.get("disposition"),
+                    "reason": "merged_disposition_but_absent_from_by_base_url",
+                })
+
     inventory["reconciliation"].update({
         "summary_total_endpoints": (summary or {}).get("total_endpoints"),
         "inventory_distinct_endpoints": len(distinct),
         "summary_total_parameters": (summary or {}).get("total_parameters"),
         "inventory_distinct_parameters": parameters,
+        "observed_distinct_endpoints": len(observed_endpoints),
+        "observed_identities": len(observed_identities),
+        "ledger_identities": len(ledger["retained"] | ledger["rejected"]),
+        "unaccounted_identities": unaccounted,
+        "identity_match": not unaccounted and not phantom,
         "match": not mismatches,
         "mismatches": mismatches,
+        "ledger_truncated": ledger_truncated,
     })
     return inventory
 
@@ -520,12 +770,46 @@ def deserialize(text: str) -> dict:
     return data
 
 
+def _merge_ledger(a: dict, b: dict) -> dict:
+    """Fold two groups' input ledgers, keeping the cap observable.
+
+    The ledger is the INPUT side of the accounting, so both groups' entries are
+    kept; only the retained list is capped, and the surplus is counted.
+    """
+    merged = {"total": 0, "entries": [], "truncated": None}
+    dropped = 0
+    for source in (a, b):
+        ledger = source.get("input_ledger") or {}
+        merged["total"] += int(ledger.get("total") or 0)
+        for entry in ledger.get("entries") or []:
+            if len(merged["entries"]) < MAX_INPUT_LEDGER_PER_SOURCE:
+                merged["entries"].append(entry)
+            else:
+                dropped += 1
+        trunc = ledger.get("truncated")
+        if isinstance(trunc, dict) and trunc.get("dropped"):
+            dropped += int(trunc.get("dropped") or 0)
+            merged["truncated"] = {
+                "limit": MAX_INPUT_LEDGER_PER_SOURCE, "dropped": dropped,
+                "reason": "input_ledger_cap_evidence_only",
+            }
+    if dropped and merged["truncated"] is None:
+        merged["truncated"] = {
+            "limit": MAX_INPUT_LEDGER_PER_SOURCE, "dropped": dropped,
+            "reason": "input_ledger_cap_evidence_only",
+        }
+    return merged
+
+
 def merge_inventories(older: Optional[dict], newer: Optional[dict]) -> dict:
     """Fold two groups' inventories without losing either one's evidence.
 
-    Observations are deduplicated by ``raw_ref``: the same raw record seen by
-    two groups is one observation, while two different raw records that happen
-    to describe the same path stay two observations (unproved equivalence).
+    Observations are deduplicated by ``(observation_id, raw_ref)``. The
+    identity is the request CONTEXT; the raw_ref is the raw RECORD. Two groups
+    that observed the same record under the same context are one observation.
+    The same record under a different auth profile, method or parameter schema
+    is a DIFFERENT observation and both survive: the old raw_ref-only key
+    coalesced them and lost the second context.
     """
     if not isinstance(older, dict):
         return newer if isinstance(newer, dict) else new_inventory()
@@ -542,15 +826,16 @@ def merge_inventories(older: Optional[dict], newer: Optional[dict]) -> dict:
         a = (older.get("producers") or {}).get(source) or {}
         b = (newer.get("producers") or {}).get(source) or {}
         observations = []
-        refs = set()
+        seen = set()
         dropped = 0
         for obs in list(a.get("observations") or []) + list(b.get("observations") or []):
-            ref = obs.get("raw_ref")
-            if ref and ref in refs:
+            if not isinstance(obs, dict):
+                continue
+            key = (obs.get("observation_id") or "", obs.get("raw_ref") or "")
+            if key in seen:
                 dropped += 1
                 continue
-            if ref:
-                refs.add(ref)
+            seen.add(key)
             observations.append(obs)
         producer = {
             "observations": observations,
@@ -559,11 +844,12 @@ def merge_inventories(older: Optional[dict], newer: Optional[dict]) -> dict:
             "truncated": None,
             "rejected": {},
             "raw_evidence": {**(a.get("raw_evidence") or {}), **(b.get("raw_evidence") or {})},
+            "input_ledger": _merge_ledger(a, b),
         }
         if dropped:
             producer["truncated"] = {
                 "limit": MAX_OBSERVATIONS_PER_SOURCE, "dropped": dropped,
-                "reason": "duplicate_raw_ref_across_groups",
+                "reason": "duplicate_observation_identity_across_groups",
             }
         for key in set(a.get("rejected") or {}) | set(b.get("rejected") or {}):
             producer["rejected"][key] = ((a.get("rejected") or {}).get(key, 0)
@@ -623,3 +909,81 @@ def summary_of(inventory: dict) -> dict:
         "reconciliation": dict(inventory.get("reconciliation") or {}),
         "truncated": dict(inventory.get("truncated") or {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# Persisted-artifact reader
+# ---------------------------------------------------------------------------
+
+#: Top-level inventory fields a reader may project.
+SELECTED_FIELDS = ("schema_version", "producers", "origins", "consumers",
+                   "reconciliation", "truncated", "inputs")
+
+#: Per-observation fields a reader may project. ``evidence`` and ``raw_locator``
+#: are excluded: the first is producer response metadata that belongs to the
+#: artifact, the second is a producer-local pointer that means nothing outside
+#: the run that produced it.
+SELECTED_OBSERVATION_FIELDS = (
+    "observation_id", "raw_ref", "source", "origin", "path", "method",
+    "auth_profile_ref", "auth_profile_revision", "disposition", "parameters",
+    "validation",
+)
+
+
+def select_persisted_fields(inventory: dict) -> dict:
+    """The inventory's selected fields, with each observation projected.
+
+    A reader that returns the whole artifact would carry response metadata and
+    producer-local locators into an API response that never asked for them.
+    """
+    if not isinstance(inventory, dict):
+        return {}
+    out = {key: inventory.get(key) for key in SELECTED_FIELDS if key in inventory}
+    producers = {}
+    for source, data in (inventory.get("producers") or {}).items():
+        if not isinstance(data, dict):
+            continue
+        entry = {
+            "observations": [
+                {k: obs.get(k) for k in SELECTED_OBSERVATION_FIELDS if k in obs}
+                for obs in (data.get("observations") or []) if isinstance(obs, dict)
+            ],
+            "observations_total": int(data.get("observations_total") or 0),
+            "truncated": data.get("truncated"),
+            "rejected": dict(data.get("rejected") or {}),
+        }
+        ledger = data.get("input_ledger")
+        if isinstance(ledger, dict):
+            entry["input_ledger"] = {
+                "total": int(ledger.get("total") or 0),
+                "entries": list(ledger.get("entries") or []),
+                "truncated": ledger.get("truncated"),
+            }
+        producers[source] = entry
+    out["producers"] = producers
+    return out
+
+
+def read_persisted_inventory(artifact: Any) -> dict:
+    """Read the discovery inventory a recon artifact persisted.
+
+    Honors only what is persisted. An absent key, a non-dict value, an
+    unsupported schema version or a malformed producer block returns
+    ``status: "unknown"`` with a reason, never an empty inventory that a caller
+    would read as "scanned and clean".
+    """
+    if not isinstance(artifact, dict):
+        return {"status": "unknown", "reason": "artifact_not_an_object"}
+    inventory = artifact.get(KEY)
+    if inventory is None:
+        return {"status": "unknown", "reason": "inventory_not_persisted"}
+    if not isinstance(inventory, dict):
+        return {"status": "unknown", "reason": "inventory_not_an_object"}
+    version = inventory.get("schema_version")
+    if version != SCHEMA_VERSION:
+        return {"status": "unknown", "reason": "unsupported_schema_version",
+                "schema_version": version}
+    if not isinstance(inventory.get("producers"), dict):
+        return {"status": "unknown", "reason": "producers_not_an_object"}
+    return {"status": "known", "schema_version": version,
+            "inventory": select_persisted_fields(inventory)}
