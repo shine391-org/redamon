@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
@@ -113,6 +114,9 @@ export async function POST(request: NextRequest) {
     } else {
       body = await request.json()
     }
+
+    const plannerProblem = plannerWriteProblem(body)
+    if (plannerProblem) return NextResponse.json({ error: plannerProblem, code: 'setting_rejected' }, { status: 400 })
 
     if ('openapiSources' in body) body.openapiSources = cleanOpenApiSources(body.openapiSources)
     const openapiError = validateOpenApiSettings(body)

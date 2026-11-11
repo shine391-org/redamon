@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { getGraphSession } from '@/app/api/graph/neo4j'
@@ -259,6 +260,24 @@ export async function POST(request: NextRequest) {
       roeEnabled: _roeEnabledLegacy,
       ...bundleFields
     } = projectData
+    const plannerProblem = plannerWriteProblem(bundleFields)
+    if (plannerProblem) return NextResponse.json({ error: plannerProblem, code: 'setting_rejected' }, { status: 400 })
+
+    // Presets are written after the project, without a surrounding transaction.
+    // Preflight their planner controls now so a refusal leaves NO partial import.
+    // Other legacy preset errors keep their existing per-row skip/report policy.
+    const plannerPresetsFile = zip.file('presets/user_project_presets.json')
+    if (plannerPresetsFile) {
+      let presets: unknown
+      try { presets = JSON.parse(await plannerPresetsFile.async('text')) } catch { /* reported by preset import below */ }
+      for (const preset of Array.isArray(presets) ? presets : []) {
+        const settings = preset?.settings
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) continue
+        const problem = plannerWriteProblem(settings)
+        if (problem) return NextResponse.json({ error: problem, code: 'setting_rejected' }, { status: 400 })
+      }
+    }
+
     // Columns only: the bundle is untrusted, and a relation key in it would be
     // a nested write past that relation's own import checks (node filters
     // arriving armed, a run that never goes stale). Export writes columns only.

@@ -261,6 +261,7 @@ export async function createReconPreset(ctx: McpContext, args: CreatePresetArgs)
   } else if (args.fromPresetId !== undefined) {
     const from = await resolvePreset(ctx.token.userId, args.fromPresetId)
     if (!from) throw notFound(args.fromPresetId)
+    if (from.source === 'user' && from.plannerWriteProblem) throw refusedSetting(from.plannerWriteProblem, '')
     raw = from.settings
     origin = `${from.source}:${from.id}`
     hint = from.source === 'user'
@@ -527,6 +528,9 @@ export async function applyReconPreset(
 
   const preset = await resolvePreset(ctx.token.userId, args.presetId)
   if (!preset) throw notFound(args.presetId)
+  // A legacy preset may carry unsupported names that the read projection drops.
+  // Refuse before defaults, replacement or persistence; never claim they applied.
+  if (preset.source === 'user' && preset.plannerWriteProblem) throw refusedSetting(preset.plannerWriteProblem, '')
 
   let defaults: Record<string, unknown>
   try {
