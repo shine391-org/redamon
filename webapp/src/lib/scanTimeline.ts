@@ -247,6 +247,14 @@ export interface CreateScanJobInput {
   targets?: string[]
   /** digestScopeDocument of the RoE text in force when the run started. */
   roeTextSha256?: string | null
+  /**
+   * G2-R3: pointer to the run-scoped plan manifest written before the
+   * vuln_scan tool launched. Only the pointer, its sha256 digest and a bounded
+   * summary -- never the full manifest and never credentials.
+   */
+  planManifestPath?: string | null
+  planManifestSha256?: string | null
+  planManifestSummary?: Record<string, unknown> | null
 }
 
 export async function createScanJob(input: CreateScanJobInput): Promise<{ id: string }> {
@@ -267,10 +275,63 @@ export async function createScanJob(input: CreateScanJobInput): Promise<{ id: st
       authorizationId: input.authorizationId ?? null,
       targets: input.targets ?? [],
       roeTextSha256: input.roeTextSha256 ?? null,
+      planManifestPath: input.planManifestPath ?? null,
+      planManifestSha256: input.planManifestSha256 ?? null,
+      planManifestSummary: input.planManifestSummary ?? undefined,
       startedAt: status === 'running' ? new Date() : null,
     },
     select: { id: true },
   })
+}
+
+/**
+ * G2-R3: persist a run-scoped plan-manifest pointer on the open ScanJob row.
+ *
+ * The orchestrator reports the pointers it read from the run's manifest index
+ * on every status poll; this writes the first one (or the one matching the
+ * run) onto the history row so the plan is traceable after the run ends. The
+ * full manifest is never stored here -- only pointer + digest + bounded
+ * summary. Best-effort: a failure is logged and swallowed, because history
+ * bookkeeping must never break a status poll.
+ */
+export async function persistPlanManifest(input: {
+  projectId: string
+  kind: string
+  runId?: string
+  pointer: {
+    plan_manifest_path: string
+    plan_manifest_sha256: string
+    plan_manifest_summary: Record<string, unknown>
+  }
+}): Promise<void> {
+  try {
+    const summary = input.pointer.plan_manifest_summary ?? {}
+    const pointerRunId = typeof summary.run_id === 'string' ? summary.run_id : ''
+    const open = await prisma.scanJob.findFirst({
+      where: {
+        projectId: input.projectId,
+        kind: input.kind,
+        status: { in: ['running', 'queued'] },
+        // The manifest's own run id is authoritative when the row has none
+        // (full_recon rows carry runId=''). A row-keyed kind must match it.
+        ...(input.runId ? { runId: input.runId } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, planManifestPath: true },
+    })
+    if (!open || open.planManifestPath) return
+    await prisma.scanJob.update({
+      where: { id: open.id },
+      data: {
+        planManifestPath: input.pointer.plan_manifest_path,
+        planManifestSha256: input.pointer.plan_manifest_sha256,
+        planManifestSummary: summary,
+      },
+    })
+    void pointerRunId
+  } catch (err) {
+    console.error('[scanTimeline] could not persist plan manifest (continuing):', err)
+  }
 }
 
 /**

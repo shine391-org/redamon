@@ -11,17 +11,33 @@ candidate; none of them is skipped or xfailed to buy acceptance.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import stat
 import sys
 import tempfile
+import types as _types
 from pathlib import Path
 from unittest.mock import patch
+
+# Stub `dns` (dnspython) so `recon.helpers` imports without the package locally.
+_dns = _types.ModuleType("dns")
+_dns.__path__ = []
+for _sub in ("resolver", "zone", "query", "exception", "rdatatype", "rdataclass", "name", "reversename", "rcode", "ttl", "tokenizer"):
+    _mod = _types.ModuleType(f"dns.{_sub}")
+    setattr(_dns, _sub, _mod)
+    sys.modules[f"dns.{_sub}"] = _mod
+sys.modules["dns"] = _dns
+
+for _missing in ("whois", "neo4j", "graph_db"):
+    if _missing not in sys.modules:
+        sys.modules[_missing] = _types.ModuleType(_missing)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "recon"))
 
+from recon.helpers import planner_manifest as pm  # noqa: E402
 from recon.helpers.planner_manifest import (  # noqa: E402
     MODE_OFF, build_manifest, manifest_digest, manifest_path,
     read_manifest, read_manifest_in_context, write_manifest,
@@ -359,7 +375,7 @@ def test_partial_run_nuclei_manifest_before_vuln_scan(monkeypatch):
     class Halt(BaseException):
         pass
 
-    def fake_write(s, output_file=None):
+    def fake_write(s, output_file=None, **kwargs):
         captured["order"].append("manifest")
         captured["manifest_settings"] = dict(s)
         return {"plan_manifest_path": "/x.json",
@@ -394,7 +410,93 @@ def test_partial_run_nuclei_manifest_before_vuln_scan(monkeypatch):
     assert captured["order"] == ["manifest", "vuln_scan"]
     ms = captured["manifest_settings"]
     assert ms.get("PLANNER_GROUP_ID") == "partial:nuclei"
-    # Canonical partial job context: tenant/project/run/group from the job,
-    # not fabricated defaults or a fresh random id per call.
     for key in ("PLANNER_TENANT", "PLANNER_PROJECT_ID", "PLANNER_RUN_ID"):
         assert key in ms
+
+# ---------------------------------------------------------------------------
+# B4/B5 — honest accounting provenance (real scope roots, hashed templates,
+# hashed observed inputs) and the run pointer index
+# ---------------------------------------------------------------------------
+
+def test_scope_roots_from_settings_batch_first():
+    settings = {"SCOPE_GROUPS": [{"scanRoot": "synthetic.test"}, {"root_domain": "other.test"}]}
+    assert pm.scope_roots_from_settings(settings) == ["synthetic.test", "other.test"]
+
+def test_scope_roots_from_settings_legacy_fallback():
+    settings = {"TARGET_DOMAIN": "synthetic.test", "TARGET_IPS": ["1.2.3.4", "5.6.7.8"]}
+    assert pm.scope_roots_from_settings(settings) == ["synthetic.test", "1.2.3.4", "5.6.7.8"]
+    assert pm.scope_roots_from_settings({}) == []
+
+def test_template_hashes_from_settings():
+    settings = {"NUCLEI_TEMPLATES": ["cves/2024.yaml", "cves/2024.yaml"],
+                "NUCLEI_TAGS": ["cve", "xss"], "NUCLEI_CUSTOM_TEMPLATES": []}
+    hashes = pm.template_hashes_from_settings(settings)
+    assert "cves/2024.yaml" in hashes
+    assert len(hashes["cves/2024.yaml"]) == 64
+    assert "cve" in hashes and "xss" in hashes
+    assert hashes["cves/2024.yaml"] == hashlib.sha256("cves/2024.yaml".encode()).hexdigest()
+    assert pm.template_hashes_from_settings({}) == {}
+
+def test_input_accounting_from_recon_data():
+    recon_data = {"http_probe": {"by_url": {"https://synthetic.test/a": {},
+                                             "https://synthetic.test/b": {}}},
+                  "resource_enum": {"discovered_urls": ["https://synthetic.test/c"]},
+                  "subdomains": ["synthetic.test"]}
+    hashes, count = pm.input_accounting_from_recon_data(recon_data)
+    assert count == 4
+    assert set(hashes) == {"https://synthetic.test/a", "https://synthetic.test/b",
+                           "https://synthetic.test/c", "synthetic.test"}
+    assert all(len(h) == 64 for h in hashes.values())
+    assert pm.input_accounting_from_recon_data({}) == ({}, 0)
+    assert pm.input_accounting_from_recon_data(None) == ({}, 0)
+
+def test_pointer_index_roundtrip(tmp_path):
+    base = tmp_path / "manifests"
+    ptr1 = {"plan_manifest_path": "x/p1.json", "plan_manifest_sha256": "a" * 64,
+            "plan_manifest_summary": {"run_id": "r", "group_id": "g"}}
+    pm.write_pointer_index(base, "p1", "r1", ptr1)
+    got = pm.read_pointer_index(base, "p1", "r1")
+    assert got == [ptr1]
+    pm.write_pointer_index(base, "p1", "r1", ptr1)
+    assert pm.read_pointer_index(base, "p1", "r1") == [ptr1]
+    assert pm.read_pointer_index(base, "p1", "r2") == []
+    bad = base / "p1" / "r1" / "pointers.json"
+    bad.write_text("{not json")
+    assert pm.read_pointer_index(base, "p1", "r1") == []
+
+def test_maybe_write_writes_real_accounting_and_index(monkeypatch, tmp_path):
+    monkeypatch.setenv("RECON_RUN_ID", "run9")
+    monkeypatch.setenv("PROJECT_ID", "p1")
+    monkeypatch.setenv("USER_ID", "u1")
+    out = tmp_path / "recon_p1.json"
+    out.write_text("{}")
+    combined = {"metadata": {}, "http_probe": {"by_url": {"https://synthetic.test/a": {}}},
+                "resource_enum": {"discovered_urls": []}, "subdomains": ["synthetic.test"]}
+    settings = {"PLANNER_MANIFEST_ENABLED": True, "PLANNER_TENANT": "t1",
+                "PLANNER_PROJECT_ID": "p1", "PLANNER_GROUP_ID": "g1",
+                "SCOPE_GROUPS": [], "NUCLEI_TEMPLATES": ["cves/2024.yaml"]}
+    ptr = main_mod._write_pre_dispatch_plan_manifest(settings, out, combined, group_id="g1")
+    assert ptr is not None
+    manifest = pm.read_manifest(Path(ptr["plan_manifest_path"]))
+    assert manifest["status"] == "known"
+    assert manifest["scope"] == {"roots": []}
+    assert manifest["template_hashes"] == {"cves/2024.yaml": hashlib.sha256("cves/2024.yaml".encode()).hexdigest()}
+    assert manifest["input_accounting"]["input_count"] == 2
+    assert set(manifest["input_accounting"]["input_hashes"]) == {
+        "https://synthetic.test/a", "synthetic.test"}
+    base = pm.manifest_base_dir(out)
+    idx = pm.read_pointer_index(base, "p1", "run9")
+    assert any(p["plan_manifest_path"] == ptr["plan_manifest_path"] for p in idx)
+    assert manifest["run_id"] == "run9"
+    assert manifest["group_id"] == "g1"
+
+def test_maybe_write_does_not_fabricate_run_id_or_defaults(monkeypatch, tmp_path):
+    monkeypatch.delenv("RECON_RUN_ID", raising=False)
+    monkeypatch.delenv("PARTIAL_RECON_RUN_ID", raising=False)
+    out = tmp_path / "recon.json"
+    out.write_text("{}")
+    settings = {"PLANNER_MANIFEST_ENABLED": True, "PLANNER_TENANT": "t",
+                "PLANNER_PROJECT_ID": "p", "PLANNER_GROUP_ID": "g"}
+    assert main_mod._write_pre_dispatch_plan_manifest(settings, out, {}, group_id="g") is None
+    assert not list((tmp_path / "planner_manifests").rglob("*")) \
+        if (tmp_path / "planner_manifests").exists() else True

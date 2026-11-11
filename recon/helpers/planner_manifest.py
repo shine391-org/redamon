@@ -429,6 +429,171 @@ def plan_pointer(manifest_path_str: str, sha256: str,
     }
 
 
+# ---------------------------------------------------------------------------
+# Honest accounting provenance (G2-R3): the callers feed the real scope roots,
+# template references and observed inputs, never empty placeholders.
+# ---------------------------------------------------------------------------
+
+#: The orchestrator sets this to the HOST path of the recon output directory;
+#: the container's ``/app/recon/output`` is that directory bind-mounted.
+OUTPUT_PATH_ENV = "HOST_RECON_OUTPUT_PATH"
+DEFAULT_OUTPUT_DIR = "/app/recon/output"
+
+
+def default_output_file() -> Path:
+    """The recon output file whose parent holds the planner-manifest base.
+
+    Used by the partial dispatch paths, which have no per-run artifact of their
+    own: the manifest still lands on the shared recon output volume so the
+    webapp/orchestrator can read it back.
+    """
+    out_dir = Path(os.environ.get(OUTPUT_PATH_ENV, DEFAULT_OUTPUT_DIR))
+    project_id = os.environ.get("PROJECT_ID", "")
+    return out_dir / f"recon_{project_id}.json"
+
+
+def manifest_base_dir(output_file: Optional[str | Path]) -> Path:
+    """The base directory for manifests and the run pointer index."""
+    output_path = Path(output_file) if output_file else default_output_file()
+    return output_path.parent / "planner_manifests"
+
+
+def template_hashes_from_settings(settings: dict[str, Any]) -> dict[str, str]:
+    """sha256 of every configured template/tag reference (honest provenance).
+
+    These are hashes of the *references the run was configured with*, not of
+    template file contents (which may not be readable at plan time). They let a
+    reader see which template set a plan covered without storing the set.
+    """
+    refs: list[str] = []
+    for key in ("NUCLEI_TEMPLATES", "NUCLEI_CUSTOM_TEMPLATES",
+                "NUCLEI_SELECTED_CUSTOM_TEMPLATES", "NUCLEI_TAGS",
+                "NUCLEI_EXCLUDE_TEMPLATES", "NUCLEI_EXCLUDE_TAGS"):
+        value = settings.get(key)
+        if isinstance(value, str):
+            refs.append(value)
+        elif isinstance(value, (list, tuple)):
+            refs.extend(v for v in value if isinstance(v, str))
+    return {ref: hashlib.sha256(ref.encode("utf-8")).hexdigest()
+            for ref in refs}
+
+
+def scope_roots_from_settings(settings: dict[str, Any]) -> list[str]:
+    """The roots this run covers, from the job's own scope settings.
+
+    Batch groups first (their ``scanRoot``), then the legacy single target /
+    IP list. Never a fabricated root.
+    """
+    roots: list[str] = []
+    groups = settings.get("SCOPE_GROUPS") or []
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            root = group.get("scanRoot") or group.get("root_domain")
+            if isinstance(root, str) and root:
+                roots.append(root)
+    if roots:
+        return roots
+    target = settings.get("TARGET_DOMAIN")
+    if isinstance(target, str) and target:
+        roots.append(target)
+    ips = settings.get("TARGET_IPS") or []
+    if isinstance(ips, list):
+        roots.extend(ip for ip in ips if isinstance(ip, str) and ip)
+    return roots
+
+
+def input_accounting_from_recon_data(
+        recon_data: Any) -> tuple[dict[str, str], int]:
+    """Honest input accounting: sha256 of every observed scan input.
+
+    Collects the BaseURLs, discovered URLs and subdomains the plan covers, so a
+    reader can tell which inputs a run was planned against. Returns
+    ``(input_hashes, input_count)``; the hashes are url -> sha256(url), bounded
+    by the manifest redaction when written.
+    """
+    urls: set[str] = set()
+    if isinstance(recon_data, dict):
+        http = recon_data.get("http_probe") or {}
+        by_url = http.get("by_url") if isinstance(http, dict) else None
+        if isinstance(by_url, dict):
+            urls.update(u for u in by_url if isinstance(u, str))
+        res = recon_data.get("resource_enum") or {}
+        discovered = res.get("discovered_urls") if isinstance(res, dict) else None
+        if isinstance(discovered, list):
+            urls.update(u for u in discovered if isinstance(u, str))
+        subs = recon_data.get("subdomains") or []
+        if isinstance(subs, list):
+            urls.update(s for s in subs if isinstance(s, str))
+    ordered = sorted(urls)
+    return ({u: hashlib.sha256(u.encode("utf-8")).hexdigest()
+             for u in ordered}, len(ordered))
+
+
+# ---------------------------------------------------------------------------
+# Run pointer index: a small, per-run record of the manifests written for it.
+# The orchestrator/webapp read this to persist and read back the pointer
+# without scanning the whole manifest tree.
+# ---------------------------------------------------------------------------
+
+def pointer_index_path(base_dir: Path, project_id: str, run_id: str) -> Path:
+    """Path of the pointer index for one (project, run)."""
+    return Path(base_dir) / _encode_component(project_id) / \
+        _encode_component(run_id) / "pointers.json"
+
+
+def read_pointer_index(base_dir: Path, project_id: str,
+                       run_id: str) -> list[dict]:
+    """Read the run's pointer index; missing/corrupt -> empty list (unknown)."""
+    path = pointer_index_path(base_dir, project_id, run_id)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    pointers = data.get("pointers") if isinstance(data, dict) else None
+    return [p for p in pointers if isinstance(p, dict)] \
+        if isinstance(pointers, list) else []
+
+
+def write_pointer_index(base_dir: Path, project_id: str, run_id: str,
+                        pointer: dict) -> None:
+    """Append a pointer to the run's index (atomic, best-effort).
+
+    Never raises: the index is an accounting aid. A pointer already present
+    (same path + digest) is not duplicated.
+    """
+    try:
+        path = pointer_index_path(base_dir, project_id, run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = read_pointer_index(base_dir, project_id, run_id)
+        key = (pointer.get("plan_manifest_path"),
+               pointer.get("plan_manifest_sha256"))
+        if any((p.get("plan_manifest_path"),
+                p.get("plan_manifest_sha256")) == key for p in existing):
+            return
+        existing.append(pointer)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                                   prefix=".pointers.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"pointers": existing}, f, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception:  # noqa: BLE001 - the index never fails a scan
+        logger.exception("planner pointer index write failed; scan continues")
+
+
 def _job_context(settings: dict[str, Any]) -> dict[str, str]:
     """Canonical tenant/project/run/group for this run, from job context only.
 
@@ -452,9 +617,58 @@ def _job_context(settings: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def maybe_write_pre_dispatch_manifest(settings: dict[str, Any],
-                                      output_file: Optional[str | Path] = None
-                                      ) -> Optional[dict]:
+def publish_plan_pointer(pointer: dict, settings: dict[str, Any],
+                         kind: str = "full_recon") -> None:
+    """POST the pointer to the webapp's ScanJob-persistence endpoint.
+
+    The recon container holds the scoped SCANNER_API_KEY (or, on older
+    deployments, INTERNAL_API_KEY) and ``WEBAPP_API_URL``. Posting here is how
+    the pointer written by the run-scoped manifest reaches the ScanJob row --
+    the webapp is the single writer of ScanJob history. Best-effort: never
+    raises, so a down webapp never fails a scan.
+    """
+    try:
+        webapp_url = os.environ.get("WEBAPP_API_URL", "")
+        if not webapp_url or not pointer:
+            return
+        key = (os.environ.get("SCANNER_API_KEY") or
+               os.environ.get("INTERNAL_API_KEY", ""))
+        if not key:
+            return
+        import json as _json
+        import urllib.request
+        payload = _json.dumps({
+            "projectId": _job_context(settings)["project_id"] or "",
+            "kind": kind,
+            "runId": _job_context(settings)["run_id"] or "",
+            "pointer": pointer,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{webapp_url.rstrip('/')}/api/internal/scan-jobs/plan-manifest",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Internal-Key": key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except Exception:  # noqa: BLE001 - the pointer publication never fails a scan
+        logger.exception("plan-manifest pointer publication failed; scan continues")
+
+
+def maybe_write_pre_dispatch_manifest(
+        settings: dict[str, Any],
+        output_file: Optional[str | Path] = None,
+        *,
+        scope: Optional[dict[str, Any]] = None,
+        template_hashes: Optional[dict[str, str]] = None,
+        input_hashes: Optional[dict[str, str]] = None,
+        input_count: Optional[int] = None,
+        task_summaries: Optional[list[dict]] = None,
+        group_id: Optional[str] = None,
+        reason: Optional[str] = None) -> Optional[dict]:
     """Write the run-scoped plan manifest before a vuln_scan dispatch.
 
     Only honoured when ``PLANNER_MANIFEST_ENABLED`` is true **and** the job
@@ -463,41 +677,55 @@ def maybe_write_pre_dispatch_manifest(settings: dict[str, Any],
     Never raises: on any failure it returns ``None`` and the scan proceeds
     (the manifest is an accounting aid, never a gate). The file is scoped to
     tenant/project/run/group under ``<output_file parent>/planner_manifests``
-    (or a scratch ``planner_manifests`` base when there is no output file), so
-    a later run or group cannot overwrite it; the returned pointer is what the
+    (or the shared recon output dir when there is no output file), so a later
+    run or group cannot overwrite it; the returned pointer is what the
     caller persists (pointer + digest + bounded summary only).
+
+    ``scope`` / ``template_hashes`` / ``input_hashes`` / ``input_count`` are the
+    caller's honest accounting provenance; when omitted they are derived from
+    the settings (scope roots, template references) or left absent (inputs).
+    The pointer is also appended to the run's pointer index so the
+    orchestrator/webapp can find it without scanning the manifest tree.
     """
     try:
         if not settings.get("PLANNER_MANIFEST_ENABLED"):
             return None
         ctx = _job_context(settings)
+        if group_id is not None:
+            ctx["group_id"] = str(group_id)
         missing = [key for key, value in ctx.items() if not value]
         if missing:
             logger.info(
                 "planner manifest skipped: incomplete job context %s", missing)
             return None
-        output_path = Path(output_file) if output_file else None
-        manifest_base = (
-            output_path.parent / "planner_manifests"
-            if output_path is not None
-            else Path(tempfile.gettempdir()) / "redamon" / "planner_manifests"
-        )
+        output_path = Path(output_file) if output_file else default_output_file()
+        manifest_base = manifest_base_dir(output_path)
         settings_for_manifest = dict(settings)
         settings_for_manifest.update(
             {f"PLANNER_{key.upper()}": value for key, value in ctx.items()})
-        scope = {"roots": settings.get("SCOPE_GROUPS") or []}
+        if scope is None:
+            scope = {"roots": scope_roots_from_settings(settings)}
+        if template_hashes is None:
+            template_hashes = template_hashes_from_settings(settings)
         manifest = build_manifest(
             run_id=ctx["run_id"], group_id=ctx["group_id"],
             tenant=ctx["tenant"], project_id=ctx["project_id"],
             scope=scope, settings=settings_for_manifest,
-            template_hashes={}, task_summaries=[],
-            reason="pre-dispatch vuln_scan plan",
+            template_hashes=template_hashes,
+            task_summaries=task_summaries or [],
+            reason=reason or "pre-dispatch vuln_scan plan",
+            input_hashes=input_hashes, input_count=input_count,
         )
         path = manifest_path(manifest_base, ctx["tenant"], ctx["project_id"],
                              ctx["run_id"], ctx["group_id"])
         written = write_manifest(path, manifest)
-        return plan_pointer(str(path), written["sha256"],
-                            written["summary"])
+        pointer = plan_pointer(str(path), written["sha256"],
+                               written["summary"])
+        write_pointer_index(manifest_base, ctx["project_id"], ctx["run_id"],
+                            pointer)
+        # Callers publish the pointer to the webapp with the correct run kind
+        # (maybe_write_pre_dispatch_manifest itself is kind-agnostic).
+        return pointer
     except Exception:  # noqa: BLE001 - the manifest never fails a scan
         logger.exception("planner manifest write failed; scan continues")
         return None

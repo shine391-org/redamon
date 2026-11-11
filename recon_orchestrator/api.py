@@ -12,6 +12,8 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from pathlib import Path
+
 import docker
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -1241,6 +1243,79 @@ async def get_recon_status(project_id: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     return await container_manager.get_status(project_id)
+
+
+#: G2-R3: the container-side prefix of every plan manifest. A reader must never
+#: accept an arbitrary path from a caller, so the accepted path is contained in
+#: this prefix before it is mapped to the host.
+_PLAN_MANIFEST_PREFIX = "/app/recon/output/planner_manifests/"
+
+
+def _host_manifest_path(container_path: str) -> Optional[str]:
+    """Map a container manifest path to the host path, or None if it escapes.
+
+    The pointer records the path as the container saw it (under
+    /app/recon/output/planner_manifests). The orchestrator reads the same file
+    through its own bind mount, so the /app/recon prefix is replaced by the
+    detected host path. A path outside the manifest prefix is refused.
+    """
+    if not isinstance(container_path, str) or \
+            not container_path.startswith(_PLAN_MANIFEST_PREFIX):
+        return None
+    remainder = container_path[len(_PLAN_MANIFEST_PREFIX):]
+    if not remainder or ".." in Path(remainder).parts:
+        return None
+    return str(Path(RECON_PATH) / "output" / "planner_manifests" / remainder)
+
+
+@app.get("/recon/{project_id}/plan-manifest")
+async def get_recon_plan_manifest(
+    project_id: str,
+    path: str = "",
+    sha256: str = "",
+    tenant: str = "",
+    run_id: str = "",
+    group_id: str = "",
+):
+    """Read back a run's plan manifest, validated against the job context.
+
+    G2-R3 reader half of the manifest lifecycle. The caller supplies the
+    pointer (path + recorded digest) it persisted and the expected job context;
+    this resolves the host path, then calls the manifest helper's
+    ``read_manifest_in_context``. Missing, incomplete, unsupported, tampered
+    or cross-tenant / cross-run / cross-group reads return
+    ``{"status": "unknown"}`` -- never a guessed clean plan.
+    """
+    host_path = _host_manifest_path(path)
+    if not host_path:
+        return {"status": "unknown",
+                "reason": "manifest_path_outside_prefix"}
+    if not sha256:
+        return {"status": "unknown", "reason": "manifest_digest_missing"}
+
+    import sys
+    recon_path = Path("/app/recon")
+    if str(recon_path) not in sys.path:
+        sys.path.insert(0, str(recon_path))
+    try:
+        from recon.helpers.planner_manifest import read_manifest_in_context
+    except Exception as e:  # noqa: BLE001 - a missing helper is unknown
+        return {"status": "unknown",
+                "reason": f"manifest_reader_unavailable: {e}"}
+
+    expected_context = {
+        "tenant": tenant,
+        "project_id": project_id,
+        "run_id": run_id,
+        "group_id": group_id,
+    }
+    try:
+        result = read_manifest_in_context(
+            host_path, expected_context, expected_sha256=sha256)
+    except Exception as e:  # noqa: BLE001 - never raise past the reader
+        return {"status": "unknown",
+                "reason": f"manifest_read_failed: {e}"}
+    return result
 
 
 @app.post("/recon/{project_id}/stop", response_model=ReconState)

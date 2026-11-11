@@ -79,6 +79,11 @@ class ReconState(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     container_id: Optional[str] = None
+    # G2-R3: pointers (path + sha256 + bounded summary) to the run-scoped plan
+    # manifests written before the vuln_scan tool launched. The full manifest
+    # is never carried here -- only the pointer, so the webapp can persist it
+    # on the ScanJob row and read it back through the plan-manifest reader.
+    plan_manifest_pointers: Optional[list] = None
 
 
 class ReconLogEvent(BaseModel):

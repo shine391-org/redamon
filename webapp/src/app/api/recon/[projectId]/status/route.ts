@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { orchestratorFetch } from '@/lib/orchestrator'
-import { reconcileScanJobStatus } from '@/lib/scanTimeline'
+import { reconcileScanJobStatus, persistPlanManifest } from '@/lib/scanTimeline'
 import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
@@ -40,6 +40,26 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     // history row. The orchestrator remains the source of truth for liveness;
     // this is best-effort bookkeeping and never affects the response.
     await reconcileScanJobStatus(projectId, data?.status)
+
+    // G2-R3: persist the plan-manifest pointer(s) the orchestrator read from
+    // the run's manifest index, so the plan is traceable on the ScanJob row.
+    try {
+      const pointers = Array.isArray(data?.plan_manifest_pointers)
+        ? data.plan_manifest_pointers
+        : []
+      for (const p of pointers) {
+        if (typeof p?.plan_manifest_path === 'string' &&
+            typeof p?.plan_manifest_sha256 === 'string') {
+          await persistPlanManifest({
+            projectId,
+            kind: 'full_recon',
+            pointer: p,
+          })
+        }
+      }
+    } catch (err) {
+      console.error('[recon status] plan-manifest persist (continuing):', err)
+    }
 
     return NextResponse.json(data)
 

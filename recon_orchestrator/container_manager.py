@@ -1081,6 +1081,37 @@ class ContainerManager:
         Docker daemon can't stall the single worker and freeze every request."""
         return await self._run_blocking(self._get_status_sync, project_id)
 
+    def _plan_manifest_pointers(self, project_id: str) -> list:
+        """Read the run-scoped plan-manifest pointers for a project.
+
+        The recon container writes a small per-run index under
+        ``<recon output>/planner_manifests/<project_id>/<run_id>/pointers.json``
+        on the shared output volume. This reads every index for the project and
+        returns the pointers (path + sha256 + bounded summary only). Best-effort:
+        a missing or unreadable index yields an empty list, never an error.
+        """
+        pointers: list = []
+        try:
+            base = Path(getattr(self, "recon_host_path", "")
+                        ) / "output" / "planner_manifests"
+            if not base.is_dir():
+                return pointers
+            project_dir = base / project_id
+            if not project_dir.is_dir():
+                return pointers
+            for index in sorted(project_dir.glob("*/pointers.json")):
+                try:
+                    data = json.loads(index.read_text())
+                except (OSError, ValueError):
+                    continue
+                entries = data.get("pointers") if isinstance(data, dict) else None
+                if isinstance(entries, list):
+                    pointers.extend(p for p in entries if isinstance(p, dict))
+        except Exception as e:  # noqa: BLE001 - status must never fail on this
+            logger.warning("plan-manifest pointer read failed for %s: %s",
+                           project_id, e)
+        return pointers
+
     def _get_status_sync(self, project_id: str) -> ReconState:
         """Synchronous Docker inspection body of get_status(). Call ONLY via
         _run_blocking so it never executes directly on the event loop."""
@@ -1091,6 +1122,8 @@ class ContainerManager:
             # the grace) is the stop, not an error, and the task removes the
             # container itself once it has logged that code.
             if state.status == ReconStatus.STOPPING:
+                state.plan_manifest_pointers = self._plan_manifest_pointers(
+                    project_id)
                 return state
 
             # Check if container is still running
@@ -1131,6 +1164,8 @@ class ContainerManager:
                         state.status = ReconStatus.ERROR
                         state.error = f"Docker API error: {e}"
 
+            state.plan_manifest_pointers = self._plan_manifest_pointers(
+                project_id)
             return state
 
         # Check if there's an orphan container
@@ -1142,6 +1177,8 @@ class ContainerManager:
                     project_id=project_id,
                     status=ReconStatus.PAUSED if container.status == "paused" else ReconStatus.RUNNING,
                     container_id=container.id,
+                    plan_manifest_pointers=self._plan_manifest_pointers(
+                        project_id),
                 )
         except NotFound:
             pass
@@ -1149,6 +1186,7 @@ class ContainerManager:
         return ReconState(
             project_id=project_id,
             status=ReconStatus.IDLE,
+            plan_manifest_pointers=self._plan_manifest_pointers(project_id),
         )
 
     async def start_recon(

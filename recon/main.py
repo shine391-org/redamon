@@ -91,7 +91,13 @@ from recon.main_recon_modules.vuln_scan import run_vuln_scan
 from recon.main_recon_modules.add_mitre import run_mitre_enrichment
 from recon.helpers.isolated_result import TopLevelKeys
 from recon.helpers.selection_coverage import KEY as SELECTION_KEY, ARTIFACT_SAVE_LOCK
-from recon.helpers.planner_manifest import maybe_write_pre_dispatch_manifest
+from recon.helpers.planner_manifest import (
+    maybe_write_pre_dispatch_manifest,
+    publish_plan_pointer,
+    input_accounting_from_recon_data,
+    scope_roots_from_settings,
+    template_hashes_from_settings,
+)
 
 #: The one lock every writer of the canonical recon artifact takes. The
 #: isolated vuln_scan wrapper persists its selection plan from a fan-out
@@ -1044,9 +1050,13 @@ def _inject_planner_job_context(settings: dict) -> dict:
     group    -> left empty here; each call site stamps its own group id
     """
     staged = dict(settings)
-    staged["PLANNER_PROJECT_ID"] = str(PROJECT_ID or "")
+    staged["PLANNER_PROJECT_ID"] = str(
+        PROJECT_ID or os.environ.get("PROJECT_ID") or "")
     staged["PLANNER_TENANT"] = str(
-        settings.get("PLANNER_TENANT") or settings.get("USER_ID") or "")
+        settings.get("PLANNER_TENANT")
+        or settings.get("USER_ID")
+        or os.environ.get("USER_ID")
+        or "")
     run_id = os.environ.get("RECON_RUN_ID") or os.environ.get(
         "PARTIAL_RECON_RUN_ID") or ""
     staged["PLANNER_RUN_ID"] = str(run_id)
@@ -1062,7 +1072,9 @@ def _write_pre_dispatch_plan_manifest(settings: dict, output_file,
     The manifest is scoped to tenant/project/run/group and written atomically
     (mode 0600) before the tool runs, so cancellation/restart readback finds it
     and a corrupt, missing or unwritable manifest is explicit unknown rather
-    than a silent all-clear. Never fails the scan.
+    than a silent all-clear. It carries the run's honest accounting: the real
+    scope roots, the configured template references (hashed) and the observed
+    scan inputs (hashed, counted). Never fails the scan.
     """
     try:
         if not settings.get("PLANNER_MANIFEST_ENABLED"):
@@ -1070,13 +1082,27 @@ def _write_pre_dispatch_plan_manifest(settings: dict, output_file,
         staged = _inject_planner_job_context(settings)
         if group_id:
             staged["PLANNER_GROUP_ID"] = str(group_id)
-        ptr = maybe_write_pre_dispatch_manifest(staged, output_file)
+        scope = {"roots": scope_roots_from_settings(staged)}
+        template_hashes = template_hashes_from_settings(staged)
+        input_hashes, input_count = input_accounting_from_recon_data(
+            combined_result)
+        ptr = maybe_write_pre_dispatch_manifest(
+            staged, output_file, scope=scope,
+            template_hashes=template_hashes, input_hashes=input_hashes,
+            input_count=input_count, group_id=group_id or None,
+            reason=f"pre-dispatch vuln_scan plan ({group_id or 'run'})")
         if ptr is not None:
             combined_result.setdefault("metadata", {}).setdefault(
                 "planner_manifest_pointers", []).append(ptr)
             try:
                 save_recon_file(combined_result, output_file)
             except Exception:  # noqa: BLE001
+                pass
+            # Publish so the webapp persists it on the ScanJob row before the
+            # tool launches (or as soon as the status poll observes it).
+            try:
+                publish_plan_pointer(ptr, staged, kind="full_recon")
+            except Exception:  # noqa: BLE001 - publication never fails a scan
                 pass
         return ptr
     except Exception:  # noqa: BLE001 - manifest never fails a scan

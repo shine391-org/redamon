@@ -45,6 +45,7 @@ import {
   rotateToNextVersion,
   rollbackPreparedVersions,
   SnapshotFreezeError,
+  persistPlanManifest,
 } from './scanTimeline'
 
 const CURRENT = {
@@ -435,5 +436,65 @@ describe('P0-2: prepare no longer runs retention', () => {
     await prepareVersionsForFullScan('p1', 'new', 'u1')
 
     expect(prismaMock.scanVersion.findMany).not.toHaveBeenCalled()
+  })
+})
+
+describe('persistPlanManifest', () => {
+  beforeEach(() => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(null)
+    prismaMock.scanJob.update.mockResolvedValue({})
+  })
+
+  test('writes pointer + digest + bounded summary onto the open running row', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue({
+      id: 'j1', planManifestPath: null,
+    })
+    await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: {
+        plan_manifest_path: '/out/planner_manifests/t1/p1/run9/g1/plan_manifest.json',
+        plan_manifest_sha256: 'a'.repeat(64),
+        plan_manifest_summary: { run_id: 'run9', group_id: 'g1', settings_hash_prefix: 'abc' },
+      },
+    })
+    expect(prismaMock.scanJob.update).toHaveBeenCalledWith({
+      where: { id: 'j1' },
+      data: {
+        planManifestPath: '/out/planner_manifests/t1/p1/run9/g1/plan_manifest.json',
+        planManifestSha256: 'a'.repeat(64),
+        planManifestSummary: { run_id: 'run9', group_id: 'g1', settings_hash_prefix: 'abc' },
+      },
+    })
+  })
+
+  test('does not overwrite a row that already carries a pointer', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue({
+      id: 'j1', planManifestPath: '/existing/path.json',
+    })
+    await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: { plan_manifest_path: '/new/path.json', plan_manifest_sha256: 'b'.repeat(64), plan_manifest_summary: {} },
+    })
+    expect(prismaMock.scanJob.update).not.toHaveBeenCalled()
+  })
+
+  test('a run-keyed kind matches the manifest\'s own run id', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue({ id: 'j2', runId: 'r1', planManifestPath: null })
+    await persistPlanManifest({
+      projectId: 'p1', kind: 'partial_recon', runId: 'r1',
+      pointer: { plan_manifest_path: '/p.json', plan_manifest_sha256: 'c'.repeat(64), plan_manifest_summary: {} },
+    })
+    expect(prismaMock.scanJob.update).toHaveBeenCalledWith({
+      where: { id: 'j2' },
+      data: expect.objectContaining({ planManifestPath: '/p.json' }),
+    })
+  })
+
+  test('a DB failure never propagates to the caller', async () => {
+    prismaMock.scanJob.findFirst.mockRejectedValue(new Error('db down'))
+    await expect(
+      persistPlanManifest({ projectId: 'p1', kind: 'full_recon',
+        pointer: { plan_manifest_path: '/p.json', plan_manifest_sha256: 'd'.repeat(64), plan_manifest_summary: {} } }),
+    ).resolves.toBeUndefined()
   })
 })

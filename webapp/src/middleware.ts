@@ -99,9 +99,13 @@ export function internalKeyRouteAllowed(method: string, pathname: string): boole
 const SCANNER_ALLOWLIST: { method: string; pattern: RegExp }[] = [
   { method: 'GET', pattern: /^\/api\/users\/[^/]+\/settings$/ },
   { method: 'GET', pattern: /^\/api\/projects\/[^/]+$/ },
-  // Recon POSTs captured HTTP transactions here (Phase 0 traffic capture). The
-  // route handler resolves the tenant from the project owner, never the body.
+  // Recon POSTs captured HTTP transactions here (Phase 0 traffic capture).
+  // The route handler resolves the tenant from the project owner, never the body.
   { method: 'POST', pattern: /^\/api\/traffic\/[^/]+\/ingest$/ },
+  // G2-R3: the recon container posts its plan-manifest pointer here so the
+  // webapp can persist it on the ScanJob row. The handler re-checks the key and
+  // scopes it to exactly this route.
+  { method: 'POST', pattern: /^\/api\/internal\/scan-jobs\/plan-manifest$/ },
 ]
 
 export function scannerKeyRouteAllowed(method: string, pathname: string): boolean {
