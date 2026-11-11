@@ -36,8 +36,8 @@ def run_serialized_scan_partial(config: dict) -> None:
     settings = partial_settings(config)
     # Force-enable so the DB toggle doesn't override an explicit partial-recon run.
     settings["SERIALIZED_SCAN_ENABLED"] = True
-    # Only allowlisted keys may override; unrelated settings are preserved.
-    settings = apply_settings_overrides(settings, config.get("settings_overrides") or {})
+    # Validate local scanner controls; public admission is separately restricted.
+    settings = apply_settings_overrides(settings, config.get("settings_overrides"))
 
     user_targets = config.get("user_targets") or {}
     raw_user_urls = user_targets.get("urls") or []

@@ -141,10 +141,10 @@ class TestRunVhostSniPartial(unittest.TestCase):
         mocks = self._run({
             "domain": "example.com",
             "user_targets": {"subdomains": ["admin.example.com"], "ips": []},
-            "settings_overrides": {"VHOST_SNI_TIMEOUT": 99, "VHOST_SNI_TEST_L4": False},
+            "settings_overrides": {"VHOST_SNI_TIMEOUT": 15, "VHOST_SNI_TEST_L4": False},
         })
         settings_arg = mocks["runner"].call_args.kwargs["settings"]
-        self.assertEqual(settings_arg["VHOST_SNI_TIMEOUT"], 99)
+        self.assertEqual(settings_arg["VHOST_SNI_TIMEOUT"], 15)
         self.assertFalse(settings_arg["VHOST_SNI_TEST_L4"])
 
     # --------------------------------------------------------------

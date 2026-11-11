@@ -1,0 +1,1595 @@
+{
+  "source_sha": "6287750f600c9bc813f030ef8bcf230fffe44777",
+  "note": "Frozen literal inventory, not a public admission allowlist. Protected runtime/internal/scope/RoE controls remain loaded but cannot be overridden. Unknown dynamic keys are not thereby authorized.",
+  "settings": [
+    {
+      "key": "AI_PIPELINE_MODEL",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": "claude-opus-4-6",
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "BADDNS_DOCKER_IMAGE",
+      "caller": "takeover",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "BADDNS_ENABLED",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "BADDNS_MODULES",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": [
+        "cname",
+        "ns",
+        "mx",
+        "txt",
+        "spf"
+      ],
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "BADDNS_NAMESERVERS",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": [],
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "BADDNS_RUN_TIMEOUT",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 1800,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "CVE_LOOKUP_ENABLED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "CVE_LOOKUP_MAX_CVES",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 20,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "CVE_LOOKUP_MIN_CVSS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 0.0,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "CVE_LOOKUP_SOURCE",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": "nvd",
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_AUTH_HEADER",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": "",
+      "sources": [
+        "recon/graphql_scan/auth.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_AUTH_TYPE",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": "",
+      "sources": [
+        "recon/graphql_scan/auth.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_AUTH_VALUE",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": "",
+      "sources": [
+        "recon/graphql_scan/auth.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_CONCURRENCY",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 5,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_COP_DEBUG",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/graphql_scan/misconfig.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_COP_DOCKER_IMAGE",
+      "caller": "graphql",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/graphql_scan/misconfig.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_COP_ENABLED",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/graphql_scan/misconfig.py",
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_COP_FORCE_SCAN",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/graphql_scan/misconfig.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_COP_TIMEOUT",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 120,
+      "sources": [
+        "recon/graphql_scan/misconfig.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_DEPTH_LIMIT",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_ENDPOINTS",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": "",
+      "sources": [
+        "recon/graphql_scan/discovery.py",
+        "recon/partial_recon_modules/graphql_scanning.py",
+        "recon/partial_recon_modules/graphql_scanning.py",
+        "recon/partial_recon_modules/graphql_scanning.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_INTROSPECTION_TEST",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_RATE_LIMIT",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_RETRY_BACKOFF",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 2.0,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_RETRY_COUNT",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 3,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_SECURITY_ENABLED",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/graphql_scan/scanner.py",
+        "recon/partial_recon_modules/graphql_scanning.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_TIMEOUT",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": 30,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "GRAPHQL_VERIFY_SSL",
+      "caller": "graphql",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/graphql_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "INCLUDE_ROOT_DOMAIN",
+      "caller": "route",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/partial_recon_modules/route_exposure_scanning.py"
+      ]
+    },
+    {
+      "key": "IP_MODE",
+      "caller": "route",
+      "disposition": "protected",
+      "value": false,
+      "sources": [
+        "recon/partial_recon_modules/route_exposure_scanning.py"
+      ]
+    },
+    {
+      "key": "KATANA_DEPTH",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 2,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "MITRE_ENABLED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_AI_RESPONSE_FILTER",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_AI_TAGS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_AUTO_UPDATE_TEMPLATES",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_BULK_SIZE",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 25,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_CONCURRENCY",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 25,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_CUSTOM_TEMPLATES",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [
+        "/custom-templates/synthetic.yaml"
+      ],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_DAST_MODE",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_DOCKER_IMAGE",
+      "caller": "takeover",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_ENABLED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_EXCLUDE_TAGS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [
+        "dos",
+        "fuzz"
+      ],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_EXCLUDE_TEMPLATES",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_FOLLOW_REDIRECTS",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_HEADLESS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_INTERACTSH",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_MAX_HOST_ERROR",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 30,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_MAX_REDIRECTS",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_MAX_RUNTIME",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 86400,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_NEW_TEMPLATES_ONLY",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_RATE_LIMIT",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 100,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_RETRIES",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 1,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_SCAN_ALL_IPS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_SELECTED_CUSTOM_TEMPLATES",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [
+        "synthetic.yaml"
+      ],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_SEVERITY",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [
+        "critical",
+        "high",
+        "medium",
+        "low"
+      ],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_SYSTEM_RESOLVERS",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_TAGS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [
+        "cve",
+        "xss",
+        "sqli",
+        "rce",
+        "lfi",
+        "ssrf",
+        "xxe",
+        "ssti"
+      ],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_TAGS_AI_USE_JEV",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_TAKEOVERS_ENABLED",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_TAKEOVER_RUN_TIMEOUT",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 1800,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_TEMPLATES",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": [],
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NUCLEI_TIMEOUT",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NVD_API_KEY",
+      "caller": "nuclei",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "NVD_KEY_ROTATOR",
+      "caller": "nuclei",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "ROE_ENABLED",
+      "caller": "cache",
+      "disposition": "protected",
+      "value": false,
+      "sources": [
+        "recon/cache_scan/scanner.py",
+        "recon/graphql_scan/discovery.py",
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vhost_sni_enum.py",
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/cache_scanning.py",
+        "recon/partial_recon_modules/graphql_scanning.py",
+        "recon/partial_recon_modules/route_exposure_scanning.py",
+        "recon/partial_recon_modules/serialized_scanning.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py",
+        "recon/route_exposure/scanner.py",
+        "recon/route_exposure/scanner.py",
+        "recon/serialized_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "ROE_EXCLUDED_HOSTS",
+      "caller": "cache",
+      "disposition": "protected",
+      "value": [],
+      "sources": [
+        "recon/cache_scan/scanner.py",
+        "recon/graphql_scan/discovery.py",
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/main_recon_modules/vhost_sni_enum.py",
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/cache_scanning.py",
+        "recon/partial_recon_modules/graphql_scanning.py",
+        "recon/partial_recon_modules/route_exposure_scanning.py",
+        "recon/partial_recon_modules/serialized_scanning.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py",
+        "recon/route_exposure/scanner.py",
+        "recon/serialized_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "ROE_GLOBAL_MAX_RPS",
+      "caller": "route",
+      "disposition": "protected",
+      "value": 0,
+      "sources": [
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "ROUTE_EXPOSURE_ENABLED",
+      "caller": "route",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/partial_recon_modules/route_exposure_scanning.py",
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "ROUTE_EXPOSURE_MAX_ROUTES_PER_HOST",
+      "caller": "route",
+      "disposition": "supported",
+      "value": 300,
+      "sources": [
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "ROUTE_EXPOSURE_MAX_ROUTES_TOTAL",
+      "caller": "route",
+      "disposition": "supported",
+      "value": 3000,
+      "sources": [
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "ROUTE_EXPOSURE_MAX_RPS",
+      "caller": "route",
+      "disposition": "supported",
+      "value": 5,
+      "sources": [
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "ROUTE_EXPOSURE_TIMEOUT",
+      "caller": "route",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "ROUTE_EXPOSURE_WORKERS",
+      "caller": "route",
+      "disposition": "supported",
+      "value": 4,
+      "sources": [
+        "recon/route_exposure/scanner.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_ADMIN_PORT_EXPOSED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_BASIC_AUTH_NO_TLS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_CACHE_CONTROL_MISSING",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_CSP_UNSAFE_INLINE",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_DATABASE_EXPOSED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_DIRECT_IP_HTTP",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_DIRECT_IP_HTTPS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_DMARC_MISSING",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_DNSSEC_MISSING",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_ENABLED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_INSECURE_FORM_ACTION",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_IP_API_EXPOSED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_KUBERNETES_API_EXPOSED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_LOGIN_NO_HTTPS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_MAX_WORKERS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_MISSING_COEP",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_MISSING_COOP",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_MISSING_CORP",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_MISSING_PERMISSIONS_POLICY",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_MISSING_REFERRER_POLICY",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_NO_RATE_LIMITING",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_REDIS_NO_AUTH",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_SESSION_NO_HTTPONLY",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_SESSION_NO_SECURE",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_SMTP_OPEN_RELAY",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_SPF_MISSING",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TIMEOUT",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_EXPIRED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_EXPIRING_SOON",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_EXPIRY_DAYS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": 30,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_HOSTNAME_MISMATCH",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_SELF_SIGNED",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_WEAK_CIPHER",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_WEAK_VERSION",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_TLS_WILDCARD_OVERBROAD",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_WAF_BYPASS",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SECURITY_CHECK_ZONE_TRANSFER",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SERIALIZED_SCAN_ENABLED",
+      "caller": "serialized",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/partial_recon_modules/serialized_scanning.py",
+        "recon/serialized_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "SUBDOMAIN_TAKEOVER_ENABLED",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_ALL",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_CHECK_AR",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_CHECK_MAIL",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_CHECK_NS",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_ENABLED",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_RUN_TIMEOUT",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 900,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_SSL",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_THREADS",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "SUBJACK_TIMEOUT",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 30,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_AI_CLASSIFIER",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_AI_USE_JEV",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_CERT_VALIDATION_ENABLED",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_CNAME_VALIDATION_ENABLED",
+      "caller": "takeover",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_CONFIDENCE_THRESHOLD",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 60,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_MANUAL_REVIEW_AUTO_PUBLISH",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_RATE_LIMIT",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": 50,
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TAKEOVER_SEVERITY",
+      "caller": "takeover",
+      "disposition": "supported",
+      "value": [
+        "critical",
+        "high",
+        "medium"
+      ],
+      "sources": [
+        "recon/main_recon_modules/subdomain_takeover.py"
+      ]
+    },
+    {
+      "key": "TARGET_IPS",
+      "caller": "route",
+      "disposition": "protected",
+      "value": [],
+      "sources": [
+        "recon/partial_recon_modules/route_exposure_scanning.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_BASELINE_SIZE_TOLERANCE",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": 50,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_CONCURRENCY",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": 20,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_CUSTOM_WORDLIST",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": "",
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_ENABLED",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_INJECT_DISCOVERED",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_MAX_CANDIDATES_PER_IP",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": 2000,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_TEST_L4",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_TEST_L7",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_TIMEOUT",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": 3,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_USE_DEFAULT_WORDLIST",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VHOST_SNI_USE_GRAPH_CANDIDATES",
+      "caller": "vhost",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/main_recon_modules/vhost_sni_enum.py"
+      ]
+    },
+    {
+      "key": "VULNERS_API_KEY",
+      "caller": "nuclei",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "VULNERS_KEY_ROTATOR",
+      "caller": "nuclei",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py"
+      ]
+    },
+    {
+      "key": "WAF_AI_CLASSIFIER",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "WAF_AI_USE_JEV",
+      "caller": "nuclei",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/main_recon_modules/vuln_scan.py",
+        "recon/partial_recon_modules/vulnerability_scanning.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_ALLOW_CPDOS",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/cache_scan/safety.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_ALLOW_DECEPTION",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/cache_scan/safety.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_ALLOW_FRAMEWORK_PACKS",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/cache_scan/safety.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_BEHAVIORAL_DELAY",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 1.1,
+      "sources": [
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_BEHAVIORAL_ORACLE",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_CACHE_BUSTER_PARAM",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": "rdmncb",
+      "sources": [
+        "recon/cache_scan/buster.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_CACHE_HEADER",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": "",
+      "sources": [
+        "recon/cache_scan/wcvs_runner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_CONCURRENCY",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/cache_scan/wcvs_runner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_CONFIRM_WORKERS",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 6,
+      "sources": [
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_CROSS_VANTAGE",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_DIFFERENTIAL",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/cache_scan/confirm.py",
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_DOCKER_IMAGE",
+      "caller": "cache",
+      "disposition": "protected",
+      "value": null,
+      "sources": [
+        "recon/cache_scan/scanner.py",
+        "recon/cache_scan/wcvs_runner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_ENABLED",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": false,
+      "sources": [
+        "recon/cache_scan/scanner.py",
+        "recon/partial_recon_modules/cache_scanning.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_MAX_RPS_PER_HOST",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 0,
+      "sources": [
+        "recon/cache_scan/wcvs_runner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_MIN_CONFIDENCE",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 0.8,
+      "sources": [
+        "recon/cache_scan/scanner.py",
+        "recon/cache_scan/scoring.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_SCAN_PROFILE",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": "safe-confirm",
+      "sources": [
+        "recon/cache_scan/safety.py",
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_TIMEOUT",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 1800,
+      "sources": [
+        "recon/cache_scan/wcvs_runner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_TIMEOUT_PER_REQ",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": 10,
+      "sources": [
+        "recon/cache_scan/scanner.py"
+      ]
+    },
+    {
+      "key": "WEB_CACHE_POISON_VERIFY_SSL",
+      "caller": "cache",
+      "disposition": "supported",
+      "value": true,
+      "sources": [
+        "recon/cache_scan/scanner.py"
+      ]
+    }
+  ]
+}

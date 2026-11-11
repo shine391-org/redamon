@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
 import { archiveProjectAuthorizations } from '@/lib/engagementArchive'
 import prisma from '@/lib/prisma'
 import { agentFetch } from '@/lib/agentFetch'
@@ -215,6 +216,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     } catch {
       return NextResponse.json({ error: 'The request body is not valid JSON.', code: 'invalid_json' }, { status: 400 })
     }
+
+    const plannerProblem = plannerWriteProblem(body)
+    if (plannerProblem) return NextResponse.json({ error: plannerProblem, code: 'setting_rejected' }, { status: 400 })
 
     // Remove fields that shouldn't be updated directly. authProfile comes back in
     // the whole-row PUT the form sends; it is a relation written only by its own

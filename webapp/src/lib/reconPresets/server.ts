@@ -8,6 +8,7 @@
  * only what the browser never needed - validating stored values, bounding a
  * write, and reading defaults server-side with a timeout.
  */
+import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
 import prisma from '@/lib/prisma'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { canonicalJson } from '@/lib/fingerprint'
@@ -175,8 +176,8 @@ export function projectPresetForRead(stored: unknown): { settings: Record<string
 /**
  * The preset fields of a settings blob arriving from a UI save or an import:
  * kept when they are preset fields, dropped otherwise, with the size bound
- * enforced. Values are NOT judged here, matching what the form could always
- * store; applying over MCP judges them instead.
+ * enforced. Planner/enrichment controls are strict before projection; other
+ * values retain the form's legacy storage contract and are judged on MCP apply.
  */
 export function presetSettingsForStorage(
   input: unknown
@@ -184,6 +185,8 @@ export function presetSettingsForStorage(
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     return { ok: false, error: 'Settings object is required' }
   }
+  const problem = plannerWriteProblem(input as Record<string, unknown>)
+  if (problem) return { ok: false, error: problem }
   const { settings, ignoredKeys } = projectPresetForRead(input)
   if (Buffer.byteLength(JSON.stringify(settings), 'utf8') > PRESET_MAX_BYTES) {
     return { ok: false, error: `A preset is at most ${PRESET_MAX_BYTES / 1024} KiB` }
@@ -216,6 +219,8 @@ export type ResolvedPreset =
       description: string
       settings: Record<string, unknown>
       ignoredKeys: string[]
+      /** Raw planner contract refusal retained before legacy projection. */
+      plannerWriteProblem?: string | null
       updatedAt: Date
       createdVia: string
       updatedVia: string
@@ -259,6 +264,8 @@ export async function resolvePreset(userId: string, presetId: string): Promise<R
     description: row.description,
     settings,
     ignoredKeys,
+    plannerWriteProblem: row.settings && typeof row.settings === 'object' && !Array.isArray(row.settings)
+      ? plannerWriteProblem(row.settings as Record<string, unknown>) : null,
     updatedAt: row.updatedAt,
     createdVia: row.createdVia,
     updatedVia: row.updatedVia,
