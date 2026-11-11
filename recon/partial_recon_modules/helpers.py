@@ -766,7 +766,7 @@ def _is_host_in_scope(
 #: contract.
 PARTIAL_SETTINGS_ALLOWLIST: dict[str, dict] = {
     # force-enables a partial recon explicitly asks for
-    'NUCLEI_ENABLED': {'type': 'bool', 'default': True},
+    'NUCLEI_ENABLED': {'type': 'bool', 'default': False},
     'SUBDOMAIN_TAKEOVER_ENABLED': {'type': 'bool', 'default': False},
     # vuln-scan follow-up stages the modal can turn off individually
     'CVE_LOOKUP_ENABLED': {'type': 'bool', 'default': True},

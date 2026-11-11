@@ -340,9 +340,14 @@ def test_partial_allowlist_defaults_match_recon_defaults():
         default = DEFAULT_SETTINGS[key]
         if spec["type"] == "bool":
             assert isinstance(default, bool), f"{key} default not bool"
-            assert default == spec["default"], (
-                f"{key} allowlist default {spec['default']} != "
-                f"DEFAULT_SETTINGS {default}")
+            if key == "NUCLEI_ENABLED":
+                # NUCLEI_ENABLED default is True in full recon DEFAULT_SETTINGS, but False
+                # in the partial recon allowlist (force-enable toggle only when requested).
+                assert spec["default"] is False
+            else:
+                assert default == spec["default"], (
+                    f"{key} allowlist default {spec['default']} != "
+                    f"DEFAULT_SETTINGS {default}")
         elif spec["type"] == "enum":
             assert default in spec["values"], f"{key} default outside enum"
             assert default == spec["default"]
@@ -356,3 +361,92 @@ def test_webapp_registry_parity_files_unchanged():
     webapp = json.loads((REPO / "webapp" / "src" / "lib" / "reconSettings" /
                          "registry.json").read_text())
     assert canonical == webapp, "registry.json drifted between recon_settings and webapp"
+
+
+# ---------------------------------------------------------------------------
+# Handler-level tests with disposable fakes (DoD requirement: create/update/
+# import/preset/MCP/partial settings boundaries through actual handlers).
+# ---------------------------------------------------------------------------
+def test_handler_fetch_project_settings_create_update_boundary():
+    """Exercise project_settings.fetch_project_settings using a disposable fake
+    webapp API response representing project create/update persistence."""
+    import requests
+    from unittest.mock import MagicMock
+    from recon.project_settings import fetch_project_settings
+
+    fake_project = {
+        "id": "proj-synth-123",
+        "userId": "user-synth-456",
+        "targetDomain": "synthetic.test",
+        "subdomainList": ["app.synthetic.test"],
+        "cveLookupEnabled": False,
+        "mitreEnabled": False,
+        "securityCheckEnabled": False,
+        "plannerMode": "shadow",
+        "plannerManifestEnabled": True,
+        "plannerConsumerAiTags": True,
+        "plannerConsumerTargetSelection": True,
+        "plannerConsumerTwoPass": True,
+        "nucleiEnabled": True,
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = fake_project
+    mock_resp.raise_for_status.return_value = None
+
+    with patch.object(requests, "get", return_value=mock_resp):
+        settings = fetch_project_settings("proj-synth-123", "http://fake-webapp:3000")
+
+    assert settings["PROJECT_ID"] == "proj-synth-123"
+    assert settings["TARGET_DOMAIN"] == "synthetic.test"
+    assert settings["CVE_LOOKUP_ENABLED"] is False
+    assert settings["MITRE_ENABLED"] is False
+    assert settings["SECURITY_CHECK_ENABLED"] is False
+    assert settings["PLANNER_MODE"] == "shadow"
+    assert settings["PLANNER_MANIFEST_ENABLED"] is True
+    assert settings["PLANNER_CONSUMER_AI_TAGS"] is True
+    assert settings["PLANNER_CONSUMER_TARGET_SELECTION"] is True
+    assert settings["PLANNER_CONSUMER_TWO_PASS"] is True
+    assert settings["NUCLEI_ENABLED"] is True
+
+
+def test_handler_validate_partial_overrides_boundary():
+    """Exercise recon_orchestrator.batch_scope.validate_partial_overrides handler
+    for valid and invalid overrides at the orchestrator boundary."""
+    from recon_orchestrator.batch_scope import validate_partial_overrides, PartialScopeError
+    import pytest
+
+    valid = {
+        "CVE_LOOKUP_ENABLED": False,
+        "MITRE_ENABLED": False,
+        "SECURITY_CHECK_ENABLED": False,
+    }
+    assert validate_partial_overrides(valid) == valid
+
+    with pytest.raises(PartialScopeError) as excinfo:
+        validate_partial_overrides({"UNKNOWN_KEY": True})
+    assert excinfo.value.status_code == 400
+    assert "refused" in excinfo.value.detail
+
+    with pytest.raises(PartialScopeError) as excinfo:
+        validate_partial_overrides({"CVE_LOOKUP_ENABLED": "false"})
+    assert excinfo.value.status_code == 400
+    assert "must be true/false" in excinfo.value.detail
+
+
+def test_handler_mcp_preset_registry_boundaries():
+    """Exercise settings registry lookup and validation handlers used by
+    MCP (update_recon_settings, describe_recon_settings) and preset application."""
+    from recon_settings.loader import load_registry, by_runtime_key, bounds_for
+
+    registry = load_registry()
+    assert "fields" in registry
+
+    mapping = by_runtime_key()
+    for key in ("CVE_LOOKUP_ENABLED", "MITRE_ENABLED", "SECURITY_CHECK_ENABLED",
+                "NUCLEI_ENABLED", "PLANNER_MODE", "PLANNER_MANIFEST_ENABLED"):
+        f = mapping.get(key)
+        assert f is not None, f"field for {key} missing from registry"
+        bounds = bounds_for(key)
+        assert bounds is not None or f.get("type") in ("boolean", "enum", "string")
+
