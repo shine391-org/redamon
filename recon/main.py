@@ -1050,8 +1050,14 @@ def _inject_planner_job_context(settings: dict) -> dict:
     group    -> left empty here; each call site stamps its own group id
     """
     staged = dict(settings)
+    # The job's own PROJECT_ID is authoritative -- never the Dockerfile-baked
+    # env default or a module-level global, both of which are a fabricated
+    # default canonical scope (G2-R3). Fall back only when the job provides none.
     staged["PLANNER_PROJECT_ID"] = str(
-        PROJECT_ID or os.environ.get("PROJECT_ID") or "")
+        settings.get("PROJECT_ID")
+        or PROJECT_ID
+        or os.environ.get("PROJECT_ID")
+        or "")
     staged["PLANNER_TENANT"] = str(
         settings.get("PLANNER_TENANT")
         or settings.get("USER_ID")
