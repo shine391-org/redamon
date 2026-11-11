@@ -85,7 +85,9 @@ def test_read_manifest_missing_and_corrupt_return_explicit_unknown():
     path.write_text("{not valid json")
     assert read_manifest(path)["status"] == "unknown"
     path.write_text(json.dumps({"schema_version": 1}))
-    assert read_manifest(path)["status"] == "known"
+    # Incomplete manifest (no planner_mode/tenant/project/run/group, no
+    # digest-bearing context) reads as unknown, never as a known plan.
+    assert read_manifest(path)["status"] == "unknown"
 
 
 def test_run_and_group_isolation_no_overwrite():

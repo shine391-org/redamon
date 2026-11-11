@@ -21,6 +21,7 @@ import sys
 import json
 import copy
 import re
+import os
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1024,6 +1025,64 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                 save_recon_file(combined_result, output_file)
 
 
+# ---------------------------------------------------------------------------
+# G2-R3: run-scoped plan manifest wiring. Written before the vuln_scan tool
+# launches in every targeting mode, scoped to the canonical job context
+# (tenant/project/run/group) -- never a fabricated default tenant/group and
+# never a fresh random run id per call. The manifest is an accounting aid:
+# it never fails a scan.
+# ---------------------------------------------------------------------------
+
+
+def _inject_planner_job_context(settings: dict) -> dict:
+    """Return a settings copy stamped with the canonical job context
+    (tenant/project/run/group) for the pre-dispatch manifest.
+
+    tenant   -> USER_ID (the project's owning user, never fabricated)
+    project  -> PROJECT_ID
+    run      -> RECON_RUN_ID / PARTIAL_RECON_RUN_ID from the job environment
+    group    -> left empty here; each call site stamps its own group id
+    """
+    staged = dict(settings)
+    staged["PLANNER_PROJECT_ID"] = str(PROJECT_ID or "")
+    staged["PLANNER_TENANT"] = str(
+        settings.get("PLANNER_TENANT") or settings.get("USER_ID") or "")
+    run_id = os.environ.get("RECON_RUN_ID") or os.environ.get(
+        "PARTIAL_RECON_RUN_ID") or ""
+    staged["PLANNER_RUN_ID"] = str(run_id)
+    return staged
+
+
+def _write_pre_dispatch_plan_manifest(settings: dict, output_file,
+                                      combined_result: dict,
+                                      group_id: str = ""):
+    """Write the run-scoped plan manifest before vuln_scan launches and record
+    pointer + digest + bounded summary on ``combined_result`` metadata.
+
+    The manifest is scoped to tenant/project/run/group and written atomically
+    (mode 0600) before the tool runs, so cancellation/restart readback finds it
+    and a corrupt, missing or unwritable manifest is explicit unknown rather
+    than a silent all-clear. Never fails the scan.
+    """
+    try:
+        if not settings.get("PLANNER_MANIFEST_ENABLED"):
+            return None
+        staged = _inject_planner_job_context(settings)
+        if group_id:
+            staged["PLANNER_GROUP_ID"] = str(group_id)
+        ptr = maybe_write_pre_dispatch_manifest(staged, output_file)
+        if ptr is not None:
+            combined_result.setdefault("metadata", {}).setdefault(
+                "planner_manifest_pointers", []).append(ptr)
+            try:
+                save_recon_file(combined_result, output_file)
+            except Exception:  # noqa: BLE001
+                pass
+        return ptr
+    except Exception:  # noqa: BLE001 - manifest never fails a scan
+        return None
+
+
 def run_ip_recon(target_ips: list, settings: dict) -> dict:
     """
     Run IP-based reconnaissance: expand CIDRs, reverse DNS, IP WHOIS.
@@ -1531,13 +1590,12 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     if not skip_active_scans:
         if "vuln_scan" in SCAN_MODULES:
             print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
-            # F09: run-scoped plan manifest before dispatch. Default off, never
-            # fails the scan; the pointer is recorded so the ScanJob row can keep
-            # pointer + digest + bounded summary (never the full manifest).
-            _manifest_ptr = maybe_write_pre_dispatch_manifest(settings, output_file)
-            if _manifest_ptr:
-                combined_result.setdefault("metadata", {}).setdefault(
-                    "planner_manifest_pointers", []).append(_manifest_ptr)
+            # G2-R3: run-scoped plan manifest before dispatch, scoped to the
+            # canonical job context (tenant/project/run/group). Default off,
+            # never fails the scan; pointer + digest + bounded summary are
+            # recorded on the run artifact before the tool launches.
+            _manifest_ptr = _write_pre_dispatch_plan_manifest(
+                settings, output_file, combined_result, group_id="ip")
             try:
                 combined_result = run_vuln_scan(combined_result, output_file=output_file, settings=settings)
                 combined_result["metadata"]["modules_executed"].append("vuln_scan")
@@ -2341,6 +2399,11 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             from recon.route_exposure import run_route_exposure_isolated
             phase_a_tools['route_exposure'] = run_route_exposure_isolated
 
+        # G2-R3: plan manifest before the vuln_scan tool launches, scoped to
+        # this run's canonical job context (per group when this is a batch).
+        _write_pre_dispatch_plan_manifest(_settings, output_file,
+                                          combined_result,
+                                          group_id=f"domain:{root_domain}")
         _run_phase_a_fan_out(phase_a_tools, combined_result, _settings, output_file)
 
         # ================================================================
@@ -3411,6 +3474,11 @@ def run_domain_group(group: dict, start_time=None) -> int:
             # vuln_scan automatically includes MITRE CWE/CAPEC enrichment
             if "vuln_scan" in SCAN_MODULES:
                 print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
+                # G2-R3: plan manifest before vuln_scan launches, scoped to
+                # this run's canonical job context (per group in a batch).
+                _write_pre_dispatch_plan_manifest(_settings, output_file,
+                                                  domain_result,
+                                                  group_id=f"domain:{root_domain}")
                 domain_result = run_vuln_scan(domain_result, output_file=output_file, settings=_settings)
                 if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
                     if "vuln_scan" not in domain_result["metadata"]["modules_executed"]:
