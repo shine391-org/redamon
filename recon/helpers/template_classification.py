@@ -529,6 +529,7 @@ def validate_auth_batch_safety(
     template_contents: Optional[Dict[str, str]] = None,
     auth_headers: Optional[List[str]] = None,
     target_origins: Optional[List[str]] = None,
+    scope_hosts: Optional[List[str]] = None,
 ) -> Tuple[bool, List[str]]:
     """
     Validate that an auth header batch is safe for the given templates.
@@ -537,6 +538,7 @@ def validate_auth_batch_safety(
     - No template sends auth to foreign origins (redirect/OAST)
     - No raw HTTP template with auth that could leak
     - Multi-request flows don't silently de-auth
+    - Target origins are in scope (when scope_hosts provided)
     """
     warnings = []
     is_safe = True
@@ -569,8 +571,8 @@ def validate_auth_batch_safety(
         if capability.is_multi_request:
             warnings.append(f"{template_id}: multi-request flow - verify auth persists across all requests")
     
-    # Check for foreign origins in target list
-    if target_origins:
+    # Check for foreign origins in target list (only when scope_hosts provided)
+    if target_origins and scope_hosts:
         try:
             from recon.helpers.auth_profile import host_in_scope
         except Exception:
@@ -578,11 +580,13 @@ def validate_auth_batch_safety(
         for origin in target_origins:
             try:
                 host = urlsplit(origin).hostname or ""
-                if host and host_in_scope is not None and not host_in_scope(host.lower(), []):  # Empty roots = default deny
+                if host and host_in_scope is not None and not host_in_scope(host.lower(), scope_hosts):
                     warnings.append(f"Target origin {origin} may be out of scope for attached auth")
                     is_safe = False
             except Exception:
                 pass
+    elif target_origins and not scope_hosts:
+        warnings.append("Scope hosts not provided - cannot verify target origins are in scope")
     
     return is_safe, warnings
 

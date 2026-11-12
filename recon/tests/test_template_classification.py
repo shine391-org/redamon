@@ -212,7 +212,8 @@ class TestAuthBatchSafety:
         safe, warnings = tc.validate_auth_batch_safety(
             ['ssl/tls-version', 'aws/s3-bucket'],
             auth_headers=['Cookie: ***'],
-            target_origins=['https://example.com']
+            target_origins=['https://example.com'],
+            scope_hosts=['example.com']
         )
         assert safe == True
 
@@ -222,7 +223,8 @@ class TestAuthBatchSafety:
             ['custom/redirect'],
             template_contents={'custom/redirect': redirect_content},
             auth_headers=['Cookie: ***'],
-            target_origins=['https://example.com']
+            target_origins=['https://example.com'],
+            scope_hosts=['example.com']
         )
         assert any('redirect' in w.lower() for w in warnings)
 
@@ -232,7 +234,8 @@ class TestAuthBatchSafety:
             ['custom/oast'],
             template_contents={'custom/oast': oast_content},
             auth_headers=['Cookie: ***'],
-            target_origins=['https://example.com']
+            target_origins=['https://example.com'],
+            scope_hosts=['example.com']
         )
         assert safe == False
         assert any('oast' in w.lower() or 'interactsh' in w.lower() for w in warnings)
@@ -243,7 +246,8 @@ class TestAuthBatchSafety:
             ['custom/raw'],
             template_contents={'custom/raw': raw_content},
             auth_headers=['Cookie: ***'],
-            target_origins=['https://example.com']
+            target_origins=['https://example.com'],
+            scope_hosts=['example.com']
         )
         assert any('raw' in w.lower() for w in warnings)
 
@@ -253,9 +257,29 @@ class TestAuthBatchSafety:
             ['custom/multi'],
             template_contents={'custom/multi': multi_content},
             auth_headers=['Cookie: ***'],
-            target_origins=['https://example.com']
+            target_origins=['https://example.com'],
+            scope_hosts=['example.com']
         )
         assert any('multi' in w.lower() or 'flow' in w.lower() for w in warnings)
+
+    def test_out_of_scope_warning(self):
+        safe, warnings = tc.validate_auth_batch_safety(
+            ['ssl/tls-version'],
+            auth_headers=['Cookie: ***'],
+            target_origins=['https://evil.com'],
+            scope_hosts=['example.com']
+        )
+        assert safe == False
+        assert any('out of scope' in w.lower() for w in warnings)
+
+    def test_no_scope_hosts_warning(self):
+        safe, warnings = tc.validate_auth_batch_safety(
+            ['ssl/tls-version'],
+            auth_headers=['Cookie: ***'],
+            target_origins=['https://example.com'],
+            scope_hosts=None
+        )
+        assert any('scope hosts not provided' in w.lower() for w in warnings)
 
 
 class TestConvenienceFunctions:
@@ -335,6 +359,98 @@ class TestClassifiedTemplateProperties:
         origin_tpl = registry.classify('ssl/tls-version')
         assert multi_tpl.is_multi_request() == True
         assert origin_tpl.is_multi_request() == False
+
+
+class TestRoutingFixture:
+    """Test the RoutingFixture controlled receiver verification."""
+
+    def test_routing_fixture_verify_routing(self):
+        """Test that RoutingFixture correctly verifies template routing."""
+        fixture = tc.RoutingFixture()
+        
+        # Simulate receiving requests for different template categories
+        template_contents = {
+            'ssl/tls-version': 'id: ssl/tls-version\ninfo:\n  tags: ssl,tls',
+            'xss/reflected': 'id: xss/reflected\ninfo:\n  tags: xss',
+            'wordpress/wp-admin': 'id: wordpress/wp-admin\ninfo:\n  tags: wordpress',
+            'fuzz/directory': 'id: fuzz/directory\ninfo:\n  tags: fuzz',
+            'file-upload/webshell': 'id: file-upload/webshell\ninfo:\n  tags: file-upload',
+            'generic/unknown': 'id: generic/unknown\ninfo:\n  tags: generic',
+        }
+        template_ids = list(template_contents.keys())
+        
+        # Record simulated requests (6 requests: 5 templates, fuzz sends 2)
+        fixture.record_request('ssl/tls-version', 'GET', '/', {}, '', 'https://example.com')
+        fixture.record_request('xss/reflected', 'GET', '/search?q=test', {}, '', 'https://example.com/search?q=test')
+        fixture.record_request('wordpress/wp-admin', 'GET', '/wp-admin/', {}, '', 'https://example.com/wp-admin/')
+        fixture.record_request('fuzz/directory', 'GET', '/dir1', {}, '', 'https://example.com/dir1')
+        fixture.record_request('fuzz/directory', 'GET', '/dir2', {}, '', 'https://example.com/dir2')  # Duplicate for multi-request
+        fixture.record_request('file-upload/webshell', 'POST', '/upload', {'Content-Type': 'multipart/form-data'}, 'file=data', 'https://example.com/upload')
+        # generic/unknown not recorded (simulates missing)
+        
+        results = fixture.verify_routing(template_ids, template_contents)
+        
+        # Verify results structure
+        assert results['total_templates'] == 6
+        assert results['received'] == 6  # 5 templates sent requests, fuzz sent 2 = 6 total
+        assert 'duplicates' in results
+        assert 'missing' in results
+        assert 'by_category' in results
+        
+        # Check duplicates counted
+        assert results['duplicates'] == 1  # fuzz/directory sent 2 requests
+        
+        # Check missing
+        assert 'generic/unknown' in results['missing']
+        
+        # Check by_category counts
+        assert results['by_category']['origin_safe']['expected'] == 1
+        assert results['by_category']['origin_safe']['received'] == 1
+        assert results['by_category']['endpoint']['expected'] == 1
+        assert results['by_category']['endpoint']['received'] == 1
+        assert results['by_category']['app_prefix']['expected'] == 1
+        assert results['by_category']['app_prefix']['received'] == 1
+        assert results['by_category']['multi_request']['expected'] == 1
+        assert results['by_category']['multi_request']['received'] == 2  # 2 requests for fuzz
+        assert results['by_category']['body_multipart']['expected'] == 1
+        assert results['by_category']['body_multipart']['received'] == 1
+        assert results['by_category']['unknown']['expected'] == 1
+        assert results['by_category']['unknown']['received'] == 0
+
+    def test_routing_fixture_no_duplicates(self):
+        """Test that RoutingFixture correctly counts no duplicates when each template sends one request."""
+        fixture = tc.RoutingFixture()
+        
+        template_contents = {
+            'ssl/tls-version': 'id: ssl/tls-version\ninfo:\n  tags: ssl',
+            'xss/reflected': 'id: xss/reflected\ninfo:\n  tags: xss',
+        }
+        template_ids = list(template_contents.keys())
+        
+        fixture.record_request('ssl/tls-version', 'GET', '/', {}, '', 'https://example.com')
+        fixture.record_request('xss/reflected', 'GET', '/search', {}, '', 'https://example.com/search')
+        
+        results = fixture.verify_routing(template_ids, template_contents)
+        
+        assert results['duplicates'] == 0
+        assert results['missing'] == []
+        assert results['received'] == 2
+
+    def test_routing_fixture_all_missing(self):
+        """Test that RoutingFixture handles all templates missing."""
+        fixture = tc.RoutingFixture()
+        
+        template_contents = {
+            'ssl/tls-version': 'id: ssl/tls-version\ninfo:\n  tags: ssl',
+        }
+        template_ids = list(template_contents.keys())
+        
+        # No requests recorded
+        results = fixture.verify_routing(template_ids, template_contents)
+        
+        assert results['received'] == 0
+        assert results['missing'] == ['ssl/tls-version']
+        assert results['duplicates'] == 0
 
 
 if __name__ == "__main__":

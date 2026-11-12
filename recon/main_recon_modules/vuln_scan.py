@@ -100,6 +100,10 @@ from recon.helpers.template_classification import (
     MODE_SHADOW,
     MODE_ENFORCE,
 )
+from recon.helpers.auth_profile import (
+    resolve_scope_hosts,
+    profile_from_settings,
+)
 from recon.helpers.security_checks import page_content_enabled
 from recon.helpers.isolated_result import TopLevelKeys
 from recon.helpers.selection_coverage import (
@@ -470,6 +474,7 @@ def _build_routed_nuclei_commands(
     base_settings: Dict[str, Any],
     auth_headers: List[str],
     container_prefix: str,
+    scope_hosts: List[str],
 ) -> List[Dict[str, Any]]:
     """
     Build separate nuclei commands for each template category with appropriate targets.
@@ -513,6 +518,7 @@ def _build_routed_nuclei_commands(
             templates=all_template_ids,
             auth_headers=auth_headers,
             target_origins=target_origins,
+            scope_hosts=scope_hosts,
         )
         if warnings:
             for w in warnings:
@@ -1339,7 +1345,9 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             
             # Check routing mode gate (off/shadow/enforce)
             routing_mode = resolve_routing_mode(settings)
-            use_routed = routing_mode != MODE_OFF and routing_consumer_enabled(settings)
+            use_routed = routing_mode == MODE_ENFORCE
+            # Shadow mode: compute routing for observation but execute legacy
+            compute_routing_for_shadow = routing_mode == MODE_SHADOW
             
             if skip_detection_pass:
                 print("[*][Nuclei] DETECTION pass skipped (no tags + no custom templates)")
@@ -1347,7 +1355,32 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 coverage_passes.append((target_urls, "failed", "no Nuclei templates selected", False))
             elif not use_routed:
                 # Off/shadow mode: run legacy single detection pass
-                print(f"[*][Nuclei] DETECTION pass running in legacy mode (NUCLEI_ROUTING_MODE={routing_mode})")
+                mode_desc = "legacy" if routing_mode == MODE_OFF else "legacy (shadow: routing computed but not executed)"
+                print(f"[*][Nuclei] DETECTION pass running in {mode_desc} mode (NUCLEI_ROUTING_MODE={routing_mode})")
+                
+                # In shadow mode, compute routing for observation/logging
+                if compute_routing_for_shadow:
+                    routing = _classify_and_route_templates(
+                        template_tags=NUCLEI_TAGS,
+                        template_paths=NUCLEI_TEMPLATES,
+                        custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+                        selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+                        exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
+                        exclude_tags=NUCLEI_EXCLUDE_TAGS,
+                        resource_enum_data=recon_data.get("resource_enum"),
+                        http_probe_data=recon_data.get("http_probe"),
+                    )
+                    # Log routing summary for observation
+                    print(f"[*][Nuclei-Routing] Shadow mode - template routing summary (not executed):")
+                    for cat, tpls in routing["by_category"].items():
+                        if tpls:
+                            target_count = len(routing["target_sets"].get(cat, []))
+                            print(f"[*][Nuclei-Routing]   {cat}: {len(tpls)} templates -> {target_count} targets")
+                    if routing["compatibility_templates"]:
+                        print(f"[*][Nuclei-Routing]   Compatibility lane: {len(routing['compatibility_templates'])} templates with unknown semantics -> legacy behavior on all targets")
+                else:
+                    routing = {"routing_metadata": {"skipped": True}, "by_category": {}, "compatibility_templates": []}
+                
                 # Build legacy detection command (single pass, all targets)
                 legacy_targets_file = str(nuclei_temp_dir / "targets_legacy.txt")
                 with open(legacy_targets_file, 'w') as f:
@@ -1401,7 +1434,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     coverage_passes.append((target_urls, "failed", f"policy_empty: {exc}", False))
                     d_findings, d_fps, d_duration = [], [], 0
             else:
-                # Enforce/shadow mode: run routed detection passes
+                # Enforce mode: run routed detection passes
                 print(f"[*][Nuclei] DETECTION pass running in routed mode (NUCLEI_ROUTING_MODE={routing_mode})")
                 # F14: Classify templates by semantics and route to appropriate targets
                 # This replaces the single detection pass with category-routed passes
@@ -1450,12 +1483,17 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 }
                 
                 try:
+                    # Get scope hosts from engagement settings
+                    auth_profile = profile_from_settings(settings)
+                    scope_hosts = resolve_scope_hosts(auth_profile, settings) if auth_profile else []
+                    
                     routed_commands = _build_routed_nuclei_commands(
                         routing=routing,
                         nuclei_temp_dir=nuclei_temp_dir,
                         base_settings=base_settings,
                         auth_headers=_nuclei_auth,
                         container_prefix="redamon-nuclei-detection",
+                        scope_hosts=scope_hosts,
                     )
                 except NucleiEmptySelectionError as exc:
                     print(f"[!][Nuclei] DETECTION pass not executed (policy_empty at build): {exc}")
