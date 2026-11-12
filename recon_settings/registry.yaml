@@ -401,6 +401,11 @@ tools:
     phase: port_scan
     traffic: none
     form_section: "NaabuSection"
+  planner:
+    title: "Planner"
+    phase: vuln_scan
+    traffic: none
+    form_section: "PlannerSection"
   project:
     title: "Project identity"
     phase: standalone
@@ -11168,7 +11173,7 @@ fields:
     roe_capped: false
     mcp: settable
     group: planner
-    form_section: null
+    form_section: PlannerSection
     validator: planner_mode
     values: ["off", "shadow", "enforce"]
     meaning: >-
@@ -11186,7 +11191,7 @@ fields:
     roe_capped: false
     mcp: settable
     group: planner
-    form_section: null
+    form_section: PlannerSection
     meaning: >-
       Write a run-scoped plan manifest before dispatch, scoped to tenant/project/
       run/group. Never a project-wide file that later runs can overwrite. Default
@@ -11200,7 +11205,7 @@ fields:
     roe_capped: false
     mcp: settable
     group: planner
-    form_section: null
+    form_section: PlannerSection
     meaning: >-
       Enable the AI tag-selection consumer (Nuclei tag pruning) for this project.
       Only honoured when plannerMode is shadow or enforce. Default false.
@@ -11213,10 +11218,10 @@ fields:
     roe_capped: false
     mcp: settable
     group: planner
-    form_section: null
+    form_section: PlannerSection
     meaning: >-
-      Enable the target-selection consumer (run-scoped manifest of selected
-      targets/templates). Only honoured when plannerMode is shadow or enforce.
+      Enable the target-selection consumer (run-scoped manifest of selected targets/templates).
+      Only honoured when plannerMode is shadow or enforce.
       Default false.
   plannerConsumerTwoPass:
     tool: planner
@@ -11227,7 +11232,7 @@ fields:
     roe_capped: false
     mcp: settable
     group: planner
-    form_section: null
+    form_section: PlannerSection
     meaning: >-
       Enable the two-pass DAST consumer. Only honoured when plannerMode is shadow
       or enforce. Default false.

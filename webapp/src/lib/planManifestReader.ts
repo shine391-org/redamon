@@ -18,7 +18,8 @@ export interface PlanManifestRead {
 interface ScanJobLike {
   planManifestPath?: string | null
   planManifestSha256?: string | null
-  planManifestSummary?: Record<string, unknown> | null
+  // Prisma JSON columns may contain any JSON value; validate at the boundary.
+  planManifestSummary?: unknown
   runId?: string
 }
 
@@ -34,7 +35,11 @@ export async function readPlanManifest(
   if (!path || !sha256) {
     return { status: 'unknown', reason: 'no_manifest_pointer' }
   }
-  const summary = job.planManifestSummary ?? {}
+  const rawSummary = job.planManifestSummary
+  if (rawSummary != null && (typeof rawSummary !== 'object' || Array.isArray(rawSummary))) {
+    return { status: 'unknown', reason: 'invalid_manifest_summary' }
+  }
+  const summary = (rawSummary ?? {}) as Record<string, unknown>
   const runId = typeof summary.run_id === 'string' ? summary.run_id : (job.runId ?? '')
   const groupId = typeof summary.group_id === 'string' ? summary.group_id : ''
   const query = new URLSearchParams({

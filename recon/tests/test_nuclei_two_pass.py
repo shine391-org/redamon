@@ -519,7 +519,7 @@ class TestRunVulnScanTwoPass(unittest.TestCase):
                 self.assertEqual(exec_mock.call_count, 2)
                 labels = [c.kwargs.get("label") for c in exec_mock.call_args_list]
                 self.assertEqual(labels, ["DETECTION", "DAST"])  # ordered
-                self.assertEqual(self.generated_targets["targets_detection.txt"], ["https://example.com"])
+                self.assertEqual(self.generated_targets["targets_legacy.txt"], ["https://example.com"])
                 self.assertEqual(self.generated_targets["targets_dast.txt"], [
                     "https://example.com/api?id=1", "https://example.com/search?q=test",
                 ])

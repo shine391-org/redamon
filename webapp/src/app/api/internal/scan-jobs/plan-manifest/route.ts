@@ -9,6 +9,7 @@
  * Authorized callers: INTERNAL_API_KEY (orchestrator/scheduler) and
  * SCANNER_API_KEY (the recon container) on this route only.
  */
+import type { Prisma } from '@prisma/client'
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { isInternalRequest, isScannerRequest } from '@/lib/session'
@@ -19,7 +20,7 @@ export const runtime = 'nodejs'
 interface Pointer {
   plan_manifest_path: string
   plan_manifest_sha256: string
-  plan_manifest_summary?: Record<string, unknown>
+  plan_manifest_summary?: Prisma.InputJsonObject
 }
 
 interface Body {

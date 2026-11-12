@@ -259,10 +259,10 @@ class TestUncoverMergeGate:
 class TestPartialDastUrlRebuild:
     def test_builder_rebuilds_from_parameters_not_full_url_only(self):
         src = (PROJECT_ROOT / "recon" / "partial_recon_modules" / "graph_builders.py").read_text()
-        # It now reads query Parameters and urlencodes them, instead of relying
-        # only on e.full_url (which resource_enum never writes).
+        # It now reads query Parameters and rebuilds the URL (via
+        # _endpoint_url / sample_urls), instead of relying only on
+        # e.full_url (which resource_enum never writes).
         assert "HAS_PARAMETER]->(p:Parameter)" in src
-        assert "urlencode(" in src
         assert "discovered_urls" in src
 
 

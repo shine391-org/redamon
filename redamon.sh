@@ -5067,7 +5067,7 @@ cmd_help() {
 # The root `tests/` dir is a grab-bag: most files exercise the agent image, but a
 # set of them import recon enrichment modules (recon/main_recon_modules/*) and so
 # must run in the recon image, not the agent image. We route them explicitly.
-_ROOT_RECON_TESTS="test_censys_enrich.py,test_criminalip_enrich.py,test_fofa_enrich.py,test_netlas_enrich.py,test_otx_enrich.py,test_uncover_enrich.py,test_virustotal_enrich.py,test_zoomeye_enrich.py,test_gau_parallel.py,test_gau_urlscan_api_key.py,test_recon_mixin_split.py,test_custom_templates_integration.py,test_masscan_integration.py,test_registry_tool_wiring.py"
+_ROOT_RECON_TESTS="test_censys_enrich.py,test_criminalip_enrich.py,test_fofa_enrich.py,test_netlas_enrich.py,test_otx_enrich.py,test_uncover_enrich.py,test_virustotal_enrich.py,test_zoomeye_enrich.py,test_gau_parallel.py,test_gau_urlscan_api_key.py,test_recon_mixin_split.py,test_custom_templates_integration.py,test_masscan_integration.py,test_registry_tool_wiring.py,test_coverage_stamps.py,test_fix_vuln_mixin_writer.py,test_graph_org_model.py,test_graph_scan_scope.py,test_recon_coverage_graph.py,test_urlscan_writers.py,test_vuln_writers_multi_root.py,test_partial_enrichment_dispatch.py,test_partial_local_dispatch.py,test_partial_override_contract.py,test_partial_override_safety.py,test_planner_manifest.py,test_planner_overrides.py"
 
 # Section spec: name|image|workdir|PYTHONPATH|testpaths|covpkg|exclude
 _TEST_SECTIONS=(

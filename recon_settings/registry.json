@@ -9569,7 +9569,7 @@
   },
   "plannerConsumerAiTags": {
    "default": false,
-   "form_section": null,
+   "form_section": "PlannerSection",
    "group": "planner",
    "has_default": true,
    "mcp": "settable",
@@ -9586,7 +9586,7 @@
   },
   "plannerConsumerTargetSelection": {
    "default": false,
-   "form_section": null,
+   "form_section": "PlannerSection",
    "group": "planner",
    "has_default": true,
    "mcp": "settable",
@@ -9603,7 +9603,7 @@
   },
   "plannerConsumerTwoPass": {
    "default": false,
-   "form_section": null,
+   "form_section": "PlannerSection",
    "group": "planner",
    "has_default": true,
    "mcp": "settable",
@@ -9620,7 +9620,7 @@
   },
   "plannerManifestEnabled": {
    "default": false,
-   "form_section": null,
+   "form_section": "PlannerSection",
    "group": "planner",
    "has_default": true,
    "mcp": "settable",
@@ -9637,7 +9637,7 @@
   },
   "plannerMode": {
    "default": "off",
-   "form_section": null,
+   "form_section": "PlannerSection",
    "group": "planner",
    "has_default": true,
    "mcp": "settable",
@@ -16536,6 +16536,12 @@
    "form_section": "ScanModulesSection",
    "phase": "standalone",
    "title": "Pipeline AI master switch",
+   "traffic": "none"
+  },
+  "planner": {
+   "form_section": "PlannerSection",
+   "phase": "vuln_scan",
+   "title": "Planner",
    "traffic": "none"
   },
   "port_scan_ai": {

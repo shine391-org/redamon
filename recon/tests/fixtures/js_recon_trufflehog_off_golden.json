@@ -30,6 +30,35 @@
  ],
  "scan_metadata": {
   "endpoint_extraction_miss": false,
+  "fetch_admission": {
+   "admitted": 2,
+   "by_defer_reason": {},
+   "by_provenance": {
+    "observed_app_js": 2
+   },
+   "bytes_downloaded": 0,
+   "candidates": 2,
+   "context": "565d240f5343e625",
+   "deferred": [],
+   "deferred_total": 0,
+   "download_attempts": 0,
+   "download_cache": {
+    "entries": 0,
+    "hits": 0
+   },
+   "download_skipped_cache": 0,
+   "enabled": true,
+   "extracted": 0,
+   "outcomes": [],
+   "parse_cache": {
+    "entries": 0,
+    "hits": 0,
+    "parses": 0
+   },
+   "parse_skipped_cache": 0,
+   "parses": 2,
+   "retries": 0
+  },
   "file_budget": {
    "by_host": {
     "app.example.com:443": {

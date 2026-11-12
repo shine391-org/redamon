@@ -15,6 +15,7 @@
  *
  * `ScanJob` rows are the run history the timeline/scheduler tables read.
  */
+import type { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { writeAudit } from '@/lib/audit'
 import { readDegradedSourceCount } from '@/lib/scanCoverage'
@@ -254,7 +255,7 @@ export interface CreateScanJobInput {
    */
   planManifestPath?: string | null
   planManifestSha256?: string | null
-  planManifestSummary?: Record<string, unknown> | null
+  planManifestSummary?: Prisma.InputJsonObject | null
 }
 
 export async function createScanJob(input: CreateScanJobInput): Promise<{ id: string }> {
@@ -301,7 +302,7 @@ export async function persistPlanManifest(input: {
   pointer: {
     plan_manifest_path: string
     plan_manifest_sha256: string
-    plan_manifest_summary: Record<string, unknown>
+    plan_manifest_summary: Prisma.InputJsonObject
   }
 }): Promise<void> {
   try {

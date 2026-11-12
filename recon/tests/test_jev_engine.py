@@ -144,7 +144,7 @@ def test_nuclei_posts_to_the_jev_route_and_logs_the_jev_tag(capsys):
     body = {"tags": ["cve", "wordpress"]}
     with mock.patch.object(nuclei_tags.requests, "post", return_value=_resp(200, body)) as post:
         out = nuclei_tags.get_ai_tags({"technologies": ["wordpress"], "servers": ["nginx"]},
-                                      ["cve"], model="ignored", engine="jev")
+                                      ["cve", "wordpress"], model="ignored", engine="jev")
     assert post.call_args.args[0].endswith("/jev/nuclei-tags")
     # Both tags are in the fallback candidate list the hook loads without a
     # templates volume, so the existing validator keeps them in order.

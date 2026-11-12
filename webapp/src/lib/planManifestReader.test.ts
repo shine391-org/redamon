@@ -5,7 +5,7 @@
  */
 import { describe, test, expect, vi, beforeEach } from 'vitest'
 
-const fetchMock = vi.fn()
+const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: fetchMock }))
 
 import { readPlanManifest } from './planManifestReader'
@@ -39,6 +39,12 @@ describe('readPlanManifest', () => {
   test('no pointer -> unknown without calling the orchestrator', async () => {
     const out = await readPlanManifest('p1', { planManifestPath: null, planManifestSha256: null, planManifestSummary: null })
     expect(out).toEqual({ status: 'unknown', reason: 'no_manifest_pointer' })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test.each([true, 1, 'invalid', []])('non-object persisted summary %j -> unknown', async (summary) => {
+    const out = await readPlanManifest('p1', { ...job, planManifestSummary: summary }, 't1')
+    expect(out).toEqual({ status: 'unknown', reason: 'invalid_manifest_summary' })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
