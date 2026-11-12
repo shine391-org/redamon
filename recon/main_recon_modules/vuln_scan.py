@@ -27,6 +27,7 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urlparse
 import sys
 
@@ -82,6 +83,17 @@ from recon.helpers import (
     run_cve_lookup,
     # Security checks
     run_security_checks,
+)
+from recon.helpers.template_classification import (
+    TemplateCategory,
+    TemplateClassificationRegistry,
+    get_registry,
+    classify_template,
+    batch_templates_by_category,
+    get_compatibility_lane_templates,
+    analyze_template_capability,
+    RequestCapability,
+    validate_auth_batch_safety,
 )
 from recon.helpers.security_checks import page_content_enabled
 from recon.helpers.isolated_result import TopLevelKeys
@@ -314,6 +326,297 @@ def _live_web_urls(recon_data: dict) -> list:
     that could not start would have scanned."""
     from recon.helpers.target_helpers import build_target_urls_from_httpx
     return build_target_urls_from_httpx(recon_data.get("http_probe"))
+
+
+# ---------------------------------------------------------------------------
+# Template Classification & Routing (F14)
+# ---------------------------------------------------------------------------
+
+def _classify_and_route_templates(
+    template_tags: List[str],
+    template_paths: List[str],
+    custom_templates: List[str],
+    selected_custom_templates: List[str],
+    exclude_templates: List[str],
+    exclude_tags: List[str],
+    resource_enum_data: Optional[dict] = None,
+    http_probe_data: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """
+    Classify templates by semantics and route them to appropriate target sets.
+    
+    Returns a dict with routing plan:
+    {
+        "by_category": {category: [template_ids]},
+        "target_sets": {category: [urls]},
+        "compatibility_templates": [template_ids],
+        "routing_metadata": {...}
+    }
+    """
+    registry = get_registry()
+    
+    # Collect all template references
+    all_templates = []
+    all_templates.extend(template_tags or [])  # These are tag names like "cve", "xss"
+    all_templates.extend(template_paths or [])  # Explicit template paths
+    all_templates.extend(custom_templates or [])
+    all_templates.extend(selected_custom_templates or [])
+    
+    # Note: template_tags (NUCLEI_TAGS) are tag names, not template IDs.
+    # The actual template expansion happens inside nuclei. We classify by tag prefix.
+    # For explicit templates (paths), we can classify directly.
+    
+    # Separate tag-based selection from explicit template paths
+    tag_based = list(template_tags or [])
+    explicit_templates = list(template_paths or []) + list(custom_templates or []) + list(selected_custom_templates or [])
+    
+    # Classify explicit templates by content if available, or by path prefix
+    explicit_classified = {}
+    for tpl in explicit_templates:
+        classified = registry.classify(tpl)
+        explicit_classified[tpl] = classified
+    
+    # Classify tag-based selection by prefix heuristic
+    tag_classified = {}
+    for tag in tag_based:
+        # Map tag to category using prefix rules
+        category = TemplateCategory.ENDPOINT  # Default for vuln tags
+        if tag in ('ssl', 'tls', 'certificate', 'dns', 'takeover', 'tech', 'fingerprint', 'exposure', 'misconfig'):
+            category = TemplateCategory.ORIGIN_SAFE
+        elif tag in ('default-login', 'panel', 'wordpress', 'wp-plugin', 'wp-theme', 'joomla', 'drupal'):
+            category = TemplateCategory.APP_PREFIX
+        elif tag in ('file-upload', 'multipart'):
+            category = TemplateCategory.BODY_MULTIPART
+        elif tag in ('fuzz', 'brute'):
+            category = TemplateCategory.MULTI_REQUEST
+        elif tag in ('aws', 'azure', 'gcp', 'kubernetes', 'docker', 'cloud'):
+            category = TemplateCategory.ORIGIN_SAFE
+        tag_classified[tag] = category
+    
+    # Build target sets from resource_enum and http_probe
+    base_urls = []
+    endpoint_urls = []
+    origin_urls = []  # Just the origin (scheme://host)
+    
+    if resource_enum_data:
+        by_base_url = resource_enum_data.get("by_base_url", {})
+        for base_url, base_data in by_base_url.items():
+            origin = base_url
+            base_urls.append(base_url)
+            endpoints = base_data.get("endpoints", {})
+            for path, ep_info in endpoints.items():
+                if isinstance(path, str) and path.startswith("/") and "{" not in path:
+                    # Has parameters?
+                    params = ep_info.get("parameters", {})
+                    has_params = False
+                    if isinstance(params, dict):
+                        query_params = params.get("query", [])
+                        body_params = params.get("body", [])
+                        has_params = bool(query_params or body_params)
+                    if has_params:
+                        endpoint_urls.append(f"{base_url}{path}")
+            # Origin URL (base)
+            origin_urls.append(origin)
+    
+    if http_probe_data:
+        by_url = http_probe_data.get("by_url", {})
+        for url, url_data in by_url.items():
+            if url not in base_urls:
+                base_urls.append(url)
+            # Extract origin
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if origin not in origin_urls:
+                origin_urls.append(origin)
+    
+    # Deduplicate
+    base_urls = sorted(set(base_urls))
+    endpoint_urls = sorted(set(endpoint_urls))
+    origin_urls = sorted(set(origin_urls))
+    
+    # Route templates to target sets
+    routing = {
+        "by_category": {cat.value: [] for cat in TemplateCategory},
+        "target_sets": {
+            TemplateCategory.ORIGIN_SAFE.value: origin_urls,
+            TemplateCategory.APP_PREFIX.value: base_urls,  # App prefix checks run on base URLs
+            TemplateCategory.ENDPOINT.value: endpoint_urls if endpoint_urls else base_urls,
+            TemplateCategory.BODY_MULTIPART.value: endpoint_urls if endpoint_urls else base_urls,
+            TemplateCategory.MULTI_REQUEST.value: base_urls,
+            TemplateCategory.RAW_HTTP.value: base_urls,
+            TemplateCategory.UNKNOWN.value: base_urls,  # Compatibility lane runs on all
+        },
+        "compatibility_templates": [],
+        "routing_metadata": {
+            "total_templates": len(all_templates),
+            "tag_based_count": len(tag_based),
+            "explicit_count": len(explicit_templates),
+            "origin_urls": len(origin_urls),
+            "base_urls": len(base_urls),
+            "endpoint_urls": len(endpoint_urls),
+        }
+    }
+    
+    # Add explicit templates to routing
+    for tpl, classified in explicit_classified.items():
+        routing["by_category"][classified.category.value].append(tpl)
+        if classified.category == TemplateCategory.UNKNOWN:
+            routing["compatibility_templates"].append(tpl)
+    
+    # Add tag-based templates to routing
+    for tag, cat in tag_classified.items():
+        routing["by_category"][cat.value].append(f"tag:{tag}")
+        if cat == TemplateCategory.UNKNOWN:
+            routing["compatibility_templates"].append(f"tag:{tag}")
+    
+    return routing
+
+
+def _build_routed_nuclei_commands(
+    routing: Dict[str, Any],
+    nuclei_temp_dir: Path,
+    base_settings: Dict[str, Any],
+    auth_headers: List[str],
+    container_prefix: str,
+) -> List[Dict[str, Any]]:
+    """
+    Build separate nuclei commands for each template category with appropriate targets.
+    
+    Returns list of command configs:
+    [
+        {
+            "category": "origin_safe",
+            "targets_file": "...",
+            "output_file": "...",
+            "container_name": "...",
+            "cmd": [...],
+            "template_selection": {...},
+        },
+        ...
+    ]
+    """
+    commands = []
+    
+    # Category to target set mapping
+    target_sets = routing["target_sets"]
+    by_category = routing["by_category"]
+    
+    for cat_value, templates in by_category.items():
+        if not templates:
+            continue
+        
+        category = TemplateCategory(cat_value)
+        targets = target_sets.get(cat_value, [])
+        
+        if not targets:
+            print(f"[!][Nuclei-Routing] No targets for category {cat_value}, skipping")
+            continue
+        
+        # Write targets file for this category
+        targets_file = str(nuclei_temp_dir / f"targets_{cat_value}.txt")
+        with open(targets_file, 'w') as f:
+            for url in targets:
+                f.write(url + "\n")
+        
+        output_file = str(nuclei_temp_dir / f"nuclei_{cat_value}.jsonl")
+        container_name = f"{container_prefix}-{cat_value}-{uuid.uuid4().hex[:8]}"
+        
+        # Build template selection for this category
+        # Separate tags from explicit templates
+        cat_tags = [t.replace("tag:", "") for t in templates if t.startswith("tag:")]
+        cat_explicit = [t for t in templates if not t.startswith("tag:")]
+        
+        # Build command
+        cmd = build_nuclei_command(
+            targets_file=targets_file,
+            output_file=output_file,
+            docker_image=base_settings.get("NUCLEI_DOCKER_IMAGE", "projectdiscovery/nuclei:latest"),
+            severity=base_settings.get("NUCLEI_SEVERITY", ["critical", "high", "medium", "low"]),
+            templates=cat_explicit if cat_explicit else None,
+            exclude_templates=base_settings.get("NUCLEI_EXCLUDE_TEMPLATES", []),
+            custom_templates=base_settings.get("NUCLEI_CUSTOM_TEMPLATES", []),
+            selected_custom_templates=base_settings.get("NUCLEI_SELECTED_CUSTOM_TEMPLATES", []),
+            tags=cat_tags if cat_tags else None,
+            exclude_tags=base_settings.get("NUCLEI_EXCLUDE_TAGS", []),
+            rate_limit=base_settings.get("NUCLEI_RATE_LIMIT", 100),
+            bulk_size=base_settings.get("NUCLEI_BULK_SIZE", 25),
+            concurrency=base_settings.get("NUCLEI_CONCURRENCY", 25),
+            timeout=base_settings.get("NUCLEI_TIMEOUT", 10),
+            retries=base_settings.get("NUCLEI_RETRIES", 1),
+            dast_mode=False,
+            new_templates_only=base_settings.get("NUCLEI_NEW_TEMPLATES_ONLY", False),
+            headless=base_settings.get("NUCLEI_HEADLESS", False),
+            system_resolvers=base_settings.get("NUCLEI_SYSTEM_RESOLVERS", True),
+            follow_redirects=base_settings.get("NUCLEI_FOLLOW_REDIRECTS", True),
+            max_redirects=base_settings.get("NUCLEI_MAX_REDIRECTS", 10),
+            interactsh=base_settings.get("NUCLEI_INTERACTSH", True),
+            auth_headers=auth_headers,
+            container_name=container_name,
+            max_host_error=base_settings.get("NUCLEI_MAX_HOST_ERROR", 30),
+        )
+        
+        commands.append({
+            "category": cat_value,
+            "targets_file": targets_file,
+            "output_file": output_file,
+            "container_name": container_name,
+            "cmd": cmd,
+            "template_selection": {
+                "tags": cat_tags,
+                "explicit_templates": cat_explicit,
+                "target_count": len(targets),
+            },
+            "target_urls": targets,
+        })
+    
+    return commands
+
+
+def _execute_routed_passes(
+    routed_commands: List[Dict[str, Any]],
+    runtime_cap: float,
+    label_prefix: str = "DETECTION",
+) -> Tuple[List[Dict], List[Dict], float, List[Dict]]:
+    """
+    Execute multiple routed nuclei passes and collect results.
+    
+    Returns: (all_findings, all_false_positives, total_duration, coverage_passes)
+    """
+    all_findings = []
+    all_false_positives = []
+    total_duration = 0.0
+    coverage_passes = []
+    
+    for cmd_info in routed_commands:
+        category = cmd_info["category"]
+        targets = cmd_info["target_urls"]
+        container_name = cmd_info["container_name"]
+        cmd = cmd_info["cmd"]
+        output_file = cmd_info["output_file"]
+        
+        label = f"{label_prefix}-{category.upper()}"
+        print(f"[*][Nuclei] Running {label} pass on {len(targets)} targets with {len(cmd_info['template_selection']['tags'])} tags + {len(cmd_info['template_selection']['explicit_templates'])} explicit templates")
+        
+        try:
+            findings, fps, duration, rc = _execute_nuclei_pass(
+                cmd, output_file, label=label,
+                runtime_cap=runtime_cap, container_name=container_name,
+            )
+            all_findings.extend(findings)
+            all_false_positives.extend(fps)
+            total_duration += duration
+            coverage_passes.append((targets, *_nuclei_pass_outcome(
+                rc, duration, runtime_cap, findings or fps), True))
+        except NucleiEmptySelectionError as exc:
+            print(f"[!][Nuclei] {label} pass not executed (policy_empty): {exc}")
+            _keep_nuclei_findings(f"nuclei {label} pass not executed: policy_empty")
+            coverage_passes.append((targets, "failed", f"policy_empty: {exc}", False))
+        except Exception as exc:
+            print(f"[!][Nuclei] {label} pass failed: {exc}")
+            coverage_passes.append((targets, "failed", str(exc), False))
+    
+    return all_findings, all_false_positives, total_duration, coverage_passes
 
 
 def _nuclei_kill_container(container_name: str) -> None:
@@ -972,13 +1275,6 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 json.dump(recon_data, f, indent=2)
             fix_file_ownership(output_file)
 
-        # Detection pass targets
-        detection_targets_file = str(nuclei_temp_dir / "targets_detection.txt")
-        with open(detection_targets_file, 'w') as f:
-            for url in target_urls:
-                f.write(url + "\n")
-        detection_output_file = str(nuclei_temp_dir / "nuclei_detection.jsonl")
-
         # DAST pass targets (parameterized URLs only)
         dast_targets_file = None
         dast_output_file = None
@@ -988,9 +1284,9 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 for url in dast_urls:
                     f.write(url + "\n")
             dast_output_file = str(nuclei_temp_dir / "nuclei_dast.jsonl")
-            print(f"[*][Nuclei] Two-pass plan: DETECTION on {len(target_urls)} URLs + DAST on {len(dast_urls)} parameterized URLs")
+            print(f"[*][Nuclei] Two-pass plan: DETECTION (routed) + DAST on {len(dast_urls)} parameterized URLs")
         else:
-            print(f"[*][Nuclei] Single-pass plan: DETECTION on {len(target_urls)} URLs")
+            print(f"[*][Nuclei] Single-pass plan: DETECTION (routed)")
 
         # scan_urls is the union for reporting/metadata
         scan_urls = sorted(set(target_urls + (dast_urls if do_dast_pass else [])))
@@ -1013,7 +1309,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             findings = []
             false_positives_filtered = []
 
-            # ---- Pass A: DETECTION ----
+            # ---- Pass A: DETECTION (Routed by Template Category - F14) ----
             start_time = datetime.now()
             coverage_passes = []
             # Set only when a pass was attempted and refused. The metadata block
@@ -1021,64 +1317,74 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             # every path -- including the Nuclei-disabled early return.
             dast_not_executed = None
             detection_not_executed = None
+            routing = {"routing_metadata": {"skipped": True}, "by_category": {}, "compatibility_templates": []}
             if skip_detection_pass:
                 print("[*][Nuclei] DETECTION pass skipped (no tags + no custom templates)")
                 d_findings, d_fps, d_duration = [], [], 0
                 coverage_passes.append((target_urls, "failed", "no Nuclei templates selected", False))
             else:
-                detection_container = f"redamon-nuclei-detection-{uuid.uuid4().hex[:12]}"
-                try:
-                    detection_cmd = build_nuclei_command(
-                        targets_file=detection_targets_file,
-                        output_file=detection_output_file,
-                        docker_image=NUCLEI_DOCKER_IMAGE,
-                        severity=NUCLEI_SEVERITY,
-                        templates=NUCLEI_TEMPLATES,
-                        exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
-                        custom_templates=NUCLEI_CUSTOM_TEMPLATES,
-                        selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
-                        tags=NUCLEI_TAGS,
-                        exclude_tags=NUCLEI_EXCLUDE_TAGS,
-                        rate_limit=NUCLEI_RATE_LIMIT,
-                        bulk_size=NUCLEI_BULK_SIZE,
-                        concurrency=NUCLEI_CONCURRENCY,
-                        timeout=NUCLEI_TIMEOUT,
-                        retries=NUCLEI_RETRIES,
-                        dast_mode=False,
-                        new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
-                        headless=NUCLEI_HEADLESS,
-                        system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
-                        follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
-                        max_redirects=NUCLEI_MAX_REDIRECTS,
-                        interactsh=NUCLEI_INTERACTSH,
-                        auth_headers=_nuclei_auth,
-                        container_name=detection_container,
-                        max_host_error=NUCLEI_MAX_HOST_ERROR,
-                    )
-                    d_findings, d_fps, d_duration, d_rc = _execute_nuclei_pass(
-                        detection_cmd, detection_output_file, label="DETECTION",
-                        runtime_cap=NUCLEI_MAX_RUNTIME, container_name=detection_container,
-                    )
-                except NucleiEmptySelectionError as exc:
-                    # Both the builder's fail-closed refusal and nuclei's own
-                    # "no templates provided for scan" fatal mean the policy left
-                    # this pass nothing to run. Record it explicitly, keep the
-                    # previous findings, and continue -- the CVE lookup and the
-                    # security checks below must still run.
-                    print(f"[!][Nuclei] DETECTION pass not executed (policy_empty): {exc}")
-                    _keep_nuclei_findings("nuclei DETECTION pass not executed: policy_empty")
-                    d_findings, d_fps, d_duration = [], [], 0
-                    detection_not_executed = {
-                        "pass": "DETECTION",
-                        "state": "not_executed",
-                        "reason": "policy_empty",
-                        "detail": str(exc),
-                    }
-                    coverage_passes.append((target_urls, "failed",
-                                            "policy_empty: no Nuclei templates selected", False))
-                else:
-                    coverage_passes.append((target_urls, *_nuclei_pass_outcome(
-                        d_rc, d_duration, NUCLEI_MAX_RUNTIME, d_findings or d_fps), True))
+                # F14: Classify templates by semantics and route to appropriate targets
+                # This replaces the single detection pass with category-routed passes
+                routing = _classify_and_route_templates(
+                    template_tags=NUCLEI_TAGS,
+                    template_paths=NUCLEI_TEMPLATES,
+                    custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+                    selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+                    exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
+                    exclude_tags=NUCLEI_EXCLUDE_TAGS,
+                    resource_enum_data=recon_data.get("resource_enum"),
+                    http_probe_data=recon_data.get("http_probe"),
+                )
+                
+                # Log routing summary
+                print(f"[*][Nuclei-Routing] Template routing summary:")
+                for cat, tpls in routing["by_category"].items():
+                    if tpls:
+                        target_count = len(routing["target_sets"].get(cat, []))
+                        print(f"[*][Nuclei-Routing]   {cat}: {len(tpls)} templates -> {target_count} targets")
+                
+                # Compatibility lane templates (unknown semantics) run with legacy behavior
+                if routing["compatibility_templates"]:
+                    print(f"[*][Nuclei-Routing] Compatibility lane: {len(routing['compatibility_templates'])} templates with unknown semantics -> legacy behavior on all targets")
+                
+                # Build routed commands
+                base_settings = {
+                    "NUCLEI_DOCKER_IMAGE": NUCLEI_DOCKER_IMAGE,
+                    "NUCLEI_SEVERITY": NUCLEI_SEVERITY,
+                    "NUCLEI_EXCLUDE_TEMPLATES": NUCLEI_EXCLUDE_TEMPLATES,
+                    "NUCLEI_CUSTOM_TEMPLATES": NUCLEI_CUSTOM_TEMPLATES,
+                    "NUCLEI_SELECTED_CUSTOM_TEMPLATES": NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+                    "NUCLEI_EXCLUDE_TAGS": NUCLEI_EXCLUDE_TAGS,
+                    "NUCLEI_RATE_LIMIT": NUCLEI_RATE_LIMIT,
+                    "NUCLEI_BULK_SIZE": NUCLEI_BULK_SIZE,
+                    "NUCLEI_CONCURRENCY": NUCLEI_CONCURRENCY,
+                    "NUCLEI_TIMEOUT": NUCLEI_TIMEOUT,
+                    "NUCLEI_RETRIES": NUCLEI_RETRIES,
+                    "NUCLEI_NEW_TEMPLATES_ONLY": NUCLEI_NEW_TEMPLATES_ONLY,
+                    "NUCLEI_HEADLESS": NUCLEI_HEADLESS,
+                    "NUCLEI_SYSTEM_RESOLVERS": NUCLEI_SYSTEM_RESOLVERS,
+                    "NUCLEI_FOLLOW_REDIRECTS": NUCLEI_FOLLOW_REDIRECTS,
+                    "NUCLEI_MAX_REDIRECTS": NUCLEI_MAX_REDIRECTS,
+                    "NUCLEI_INTERACTSH": NUCLEI_INTERACTSH,
+                    "NUCLEI_MAX_HOST_ERROR": NUCLEI_MAX_HOST_ERROR,
+                }
+                
+                routed_commands = _build_routed_nuclei_commands(
+                    routing=routing,
+                    nuclei_temp_dir=nuclei_temp_dir,
+                    base_settings=base_settings,
+                    auth_headers=_nuclei_auth,
+                    container_prefix="redamon-nuclei-detection",
+                )
+                
+                # Execute routed passes
+                d_findings, d_fps, d_duration, routed_coverage = _execute_routed_passes(
+                    routed_commands=routed_commands,
+                    runtime_cap=NUCLEI_MAX_RUNTIME,
+                    label_prefix="DETECTION",
+                )
+                coverage_passes.extend(routed_coverage)
+            
             findings.extend(d_findings)
             false_positives_filtered.extend(d_fps)
 
@@ -1188,21 +1494,23 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "declared_only": _declared_report,
                     "dast_urls_discovered": len(dast_urls) if NUCLEI_DAST_MODE else 0,
                     # F03: the DAST pass is a separate consumer of the operator's
-                    # denylist. Record what it actually received and whether the
-                    # builder was asked to drop it, so a policy regression is
-                    # visible in the artifact rather than only in the argv.
-                    "dast_exclude_tags": NUCLEI_EXCLUDE_TAGS,
-                    "dast_exclude_templates": NUCLEI_EXCLUDE_TEMPLATES,
-                    # Absent means no DAST pass was attempted: nothing was
-                    # skipped, so there is no policy state to report.
-                    **({"dast_not_executed": dast_not_executed}
-                       if dast_not_executed is not None else {}),
-                    # Same contract for the DETECTION pass: present only when the
-                    # builder's fail-closed refusal or nuclei's "no templates
-                    # provided for scan" fatal left it nothing to run.
-                    **({"detection_not_executed": detection_not_executed}
-                       if detection_not_executed is not None else {}),
-                    "katana_crawl_depth": KATANA_DEPTH if NUCLEI_DAST_MODE else None,
+                                        # denylist. Record what it actually received and whether the
+                                        # builder was asked to drop it, so a policy regression is
+                                        # visible in the artifact rather than only in the argv.
+                                        "dast_exclude_tags": NUCLEI_EXCLUDE_TAGS,
+                                        "dast_exclude_templates": NUCLEI_EXCLUDE_TEMPLATES,
+                                        # F14: Template routing metadata
+                                        "template_routing": routing.get("routing_metadata", {}),
+                                        # Absent means no DAST pass was attempted: nothing was
+                                        # skipped, so there is no policy state to report.
+                                        **( {"dast_not_executed": dast_not_executed}
+                                           if dast_not_executed is not None else {}),
+                                        # Same contract for the DETECTION pass: present only when the
+                                        # builder's fail-closed refusal or nuclei's "no templates
+                                        # provided for scan" fatal left it nothing to run.
+                                        **( {"detection_not_executed": detection_not_executed}
+                                           if detection_not_executed is not None else {}),
+                                        "katana_crawl_depth": KATANA_DEPTH if NUCLEI_DAST_MODE else None,
                     "total_urls_scanned": len(scan_urls),
                     "total_hostnames": len(hostnames),
                     "total_ips": len(ips),
@@ -1404,11 +1712,16 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             # Docker may create output files as root, so fall back to a docker-based
             # rm when a PermissionError is raised.
             cleanup_paths = [
-                detection_targets_file,
-                detection_output_file,
                 dast_targets_file,
                 dast_output_file,
             ]
+            # Add routed detection output files (they follow pattern nuclei_<category>.jsonl)
+            for cat in TemplateCategory:
+                routed_output = str(nuclei_temp_dir / f"nuclei_{cat.value}.jsonl")
+                cleanup_paths.append(routed_output)
+                routed_targets = str(nuclei_temp_dir / f"targets_{cat.value}.txt")
+                cleanup_paths.append(routed_targets)
+            
             for path_str in cleanup_paths:
                 if not path_str:
                     continue

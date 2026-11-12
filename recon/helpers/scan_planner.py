@@ -31,13 +31,23 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
 
 from recon.helpers.planner_manifest import (
     MODE_OFF, MODE_SHADOW, MODE_ENFORCE, resolve_mode,
     template_hashes_from_settings, scope_roots_from_settings,
     _strip_userinfo, MANIFEST_MAX_TASKS,
+)
+from recon.helpers.template_classification import (
+    TemplateCategory,
+    TemplateClassificationRegistry,
+    ClassifiedTemplate,
+    get_registry,
+    classify_template,
+    analyze_template_capability,
+    RequestCapability,
+    validate_auth_batch_safety,
 )
 
 #: Bound on tasks per plan — imported from planner_manifest (MANIFEST_MAX_TASKS)
@@ -168,10 +178,42 @@ def _content_type_known(content_type: str) -> bool:
                   "application/octet-stream")
 
 
+def _get_template_registry() -> TemplateClassificationRegistry:
+    """Get the template classification registry (lazy-loaded)."""
+    global _TEMPLATE_REGISTRY
+    if _TEMPLATE_REGISTRY is None:
+        _TEMPLATE_REGISTRY = get_registry()
+    return _TEMPLATE_REGISTRY
+
+
+# Module-level registry cache
+_TEMPLATE_REGISTRY: Optional[TemplateClassificationRegistry] = None
+
+
 def _template_known(template: str) -> Optional[str]:
-    """Return the provenance rule for a known template, or None when unknown."""
+    """Return the provenance rule for a known template, or None when unknown.
+    
+    Uses the new TemplateClassificationRegistry for classification.
+    Falls back to TEMPLATE_RULES for backward compatibility.
+    """
     if not isinstance(template, str) or not template:
         return None
+    
+    registry = _get_template_registry()
+    
+    # Try registry classification first (handles full template paths like 'cve/2024/...')
+    classified = registry.classify(template)
+    if classified.is_known():
+        return classified.provenance
+    
+    # For bare tag names (no '/'), try tag-based classification
+    # NUCLEI_TAGS are tag names like 'cve', 'xss', 'ssl', not template paths
+    if "/" not in template:
+        tag_category = registry._classify_by_tags((template,))
+        if tag_category != TemplateCategory.UNKNOWN:
+            return f"rule:tag-known-{tag_category.value}"
+    
+    # Fallback to legacy TEMPLATE_RULES
     for prefix, provenance in TEMPLATE_RULES:
         if template.startswith(prefix):
             return provenance
@@ -241,6 +283,9 @@ class PlanTask:
     estimate: Optional[int] = None
     provenance: str = ""
     reason: str = ""
+    template_category: str = ""  # TemplateCategory value
+    requires_body_support: bool = False  # Whether template needs body/multipart transport
+    is_multi_request: bool = False  # Whether template executes multiple requests
 
     def __post_init__(self) -> None:
         # Normalize tuples so the frozen dataclass is hashable and comparable.
@@ -601,9 +646,20 @@ class ScanPlanner:
           3. Unknown template semantics -> COMPATIBILITY (legacy behavior)
           4. Known template but unknown target aspect -> COMPATIBILITY
           5. Known template + known target -> PLANNED with provenance
+
+        Uses TemplateClassificationRegistry for semantic routing:
+        - origin_safe: runs on origin only (no path needed)
+        - app_prefix: runs on known app paths
+        - endpoint: runs on parameterized endpoints
+        - body_multipart: requires body-capable transport
+        - multi_request: multi-step flows
+        - raw_http: raw HTTP requests
+        - unknown: compatibility lane
         """
         provenance = ""
         reason = ""
+        template_category = TemplateCategory.UNKNOWN
+        capability = None
 
         # 1. Missing template -> explicit failed selection, never silent drop.
         template_prov = _template_known(template)
@@ -624,28 +680,70 @@ class ScanPlanner:
             reason = "template semantics unknown -> compatibility lane (run legacy behavior)"
             provenance = "rule:template-unknown"
             estimate = 1  # one request per template, labeled estimate
-        # 4. Known template; classify target aspects.
+        # 4. Known template; classify target aspects with semantic routing.
         else:
             provenance = template_prov
+            
+            # Get template classification for semantic routing
+            registry = _get_template_registry()
+            classified = registry.classify(template)
+            
+            # For bare tag names (no '/'), use tag-based classification
+            # NUCLEI_TAGS are tag names like 'cve', 'xss', 'ssl', not template paths
+            if classified.category == TemplateCategory.UNKNOWN and "/" not in template:
+                tag_category = registry._classify_by_tags((template,))
+                if tag_category != TemplateCategory.UNKNOWN:
+                    # Create a synthetic classified object with the tag category
+                    classified = type(classified)(
+                        template_id=template,
+                        category=tag_category,
+                        provenance=f"rule:tag-known-{tag_category.value}",
+                        confidence=0.5,
+                        meta=None,
+                    )
+            
+            template_category = classified.category
+            capability = analyze_template_capability(template)
+            
             origin_ok = _origin_known(origin)
             path_ok = _path_known(path)
             ct_ok = _content_type_known(content_type)
-            if origin_ok and path_ok and ct_ok:
+            
+            # Semantic routing rules:
+            # - origin_safe: only needs origin_ok
+            # - app_prefix: needs origin_ok + path matches known prefix
+            # - endpoint: needs origin_ok + path_ok + ct_ok
+            # - body_multipart/multi_request/raw_http: needs full target known
+            # - unknown: compatibility
+            
+            target_known = False
+            if template_category == TemplateCategory.ORIGIN_SAFE:
+                target_known = origin_ok
+            elif template_category == TemplateCategory.APP_PREFIX:
+                target_known = origin_ok and path_ok
+            elif template_category in (TemplateCategory.ENDPOINT, TemplateCategory.BODY_MULTIPART):
+                target_known = origin_ok and path_ok and ct_ok
+            elif template_category in (TemplateCategory.MULTI_REQUEST, TemplateCategory.RAW_HTTP):
+                target_known = origin_ok and path_ok and ct_ok
+            else:  # UNKNOWN
+                target_known = False
+            
+            if target_known:
                 disposition = Disposition.PLANNED
-                reason = "known template + known target category"
-                provenance = f"{template_prov};rule:target-known"
+                reason = f"known template ({template_category.value}) + known target category"
+                provenance = f"{template_prov};rule:target-known;category:{template_category.value}"
                 estimate = 1
             else:
                 disposition = Disposition.COMPATIBILITY
                 missing = []
                 if not origin_ok:
                     missing.append("origin")
-                if not path_ok:
+                if template_category != TemplateCategory.ORIGIN_SAFE and not path_ok:
                     missing.append("path")
-                if not ct_ok:
+                if template_category in (TemplateCategory.ENDPOINT, TemplateCategory.BODY_MULTIPART, TemplateCategory.MULTI_REQUEST, TemplateCategory.RAW_HTTP) and not ct_ok:
                     missing.append("content-type")
-                reason = "unknown target aspect(s): " + ", ".join(missing) + " -> compatibility"
-                provenance = f"{template_prov};rule:target-unknown"
+                reason = f"unknown target aspect(s) for {template_category.value}: " + ", ".join(missing) + " -> compatibility"
+                provenance = f"{template_prov};rule:target-unknown;category:{template_category.value}"
                 estimate = 1
 
         task_id = _task_id(template, origin, path, method, query, body,
@@ -664,6 +762,9 @@ class ScanPlanner:
             estimate=estimate,
             provenance=provenance,
             reason=reason,
+            template_category=template_category.value,
+            requires_body_support=capability.has_body if capability else False,
+            is_multi_request=capability.is_multi_request if capability else False,
         )
 
     # ------------------------------------------------------------------ #
@@ -703,6 +804,9 @@ class ScanPlanner:
                 "estimate": task.estimate,
                 "provenance": task.provenance,
                 "reason": task.reason,
+                "template_category": task.template_category,
+                "requires_body_support": task.requires_body_support,
+                "is_multi_request": task.is_multi_request,
             })
 
         #: Content-bound stamp so two runs of the same inputs produce an
