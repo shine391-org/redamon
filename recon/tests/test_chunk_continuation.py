@@ -270,3 +270,251 @@ def test_budget_defers_rather_than_deletes(tmp_path):
     assert "takeover" in snap["origins"]["nuclei"]["deferred"]
     # Candidate is still in the backlog (deferred), not deleted.
     assert snap["origins"]["nuclei"]["used"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Integration: the REAL _start_checkpoint -> _run_phase_a_fan_out -> journal
+# -> resume path. Helper-level tests alone did not catch the cross-group and
+# cross-run collisions (review round 1), so these drive the actual caller.
+# ---------------------------------------------------------------------------
+
+import sys
+from unittest import mock
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "recon"))
+
+
+@pytest.fixture
+def recon_main(tmp_path, monkeypatch):
+    """Import recon.main with a hermetic settings stub and a tmp OUTPUT_DIR."""
+    stub = {
+        'TARGET_DOMAIN': 'example.com', 'SUBDOMAIN_LIST': [], 'IP_MODE': False,
+        'TARGET_IPS': [], 'DOMAIN_BATCH_MODE': False, 'DOMAIN_BATCH_GROUPS': [],
+        'USE_BRUTEFORCE_FOR_SUBDOMAINS': False, 'SCAN_MODULES': ['vuln_scan'],
+        'UPDATE_GRAPH_DB': False, 'USER_ID': 'u1', 'PROJECT_ID': 'p1',
+        'VERIFY_DOMAIN_OWNERSHIP': False, 'STEALTH_MODE': False,
+        'OWNERSHIP_TOKEN': '', 'OWNERSHIP_TXT_PREFIX': '',
+    }
+    with mock.patch('recon.project_settings.get_settings', return_value=dict(stub)):
+        for mod in [m for m in list(sys.modules) if m in ('recon.main', 'main')]:
+            del sys.modules[mod]
+        import recon.main as rm
+        monkeypatch.setattr(rm, "OUTPUT_DIR", tmp_path)
+        yield rm
+
+
+def _tool(payload=None):
+    def _run(data, settings):
+        return payload if payload is not None else {"findings": []}
+    return _run
+
+
+def _combined():
+    return {"metadata": {"modules_executed": []}}
+
+
+class TestRealFanOutPath:
+    def test_two_batch_groups_never_share_a_chunk_key(self, recon_main, tmp_path):
+        """Group 2 must run its own tools even though group 1 completed the same
+        tool names. A shared project-level key silently skipped Phase A for
+        groups 2..N (review round 1, blocker 1)."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool(), "graphql_scan": _tool()}
+
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, _combined(), settings, output,
+                                group_id="group-a")
+
+        combined = _combined()
+        rm._start_checkpoint(settings, "p1", "run-1", "group-b", "t1")
+        rm._run_phase_a_fan_out(tools, combined, settings, output,
+                                group_id="group-b")
+
+        assert combined["metadata"]["modules_executed"] == ["vuln_scan", "graphql_scan"]
+
+    def test_restart_same_run_skips_completed_chunks(self, recon_main, tmp_path):
+        """A restart of the SAME run resumes: completed chunks are not re-run."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool()}
+
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, _combined(), settings, output,
+                                group_id="group-a")
+
+        combined = _combined()
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, combined, settings, output,
+                                group_id="group-a")
+
+        assert combined["metadata"]["modules_executed"] == []
+
+    def test_new_run_does_not_reuse_the_previous_runs_checkpoints(
+            self, recon_main, tmp_path):
+        """A brand-new run (new run_id) must NOT reuse run-1's checkpoints: it
+        cleared the graph and starts fresh (review round 1, blocker 2)."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool()}
+
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, _combined(), settings, output,
+                                group_id="group-a")
+
+        combined = _combined()
+        rm._start_checkpoint(settings, "p1", "run-2", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, combined, settings, output,
+                                group_id="group-a")
+
+        assert combined["metadata"]["modules_executed"] == ["vuln_scan"]
+
+    def test_same_run_config_change_replans_instead_of_silent_resume(
+            self, recon_main, tmp_path):
+        """Same run, changed scope/settings -> replan from a fresh checkpoint,
+        never a silent resume (DoD: incompatible snapshot requires replan)."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool()}
+
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, _combined(), settings, output,
+                                group_id="group-a")
+
+        changed = dict(settings)
+        changed["TARGET_DOMAIN"] = "changed.example"
+        combined = _combined()
+        status = rm._start_checkpoint(changed, "p1", "run-1", "group-a", "t1")
+        assert status == "fresh"
+        rm._run_phase_a_fan_out(tools, combined, changed, output,
+                                group_id="group-a")
+        assert combined["metadata"]["modules_executed"] == ["vuln_scan"]
+
+    def test_journal_path_is_per_run(self, recon_main, tmp_path):
+        rm = recon_main
+        base = tmp_path / "recon_p1.json"
+        assert (rm._checkpoint_journal_path(base, "run-1")
+                == tmp_path / ".recon_p1.json.run-1.chunk-journal")
+        assert (rm._checkpoint_journal_path(base, "")
+                == tmp_path / ".recon_p1.json.chunk-journal")
+
+
+class TestBudgetWiring:
+    def test_budget_defers_without_deleting_and_persists(
+            self, recon_main, tmp_path):
+        """An over-budget candidate is deferred (backlog persisted), not
+        dropped; the ledger round-trips through the run's journal."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool(), "graphql_scan": _tool()}
+
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._checkpoint_budget.set_limit("group-a", 1)
+        combined = _combined()
+        rm._run_phase_a_fan_out(tools, combined, settings, output,
+                                group_id="group-a")
+
+        # Exactly one tool admitted; the other deferred, still in the backlog.
+        assert len(combined["metadata"]["modules_executed"]) == 1
+        snapshot = rm._checkpoint_journal.load()
+        assert any(e.status == "deferred" for e in snapshot.chunks.values())
+        persisted = rm._checkpoint_journal.load_budget()
+        assert persisted is not None
+        assert persisted["origins"]["group-a"]["deferred"]
+
+    def test_unbounded_default_admits_everything(self, recon_main, tmp_path):
+        """No operator-approved budget -> unbounded: every candidate runs."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool(), "graphql_scan": _tool()}
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        combined = _combined()
+        rm._run_phase_a_fan_out(tools, combined, settings, output,
+                                group_id="group-a")
+        assert combined["metadata"]["modules_executed"] == ["vuln_scan", "graphql_scan"]
+
+
+class TestUncertainRecovery:
+    def test_interrupted_chunk_is_reported_and_retried(
+            self, recon_main, tmp_path, capsys):
+        """A chunk left running with an expired lease is reported as uncertain
+        and retried under the safe policy, not silently skipped or replayed
+        without acknowledgement."""
+        rm = recon_main
+        settings = dict(rm._settings)
+        output = tmp_path / "recon_p1.json"
+        tools = {"vuln_scan": _tool()}
+
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._checkpoint_journal.append(ChunkEntry(
+            tenant="t1", project_id="p1", run_id="run-1",
+            chunk_index=0, origin="group-a:vuln_scan", tool_ids=["vuln_scan"],
+            status="running", lease_id="dead", lease_expires_at=time.time() - 10,
+            started_at=time.time() - 20, coverage_durable=False, revision={},
+        ))
+
+        combined = _combined()
+        rm._start_checkpoint(settings, "p1", "run-1", "group-a", "t1")
+        rm._run_phase_a_fan_out(tools, combined, settings, output,
+                                group_id="group-a")
+
+        out = capsys.readouterr().out
+        assert "uncertain chunk group-a:vuln_scan" in out
+        assert combined["metadata"]["modules_executed"] == ["vuln_scan"]
+        assert rm._checkpoint_journal.is_done("group-a:vuln_scan", 0) is True
+
+
+class TestCoverageDurability:
+    def test_no_future_with_graph_disabled_is_durable(self, recon_main, tmp_path):
+        rm = recon_main
+        out = tmp_path / "recon.json"
+        out.write_text("{}")
+        assert rm._checkpoint_coverage_durable(None, out, "vuln_scan") is True
+
+    def test_no_future_with_graph_enabled_is_not_durable(
+            self, recon_main, tmp_path, monkeypatch):
+        rm = recon_main
+        monkeypatch.setattr(rm, "UPDATE_GRAPH_DB", True)
+        out = tmp_path / "recon.json"
+        out.write_text("{}")
+        assert rm._checkpoint_coverage_durable(None, out, "vuln_scan") is False
+
+    def test_failed_future_is_not_durable(self, recon_main, tmp_path):
+        import concurrent.futures
+        rm = recon_main
+        out = tmp_path / "recon.json"
+        out.write_text("{}")
+        future = concurrent.futures.Future()
+        future.set_result(False)
+        assert rm._checkpoint_coverage_durable(future, out, "vuln_scan") is False
+
+    def test_raised_future_is_not_durable(self, recon_main, tmp_path):
+        import concurrent.futures
+        rm = recon_main
+        out = tmp_path / "recon.json"
+        out.write_text("{}")
+        future = concurrent.futures.Future()
+        future.set_exception(RuntimeError("neo4j down"))
+        assert rm._checkpoint_coverage_durable(future, out, "vuln_scan") is False
+
+    def test_missing_output_is_not_durable(self, recon_main, tmp_path):
+        rm = recon_main
+        assert (rm._checkpoint_coverage_durable(
+            None, tmp_path / "missing.json", "vuln_scan") is False)
+
+    def test_successful_future_is_durable(self, recon_main, tmp_path):
+        import concurrent.futures
+        rm = recon_main
+        out = tmp_path / "recon.json"
+        out.write_text("{}")
+        future = concurrent.futures.Future()
+        future.set_result(True)
+        assert rm._checkpoint_coverage_durable(future, out, "vuln_scan") is True

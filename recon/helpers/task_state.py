@@ -172,6 +172,15 @@ class TaskStateMachine:
         with self._lock:
             return self._tasks.get(chunk_key)
 
+    def restore(self, task: TaskState) -> None:
+        """Load a durable task state (rebuilt from the journal) into the machine.
+
+        A restart rebuilds the in-memory machine from the journal so the lease
+        and recovery rules apply to chunks the previous process left behind.
+        """
+        with self._lock:
+            self._tasks[task.chunk_key] = task
+
     def snapshot(self) -> dict[str, TaskState]:
         with self._lock:
             return dict(self._tasks)
