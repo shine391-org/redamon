@@ -42,6 +42,11 @@ from recon.helpers.js_recon.framework import (
     detect_frameworks, detect_dom_sinks, detect_dev_comments,
     load_custom_frameworks,
 )
+from recon.helpers.js_recon.fetch_admission import (
+    ContentParseCache, DownloadCache, FetchCandidate, FetchMetrics, FetchOutcome,
+    PROVENANCE_RANK, RETRYABLE, MAX_RETRIES, classify_candidate,
+    context_key, extract_endpoints_cached, plan_fetches,
+)
 from recon.helpers.js_recon.urls import accept_js_response, is_js_content_type, is_js_url
 from recon.helpers.ai_signal_catalog import match_ai_sdk
 
@@ -509,6 +514,83 @@ def _should_include_url(url: str, settings: dict) -> bool:
     return True
 
 
+def _collect_js_candidates(combined_result: dict, settings: dict) -> list:
+    """Collect JS fetch candidates, each with the provenance that produced it.
+
+    Same sources as ``_collect_js_urls``, but a candidate records WHY it is a
+    candidate: a crawler observed the URL, http_probe served it as JavaScript,
+    or it is a bare string with no evidence chain (deferred by the planner).
+
+    A Rules-of-Engagement exclusion is dropped whichever source named it.
+    """
+    candidates: dict = {}
+
+    def _add(url, *, observed_app_js=False, served_js=False,
+             from_dynamic_import=False, from_source_map=False, source_ref=""):
+        if not isinstance(url, str) or not url:
+            return
+        candidate = classify_candidate(
+            url,
+            observed_app_js=observed_app_js,
+            served_js=served_js,
+            from_dynamic_import=from_dynamic_import,
+            from_source_map=from_source_map,
+            source_ref=source_ref,
+        )
+        # A bare string with no provenance chain is kept: the planner defers
+        # it with its reason instead of the collector dropping it silently.
+        existing = candidates.get(candidate.url)
+        if existing is None or PROVENANCE_RANK[candidate.provenance] < PROVENANCE_RANK[existing.provenance]:
+            candidates[candidate.url] = candidate
+
+    resource_enum = combined_result.get('resource_enum', {})
+    discovered_urls = list(resource_enum.get('js_urls') or []) + list(resource_enum.get('discovered_urls') or [])
+
+    for url in discovered_urls:
+        if _is_js_url(url) and _should_include_url(url, settings):
+            _add(url, observed_app_js=True, source_ref='resource_enum')
+
+    # httpx probed URLs; one it saw answer with a JavaScript type counts
+    # whatever its name. A URL whose name does not say JS but that answered as
+    # JS is a content-type exception, not an ordinary observed file.
+    http_probe = combined_result.get('http_probe', {})
+    if isinstance(http_probe, dict):
+        for url, info in (http_probe.get('by_url') or {}).items():
+            served_js = isinstance(info, dict) and is_js_content_type(info.get('content_type'))
+            if isinstance(url, str) and (served_js or _is_js_url(url)) and _should_include_url(url, settings):
+                if served_js and not _is_js_url(url):
+                    # The name does not say JS; the answer did. A content-type
+                    # exception is weaker evidence than an observed JS file.
+                    _add(url, served_js=True, source_ref='http_probe')
+                else:
+                    _add(url, observed_app_js=True, source_ref='http_probe')
+
+    settings = settings or {}
+    # archived_urls holds what only a web archive reported; http_probe's own
+    # answer for a URL means the live site still serves it.
+    if not settings.get('JS_RECON_INCLUDE_ARCHIVED_JS', True):
+        archived = set(resource_enum.get('archived_urls') or [])
+        probed = set((http_probe.get('by_url') or {}) if isinstance(http_probe, dict) else ())
+        dropped = {u for u in candidates if u in archived and u not in probed}
+        if dropped:
+            print(f"[-][JsRecon] Left out {len(dropped)} JS URL(s) seen only in web archives "
+                  f"(JS_RECON_INCLUDE_ARCHIVED_JS off)")
+            for url in dropped:
+                candidates.pop(url, None)
+
+    excluded = settings.get('ROE_EXCLUDED_HOSTS') if settings.get('ROE_ENABLED') else None
+    excluded = [e for e in (excluded or []) if isinstance(e, str) and e.strip()]
+    if excluded:
+        kept = {u: c for u, c in candidates.items()
+                if not _is_roe_excluded(_host_of(u), excluded)}
+        if len(kept) < len(candidates):
+            print(f"[-][JsRecon] Dropped {len(candidates) - len(kept)} JS URL(s) on RoE-excluded hosts")
+        candidates = kept
+
+    print(f"[*][JsRecon] Collected {len(candidates)} JS URLs from pipeline")
+    return [candidates[u] for u in sorted(candidates)]
+
+
 def _collect_js_urls(combined_result: dict, settings: dict) -> list:
     """
     Collect JS file URLs from the recon pipeline output.
@@ -522,46 +604,7 @@ def _collect_js_urls(combined_result: dict, settings: dict) -> list:
 
     A Rules-of-Engagement exclusion is dropped whichever source named it.
     """
-    js_urls = set()
-
-    resource_enum = combined_result.get('resource_enum', {})
-    discovered_urls = list(resource_enum.get('js_urls') or []) + list(resource_enum.get('discovered_urls') or [])
-
-    for url in discovered_urls:
-        if isinstance(url, str) and _is_js_url(url) and _should_include_url(url, settings):
-            js_urls.add(url)
-
-    # httpx probed URLs; one it saw answer with a JavaScript type counts
-    # whatever its name.
-    http_probe = combined_result.get('http_probe', {})
-    if isinstance(http_probe, dict):
-        for url, info in (http_probe.get('by_url') or {}).items():
-            served_js = isinstance(info, dict) and is_js_content_type(info.get('content_type'))
-            if isinstance(url, str) and (served_js or _is_js_url(url)) and _should_include_url(url, settings):
-                js_urls.add(url)
-
-    settings = settings or {}
-    # archived_urls holds what only a web archive reported; http_probe's own
-    # answer for a URL means the live site still serves it.
-    if not settings.get('JS_RECON_INCLUDE_ARCHIVED_JS', True):
-        archived = set(resource_enum.get('archived_urls') or [])
-        probed = set((http_probe.get('by_url') or {}) if isinstance(http_probe, dict) else ())
-        dropped = {u for u in js_urls if u in archived and u not in probed}
-        if dropped:
-            print(f"[-][JsRecon] Left out {len(dropped)} JS URL(s) seen only in web archives "
-                  f"(JS_RECON_INCLUDE_ARCHIVED_JS off)")
-            js_urls -= dropped
-
-    excluded = settings.get('ROE_EXCLUDED_HOSTS') if settings.get('ROE_ENABLED') else None
-    excluded = [e for e in (excluded or []) if isinstance(e, str) and e.strip()]
-    if excluded:
-        kept = {u for u in js_urls if not _is_roe_excluded(_host_of(u), excluded)}
-        if len(kept) < len(js_urls):
-            print(f"[-][JsRecon] Dropped {len(js_urls) - len(kept)} JS URL(s) on RoE-excluded hosts")
-        js_urls = kept
-
-    print(f"[*][JsRecon] Collected {len(js_urls)} JS URLs from pipeline")
-    return sorted(js_urls)
+    return [candidate.url for candidate in _collect_js_candidates(combined_result, settings)]
 
 
 def _default_max_files() -> int:
@@ -681,6 +724,9 @@ def _download_js_files(
     timeout: int,
     unreachable: Optional[list] = None,
     settings: Optional[dict] = None,
+    download_cache=None,
+    metrics: Optional[FetchMetrics] = None,
+    outcomes: Optional[list] = None,
 ) -> list:
     """
     Download JS files to local temp directory.
@@ -689,6 +735,11 @@ def _download_js_files(
     `unreachable` collects the URLs never fetched: a host already known down,
     or a request that raised. `settings`, when given, supplies the validated
     engagement identity header (attrbuted like every other target request).
+
+    `download_cache` (a DownloadCache) skips a URL this run already fetched;
+    `metrics` counts attempts/bytes/cache hits; `outcomes` receives one
+    FetchOutcome per URL so a timeout, a challenge or a 404 stays visible as
+    evidence instead of disappearing into a None.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     downloaded = []
@@ -699,56 +750,107 @@ def _download_js_files(
 
     print(f"[*][JsRecon] Downloading {len(urls_to_fetch)} JS files (max {max_files})...")
 
+    def _record(url, status, *, status_code=None, reason="", retries=0):
+        if outcomes is not None:
+            outcomes.append(FetchOutcome(
+                url=url, status=status, status_code=status_code, reason=reason,
+                retries=retries,
+            ))
+
     def fetch_one(idx_url):
         idx, url = idx_url
         if _js_skip(url):
             unreachable.append(url)
+            _record(url, 'unreachable', reason='host_known_down')
             return None
-        try:
-            # STRIDE I14: JS URLs are target-derived; validate every redirect hop
-            # (rather than disabling redirects, so legit CDN-hosted JS still loads).
-            resp = _safe_redirect_get(
-                url,
-                timeout=min(timeout // 10, 30),
-                headers={'User-Agent': 'Mozilla/5.0 (compatible; RedAmon/1.0)'},
-                extra_headers=identity_headers,
-            )
-            if resp is None:
-                return None
-            _js_alive(url)
-            if resp.status_code != 200:
-                print(f"[!][JsRecon] {url} -- HTTP {resp.status_code}")
-                return None
-
-            # Check content length (pre-download check if header available)
-            content_length = resp.headers.get('Content-Length')
-            if content_length and int(content_length) > _MAX_JS_FILE_SIZE:
-                print(f"[!][JsRecon] {url} -- too large ({int(content_length)} bytes)")
-                return None
-
-            content = resp.text
-            if not content or len(content) > _MAX_JS_FILE_SIZE:
-                return None
-            accepted, why = accept_js_response(url, resp.headers.get('Content-Type'), content)
-            if not accepted:
-                print(f"[-][JsRecon] {url} -- not a JS file ({why})")
-                return None
-
+        cached = download_cache.lookup(url) if download_cache is not None else None
+        if cached is not None:
+            if metrics is not None:
+                metrics.download_skipped_cache += 1
             filepath = work_dir / f"js_{idx}.js"
-            filepath.write_text(content, encoding='utf-8')
-
+            filepath.write_text(cached.get('content') or '', encoding='utf-8')
+            _record(url, 'ok', status_code=cached.get('status_code'),
+                    reason='cache_hit', retries=0)
             return {
                 'url': url,
                 'filepath': str(filepath),
-                'content': content,
-                'headers': dict(resp.headers),
-                'size': len(content),
+                'content': cached.get('content') or '',
+                'headers': dict(cached.get('headers') or {}),
+                'size': len(cached.get('content') or ''),
             }
-        except Exception as e:
-            _js_failed(url, e)
-            unreachable.append(url)
-            print(f"[!][JsRecon] {url} -- {type(e).__name__}: {e}")
-            return None
+        attempt = 0
+        while True:
+            attempt += 1
+            if metrics is not None:
+                metrics.download_attempts += 1
+            try:
+                # STRIDE I14: JS URLs are target-derived; validate every redirect hop
+                # (rather than disabling redirects, so legit CDN-hosted JS still loads).
+                resp = _safe_redirect_get(
+                    url,
+                    timeout=min(timeout // 10, 30),
+                    headers={'User-Agent': 'Mozilla/5.0 (compatible; RedAmon/1.0)'},
+                    extra_headers=identity_headers,
+                )
+                if resp is None:
+                    _record(url, 'unsafe', reason='ssrf_guard', retries=attempt - 1)
+                    return None
+                _js_alive(url)
+                if resp.status_code != 200:
+                    print(f"[!][JsRecon] {url} -- HTTP {resp.status_code}")
+                    _record(url, f'http_{resp.status_code}', status_code=resp.status_code,
+                            retries=attempt - 1)
+                    return None
+
+                # Check content length (pre-download check if header available)
+                content_length = resp.headers.get('Content-Length')
+                if content_length and int(content_length) > _MAX_JS_FILE_SIZE:
+                    print(f"[!][JsRecon] {url} -- too large ({int(content_length)} bytes)")
+                    _record(url, 'too_large', status_code=resp.status_code,
+                            retries=attempt - 1)
+                    return None
+
+                content = resp.text
+                if not content or len(content) > _MAX_JS_FILE_SIZE:
+                    _record(url, 'empty_or_too_large', status_code=resp.status_code,
+                            retries=attempt - 1)
+                    return None
+                accepted, why = accept_js_response(url, resp.headers.get('Content-Type'), content)
+                if not accepted:
+                    print(f"[-][JsRecon] {url} -- not a JS file ({why})")
+                    _record(url, 'not_js', status_code=resp.status_code, reason=why,
+                            retries=attempt - 1)
+                    return None
+
+                filepath = work_dir / f"js_{idx}.js"
+                filepath.write_text(content, encoding='utf-8')
+
+                record = {
+                    'url': url,
+                    'filepath': str(filepath),
+                    'content': content,
+                    'headers': dict(resp.headers),
+                    'size': len(content),
+                }
+                if metrics is not None:
+                    metrics.bytes_downloaded += len(content)
+                if download_cache is not None:
+                    download_cache.store(url, {
+                        'content': content, 'headers': dict(resp.headers),
+                        'status_code': resp.status_code,
+                    })
+                _record(url, 'ok', status_code=resp.status_code, retries=attempt - 1)
+                return record
+            except Exception as e:
+                _js_failed(url, e)
+                status = 'timeout' if isinstance(e, requests.Timeout) else (
+                    'challenge' if 'challenge' in str(e).lower() else 'unreachable')
+                if status in RETRYABLE and (attempt - 1) < MAX_RETRIES:
+                    continue
+                unreachable.append(url)
+                _record(url, status, reason=f'{type(e).__name__}: {e}', retries=attempt - 1)
+                print(f"[!][JsRecon] {url} -- {type(e).__name__}: {e}")
+                return None
 
     with ThreadPoolExecutor(max_workers=min(concurrency, 20)) as executor:
         futures = {
@@ -765,7 +867,8 @@ def _download_js_files(
     return downloaded
 
 
-def _run_analysis(js_files: list, settings: dict) -> dict:
+def _run_analysis(js_files: list, settings: dict, parse_cache=None,
+                  metrics: Optional[FetchMetrics] = None) -> dict:
     """
     Run all enabled analysis modules in parallel.
 
@@ -887,10 +990,13 @@ def _run_analysis(js_files: list, settings: dict) -> dict:
                 detect_dependency_confusion, js_files, settings
             )
 
-        # 4. Endpoint extraction
+        # 4. Endpoint extraction. Behind the content-addressed cache: the same
+        # bytes parse once, and each serving URL resolves its own relative
+        # references.
         if settings.get('JS_RECON_EXTRACT_ENDPOINTS', True):
             futures['endpoints'] = executor.submit(
-                extract_endpoints, js_files, settings
+                extract_endpoints_cached, js_files, settings,
+                cache=parse_cache, metrics=metrics, parse_fn=extract_endpoints,
             )
 
         # 5. Framework + DOM sinks + dev comments
@@ -1861,6 +1967,20 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
     from recon.helpers.coverage_stamps import run_started_at
     coverage_at = run_started_at()
     js_urls, selected_urls, downloaded, unreachable = [], [], [], []
+    fetch_metrics = FetchMetrics()
+    fetch_outcomes: list = []
+    fetch_deferred: list = []
+    fetch_context = context_key(
+        tenant=str((combined_result.get('metadata') or {}).get('tenant', '')),
+        project_id=str((combined_result.get('metadata') or {}).get('project_id', '')),
+        auth_ref=str((combined_result.get('metadata') or {}).get('auth_ref', '')),
+    )
+    parse_cache = None
+    download_cache = None
+    admission_enabled = bool(settings.get('JS_RECON_FETCH_ADMISSION', True))
+    if admission_enabled:
+        parse_cache = ContentParseCache(fetch_context)
+        download_cache = DownloadCache(fetch_context)
     try:
         # 1. Load uploaded JS files (manual uploads from UI)
         project_id = combined_result.get('metadata', {}).get('project_id', '')
@@ -1868,12 +1988,32 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         print(f"[*][JsRecon] Project ID: {project_id}, uploaded files setting: {uploaded_setting}")
         uploaded_files = _load_uploaded_files(settings, project_id) if project_id else []
 
-        # 2. Collect JS URLs from pipeline
-        js_urls = _collect_js_urls(combined_result, settings)
+        # 2. Collect JS URLs from pipeline, each with the provenance that named it
+        js_candidates = _collect_js_candidates(combined_result, settings)
+        if not js_candidates:
+            # Backward compatibility: a caller (or test) that mocks
+            # _collect_js_urls supplies plain URLs; treat each as an observed
+            # app-JS file rather than losing the input.
+            js_candidates = [
+                classify_candidate(u, observed_app_js=True, source_ref='resource_enum')
+                for u in _collect_js_urls(combined_result, settings)
+            ]
+        js_urls = [candidate.url for candidate in js_candidates]
 
-        # 3. Download JS files from pipeline URLs, the budget shared by host
+        # 3. Choose the fetch set by provenance before downloading
         max_files = settings.get('JS_RECON_MAX_FILES') or _default_max_files()
-        selected_urls, by_host = _select_js_urls(js_urls, max_files)
+        if admission_enabled:
+            plan = plan_fetches(
+                js_candidates, max_files, fetch_metrics,
+                key=lambda c: _js_fetch_rank(c.url),
+            )
+            selected_urls = [candidate.url for candidate in plan.planned]
+            fetch_deferred = list(plan.deferred)
+            by_host = plan.by_host
+        else:
+            selected_urls, by_host = _select_js_urls(js_urls, max_files)
+            fetch_metrics.candidates = len(js_urls)
+            fetch_metrics.admitted = len(selected_urls)
         file_budget = {
             'max_files': max_files,
             'candidates': len(set(js_urls)),
@@ -1891,6 +2031,9 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
                 timeout=settings.get('JS_RECON_TIMEOUT', 900),
                 unreachable=unreachable,
                 settings=settings,
+                download_cache=download_cache,
+                metrics=fetch_metrics,
+                outcomes=fetch_outcomes,
             )
         downloaded = list(js_files)
         if file_budget['cut']:
@@ -1921,7 +2064,8 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
               f"({len(js_files) - len(uploaded_files)} from pipeline, {len(uploaded_files)} uploaded)...")
 
         # 3. Run all analysis modules
-        results = _run_analysis(js_files, settings)
+        results = _run_analysis(js_files, settings, parse_cache=parse_cache,
+                                metrics=fetch_metrics)
         trufflehog = results.pop('_trufflehog', None)
         trufflehog_urls = trufflehog.pop('_input_urls', []) if trufflehog else []
         trufflehog_reason = (f"trufflehog {trufflehog['status']}: {trufflehog['reason']}"
@@ -2051,6 +2195,23 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
                 'js_files_total_size_bytes': total_size,
                 'duration_seconds': round(duration, 1),
                 'file_budget': file_budget,
+                'fetch_admission': {
+                    'enabled': admission_enabled,
+                    'context': fetch_context,
+                    **fetch_metrics.as_dict(),
+                    'deferred': [
+                        {'url': c.url, 'provenance': c.provenance.value, 'reason': c.reason}
+                        for c in fetch_deferred[:200]
+                    ],
+                    'deferred_total': len(fetch_deferred),
+                    'outcomes': [
+                        {'url': o.url, 'status': o.status, 'status_code': o.status_code,
+                         'reason': o.reason, 'retries': o.retries}
+                        for o in fetch_outcomes
+                    ],
+                    'parse_cache': parse_cache.stats() if parse_cache else None,
+                    'download_cache': download_cache.stats() if download_cache else None,
+                },
                 'coverage': _js_coverage(
                     combined_result, settings, coverage_at, js_urls=js_urls, selected=selected_urls,
                     downloaded=downloaded, unreachable=unreachable, unanalyzed=unanalyzed or (),
