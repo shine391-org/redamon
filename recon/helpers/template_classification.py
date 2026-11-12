@@ -43,6 +43,29 @@ class TemplateCategory(str, Enum):
 
 ALL_CATEGORIES = tuple(TemplateCategory)
 
+# Routing mode (mirrors planner's off/shadow/enforce pattern)
+MODE_OFF = "off"
+MODE_SHADOW = "shadow"
+MODE_ENFORCE = "enforce"
+MODES = (MODE_OFF, MODE_SHADOW, MODE_ENFORCE)
+
+def resolve_routing_mode(settings: dict[str, Any]) -> str:
+    """Effective routing mode from settings: off | shadow | enforce.
+    
+    Defaults to off (patched legacy behaviour). An unrecognised value is
+    treated as off rather than silently escalating to enforce.
+    """
+    mode = settings.get("NUCLEI_ROUTING_MODE", settings.get("nuclei_routing_mode", MODE_OFF))
+    return mode if mode in MODES else MODE_OFF
+
+def routing_consumer_enabled(settings: dict[str, Any]) -> bool:
+    """Whether routed execution is honoured for this run.
+    
+    Only honoured when the mode is shadow or enforce; off means
+    patched legacy behaviour with no routing optimization.
+    """
+    return resolve_routing_mode(settings) != MODE_OFF
+
 
 # ---------------------------------------------------------------------------
 # Classification rules (prefix -> category)
@@ -222,18 +245,35 @@ class TemplateClassificationRegistry:
         self._loaded = True
     
     def _load_stats(self) -> List[TemplateMeta]:
-        """Load template metadata from stats file."""
+        """Load template metadata from TEMPLATES-STATS.json."""
         try:
             with open(self.stats_path) as f:
                 stats = json.load(f)
             result = []
-            for t in stats.get('tags', []):
-                # TEMPLATES-STATS.json has tags with template lists
-                # We need to invert: get templates from tag listings
-                pass
-            # Actually the stats file structure is different - let's check
-            # Fallback: return empty, will be populated by classify()
-            return []
+            # TEMPLATES-STATS.json structure: {"tags": {"tag_name": {"count": N, "templates": [...]} ...}}
+            # Invert to get per-template metadata
+            template_map: Dict[str, Dict[str, Any]] = {}
+            for tag_name, tag_info in stats.get('tags', {}).items():
+                if not isinstance(tag_info, dict):
+                    continue
+                count = tag_info.get('count', 0)
+                templates = tag_info.get('templates', [])
+                for tpl in templates:
+                    if not isinstance(tpl, str):
+                        continue
+                    if tpl not in template_map:
+                        template_map[tpl] = {"name": tpl, "count": 0, "tags": [], "severity": "", "author": ""}
+                    template_map[tpl]["count"] += count
+                    template_map[tpl]["tags"].append(tag_name)
+            for tpl_data in template_map.values():
+                result.append(TemplateMeta(
+                    name=tpl_data["name"],
+                    count=tpl_data["count"],
+                    tags=tuple(tpl_data["tags"]),
+                    severity=tpl_data.get("severity", ""),
+                    author=tpl_data.get("author", ""),
+                ))
+            return result
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return []
     
@@ -322,6 +362,10 @@ class TemplateClassificationRegistry:
         # Cloud/Infrastructure tags -> origin safe
         if tags_set & {'aws', 'azure', 'gcp', 'kubernetes', 'docker', 'cloud'}:
             return TemplateCategory.ORIGIN_SAFE
+        
+        # HTTP/misc tags that don't indicate a specific category -> UNKNOWN (compatibility lane)
+        if tags_set & {'http', 'misc', 'generic', 'network', 'protocol'}:
+            return TemplateCategory.UNKNOWN
         
         return TemplateCategory.UNKNOWN
     
@@ -527,11 +571,14 @@ def validate_auth_batch_safety(
     
     # Check for foreign origins in target list
     if target_origins:
-        from recon.helpers.auth_profile import host_in_scope
+        try:
+            from recon.helpers.auth_profile import host_in_scope
+        except Exception:
+            host_in_scope = None
         for origin in target_origins:
             try:
                 host = urlsplit(origin).hostname or ""
-                if host and not host_in_scope(host.lower(), []):  # Empty roots = default deny
+                if host and host_in_scope is not None and not host_in_scope(host.lower(), []):  # Empty roots = default deny
                     warnings.append(f"Target origin {origin} may be out of scope for attached auth")
                     is_safe = False
             except Exception:

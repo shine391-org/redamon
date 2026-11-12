@@ -94,6 +94,11 @@ from recon.helpers.template_classification import (
     analyze_template_capability,
     RequestCapability,
     validate_auth_batch_safety,
+    resolve_routing_mode,
+    routing_consumer_enabled,
+    MODE_OFF,
+    MODE_SHADOW,
+    MODE_ENFORCE,
 )
 from recon.helpers.security_checks import page_content_enabled
 from recon.helpers.isolated_result import TopLevelKeys
@@ -355,20 +360,15 @@ def _classify_and_route_templates(
     """
     registry = get_registry()
     
-    # Collect all template references
-    all_templates = []
-    all_templates.extend(template_tags or [])  # These are tag names like "cve", "xss"
-    all_templates.extend(template_paths or [])  # Explicit template paths
-    all_templates.extend(custom_templates or [])
-    all_templates.extend(selected_custom_templates or [])
-    
-    # Note: template_tags (NUCLEI_TAGS) are tag names, not template IDs.
-    # The actual template expansion happens inside nuclei. We classify by tag prefix.
-    # For explicit templates (paths), we can classify directly.
-    
     # Separate tag-based selection from explicit template paths
-    tag_based = list(template_tags or [])
-    explicit_templates = list(template_paths or []) + list(custom_templates or []) + list(selected_custom_templates or [])
+    tag_based = list(template_tags or [])  # These are tag names like "cve", "xss"
+    # Explicit templates (paths + custom) - deduplicated
+    explicit_templates = []
+    seen_explicit = set()
+    for tpl in (template_paths or []) + (custom_templates or []) + (selected_custom_templates or []):
+        if tpl and tpl not in seen_explicit:
+            explicit_templates.append(tpl)
+            seen_explicit.add(tpl)
     
     # Classify explicit templates by content if available, or by path prefix
     explicit_classified = {}
@@ -376,21 +376,12 @@ def _classify_and_route_templates(
         classified = registry.classify(tpl)
         explicit_classified[tpl] = classified
     
-    # Classify tag-based selection by prefix heuristic
+    # Classify tag-based selection using registry's tag classification
+    # (not hardcoded ENDPOINT default)
     tag_classified = {}
     for tag in tag_based:
-        # Map tag to category using prefix rules
-        category = TemplateCategory.ENDPOINT  # Default for vuln tags
-        if tag in ('ssl', 'tls', 'certificate', 'dns', 'takeover', 'tech', 'fingerprint', 'exposure', 'misconfig'):
-            category = TemplateCategory.ORIGIN_SAFE
-        elif tag in ('default-login', 'panel', 'wordpress', 'wp-plugin', 'wp-theme', 'joomla', 'drupal'):
-            category = TemplateCategory.APP_PREFIX
-        elif tag in ('file-upload', 'multipart'):
-            category = TemplateCategory.BODY_MULTIPART
-        elif tag in ('fuzz', 'brute'):
-            category = TemplateCategory.MULTI_REQUEST
-        elif tag in ('aws', 'azure', 'gcp', 'kubernetes', 'docker', 'cloud'):
-            category = TemplateCategory.ORIGIN_SAFE
+        # Use registry's tag-based heuristic classification
+        category = registry._classify_by_tags((tag,))
         tag_classified[tag] = category
     
     # Build target sets from resource_enum and http_probe
@@ -449,7 +440,7 @@ def _classify_and_route_templates(
         },
         "compatibility_templates": [],
         "routing_metadata": {
-            "total_templates": len(all_templates),
+            "total_templates": len(tag_based) + len(explicit_templates),
             "tag_based_count": len(tag_based),
             "explicit_count": len(explicit_templates),
             "origin_urls": len(origin_urls),
@@ -458,13 +449,13 @@ def _classify_and_route_templates(
         }
     }
     
-    # Add explicit templates to routing
+    # Add explicit templates to routing (each goes to exactly ONE category)
     for tpl, classified in explicit_classified.items():
         routing["by_category"][classified.category.value].append(tpl)
         if classified.category == TemplateCategory.UNKNOWN:
             routing["compatibility_templates"].append(tpl)
     
-    # Add tag-based templates to routing
+    # Add tag-based templates to routing (each tag goes to exactly ONE category)
     for tag, cat in tag_classified.items():
         routing["by_category"][cat.value].append(f"tag:{tag}")
         if cat == TemplateCategory.UNKNOWN:
@@ -502,6 +493,33 @@ def _build_routed_nuclei_commands(
     target_sets = routing["target_sets"]
     by_category = routing["by_category"]
     
+    # Collect all template IDs for capability analysis
+    all_template_ids = []
+    for templates in by_category.values():
+        all_template_ids.extend([t for t in templates if not t.startswith("tag:")])
+    
+    # Analyze capabilities for auth batch safety
+    template_capabilities = {}
+    for tpl in all_template_ids:
+        cap = analyze_template_capability(tpl)
+        template_capabilities[tpl] = cap
+    
+    # Validate auth batch safety if we have auth headers
+    if auth_headers:
+        target_origins = []
+        for targets in target_sets.values():
+            target_origins.extend(targets)
+        is_safe, warnings = validate_auth_batch_safety(
+            templates=all_template_ids,
+            auth_headers=auth_headers,
+            target_origins=target_origins,
+        )
+        if warnings:
+            for w in warnings:
+                print(f"[!][Nuclei-Routing] Auth safety: {w}")
+        if not is_safe:
+            print(f"[!][Nuclei-Routing] Auth batch safety check FAILED - some templates may leak credentials")
+    
     for cat_value, templates in by_category.items():
         if not templates:
             continue
@@ -523,11 +541,11 @@ def _build_routed_nuclei_commands(
         container_name = f"{container_prefix}-{cat_value}-{uuid.uuid4().hex[:8]}"
         
         # Build template selection for this category
-        # Separate tags from explicit templates
+        # Separate tags from explicit templates (custom templates already routed to correct category)
         cat_tags = [t.replace("tag:", "") for t in templates if t.startswith("tag:")]
         cat_explicit = [t for t in templates if not t.startswith("tag:")]
         
-        # Build command
+        # Build command - NO custom_templates injection (already routed per category)
         cmd = build_nuclei_command(
             targets_file=targets_file,
             output_file=output_file,
@@ -535,8 +553,8 @@ def _build_routed_nuclei_commands(
             severity=base_settings.get("NUCLEI_SEVERITY", ["critical", "high", "medium", "low"]),
             templates=cat_explicit if cat_explicit else None,
             exclude_templates=base_settings.get("NUCLEI_EXCLUDE_TEMPLATES", []),
-            custom_templates=base_settings.get("NUCLEI_CUSTOM_TEMPLATES", []),
-            selected_custom_templates=base_settings.get("NUCLEI_SELECTED_CUSTOM_TEMPLATES", []),
+            custom_templates=[],  # Already routed per category, don't re-inject
+            selected_custom_templates=[],  # Already routed per category, don't re-inject
             tags=cat_tags if cat_tags else None,
             exclude_tags=base_settings.get("NUCLEI_EXCLUDE_TAGS", []),
             rate_limit=base_settings.get("NUCLEI_RATE_LIMIT", 100),
@@ -1318,11 +1336,73 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             dast_not_executed = None
             detection_not_executed = None
             routing = {"routing_metadata": {"skipped": True}, "by_category": {}, "compatibility_templates": []}
+            
+            # Check routing mode gate (off/shadow/enforce)
+            routing_mode = resolve_routing_mode(settings)
+            use_routed = routing_mode != MODE_OFF and routing_consumer_enabled(settings)
+            
             if skip_detection_pass:
                 print("[*][Nuclei] DETECTION pass skipped (no tags + no custom templates)")
                 d_findings, d_fps, d_duration = [], [], 0
                 coverage_passes.append((target_urls, "failed", "no Nuclei templates selected", False))
+            elif not use_routed:
+                # Off/shadow mode: run legacy single detection pass
+                print(f"[*][Nuclei] DETECTION pass running in legacy mode (NUCLEI_ROUTING_MODE={routing_mode})")
+                # Build legacy detection command (single pass, all targets)
+                legacy_targets_file = str(nuclei_temp_dir / "targets_legacy.txt")
+                with open(legacy_targets_file, 'w') as f:
+                    for url in target_urls:
+                        f.write(url + "\n")
+                legacy_output_file = str(nuclei_temp_dir / "nuclei_legacy.jsonl")
+                legacy_container_name = f"redamon-nuclei-legacy-{uuid.uuid4().hex[:8]}"
+                legacy_cmd = build_nuclei_command(
+                    targets_file=legacy_targets_file,
+                    output_file=legacy_output_file,
+                    docker_image=NUCLEI_DOCKER_IMAGE,
+                    severity=NUCLEI_SEVERITY,
+                    templates=NUCLEI_TEMPLATES if NUCLEI_TEMPLATES else None,
+                    exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
+                    custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+                    selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+                    tags=NUCLEI_TAGS if NUCLEI_TAGS else None,
+                    exclude_tags=NUCLEI_EXCLUDE_TAGS,
+                    rate_limit=NUCLEI_RATE_LIMIT,
+                    bulk_size=NUCLEI_BULK_SIZE,
+                    concurrency=NUCLEI_CONCURRENCY,
+                    timeout=NUCLEI_TIMEOUT,
+                    retries=NUCLEI_RETRIES,
+                    dast_mode=False,
+                    new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
+                    headless=NUCLEI_HEADLESS,
+                    system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
+                    follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
+                    max_redirects=NUCLEI_MAX_REDIRECTS,
+                    interactsh=NUCLEI_INTERACTSH,
+                    auth_headers=_nuclei_auth,
+                    container_name=legacy_container_name,
+                    max_host_error=NUCLEI_MAX_HOST_ERROR,
+                )
+                try:
+                    d_findings, d_fps, d_duration, d_rc = _execute_nuclei_pass(
+                        legacy_cmd, legacy_output_file, label="DETECTION",
+                        runtime_cap=NUCLEI_MAX_RUNTIME, container_name=legacy_container_name,
+                    )
+                    coverage_passes.append((target_urls, *_nuclei_pass_outcome(
+                        d_rc, d_duration, NUCLEI_MAX_RUNTIME, d_findings or d_fps), True))
+                except NucleiEmptySelectionError as exc:
+                    print(f"[!][Nuclei] DETECTION pass not executed (policy_empty): {exc}")
+                    _keep_nuclei_findings(f"nuclei DETECTION pass not executed: policy_empty")
+                    detection_not_executed = {
+                        "pass": "DETECTION",
+                        "state": "not_executed",
+                        "reason": "policy_empty",
+                        "detail": str(exc),
+                    }
+                    coverage_passes.append((target_urls, "failed", f"policy_empty: {exc}", False))
+                    d_findings, d_fps, d_duration = [], [], 0
             else:
+                # Enforce/shadow mode: run routed detection passes
+                print(f"[*][Nuclei] DETECTION pass running in routed mode (NUCLEI_ROUTING_MODE={routing_mode})")
                 # F14: Classify templates by semantics and route to appropriate targets
                 # This replaces the single detection pass with category-routed passes
                 routing = _classify_and_route_templates(
@@ -1347,7 +1427,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 if routing["compatibility_templates"]:
                     print(f"[*][Nuclei-Routing] Compatibility lane: {len(routing['compatibility_templates'])} templates with unknown semantics -> legacy behavior on all targets")
                 
-                # Build routed commands
+                # Build routed commands (wrapped to catch build-time NucleiEmptySelectionError)
                 base_settings = {
                     "NUCLEI_DOCKER_IMAGE": NUCLEI_DOCKER_IMAGE,
                     "NUCLEI_SEVERITY": NUCLEI_SEVERITY,
@@ -1369,21 +1449,34 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "NUCLEI_MAX_HOST_ERROR": NUCLEI_MAX_HOST_ERROR,
                 }
                 
-                routed_commands = _build_routed_nuclei_commands(
-                    routing=routing,
-                    nuclei_temp_dir=nuclei_temp_dir,
-                    base_settings=base_settings,
-                    auth_headers=_nuclei_auth,
-                    container_prefix="redamon-nuclei-detection",
-                )
-                
-                # Execute routed passes
-                d_findings, d_fps, d_duration, routed_coverage = _execute_routed_passes(
-                    routed_commands=routed_commands,
-                    runtime_cap=NUCLEI_MAX_RUNTIME,
-                    label_prefix="DETECTION",
-                )
-                coverage_passes.extend(routed_coverage)
+                try:
+                    routed_commands = _build_routed_nuclei_commands(
+                        routing=routing,
+                        nuclei_temp_dir=nuclei_temp_dir,
+                        base_settings=base_settings,
+                        auth_headers=_nuclei_auth,
+                        container_prefix="redamon-nuclei-detection",
+                    )
+                except NucleiEmptySelectionError as exc:
+                    print(f"[!][Nuclei] DETECTION pass not executed (policy_empty at build): {exc}")
+                    _keep_nuclei_findings(f"nuclei DETECTION pass not executed: policy_empty")
+                    detection_not_executed = {
+                        "pass": "DETECTION",
+                        "state": "not_executed",
+                        "reason": "policy_empty",
+                        "detail": str(exc),
+                    }
+                    routed_commands = []
+                    coverage_passes.append((target_urls, "failed", f"policy_empty: {exc}", False))
+                    d_findings, d_fps, d_duration = [], [], 0
+                else:
+                    # Execute routed passes
+                    d_findings, d_fps, d_duration, routed_coverage = _execute_routed_passes(
+                        routed_commands=routed_commands,
+                        runtime_cap=NUCLEI_MAX_RUNTIME,
+                        label_prefix="DETECTION",
+                    )
+                    coverage_passes.extend(routed_coverage)
             
             findings.extend(d_findings)
             false_positives_filtered.extend(d_fps)
