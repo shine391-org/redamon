@@ -14,6 +14,13 @@ export interface ReconState {
   completed_at: string | null
   error: string | null
   container_id?: string | null
+  // Coverage summary (F15): per-module counts for planned/completed/deferred/failed/not_tested
+  coverage_summary?: Record<string, unknown> | null
+  // Run mode and reason for terminal states
+  run_mode?: string | null
+  run_reason?: string | null
+  // History vs current run separation
+  is_history?: boolean
 }
 
 export interface ReconLogEvent {

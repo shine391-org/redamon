@@ -40,6 +40,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from recon.helpers.resource_enum.arjun_contract import (
     arjun_settings, arjun_url_host, select_arjun_targets, record_arjun_selection, reconcile_arjun_schema,
+    classify_late_source_endpoint, plan_arjun_late_sources,
 )
 
 
@@ -1781,6 +1782,87 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             # Request exceptions can carry credentials: a fixed text only.
             print("[!][OpenAPI] Ingestion failed; resource enumeration continues")
 
+    # Late-source Arjun pass: enrich endpoints that appeared from GAU, ParamSpider,
+    # Kiterunner, URLScan, OpenAPI after the early Arjun pass ran.
+    arjun_late_stats = {"arjun_total": 0, "arjun_new_endpoints": 0,
+                        "arjun_existing_enriched": 0, "arjun_params_discovered": 0}
+    arjun_late_meta = {}
+    arjun_late_unexecuted = []
+    admitted_tasks = []
+    deferred_endpoints = []
+    late_summary = {}
+
+    if ARJUN_ENABLED and settings.get('ARJUN_LATE_SOURCES', True):
+        print("\n[*][Arjun] Late-source parameter discovery (GAU/ParamSpider/Kiterunner/URLScan/OpenAPI)...")
+        # Collect URLs already targeted by early Arjun pass
+        already_targeted = set(arjun_target_urls) if 'arjun_target_urls' in locals() else set()
+        # Build allowed_hosts from target_domains (already normalized)
+        allowed_hosts = {arjun_url_host(u) for u in target_domains if arjun_url_host(u)}
+        # Plan late-source Arjun using remaining budget
+        remaining_budget = ARJUN_MAX_ENDPOINTS - len(already_targeted)
+        admitted_tasks, deferred_endpoints, late_summary = plan_arjun_late_sources(
+            organized_data['by_base_url'],
+            already_targeted,
+            allowed_hosts=allowed_hosts,
+            remaining_budget=remaining_budget if remaining_budget > 0 else 0,
+        )
+        if admitted_tasks:
+            late_target_urls = [t['url'] for t in admitted_tasks]
+            # Build methods per URL from admitted tasks
+            url_to_methods = {t['url']: t['methods'] for t in admitted_tasks}
+            # Run Arjun with per-URL methods (we'll run the union of methods for all late URLs)
+            late_methods = list(dict.fromkeys(m for t in admitted_tasks for m in t['methods']))
+            arjun_late_results, arjun_late_meta = run_arjun_discovery(
+                late_target_urls,
+                late_methods,
+                ARJUN_THREADS,
+                ARJUN_TIMEOUT,
+                ARJUN_SCAN_TIMEOUT,
+                ARJUN_CHUNK_SIZE,
+                ARJUN_RATE_LIMIT,
+                ARJUN_STABLE,
+                ARJUN_PASSIVE,
+                ARJUN_DISABLE_REDIRECTS,
+                ARJUN_CUSTOM_HEADERS,
+                target_domains,
+            )
+            arjun_late_unexecuted = [d['url'] for d in deferred_endpoints]
+
+            if arjun_late_results:
+                print("[*][Arjun] Merging late-source discovered parameters...")
+                keys_before_arjun_late = _merged_keys()
+                organized_data['by_base_url'], arjun_late_stats = merge_arjun_into_by_base_url(
+                    arjun_late_results,
+                    organized_data['by_base_url'],
+                    allowed_hosts=target_domains,
+                )
+                _record("arjun-late", _da.observe_arjun, results=arjun_late_results,
+                        existing_keys=keys_before_arjun_late,
+                        merged_keys=_merged_keys(), auth_ref=AUTH_REF,
+                        auth_revision=AUTH_REVISION)
+                _record("arjun-late-raw", _di.record_raw_evidence, source="arjun-late", record={
+                    "targets": len(late_target_urls),
+                    "unexecuted": len(arjun_late_unexecuted),
+                    "results": len(arjun_late_results),
+                    "executions": [e.get("status") for e in (arjun_late_meta.get("execution") or [])],
+                    "output_states": [e.get("output_state") for e in (arjun_late_meta.get("execution") or [])],
+                    "deferred": len(deferred_endpoints),
+                    "deferred_reasons": late_summary.get("deferred_reasons", {}),
+                    "temp_output_removed": True,
+                })
+                print(f"[+][Arjun-late] Total URLs with params: {arjun_late_stats['arjun_total']}")
+                print(f"[+][Arjun-late] New endpoints: {arjun_late_stats['arjun_new_endpoints']}")
+                print(f"[+][Arjun-late] Existing endpoints enriched: {arjun_late_stats['arjun_existing_enriched']}")
+                print(f"[+][Arjun-late] Parameters discovered: {arjun_late_stats['arjun_params_discovered']}")
+            else:
+                print("[!][Arjun-late] No parameters found on late-source endpoints")
+        else:
+            print(f"[+][Arjun-late] No eligible late-source endpoints (deferred: {late_summary.get('deferred_count', 0)})")
+        record_arjun_selection(arjun_late_meta, arjun_late_unexecuted)
+    else:
+        if ARJUN_ENABLED:
+            print("[+][Arjun-late] Skipped (ARJUN_LATE_SOURCES=False)")
+
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
 
@@ -1909,9 +1991,12 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             'arjun_methods': ARJUN_METHODS if ARJUN_ENABLED else [],
             'arjun_max_endpoints': ARJUN_MAX_ENDPOINTS if ARJUN_ENABLED else None,
             'arjun_passive': ARJUN_PASSIVE if ARJUN_ENABLED else None,
-            'arjun_params_discovered': arjun_stats['arjun_params_discovered'],
+            'arjun_late_sources': bool(settings.get('ARJUN_LATE_SOURCES', True)) if ARJUN_ENABLED else False,
+            'arjun_params_discovered': arjun_stats['arjun_params_discovered'] + arjun_late_stats['arjun_params_discovered'],
             'arjun_stats': arjun_stats,
+            'arjun_late_stats': arjun_late_stats,
             'arjun_execution': arjun_meta,
+            'arjun_late_execution': arjun_late_meta,
             # General
             'proxy_used': False,
             'target_urls_count': len(target_urls),
@@ -1964,10 +2049,13 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             'kiterunner_overlap': kr_stats['kr_overlap'],
             'kiterunner_with_multiple_methods': kr_stats.get('kr_with_multiple_methods', 0),
             # Arjun breakdown
-            'from_arjun': arjun_stats['arjun_total'] if ARJUN_ENABLED else 0,
-            'arjun_new_endpoints': arjun_stats['arjun_new_endpoints'],
-            'arjun_existing_enriched': arjun_stats['arjun_existing_enriched'],
-            'arjun_params_discovered': arjun_stats['arjun_params_discovered'],
+            'from_arjun': (arjun_stats['arjun_total'] + arjun_late_stats['arjun_total']) if ARJUN_ENABLED else 0,
+            'arjun_new_endpoints': arjun_stats['arjun_new_endpoints'] + arjun_late_stats['arjun_new_endpoints'],
+            'arjun_existing_enriched': arjun_stats['arjun_existing_enriched'] + arjun_late_stats['arjun_existing_enriched'],
+            'arjun_params_discovered': arjun_stats['arjun_params_discovered'] + arjun_late_stats['arjun_params_discovered'],
+            'arjun_late_new_endpoints': arjun_late_stats['arjun_new_endpoints'],
+            'arjun_late_existing_enriched': arjun_late_stats['arjun_existing_enriched'],
+            'arjun_late_params_discovered': arjun_late_stats['arjun_params_discovered'],
             'methods': {},
             'categories': {}
         },
@@ -1980,6 +2068,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             + ffuf_meta.get("external_domains", [])
             + zap_ajax_meta.get("external_domains", [])
             + arjun_meta.get("external_domains", [])
+            + arjun_late_meta.get("external_domains", [])
         ),
     }
 
@@ -2039,6 +2128,12 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 "unexecuted": len(arjun_unexecuted) if ARJUN_ENABLED else 0,
                 "sources_present": arjun_sources_present,
                 "sources_absent": arjun_sources_absent,
+            },
+            arjun_late={
+                "targets": len(admitted_tasks) if ARJUN_ENABLED and settings.get('ARJUN_LATE_SOURCES', True) else 0,
+                "unexecuted": len(arjun_late_unexecuted) if ARJUN_ENABLED and settings.get('ARJUN_LATE_SOURCES', True) else 0,
+                "deferred": len(deferred_endpoints) if ARJUN_ENABLED and settings.get('ARJUN_LATE_SOURCES', True) else 0,
+                "deferred_reasons": late_summary.get("deferred_reasons", {}) if ARJUN_ENABLED and settings.get('ARJUN_LATE_SOURCES', True) else {},
             },
             js_recon={
                 "input_count": len(all_discovered_urls) + len(crawl_js_urls),
@@ -2128,6 +2223,10 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     if ARJUN_ENABLED and arjun_stats['arjun_params_discovered'] > 0:
         print(f"[+][Arjun] Enriched endpoints: {arjun_stats['arjun_existing_enriched']}")
         print(f"[+][Arjun] New endpoints: {arjun_stats['arjun_new_endpoints']}")
+    if ARJUN_ENABLED and arjun_late_stats['arjun_params_discovered'] > 0:
+        print(f"[+][Arjun-late] Parameter discovery: {arjun_late_stats['arjun_params_discovered']} params")
+        print(f"[+][Arjun-late] Enriched endpoints: {arjun_late_stats['arjun_existing_enriched']}")
+        print(f"[+][Arjun-late] New endpoints: {arjun_late_stats['arjun_new_endpoints']}")
     print(f"[+][ResourceEnum] Base URLs: {resource_enum_result['summary']['total_base_urls']}")
     print(f"[+][ResourceEnum] Endpoints: {resource_enum_result['summary']['total_endpoints']}")
     print(f"[+][ResourceEnum] Parameters: {resource_enum_result['summary']['total_parameters']}")

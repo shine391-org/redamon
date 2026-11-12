@@ -780,3 +780,164 @@
   white-space: nowrap;
   cursor: help;
 }
+
+/* Coverage Summary Panel (F15) */
+.coverageSummary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-0-5) var(--space-2);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+}
+
+.coverageLabel {
+  font-weight: var(--font-semibold);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.coverageModule {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-family: var(--font-mono);
+}
+
+.coverageModuleName {
+  color: var(--text-tertiary);
+  font-weight: var(--font-medium);
+}
+
+.coverageCount {
+  font-weight: var(--font-semibold);
+  padding: 0 4px;
+  border-radius: var(--radius-xs);
+}
+
+.coverageComplete {
+  color: var(--status-success);
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.coveragePartial {
+  color: var(--status-warning);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.coverageNoInput {
+  color: var(--text-tertiary);
+  background: var(--bg-tertiary);
+}
+
+.coverageFailed {
+  color: var(--status-error);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.coverageNotScanned {
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+}
+
+.coverageNotRecorded {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Light theme overrides for coverage summary */
+:global([data-theme='light']) .coverageSummary {
+  background: var(--color-white);
+  border-color: var(--color-gray-300);
+}
+
+:global([data-theme='light']) .coverageLabel {
+  color: var(--color-gray-600);
+}
+
+:global([data-theme='light']) .coverageModuleName {
+  color: var(--color-gray-500);
+}
+
+:global([data-theme='light']) .coverageComplete {
+  color: var(--color-green-700);
+  background: var(--color-green-50);
+}
+
+:global([data-theme='light']) .coveragePartial {
+  color: var(--color-amber-700);
+  background: var(--color-amber-50);
+}
+
+:global([data-theme='light']) .coverageNoInput {
+  color: var(--color-gray-500);
+  background: var(--color-gray-100);
+}
+
+:global([data-theme='light']) .coverageFailed {
+  color: var(--color-red-700);
+  background: var(--color-red-50);
+}
+
+:global([data-theme='light']) .coverageNotScanned {
+  color: var(--color-gray-400);
+  background: var(--color-gray-100);
+}
+
+:global([data-theme='light']) .coverageNotRecorded {
+  color: var(--color-gray-400);
+}
+
+.coverageRunInfo {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-2);
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--border-default);
+  font-size: 10px;
+}
+
+.coverageRunMode {
+  color: var(--status-info);
+  background: rgba(59, 130, 246, 0.12);
+  padding: 0 4px;
+  border-radius: var(--radius-xs);
+  font-weight: var(--font-medium);
+}
+
+.coverageRunReason {
+  color: var(--status-warning);
+  background: rgba(245, 158, 11, 0.12);
+  padding: 0 4px;
+  border-radius: var(--radius-xs);
+  font-weight: var(--font-medium);
+}
+
+.coverageHistoryBadge {
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  padding: 0 4px;
+  border-radius: var(--radius-xs);
+  font-weight: var(--font-medium);
+  font-style: italic;
+}
+
+/* Light theme overrides for coverage run info */
+:global([data-theme='light']) .coverageRunMode {
+  color: var(--color-blue-700);
+  background: var(--color-blue-50);
+}
+
+:global([data-theme='light']) .coverageRunReason {
+  color: var(--color-amber-700);
+  background: var(--color-amber-50);
+}
+
+:global([data-theme='light']) .coverageHistoryBadge {
+  color: var(--color-gray-500);
+  background: var(--color-gray-100);
+}

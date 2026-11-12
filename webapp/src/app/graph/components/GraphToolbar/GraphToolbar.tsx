@@ -38,6 +38,14 @@ interface GraphToolbarProps {
   /** Set when the data check itself failed, so the disabled download does not claim "no data". */
   reconDataError?: string | null
   isLogsOpen?: boolean
+  // Coverage summary (F15): per-module counts for planned/completed/deferred/failed/not_tested
+  reconCoverageSummary?: Record<string, unknown> | null
+  /** Run mode (F15): 'new' | 'overwrite' */
+  runMode?: string | null
+  /** Run reason (F15): e.g., 'completed_with_gaps', 'scheduled', 'manual' */
+  runReason?: string | null
+  /** Whether this is a historical run (F15) */
+  isHistory?: boolean
   // GVM props
   gvmAvailable?: boolean
   /** The GVM button's tooltip while unavailable: not installed, or the check itself failed. */
@@ -132,6 +140,11 @@ export function GraphToolbar({
   hasReconData = false,
   reconDataError = null,
   isLogsOpen = false,
+  // Coverage summary (F15)
+  reconCoverageSummary,
+  runMode,
+  runReason,
+  isHistory,
   // GVM props
   gvmAvailable = true,
   gvmUnavailableReason = '',
@@ -271,6 +284,18 @@ export function GraphToolbar({
             onSelect={onSelectVersion}
             onManage={onManageVersions}
             activating={isActivatingVersion}
+          />
+        </>
+      )}
+
+      {reconCoverageSummary && (
+        <>
+          <div className={styles.divider} />
+          <CoverageSummaryPanel
+            summary={reconCoverageSummary}
+            runMode={runMode}
+            runReason={runReason}
+            isHistory={isHistory}
           />
         </>
       )}
@@ -536,3 +561,51 @@ export function GraphToolbar({
     </div>
   )
 }
+
+// Coverage Summary Panel (F15): displays per-module planned/completed/deferred/failed/not_tested counts
+function CoverageSummaryPanel({
+  summary,
+  runMode,
+  runReason,
+  isHistory,
+}: {
+  summary: Record<string, unknown> | null
+  runMode?: string | null
+  runReason?: string | null
+  isHistory?: boolean
+}) {
+  if (!summary) return null
+
+  const modules = Object.entries(summary) as [string, { recorded: boolean; complete?: number; partial?: number; no_input?: number; failed?: number; not_scanned?: number }][]
+
+  return (
+    <div className={styles.coverageSummary}>
+      <span className={styles.coverageLabel}>Coverage:</span>
+      {modules.map(([module, counts]) => (
+        <span key={module} className={styles.coverageModule} title={`${module}: ${JSON.stringify(counts)}`}>
+          <span className={styles.coverageModuleName}>{module === 'js_recon' ? 'JS Recon' : 'Nuclei'}:</span>
+          {counts.recorded ? (
+            <>
+              {counts.complete && <span className={`${styles.coverageCount} ${styles.coverageComplete}`} title="Complete">{counts.complete}</span>}
+              {counts.partial && <span className={`${styles.coverageCount} ${styles.coveragePartial}`} title="Partial">{counts.partial}</span>}
+              {counts.no_input && <span className={`${styles.coverageCount} ${styles.coverageNoInput}`} title="No input">{counts.no_input}</span>}
+              {counts.failed && <span className={`${styles.coverageCount} ${styles.coverageFailed}`} title="Failed">{counts.failed}</span>}
+              {counts.not_scanned && <span className={`${styles.coverageCount} ${styles.coverageNotScanned}`} title="Not scanned">{counts.not_scanned}</span>}
+            </>
+          ) : (
+            <span className={styles.coverageNotRecorded} title="Coverage not recorded (scanned before coverage stamps existed, or never run)">—</span>
+          )}
+        </span>
+      ))}
+      {(runMode || runReason) && (
+        <span className={styles.coverageRunInfo}>
+          {runMode && <span className={styles.coverageRunMode} title={`Mode: ${runMode}`}>{runMode === 'new' ? 'New version' : runMode === 'overwrite' ? 'Overwrite' : runMode}</span>}
+          {runReason && <span className={styles.coverageRunReason} title={`Reason: ${runReason}`}>{runReason}</span>}
+          {isHistory && <span className={styles.coverageHistoryBadge} title="Historical run">History</span>}
+        </span>
+      )}
+    </div>
+  )
+}
+
+export default GraphToolbar

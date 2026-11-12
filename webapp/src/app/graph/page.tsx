@@ -1680,6 +1680,10 @@ export default function GraphPage() {
         hasReconData={hasReconData}
         reconDataError={dataProbeErrors.recon}
         isLogsOpen={activeLogsDrawer === 'recon'}
+        reconCoverageSummary={reconState?.coverage_summary ?? null}
+        runMode={reconState?.run_mode ?? null}
+        runReason={reconState?.run_reason ?? null}
+        isHistory={reconState?.is_history ?? false}
         // GVM props
         gvmAvailable={gvmAvailability.available}
         gvmUnavailableReason={gvmAvailability.reason}

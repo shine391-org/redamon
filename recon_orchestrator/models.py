@@ -79,6 +79,16 @@ class ReconState(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     container_id: Optional[str] = None
+    # Coverage summary (F15): bounded per-module counts so the UI can show
+    # planned/completed/deferred/failed/not_tested separately. Unknown is distinct
+    # from zero; absent means the scan predates the feature or never recorded it.
+    coverage_summary: Optional[dict] = None
+    # Run mode and reason for terminal states (completed_with_gaps, etc.)
+    run_mode: Optional[str] = None
+    run_reason: Optional[str] = None
+    # History vs current run separation: true when this status reflects a
+    # historical ScanJob rather than the live orchestrator state.
+    is_history: bool = False
     # G2-R3: pointers (path + sha256 + bounded summary) to the run-scoped plan
     # manifests written before the vuln_scan tool launched. The full manifest
     # is never carried here -- only the pointer, so the webapp can persist it
