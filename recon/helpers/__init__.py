@@ -86,6 +86,26 @@ from .takeover_helpers import (
     BADDNS_DEFAULT_MODULES,
 )
 
+# Durable chunk checkpoint (F16)
+from .chunk_journal import (
+    ChunkJournal,
+    ChunkEntry,
+    JournalRevision,
+    JournalSnapshot,
+    JournalError,
+    RevisionMismatch,
+)
+from .task_state import (
+    TaskState,
+    TaskStateMachine,
+    RecoveryDecision,
+    DEFAULT_LEASE_TTL_S,
+)
+from .chunk_budget import (
+    OriginBudget,
+    BudgetLedger,
+)
+
 __all__ = [
     # Docker
     "is_docker_installed",
@@ -139,5 +159,18 @@ __all__ = [
     "PROVIDER_FROM_SIGNAL",
     "BADDNS_MODULES",
     "BADDNS_DEFAULT_MODULES",
+    # Durable chunk checkpoint (F16)
+    "ChunkJournal",
+    "ChunkEntry",
+    "JournalRevision",
+    "JournalSnapshot",
+    "JournalError",
+    "RevisionMismatch",
+    "TaskState",
+    "TaskStateMachine",
+    "RecoveryDecision",
+    "DEFAULT_LEASE_TTL_S",
+    "OriginBudget",
+    "BudgetLedger",
 ]
 

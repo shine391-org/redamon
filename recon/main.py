@@ -26,6 +26,7 @@ from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+from typing import Optional
 
 # Add project root to path for imports (needed for graph_db, utils modules)
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -98,12 +99,185 @@ from recon.helpers.planner_manifest import (
     scope_roots_from_settings,
     template_hashes_from_settings,
 )
+from recon.helpers.chunk_journal import (
+    ChunkJournal,
+    ChunkEntry,
+    JournalRevision,
+    JournalError,
+    RevisionMismatch,
+)
+from recon.helpers.task_state import (
+    TaskStateMachine,
+    RecoveryDecision,
+    DEFAULT_LEASE_TTL_S,
+)
+from recon.helpers.chunk_budget import BudgetLedger
 
 #: The one lock every writer of the canonical recon artifact takes. The
 #: isolated vuln_scan wrapper persists its selection plan from a fan-out
 #: thread (recon.helpers.selection_coverage.persist_plan) while the main thread
 #: saves here; both must be serialized or the two writes interleave.
 _save_lock = ARTIFACT_SAVE_LOCK
+
+# ---------------------------------------------------------------------------
+# Durable chunk checkpoint (F16): per-run journal + state machine + budget.
+# Created per run in _start_checkpoint(); None until then so imports of this
+# module outside a run (tests, partial modules) are unaffected.
+# ---------------------------------------------------------------------------
+_checkpoint_journal: Optional[ChunkJournal] = None
+_checkpoint_state: Optional[TaskStateMachine] = None
+_checkpoint_budget: Optional[BudgetLedger] = None
+_checkpoint_revision: Optional[JournalRevision] = None
+
+
+def _checkpoint_journal_path(output_file: Path) -> Path:
+    """The durable journal lives next to the recon artifact so artifact rotation
+    (which replaces the artifact file) leaves the journal in place."""
+    return output_file.parent / f".{output_file.name}.chunk-journal"
+
+
+def _start_checkpoint(settings: dict, project_id: str, run_id: str,
+                      group_id: str, tenant: str) -> None:
+    """Open (or resume) the durable chunk journal for this run.
+
+    The journal is keyed on tenant/project/run/scope/settings/template/auth
+    revisions. A resume validates the revision block: incompatible snapshots
+    raise RevisionMismatch and the caller must replan or approve, never
+    silently resume.
+
+    The journal lives next to the canonical recon artifact (not the per-group
+    file) so every batch group shares one journal and artifact rotation leaves
+    it in place.
+    """
+    global _checkpoint_journal, _checkpoint_state, _checkpoint_budget, _checkpoint_revision
+
+    scope_roots = scope_roots_from_settings(settings)
+    template_revs = template_hashes_from_settings(settings)
+    settings_hash = __import__("hashlib").sha256(
+        json.dumps(settings or {}, sort_keys=True).encode()).hexdigest()
+
+    revision = JournalRevision(
+        tenant=tenant,
+        project_id=project_id,
+        run_id=run_id,
+        scope="|".join(scope_roots),
+        settings_hash=settings_hash,
+        template_rev="|".join(sorted(template_revs.values())),
+        auth_rev=str(settings.get("PLANNER_AUTH_REV", "")),
+    )
+
+    journal_path = OUTPUT_DIR / f".recon_{project_id}.json.chunk-journal"
+    journal = ChunkJournal(journal_path, revision,
+                           lease_ttl_s=DEFAULT_LEASE_TTL_S)
+
+    # Validate on load: a RevisionMismatch means the run's scope/config
+    # changed since the journal was written -> replan or approval required.
+    try:
+        journal.load()
+    except RevisionMismatch:
+        raise
+    except JournalError:
+        # Corrupted or absent journal -> unknown/block safe: start fresh but
+        # treat prior state as unknown (do not trust any done chunk).
+        journal = ChunkJournal(journal_path, revision,
+                               lease_ttl_s=DEFAULT_LEASE_TTL_S)
+
+    state = TaskStateMachine(lease_ttl_s=DEFAULT_LEASE_TTL_S)
+    budget = BudgetLedger()
+
+    _checkpoint_journal = journal
+    _checkpoint_state = state
+    _checkpoint_budget = budget
+    _checkpoint_revision = revision
+
+
+def _checkpoint_done_keys() -> set[tuple[str, int]]:
+    """Chunk keys that are completed with coverage durable: skip on resume."""
+    if _checkpoint_journal is None:
+        return set()
+    snapshot = _checkpoint_journal.load()
+    return snapshot.completed_keys()
+
+
+def _checkpoint_uncertain() -> list:
+    """Chunks whose outcome is not safely known (safe-policy retry set)."""
+    if _checkpoint_journal is None or _checkpoint_state is None:
+        return []
+    import time
+    now = time.time()
+    return _checkpoint_journal.uncertain(now)
+
+
+def _checkpoint_chunk_claim(tool_key: str, origin: str, chunk_index: int,
+                            lease_id: str) -> bool:
+    """Try to claim a chunk for execution. Returns False when it is already
+    completed (skip) or held by an active lease (concurrent duplicate dispatch)."""
+    if _checkpoint_state is None or _checkpoint_journal is None:
+        return True  # checkpoint not enabled: proceed as before
+    key = (origin, chunk_index)
+    if _checkpoint_journal.is_done(origin, chunk_index):
+        return False
+    task = _checkpoint_state.claim(f"{tool_key}:{chunk_index}", lease_id,
+                                   revision={k: getattr(_checkpoint_revision, k)
+                                             for k in ("scope", "settings_hash",
+                                                       "template_rev", "auth_rev")}
+                                   if _checkpoint_revision else {})
+    return task.status == "running"
+
+
+def _checkpoint_chunk_complete(tool_key: str, origin: str, chunk_index: int,
+                               coverage_durable: bool = False) -> None:
+    """Mark a chunk completed with (or without) durable coverage."""
+    if _checkpoint_journal is None or _checkpoint_state is None:
+        return
+    entry = ChunkEntry(
+        tenant=_checkpoint_revision.tenant if _checkpoint_revision else "",
+        project_id=_checkpoint_revision.project_id if _checkpoint_revision else "",
+        run_id=_checkpoint_revision.run_id if _checkpoint_revision else "",
+        chunk_index=chunk_index,
+        origin=origin,
+        tool_ids=[tool_key],
+        status="completed",
+        lease_id="",
+        lease_expires_at=0.0,
+        started_at=__import__("time").time(),
+        completed_at=__import__("time").time(),
+        output_ref=None,
+        coverage_durable=coverage_durable,
+        revision={k: getattr(_checkpoint_revision, k)
+                  for k in ("scope", "settings_hash", "template_rev", "auth_rev")}
+        if _checkpoint_revision else {},
+    )
+    _checkpoint_journal.mark_completed(entry)
+    _checkpoint_state.release(f"{tool_key}:{chunk_index}", "completed",
+                              coverage_durable=coverage_durable)
+
+
+def _checkpoint_chunk_defer(tool_key: str, origin: str, chunk_index: int,
+                            reason: str) -> None:
+    """Report a chunk as uncertain (interrupted execution): safe-policy retry."""
+    if _checkpoint_journal is None or _checkpoint_state is None:
+        return
+    entry = ChunkEntry(
+        tenant=_checkpoint_revision.tenant if _checkpoint_revision else "",
+        project_id=_checkpoint_revision.project_id if _checkpoint_revision else "",
+        run_id=_checkpoint_revision.run_id if _checkpoint_revision else "",
+        chunk_index=chunk_index,
+        origin=origin,
+        tool_ids=[tool_key],
+        status="deferred",
+        lease_id="",
+        lease_expires_at=0.0,
+        started_at=__import__("time").time(),
+        coverage_durable=False,
+        revision={k: getattr(_checkpoint_revision, k)
+                  for k in ("scope", "settings_hash", "template_rev", "auth_rev")}
+        if _checkpoint_revision else {},
+    )
+    _checkpoint_journal.mark_uncertain(entry)
+    _checkpoint_state.release(f"{tool_key}:{chunk_index}", "deferred",
+                              reason=reason)
+
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -1009,14 +1183,29 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
 
     Each answer is merged before its graph update is queued, because the
     update snapshots combined_result at queue time.
+
+    F16 checkpoint: each tool is a durable chunk. Before dispatch the chunk is
+    claimed (a completed chunk is skipped on resume; an active lease rejects
+    concurrent duplicate dispatch). After the answer merges, saves and the
+    graph update is queued, the chunk is marked completed only when coverage
+    is durable. A failed chunk is deferred (uncertient, safe-policy retry),
+    never silently replayed.
     """
     if not tools:
         return
+    import time, uuid
+    lease_id = uuid.uuid4().hex
     print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning (fan-out: {', '.join(tools.keys())})")
     print("-" * 40)
     with ThreadPoolExecutor(max_workers=len(tools)) as pool:
-        futures = {pool.submit(fn, combined_result, settings): key
-                   for key, fn in tools.items()}
+        futures = {}
+        for key, fn in tools.items():
+            origin = key
+            chunk_index = 0
+            if not _checkpoint_chunk_claim(key, origin, chunk_index, lease_id):
+                print(f"    [checkpoint] {key}: already complete, skipping")
+                continue
+            futures[pool.submit(fn, combined_result, settings)] = key
         for fut in as_completed(futures):
             key = futures[fut]
             try:
@@ -1024,11 +1213,15 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                 combined_result["metadata"]["modules_executed"].append(key)
                 save_recon_file(combined_result, output_file)
                 _graph_update_bg(f"update_graph_from_{key}", combined_result, USER_ID, PROJECT_ID)
+                _checkpoint_chunk_complete(key, origin=key, chunk_index=0,
+                                           coverage_durable=True)
             except Exception as e:
                 print(f"[!][Pipeline] {key} failed: {e}")
                 combined_result["metadata"].setdefault("phase_errors", {})[key] = str(e)
                 _note_phase_error(key)
                 save_recon_file(combined_result, output_file)
+                _checkpoint_chunk_defer(key, origin=key, chunk_index=0,
+                                        reason=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1334,15 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     _graph_reset()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = recon_output_file(OUTPUT_DIR, PROJECT_ID)
+
+    # F16: open/resume the durable chunk journal for this run.
+    _start_checkpoint(_settings, PROJECT_ID,
+                      str(_settings.get("PLANNER_RUN_ID")
+                          or __import__("os").environ.get("RECON_RUN_ID")
+                          or __import__("os").environ.get("PARTIAL_RECON_RUN_ID")
+                          or ""),
+                      str(_settings.get("PLANNER_GROUP_ID") or ""),
+                      str(_settings.get("PLANNER_TENANT") or ""))
 
     mock_domain = f"ip-targets.{PROJECT_ID}"
 
@@ -1803,6 +2005,15 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = recon_output_file(
         OUTPUT_DIR, PROJECT_ID, target_info["root_domain"] if _batch_groups() else None)
+
+    # F16: open/resume the durable chunk journal for this run.
+    _start_checkpoint(_settings, PROJECT_ID,
+                      str(_settings.get("PLANNER_RUN_ID")
+                          or __import__("os").environ.get("RECON_RUN_ID")
+                          or __import__("os").environ.get("PARTIAL_RECON_RUN_ID")
+                          or ""),
+                      str(_settings.get("PLANNER_GROUP_ID") or ""),
+                      str(_settings.get("PLANNER_TENANT") or ""))
 
     # Initialize result structure with dynamic scan_type and empty modules_executed
     combined_result = {
