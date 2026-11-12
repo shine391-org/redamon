@@ -95,9 +95,6 @@ from recon.main_recon_modules.add_mitre import run_mitre_enrichment
 from recon.helpers.isolated_result import TopLevelKeys
 from recon.helpers.selection_coverage import KEY as SELECTION_KEY, ARTIFACT_SAVE_LOCK
 from recon.helpers.planner_manifest import (
-    maybe_write_pre_dispatch_manifest,
-    publish_plan_pointer,
-    input_accounting_from_recon_data,
     scope_roots_from_settings,
     template_hashes_from_settings,
 )
@@ -200,51 +197,47 @@ def _start_checkpoint(settings: dict, project_id: str, run_id: str,
     global _checkpoint_journal, _checkpoint_state, _checkpoint_budget
     global _checkpoint_revision, _checkpoint_group
 
-    scope_roots = scope_roots_from_settings(settings)
-    template_revs = template_hashes_from_settings(settings)
-    settings_hash = hashlib.sha256(
-        json.dumps(settings or {}, sort_keys=True).encode()).hexdigest()
-
+    _checkpoint_journal = _checkpoint_state = _checkpoint_budget = None
+    _checkpoint_revision = None
+    _checkpoint_group = str(group_id or "")
+    if not settings.get("CHUNK_CHECKPOINT_ENABLED", True):
+        if os.environ.get("RECON_CONTINUE_RUN_ID"):
+            raise JournalError("checkpoint_disabled")
+        return "disabled"
+    from recon.helpers.chunk_evidence import identifier
+    identifier(project_id)
+    identifier(run_id)
+    tenant = tenant or str(settings.get("USER_ID") or "")
     revision = JournalRevision(
-        tenant=tenant,
-        project_id=project_id,
-        run_id=run_id,
-        scope="|".join(scope_roots),
-        settings_hash=settings_hash,
-        template_rev="|".join(sorted(template_revs.values())),
+        tenant=tenant, project_id=project_id, run_id=run_id,
+        scope="|".join(scope_roots_from_settings(settings)),
+        settings_hash=hashlib.sha256(json.dumps(settings or {}, sort_keys=True).encode()).hexdigest(),
+        template_rev="|".join(sorted(template_hashes_from_settings(settings).values())),
         auth_rev=str(settings.get("PLANNER_AUTH_REV", "")),
     )
-
     canonical = OUTPUT_DIR / f"recon_{project_id}.json"
     journal_path = _checkpoint_journal_path(canonical, run_id)
-    journal = ChunkJournal(journal_path, revision,
-                           lease_ttl_s=DEFAULT_LEASE_TTL_S)
-
-    try:
-        journal.load()
-        status = "resumed"
-    except RunMismatch as exc:
-        # A different run: start fresh. (The run id is normally in the path, so
-        # this is defense-in-depth for a shared path.)
-        print(f"[checkpoint] {exc}")
-        journal = ChunkJournal(journal_path, revision,
-                               lease_ttl_s=DEFAULT_LEASE_TTL_S)
-        journal.reset()
-        status = "fresh"
-    except RevisionMismatch as exc:
-        # Same run, changed configuration: replan, never a silent resume.
-        print(f"[checkpoint] {exc}")
-        print("[checkpoint] replanning: starting from a fresh checkpoint")
-        journal = ChunkJournal(journal_path, revision,
-                               lease_ttl_s=DEFAULT_LEASE_TTL_S)
-        journal.reset()
-        status = "fresh"
-    except JournalError as exc:
-        # Corrupted or unreadable: unknown/block safe -> fresh, trust nothing.
-        print(f"[checkpoint] {exc}")
-        print("[checkpoint] prior state unknown: starting from a fresh checkpoint")
-        journal = ChunkJournal(journal_path, revision,
-                               lease_ttl_s=DEFAULT_LEASE_TTL_S)
+    journal = ChunkJournal(journal_path, revision, lease_ttl_s=DEFAULT_LEASE_TTL_S)
+    # Existing state is evidence, not scratch space. A continuation must never
+    # reset an incompatible journal (that would be a fake resume): it fails
+    # explicitly. A fresh full run replans from a fresh checkpoint when the
+    # stored revision is incompatible or the journal is unreadable.
+    if journal_path.exists():
+        from recon.helpers.chunk_evidence import read_journal, EvidenceError
+        try:
+            read_journal(journal_path, revision.to_dict())
+            journal.load()
+        except (EvidenceError, JournalError, ValueError) as exc:
+            if os.environ.get("RECON_CONTINUE_RUN_ID"):
+                raise JournalError(f"checkpoint_incompatible: {exc}") from exc
+            print(f"[checkpoint] {exc}: replanning from a fresh checkpoint")
+            journal.reset()
+            status = "fresh"
+        else:
+            status = "resumed"
+    elif os.environ.get("RECON_CONTINUE_RUN_ID"):
+        raise JournalError("checkpoint_missing")
+    else:
         journal.reset()
         status = "fresh"
 
@@ -318,7 +311,15 @@ def _checkpoint_chunk_claim(tool_key: str, origin: str, chunk_index: int,
         return False
     task = _checkpoint_state.claim(f"{origin}:{chunk_index}", lease_id,
                                    revision=_checkpoint_revision_dict())
-    return task.status == "running"
+    if task.status != "running" or task.lease_id != lease_id:
+        return False
+    _checkpoint_journal.append(ChunkEntry(
+        tenant=_checkpoint_revision.tenant, project_id=_checkpoint_revision.project_id,
+        run_id=_checkpoint_revision.run_id, origin=origin, chunk_index=chunk_index,
+        tool_ids=[tool_key], status="running", lease_id=lease_id,
+        lease_expires_at=task.lease_expires_at, started_at=task.started_at,
+        revision=_checkpoint_revision_dict()))
+    return True
 
 
 def _checkpoint_chunk_complete(tool_key: str, origin: str, chunk_index: int,
@@ -343,7 +344,10 @@ def _checkpoint_chunk_complete(tool_key: str, origin: str, chunk_index: int,
         coverage_durable=coverage_durable,
         revision=_checkpoint_revision_dict(),
     )
-    _checkpoint_journal.mark_completed(entry)
+    if coverage_durable:
+        _checkpoint_journal.mark_completed(entry)
+    else:
+        _checkpoint_journal.append(entry)
     _checkpoint_state.release(f"{origin}:{chunk_index}", "completed",
                               coverage_durable=coverage_durable)
 
@@ -366,6 +370,7 @@ def _checkpoint_chunk_defer(tool_key: str, origin: str, chunk_index: int,
         started_at=time.time(),
         coverage_durable=False,
         revision=_checkpoint_revision_dict(),
+        reason="budget_exhausted" if reason == "budget exhausted" else "execution_uncertain",
     )
     _checkpoint_journal.mark_uncertain(entry)
     _checkpoint_state.release(f"{origin}:{chunk_index}", "deferred",
@@ -932,8 +937,20 @@ def save_recon_file(data: dict, output_file: Path):
     artifact or the new one, never a partial.
     """
     from recon.helpers.atomic_io import atomic_write_json
+    run = os.environ.get("RECON_RUN_ID")
+    if run:
+        data.setdefault("metadata", {})["checkpoint_context"] = {
+            "project_id": PROJECT_ID, "tenant": str(USER_ID), "run_id": run,
+            "mode": "continuation" if os.environ.get("RECON_CONTINUE_RUN_ID") else "full"}
     with _save_lock:
         atomic_write_json(output_file, data)
+        if _checkpoint_revision is not None:
+            from recon.helpers.chunk_evidence import descriptor_name
+            from recon.helpers.chunk_continuation import seal_group
+            descriptor = OUTPUT_DIR / descriptor_name(PROJECT_ID, _checkpoint_revision.run_id)
+            if descriptor.exists():
+                seal_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
+                           _checkpoint_group, output_file)
     _shutdown.park()
 
 
@@ -1306,6 +1323,79 @@ def _merge_isolated_result(combined: dict, key: str, result) -> None:
         combined[key] = result
 
 
+def _checkpoint_prepare_phase_a(tools, result, settings, output_file, group_id):
+    if _checkpoint_journal is None:
+        return
+    from recon.helpers.chunk_continuation import register_group
+    from recon.helpers.chunk_evidence import EvidenceError, descriptor_name
+    save_recon_file(result, output_file)
+    try:
+        register_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
+                       _checkpoint_revision.tenant, _checkpoint_revision.to_dict(),
+                       group_id, output_file, tools, settings)
+    except EvidenceError:
+        # A continuation must never replace an incompatible descriptor: that
+        # would be a fake resume. A fresh full run replans, so the stale
+        # descriptor for this run is replaced with the new revision.
+        if os.environ.get("RECON_CONTINUE_RUN_ID"):
+            raise
+        descriptor = OUTPUT_DIR / descriptor_name(PROJECT_ID, _checkpoint_revision.run_id)
+        if descriptor.exists():
+            descriptor.unlink()
+        register_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
+                       _checkpoint_revision.tenant, _checkpoint_revision.to_dict(),
+                       group_id, output_file, tools, settings)
+
+
+def _continuation_tools(names, output_file):
+    # Static allowlist, never import a module or callable named by an artifact.
+    from recon.main_recon_modules.vuln_scan import run_vuln_scan_isolated
+    from recon.graphql_scan import run_graphql_scan_isolated
+    from recon.main_recon_modules.subdomain_takeover import run_subdomain_takeover_isolated
+    from recon.main_recon_modules.vhost_sni_enum import run_vhost_sni_enrichment_isolated
+    from recon.cache_scan import run_cache_scan_isolated
+    from recon.main_recon_modules.origin_discovery import run_origin_discovery_enrichment_isolated
+    from recon.route_exposure import run_route_exposure_isolated
+    allowed = {
+        "vuln_scan": partial(run_vuln_scan_isolated, output_file=output_file),
+        "graphql_scan": run_graphql_scan_isolated,
+        "subdomain_takeover": run_subdomain_takeover_isolated,
+        "vhost_sni": run_vhost_sni_enrichment_isolated,
+        "cache_scan": run_cache_scan_isolated,
+        "origin_discovery": run_origin_discovery_enrichment_isolated,
+        "route_exposure": run_route_exposure_isolated,
+    }
+    return {name: allowed[name] for name in names}
+
+
+def _continue_phase_a():
+    from recon.helpers.chunk_continuation import continuation_work
+    run = os.environ["RECON_CONTINUE_RUN_ID"]
+    if run != os.environ.get("RECON_RUN_ID"):
+        raise JournalError("run_mismatch")
+    allowed, _ = _check_roe_time_window(_settings)
+    if not allowed:
+        raise JournalError("roe_window_closed")
+    desc, group, names, result, _ = continuation_work(
+        OUTPUT_DIR, PROJECT_ID, run, str(USER_ID), os.environ.get("RECON_PROJECT_REVISION"))
+    _start_checkpoint(_settings, PROJECT_ID, run, group["group_id"], str(USER_ID))
+    # A human invocation grants one new budget window, not new settings or a
+    # new run. Lifetime usage remains in the journal's budget audit lines.
+    if _checkpoint_budget is not None:
+        _checkpoint_budget.renew_window()
+        _checkpoint_journal.save_budget(_checkpoint_budget.snapshot())
+    output = OUTPUT_DIR / group["output"]
+    _graph_reset()
+    _run_phase_a_fan_out(_continuation_tools(names, output), result, _settings, output,
+                         group_id=group["group_id"])
+    finalize_discovery_inventory(result)
+    save_recon_file(result, output)
+    _graph_wait_all()
+    # No graph clear, full-pipeline prune, Phase B replay, version rotation, or
+    # invented completion of the phases this entrypoint did not run.
+    return 0
+
+
 def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                          output_file, group_id: str = "") -> None:
     """GROUP 6 Phase A: run the active scanners concurrently on deep copies.
@@ -1326,6 +1416,18 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
         return
     import uuid
     group_id = group_id or _checkpoint_group
+    _checkpoint_prepare_phase_a(tools, combined_result, settings, output_file, group_id)
+    if _checkpoint_budget is not None:
+        # Apply operator budgets from the shared runtime keys only when the
+        # caller actually supplied them. A fresh run starts with no limit
+        # (unbounded); an explicitly configured budget is never clobbered by a
+        # default, and a caller that staged a limit itself keeps it.
+        if "CHECKPOINT_BUDGET_PER_GROUP" in settings:
+            _checkpoint_budget.set_limit(group_id, settings["CHECKPOINT_BUDGET_PER_GROUP"])
+        if "CHECKPOINT_BUDGET_PER_TOOL" in settings:
+            for tool in tools:
+                _checkpoint_budget.set_limit(group_id, settings["CHECKPOINT_BUDGET_PER_TOOL"],
+                                             check_family=tool)
     lease_id = uuid.uuid4().hex
     print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning (fan-out: {', '.join(tools.keys())})")
     print("-" * 40)
@@ -1338,6 +1440,8 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
             origin = _checkpoint_chunk_origin(group_id, key)
             chunk_index = 0
             budget_origin = group_id or key
+            if _checkpoint_journal is not None and _checkpoint_journal.is_done(origin, chunk_index):
+                continue
             if not _checkpoint_budget_admit(budget_origin, key):
                 print(f"    [checkpoint] {key}: budget exhausted, deferred "
                       f"(backlog persisted, candidate not dropped)")
@@ -1355,7 +1459,9 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
             origin = _checkpoint_chunk_origin(group_id, key)
             try:
                 _merge_isolated_result(combined_result, key, fut.result())
-                combined_result["metadata"]["modules_executed"].append(key)
+                if key not in combined_result["metadata"]["modules_executed"]:
+                    combined_result["metadata"]["modules_executed"].append(key)
+                combined_result["metadata"].get("phase_errors", {}).pop(key, None)
                 save_recon_file(combined_result, output_file)
                 graph_future = _graph_update_bg(
                     f"update_graph_from_{key}", combined_result, USER_ID, PROJECT_ID)
@@ -1408,52 +1514,6 @@ def _inject_planner_job_context(settings: dict) -> dict:
         "PARTIAL_RECON_RUN_ID") or ""
     staged["PLANNER_RUN_ID"] = str(run_id)
     return staged
-
-
-def _write_pre_dispatch_plan_manifest(settings: dict, output_file,
-                                      combined_result: dict,
-                                      group_id: str = ""):
-    """Write the run-scoped plan manifest before vuln_scan launches and record
-    pointer + digest + bounded summary on ``combined_result`` metadata.
-
-    The manifest is scoped to tenant/project/run/group and written atomically
-    (mode 0600) before the tool runs, so cancellation/restart readback finds it
-    and a corrupt, missing or unwritable manifest is explicit unknown rather
-    than a silent all-clear. It carries the run's honest accounting: the real
-    scope roots, the configured template references (hashed) and the observed
-    scan inputs (hashed, counted). Never fails the scan.
-    """
-    try:
-        if not settings.get("PLANNER_MANIFEST_ENABLED"):
-            return None
-        staged = _inject_planner_job_context(settings)
-        if group_id:
-            staged["PLANNER_GROUP_ID"] = str(group_id)
-        scope = {"roots": scope_roots_from_settings(staged)}
-        template_hashes = template_hashes_from_settings(staged)
-        input_hashes, input_count = input_accounting_from_recon_data(
-            combined_result)
-        ptr = maybe_write_pre_dispatch_manifest(
-            staged, output_file, scope=scope,
-            template_hashes=template_hashes, input_hashes=input_hashes,
-            input_count=input_count, group_id=group_id or None,
-            reason=f"pre-dispatch vuln_scan plan ({group_id or 'run'})")
-        if ptr is not None:
-            combined_result.setdefault("metadata", {}).setdefault(
-                "planner_manifest_pointers", []).append(ptr)
-            try:
-                save_recon_file(combined_result, output_file)
-            except Exception:  # noqa: BLE001
-                pass
-            # Publish so the webapp persists it on the ScanJob row before the
-            # tool launches (or as soon as the status poll observes it).
-            try:
-                publish_plan_pointer(ptr, staged, kind="full_recon")
-            except Exception:  # noqa: BLE001 - publication never fails a scan
-                pass
-        return ptr
-    except Exception:  # noqa: BLE001 - manifest never fails a scan
-        return None
 
 
 def run_ip_recon(target_ips: list, settings: dict) -> dict:
@@ -1972,14 +2032,13 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     if not skip_active_scans:
         if "vuln_scan" in SCAN_MODULES:
             print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
-            # G2-R3: run-scoped plan manifest before dispatch, scoped to the
-            # canonical job context (tenant/project/run/group). Default off,
-            # never fails the scan; pointer + digest + bounded summary are
-            # recorded on the run artifact before the tool launches.
-            _manifest_ptr = _write_pre_dispatch_plan_manifest(
-                settings, output_file, combined_result, group_id="ip")
+            # Planner job context flows into the actual vuln_scan boundary so
+            # the detailed run-scoped manifest is written there (group id
+            # included), never by an outer pre-target writer.
+            staged = _inject_planner_job_context(settings)
+            staged["PLANNER_GROUP_ID"] = "ip"
             try:
-                combined_result = run_vuln_scan(combined_result, output_file=output_file, settings=settings)
+                combined_result = run_vuln_scan(combined_result, output_file=output_file, settings=staged)
                 combined_result["metadata"]["modules_executed"].append("vuln_scan")
                 save_recon_file(combined_result, output_file)
 
@@ -2791,12 +2850,12 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             from recon.route_exposure import run_route_exposure_isolated
             phase_a_tools['route_exposure'] = run_route_exposure_isolated
 
-        # G2-R3: plan manifest before the vuln_scan tool launches, scoped to
-        # this run's canonical job context (per group when this is a batch).
-        _write_pre_dispatch_plan_manifest(_settings, output_file,
-                                          combined_result,
-                                          group_id=f"domain:{root_domain}")
-        _run_phase_a_fan_out(phase_a_tools, combined_result, _settings, output_file,
+        # Planner job context flows into the actual vuln_scan boundary via the
+        # phase-A fan-out settings; the detailed run-scoped manifest is written
+        # there, never by an outer pre-target writer.
+        staged = _inject_planner_job_context(_settings)
+        staged["PLANNER_GROUP_ID"] = f"domain:{root_domain}"
+        _run_phase_a_fan_out(phase_a_tools, combined_result, staged, output_file,
                              group_id=str(root_domain or ""))
 
         # ================================================================
@@ -3379,7 +3438,11 @@ def main():
     _shutdown.register_drain(_drain_graph_writes)
     _shutdown.set_sweep(_apply_node_filters)
     try:
-        return _run_pipeline()
+        from recon.helpers.chunk_execution import execution_lock
+        with execution_lock(OUTPUT_DIR, PROJECT_ID):
+            if os.environ.get("RECON_CONTINUE_RUN_ID"):
+                return _continue_phase_a()
+            return _run_pipeline()
     finally:
         if not _shutdown.stop_requested():
             _graph_wait_all()
@@ -3867,12 +3930,11 @@ def run_domain_group(group: dict, start_time=None) -> int:
             # vuln_scan automatically includes MITRE CWE/CAPEC enrichment
             if "vuln_scan" in SCAN_MODULES:
                 print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
-                # G2-R3: plan manifest before vuln_scan launches, scoped to
-                # this run's canonical job context (per group in a batch).
-                _write_pre_dispatch_plan_manifest(_settings, output_file,
-                                                  domain_result,
-                                                  group_id=f"domain:{root_domain}")
-                domain_result = run_vuln_scan(domain_result, output_file=output_file, settings=_settings)
+                # Planner job context flows into the actual vuln_scan boundary;
+                # the detailed run-scoped manifest is written there.
+                staged = _inject_planner_job_context(_settings)
+                staged["PLANNER_GROUP_ID"] = f"domain:{root_domain}"
+                domain_result = run_vuln_scan(domain_result, output_file=output_file, settings=staged)
                 if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
                     if "vuln_scan" not in domain_result["metadata"]["modules_executed"]:
                         domain_result["metadata"]["modules_executed"].append("vuln_scan")

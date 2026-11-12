@@ -11237,6 +11237,84 @@ fields:
       Enable the two-pass DAST consumer. Only honoured when plannerMode is shadow
       or enforce. Default false.
 
+  nucleiRoutingMode:
+    tool: planner
+    runtime_key: "NUCLEI_ROUTING_MODE"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: PlannerSection
+    values: ["off", "shadow", "enforce"]
+    meaning: >-
+      Nuclei semantic routing is independent of plannerMode. off preserves legacy dispatch; shadow records routing without changing dispatch; enforce uses semantic routing and keeps unknown semantics in compatibility.
+  jsReconFetchAdmission:
+    tool: js_recon
+    runtime_key: "JS_RECON_FETCH_ADMISSION"
+    unit: none
+    phase: js_recon
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: PlannerSection
+    meaning: >-
+      Rank and admit JavaScript candidates before download using provenance and per-host file budgets when JS Recon runs. Unknown validation is not evidence that a candidate is dead.
+  arjunLateSources:
+    tool: arjun
+    runtime_key: "ARJUN_LATE_SOURCES"
+    unit: none
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: PlannerSection
+    meaning: >-
+      Use late discovery sources for Arjun when Arjun runs, within the remaining endpoint budget. Deferred endpoints retain reasons. Independent of planner mode.
+  chunkCheckpointEnabled:
+    tool: planner
+    runtime_key: "CHUNK_CHECKPOINT_ENABLED"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: PlannerSection
+    meaning: >-
+      Persist durable Group 6 Phase A tool/group chunk checkpoints. This is not request-level checkpointing or resume of arbitrary pipeline phases.
+  checkpointBudgetPerGroup:
+    tool: planner
+    runtime_key: "CHECKPOINT_BUDGET_PER_GROUP"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: PlannerSection
+    bounds: { min: 0, max: 1000000 }
+    zero_means: unlimited
+    meaning: >-
+      Maximum admitted Group 6 Phase A chunks per group. 0 means unbounded. Not a per-HTTP-request limit, rate limit, or whole-pipeline budget.
+  checkpointBudgetPerTool:
+    tool: planner
+    runtime_key: "CHECKPOINT_BUDGET_PER_TOOL"
+    unit: none
+    phase: vuln_scan
+    traffic: none
+    roe_capped: false
+    mcp: settable
+    group: planner
+    form_section: PlannerSection
+    bounds: { min: 0, max: 1000000 }
+    zero_means: unlimited
+    meaning: >-
+      Maximum admitted Group 6 Phase A chunks per tool. 0 means unbounded. Not a per-HTTP-request limit, rate limit, or whole-pipeline budget.
+
 
 # Runtime keys with no Prisma column. Not MCP-reachable, but the derived
 # cap list is a query over this file, so a rate that lives only here is in it.

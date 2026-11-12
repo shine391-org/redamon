@@ -13,6 +13,7 @@ Three modes:
 
 import atexit
 import ipaddress
+import os
 import re
 import json
 import time
@@ -1970,10 +1971,22 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
     fetch_metrics = FetchMetrics()
     fetch_outcomes: list = []
     fetch_deferred: list = []
+    metadata = combined_result.get('metadata') or {}
+    from recon.helpers.planner_manifest import _job_context
+    job_context = _job_context(settings)
+    # Profile material is hashed, never logged or persisted as a raw header.
+    # The same owner/project/auth revision must partition both full/partial
+    # caches; an absent metadata tenant must not create a cross-owner cache.
+    import hashlib as _hashlib
+    auth_context = _hashlib.sha256(json.dumps({
+        'ref': metadata.get('auth_ref', ''),
+        'profile': settings.get('AUTH_PROFILE', {}),
+        'headers': settings.get('JS_RECON_CUSTOM_HEADERS', []),
+    }, sort_keys=True, default=str).encode()).hexdigest()
     fetch_context = context_key(
-        tenant=str((combined_result.get('metadata') or {}).get('tenant', '')),
-        project_id=str((combined_result.get('metadata') or {}).get('project_id', '')),
-        auth_ref=str((combined_result.get('metadata') or {}).get('auth_ref', '')),
+        tenant=str(job_context['tenant'] or settings.get('USER_ID') or metadata.get('tenant') or os.environ.get('USER_ID', '')),
+        project_id=str(job_context['project_id'] or metadata.get('project_id') or os.environ.get('PROJECT_ID', '')),
+        auth_ref=auth_context,
     )
     parse_cache = None
     download_cache = None

@@ -1,4 +1,5 @@
 /** @vitest-environment node */
+import { qualitySettings, invalidQualitySettings } from '@/lib/reconSettings/qualitySettings.testFixtures'
 import { beforeEach, expect, test, vi } from 'vitest'
 const h = vi.hoisted(() => ({
   project: {} as Record<string, unknown>, preset: {} as Record<string, unknown>,
@@ -45,7 +46,7 @@ import { extractPresetSettings } from '@/lib/project-preset-utils'
 const ctx = (): McpContext => ({ token: { tokenId: 'fixture', userId: 'owner', name: 'fixture', tokenPrefix: 'rdmn_mcp_fixture',
   scopes: ['recon:read','recon:settings','project:create','preset:write','preset:apply'] as never } })
 const at = new Date('2026-01-01T00:00:00Z')
-const valid = { plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
+const valid = { ...qualitySettings, plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
   plannerConsumerTargetSelection: false, plannerConsumerTwoPass: false,
   cveLookupEnabled: false, mitreEnabled: false, securityCheckEnabled: false }
 beforeEach(() => {
@@ -69,8 +70,9 @@ const writers = {
   presetCopy: (settings: Record<string, unknown>) => { h.preset.settings = settings; return createReconPreset(ctx(), { name: 'copied fixture', fromPresetId: 'preset1' }) },
 }
 const invalid = [
+  ...invalidQualitySettings,
   ...['bad', 'SHADOW', '', null, 1, false, [], {}].map(v => ['plannerMode', v]),
-  ...Object.keys(valid).filter(k => k !== 'plannerMode').flatMap(k => ['false', 'true', 0, 1, null, [], {}].map(v => [k, v])),
+  ...Object.keys(valid).filter(k => k !== 'plannerMode' && !(k in qualitySettings)).flatMap(k => ['false', 'true', 0, 1, null, [], {}].map(v => [k, v])),
   ['plannerUnknown', false], ['PLANNER_MODE', 'shadow'],
 ] as [string, unknown][]
 for (const [name, write] of Object.entries(writers)) {

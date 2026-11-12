@@ -7,6 +7,12 @@
 import { field } from './registry'
 import { validateValue } from './validators'
 
+const QUALITY_KEYS = new Set([
+  'nucleiRoutingMode', 'jsReconFetchAdmission', 'arjunLateSources',
+  'chunkCheckpointEnabled', 'checkpointBudgetPerGroup', 'checkpointBudgetPerTool',
+])
+const QUALITY_RUNTIME_KEYS = /^(NUCLEI_ROUTING_MODE|JS_RECON_FETCH_ADMISSION|ARJUN_LATE_SOURCES|CHUNK_CHECKPOINT_ENABLED|CHECKPOINT_BUDGET_PER_GROUP|CHECKPOINT_BUDGET_PER_TOOL)$/i
+
 const ENRICHMENT_KEYS = new Set(['cveLookupEnabled', 'mitreEnabled', 'securityCheckEnabled'])
 
 export function plannerWriteProblem(input: Record<string, unknown>): string | null {
@@ -14,7 +20,8 @@ export function plannerWriteProblem(input: Record<string, unknown>): string | nu
     // Runtime names are not API column names; refuse instead of silently losing
     // a misspelled/unsupported planner control in pickProjectColumns.
     const planner = /^planner/i.test(key) || /^PLANNER_/i.test(key)
-    if (!planner && !ENRICHMENT_KEYS.has(key)) continue
+    if (QUALITY_RUNTIME_KEYS.test(key)) return `${key} is not a canonical project settings name.`
+    if (!planner && !QUALITY_KEYS.has(key) && !ENRICHMENT_KEYS.has(key)) continue
     const spec = field(key)
     if (!spec || (planner && !key.startsWith('planner'))) {
       return `${key} is not a supported planner setting; use canonical settings names.`

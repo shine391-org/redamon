@@ -1,6 +1,9 @@
 import { SECTION_INPUT_MAP, SECTION_NODE_MAP, SECTION_ENRICH_MAP } from '../nodeMapping'
 import { NODE_COLORS } from '@/app/graph/config/colors'
 
+// Settings are reachable from the workflow but are not runnable scanner nodes.
+export const WORKFLOW_SETTINGS = [{ id: 'Planner', label: 'Planner' }] as const
+
 // ---- Tool definitions ----
 
 export interface WorkflowToolDef {

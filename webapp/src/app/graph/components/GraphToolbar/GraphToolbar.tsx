@@ -5,6 +5,7 @@ import { StealthIcon } from '@/components/icons/StealthIcon'
 import { Toggle, WikiInfoButton } from '@/components/ui'
 import type { ReconStatus, GvmStatus, GithubHuntStatus, TrufflehogStatus, PartialReconState } from '@/lib/recon-types'
 import { PartialReconBadges } from '@/components/PartialReconBadges'
+import { ReconDiagnostics } from './ReconDiagnostics'
 import { VersionSwitch } from '../VersionSwitch'
 import { ScanStatusWarning } from '@/components/scans/ScanStatusWarning'
 import { GVM_NOT_INSTALLED } from '@/components/scans/scanErrors'
@@ -287,6 +288,8 @@ export function GraphToolbar({
           />
         </>
       )}
+
+      <ReconDiagnostics projectId={projectId} historicalView={isHistory || Boolean(selectedVersionId)} />
 
       {reconCoverageSummary && (
         <>
@@ -576,28 +579,28 @@ function CoverageSummaryPanel({
 }) {
   if (!summary) return null
 
-  const modules = Object.entries(summary) as [string, { recorded: boolean; complete?: number; partial?: number; no_input?: number; failed?: number; not_scanned?: number }][]
+  const modules = Object.entries(summary).slice(0, 30).filter((entry): entry is [string, Record<string, unknown>] => entry[1] !== null && typeof entry[1] === 'object' && !Array.isArray(entry[1]))
 
   return (
     <div className={styles.coverageSummary}>
       <span className={styles.coverageLabel}>Coverage:</span>
       {modules.map(([module, counts]) => (
-        <span key={module} className={styles.coverageModule} title={`${module}: ${JSON.stringify(counts)}`}>
-          <span className={styles.coverageModuleName}>{module === 'js_recon' ? 'JS Recon' : 'Nuclei'}:</span>
+        <span key={module} className={styles.coverageModule} title={`${module.slice(0, 80)} coverage summary`}>
+          <span className={styles.coverageModuleName}>{module === 'js_recon' ? 'JS Recon' : module === 'nuclei' ? 'Nuclei' : module.slice(0, 80)}:</span>
           {counts.recorded ? (
             <>
-              {counts.complete && <span className={`${styles.coverageCount} ${styles.coverageComplete}`} title="Complete">{counts.complete}</span>}
-              {counts.partial && <span className={`${styles.coverageCount} ${styles.coveragePartial}`} title="Partial">{counts.partial}</span>}
-              {counts.no_input && <span className={`${styles.coverageCount} ${styles.coverageNoInput}`} title="No input">{counts.no_input}</span>}
-              {counts.failed && <span className={`${styles.coverageCount} ${styles.coverageFailed}`} title="Failed">{counts.failed}</span>}
-              {counts.not_scanned && <span className={`${styles.coverageCount} ${styles.coverageNotScanned}`} title="Not scanned">{counts.not_scanned}</span>}
+              {['complete', 'partial', 'no_input', 'failed', 'not_scanned'].map(key => (
+                <span key={key} className={styles.coverageCount} title={key}>
+                  {key.replace(/_/g, ' ')}: {typeof counts[key] === 'number' && Number.isFinite(counts[key]) ? String(counts[key]) : 'unknown'}
+                </span>
+              ))}
             </>
           ) : (
-            <span className={styles.coverageNotRecorded} title="Coverage not recorded (scanned before coverage stamps existed, or never run)">—</span>
+            <span className={styles.coverageNotRecorded} title="Coverage not recorded (scanned before coverage stamps existed, or never run)">Unknown</span>
           )}
         </span>
       ))}
-      {(runMode || runReason) && (
+      {(runMode || runReason || isHistory) && (
         <span className={styles.coverageRunInfo}>
           {runMode && <span className={styles.coverageRunMode} title={`Mode: ${runMode}`}>{runMode === 'new' ? 'New version' : runMode === 'overwrite' ? 'Overwrite' : runMode}</span>}
           {runReason && <span className={styles.coverageRunReason} title={`Reason: ${runReason}`}>{runReason}</span>}

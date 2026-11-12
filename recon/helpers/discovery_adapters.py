@@ -391,6 +391,7 @@ def record_input_facts(inventory: dict, *, discovered_url_sources: Dict[str, int
                        discovered_urls_total: int, by_base_url_sources: Sequence[str],
                        by_base_url_endpoints: int,
                        arjun: Optional[dict] = None,
+                       arjun_late: Optional[dict] = None,
                        js_recon: Optional[dict] = None) -> dict:
     """The composition of the structures consumers read, before any finalization.
 
@@ -403,6 +404,7 @@ def record_input_facts(inventory: dict, *, discovered_url_sources: Dict[str, int
         "by_base_url_sources": list(by_base_url_sources or []),
         "by_base_url_endpoints": int(by_base_url_endpoints or 0),
         "arjun": dict(arjun or {}),
+        "arjun_late": dict(arjun_late or {}),
         "js_recon": dict(js_recon or {}),
     }
     return inventory

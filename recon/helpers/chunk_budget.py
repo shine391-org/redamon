@@ -47,6 +47,8 @@ class _BudgetCounter:
     def record(self, admitted: bool, check_family: str = "") -> None:
         if admitted:
             self.used += 1
+            if check_family in self.deferred:
+                self.deferred.remove(check_family)
         elif check_family and check_family not in self.deferred:
             self.deferred.append(check_family)
 
@@ -74,6 +76,8 @@ class OriginBudget:
     def record(self, check_family: str, *, admitted: bool) -> None:
         if admitted:
             self.used += 1
+            if check_family in self.deferred:
+                self.deferred.remove(check_family)
         else:
             if check_family not in self.deferred:
                 self.deferred.append(check_family)
@@ -82,6 +86,9 @@ class OriginBudget:
 @dataclass
 class BudgetLedger:
     """Per-origin, per-check-family budget accounting for one run."""
+
+    window: int = 0
+    lifetime_used: int = 0
 
     #: origin -> OriginBudget
     origins: dict[str, OriginBudget] = field(default_factory=dict)
@@ -118,18 +125,26 @@ class BudgetLedger:
         counter = self.family_for(check_family)
         counter.record(admitted, check_family=check_family)
         if admitted:
+            self.lifetime_used += 1
             self.families[check_family] = self.families.get(check_family, 0) + 1
 
     def set_limit(self, origin: str, limit: int, *,
                   check_family: Optional[str] = None) -> None:
         """Set an origin limit, or a per-family limit when ``check_family``."""
         if check_family is None:
-            self.origin_for(origin).limit = max(0, int(limit))
+            self.origin_for(origin).limit = None if int(limit) == 0 else max(0, int(limit))
         else:
-            self.family_for(check_family).limit = max(0, int(limit))
+            self.family_for(check_family).limit = None if int(limit) == 0 else max(0, int(limit))
+
+    def renew_window(self) -> None:
+        """An explicit human invocation grants another same-sized chunk window."""
+        self.window += 1
+        for counter in list(self.origins.values()) + list(self.family_budgets.values()):
+            counter.used = 0
 
     def snapshot(self) -> dict:
         return {
+            "window": self.window, "lifetime_used": self.lifetime_used,
             "origins": {
                 origin: {
                     "limit": b.limit,
@@ -154,7 +169,8 @@ class BudgetLedger:
     @classmethod
     def from_snapshot(cls, data: dict) -> "BudgetLedger":
         """Rebuild a ledger from ``snapshot()`` (a persisted journal line)."""
-        ledger = cls()
+        ledger = cls(window=int(data.get("window", 0)),
+                     lifetime_used=int(data.get("lifetime_used", 0)))
         for origin, raw in (data.get("origins") or {}).items():
             budget = OriginBudget(
                 origin=origin,

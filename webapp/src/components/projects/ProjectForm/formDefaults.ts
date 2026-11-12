@@ -6,6 +6,17 @@ import type { Project } from '@prisma/client'
  * built on top of these, edit mode included.
  */
 export const MINIMAL_DEFAULTS: Partial<Project> = {
+  plannerMode: 'off',
+  plannerManifestEnabled: false,
+  plannerConsumerAiTags: false,
+  plannerConsumerTargetSelection: false,
+  plannerConsumerTwoPass: false,
+  nucleiRoutingMode: 'off',
+  jsReconFetchAdmission: true,
+  arjunLateSources: true,
+  chunkCheckpointEnabled: true,
+  checkpointBudgetPerGroup: 0,
+  checkpointBudgetPerTool: 0,
   name: '',
   jevProviderId: null,
   description: '',

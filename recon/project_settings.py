@@ -73,6 +73,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'PLANNER_CONSUMER_TARGET_SELECTION': False,
     'PLANNER_CONSUMER_TWO_PASS': False,
 
+    # Runtime routing/admission and Group 6 Phase A chunk controls.
+    'NUCLEI_ROUTING_MODE': 'off',
+    'JS_RECON_FETCH_ADMISSION': True,
+    'ARJUN_LATE_SOURCES': True,
+    'CHUNK_CHECKPOINT_ENABLED': True,
+    'CHECKPOINT_BUDGET_PER_GROUP': 0,
+    'CHECKPOINT_BUDGET_PER_TOOL': 0,
+
     # WHOIS/DNS
     'WHOIS_ENABLED': True,
     'WHOIS_MAX_RETRIES': 6,
@@ -1668,6 +1676,23 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['PLANNER_CONSUMER_AI_TAGS'] = project.get('plannerConsumerAiTags', DEFAULT_SETTINGS['PLANNER_CONSUMER_AI_TAGS'])
     settings['PLANNER_CONSUMER_TARGET_SELECTION'] = project.get('plannerConsumerTargetSelection', DEFAULT_SETTINGS['PLANNER_CONSUMER_TARGET_SELECTION'])
     settings['PLANNER_CONSUMER_TWO_PASS'] = project.get('plannerConsumerTwoPass', DEFAULT_SETTINGS['PLANNER_CONSUMER_TWO_PASS'])
+
+    # Shared feature-completion fields (direct mappings remain auditable).
+    settings['NUCLEI_ROUTING_MODE'] = project.get('nucleiRoutingMode', DEFAULT_SETTINGS['NUCLEI_ROUTING_MODE'])
+    settings['JS_RECON_FETCH_ADMISSION'] = project.get('jsReconFetchAdmission', DEFAULT_SETTINGS['JS_RECON_FETCH_ADMISSION'])
+    settings['ARJUN_LATE_SOURCES'] = project.get('arjunLateSources', DEFAULT_SETTINGS['ARJUN_LATE_SOURCES'])
+    settings['CHUNK_CHECKPOINT_ENABLED'] = project.get('chunkCheckpointEnabled', DEFAULT_SETTINGS['CHUNK_CHECKPOINT_ENABLED'])
+    settings['CHECKPOINT_BUDGET_PER_GROUP'] = project.get('checkpointBudgetPerGroup', DEFAULT_SETTINGS['CHECKPOINT_BUDGET_PER_GROUP'])
+    settings['CHECKPOINT_BUDGET_PER_TOOL'] = project.get('checkpointBudgetPerTool', DEFAULT_SETTINGS['CHECKPOINT_BUDGET_PER_TOOL'])
+    # Reject string booleans and bool-as-int without changing saved values.
+    if settings['NUCLEI_ROUTING_MODE'] not in ('off', 'shadow', 'enforce'):
+        settings['NUCLEI_ROUTING_MODE'] = 'off'
+    for key in ('JS_RECON_FETCH_ADMISSION', 'ARJUN_LATE_SOURCES', 'CHUNK_CHECKPOINT_ENABLED'):
+        if type(settings[key]) is not bool:
+            settings[key] = DEFAULT_SETTINGS[key]
+    for key in ('CHECKPOINT_BUDGET_PER_GROUP', 'CHECKPOINT_BUDGET_PER_TOOL'):
+        if type(settings[key]) is not int or not 0 <= settings[key] <= 1000000:
+            settings[key] = 0
 
     # Subdomain Takeover Scanner
     settings['SUBDOMAIN_TAKEOVER_ENABLED'] = project.get('subdomainTakeoverEnabled', DEFAULT_SETTINGS['SUBDOMAIN_TAKEOVER_ENABLED'])

@@ -169,6 +169,7 @@ class ChunkEntry:
     output_ref: Optional[str] = None
     coverage_durable: bool = False
     revision: dict[str, str] = field(default_factory=dict)
+    reason: str = ""
     entry_id: str = field(default_factory=_new_id)
     created_at: float = field(default_factory=_utc_now)
 
@@ -193,6 +194,8 @@ class ChunkEntry:
             "revision": dict(self.revision),
             "created_at": self.created_at,
         }
+        if self.reason:
+            d["reason"] = self.reason
         d["checksum"] = _checksum(d)
         return d
 
@@ -213,6 +216,7 @@ class ChunkEntry:
             output_ref=data.get("output_ref"),
             coverage_durable=bool(data.get("coverage_durable", False)),
             revision=dict(data.get("revision") or {}),
+            reason=str(data.get("reason") or ""),
             entry_id=str(data.get("entry_id") or _new_id()),
             created_at=float(data.get("created_at", 0.0)),
         )
@@ -288,7 +292,7 @@ class JournalSnapshot:
             self.chunks[key] = entry
 
     def completed_keys(self) -> set[tuple[str, int]]:
-        return {k for k, e in self.chunks.items() if e.status == "completed"}
+        return {k for k, e in self.chunks.items() if e.status == "completed" and e.coverage_durable}
 
     def uncertain_keys(self, now: float) -> set[tuple[str, int]]:
         """Chunks whose outcome is not safely known: running with an expired
@@ -428,8 +432,10 @@ class ChunkJournal:
                 try:
                     for raw in data.get("chunks") or []:
                         entry = ChunkEntry.from_dict(raw)
-                        if _verify_checksum(entry):
+                        if _verify_checksum_raw(raw):
                             snapshot.merge(entry)
+                        else:
+                            raise JournalError("invalid snapshot checksum")
                 except Exception:  # noqa: BLE001
                     truncated_at = idx
                     break

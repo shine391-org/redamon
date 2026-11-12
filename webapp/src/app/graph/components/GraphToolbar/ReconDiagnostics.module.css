@@ -1,0 +1,12 @@
+.panel { display: grid; gap: 16px; overflow-wrap: anywhere; }
+.panel section { border-top: 1px solid var(--border-default, #555); padding-top: 12px; }
+.panel h3 { margin-bottom: 8px; }
+.panel p { margin: 8px 0; line-height: 1.5; }
+.values { margin: 4px 0; }
+.values > div { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(0, 3fr); gap: 12px; padding: 4px 0; }
+.values dt { font-weight: 600; }
+.values dd { margin: 0; min-width: 0; }
+.panel ul { padding-left: 20px; }
+.confirm { border: 1px solid var(--border-default, #555); padding: 12px; }
+.confirm button { margin-right: 8px; }
+@media (max-width: 600px) { .values > div { grid-template-columns: 1fr; gap: 4px; } }

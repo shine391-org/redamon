@@ -1,4 +1,5 @@
 /** @vitest-environment node */
+import { qualitySettings, invalidQualitySettings } from '@/lib/reconSettings/qualitySettings.testFixtures'
 import { describe, test, expect, beforeEach, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
@@ -67,13 +68,14 @@ beforeEach(() => {
 
 
 const invalids = [
+  ...invalidQualitySettings,
   ...['bogus', 'SHADOW', '', null, 1, false, [], {}].map(value => ['plannerMode', value]),
   ...['plannerManifestEnabled', 'plannerConsumerAiTags', 'plannerConsumerTargetSelection', 'plannerConsumerTwoPass',
       'cveLookupEnabled', 'mitreEnabled', 'securityCheckEnabled'].flatMap(key =>
         ['false', 'true', 0, 1, null, [], {}].map(value => [key, value])),
   ['plannerUnknown', false], ['PLANNER_MODE', 'shadow'],
 ] as [string, unknown][]
-const valid = { plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
+const valid = { ...qualitySettings, plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
   plannerConsumerTargetSelection: false, plannerConsumerTwoPass: false,
   cveLookupEnabled: false, mitreEnabled: false, securityCheckEnabled: false }
 
@@ -100,11 +102,11 @@ test('absent planner keys never become overrides', async () => {
 })
 
 test('valid partial update preserves saved unrelated settings and CAS refuses stale writes', async () => {
-  let row: Record<string, unknown> = { ...STORED, plannerMode: 'shadow', nucleiRateLimit: 42, httpxCustomHeaders: ['X-Test: fixture'] }
+  let row: Record<string, unknown> = { ...STORED, ...qualitySettings, plannerMode: 'shadow', nucleiRateLimit: 42, httpxCustomHeaders: ['X-Test: fixture'] }
   h.findUnique.mockImplementation(async () => ({ ...row }))
   h.update.mockImplementation(async ({ data }) => (row = { ...row, ...data }))
   expect((await call({ plannerConsumerTwoPass: false })).status).toBe(200)
-  expect(row).toMatchObject({ plannerMode: 'shadow', nucleiRateLimit: 42, httpxCustomHeaders: ['X-Test: fixture'], plannerConsumerTwoPass: false })
+  expect(row).toMatchObject({ ...qualitySettings, plannerMode: 'shadow', nucleiRateLimit: 42, httpxCustomHeaders: ['X-Test: fixture'], plannerConsumerTwoPass: false })
   h.updateMany.mockResolvedValue({ count: 0 })
   expect((await call({ plannerMode: 'enforce', updatedAt: '2026-01-01T00:00:00Z' })).status).toBe(409)
   expect(row.plannerMode).toBe('shadow')

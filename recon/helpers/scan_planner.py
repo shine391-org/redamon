@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 from recon.helpers.planner_manifest import (
     MODE_OFF, MODE_SHADOW, MODE_ENFORCE, resolve_mode,
     template_hashes_from_settings, scope_roots_from_settings,
-    _strip_userinfo, MANIFEST_MAX_TASKS,
+    _strip_userinfo, _redact, MANIFEST_MAX_TASKS,
 )
 from recon.helpers.template_classification import (
     TemplateCategory,
@@ -557,7 +557,8 @@ class ScanPlanner:
                 break
             origin, path, method, query, body, content_type, auth_revision = \
                 self._decompose_target(target, inventory)
-            in_scope = _origin_in_scope(origin, self.settings)
+            in_scope = (_origin_in_scope(origin, self.settings)
+                        if scope_roots_from_settings(self.settings) else None)
 
             for template in self.template_refs:
                 if len(tasks) >= MAX_TASKS:
@@ -640,7 +641,7 @@ class ScanPlanner:
     def _classify_task(self, *, template: str, origin: str, path: str,
                        method: str, query: tuple, body: tuple,
                        content_type: str, auth_revision: str,
-                       in_scope: bool) -> PlanTask:
+                       in_scope: Optional[bool]) -> PlanTask:
         """Classify one (template × target) into a disposition.
 
         Precedence:
@@ -672,10 +673,15 @@ class ScanPlanner:
             provenance = "rule:template-missing"
             estimate = None
         # 2. Out of scope -> not applicable.
-        elif not in_scope:
+        elif in_scope is False:
             disposition = Disposition.NOT_APPLICABLE
             reason = "origin outside configured scope roots"
             provenance = "rule:out-of-scope"
+            estimate = None
+        elif in_scope is None:
+            disposition = Disposition.COMPATIBILITY
+            reason = "scope evidence unavailable -> compatibility (not a scope authorization)"
+            provenance = "rule:scope-unknown"
             estimate = None
         # 3. Unknown template semantics -> compatibility lane (legacy behavior).
         elif template_prov is None:
@@ -823,7 +829,7 @@ class ScanPlanner:
                 sort_keys=True, separators=(",", ":")),
         )
 
-        return {
+        return _redact({
             "schema_version": 1,
             "planner_version": 1,
             "planner_mode": self.mode,
@@ -851,7 +857,7 @@ class ScanPlanner:
             #: created_at but identical plan_id (determinism is about plan_id,
             #: not wall-clock).
             "created_at": created_at,
-        }
+        })
 
 
 def plan_for_settings(settings: dict[str, Any], template_refs: Iterable[str],

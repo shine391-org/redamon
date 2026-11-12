@@ -397,8 +397,6 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
                     value={(data.nucleiTags ?? []).join(', ')}
                     onChange={(e) => updateField('nucleiTags', e.target.value.split(',').map(s => s.trim()).filter(Boolean))}
                     placeholder="cve, xss, sqli, rce (empty = custom templates only)"
-                    disabled={data.nucleiAiTags}
-                    style={data.nucleiAiTags ? { opacity: 0.5 } : undefined}
                   />
                   <FileImportButton
                     fieldName="tags"
@@ -407,7 +405,7 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
                 </div>
                 <span className={styles.fieldHint}>
                   {data.nucleiAiTags ? (
-                    <>Tags chosen by AI per scan based on tech fingerprint. The static list above is ignored.</>
+                    <>AI may only prune tags from the saved Include Tags set based on the tech fingerprint; it cannot add tags outside that set. Exclusions still apply. An empty saved set does not expand to all templates.</>
                   ) : (
                     <>
                       Popular: cve, xss, sqli, rce, lfi, ssrf, xxe, ssti.
@@ -556,11 +554,11 @@ export function NucleiSection({ data, updateField, onRun }: NucleiSectionProps) 
               <div className={`${styles.callout} ${styles.calloutInfo}`}>
                 <Info size={16} />
                 <div>
-                  <strong>How the two passes work.</strong> Pass 1 (detection) runs your full configuration: severities, tags, custom templates, the whole ~8000-template corpus minus what you exclude. Pass 2 (DAST) runs only the ~250 templates under <code>dast/</code> with <code>-dast</code> forced on, and ignores tag/template filters because those filters would empty-intersect with the DAST set and fatal with <em>&ldquo;no templates provided for scan.&rdquo;</em>
+                  <strong>How the two passes work.</strong> Pass 1 (detection) uses your selected tags, custom templates, severities and exclusions. An empty selection does not expand to the full corpus. Pass 2 (DAST) uses the DAST template set with <code>-dast</code> and preserves policy exclusions and severity restrictions; it is not an unfiltered scan. Empty or failed template selection is recorded, not treated as clean coverage.
                   <br /><br />
                   <strong>DAST pass needs parameterized URLs.</strong> Built-in DAST templates fuzz query parameters (path/header/cookie/body fuzzing exists since v3.2 but is rare in stock templates). If <code>resource_enum</code> hasn&rsquo;t produced any URLs containing <code>?param=value</code>, the DAST pass is skipped automatically and only the detection pass runs. Run Katana / Hakrawler first if you want DAST coverage.
                   <br /><br />
-                  <strong>Tag and template filters apply to the detection pass only.</strong> Want to bias the detection pass toward GraphQL? Set Include Tags <code>graphql,apollo,hasura</code> as usual: it filters pass 1 only, the DAST pass still runs unfiltered against your parameterized URLs.
+                  <strong>Separate selection, shared safety policy.</strong> Detection include tags choose detection templates; DAST uses its own candidate set. Excluded tags and templates remain excluded in both passes. Review diagnostics for effective selections, compatibility paths and deferred reasons; a skipped URL is not evidence of a clean scan.
                   <br /><br />
                   <strong>Cost:</strong> roughly 2x scan time when DAST is on (the two passes can&rsquo;t share work). Findings from both passes are merged into a single report.
                 </div>

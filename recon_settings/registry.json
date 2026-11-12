@@ -1418,6 +1418,23 @@
    "type": "boolean",
    "unit": "none"
   },
+  "arjunLateSources": {
+   "default": true,
+   "form_section": "PlannerSection",
+   "group": "planner",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Use late discovery sources for Arjun when Arjun runs, within the remaining endpoint budget. Deferred endpoints retain reasons. Independent of planner mode.",
+   "optional": false,
+   "phase": "resource_enum",
+   "prisma_type": "Boolean",
+   "roe_capped": false,
+   "runtime_key": "ARJUN_LATE_SOURCES",
+   "tool": "arjun",
+   "traffic": "active",
+   "type": "boolean",
+   "unit": "none"
+  },
   "arjunMaxEndpoints": {
    "bounds": {
     "min": 1,
@@ -1837,6 +1854,67 @@
    "traffic": "passive",
    "type": "int",
    "unit": "threads"
+  },
+  "checkpointBudgetPerGroup": {
+   "bounds": {
+    "min": 0,
+    "max": 1000000
+   },
+   "default": 0,
+   "form_section": "PlannerSection",
+   "group": "planner",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Maximum admitted Group 6 Phase A chunks per group. 0 means unbounded. Not a per-HTTP-request limit, rate limit, or whole-pipeline budget.",
+   "optional": false,
+   "phase": "vuln_scan",
+   "prisma_type": "Int",
+   "roe_capped": false,
+   "runtime_key": "CHECKPOINT_BUDGET_PER_GROUP",
+   "tool": "planner",
+   "traffic": "none",
+   "type": "int",
+   "unit": "none",
+   "zero_means": "unlimited"
+  },
+  "checkpointBudgetPerTool": {
+   "bounds": {
+    "min": 0,
+    "max": 1000000
+   },
+   "default": 0,
+   "form_section": "PlannerSection",
+   "group": "planner",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Maximum admitted Group 6 Phase A chunks per tool. 0 means unbounded. Not a per-HTTP-request limit, rate limit, or whole-pipeline budget.",
+   "optional": false,
+   "phase": "vuln_scan",
+   "prisma_type": "Int",
+   "roe_capped": false,
+   "runtime_key": "CHECKPOINT_BUDGET_PER_TOOL",
+   "tool": "planner",
+   "traffic": "none",
+   "type": "int",
+   "unit": "none",
+   "zero_means": "unlimited"
+  },
+  "chunkCheckpointEnabled": {
+   "default": true,
+   "form_section": "PlannerSection",
+   "group": "planner",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Persist durable Group 6 Phase A tool/group chunk checkpoints. This is not request-level checkpointing or resume of arbitrary pipeline phases.",
+   "optional": false,
+   "phase": "vuln_scan",
+   "prisma_type": "Boolean",
+   "roe_capped": false,
+   "runtime_key": "CHUNK_CHECKPOINT_ENABLED",
+   "tool": "planner",
+   "traffic": "none",
+   "type": "boolean",
+   "unit": "none"
   },
   "createdAt": {
    "default": null,
@@ -5934,6 +6012,23 @@
    "type": "boolean",
    "unit": "none"
   },
+  "jsReconFetchAdmission": {
+   "default": true,
+   "form_section": "PlannerSection",
+   "group": "planner",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Rank and admit JavaScript candidates before download using provenance and per-host file budgets when JS Recon runs. Unknown validation is not evidence that a candidate is dead.",
+   "optional": false,
+   "phase": "js_recon",
+   "prisma_type": "Boolean",
+   "roe_capped": false,
+   "runtime_key": "JS_RECON_FETCH_ADMISSION",
+   "tool": "js_recon",
+   "traffic": "active",
+   "type": "boolean",
+   "unit": "none"
+  },
   "jsReconFrameworkDetect": {
    "default": true,
    "form_section": "JsReconSection",
@@ -8676,6 +8771,28 @@
    "traffic": "active",
    "type": "int",
    "unit": "count"
+  },
+  "nucleiRoutingMode": {
+   "default": "off",
+   "form_section": "PlannerSection",
+   "group": "planner",
+   "has_default": true,
+   "mcp": "settable",
+   "meaning": "Nuclei semantic routing is independent of plannerMode. off preserves legacy dispatch; shadow records routing without changing dispatch; enforce uses semantic routing and keeps unknown semantics in compatibility.",
+   "optional": false,
+   "phase": "vuln_scan",
+   "prisma_type": "String",
+   "roe_capped": false,
+   "runtime_key": "NUCLEI_ROUTING_MODE",
+   "tool": "planner",
+   "traffic": "none",
+   "type": "string",
+   "unit": "none",
+   "values": [
+    "off",
+    "shadow",
+    "enforce"
+   ]
   },
   "nucleiScanAllIps": {
    "default": false,

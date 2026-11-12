@@ -104,6 +104,7 @@ from recon.helpers.auth_profile import (
     resolve_scope_hosts,
     profile_from_settings,
 )
+from recon.helpers.planner_runtime import enforcing, plan_dispatch, persist_dispatch, routing_compatibility_reason
 from recon.helpers.security_checks import page_content_enabled
 from recon.helpers.isolated_result import TopLevelKeys
 from recon.helpers.selection_coverage import (
@@ -119,7 +120,7 @@ from recon.helpers.selection_coverage import (
 # vuln_scan. technology_cves exists only when the CVE lookup ran.
 # selection_coverage is the persisted plan of what this run selected; it is
 # written BEFORE the tool launches and carried through every merge boundary.
-_VULN_SCAN_RESULT_KEYS = ("vuln_scan", "technology_cves", SELECTION_KEY)
+_VULN_SCAN_RESULT_KEYS = ("vuln_scan", "technology_cves", SELECTION_KEY, "planner_manifest")
 
 
 def _nuclei_watch_stats(line: str, label: str, state: dict) -> None:
@@ -350,6 +351,7 @@ def _classify_and_route_templates(
     exclude_tags: List[str],
     resource_enum_data: Optional[dict] = None,
     http_probe_data: Optional[dict] = None,
+    admitted_targets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Classify templates by semantics and route them to appropriate target sets.
@@ -362,6 +364,7 @@ def _classify_and_route_templates(
         "routing_metadata": {...}
     }
     """
+    from urllib.parse import urlparse
     registry = get_registry()
     
     # Separate tag-based selection from explicit template paths
@@ -453,6 +456,21 @@ def _classify_and_route_templates(
         }
     }
     
+    if admitted_targets is not None:
+        # Routing must not synthesize URLs from inventory (which may be
+        # declared-only or carry a different encoded query). Missing root or
+        # request-transport proof keeps the admitted legacy list intact.
+        admitted = list(admitted_targets)
+        roots = [u for u in admitted if urlparse(u).path in ('', '/') and not urlparse(u).query]
+        origins = {f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in admitted}
+        root_origins = {f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in roots}
+        for category in TemplateCategory:
+            routing['target_sets'][category.value] = (
+                roots if category == TemplateCategory.ORIGIN_SAFE and origins == root_origins
+                and all(ref in ('ssl', 'tls', 'certificate') or ref.startswith(('ssl/', 'tls/', 'certificate/'))
+                        for ref in list(template_tags or []) + explicit_templates) else admitted)
+        routing['routing_metadata']['input_contract'] = 'admitted legacy URLs only; unsupported semantics compatibility'
+
     # Add explicit templates to routing (each goes to exactly ONE category)
     for tpl, classified in explicit_classified.items():
         routing["by_category"][classified.category.value].append(tpl)
@@ -1091,7 +1109,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         # saved/effective/added/removed + reason in scan_metadata.
         ai_tags_used = False
         ai_selection = None
-        if NUCLEI_AI_TAGS and NUCLEI_TAGS:
+        if (NUCLEI_AI_TAGS or enforcing(settings, 'ai_tags')) and NUCLEI_TAGS:
             from recon.helpers.ai_planner.nuclei_tags import (
                 get_ai_tags,
                 policy_filtered_selection,
@@ -1158,6 +1176,16 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             else:
                 print(f"[!][Nuclei] resource_enum not found - run resource_enum before vuln_scan for DAST mode")
     
+        # Planner runs on real built inputs with endpoint evidence, never on
+        # an upstream estimate. Shadow does no additional HTTP/LLM calls.
+        target_urls, dast_urls, planner_routing, planner_tasks, planner_details = plan_dispatch(
+            settings, target_urls, dast_urls, tags=NUCLEI_TAGS,
+            templates=NUCLEI_TEMPLATES, custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+            selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+            inventory=recon_data.get('resource_enum'))
+        if ai_selection:
+            planner_details['selection']['ai_tags'] = ai_selection
+
         # Break down what will actually be scanned (target_urls is the real list)
         ip_target_count = sum(1 for u in target_urls if _url_host_is_ip(u))
         host_target_count = len(target_urls) - ip_target_count
@@ -1269,13 +1297,16 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         # a result checkpoint. ``selection_hint`` comes from a partial run and
         # marks the run as target/template-limited.
         _partial_scope = bool(selection_hint and selection_hint.get("scope") == "partial")
-        _deferred = bool(selection_hint and selection_hint.get("deferred"))
+        _deferred = bool(selection_hint and selection_hint.get("deferred")) or bool(
+            planner_details['consumers']['two_pass'].get('deferred_count'))
+        planner_selective = planner_routing is not None and any(
+            urls != target_urls for urls in planner_routing['target_sets'].values())
         selection_plan = _selection_plan(
             targets=target_urls,
             saved_tags=saved_nuclei_tags,
             effective_tags=NUCLEI_TAGS,
             ai_pruned=ai_tags_used,
-            partial_scope=_partial_scope,
+            partial_scope=_partial_scope or planner_selective or resolve_routing_mode(settings) == MODE_ENFORCE,
             deferred=_deferred,
             severity=NUCLEI_SEVERITY,
             exclude_tags=NUCLEI_EXCLUDE_TAGS,
@@ -1329,6 +1360,21 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         from recon.helpers.auth_profile import append_engagement_identity as _append_identity
         _nuclei_auth = _append_identity(_nuclei_auth, settings)
 
+        # Resolve compatibility *before* recording the detailed dispatch plan.
+        # Mixed -t/-tags and custom mount selections cannot be split without
+        # changing the policy intersection. Auth/identity stays indivisible too.
+        routing_fallback = routing_compatibility_reason(settings)
+        if _nuclei_auth:
+            routing_fallback = 'authenticated/identity transport requires legacy builder'
+        if routing_fallback:
+            planner_routing = None
+            planner_details['consumers']['target_selection'].update(
+                executing=False, reason='compatibility: ' + routing_fallback)
+        planner_details['selection']['routing_mode'] = resolve_routing_mode(settings)
+        planner_details['selection']['routing_compatibility_reason'] = routing_fallback
+        persist_dispatch(settings, recon_data, plan_output_file or output_file,
+                         planner_tasks, planner_details, target_urls, dast_urls)
+
         try:
             findings = []
             false_positives_filtered = []
@@ -1345,7 +1391,11 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             
             # Check routing mode gate (off/shadow/enforce)
             routing_mode = resolve_routing_mode(settings)
-            use_routed = routing_mode == MODE_ENFORCE
+            use_routed = routing_mode == MODE_ENFORCE or planner_routing is not None
+            if routing_fallback:
+                # Preserve the existing builder's scoped credential and custom
+                # mount mapping; category heuristics cannot prove safe transport.
+                use_routed = False
             # Shadow mode: compute routing for observation but execute legacy
             compute_routing_for_shadow = routing_mode == MODE_SHADOW
             
@@ -1369,6 +1419,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                         exclude_tags=NUCLEI_EXCLUDE_TAGS,
                         resource_enum_data=recon_data.get("resource_enum"),
                         http_probe_data=recon_data.get("http_probe"),
+                        admitted_targets=target_urls,
                     )
                     # Log routing summary for observation
                     print(f"[*][Nuclei-Routing] Shadow mode - template routing summary (not executed):")
@@ -1442,7 +1493,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 print(f"[*][Nuclei] DETECTION pass running in routed mode (NUCLEI_ROUTING_MODE={routing_mode})")
                 # F14: Classify templates by semantics and route to appropriate targets
                 # This replaces the single detection pass with category-routed passes
-                routing = _classify_and_route_templates(
+                routing = planner_routing or _classify_and_route_templates(
                     template_tags=NUCLEI_TAGS,
                     template_paths=NUCLEI_TEMPLATES,
                     custom_templates=NUCLEI_CUSTOM_TEMPLATES,
@@ -1451,6 +1502,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     exclude_tags=NUCLEI_EXCLUDE_TAGS,
                     resource_enum_data=recon_data.get("resource_enum"),
                     http_probe_data=recon_data.get("http_probe"),
+                    admitted_targets=target_urls,
                 )
                 
                 # Log routing summary

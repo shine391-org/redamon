@@ -429,6 +429,7 @@ async function startFullScanLocked(input: StartFullScanInput): Promise<StartFull
     // produced it and the document that permitted looking. JobQueue.settingsHash
     // is the only other settings fingerprint anywhere and it is deleted with the
     // queue row the moment the job dispatches.
+    runId: typeof state.run_id === 'string' ? state.run_id : '',
     settingsHash: await fingerprintProjectSettings(projectId),
     authorizationId: await currentAuthorizationId(projectId),
     status: 'running',

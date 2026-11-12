@@ -75,7 +75,8 @@ CONSUMERS = (CONSUMER_AI_TAGS, CONSUMER_TARGET_SELECTION, CONSUMER_TWO_PASS)
 
 #: Header/cookie-like keys that must never be written into a manifest.
 SENSITIVE_PREFIXES = ("authorization", "cookie", "x-api-key", "x-auth-token",
-                      "proxy-authorization", "set-cookie")
+                      "proxy-authorization", "set-cookie", "password", "secret",
+                      "api_key", "apikey", "access_token", "refresh_token", "token")
 
 #: Top-level keys the reader accepts as a complete, supported manifest.
 REQUIRED_MANIFEST_KEYS = (
@@ -90,7 +91,7 @@ KNOWN_MANIFEST_KEYS = set(REQUIRED_MANIFEST_KEYS) | {
     # Planner (F10) shadow-manifest accounting -- additive, backward
     # compatible; a manifest written without them still reads as known.
     "plan_id", "disposition_counts", "input_count", "oversize",
-    "task_count", "template_count",
+    "task_count", "template_count", "consumers", "selection", "inventory",
 }
 
 #: Manifest bounding: explicit limits with observable markers, never silent truncation.
@@ -163,7 +164,10 @@ def _redact(value: Any) -> Any:
             if isinstance(k, str) and any(
                     k.lower().startswith(p) for p in SENSITIVE_PREFIXES):
                 continue  # credentials never enter the manifest
-            out[k] = _redact(v)
+            safe_key = _redact(k) if isinstance(k, str) else k
+            if safe_key in out:
+                safe_key = f"{safe_key} [sha256:{hashlib.sha256(str(k).encode()).hexdigest()[:16]}]"
+            out[safe_key] = _redact(v)
         if len(out) > MANIFEST_MAX_COLLECTION_ITEMS:
             kept = dict(list(out.items())[:MANIFEST_MAX_COLLECTION_ITEMS])
             kept["<redacted: collection truncated>"] = (
@@ -179,6 +183,13 @@ def _redact(value: Any) -> Any:
         return out
     if isinstance(value, str):
         value = _strip_userinfo(value)
+        # Query/fragment values and inline headers can carry arbitrary secrets
+        # that have no recognizable token prefix. Plans expose counts/hashed
+        # request identity, never raw URL query values or header values.
+        value = re.sub(r'(https?://[^\s?#]+)\?[^\s#]*(?:#[^\s]*)?', r'\1?<redacted>', value)
+        value = re.sub(r'(https?://[^\s#]+)#[^\s]*', r'\1#<redacted>', value)
+        if re.search(r'(?i)(authorization|cookie|x-api-key|x-auth-token|password|secret|access_token)\s*[:=]', value):
+            return "<redacted>"
         if len(value) > MANIFEST_MAX_STRING_CHARS:
             return f"<redacted: oversize {len(value)} chars>"
         if _SECRET_VALUE_RE.search(value):
@@ -661,7 +672,7 @@ def publish_plan_pointer(pointer: dict, settings: dict[str, Any],
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
     except Exception:  # noqa: BLE001 - the pointer publication never fails a scan
-        logger.exception("plan-manifest pointer publication failed; scan continues")
+        logger.warning("plan-manifest pointer publication failed; scan continues")
 
 
 def maybe_write_pre_dispatch_manifest(
@@ -674,7 +685,8 @@ def maybe_write_pre_dispatch_manifest(
         input_count: Optional[int] = None,
         task_summaries: Optional[list[dict]] = None,
         group_id: Optional[str] = None,
-        reason: Optional[str] = None) -> Optional[dict]:
+        reason: Optional[str] = None,
+        plan_details: Optional[dict] = None) -> Optional[dict]:
     """Write the run-scoped plan manifest before a vuln_scan dispatch.
 
     Only honoured when ``PLANNER_MANIFEST_ENABLED`` is true **and** the job
@@ -722,6 +734,11 @@ def maybe_write_pre_dispatch_manifest(
             reason=reason or "pre-dispatch vuln_scan plan",
             input_hashes=input_hashes, input_count=input_count,
         )
+        if plan_details:
+            allowed = {"plan_id", "disposition_counts", "input_count", "oversize",
+                       "task_count", "template_count", "consumers", "selection", "inventory"}
+            manifest.update(_redact({k: v for k, v in plan_details.items() if k in allowed}))
+        manifest = _redact(manifest)
         path = manifest_path(manifest_base, ctx["tenant"], ctx["project_id"],
                              ctx["run_id"], ctx["group_id"])
         written = write_manifest(path, manifest)
@@ -733,5 +750,5 @@ def maybe_write_pre_dispatch_manifest(
         # (maybe_write_pre_dispatch_manifest itself is kind-agnostic).
         return pointer
     except Exception:  # noqa: BLE001 - the manifest never fails a scan
-        logger.exception("planner manifest write failed; scan continues")
+        logger.warning("planner manifest write failed; scan continues")
         return None

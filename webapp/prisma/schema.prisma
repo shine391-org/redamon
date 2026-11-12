@@ -479,6 +479,15 @@ model Project {
   plannerConsumerTargetSelection Boolean  @default(false) @map("planner_consumer_target_selection")
   plannerConsumerTwoPass      Boolean  @default(false) @map("planner_consumer_two_pass")
 
+  nucleiRoutingMode          String   @default("off") @map("nuclei_routing_mode")
+  jsReconFetchAdmission      Boolean  @default(true) @map("js_recon_fetch_admission")
+  arjunLateSources           Boolean  @default(true) @map("arjun_late_sources")
+  chunkCheckpointEnabled     Boolean  @default(true) @map("chunk_checkpoint_enabled")
+  /// Group 6 Phase A tool/group chunks, not HTTP requests or pipeline-wide limits.
+  /// Zero is unbounded; stored settings are not changed by continuation.
+  checkpointBudgetPerGroup   Int      @default(0) @map("checkpoint_budget_per_group")
+  checkpointBudgetPerTool    Int      @default(0) @map("checkpoint_budget_per_tool")
+
   // ========== RECON PRESET ==========
   reconPresetId               String?  @map("recon_preset_id")
   /// { name, fingerprint } of the preset last loaded; the UI shows its badge while the saved settings still match the fingerprint

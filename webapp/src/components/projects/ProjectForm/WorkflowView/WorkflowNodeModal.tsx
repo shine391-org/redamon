@@ -4,7 +4,9 @@ import { useState, useCallback } from 'react'
 import type { Project } from '@prisma/client'
 import { Save, Loader2 } from 'lucide-react'
 import { Modal, WikiInfoButton } from '@/components/ui'
-import { WORKFLOW_TOOLS } from './workflowDefinition'
+import { WORKFLOW_TOOLS, WORKFLOW_SETTINGS } from './workflowDefinition'
+
+import { PlannerSection } from '../sections/PlannerSection'
 
 // Section component imports
 import { SubdomainDiscoverySection } from '../sections/SubdomainDiscoverySection'
@@ -94,13 +96,14 @@ export function WorkflowNodeModal({
 
   const isInput = toolId === 'input'
   const toolDef = isInput ? null : WORKFLOW_TOOLS.find(t => t.id === toolId)
-  const title = isInput ? 'Target & Modules' : (toolDef?.label ?? toolId)
+  const title = isInput ? 'Target & Modules' : (toolDef?.label ?? WORKFLOW_SETTINGS.find(s => s.id === toolId)?.label ?? toolId)
 
   function renderSection() {
     const baseProps = { data, updateField }
     const extendedProps = { ...baseProps, projectId, mode }
 
     switch (toolId) {
+      case 'Planner': return <PlannerSection {...baseProps} />
       case 'SubdomainDiscovery': return <SubdomainDiscoverySection {...baseProps} />
       case 'Urlscan':           return <UrlscanSection {...baseProps} />
       case 'Shodan':            return <ShodanSection {...baseProps} />

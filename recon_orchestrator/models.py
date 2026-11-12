@@ -82,6 +82,7 @@ class ReconState(BaseModel):
     # Coverage summary (F15): bounded per-module counts so the UI can show
     # planned/completed/deferred/failed/not_tested separately. Unknown is distinct
     # from zero; absent means the scan predates the feature or never recorded it.
+    run_id: Optional[str] = None
     coverage_summary: Optional[dict] = None
     # Run mode and reason for terminal states (completed_with_gaps, etc.)
     run_mode: Optional[str] = None

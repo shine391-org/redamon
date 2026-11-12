@@ -3,6 +3,7 @@ Docker container lifecycle management for recon processes
 """
 import asyncio
 import functools
+from recon_evidence import diagnostics, identifier
 import json
 import logging
 import threading
@@ -1079,7 +1080,25 @@ class ContainerManager:
 
         The Docker inspection runs off the event loop via _run_blocking so a slow
         Docker daemon can't stall the single worker and freeze every request."""
-        return await self._run_blocking(self._get_status_sync, project_id)
+        identifier(project_id)
+        state = await self._run_blocking(self._get_status_sync, project_id)
+        evidence = await self._run_blocking(
+            diagnostics, Path(self.recon_host_path) / "output", project_id,
+            getattr(state, "run_id", None), None,
+            state.status in (ReconStatus.RUNNING, ReconStatus.STARTING, ReconStatus.PAUSED, ReconStatus.STOPPING))
+        state.coverage_summary = evidence["coverage_summary"]
+        state.is_history = bool(evidence["is_history"] or state.status == ReconStatus.IDLE and evidence["run_id"])
+        state.run_mode = evidence.get("run_mode")
+        state.run_id = evidence["run_id"]
+        chunk = evidence.get("chunk_summary")
+        if chunk:
+            state.run_reason = ("group6_phase_a_with_gaps" if any(chunk.get(k) for k in
+                ("deferred", "failed", "partial", "not_tested", "running")) else "group6_phase_a_durable")
+        elif evidence["coverage_summary"]:
+            state.run_reason = "durable_module_coverage"
+        else:
+            state.run_reason = "coverage_unknown"
+        return state
 
     def _plan_manifest_pointers(self, project_id: str) -> list:
         """Read the run-scoped plan-manifest pointers for a project.
@@ -1197,6 +1216,8 @@ class ContainerManager:
         recon_path: str,
         custom_templates_path: str = "",
         scan_mode: Optional[str] = None,
+        continuation_run_id: Optional[str] = None,
+        project_revision: str = "",
     ) -> ReconState:
         """Start a recon container for a project.
 
@@ -1207,30 +1228,59 @@ class ContainerManager:
         only forwarded to the container as SCAN_MODE for logs/telemetry.
         """
 
+        identifier(project_id)
+        locks = getattr(self, "_recon_start_locks", None)
+        if locks is None:
+            locks = self._recon_start_locks = {}
+        lock = locks.setdefault(project_id, asyncio.Lock())
+        if lock.locked():
+            raise ValueError("project_start_busy")
+        async with lock:
+            return await self._start_recon_locked(project_id, user_id, webapp_api_url,
+                recon_path, custom_templates_path, scan_mode, continuation_run_id, project_revision)
+
+    async def _start_recon_locked(self, project_id, user_id, webapp_api_url,
+                                 recon_path, custom_templates_path, scan_mode,
+                                 continuation_run_id, project_revision):
         # Check if already running, paused or still draining a stop: the
         # force-remove below would otherwise cut a stopped run's drain short.
         current_state = await self.get_status(project_id)
-        if current_state.status in (ReconStatus.RUNNING, ReconStatus.PAUSED, ReconStatus.STOPPING):
+        if current_state.status in (ReconStatus.STARTING, ReconStatus.RUNNING, ReconStatus.PAUSED, ReconStatus.STOPPING):
             raise ValueError(f"Recon already active for project {project_id}")
 
         # Mutual exclusion: block if any partial recon is running
         if self._count_active_partial_recons(project_id) > 0:
             raise ValueError(f"Partial recon(s) running for project {project_id}. Stop them first.")
 
+        if continuation_run_id:
+            from recon_evidence import continuation_work
+            identifier(continuation_run_id)
+            continuation_work(Path(recon_path) / "output", project_id,
+                              continuation_run_id, user_id, project_revision)
         # Memory admission (Part 1): reserve this scan's RAM envelope or reject.
-        await self._admit_scan("full_recon", project_id, user_id=user_id)
+        previous = self.running_states.get(project_id)
+        self.running_states[project_id] = ReconState(project_id=project_id, status=ReconStatus.STARTING)
+        try:
+            await self._admit_scan("full_recon", project_id, user_id=user_id)
+        except BaseException:
+            if previous is None:
+                self.running_states.pop(project_id, None)
+            else:
+                self.running_states[project_id] = previous
+            raise
 
         # Lazy-on-scan OSV DB + incident-intel refresh for the L2 supply-chain
         # module (GROUP 5.5). Fired in the BACKGROUND so a >24h-old feed's delta
         # sync (~30s) does not hold the /start response open past the webapp's
         # orchestrator timeout. TTL-guarded and best-effort; the L2 module that
         # reads them runs late enough that a background refresh has long finished.
-        self._warm_feeds_in_background()
+        if not continuation_run_id:
+            self._warm_feeds_in_background()
 
         # Mint a run id for this full-recon scan. Full recon had no run id (unlike
         # partial/ai-attack); the HTTP traffic-capture layer tags every captured
         # transaction with it so the /traffic UI can group "this scan's traffic".
-        recon_run_id = str(uuid.uuid4())
+        recon_run_id = continuation_run_id or str(uuid.uuid4())
 
         # Clean up any existing container
         container_name = self._get_container_name(project_id)
@@ -1245,6 +1295,7 @@ class ContainerManager:
         state = ReconState(
             project_id=project_id,
             status=ReconStatus.STARTING,
+            run_id=recon_run_id,
             started_at=datetime.now(timezone.utc),
         )
         self.running_states[project_id] = state
@@ -1290,6 +1341,8 @@ class ContainerManager:
                     **_secret_hmac_env(),
                     **_governor_overrides(),
                     "RECON_RUN_ID": recon_run_id,
+                    "RECON_CONTINUE_RUN_ID": continuation_run_id or "",
+                    "RECON_PROJECT_REVISION": project_revision,
                     # Scan Timeline telemetry only (see start_recon docstring).
                     "SCAN_MODE": scan_mode or "",
                     "UPDATE_GRAPH_DB": "true",
@@ -2522,7 +2575,7 @@ class ContainerManager:
 
         # Mutual exclusion with full recon
         recon_state = await self.get_status(project_id)
-        if recon_state.status in (ReconStatus.RUNNING, ReconStatus.PAUSED, ReconStatus.STOPPING):
+        if recon_state.status in (ReconStatus.STARTING, ReconStatus.RUNNING, ReconStatus.PAUSED, ReconStatus.STOPPING):
             raise ValueError(f"Full recon is running for project {project_id}. Stop it first.")
 
         run_id = str(uuid.uuid4())

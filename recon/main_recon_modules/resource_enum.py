@@ -1797,36 +1797,55 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         # Collect URLs already targeted by early Arjun pass
         already_targeted = set(arjun_target_urls) if 'arjun_target_urls' in locals() else set()
         # Build allowed_hosts from target_domains (already normalized)
-        allowed_hosts = {arjun_url_host(u) for u in target_domains if arjun_url_host(u)}
+        from recon.helpers.openapi.scope import _normalize_scope_host
+        allowed_hosts = {_normalize_scope_host(host) for host in target_domains} - {''}
         # Plan late-source Arjun using remaining budget
         remaining_budget = ARJUN_MAX_ENDPOINTS - len(already_targeted)
         admitted_tasks, deferred_endpoints, late_summary = plan_arjun_late_sources(
             organized_data['by_base_url'],
             already_targeted,
             allowed_hosts=allowed_hosts,
-            remaining_budget=remaining_budget if remaining_budget > 0 else 0,
+            remaining_budget=remaining_budget if ARJUN_MAX_ENDPOINTS else None,
         )
+        # Late endpoint evidence cannot authorize methods the operator disabled.
+        # Group by exact method set: a POST endpoint must not cause POST on
+        # another GET-only URL through the former union-of-methods batch.
+        method_groups = {}
+        configured_methods = {m.upper() for m in ARJUN_METHODS}
+        retained_tasks = []
+        for task in admitted_tasks:
+            methods = tuple(m.upper() for m in task['methods'] if m.upper() in configured_methods)
+            if not methods:
+                deferred_endpoints.append({**task, 'reason': 'configured_method_excluded'})
+                continue
+            task['methods'] = list(methods)
+            retained_tasks.append(task)
+            method_groups.setdefault(methods, []).append(task['url'])
+        admitted_tasks = retained_tasks
+        arjun_late_unexecuted = [d['url'] for d in deferred_endpoints]
+        late_summary['admitted_count'] = len(admitted_tasks)
+        late_summary['deferred_count'] = len(deferred_endpoints)
+        late_summary['deferred_reasons'] = {}
+        for item in deferred_endpoints:
+            reason = item.get('reason', 'unknown')
+            late_summary['deferred_reasons'][reason] = late_summary['deferred_reasons'].get(reason, 0) + 1
         if admitted_tasks:
             late_target_urls = [t['url'] for t in admitted_tasks]
-            # Build methods per URL from admitted tasks
-            url_to_methods = {t['url']: t['methods'] for t in admitted_tasks}
-            # Run Arjun with per-URL methods (we'll run the union of methods for all late URLs)
-            late_methods = list(dict.fromkeys(m for t in admitted_tasks for m in t['methods']))
-            arjun_late_results, arjun_late_meta = run_arjun_discovery(
-                late_target_urls,
-                late_methods,
-                ARJUN_THREADS,
-                ARJUN_TIMEOUT,
-                ARJUN_SCAN_TIMEOUT,
-                ARJUN_CHUNK_SIZE,
-                ARJUN_RATE_LIMIT,
-                ARJUN_STABLE,
-                ARJUN_PASSIVE,
-                ARJUN_DISABLE_REDIRECTS,
-                ARJUN_CUSTOM_HEADERS,
-                target_domains,
-            )
-            arjun_late_unexecuted = [d['url'] for d in deferred_endpoints]
+            arjun_late_results = []
+            execution = []
+            for methods, urls in method_groups.items():
+                results, meta = run_arjun_discovery(
+                    urls, list(methods), ARJUN_THREADS, ARJUN_TIMEOUT,
+                    ARJUN_SCAN_TIMEOUT, ARJUN_CHUNK_SIZE, ARJUN_RATE_LIMIT,
+                    ARJUN_STABLE, ARJUN_PASSIVE, ARJUN_DISABLE_REDIRECTS,
+                    ARJUN_CUSTOM_HEADERS, target_domains,
+                )
+                arjun_late_results.extend(results)
+                execution.extend(meta.get('execution') or [])
+                if meta.get('status') not in (None, 'complete'):
+                    arjun_late_meta['status'] = 'partial'
+            arjun_late_meta['execution'] = execution
+            arjun_late_meta.setdefault('status', 'complete')
 
             if arjun_late_results:
                 print("[*][Arjun] Merging late-source discovered parameters...")
@@ -1997,6 +2016,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             'arjun_late_stats': arjun_late_stats,
             'arjun_execution': arjun_meta,
             'arjun_late_execution': arjun_late_meta,
+            'arjun_late_summary': late_summary,
             # General
             'proxy_used': False,
             'target_urls_count': len(target_urls),

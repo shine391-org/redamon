@@ -1226,6 +1226,7 @@ async def start_recon(project_id: str, request: ReconStartRequest):
             recon_path=RECON_PATH,
             custom_templates_path=CUSTOM_TEMPLATES_PATH,
             scan_mode=request.mode,
+            project_revision=__import__("recon_evidence").project_revision(project),
         )
     except ValueError as e:
         raise _value_error_http(e)
@@ -1243,6 +1244,79 @@ async def get_recon_status(project_id: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     return await container_manager.get_status(project_id)
+
+
+@app.get("/recon/{project_id}/diagnostics")
+async def get_recon_diagnostics(project_id: str, run_id: Optional[str] = None):
+    if not container_manager:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    from recon_evidence import diagnostics, identifier
+    try:
+        identifier(project_id)
+        if run_id is not None:
+            identifier(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_context") from None
+    state = await container_manager.get_status(project_id)
+    active = state.status in (ReconStatus.STARTING, ReconStatus.RUNNING,
+                              ReconStatus.PAUSED, ReconStatus.STOPPING)
+    result = await asyncio.to_thread(diagnostics, Path(RECON_PATH) / "output",
+                                     project_id, run_id or state.run_id, None, active)
+    continuation = (result.get("checkpoint") or {}).get("continuation", {})
+    if continuation.get("eligible"):
+        # Eligibility includes live scope/settings/authority compatibility; it
+        # is a hint, never authorization to dispatch. POST rechecks everything.
+        try:
+            project = _fetch_project_for_preflight(project_id)
+            _check_roe_time_window(project)
+            from recon_evidence import continuation_work, project_revision
+            continuation_work(Path(RECON_PATH) / "output", project_id, result["run_id"],
+                              project.get("userId"), project_revision(project))
+        except Exception:
+            continuation.update(eligible=False, reason="preflight_incompatible_or_unavailable")
+    return result
+
+
+@app.post("/recon/{project_id}/continue", response_model=ReconState)
+async def continue_recon(project_id: str, request: Request):
+    if not container_manager:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    from recon_evidence import identifier, continuation_work, project_revision
+    try:
+        body = await request.json()
+        identifier(project_id)
+        identifier(body.get("run_id"))
+        if set(body) != {"run_id", "confirm", "user_id"} or body["confirm"] is not True:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="explicit_confirmation_required") from None
+    project = _fetch_project_for_preflight(project_id)
+    if not project.get("userId") or body["user_id"] != project["userId"]:
+        raise HTTPException(status_code=403, detail="owner_mismatch")
+    if (project.get("activationState") not in (None, "idle")
+            and project.get("activationVersionId") != f"continue:{body['run_id']}"):
+        raise HTTPException(status_code=409, detail="graph_activation_busy")
+    if project.get("ipMode") or project.get("domainBatchMode"):
+        raise HTTPException(status_code=409, detail="unsupported_targeting_mode")
+    from hard_guardrail import first_hard_blocked
+    from batch_scope import guardrail_targets
+    targets = guardrail_targets(project)
+    if not targets or first_hard_blocked(targets):
+        raise HTTPException(status_code=403, detail="scope_refused")
+    _check_roe_time_window(project)
+    revision = project_revision(project)
+    try:
+        continuation_work(Path(RECON_PATH) / "output", project_id, body["run_id"],
+                          project["userId"], revision)
+        state = await container_manager.start_recon(
+            project_id=project_id, user_id=project["userId"],
+            webapp_api_url=_spawned_webapp_url(), recon_path=RECON_PATH,
+            custom_templates_path=CUSTOM_TEMPLATES_PATH,
+            continuation_run_id=body["run_id"], project_revision=revision)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="continuation_incompatible_or_busy") from None
+    _refuse_failed_spawn(state)
+    return state
 
 
 #: G2-R3: the container-side prefix of every plan manifest. A reader must never

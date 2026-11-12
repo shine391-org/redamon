@@ -14,6 +14,7 @@ import { ToolNode } from './ToolNode'
 import { DataNode } from './DataNode'
 import { InputNode } from './InputNode'
 import { CustomEdge } from './CustomEdge'
+import { WORKFLOW_SETTINGS } from './workflowDefinition'
 import { WorkflowNodeModal } from './WorkflowNodeModal'
 import { NodeListOverlay } from './NodeListOverlay'
 import { useDataNodeCounts } from './useToolNodeCounts'
@@ -259,6 +260,14 @@ export function WorkflowView({ formData, updateField, projectId, mode, onSave, o
           animation: dotFlow 0.6s linear infinite;
         }
       `}} />
+      <div style={{ position: 'absolute', top: 12, left: 12, zIndex: 20 }}>
+        {WORKFLOW_SETTINGS.map(setting => (
+          <button key={setting.id} type="button" className="button buttonSecondary"
+            onClick={() => setSelectedToolId(setting.id)} aria-label={`${setting.label} settings`}>
+            {setting.label} settings
+          </button>
+        ))}
+      </div>
       <ReactFlow
         nodes={nodes}
         edges={edges}

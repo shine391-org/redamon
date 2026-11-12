@@ -1,4 +1,5 @@
 /** @vitest-environment node */
+import { qualitySettings, invalidQualitySettings } from '@/lib/reconSettings/qualitySettings.testFixtures'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
@@ -18,15 +19,15 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.create.mockImplementation(async ({ data }) => ({ id: 'preset-1', ...data }))
 })
-const valid = { plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
+const valid = { ...qualitySettings, plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
   plannerConsumerTargetSelection: false, plannerConsumerTwoPass: false,
   cveLookupEnabled: false, mitreEnabled: false, securityCheckEnabled: false }
 const save = (settings: Record<string, unknown>) => POST(new NextRequest('http://x/api/presets', {
   method: 'POST', body: JSON.stringify({ name: 'fixture', settings }),
 }))
 test.each([
-  ['plannerMode', 'SHADOW'], ['plannerMode', null], ['plannerMode', 1],
-  ...Object.keys(valid).filter(k => k !== 'plannerMode').flatMap(key =>
+  ...invalidQualitySettings,  ['plannerMode', 'SHADOW'], ['plannerMode', null], ['plannerMode', 1],
+  ...Object.keys(valid).filter(k => k !== 'plannerMode' && !(k in qualitySettings)).flatMap(key =>
     ['false', 1, null].map(value => [key, value])),
   ['plannerUnknown', false], ['PLANNER_MODE', 'shadow'],
 ] as [string, unknown][])('preset refuses %s=%j before storage', async (key, value) => {

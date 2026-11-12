@@ -1,5 +1,7 @@
 'use client'
 
+import { PlannerSection } from './sections/PlannerSection'
+
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Save, X, Loader2, Download, ShieldAlert, Zap, Bookmark, FolderOpen, List, GitBranch, Play, Check } from 'lucide-react'
 import { useRouter } from 'next/navigation'
@@ -142,6 +144,7 @@ const TAB_GROUPS = [
     tabs: [
       { id: 'preset', label: 'Recon Preset' },
       { id: 'target', label: 'Target & Modules' },
+      { id: 'planner', label: 'Planner' },
       { id: 'discovery', label: 'Discovery & OSINT' },
       { id: 'port', label: 'Port Scanning' },
       { id: 'http', label: 'HTTP Probing' },
@@ -218,7 +221,7 @@ function PresetLoadWarning({ saves, documentKeys = [] }: { saves: boolean; docum
   )
 }
 
-const RECON_TAB_IDS = new Set<string>(['preset', 'target','discovery', 'port', 'http', 'resource', 'jsrecon', 'vuln', 'cve', 'security'])
+const RECON_TAB_IDS = new Set<string>(['preset', 'target', 'planner','discovery', 'port', 'http', 'resource', 'jsrecon', 'vuln', 'cve', 'security'])
 // All valid tab ids, for validating a `?tab=` deep-link.
 const ALL_TAB_IDS = new Set<string>(TAB_GROUPS.flatMap(g => g.tabs.map(t => t.id)))
 
@@ -1550,6 +1553,10 @@ export function ProjectForm({
             <SerializedScanSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('SerializedScan') : undefined} />
             <SupplyChainReconSection data={formData} updateField={updateField} onRun={mode === 'edit' && projectId ? () => setPartialReconToolId('SupplyChainRecon') : undefined} />
           </>
+        )}
+
+        {activeTab === 'planner' && viewMode === 'tabs' && (
+          <PlannerSection data={formData} updateField={updateField} />
         )}
 
         {activeTab === 'vuln' && viewMode === 'tabs' && (

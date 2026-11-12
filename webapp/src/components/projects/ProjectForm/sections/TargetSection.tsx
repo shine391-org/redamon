@@ -916,7 +916,7 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
                       engineField: 'nucleiTagsAiUseJev',
                       label: 'Nuclei: Use AI for Tag Selection',
                       summary: 'Prunes the tag list to the detected tech stack, once per scan.',
-                      description: 'Once per scan, Nuclei aggregates the detected tech stack from http_probe (Wappalyzer + Server headers) and asks the configured model to prune its include-tags list to ones matching the stack. Drops irrelevant tags like wordpress on Node sites, adds tech-specific ones like apache or wp-plugin when detected. The static Include Tags list in the Nuclei module is ignored when this is on. Same toggle as in the Nuclei module: flipping it here flips it there. Candidate tag pool is built from the live nuclei-templates volume (count >= 50, ~125 broad-category tags).',
+                      description: 'Nuclei asks the configured model to prune the saved Include Tags set using the detected tech stack. It can remove irrelevant tags but cannot add tags outside your saved set. The saved Include Tags list remains the policy boundary; exclusions still apply and an empty selection never expands to the full corpus. Same toggle as in the Nuclei module: flipping it here flips it there.',
                     },
                     {
                       field: 'wafAiClassifier',

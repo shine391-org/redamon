@@ -1,4 +1,5 @@
 /** @vitest-environment node */
+import { qualitySettings, invalidQualitySettings } from '@/lib/reconSettings/qualitySettings.testFixtures'
 import { describe, test, expect, beforeEach, vi } from 'vitest'
 
 const h = vi.hoisted(() => ({
@@ -49,13 +50,14 @@ beforeEach(() => {
 
 
 const invalids = [
+  ...invalidQualitySettings,
   ...['bogus', 'SHADOW', '', null, 1, false, [], {}].map(value => ['plannerMode', value]),
   ...['plannerManifestEnabled', 'plannerConsumerAiTags', 'plannerConsumerTargetSelection', 'plannerConsumerTwoPass',
       'cveLookupEnabled', 'mitreEnabled', 'securityCheckEnabled'].flatMap(key =>
         ['false', 'true', 0, 1, null, [], {}].map(value => [key, value])),
   ['plannerUnknown', false], ['PLANNER_MODE', 'shadow'],
 ] as [string, unknown][]
-const valid = { plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
+const valid = { ...qualitySettings, plannerMode: 'shadow', plannerManifestEnabled: false, plannerConsumerAiTags: false,
   plannerConsumerTargetSelection: false, plannerConsumerTwoPass: false,
   cveLookupEnabled: false, mitreEnabled: false, securityCheckEnabled: false }
 

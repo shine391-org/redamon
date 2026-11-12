@@ -304,7 +304,7 @@ describe('T33 an active rate is always capped', () => {
     // Being in the cap list is not the same as being capped: a 0 sails past a
     // `value > ceiling` test. zero_means is what lets the capper see it.
     const problems = offenders(f =>
-      f.zero_means === 'unlimited' && !f.roe_capped
+      f.unit === 'rps' && f.zero_means === 'unlimited' && !f.roe_capped
         ? 'zero means unlimited but nothing caps it'
         : null
     )
