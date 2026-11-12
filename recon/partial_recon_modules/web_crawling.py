@@ -34,6 +34,9 @@ from recon.helpers.auth_profile import merge_auth_headers
 from recon.helpers.auth_profile import profile_from_settings as _profile_of
 from recon.helpers import discovery_inventory as _di, discovery_adapters as _da
 
+# Planner controls shared with the ownership planner (F11).
+from recon.helpers.planner_manifest import resolve_mode, MODE_ENFORCE
+
 
 def run_katana(config: dict) -> None:
     """
@@ -929,6 +932,7 @@ def run_ffuf(config: dict) -> None:
         pull_ffuf_binary_check,
         merge_ffuf_into_by_base_url,
         select_base_paths,
+        origin_key,
     )
 
     roots = scope_roots(config)
@@ -1065,8 +1069,13 @@ def run_ffuf(config: dict) -> None:
         print("[!][Partial Recon] ffuf binary not found in PATH")
         sys.exit(1)
 
-    # Smart fuzz: query existing endpoints from graph for discovered base paths
+    # Smart fuzz: per-origin base paths from the graph (F11 ownership).
+    # A base path seen on another origin is a cross-origin hypothesis with a
+    # reason and a cost, not default workload. Query per origin so the planner
+    # applies only that origin's own prefixes to its targets; raw discoveries
+    # are kept in ``by_base_url`` either way.
     discovered_base_paths = None
+    by_base_url: dict[str, dict] = {}
     if FFUF_SMART_FUZZ and include_graph:
         try:
             from graph_db import Neo4jClient
@@ -1075,36 +1084,28 @@ def run_ffuf(config: dict) -> None:
                     with gc.driver.session() as session:
                         result = session.run(
                             """
-                            MATCH (e:Endpoint {user_id: $uid, project_id: $pid})
+                            MATCH (e:Endpoint {user_id: $uid, project_id: $pid})<-[r:HAS_ENDPOINT]-(b:BaseURL {user_id: $uid, project_id: $pid})
                             WHERE NOT """ + declared_only_unsafe("e") + """ AND NOT """ + quarantined("e") + """
-                            RETURN collect(DISTINCT e.path) AS paths
+                            RETURN b.url AS base_url, collect(DISTINCT e.path) AS paths
                             """,
                             uid=user_id, pid=project_id,
                         )
-                        record = result.single()
-                        if record:
+                        for record in result:
+                            base_url = record["base_url"]
                             paths = record["paths"] or []
-                            base_paths = set()
+                            eps: dict[str, dict] = {}
                             for path in paths:
-                                if not path:
-                                    continue
-                                parts = path.strip('/').split('/')
-                                if len(parts) >= 2:
-                                    base_paths.add('/'.join(parts[:2]))
-                                if len(parts) >= 1 and parts[0]:
-                                    base_paths.add(parts[0])
-                            if base_paths:
-                                from recon.helpers.ai_planner.ffuf_base_paths import ranker_for
-                                # No recon JSON in a partial run: the shadow records
-                                # stay in the capped log lines and the summary.
-                                discovered_base_paths = select_base_paths(
-                                    base_paths, FFUF_SMART_FUZZ_MAX_BASE_PATHS,
-                                    ranker=ranker_for(settings))
-                                print(f"[*][Partial Recon] Smart fuzz: targeting {len(discovered_base_paths)} discovered base paths")
+                                if isinstance(path, str) and path:
+                                    eps[path] = {}
+                            by_base_url[base_url] = {"endpoints": eps}
         except Exception as e:
             print(f"[!][Partial Recon] Smart fuzz query failed: {e}")
 
+    # Extensions: static global list by default; per-origin AI picks only under
+    # enforcement, so one target's pick is never replayed against another origin.
+    # Shadow keeps the legacy union and the legacy probes (no new traffic).
     effective_extensions = FFUF_EXTENSIONS
+    extensions_by_origin = None
     if FFUF_AI_EXTENSIONS:
         from recon.helpers.ai_planner.ffuf_extensions import get_ai_extensions
         ai_user_id = os.environ.get('USER_ID', '')
@@ -1123,6 +1124,48 @@ def run_ffuf(config: dict) -> None:
         effective_extensions = sorted({e for exts in ai_per_target.values() for e in exts})
         print(f"[*][Partial Recon][FFuf] AI selected {len(effective_extensions)} unique extensions: {effective_extensions}")
         print(f"[*][Partial Recon][FFuf] Static FFUF_EXTENSIONS list ({FFUF_EXTENSIONS}) is being ignored.")
+        if resolve_mode(settings) == MODE_ENFORCE:
+            extensions_by_origin = {}
+            for url, exts in ai_per_target.items():
+                bucket = extensions_by_origin.setdefault(origin_key(url), [])
+                for e in exts:
+                    if e not in bucket:
+                        bucket.append(e)
+
+    # Ownership plan: None when PLANNER_MODE is off (legacy runs exactly as
+    # before); shadow records + executes legacy; enforce executes it.
+    from recon.helpers.ai_planner.ffuf_base_paths import ranker_for
+    from recon.helpers.resource_enum import ffuf_ownership as _ff
+    ownership_plan = _ff.plan_ffuf_ownership(
+        target_urls=target_urls,
+        by_base_url=by_base_url or None,
+        settings=settings,
+        extensions=FFUF_EXTENSIONS,
+        extensions_by_origin=extensions_by_origin,
+        ranker=(ranker_for(settings) if FFUF_SMART_FUZZ else None),
+    )
+    if ownership_plan is None:
+        # PLANNER_MODE == off: the legacy global-union behaviour, preserved
+        # verbatim as the rollback path.
+        if FFUF_SMART_FUZZ and by_base_url:
+            base_paths = set()
+            for base_data in by_base_url.values():
+                for path in base_data.get("endpoints", {}).keys():
+                    parts = path.strip('/').split('/')
+                    if len(parts) >= 2:
+                        base_paths.add('/'.join(parts[:2]))
+                    if len(parts) >= 1 and parts[0]:
+                        base_paths.add(parts[0])
+            if base_paths:
+                from recon.helpers.ai_planner.ffuf_base_paths import ranker_for
+                discovered_base_paths = select_base_paths(
+                    base_paths, FFUF_SMART_FUZZ_MAX_BASE_PATHS,
+                    ranker=ranker_for(settings))
+                print(f"[*][Partial Recon] Smart fuzz: targeting {len(discovered_base_paths)} discovered base paths")
+    else:
+        print(f"[*][Partial Recon] Ownership plan mode={ownership_plan.mode} execute={ownership_plan.execute} origins={ownership_plan.counts['targets']} cap={ownership_plan.cap} scope={ownership_plan.cap_scope}")
+        for reason, count in sorted(ownership_plan.counts.items()):
+            print(f"[*][Partial Recon] {reason}: {count}")
 
     _auth_profile = _profile_of(settings)
     AUTH_REF = (f"auth_profile:{_auth_profile.get('id') or _auth_profile.get('name') or 'unnamed'}"
@@ -1150,6 +1193,9 @@ def run_ffuf(config: dict) -> None:
         target_domains,
         discovered_base_paths,
         FFUF_PARALLELISM,
+        # F11: ownership execution path, shadows nothing when disabled.
+        origin_plan=(ownership_plan.origin_base_paths() if (ownership_plan is not None and ownership_plan.execute) else None),
+        extensions_by_origin=(extensions_by_origin if ownership_plan is not None and ownership_plan.execute else None),
     )
     print(f"[+][Partial Recon] FFuf discovered {len(ffuf_results)} endpoints")
 

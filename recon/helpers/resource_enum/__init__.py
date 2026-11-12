@@ -92,6 +92,7 @@ from .ffuf_helpers import (
     pull_ffuf_binary_check,
     merge_ffuf_into_by_base_url,
     select_base_paths,
+    origin_key,
 )
 
 # Arjun helpers

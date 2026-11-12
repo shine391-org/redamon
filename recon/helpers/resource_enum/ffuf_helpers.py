@@ -187,6 +187,8 @@ def run_ffuf_discovery(
     allowed_hosts: set,
     discovered_base_paths: Optional[List[str]] = None,
     parallelism: int = 3,
+    origin_plan: Optional[Dict[str, List[str]]] = None,
+    extensions_by_origin: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[List[Dict], Dict]:
     """
     Run FFuf directory fuzzer against target URLs.
@@ -236,7 +238,16 @@ def run_ffuf_discovery(
     all_results = []
     external_domain_entries = []
 
-    fuzz_targets = _build_fuzz_targets(target_urls, discovered_base_paths)
+    # F11: ``origin_plan`` is the ownership planner's per-origin base-path map.
+    # When it is present the executor never applies one origin's base path to
+    # another origin's target; when it is absent the legacy global set is used
+    # (the ``off``/``shadow`` execution path, kept for rollback).
+    if origin_plan is not None:
+        fuzz_targets = _build_origin_fuzz_targets(target_urls, origin_plan)
+        plan_kind = "origin_ownership"
+    else:
+        fuzz_targets = _build_fuzz_targets(target_urls, discovered_base_paths)
+        plan_kind = "legacy_global"
     print(f"[*][FFuf] Fuzz targets (root + base paths): {len(fuzz_targets)}")
 
     # Skip a fuzz target whose host another module already found unreachable:
@@ -259,11 +270,18 @@ def run_ffuf_discovery(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for idx, fuzz_url in enumerate(fuzz_targets):
+                # F11: extensions are per origin, so an AI pick made for one
+                # target is never replayed against a different origin. A target
+                # whose origin has no entry keeps the caller's global list.
+                target_extensions = extensions
+                if extensions_by_origin:
+                    target_extensions = list(
+                        extensions_by_origin.get(origin_key(fuzz_url), extensions))
                 future = executor.submit(
                     _fuzz_single_target,
                     idx, fuzz_url, output_dir, wordlist, effective_threads,
                     timeout, max_time, rate, match_codes, filter_codes,
-                    filter_size, extensions, recursion, recursion_depth,
+                    filter_size, target_extensions, recursion, recursion_depth,
                     auto_calibrate, custom_headers, follow_redirects,
                     allowed_hosts
                 )
@@ -290,6 +308,9 @@ def run_ffuf_discovery(
     # AFTER this temp directory is gone rather than reconstructing it.
     return unique_results, {
         "external_domains": external_domain_entries,
+        "plan_kind": plan_kind,
+        "origin_plan_origins": len(origin_plan) if origin_plan else 0,
+        "extensions_by_origin": len(extensions_by_origin) if extensions_by_origin else 0,
         "fuzz_targets_built": fuzz_targets_built,
         "fuzz_targets_skipped_unreachable": fuzz_targets_skipped,
         "fuzz_targets_run": len(fuzz_targets),
@@ -297,6 +318,54 @@ def run_ffuf_discovery(
         "results_unique": len(unique_results),
         "temp_output_removed": True,
     }
+
+
+def origin_key(url: str) -> str:
+    """`scheme://netloc` with userinfo stripped; the port is kept.
+
+    Non-default ports are different origins (``https://a.test:8443`` is not
+    ``https://a.test``), and userinfo is dropped so a credential never becomes
+    part of a plan key or a manifest. Empty when the URL is not http(s).
+    """
+    try:
+        parts = urlsplit(url)
+    except (ValueError, TypeError):
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return ""
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
+
+
+def base_paths_of(path: str) -> set:
+    """First one and two segments of an endpoint path, encoding preserved.
+
+    The same rule the caller always used (a one-segment and a two-segment
+    prefix), kept here so the planner and the executor cannot drift. ``%2f``
+    stays ``%2f``: a decoded slash would invent a directory the target never
+    showed.
+    """
+    parts = (path or "").strip("/").split("/")
+    out = set()
+    if len(parts) >= 2:
+        out.add("/".join(parts[:2]))
+    if parts and parts[0]:
+        out.add(parts[0])
+    return out
+
+
+def directory_target(base_url: str, prefix: str = "") -> str:
+    """Insert the directory placeholder before any query, preserving the rest.
+
+    Split path/query before inserting ``FUZZ`` so a query context is kept (P0
+    contract), path case/escapes and matrix parameters survive, and a fragment
+    (client-only, never part of an HTTP request target) is dropped.
+    """
+    parsed = urlsplit(base_url)
+    path = parsed.path.rstrip("/")
+    if prefix:
+        path += "/" + prefix
+    return urlunsplit(parsed._replace(path=path + "/FUZZ", fragment=""))
 
 
 def _build_fuzz_targets(
@@ -309,19 +378,14 @@ def _build_fuzz_targets(
     For each target URL, creates:
     - Root fuzz: https://target.com/FUZZ
     - Base path fuzz: https://target.com/api/v1/FUZZ (from crawlers)
+
+    LEGACY (F11): ``discovered_base_paths`` is one global set, so every base
+    path is applied to every target -- a cross-product. Kept verbatim as the
+    ``off``/``shadow`` execution path; the ownership planner builds the
+    per-origin map and calls ``_build_origin_fuzz_targets`` instead.
     """
     fuzz_targets = []
     target_urls = admit_http_urls(target_urls, "ffuf_seed")
-
-    def directory_target(base_url, prefix=""):
-        # Split path/query before inserting the directory placeholder. Preserve
-        # query context (P0 contract), path case/escapes and matrix parameters;
-        # a fragment is client-only, never part of an HTTP request target.
-        parsed = urlsplit(base_url)
-        path = parsed.path.rstrip('/')
-        if prefix:
-            path += '/' + prefix
-        return urlunsplit(parsed._replace(path=path + '/FUZZ', fragment=""))
 
     for base_url in target_urls:
         fuzz_targets.append(directory_target(base_url))
@@ -339,6 +403,37 @@ def _build_fuzz_targets(
                     fuzz_targets.append(target)
 
     # Deduplicate identical generated tasks, never different query contexts.
+    return list(dict.fromkeys(fuzz_targets))
+
+
+def _build_origin_fuzz_targets(
+    target_urls: List[str],
+    base_paths_by_origin: Dict[str, List[str]],
+) -> List[str]:
+    """Build fuzz targets from a PER-ORIGIN base-path map (F11 ownership).
+
+    Every target keeps its own root task; the base paths applied to it are the
+    ones its OWN origin showed in the inventory. A base path observed on a
+    different origin is never applied here -- that is the cross-origin
+    hypothesis lane, which the planner records and only an explicit opt-in
+    executes. Identical generated tasks are deduplicated; different query
+    contexts are not.
+    """
+    fuzz_targets: List[str] = []
+    target_urls = admit_http_urls(target_urls, "ffuf_seed")
+
+    for base_url in target_urls:
+        fuzz_targets.append(directory_target(base_url))
+        for path in base_paths_by_origin.get(origin_key(base_url), []):
+            if not isinstance(path, str) or '?' in path or '#' in path:
+                continue
+            path = path.strip('/')
+            if not path:
+                continue
+            target = directory_target(base_url, path)
+            if http_url_rejection(target) is None:
+                fuzz_targets.append(target)
+
     return list(dict.fromkeys(fuzz_targets))
 
 

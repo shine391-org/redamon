@@ -53,6 +53,9 @@ from recon.helpers import (
     build_target_urls,
 )
 
+# Planner controls shared with the ownership planner (F11).
+from recon.helpers.planner_manifest import resolve_mode, MODE_ENFORCE
+
 # Import from resource_enum helpers
 from recon.helpers.resource_enum import (
     # GAU helpers
@@ -87,6 +90,7 @@ from recon.helpers.resource_enum import (
     pull_ffuf_binary_check,
     merge_ffuf_into_by_base_url,
     select_base_paths,
+    origin_key,
     # ZAP Ajax Spider helpers
     pull_zap_ajax_docker_image,
     run_zap_ajax_spider,
@@ -1278,7 +1282,10 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             auth_revision=AUTH_REVISION,
             existing_keys=_merged_keys(), merged_keys=_merged_keys())
 
-    # FFuf directory fuzzing (runs after crawlers and jsluice, before GAU merge)
+    # FFuf directory fuzzing (runs after crawlers and jsluice, before GAU merge).
+    # F11: per-origin ownership planning. Base paths are applied under the
+    # origin that showed them; anything seen elsewhere is a cross-origin
+    # hypothesis with a reason and a cost, not default workload.
     ffuf_stats = {
         "ffuf_total": 0,
         "ffuf_new": 0,
@@ -1287,24 +1294,11 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     if FFUF_ENABLED:
         if pull_ffuf_binary_check():
-            discovered_base_paths = None
-            if FFUF_SMART_FUZZ:
-                base_paths = set()
-                for base_url, base_data in organized_data['by_base_url'].items():
-                    for path in base_data.get('endpoints', {}).keys():
-                        parts = path.strip('/').split('/')
-                        if len(parts) >= 2:
-                            base_paths.add('/'.join(parts[:2]))
-                        if len(parts) >= 1 and parts[0]:
-                            base_paths.add(parts[0])
-                if base_paths:
-                    from recon.helpers.ai_planner.ffuf_base_paths import ranker_for
-                    discovered_base_paths = select_base_paths(
-                        base_paths, FFUF_SMART_FUZZ_MAX_BASE_PATHS,
-                        ranker=ranker_for(settings, recon_data))
-                    print(f"[*][FFuf] Smart fuzz: targeting {len(discovered_base_paths)} discovered base paths")
-
+            # Extensions: static global list by default; per-origin AI picks only
+            # under enforcement, so one target's pick is never replayed against
+            # another origin. Shadow keeps the legacy union and the legacy probes.
             effective_extensions = FFUF_EXTENSIONS
+            extensions_by_origin = None
             if FFUF_AI_EXTENSIONS:
                 from recon.helpers.ai_planner.ffuf_extensions import get_ai_extensions
                 user_id = os.environ.get('USER_ID', '')
@@ -1320,10 +1314,53 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                         engine=('jev' if FFUF_AI_USE_JEV else 'llm'),
                         settings=settings,
                     )
-                # Union of per-target extensions (single ffuf job uses one -e list).
                 effective_extensions = sorted({e for exts in ai_per_target.values() for e in exts})
                 print(f"[*][FFuf] AI selected {len(effective_extensions)} unique extensions across all targets: {effective_extensions}")
                 print(f"[*][FFuf] Static FFUF_EXTENSIONS list ({FFUF_EXTENSIONS}) is being ignored.")
+                if resolve_mode(settings) == MODE_ENFORCE:
+                    extensions_by_origin = {}
+                    for url, exts in ai_per_target.items():
+                        bucket = extensions_by_origin.setdefault(origin_key(url), [])
+                        for e in exts:
+                            if e not in bucket:
+                                bucket.append(e)
+
+            # Ownership plan: None when PLANNER_MODE is off (legacy runs exactly
+            # as before); shadow records + executes legacy; enforce executes it.
+            discovered_base_paths = None
+            from recon.helpers.ai_planner.ffuf_base_paths import ranker_for
+            from recon.helpers.resource_enum import ffuf_ownership as _ff
+            ownership_plan = _ff.plan_ffuf_ownership(
+                target_urls=target_urls,
+                by_base_url=organized_data['by_base_url'],
+                settings=settings,
+                extensions=FFUF_EXTENSIONS,
+                extensions_by_origin=extensions_by_origin,
+                ranker=(ranker_for(settings, recon_data) if FFUF_SMART_FUZZ else None),
+            )
+            if ownership_plan is None:
+                # PLANNER_MODE == off: the legacy global-union behaviour,
+                # preserved verbatim as the rollback path.
+                if FFUF_SMART_FUZZ:
+                    base_paths = set()
+                    for base_url, base_data in organized_data['by_base_url'].items():
+                        for path in base_data.get('endpoints', {}).keys():
+                            parts = path.strip('/').split('/')
+                            if len(parts) >= 2:
+                                base_paths.add('/'.join(parts[:2]))
+                            if len(parts) >= 1 and parts[0]:
+                                base_paths.add(parts[0])
+                    if base_paths:
+                        from recon.helpers.ai_planner.ffuf_base_paths import ranker_for
+                        discovered_base_paths = select_base_paths(
+                            base_paths, FFUF_SMART_FUZZ_MAX_BASE_PATHS,
+                            ranker=ranker_for(settings, recon_data))
+                        print(f"[*][FFuf] Smart fuzz: targeting {len(discovered_base_paths)} discovered base paths")
+            else:
+                print(f"[*][FFuf] Ownership plan mode={ownership_plan.mode} execute={ownership_plan.execute} origins={ownership_plan.counts['targets']} cap={ownership_plan.cap} scope={ownership_plan.cap_scope} seed={ownership_plan.seed}")
+                for reason, count in sorted(ownership_plan.counts.items()):
+                    print(f"[*][FFuf] {reason}: {count}")
+                print(f"[*][FFuf] Cross-origin hypotheses recorded: {sum(len(v) for v in ownership_plan.cross_origin.values())}")
 
             ffuf_results, ffuf_meta = run_ffuf_discovery(
                 target_urls,
@@ -1344,6 +1381,9 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 target_domains,
                 discovered_base_paths,
                 FFUF_PARALLELISM,
+                # F11: ownership execution path, shadows nothing when disabled.
+                origin_plan=(ownership_plan.origin_base_paths() if (ownership_plan is not None and ownership_plan.execute) else None),
+                extensions_by_origin=(extensions_by_origin if ownership_plan is not None and ownership_plan.execute else None),
             )
 
             if ffuf_results:
@@ -1368,6 +1408,9 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                     "results": len(ffuf_results),
                     "results_raw": ffuf_meta.get("results_raw"),
                     "external_domains": len(ffuf_meta.get("external_domains") or []),
+                    "plan_kind": ffuf_meta.get("plan_kind"),
+                    "origin_plan_origins": ffuf_meta.get("origin_plan_origins"),
+                    "extensions_by_origin": ffuf_meta.get("extensions_by_origin"),
                     "smart_fuzz_base_paths": len(discovered_base_paths or []),
                     "extensions": len(effective_extensions or []),
                     "wordlist": FFUF_WORDLIST if FFUF_ENABLED else None,
