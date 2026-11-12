@@ -1388,34 +1388,38 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                         f.write(url + "\n")
                 legacy_output_file = str(nuclei_temp_dir / "nuclei_legacy.jsonl")
                 legacy_container_name = f"redamon-nuclei-legacy-{uuid.uuid4().hex[:8]}"
-                legacy_cmd = build_nuclei_command(
-                    targets_file=legacy_targets_file,
-                    output_file=legacy_output_file,
-                    docker_image=NUCLEI_DOCKER_IMAGE,
-                    severity=NUCLEI_SEVERITY,
-                    templates=NUCLEI_TEMPLATES if NUCLEI_TEMPLATES else None,
-                    exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
-                    custom_templates=NUCLEI_CUSTOM_TEMPLATES,
-                    selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
-                    tags=NUCLEI_TAGS if NUCLEI_TAGS else None,
-                    exclude_tags=NUCLEI_EXCLUDE_TAGS,
-                    rate_limit=NUCLEI_RATE_LIMIT,
-                    bulk_size=NUCLEI_BULK_SIZE,
-                    concurrency=NUCLEI_CONCURRENCY,
-                    timeout=NUCLEI_TIMEOUT,
-                    retries=NUCLEI_RETRIES,
-                    dast_mode=False,
-                    new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
-                    headless=NUCLEI_HEADLESS,
-                    system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
-                    follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
-                    max_redirects=NUCLEI_MAX_REDIRECTS,
-                    interactsh=NUCLEI_INTERACTSH,
-                    auth_headers=_nuclei_auth,
-                    container_name=legacy_container_name,
-                    max_host_error=NUCLEI_MAX_HOST_ERROR,
-                )
+                # The build sits inside the try, like the routed branch below:
+                # the builder's fail-closed refusal (empty selection) is a
+                # policy_empty outcome, not an exception that skips the CVE
+                # lookup and security checks.
                 try:
+                    legacy_cmd = build_nuclei_command(
+                        targets_file=legacy_targets_file,
+                        output_file=legacy_output_file,
+                        docker_image=NUCLEI_DOCKER_IMAGE,
+                        severity=NUCLEI_SEVERITY,
+                        templates=NUCLEI_TEMPLATES if NUCLEI_TEMPLATES else None,
+                        exclude_templates=NUCLEI_EXCLUDE_TEMPLATES,
+                        custom_templates=NUCLEI_CUSTOM_TEMPLATES,
+                        selected_custom_templates=NUCLEI_SELECTED_CUSTOM_TEMPLATES,
+                        tags=NUCLEI_TAGS if NUCLEI_TAGS else None,
+                        exclude_tags=NUCLEI_EXCLUDE_TAGS,
+                        rate_limit=NUCLEI_RATE_LIMIT,
+                        bulk_size=NUCLEI_BULK_SIZE,
+                        concurrency=NUCLEI_CONCURRENCY,
+                        timeout=NUCLEI_TIMEOUT,
+                        retries=NUCLEI_RETRIES,
+                        dast_mode=False,
+                        new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
+                        headless=NUCLEI_HEADLESS,
+                        system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
+                        follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
+                        max_redirects=NUCLEI_MAX_REDIRECTS,
+                        interactsh=NUCLEI_INTERACTSH,
+                        auth_headers=_nuclei_auth,
+                        container_name=legacy_container_name,
+                        max_host_error=NUCLEI_MAX_HOST_ERROR,
+                    )
                     d_findings, d_fps, d_duration, d_rc = _execute_nuclei_pass(
                         legacy_cmd, legacy_output_file, label="DETECTION",
                         runtime_cap=NUCLEI_MAX_RUNTIME, container_name=legacy_container_name,

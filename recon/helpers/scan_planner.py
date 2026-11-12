@@ -192,31 +192,34 @@ _TEMPLATE_REGISTRY: Optional[TemplateClassificationRegistry] = None
 
 def _template_known(template: str) -> Optional[str]:
     """Return the provenance rule for a known template, or None when unknown.
-    
-    Uses the new TemplateClassificationRegistry for classification.
-    Falls back to TEMPLATE_RULES for backward compatibility.
+
+    TEMPLATE_RULES wins: the planner's provenance contract is the
+    ``rule:template-known-*`` set, and a registry ``rule:<category>`` string
+    would just duplicate the ``category:<value>`` segment the task provenance
+    already carries. The registry classifies what TEMPLATE_RULES does not
+    cover: the rest of the official template tree, plus bare NUCLEI_TAGS.
     """
     if not isinstance(template, str) or not template:
         return None
-    
+
+    for prefix, provenance in TEMPLATE_RULES:
+        if template.startswith(prefix):
+            return provenance
+
     registry = _get_template_registry()
-    
-    # Try registry classification first (handles full template paths like 'cve/2024/...')
+
+    # Full template paths (like 'ssl/...') outside the TEMPLATE_RULES prefixes
     classified = registry.classify(template)
     if classified.is_known():
         return classified.provenance
-    
+
     # For bare tag names (no '/'), try tag-based classification
     # NUCLEI_TAGS are tag names like 'cve', 'xss', 'ssl', not template paths
     if "/" not in template:
         tag_category = registry._classify_by_tags((template,))
         if tag_category != TemplateCategory.UNKNOWN:
             return f"rule:tag-known-{tag_category.value}"
-    
-    # Fallback to legacy TEMPLATE_RULES
-    for prefix, provenance in TEMPLATE_RULES:
-        if template.startswith(prefix):
-            return provenance
+
     return None
 
 
