@@ -143,7 +143,7 @@ function DiagnosticsPanel({ projectId, historicalView, onClose }: { projectId: s
         return
       }
       const res = await fetch(`/api/recon/${encodeURIComponent(projectId)}/continue`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: run }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ run_id: run, confirm: true }),
       })
       if (!res.ok) throw await readApiError(res, 'Continuation refused')
       const response = object(await res.json())

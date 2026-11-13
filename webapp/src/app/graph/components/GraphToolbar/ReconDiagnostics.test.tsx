@@ -71,7 +71,7 @@ test('continuation requires click then confirmation, supports cancel and reports
   fireEvent.click(screen.getByRole('button', { name: 'Confirm continuation' }))
   await screen.findByText(/revision_conflict.*HTTP 409/)
   expect(posts()).toHaveLength(1)
-  expect(JSON.parse(String(posts()[0][1]?.body))).toEqual({ run_id: 'fixture-run' })
+  expect(JSON.parse(String(posts()[0][1]?.body))).toEqual({ run_id: 'fixture-run', confirm: true })
   expect(continueButton()).toBeDisabled()
 })
 
