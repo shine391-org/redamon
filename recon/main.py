@@ -959,8 +959,11 @@ def save_recon_file(data: dict, output_file: Path):
             from recon.helpers.chunk_continuation import seal_group
             descriptor = OUTPUT_DIR / descriptor_name(PROJECT_ID, _checkpoint_revision.run_id)
             if descriptor.exists():
-                seal_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
-                           _checkpoint_group, output_file)
+                try:
+                    seal_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
+                               _checkpoint_group, output_file)
+                except Exception as e:
+                    print(f"[!][Checkpoint] warning: seal_group failed: {type(e).__name__}: {e}")
     _shutdown.park()
 
 
@@ -1334,7 +1337,7 @@ def _merge_isolated_result(combined: dict, key: str, result) -> None:
 
 
 def _checkpoint_prepare_phase_a(tools, result, settings, output_file, group_id):
-    if _checkpoint_journal is None:
+    if _checkpoint_journal is None or _checkpoint_revision is None:
         return
     from recon.helpers.chunk_continuation import register_group
     from recon.helpers.chunk_evidence import EvidenceError, descriptor_name
@@ -1352,9 +1355,12 @@ def _checkpoint_prepare_phase_a(tools, result, settings, output_file, group_id):
         descriptor = OUTPUT_DIR / descriptor_name(PROJECT_ID, _checkpoint_revision.run_id)
         if descriptor.exists():
             descriptor.unlink()
-        register_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
-                       _checkpoint_revision.tenant, _checkpoint_revision.to_dict(),
-                       group_id, output_file, tools, settings)
+        try:
+            register_group(OUTPUT_DIR, PROJECT_ID, _checkpoint_revision.run_id,
+                           _checkpoint_revision.tenant, _checkpoint_revision.to_dict(),
+                           group_id, output_file, tools, settings)
+        except EvidenceError as e:
+            print(f"[!][Checkpoint] warning: register_group retry failed: {e}")
 
 
 def _continuation_tools(names, output_file):

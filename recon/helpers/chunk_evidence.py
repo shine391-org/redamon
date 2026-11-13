@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
 TOOLS = frozenset({"vuln_scan", "graphql_scan", "subdomain_takeover", "vhost_sni",
                    "cache_scan", "origin_discovery", "route_exposure"})
 STATUSES = frozenset({"pending", "running", "completed", "partial", "deferred", "failed"})
-MAX_FILE = 32 * 1024 * 1024
+MAX_FILE = int(os.environ.get("RECON_CHUNK_MAX_FILE", 1024 * 1024 * 1024))
 MAX_GROUPS = 1000
 
 
@@ -50,7 +51,10 @@ def safe_file(base, name):
     return path
 
 
-def read_json(path, maximum=MAX_FILE):
+def read_json(path, maximum=None):
+    path = Path(path)
+    if maximum is None:
+        maximum = MAX_FILE
     if path.is_symlink() or path.stat().st_size > maximum:
         raise EvidenceError("artifact_unreadable")
     with path.open("rb") as handle:
