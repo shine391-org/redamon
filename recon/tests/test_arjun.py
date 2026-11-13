@@ -815,6 +815,7 @@ def test_settings_defaults_match_prisma_defaults():
         'ARJUN_ENABLED', 'ARJUN_THREADS', 'ARJUN_TIMEOUT', 'ARJUN_SCAN_TIMEOUT',
         'ARJUN_METHODS', 'ARJUN_MAX_ENDPOINTS', 'ARJUN_CHUNK_SIZE', 'ARJUN_RATE_LIMIT',
         'ARJUN_STABLE', 'ARJUN_PASSIVE', 'ARJUN_DISABLE_REDIRECTS', 'ARJUN_CUSTOM_HEADERS',
+        'ARJUN_LATE_SOURCES',
     }
     assert arjun_keys == expected, f"Missing or extra keys: {arjun_keys ^ expected}"
 

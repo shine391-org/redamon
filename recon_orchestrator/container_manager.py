@@ -1083,7 +1083,7 @@ class ContainerManager:
         identifier(project_id)
         state = await self._run_blocking(self._get_status_sync, project_id)
         evidence = await self._run_blocking(
-            diagnostics, Path(self.recon_host_path) / "output", project_id,
+            diagnostics, Path(getattr(self, "recon_host_path", "")) / "output", project_id,
             getattr(state, "run_id", None), None,
             state.status in (ReconStatus.RUNNING, ReconStatus.STARTING, ReconStatus.PAUSED, ReconStatus.STOPPING))
         state.coverage_summary = evidence["coverage_summary"]

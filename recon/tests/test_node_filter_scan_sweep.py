@@ -71,9 +71,11 @@ class TestTheSweepSitsInAFinally:
     def test_full_recon(self):
         main = _function(_source('recon/main.py'), 'main')
         assert '_shutdown.set_sweep(_apply_node_filters)' in main, main
-        assert re.search(r'try:\s+return _run_pipeline\(\)\s+finally:\s+'
+        # The pipeline (and its continuation branch) sit in the try; the sweep
+        # sits in the finally. The execution lock wrapper between them is fine.
+        assert re.search(r'try:\s+.*?_run_pipeline\(\).*?finally:\s+'
                          r'if not _shutdown\.stop_requested\(\):\s+'
-                         r'_graph_wait_all\(\)\s+_shutdown\.sweep_once\(\)', main), main
+                         r'_graph_wait_all\(\)\s+_shutdown\.sweep_once\(\)', main, re.S), main
 
     def test_full_recon_sweeps_once_per_run_not_per_group(self):
         src = _source('recon/main.py')

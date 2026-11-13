@@ -126,7 +126,9 @@ def test_every_zero_unlimited_rate_is_also_capped():
     3 rps project while looking covered.
     """
     capped = set(reg.roe_capped_runtime_keys())
-    uncapped = sorted(k for k in reg.unlimited_zero_runtime_keys() if k not in capped)
+    uncapped = sorted(k for k in reg.unlimited_zero_runtime_keys()
+                      if k not in capped
+                      and (reg.by_runtime_key().get(k) or reg.runtime_only().get(k) or {}).get("unit") == "rps")
     assert uncapped == [], f"these rates mean unlimited at 0 and nothing caps them: {uncapped}"
 
 

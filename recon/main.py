@@ -204,6 +204,15 @@ def _start_checkpoint(settings: dict, project_id: str, run_id: str,
         if os.environ.get("RECON_CONTINUE_RUN_ID"):
             raise JournalError("checkpoint_disabled")
         return "disabled"
+    # A run id is the checkpoint's identity. Without one there is no safe
+    # journal to open: never invent or reuse one. A continuation cannot proceed
+    # (its whole point is the same run), a fresh run simply runs without a
+    # checkpoint rather than failing or colliding with another run's state.
+    if not run_id:
+        if os.environ.get("RECON_CONTINUE_RUN_ID"):
+            raise JournalError("run_context_unavailable")
+        print("[checkpoint] no run id in context; checkpoint disabled for this run")
+        return "disabled"
     from recon.helpers.chunk_evidence import identifier
     identifier(project_id)
     identifier(run_id)

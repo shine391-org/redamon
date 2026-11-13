@@ -79,6 +79,12 @@ def test_a_zero_that_means_unlimited_becomes_the_ceiling(key):
     """
     if key not in DEFAULT_SETTINGS:
         pytest.skip(f"{key} is not a runtime setting in this build")
+    # The engagement ceiling is a request-rate ceiling. A non-rate sentinel
+    # (e.g. a chunk budget, where 0 means "no chunk cap") is not a request
+    # rate and must not be rewritten to the rps ceiling.
+    spec = reg.by_runtime_key().get(key) or reg.runtime_only().get(key) or {}
+    if spec.get("unit") != "rps":
+        pytest.skip(f"{key} is not a request rate; the rps ceiling does not apply")
     assert apply_roe_rate_cap(_with_roe(**{key: 0}))[key] == CEILING
 
 
