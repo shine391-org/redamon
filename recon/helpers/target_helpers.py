@@ -63,7 +63,15 @@ def admit_http_urls(urls, source: str, report: Optional[dict] = None) -> List[st
         else:
             kept.append(url)
     if report is not None:
-        report[source] = {"admitted": len(kept), "rejected": rejected}
+        prior = report.get(source)
+        merged = dict(prior) if isinstance(prior, dict) else {"admitted": 0, "rejected": {}}
+        merged["admitted"] = int(merged.get("admitted") or 0) + len(kept)
+        prior_rejected = merged.get("rejected")
+        merged_rejected = dict(prior_rejected) if isinstance(prior_rejected, dict) else {}
+        for reason, count in rejected.items():
+            merged_rejected[reason] = merged_rejected.get(reason, 0) + count
+        merged["rejected"] = merged_rejected
+        report[source] = merged
     elif rejected:
         print(f"[*][HTTP admission] {source}: {rejected}")
     return kept
@@ -105,7 +113,7 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
     hostnames = set()
     ip_to_hostnames = {}
 
-    dns_data = recon_data.get("dns", {})
+    dns_data = (recon_data or {}).get("dns", {})
     if not dns_data:
         return ips, hostnames, ip_to_hostnames
 
@@ -117,24 +125,25 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
     # Extract from root domain
     domain = recon_data.get("domain", "") or metadata.get("target", "")
     domain_dns = dns_data.get("domain", {})
-    if domain_dns and include_root_domain:
-        # The apex's IPs only with the apex: an address it resolves to is not a
-        # target when the operator left the root out.
+    if domain_dns:
+        # Record the apex mapping even when the root host itself is out of
+        # scope. The address list is still a discovered asset, and an IP-only
+        # consumer needs the host attribution to decide whether a measured
+        # response belongs to the engagement or to a shared edge address.
         domain_ips = domain_dns.get("ips", {})
         ipv4_list = domain_ips.get("ipv4", [])
         ipv6_list = domain_ips.get("ipv6", [])
-
-        ips.update(ipv4_list)
-        ips.update(ipv6_list)
-
-        if domain and include_root_domain:
-            hostnames.add(domain)
+        if domain:
             for ip in ipv4_list + ipv6_list:
                 if ip:
-                    if ip not in ip_to_hostnames:
-                        ip_to_hostnames[ip] = []
+                    ip_to_hostnames.setdefault(ip, [])
                     if domain not in ip_to_hostnames[ip]:
                         ip_to_hostnames[ip].append(domain)
+        if include_root_domain:
+            ips.update(ipv4_list)
+            ips.update(ipv6_list)
+            if domain:
+                hostnames.add(domain)
     
     # Extract from all subdomains
     subdomains_dns = dns_data.get("subdomains", {})
@@ -168,29 +177,108 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
 # URL Building from httpx Data
 # =============================================================================
 
+def _observed_http_verdict(entry: dict):
+    """Why an observed HTTP response is NOT a distinct application route.
+
+    The signature is deliberately narrow and evidence-based. A status alone is
+    never the test: a 403 login page is a real route and must remain a target.
+    Neither is "is_cdn": the hostname was reached through the shared edge, but
+    that is not proof the host itself does not serve application content. Only
+    a known edge error page (Cloudflare 1003: the origin may not be reached)
+    with no title and no application content signature is excluded here.
+
+    Returns a stable reason string, or None when the observation may still
+    represent a distinct route. A True/False caller must therefore use the
+    string, never truthiness: the returned empty string is still a verdict.
+    """
+    if not isinstance(entry, dict):
+        return None
+    status = entry.get("status_code")
+    # An unknown/absent status is not an error verdict. It is retained so a
+    # supplied seed or a failed probe is not silently dropped.
+    if not isinstance(status, int) or status not in (
+            403, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530):
+        return None
+    title = (entry.get("title") or "").strip()
+    if title:
+        return None
+    content_type = (entry.get("content_type") or "").lower()
+    body = entry.get("body")
+    # A titled HTML page was already returned above. For an untitled response,
+    # text/html is still application content evidence (a policy/error document)
+    # and must remain a target; only a non-document/empty edge response is not.
+    if "html" in content_type and isinstance(body, (str, bytes, bytearray)) and len(body) > 128:
+        return None
+    if isinstance(body, (bytes, bytearray)) and len(body) > 256:
+        return None
+    if isinstance(body, str):
+        compact = "".join(body.split()).lower()
+        if len(compact) > 256:
+            return None
+    declared_length = entry.get("content_length")
+    if isinstance(declared_length, int) and declared_length > 256:
+        return None
+    headers = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
+    cf_ray = next((v for k, v in headers.items()
+                   if str(k).lower() in ("cf-ray", "cf-request-id", "cf-mitigated")), "")
+    text = " ".join(str(v).lower() for v in (title, body, headers.get("server"), headers.get("content-type"))
+                    if v)
+    if "cloudflare" in text or "cf-ray" in text or "ray id" in text:
+        if len(text) <= 512 and not title:
+            return "edge_error_page_cloudflare"
+    if not title and not cf_ray and "html" not in content_type and "cloudflare" not in text:
+        return "edge_error_page_short_body"
+    return None
+
+
 def build_target_urls_from_httpx(httpx_data: Optional[dict], report=None) -> List[str]:
     """
     Build list of target URLs from httpx scan results.
-    Uses live URLs discovered by httpx for more accurate targeting.
-    
+
+    Uses live URLs discovered by httpx for more accurate targeting. Observed
+    edge-infrastructure error pages are excluded from downstream application
+    work; genuine 401/403/5xx application responses (for example a titled login
+    page) remain. Raw httpx evidence is never mutated.
+
     Args:
         httpx_data: httpx scan results containing live URLs
-        
+
     Returns:
         List of live URLs to scan
     """
     urls = []
-    
+    excluded = {}
+
     if httpx_data:
         # Use live URLs from httpx (already verified to be responding)
         by_url = httpx_data.get("by_url", {})
         for url, url_data in by_url.items():
             status_code = url_data.get("status_code")
-            # Include URLs with successful responses (not server errors)
-            if (isinstance(status_code, int) and 0 < status_code < 500) or (status_code is None and url_data.get("provenance") == "supplied"):
+            # Include URLs with successful responses (not server errors).
+            # The status test comes first: only an observed error response can
+            # be judged an edge error page, and a success/failed probe is never
+            # discarded by this classifier.
+            if ((isinstance(status_code, int) and 0 < status_code < 500)
+                    or (status_code is None and url_data.get("provenance") == "supplied")):
                 urls.append(url)
-    
+                continue
+            reason = _observed_http_verdict(url_data)
+            if reason is not None:
+                excluded[reason] = excluded.get(reason, 0) + 1
+
+    disposition = {"admitted": len(urls), "excluded": excluded}
+    if report is not None:
+        # Preserve the syntax-admission summary this call also writes. A caller
+        # that passes one report must receive both dispositions, not a partial
+        # view with the edge-error decisions silently discarded.
+        prior = report.get("httpx_or_supplied")
+        merged = dict(prior) if isinstance(prior, dict) else {}
+        merged.update(disposition)
+        report["httpx_or_supplied"] = merged
+    elif excluded:
+        print(f"[*][HTTP admission] httpx_or_supplied: edge error pages {excluded}")
     return sorted(set(admit_http_urls(urls, "httpx_or_supplied", report)))
+
 
 
 # =============================================================================
@@ -486,6 +574,7 @@ def build_target_urls(
     scan_all_ips: bool = False,
     admission_report: Optional[dict] = None,
     declared_report: Optional[dict] = None,
+    ip_to_hostnames: Optional[Dict[str, List[str]]] = None,
 ) -> List[str]:
     """
     Build the list of target URLs for nuclei scanning as the UNION of every
@@ -589,10 +678,51 @@ def build_target_urls(
         if len(url_set) > before:
             counts["fallback_subdomain"] += 1
 
+    # A 403/5xx edge error page is not a route, and a shared CDN address that
+    # only serves those pages is not a distinct application surface. The
+    # observation stays in http_probe; only the derived work list changes.
+    raw_ips = {ip for ip in (ips or set()) if isinstance(ip, str) and ip}
+    # Addresses discovered even when their root hostname is excluded from the
+    # active host set still belong to the engagement's discovered assets. An
+    # address that was actually probed is judged from that observation; one that
+    # was never probed stays available for an explicit scan_all_ips request.
+    raw_ips |= set((ip_to_hostnames or {}).keys())
+    covered_ips = {ip for ip in raw_ips if ip in covered_hosts}
+    edge_error_ips = set()
+
     # Source 4: IPs not covered (opt-in)
     if scan_all_ips:
-        for ip in sorted(ips):
-            if not ip or ip in covered_hosts:
+        # Attribute an edge-error observation to the exact hostname that was
+        # probed, never to every address it resolves to. A CDN address also
+        # serves unrelated customers, so an IP is skipped only when its mapped
+        # project hostname was itself measured as an edge error page.
+        edge_error_hosts = {
+            (urlparse(u).hostname or "").lower()
+            for u, entry in (httpx_data or {}).get("by_url", {}).items()
+            if _observed_http_verdict(entry) is not None
+        }
+        error_ips = set()
+        mapping = ip_to_hostnames if ip_to_hostnames is not None else {}
+        for ip in sorted(raw_ips - covered_hosts):
+            # An exact-IP httpx probe has no DNS mapping. Its own URL is the
+            # observation that identifies it. A hostname-mapped address is
+            # judged only by that mapped project host, never by every address
+            # sharing the same CDN range.
+            direct_ip_observed = any(
+                (urlparse(u).hostname or "") == ip
+                for u, entry in (httpx_data or {}).get("by_url", {}).items()
+                if _observed_http_verdict(entry) is not None
+            )
+            mapped = {str(h).lower() for h in (mapping.get(ip) or []) if h}
+            if direct_ip_observed or (mapped and mapped <= edge_error_hosts):
+                error_ips.add(ip)
+        covered_ips |= error_ips
+        edge_error_ips |= error_ips
+        if error_ips:
+            print(f"[*][Targets] Skipped {len(error_ips)} shared CDN IP(s) serving edge error pages only")
+
+        for ip in sorted(raw_ips):
+            if not ip or ip in covered_ips:
                 continue
             try:
                 ipaddress.ip_address(ip)
