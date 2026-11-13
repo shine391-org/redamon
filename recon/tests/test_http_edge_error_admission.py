@@ -20,8 +20,8 @@ def _data():
                                  "headers": {"server": "cloudflare"}},
             f"{HOST}": {"status_code": 403, "content_length": 464, "title": "Login"},
             "https://api.example.test/health": {
-                "status_code": 503, "content_length": 41,
-                "body": "origin unavailable", "headers": {"server": "envoy"}},
+                "status_code": 403, "content_length": 4096,
+                "body": "application policy: access denied by origin", "headers": {"server": "envoy"}},
             "https://app.example.test": {"status_code": 200, "title": "App"},
         }},
         "domain": "khotaikhoan.net",
@@ -38,6 +38,7 @@ def test_shared_edge_error_page_is_excluded_and_observed_evidence_remains():
                                 admission_report={}, ip_to_hostnames=mapping)
     assert f"https://{CDN_IP}" not in urls
     assert "https://app.example.test" in urls
+    assert "https://api.example.test/health" in urls
     assert data == before
 
 
@@ -77,5 +78,5 @@ def test_exclusion_is_reported_without_claim_the_route_was_scanned():
     _h, _ips, _mapping = th.extract_targets_from_recon(data)
     th.build_target_urls(_h, _ips, data, scan_all_ips=True,
                          admission_report=report, ip_to_hostnames=_mapping)
-    assert sum(report["httpx_or_supplied"]["excluded"].values()) == 1
+    assert report["httpx_or_supplied"]["excluded"].get("edge_error_page_cloudflare") == 1
     assert data["http_probe"]["by_url"][f"http://{CDN_IP}"]["status_code"] == 403

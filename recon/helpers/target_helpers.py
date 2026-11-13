@@ -215,9 +215,6 @@ def _observed_http_verdict(entry: dict):
         compact = "".join(body.split()).lower()
         if len(compact) > 256:
             return None
-    declared_length = entry.get("content_length")
-    if isinstance(declared_length, int) and declared_length > 256:
-        return None
     headers = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
     cf_ray = next((v for k, v in headers.items()
                    if str(k).lower() in ("cf-ray", "cf-request-id", "cf-mitigated")), "")
@@ -226,7 +223,10 @@ def _observed_http_verdict(entry: dict):
     if "cloudflare" in text or "cf-ray" in text or "ray id" in text:
         if len(text) <= 512 and not title:
             return "edge_error_page_cloudflare"
-    if not title and not cf_ray and "html" not in content_type and "cloudflare" not in text:
+    declared_length = entry.get("content_length")
+    if (not title and not cf_ray and "html" not in content_type
+            and "cloudflare" not in text and isinstance(declared_length, int)
+            and 0 < declared_length <= 128):
         return "edge_error_page_short_body"
     return None
 
@@ -254,17 +254,17 @@ def build_target_urls_from_httpx(httpx_data: Optional[dict], report=None) -> Lis
         by_url = httpx_data.get("by_url", {})
         for url, url_data in by_url.items():
             status_code = url_data.get("status_code")
-            # Include URLs with successful responses (not server errors).
-            # The status test comes first: only an observed error response can
-            # be judged an edge error page, and a success/failed probe is never
-            # discarded by this classifier.
-            if ((isinstance(status_code, int) and 0 < status_code < 500)
-                    or (status_code is None and url_data.get("provenance") == "supplied")):
-                urls.append(url)
-                continue
+            # A successful response is always a real route. A 4xx is an
+            # application response unless its own evidence says it is an edge
+            # error page. A 5xx is retained: the old behavior deliberately
+            # included origin failures, and a short generic body is not proof
+            # that no application route exists.
             reason = _observed_http_verdict(url_data)
             if reason is not None:
                 excluded[reason] = excluded.get(reason, 0) + 1
+            elif (isinstance(status_code, int) and 0 < status_code < 500) or (
+                    status_code is None and url_data.get("provenance") == "supplied"):
+                urls.append(url)
 
     disposition = {"admitted": len(urls), "excluded": excluded}
     if report is not None:
