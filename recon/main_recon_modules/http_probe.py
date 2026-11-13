@@ -1019,9 +1019,18 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
     if resolvers:
         cmd.extend(["-r", ",".join(resolvers)])
 
-    # Custom headers
+    # Custom headers. A client-specified Accept-Encoding is removed only from
+    # the generated argv: the capture proxy must be able to decode a gzip body
+    # without losing it, and preserving auth/identity/custom request headers
+    # remains mandatory. The operator's other lines are untouched.
     if HTTPX_CUSTOM_HEADERS:
         for header in HTTPX_CUSTOM_HEADERS:
+            if ":" not in header:
+                continue
+            name = header.split(":", 1)[0].strip().lower()
+            if name == "accept-encoding":
+                print("[*][httpx] Accept-Encoding omitted; tool transport handles content decoding")
+                continue
             cmd.extend(["-H", header])
 
     # Status code filters
@@ -1045,6 +1054,113 @@ _FOREIGN_PAGE_FIELDS = frozenset({
     "words", "word-count", "lines", "line-count", "header", "body",
     "tls", "tls-grab", "tls_version", "subject_cn", "subject_an", "issuer_org",
 })
+
+
+# A response body is evidence for fingerprint/title extraction, not an unbounded
+# archive. This cap covers the compressed body httpx reports in -irr mode, so a
+# pathological response cannot turn the JSON output into an OOM vector.
+_HTTP_BODY_EVIDENCE_CAP = 256 * 1024
+
+
+def _text_from_httpx_fields(entry: dict):
+    """Best-effort decoded response body, preferring httpx's decoded value.
+
+    httpx has already decompressed the transport response and extracted the
+    title. Only a raw/base64 field from an older/newer tool shape needs local
+    decoding; if that value is already lossy, reconstructing it is not possible,
+    so the caller keeps the status/header evidence instead of inventing a title.
+    """
+    if not isinstance(entry, dict):
+        return None, None
+    body = entry.get("body")
+    source = "body"
+    if isinstance(body, (bytes, bytearray)):
+        raw = bytes(body)
+    elif isinstance(body, str) and body:
+        raw = body.encode("utf-8", "surrogatepass")
+        if entry.get("content_encoding") == "gzip" or entry.get("content-encoding") == "gzip":
+            source = "body_gzip"
+        else:
+            import base64
+            try:
+                decoded = base64.b64decode(body, validate=True)
+                raw = decoded
+                source = "body_base64"
+            except Exception:  # noqa: BLE001
+                source = "body_text"
+    else:
+        for key in ("response_body", "response-body", "raw_response", "raw-response"):
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                raw = value.encode("utf-8", "surrogatepass")
+                source = key
+                break
+        else:
+            return None, None
+    if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
+        return None, "too_large"
+    import gzip
+    import io
+    import zlib
+    decompressed = None
+    candidates = [raw]
+    if isinstance(body, str) and body and source == "body_gzip":
+        import base64
+        try:
+            decoded = base64.b64decode(body, validate=True)
+            if decoded != raw:
+                candidates.append(decoded)
+        except Exception:  # noqa: BLE001
+            pass
+    for candidate in candidates:
+        if candidate[:2] == b"\x1f\x8b":
+            try:
+                decompressor = gzip.GzipFile(fileobj=io.BytesIO(candidate))
+                decompressed = decompressor.read(_HTTP_BODY_EVIDENCE_CAP)
+                break
+            except Exception:  # noqa: BLE001 - corrupt gzip is evidence, not a clean page
+                decompressed = None
+        elif candidate[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+            try:
+                decompressed = zlib.decompress(candidate, bufsize=_HTTP_BODY_EVIDENCE_CAP)
+                break
+            except Exception:  # noqa: BLE001
+                decompressed = None
+    if decompressed is not None:
+        raw = decompressed
+        if source in ("body", "body_gzip"):
+            source = "body_gzip_decoded"
+    if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
+        return None, "too_large"
+    return raw.decode("utf-8", errors="replace"), source
+
+
+def _record_response_headers(url_entry: dict, entry: dict) -> None:
+    """Keep the wire header evidence httpx already put in its JSON object.
+
+    The transport parser reads a few named keys. A raw response block, when a
+    future httpx shape supplies one, is parsed only for header lines. Request
+    headers are deliberately not copied: this row describes the target's
+    response and must never be used as a record of what RedAmon sent.
+    """
+    headers = entry.get("header") if isinstance(entry.get("header"), dict) else None
+    if not headers:
+        for key in ("response_headers", "response-headers", "raw_response", "raw-response"):
+            raw = entry.get(key)
+            if isinstance(raw, str) and raw:
+                parsed = {}
+                in_headers = False
+                for line in raw.splitlines():
+                    if not in_headers and line.strip() == "":
+                        in_headers = True
+                        continue
+                    if ":" in line:
+                        name, value = line.split(":", 1)
+                        parsed[name.strip()] = value.strip()
+                headers = parsed
+                break
+    if headers:
+        url_entry["headers"] = headers
 
 
 def _redirect_chain(chain_codes, status_code) -> Optional[List[int]]:
@@ -1249,13 +1365,15 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
             if entry.get("hash"):
                 url_entry["body_hash"] = entry.get("hash")
 
-            # Response headers
-            if entry.get("header"):
-                url_entry["headers"] = entry.get("header")
-
-            # Response body (if included)
-            if entry.get("body"):
-                url_entry["body"] = entry.get("body")
+            # Response body evidence (if included). Keep a bounded value even
+            # for a non-HTML error page so a shared-edge signature can be
+            # distinguished from an application response without another probe.
+            body_text, body_source = _text_from_httpx_fields(entry)
+            if body_text:
+                url_entry["body"] = body_text[:_HTTP_BODY_EVIDENCE_CAP]
+            elif body_source:
+                url_entry["body_decode"] = body_source
+            _record_response_headers(url_entry, entry)
 
             # AI surface recon: annotate header / favicon / title / wappalyzer
             ai_fired = _annotate_ai_http_signals(url_entry, settings)
