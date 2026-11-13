@@ -172,7 +172,7 @@ else
 fi
 for site in cmd_init cmd_update; do
   _end=$([[ $site == cmd_init ]] && echo cmd_update || echo cmd_status)
-  awk "/^${site}\\(\\)/,/^${_end}\\(\\)/" "$DEPLOY" | grep -q '^seed AGENT_IN_THE_LOOP_ENABLED ' \
+  awk "/^${site}\\(\\)/,/^${_end}\\(\\)/" "$DEPLOY" | grep '^seed AGENT_IN_THE_LOOP_ENABLED ' >/dev/null \
     && ok "$site seeds AGENT_IN_THE_LOOP_ENABLED" \
     || bad "$site seeds AGENT_IN_THE_LOOP_ENABLED" "absent" "a seed line"
 done
@@ -189,7 +189,7 @@ awk '/AGENT_IN_THE_LOOP_ENABLED=true but MCP_SERVER_ENABLED is off/{print}' "$DE
   || bad "that is a log()" "warn, die or absent" "log"
 for site in cmd_init cmd_update; do
   _end=$([[ $site == cmd_init ]] && echo cmd_update || echo cmd_status)
-  awk "/^${site}\\(\\)/,/^${_end}\\(\\)/" "$DEPLOY" | grep -q '^seed REDAMON_SINGLE_HOST_DEPLOY true' \
+  awk "/^${site}\\(\\)/,/^${_end}\\(\\)/" "$DEPLOY" | grep '^seed REDAMON_SINGLE_HOST_DEPLOY true' >/dev/null \
     && ok "$site marks the .env as a deployed server" \
     || bad "$site marks the .env as a deployed server" "absent" "seed REDAMON_SINGLE_HOST_DEPLOY true"
 done

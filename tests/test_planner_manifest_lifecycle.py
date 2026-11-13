@@ -290,12 +290,17 @@ def test_maybe_write_does_not_mutate_caller_settings(tmp_path):
     assert "NUCLEI_RATE_LIMIT" not in json.dumps(m)
 
 
-def test_maybe_write_unwritable_output_never_raises():
+def test_maybe_write_unwritable_output_never_raises(tmp_path):
+    # A root-run container can create arbitrary absolute directories. A regular
+    # file used as a parent cannot become a directory, regardless of the UID.
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("keep this file intact")
     assert maybe_write_pre_dispatch_manifest(
         {"PLANNER_MANIFEST_ENABLED": True,
          "PLANNER_TENANT": "t", "PLANNER_PROJECT_ID": "p",
          "PLANNER_RUN_ID": "r", "PLANNER_GROUP_ID": "g"},
-        "/nonexistent-dir-deep/no/such/file.json") is None
+        blocked_parent / "file.json") is None
+    assert blocked_parent.read_text() == "keep this file intact"
 
 
 # ---------------------------------------------------------------------------

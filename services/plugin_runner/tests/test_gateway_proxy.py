@@ -38,7 +38,13 @@ class Proxy:
             conn.putheader(k, v)
         if body or method == "POST":
             conn.putheader("Content-Length", str(len(body)))
-        conn.endheaders(body or None)
+        try:
+            conn.endheaders(body or None)
+        except BrokenPipeError:
+            # An overloaded listener can send its final 503 before the client
+            # finishes sending the body. Still parse the actual HTTP response;
+            # a missing/malformed response must continue to fail the test.
+            pass
         r = conn.getresponse()
         out = (r.status, dict((k.lower(), v) for k, v in r.getheaders()), r.read())
         conn.close()
@@ -69,6 +75,19 @@ def runner_door(upstream):
     p = Proxy("runner", upstream.base_url)
     yield p
     p.close()
+
+
+def test_raw_client_does_not_hide_a_missing_response_after_broken_pipe(monkeypatch, gateway):
+    def broken_send(self, *args, **kwargs):
+        raise BrokenPipeError("peer finished before request body")
+
+    def missing_response(self):
+        raise http.client.RemoteDisconnected("no HTTP response was received")
+
+    monkeypatch.setattr(http.client.HTTPConnection, "endheaders", broken_send)
+    monkeypatch.setattr(http.client.HTTPConnection, "getresponse", missing_response)
+    with pytest.raises(http.client.RemoteDisconnected, match="no HTTP response"):
+        gateway.raw("POST", "/api/plugin-gateway/v1/data/get", b"{}")
 
 
 def test_a_gateway_call_is_forwarded_with_only_the_allowed_headers(gateway, upstream):
