@@ -114,6 +114,7 @@ from recon.helpers.selection_coverage import (
     persist_plan,
     plan_hosts,
     record_outcome,
+    record_execution,
 )
 
 # Every top-level key run_vuln_scan writes; the security checks nest inside
@@ -169,7 +170,9 @@ def _nuclei_pass_outcome(returncode, duration, runtime_cap, parsed) -> tuple:
     """``(status, reason)`` for every host one pass targeted. A pass stopped at
     NUCLEI_MAX_RUNTIME never says which targets it reached, so all are partial;
     the watchdog fires at the cap, so the pass lasted at least that long."""
-    if not returncode:
+    if returncode == -124:
+        return "partial", "runtime cap"
+    if returncode == 0:
         return "complete", None
     if runtime_cap and duration >= runtime_cap:
         return "partial", "runtime cap"
@@ -302,11 +305,11 @@ def _selection_plan(*, targets, saved_tags, effective_tags, ai_pruned=False,
     )
     plan["passes"] = [
         {"name": "detection", "targets": len(list(targets or [])),
-         "templates": "tags" if effective else "none", "ran": not deferred},
+         "templates": "tags" if effective else "none", "ran": False},
     ]
     if dast_mode and dast_targets:
         plan["passes"].append({"name": "dast", "targets": len(list(dast_targets)),
-                               "templates": "dast", "ran": True})
+                               "templates": "dast", "ran": False})
     return plan
 
 
@@ -656,6 +659,7 @@ def _execute_routed_passes(
             coverage_passes.append((targets, "failed", f"policy_empty: {exc}", False))
         except Exception as exc:
             print(f"[!][Nuclei] {label} pass failed: {exc}")
+            _keep_nuclei_findings(f"nuclei {label} pass failed: {type(exc).__name__}")
             coverage_passes.append((targets, "failed", str(exc), False))
     
     return all_findings, all_false_positives, total_duration, coverage_passes
@@ -798,7 +802,8 @@ def _execute_nuclei_pass(cmd: list, output_file: str, label: str,
                   f"results - previous Nuclei findings are kept")
         _keep_nuclei_findings(f"nuclei {label} pass exited {process.returncode}")
 
-    return findings, false_positives, duration, process.returncode
+    # Preserve watchdog evidence even if the killed process reports exit zero.
+    return findings, false_positives, duration, -124 if truncated["hit"] else process.returncode
 
 
 # =============================================================================
@@ -1399,7 +1404,10 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             # Shadow mode: compute routing for observation but execute legacy
             compute_routing_for_shadow = routing_mode == MODE_SHADOW
             
-            if skip_detection_pass:
+            if not target_urls:
+                print("[*][Nuclei] DETECTION pass not scanned (no selected targets)")
+                d_findings, d_fps, d_duration = [], [], 0
+            elif skip_detection_pass:
                 print("[*][Nuclei] DETECTION pass skipped (no tags + no custom templates)")
                 d_findings, d_fps, d_duration = [], [], 0
                 coverage_passes.append((target_urls, "failed", "no Nuclei templates selected", False))
@@ -1487,6 +1495,10 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                         "detail": str(exc),
                     }
                     coverage_passes.append((target_urls, "failed", f"policy_empty: {exc}", False))
+                    d_findings, d_fps, d_duration = [], [], 0
+                except Exception as exc:
+                    _keep_nuclei_findings(f"nuclei DETECTION pass failed: {type(exc).__name__}")
+                    coverage_passes.append((target_urls, "failed", str(exc), False))
                     d_findings, d_fps, d_duration = [], [], 0
             else:
                 # Enforce mode: run routed detection passes
@@ -1635,6 +1647,9 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     }
                     coverage_passes.append((dast_urls, "failed",
                                             "policy_empty: no templates provided for scan", False))
+                except Exception as exc:
+                    _keep_nuclei_findings(f"nuclei DAST pass failed: {type(exc).__name__}")
+                    coverage_passes.append((dast_urls, "failed", str(exc), False))
                 else:
                     coverage_passes.append((dast_urls, *_nuclei_pass_outcome(
                         b_rc, b_duration, NUCLEI_MAX_RUNTIME, b_findings or b_fps), True))
@@ -1652,6 +1667,19 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 if len(false_positives_filtered) > 5:
                     print(f"[*][Nuclei]   ... and {len(false_positives_filtered) - 5} more")
         
+            selection_plan = record_execution(selection_plan, coverage_passes, deferred=_deferred)
+            execution = selection_plan["execution"]
+            attempted_urls = sorted({u for urls, _, _, ran in coverage_passes if ran for u in urls})
+            completed_urls = sorted(
+                {u for urls, status, _, ran in coverage_passes if ran and status == "complete" for u in urls}
+                - {u for urls, status, _, _ in coverage_passes if status != "complete" for u in urls})
+            # No executable routed chunks is not proof of coverage. Keep the
+            # existing conservative host guard, without inventing an executed pass.
+            host_passes = coverage_passes
+            if not coverage_passes and target_urls:
+                _keep_nuclei_findings("no selected Nuclei chunks executed")
+                host_passes = [(target_urls, "failed", "no selected chunks executed", False)]
+
             # Organize results
             nuclei_results = {
                 "scan_metadata": {
@@ -1698,19 +1726,23 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                                         **( {"detection_not_executed": detection_not_executed}
                                            if detection_not_executed is not None else {}),
                                         "katana_crawl_depth": KATANA_DEPTH if NUCLEI_DAST_MODE else None,
-                    "total_urls_scanned": len(scan_urls),
+                    "total_urls_scanned": len(completed_urls),
+                    "total_urls_selected": len(scan_urls),
+                    "total_urls_attempted": len(attempted_urls),
+                    "execution": execution,
                     "total_hostnames": len(hostnames),
                     "total_ips": len(ips),
                     "false_positives_filtered": len(false_positives_filtered),
                     "coverage": _nuclei_coverage(
-                        coverage_at, coverage_passes, findings,
+                        coverage_at, host_passes, findings,
                         exhaustive=bool(selection_plan.get("exhaustive", False)),
                     ),
                 },
                 "discovered_urls": {
                     "base_urls": sorted(target_urls),
                     "dast_urls_with_params": sorted(dast_urls) if dast_urls else [],
-                    "all_scanned_urls": sorted(scan_urls),
+                    "all_scanned_urls": completed_urls,
+                    "attempted_urls": attempted_urls,
                 },
                 "by_target": {},
                 "summary": {
@@ -1813,11 +1845,9 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             # F07: record what the passes actually proved, so the plan is not
             # just a launch-time intent. A failed pass cuts its source (see
             # _keep_nuclei_findings) regardless of this status.
-            recon_data[SELECTION_KEY] = record_outcome(
-                recon_data[SELECTION_KEY],
-                "partial" if _deferred else "complete",
-                completed=int(len(findings or [])),
-            )
+            recon_data[SELECTION_KEY] = selection_plan
+            if plan_output_file is not None:
+                persist_plan(plan_output_file, selection_plan)
         
             # Save incrementally if output file provided
             if output_file:
@@ -1827,13 +1857,15 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         
             # Print summary
             print(f"\n{'=' * 70}")
-            print(f"[+][Nuclei] NUCLEI SCAN COMPLETE")
+            print(f"[*][Nuclei] NUCLEI SCAN {execution['status'].upper()}")
             print(f"[+][Nuclei] Duration: {duration:.2f} seconds")
             print(f"[+][Nuclei] Execution mode: DOCKER")
-            if do_dast_pass:
-                print(f"[+][Nuclei] URLs scanned: {len(target_urls)} (detection) + {len(dast_urls)} (DAST)")
-            else:
-                print(f"[+][Nuclei] URLs scanned: {len(target_urls)}")
+            print(f"[*][Nuclei] URLs attempted: {len(attempted_urls)}; "
+                  f"all selected passes successfully completed: {len(completed_urls)}")
+            print(f"[*][Nuclei] Passes/chunks completed: {execution['completed_passes']} / "
+                  f"{execution['attempted_passes']} attempted (not per-target/template verification)")
+            if execution['status'] != 'complete':
+                print("[!][Nuclei] Coverage incomplete; zero findings is not an all-clear")
             print(f"[+][Nuclei] Total findings: {len(findings)}")
         
             # Vulnerability summary
@@ -1923,6 +1955,25 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
             # The directory is this run's alone, so whatever is left in it can go.
             shutil.rmtree(nuclei_temp_dir, ignore_errors=True)
+
+    if NUCLEI_ENABLED and not run_nuclei:
+        # Early exits still need a durable outcome, not an absent/planned success.
+        early_targets = locals().get("target_urls", _live_web_urls(recon_data))
+        early_reason = nuclei_unavailable or (
+            "no Nuclei templates selected" if locals().get("skip_detection_pass") else "no targets")
+        early_plan = _selection_plan(
+            targets=early_targets, saved_tags=saved_nuclei_tags, effective_tags=NUCLEI_TAGS,
+            partial_scope=bool(selection_hint and selection_hint.get("scope") == "partial"))
+        early_passes = [(early_targets, "failed", early_reason, False)] if early_reason != "no targets" else []
+        early_plan = record_execution(early_plan, early_passes)
+        early_plan["reason"] = early_reason
+        # The plan persists to the canonical artifact under the same lock the
+        # main path uses. The in-memory top-level result stays the scanner
+        # result contract; a failed launch is reported through the coverage
+        # circuit breaker rather than a new result key.
+        if plan_output_file is not None:
+            persist_plan(plan_output_file, early_plan)
+        print(f"[*][Nuclei] NUCLEI SCAN {early_plan['status'].upper()}: {early_reason}")
 
     # Run CVE lookup for detected technologies (like Nmap's vulners)
     if CVE_LOOKUP_ENABLED and recon_data.get("http_probe"):

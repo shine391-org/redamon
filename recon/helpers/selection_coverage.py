@@ -42,7 +42,7 @@ SCHEMA_VERSION = 1
 ARTIFACT_SAVE_LOCK = threading.Lock()
 
 #: Plan statuses, worst-first, for merging several groups' plans.
-STATUS_ORDER = ("failed", "partial", "planned", "complete")
+STATUS_ORDER = ("failed", "partial", "not_scanned", "planned", "complete")
 
 #: Outcome counters summed when two groups' plans merge. A Domain batch runs
 #: one plan per group; the canonical artifact must describe the whole batch,
@@ -109,6 +109,55 @@ def record_outcome(plan: dict, status: str, *, completed: int = 0, partial: int 
         return out
     except Exception:  # noqa: BLE001 - a plan is never worth failing a scan over
         return plan
+
+
+def record_execution(plan: dict, passes=(), *, deferred: bool = False) -> dict:
+    """Account for subprocess passes/chunks, NOT matches or template tests.
+
+    Exit success proves only completion of the selected invocation. It does not
+    prove every target responded or that every template ran. Deferred is a
+    pass-group marker (the planner owns exact deferred task counts).
+    """
+    passes = list(passes)
+    counts = {field: 0 for field in OUTCOME_FIELDS}
+    attempted, completed, incomplete = set(), set(), set()
+    rows = []
+    for urls, status, reason, ran in passes:
+        urls = set(urls)
+        field = {"complete": "completed", "partial": "partial",
+                 "failed": "failed"}.get(status, "unknown")
+        counts[field] += 1
+        if ran:
+            attempted.update(urls)
+        if status == "complete" and ran:
+            completed.update(urls)
+        else:
+            incomplete.update(urls)
+        rows.append({"status": status, "reason": reason, "attempted": bool(ran),
+                     "targets": len(urls)})
+    counts["deferred"] = int(bool(deferred))
+    if counts["partial"] or (counts["completed"] and
+                              (counts["failed"] or counts["unknown"] or deferred)):
+        status = "partial"
+    elif counts["failed"] or counts["unknown"]:
+        status = "failed"
+    elif counts["completed"]:
+        status = "complete" if is_exhaustive(plan) else "partial"
+    else:
+        status = "not_scanned"
+    out = record_outcome(plan, status, **counts)
+    out["outcome_unit"] = "subprocess_pass_or_chunk"
+    out["deferred_unit"] = "pass_group_with_deferred_work"
+    out["execution"] = {
+        "status": status, "passes": rows,
+        "attempted_passes": sum(row["attempted"] for row in rows),
+        "completed_passes": counts["completed"],
+        "attempted_urls": len(attempted),
+        "urls_in_completed_passes": len(completed),
+        "urls_with_all_selected_passes_completed": len(completed - incomplete),
+        "completion_basis": "subprocess exit; not per-target/template verification",
+    }
+    return out
 
 
 def is_exhaustive(plan) -> bool:
