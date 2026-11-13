@@ -43,6 +43,7 @@ from recon.helpers.planner_manifest import (  # noqa: E402
     read_manifest, read_manifest_in_context, write_manifest,
     maybe_write_pre_dispatch_manifest,
 )
+from recon.helpers.planner_runtime import persist_dispatch  # noqa: E402
 
 import recon.main as main_mod  # noqa: E402  (real main.py wiring helpers)
 
@@ -315,10 +316,9 @@ def test_manifest_persisted_before_launch_in_off_mode_is_none(monkeypatch, tmp_p
     combined = {"metadata": {}}
     settings = dict(_enabled_settings("g1"))
     settings["PLANNER_MANIFEST_ENABLED"] = False
-    ptr = main_mod._write_pre_dispatch_plan_manifest(settings, out, combined,
-                                                     group_id="g1")
+    ptr = persist_dispatch(settings, combined, out, [], {}, [], [])
     assert ptr is None
-    assert "planner_manifest_pointers" not in combined.get("metadata", {})
+    assert "planner_manifest" not in combined
 
 
 def test_manifest_persisted_before_launch_writes_pointer_and_file(monkeypatch, tmp_path):
@@ -327,10 +327,10 @@ def test_manifest_persisted_before_launch_writes_pointer_and_file(monkeypatch, t
     out.write_text("{}")
     combined = {"metadata": {}}
     settings = _enabled_settings("g1")
-    ptr = main_mod._write_pre_dispatch_plan_manifest(settings, out, combined,
-                                                     group_id="g1")
+    ptr = persist_dispatch(settings, combined, out, [], {},
+                           ["https://synthetic.test/a"], [])
     assert ptr is not None
-    assert combined["metadata"]["planner_manifest_pointers"] == [ptr]
+    assert combined["planner_manifest"] == ptr
     path = Path(ptr["plan_manifest_path"])
     assert path.exists()  # durable on disk before any tool launch
     m = read_manifest_in_context(path, EXPECTED_CTX,
@@ -349,8 +349,7 @@ def test_manifest_group_isolation_across_modes(monkeypatch, tmp_path):
         out.write_text("{}")
         combined = {"metadata": {}}
         settings = _enabled_settings(group_id)
-        ptr = main_mod._write_pre_dispatch_plan_manifest(settings, out,
-                                                         combined, group_id=group_id)
+        ptr = persist_dispatch(settings, combined, out, [], {}, [], [])
         assert ptr is not None
         written.append(ptr)
     paths = {Path(p["plan_manifest_path"]).parent for p in written}
@@ -475,15 +474,15 @@ def test_maybe_write_writes_real_accounting_and_index(monkeypatch, tmp_path):
     settings = {"PLANNER_MANIFEST_ENABLED": True, "PLANNER_TENANT": "t1",
                 "PLANNER_PROJECT_ID": "p1", "PLANNER_GROUP_ID": "g1",
                 "SCOPE_GROUPS": [], "NUCLEI_TEMPLATES": ["cves/2024.yaml"]}
-    ptr = main_mod._write_pre_dispatch_plan_manifest(settings, out, combined, group_id="g1")
+    ptr = persist_dispatch(settings, combined, out, [], {},
+                           ["https://synthetic.test/a", "https://synthetic.test/b"], [])
     assert ptr is not None
     manifest = pm.read_manifest(Path(ptr["plan_manifest_path"]))
     assert manifest["status"] == "known"
     assert manifest["scope"] == {"roots": []}
     assert manifest["template_hashes"] == {"cves/2024.yaml": hashlib.sha256("cves/2024.yaml".encode()).hexdigest()}
     assert manifest["input_accounting"]["input_count"] == 2
-    assert set(manifest["input_accounting"]["input_hashes"]) == {
-        "https://synthetic.test/a", "synthetic.test"}
+    assert "dispatch_sha256" in manifest["input_accounting"]["input_hashes"]
     base = pm.manifest_base_dir(out)
     idx = pm.read_pointer_index(base, "p1", "run9")
     assert any(p["plan_manifest_path"] == ptr["plan_manifest_path"] for p in idx)
@@ -497,6 +496,6 @@ def test_maybe_write_does_not_fabricate_run_id_or_defaults(monkeypatch, tmp_path
     out.write_text("{}")
     settings = {"PLANNER_MANIFEST_ENABLED": True, "PLANNER_TENANT": "t",
                 "PLANNER_PROJECT_ID": "p", "PLANNER_GROUP_ID": "g"}
-    assert main_mod._write_pre_dispatch_plan_manifest(settings, out, {}, group_id="g") is None
+    assert persist_dispatch(settings, {}, out, [], {}, [], []) is None
     assert not list((tmp_path / "planner_manifests").rglob("*")) \
         if (tmp_path / "planner_manifests").exists() else True
