@@ -1,5 +1,7 @@
 """Round-robin API key rotation to avoid rate limits."""
 
+import hashlib
+import json
 import logging
 import threading
 
@@ -21,10 +23,24 @@ class KeyRotator:
         self._positions = [i + 1 for i, k in enumerate(keys) if k]
         self.keys = [k for k in keys if k]
         self.rotate_every_n = max(1, rotate_every_n)
+        # Config, not live rotation state: counters and a provider-rejected key
+        # do not change the plan/checkpoint revision.
+        self._configuration_fingerprint = self._fingerprint(self.keys, self.rotate_every_n)
         self._call_count = 0
         self._index = 0
         self._dropped = 0
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _fingerprint(keys, rotate_every_n):
+        return hashlib.sha256(json.dumps(
+            {'keys': keys, 'rotate_every_n': rotate_every_n},
+            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        """Immutable identity of the configured pool; never plaintext keys."""
+        return self._configuration_fingerprint
 
     @property
     def current_key(self) -> str:

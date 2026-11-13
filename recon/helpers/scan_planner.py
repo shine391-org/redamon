@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlsplit
+from recon.helpers.settings_fingerprint import settings_fingerprint
 
 from recon.helpers.planner_manifest import (
     MODE_OFF, MODE_SHADOW, MODE_ENFORCE, resolve_mode,
@@ -498,10 +499,7 @@ class ScanPlanner:
         self.mode = resolve_mode(self.settings)
         # Planning context hash: settings hash + template refs hash + seed.
         ctx = {
-            "settings_hash": hashlib.sha256(
-                json.dumps(self.settings, sort_keys=True,
-                           separators=(",", ":")).encode()
-            ).hexdigest(),
+            "settings_hash": settings_fingerprint(self.settings, compact=True),
             "template_refs": self.template_refs,
             "seed": self.seed,
         }
@@ -829,6 +827,7 @@ class ScanPlanner:
                 sort_keys=True, separators=(",", ":")),
         )
 
+        settings_hash = settings_fingerprint(self.settings)
         return _redact({
             "schema_version": 1,
             "planner_version": 1,
@@ -839,10 +838,8 @@ class ScanPlanner:
             "run_id": ctx["run_id"],
             "group_id": ctx["group_id"],
             "scope": {"roots": scope_roots_from_settings(self.settings)},
-            "settings_hash": hashlib.sha256(
-                json.dumps(self.settings, sort_keys=True).encode()).hexdigest(),
-            "settings_hash_prefix": hashlib.sha256(
-                json.dumps(self.settings, sort_keys=True).encode()).hexdigest()[:16],
+            "settings_hash": settings_hash,
+            "settings_hash_prefix": settings_hash[:16],
             "template_hashes": template_hashes_from_settings(self.settings),
             "input_count": input_count,
             "template_count": template_count,

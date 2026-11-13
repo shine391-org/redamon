@@ -94,6 +94,7 @@ from recon.main_recon_modules.vuln_scan import run_vuln_scan
 from recon.main_recon_modules.add_mitre import run_mitre_enrichment
 from recon.helpers.isolated_result import TopLevelKeys
 from recon.helpers.selection_coverage import KEY as SELECTION_KEY, ARTIFACT_SAVE_LOCK
+from recon.helpers.settings_fingerprint import settings_fingerprint
 from recon.helpers.planner_manifest import (
     scope_roots_from_settings,
     template_hashes_from_settings,
@@ -220,7 +221,7 @@ def _start_checkpoint(settings: dict, project_id: str, run_id: str,
     revision = JournalRevision(
         tenant=tenant, project_id=project_id, run_id=run_id,
         scope="|".join(scope_roots_from_settings(settings)),
-        settings_hash=hashlib.sha256(json.dumps(settings or {}, sort_keys=True).encode()).hexdigest(),
+        settings_hash=settings_fingerprint(settings),
         template_rev="|".join(sorted(template_hashes_from_settings(settings).values())),
         auth_rev=str(settings.get("PLANNER_AUTH_REV", "")),
     )

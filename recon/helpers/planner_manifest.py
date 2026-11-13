@@ -273,6 +273,9 @@ def build_manifest(*, run_id: str, group_id: str, tenant: str,
     (provenance of the planned inputs) when the caller has them; they are
     optional and omitted entirely when not provided.
     """
+    from recon.helpers.settings_fingerprint import settings_fingerprint
+
+    settings_hash = settings_fingerprint(settings)
     mode = mode or resolve_mode(settings)
     tasks = copy.deepcopy(task_summaries or [])
     task_truncated = 0
@@ -288,10 +291,8 @@ def build_manifest(*, run_id: str, group_id: str, tenant: str,
         "run_id": run_id,
         "group_id": group_id,
         "scope": _redact(copy.deepcopy(scope or {})),
-        "settings_hash": hashlib.sha256(
-            json.dumps(settings or {}, sort_keys=True).encode()).hexdigest(),
-        "settings_hash_prefix": hashlib.sha256(
-            json.dumps(settings or {}, sort_keys=True).encode()).hexdigest()[:16],
+        "settings_hash": settings_hash,
+        "settings_hash_prefix": settings_hash[:16],
         "template_hashes": _redact(copy.deepcopy(template_hashes or {})),
         "tasks": _redact(tasks),
         "reason": str(reason or ""),
