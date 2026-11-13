@@ -42,6 +42,38 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # `_ai_catalog.AI_FAVICON_HASHES` always reads the current dict object.
 from helpers.system_resolvers import system_resolvers
 from helpers import ai_signal_catalog as _ai_catalog
+def _body_title(body):
+    """Extract an HTML title from already-decoded evidence, or None.
+
+    Deliberately local: this is a fallback for an httpx shape whose title
+    extractor did not survive a compressed body. It never invents a title and
+    never touches the network.
+    """
+    if not body:
+        return None
+    from html.parser import HTMLParser
+    class _Title(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.active = False
+            self.parts = []
+            self.done = False
+        def handle_starttag(self, tag, attrs):
+            if tag == "title" and not self.done:
+                self.active = True
+        def handle_endtag(self, tag):
+            if tag == "title":
+                self.active = False
+                self.done = True
+        def handle_data(self, data):
+            if self.active:
+                self.parts.append(data)
+    parser = _Title()
+    try:
+        parser.feed(body)
+    except Exception:  # noqa: BLE001 - malformed HTML is not a reason to lose the response
+        return None
+    return " ".join("".join(parser.parts).split())[:4096] or None
 from helpers.ai_signal_catalog import (
     AI_HEADER_PATTERNS,
     match_ai_title,
@@ -1078,16 +1110,20 @@ def _text_from_httpx_fields(entry: dict):
         raw = bytes(body)
     elif isinstance(body, str) and body:
         raw = body.encode("utf-8", "surrogatepass")
-        if entry.get("content_encoding") == "gzip" or entry.get("content-encoding") == "gzip":
+        import base64
+        try:
+            decoded = base64.b64decode(body, validate=True)
+            raw = decoded
+            source = "body_base64"
+        except Exception:  # noqa: BLE001
+            source = "body_text"
+        # httpx -irrb gives the raw wire header separately. Its Content-Encoding
+        # is authoritative: a base64 body below is still compressed even when
+        # the older named header field was dropped or normalized.
+        raw_header = entry.get("raw_header") if isinstance(entry.get("raw_header"), str) else ""
+        header_text = raw_header.lower()
+        if "content-encoding: gzip" in header_text:
             source = "body_gzip"
-        else:
-            import base64
-            try:
-                decoded = base64.b64decode(body, validate=True)
-                raw = decoded
-                source = "body_base64"
-            except Exception:  # noqa: BLE001
-                source = "body_text"
     else:
         for key in ("response_body", "response-body", "raw_response", "raw-response"):
             value = entry.get(key)
@@ -1099,36 +1135,31 @@ def _text_from_httpx_fields(entry: dict):
             return None, None
     if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
         return None, "too_large"
+    import base64
     import gzip
     import io
     import zlib
     decompressed = None
-    candidates = [raw]
-    if isinstance(body, str) and body and source == "body_gzip":
-        import base64
+    if source in ("body_gzip", "body_base64"):
         try:
             decoded = base64.b64decode(body, validate=True)
-            if decoded != raw:
-                candidates.append(decoded)
+            if decoded[:2] == b"\x1f\x8b":
+                decompressed = gzip.GzipFile(fileobj=io.BytesIO(decoded)).read(_HTTP_BODY_EVIDENCE_CAP)
+        except Exception:  # noqa: BLE001 - malformed/base64 is evidence, not a clean page
+            decompressed = None
+    if decompressed is None and raw[:2] == b"\x1f\x8b":
+        try:
+            decompressed = gzip.GzipFile(fileobj=io.BytesIO(raw)).read(_HTTP_BODY_EVIDENCE_CAP)
         except Exception:  # noqa: BLE001
-            pass
-    for candidate in candidates:
-        if candidate[:2] == b"\x1f\x8b":
-            try:
-                decompressor = gzip.GzipFile(fileobj=io.BytesIO(candidate))
-                decompressed = decompressor.read(_HTTP_BODY_EVIDENCE_CAP)
-                break
-            except Exception:  # noqa: BLE001 - corrupt gzip is evidence, not a clean page
-                decompressed = None
-        elif candidate[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
-            try:
-                decompressed = zlib.decompress(candidate, bufsize=_HTTP_BODY_EVIDENCE_CAP)
-                break
-            except Exception:  # noqa: BLE001
-                decompressed = None
+            decompressed = None
+    elif decompressed is None and raw[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+        try:
+            decompressed = zlib.decompress(raw, bufsize=_HTTP_BODY_EVIDENCE_CAP)
+        except Exception:  # noqa: BLE001
+            decompressed = None
     if decompressed is not None:
         raw = decompressed
-        if source in ("body", "body_gzip"):
+        if source in ("body", "body_gzip", "body_base64"):
             source = "body_gzip_decoded"
     if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
         return None, "too_large"
@@ -1371,6 +1402,10 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
             body_text, body_source = _text_from_httpx_fields(entry)
             if body_text:
                 url_entry["body"] = body_text[:_HTTP_BODY_EVIDENCE_CAP]
+                if _body_title and not url_entry.get("title"):
+                    decoded_title = _body_title(body_text[:_HTTP_BODY_EVIDENCE_CAP])
+                    if decoded_title:
+                        url_entry["title"] = decoded_title
             elif body_source:
                 url_entry["body_decode"] = body_source
             _record_response_headers(url_entry, entry)

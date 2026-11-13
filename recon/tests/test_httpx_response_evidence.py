@@ -11,10 +11,12 @@ from recon.main_recon_modules import http_probe
 
 def test_base64_gzip_body_is_decoded_for_evidence():
     body = gzip.compress(b"<title>LOCAL_403_ERROR_TITLE</title>")
-    entry = {"body": base64.b64encode(body).decode(), "content_encoding": "gzip"}
+    entry = {"body": base64.b64encode(body).decode(), "content_encoding": "gzip",
+             "raw_header": "HTTP/1.1 403 Forbidden\r\nContent-Encoding: gzip\r\n\r\n"}
     text, source = http_probe._text_from_httpx_fields(entry)
     assert text == "<title>LOCAL_403_ERROR_TITLE</title>"
     assert source == "body_gzip_decoded"
+    assert http_probe._body_title(text) == "LOCAL_403_ERROR_TITLE"
 
 
 def test_already_decoded_text_is_preserved():
