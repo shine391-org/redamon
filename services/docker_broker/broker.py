@@ -366,6 +366,12 @@ def _default_tool_mem() -> int:
 
 
 BROKER_TOOL_MEM = _parse_size(os.environ.get("BROKER_TOOL_MEM_BYTES", ""), _default_tool_mem())
+# Optional, image-scoped ceiling for the shipped Nuclei runner. Keep the shared
+# tool ceiling unchanged: raising it would grant every unsized tool more RAM.
+# Empty/invalid/non-positive values inherit the shared ceiling, never unlimited.
+BROKER_NUCLEI_MEM = _parse_size(os.environ.get("BROKER_NUCLEI_MEM_BYTES", ""), BROKER_TOOL_MEM)
+if BROKER_NUCLEI_MEM <= 0:
+    BROKER_NUCLEI_MEM = BROKER_TOOL_MEM
 # Defensive parse: a non-integer (e.g. "512m") must not crash the broker at import,
 # which would leave recon unable to spawn ANY tool container.
 BROKER_TOOL_PIDS = max(0, _parse_int(os.environ.get("BROKER_TOOL_PIDS", "0"), 0))  # 0 = don't set
@@ -383,10 +389,14 @@ def inject_limits(cfg: dict) -> dict:
     if not isinstance(hc, dict):
         hc = {}
         cfg["HostConfig"] = hc
-    if BROKER_TOOL_MEM > 0:
+    image = cfg.get("Image")
+    nuclei = (isinstance(image, str) and _canonical_image(image) in
+              {"projectdiscovery/nuclei", "projectdiscovery/nuclei:latest"})
+    memory_cap = BROKER_NUCLEI_MEM if nuclei else BROKER_TOOL_MEM
+    if memory_cap > 0:
         cur = hc.get("Memory") or 0
-        if cur == 0 or cur > BROKER_TOOL_MEM:
-            hc["Memory"] = BROKER_TOOL_MEM
+        if cur == 0 or cur > memory_cap:
+            hc["Memory"] = memory_cap
     if BROKER_TOOL_PIDS > 0:
         cur = hc.get("PidsLimit") or 0
         if cur == 0 or cur > BROKER_TOOL_PIDS:

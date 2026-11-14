@@ -424,6 +424,9 @@ services:
       # or that tool runs below the limit ZAP's heap was sized for.
       # tests/test_resource_governor.py pins this default against the governor.
       BROKER_TOOL_MEM_BYTES: ${BROKER_TOOL_MEM_BYTES:-3g}
+      # Optional override ONLY for the shipped projectdiscovery/nuclei runner.
+      # Empty inherits the shared tool cap; it does not raise other tools' caps.
+      BROKER_NUCLEI_MEM_BYTES: ${BROKER_NUCLEI_MEM_BYTES:-}
       # D1: fork-bomb ceiling injected into every sibling tool container
       # (katana/nuclei/httpx/...). Was 0 (unlimited); 512 is generous per tool.
       BROKER_TOOL_PIDS: ${BROKER_TOOL_PIDS:-512}
