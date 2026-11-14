@@ -183,9 +183,9 @@ def test_http_host_compatibility_is_not_dns_injection_policy(url):
     assert th.build_target_urls_from_httpx({'by_url': {url: {'status_code': 200}}}) == [url]
 
 
-def test_later_measured_server_error_is_not_overridden_by_supplied_provenance():
+def test_later_measured_server_error_is_admitted_not_overridden():
     assert th.build_target_urls_from_httpx({'by_url': {GOOD[0]: {
-        'status_code': 503, 'provenance': 'supplied'}}}) == []
+        'status_code': 503, 'provenance': 'supplied'}}}) == [GOOD[0]]
 
 
 def test_ffuf_identical_generated_directory_tasks_are_not_repeated():

@@ -543,9 +543,16 @@ def finalize_inventory(recon_data: dict) -> dict:
 
     vuln_scan = recon_data.get("vuln_scan") or {}
     metadata = vuln_scan.get("scan_metadata") or {}
+    # The consumer's admitted input is what it was GIVEN (every selected URL),
+    # not only what completed: a pass stopped by the runtime cap still received
+    # its targets. ``total_urls_selected`` is the current field; the legacy
+    # artifacts predate it and carry only ``total_urls_scanned``.
+    selected_count = metadata.get("total_urls_selected")
+    if not isinstance(selected_count, int) or isinstance(selected_count, bool):
+        selected_count = metadata.get("total_urls_scanned")
     consumer_nuclei_detection(
         inventory,
-        target_count=int(metadata.get("total_urls_scanned") or 0),
+        target_count=int(selected_count or 0),
         admission=metadata.get("target_admission"),
         declared=metadata.get("declared_only"),
     )

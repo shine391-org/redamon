@@ -22,6 +22,14 @@ from urllib.parse import urlparse
 
 from .classification import classify_endpoint
 
+try:
+    from .kiterunner_proxy.tar_safe import safe_extract_tar
+except ImportError:  # direct/script import outside the package
+    import sys as _sys
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parent / "kiterunner_proxy"))
+    from tar_safe import safe_extract_tar  # type: ignore[import-not-found]
+
 
 def _create_temp_dir(prefix: str = "kr") -> Path:
     """Create a temp directory under /tmp/redamon for Docker-in-Docker compatibility."""
@@ -109,12 +117,9 @@ def ensure_kiterunner_binary(wordlist_name: str) -> Tuple[Optional[str], Optiona
                 f.write(payload)
             if asset_name.endswith(".tar.gz"):
                 with tarfile.open(archive_path, "r:gz") as tar:
-                    base = kr_dir.resolve()
-                    for member in tar.getmembers():
-                        target = (kr_dir / member.name).resolve()
-                        if base not in target.parents and target != base:
-                            raise ValueError("unsafe archive path")
-                        tar.extract(member, path=kr_dir)
+                    # CDN/GitHub archives are untrusted input: reject traversal,
+                    # absolute paths and escaping symlink/hardlink targets.
+                    safe_extract_tar(tar, kr_dir)
             elif asset_name.endswith(".zip"):
                 with zipfile.ZipFile(archive_path, 'r') as zip_ref:
                     base = kr_dir.resolve()
@@ -160,9 +165,11 @@ def ensure_kiterunner_binary(wordlist_name: str) -> Tuple[Optional[str], Optiona
                     with open(archive_path, 'wb') as f:
                         f.write(response.read())
 
-                # Extract wordlist
+                # Extract wordlist through the shared containment guard: CDN
+                # archives can carry absolute paths, ../ traversal and escaping
+                # symlink/hardlink members.
                 with tarfile.open(archive_path, "r:gz") as tar:
-                    tar.extractall(path=kr_dir)
+                    safe_extract_tar(tar, kr_dir)
 
                 # Cleanup archive
                 archive_path.unlink()

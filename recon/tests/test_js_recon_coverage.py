@@ -189,3 +189,94 @@ def test_base_url_key_is_one_spelling_per_web_service():
     assert base_url_key("https://cdn.example.com/x.js.map#src/app.ts") == "https://cdn.example.com:443"
     assert base_url_key("upload://bundle.js") == ""
     assert base_url_key("") == ""
+
+
+# --- selected-but-not-read outcomes earn their own reason code ----------------
+
+def _outcomes(*pairs):
+    return [{"url": url, "status": status, "reason": reason}
+            for url, status, reason in pairs]
+
+
+def test_a_too_large_or_empty_answer_is_a_recorded_loss_not_no_input():
+    """The real downloader records the loss; the host must not look clean."""
+    urls = [f"https://{APP}/static/js/main.{n}.js" for n in (1, 2)]
+    cov = js_recon._js_coverage({"metadata": {}, "http_probe": {"by_url": {}}}, {},
+                                "2026-01-01T00:00:00Z", js_urls=urls, selected=urls,
+                                unreachable=list(urls),
+                                outcomes=_outcomes((urls[0], "too_large", ""),
+                                                   (urls[1], "empty", "")))
+    assert _row(cov, APP) == {"status": "failed", "inputs": 0, "outputs": 0,
+                               "reason": "empty, too_large"}
+
+
+def test_an_ssrf_guard_refusal_is_a_failure_with_its_own_reason():
+    urls = [f"https://{APP}/static/js/main.{n}.js" for n in (1, 2)]
+    cov = js_recon._js_coverage({"metadata": {}, "http_probe": {"by_url": {}}}, {},
+                                "2026-01-01T00:00:00Z", js_urls=urls, selected=urls,
+                                unreachable=list(urls),
+                                outcomes=_outcomes((urls[0], "unsafe", "ssrf_guard"),
+                                                   (urls[1], "unsafe", "ssrf_guard")))
+    row = _row(cov, APP)
+    assert row["status"] == "failed" and "ssrf_guard" in row["reason"]
+    assert "host unreachable" not in row["reason"]
+
+
+def test_only_not_javascript_stays_no_input_and_says_why():
+    urls = [f"https://{APP}/static/js/main.{n}.js" for n in (1, 2)]
+    cov = js_recon._js_coverage({"metadata": {}, "http_probe": {"by_url": {}}}, {},
+                                "2026-01-01T00:00:00Z", js_urls=urls, selected=urls,
+                                unreachable=list(urls),
+                                outcomes=_outcomes((urls[0], "not_js", "html"),
+                                                   (urls[1], "not_js", "html")))
+    assert _row(cov, APP) == {"status": "no_input", "inputs": 0, "outputs": 0,
+                               "reason": "not_js"}
+
+
+def test_a_mixed_corpus_is_partial_with_the_real_reason_codes():
+    urls = [f"https://{APP}/static/js/main.{n}.js" for n in (1, 2)]
+    cov = js_recon._js_coverage({"metadata": {}, "http_probe": {"by_url": {}}}, {},
+                                "2026-01-01T00:00:00Z", js_urls=urls, selected=urls,
+                                downloaded=[{"url": urls[0]}], unreachable=[urls[1]],
+                                outcomes=_outcomes((urls[0], "ok", "cache_hit"),
+                                                   (urls[1], "http_403", "")))
+    assert _row(cov, APP) == {"status": "partial", "inputs": 1, "outputs": 0,
+                               "reason": "http_403"}
+
+
+class _Resp:
+    def __init__(self, status, headers=None, text=""):
+        self.status_code = status
+        self.headers = headers or {}
+        self.text = text
+
+
+class _Session:
+    def __init__(self, answers):
+        self.answers = answers
+
+    def get(self, url, **kw):
+        return self.answers[url]
+
+
+def test_the_real_downloader_feeds_its_outcomes_to_coverage(tmp_path):
+    """End to end through run_js_recon: a 403 and a 200 make the host partial
+    with the HTTP reason named - never the old blanket "host unreachable"."""
+    ok_url = f"https://{APP}/static/js/main.1.js"
+    denied_url = f"https://{APP}/static/js/main.2.js"
+    answers = {
+        ok_url: _Resp(200, {"Content-Type": "application/javascript"}, "var a = 1;\n"),
+        denied_url: _Resp(403, {"Content-Type": "text/html"}, "denied"),
+    }
+    combined = _combined(live=(APP,), discovered=(ok_url, denied_url))
+    settings = dict(SETTINGS, JS_RECON_TIMEOUT=30, JS_RECON_SOURCE_MAPS=False)
+    with mock.patch.object(js_recon, "_capture_session",
+                           return_value=(_Session(answers), False)), \
+            mock.patch.object(js_recon, "is_address_safe_to_scan", return_value=True), \
+            mock.patch.object(js_recon, "is_url_safe_to_probe", return_value=True):
+        out = js_recon.run_js_recon(combined, settings)
+    cov = out["js_recon"]["scan_metadata"]["coverage"]
+    row = _row(cov, APP)
+    assert row["status"] == "partial" and row["inputs"] == 1
+    assert "http_403" in row["reason"]
+    assert "host unreachable" not in (row["reason"] or "")

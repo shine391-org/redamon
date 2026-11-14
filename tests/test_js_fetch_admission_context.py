@@ -434,7 +434,10 @@ class DownloadSeamTests(unittest.TestCase):
         js_recon._identity_request_headers = lambda settings: {}
         js_recon._download_allowed = lambda url: True
 
-        def fake_get(url, *, timeout, headers, max_redirects=5, extra_headers=None):
+        def fake_get(url, *, timeout, headers, max_redirects=5, extra_headers=None,
+                     session=None):
+            self.assertIsNotNone(session)
+            self.assertFalse(session.trust_env)
             self.calls += 1
             try:
                 return next(self.responses)

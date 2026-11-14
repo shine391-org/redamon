@@ -92,11 +92,15 @@ class TestRegressionNucleiEarlyReturns:
         assert out["vuln_scan"]["security_checks"] == SECURITY["security_checks"]
         assert not cb.coverage_report().degraded
 
-    def test_empty_tags_with_a_dast_pass_still_runs_it_and_records_nothing(self, pipeline):
+    def test_empty_tags_with_a_dast_pass_still_runs_it_and_keeps_findings(self, pipeline):
+        """DAST still runs, but the DETECTION pass did not: its earlier
+        findings were not re-checked, so the prune must keep them."""
         vs.run_vuln_scan(_recon(), settings=_settings(NUCLEI_TAGS=[], NUCLEI_DAST_MODE=True))
         assert pipeline["passes"] == ["DAST"]
         assert pipeline["security"] == 1
-        assert not cb.coverage_report().degraded
+        report = cb.coverage_report()
+        assert {"nuclei", "vuln_scan"} <= report.degraded_sources
+        assert "security_check" not in report.degraded_sources
 
     def test_a_healthy_scan_is_unchanged(self, pipeline):
         out = vs.run_vuln_scan(_recon(), settings=_settings())

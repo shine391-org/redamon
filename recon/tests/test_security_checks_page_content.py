@@ -217,8 +217,9 @@ class TestPartialBuilder:
         found = {f["type"] for f in sc.run_page_content_checks(data, _all_on())}
         assert found == {"debug_page"}     # the unknown status is no 200 for Jenkins
 
-    def test_the_target_builders_still_skip_5xx(self):
+    def test_the_target_builders_keep_measured_5xx(self):
         from recon.helpers.target_helpers import build_target_urls_from_httpx
         data, _ = _build([{**ROW, "url": "https://err.example.test", "host": "err.example.test",
                            "status_code": 503}, ROW])
-        assert build_target_urls_from_httpx(data["http_probe"]) == ["https://ci.example.test"]
+        assert build_target_urls_from_httpx(data["http_probe"]) == [
+            "https://ci.example.test", "https://err.example.test"]

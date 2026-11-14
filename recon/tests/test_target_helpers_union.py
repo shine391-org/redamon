@@ -118,14 +118,14 @@ class TestBuildTargetUrlsUnion(unittest.TestCase):
                 "by_url": {
                     "https://a.com": {"status_code": 200},
                     "https://b.com:8443": {"status_code": 301},
-                    "https://dead.com": {"status_code": 502},  # >= 500 filtered
+                    "https://dead.com": {"status_code": 502},  # measured 5xx is retained
                 }
             }
         }
         urls = self._silent(TH.build_target_urls, set(), set(), recon_data=recon)
         self.assertIn("https://a.com", urls)
         self.assertIn("https://b.com:8443", urls)
-        self.assertNotIn("https://dead.com", urls)
+        self.assertIn("https://dead.com", urls)
 
     # --- Source 3: subdomain fallback for uncovered hosts ---------------
 
@@ -909,11 +909,11 @@ class TestBuildTargetUrlsEdgeCases(unittest.TestCase):
         urls = self._silent(TH.build_target_urls, set(), set(), recon_data=recon)
         self.assertIn("https://a.com", urls)
 
-    def test_status_500_excluded(self):
-        """5xx = server error, not a useful target."""
+    def test_status_500_included(self):
+        """A measured 5xx is an origin response and stays eligible."""
         recon = {"http_probe": {"by_url": {"https://a.com": {"status_code": 500}}}}
         urls = self._silent(TH.build_target_urls, set(), set(), recon_data=recon)
-        self.assertNotIn("https://a.com", urls)
+        self.assertIn("https://a.com", urls)
 
     def test_status_zero_excluded(self):
         """status_code=0 (falsy) excluded -- preserves existing build_target_urls_from_httpx behavior."""

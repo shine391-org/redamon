@@ -107,52 +107,91 @@ def _identity_request_headers(settings) -> dict:
     return identity_header_dict(settings)
 
 
+def _canonical_capture_route():
+    """``(host, port)`` of the capture proxy's loopback publish, or ``None``.
+
+    ``get_capture_routing`` is the only selector of a capture route; this is
+    the address its answer is checked against, so a stale answer (an old port)
+    or one naming another host is refused before it can receive the signed
+    context tag. Returns ``None`` when the routing module cannot be read, in
+    which case no canonical answer exists to check against.
+    """
+    try:
+        from helpers import proxy_routing as _proxy_routing
+    except Exception:  # noqa: BLE001 - without the module there is no route
+        return None
+    host = str(getattr(_proxy_routing, "_PROXY_HOST", "") or "").lower()
+    if not host:
+        return None
+    config = getattr(_proxy_routing, "_config", {}) or {}
+    port = config.get("port")
+    if port is None:
+        try:
+            port = _proxy_routing._proxy_port()
+        except Exception:  # noqa: BLE001
+            port = None
+    if port is None:
+        return None
+    try:
+        return host, int(port)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for a loopback IP literal or ``localhost``."""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 def _capture_session(tool="js_recon"):
     """A Requests session that keeps JS fetches on the canonical capture path.
 
-    Explicit routing wins. The environment is consulted only when it names the
-    same proxy host the capture configuration uses; an arbitrary inherited
-    proxy is ignored, because requests would otherwise carry X-Redamon-Ctx to a
-    third-party proxy. No route means a normal direct session.
+    ``trust_env`` is ALWAYS off, on every path: an inherited environment proxy
+    must never take these requests, because it cannot carry the signed context
+    tag and would leak the engagement identity header to a third party. The
+    environment is therefore never consulted. The only route ever used is the
+    one ``get_capture_routing`` returns, and only while it names the capture
+    proxy's own loopback publish; no route, no token, a bad scheme, a remote
+    host or a stale/wrong port all fall back to an ordinary direct session
+    with no context header.
     """
+    session = requests.Session()
+    session.trust_env = False
     try:
         from helpers.proxy_routing import get_capture_routing
         proxy_url, ctx_token = get_capture_routing(tool)
     except Exception:  # noqa: BLE001 - capture is an attribution aid, not a gate
-        return requests.Session(), False
-    session = requests.Session()
-    if not proxy_url:
-        # No canonical route was configured. A pre-existing environment proxy
-        # is usable only when it points at the capture host: the environment
-        # cannot carry X-Redamon-Ctx, and a session that silently trusts it
-        # would leak that header to an unrelated third-party proxy.
-        env_proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-                     or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "")
-        try:
-            from helpers import proxy_routing as _proxy_routing
-            configured_host = str(getattr(_proxy_routing, "_PROXY_HOST", "") or "")
-        except Exception:  # noqa: BLE001
-            configured_host = ""
-        env_host = urlparse(env_proxy).hostname if env_proxy else None
-        if env_proxy and configured_host and env_host and env_host == configured_host:
-            session.proxies.update({"http": env_proxy, "https": env_proxy})
-            session.trust_env = False
-            return session, False
         return session, False
-    if not ctx_token or not str(ctx_token).strip():
+    if not proxy_url or not ctx_token or not str(ctx_token).strip():
         # Never add an empty context header; without a token the proxy cannot
         # attribute the request, so keep the ordinary transport.
         return session, False
     parsed = urlparse(proxy_url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    if (parsed.scheme != "http" or not parsed.hostname or parsed.username is not None
+            or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
+        return session, False
+    host = (parsed.hostname or "").lower()
+    if not _is_loopback_host(host):
+        print(f"[!][JsRecon] refusing capture route {proxy_url}: not the loopback proxy")
+        return session, False
+    try:
+        route_port = parsed.port
+    except ValueError:
+        return session, False
+    canonical = _canonical_capture_route()
+    if canonical is None:
+        return session, False
+    if (host, route_port) != canonical:
+        print(f"[!][JsRecon] refusing stale capture route {proxy_url}: "
+              f"expected {canonical[0]}:{canonical[1]}")
         return session, False
     session.proxies.update({"http": proxy_url, "https": proxy_url})
     # The proxy removes this header before connecting to the origin. It is the
     # same header the other JS-aware tools carry; it is never sent direct.
     session.headers.update({"X-Redamon-Ctx": str(ctx_token)})
-    # An inherited proxy that is not the capture route must not silently take
-    # these requests. The explicit session proxy above is authoritative.
-    session.trust_env = False
     return session, True
 
 
@@ -784,9 +823,12 @@ def _download_js_files(
     Download JS files to local temp directory.
 
     Returns list of dicts with: url, filepath, content, headers, size.
-    `unreachable` collects the URLs never fetched: a host already known down,
-    or a request that raised. `settings`, when given, supplies the validated
-    engagement identity header (attrbuted like every other target request).
+    `unreachable` collects every selected URL that was NOT read: a host
+    already known down, a refused redirect, an HTTP error, a too-large or
+    empty body, a non-JS answer, or a request that raised. Each of those also
+    gets a FetchOutcome, whose status is the reason code `_js_coverage` names.
+    `settings`, when given, supplies the validated engagement identity header
+    (attrbuted like every other target request).
 
     `download_cache` (a DownloadCache) skips a URL this run already fetched;
     `metrics` counts attempts/bytes/cache hits; `outcomes` receives one
@@ -850,6 +892,7 @@ def _download_js_files(
                 )
                 if resp is None:
                     _record(url, 'unsafe', reason='ssrf_guard', retries=attempt - 1)
+                    unreachable.append(url)
                     return None
                 _js_alive(url)
                 if resp.status_code != 200:
@@ -862,24 +905,40 @@ def _download_js_files(
                     unreachable.append(url)
                     return None
 
-                # Check content length (pre-download check if header available)
-                content_length = resp.headers.get('Content-Length')
-                if content_length and int(content_length) > _MAX_JS_FILE_SIZE:
-                    print(f"[!][JsRecon] {url} -- too large ({int(content_length)} bytes)")
+                # Check content length (pre-download check if header available).
+                # A malformed Content-Length is not a size answer; fall through
+                # to the body-length check below.
+                content_length = None
+                try:
+                    raw_length = resp.headers.get('Content-Length')
+                    content_length = int(raw_length) if raw_length else None
+                except (TypeError, ValueError):
+                    content_length = None
+                if content_length is not None and content_length > _MAX_JS_FILE_SIZE:
+                    print(f"[!][JsRecon] {url} -- too large ({content_length} bytes)")
                     _record(url, 'too_large', status_code=resp.status_code,
                             retries=attempt - 1)
+                    unreachable.append(url)
                     return None
 
                 content = resp.text
-                if not content or len(content) > _MAX_JS_FILE_SIZE:
-                    _record(url, 'empty_or_too_large', status_code=resp.status_code,
+                if not content:
+                    _record(url, 'empty', status_code=resp.status_code,
                             retries=attempt - 1)
+                    unreachable.append(url)
+                    return None
+                if len(content) > _MAX_JS_FILE_SIZE:
+                    print(f"[!][JsRecon] {url} -- too large ({len(content)} bytes)")
+                    _record(url, 'too_large', status_code=resp.status_code,
+                            retries=attempt - 1)
+                    unreachable.append(url)
                     return None
                 accepted, why = accept_js_response(url, resp.headers.get('Content-Type'), content)
                 if not accepted:
                     print(f"[-][JsRecon] {url} -- not a JS file ({why})")
                     _record(url, 'not_js', status_code=resp.status_code, reason=why,
                             retries=attempt - 1)
+                    unreachable.append(url)
                     return None
 
                 filepath = work_dir / f"js_{idx}.js"
@@ -912,15 +971,25 @@ def _download_js_files(
                 print(f"[!][JsRecon] {url} -- {type(e).__name__}: {e}")
                 return None
 
-    with ThreadPoolExecutor(max_workers=min(concurrency, 20)) as executor:
-        futures = {
-            executor.submit(fetch_one, (i, url)): url
-            for i, url in enumerate(urls_to_fetch)
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                downloaded.append(result)
+    try:
+        with ThreadPoolExecutor(max_workers=min(concurrency, 20)) as executor:
+            futures = {
+                executor.submit(fetch_one, (i, url)): url
+                for i, url in enumerate(urls_to_fetch)
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    downloaded.append(result)
+    finally:
+        # The batch is over: release the session's sockets. A test fake (or a
+        # transport wrapper) may have no close(); that must not break the run.
+        closer = getattr(fetch_session, 'close', None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 - cleanup never fails a scan
+                pass
 
     print(f"[+][JsRecon] Downloaded {len(downloaded)}/{len(urls_to_fetch)} JS files "
           f"({sum(f['size'] for f in downloaded) / 1024 / 1024:.1f} MB total)")
@@ -1895,16 +1964,42 @@ def _considered_base_urls(combined_result: dict, settings: dict, js_urls) -> set
     return keys
 
 
+def _loss_reason(outcome) -> str:
+    """The coverage reason code one selected-but-unread URL earned.
+
+    A URL with no FetchOutcome (a caller or test that only names the loss)
+    keeps the historical ``host unreachable`` reading; every real outcome
+    carries its own status.
+    """
+    if outcome is None:
+        return 'host unreachable'
+    if isinstance(outcome, dict):
+        status = outcome.get('status') or ''
+        reason = outcome.get('reason') or ''
+    else:
+        status = getattr(outcome, 'status', '') or ''
+        reason = getattr(outcome, 'reason', '') or ''
+    if status in ('', 'ok', 'cache_hit'):
+        return 'not read'
+    if status == 'unsafe':
+        return str(reason) if reason else 'ssrf_guard'
+    return str(status)
+
+
 def _js_coverage(combined_result: dict, settings: dict, at: str, *, js_urls=(), selected=(),
                  downloaded=(), unreachable=(), unanalyzed=(), results=None, error=None,
-                 trufflehog_reason=None, trufflehog_urls=()) -> dict:
+                 trufflehog_reason=None, trufflehog_urls=(), outcomes=()) -> dict:
     """``{"at", "hosts": {base_url_key: row}}``, one row per considered host.
 
-    A host with no JS candidate, or whose candidates all turned out not to be
-    JavaScript, is ``no_input``. One whose files were all lost to an
-    unreachable host or a failed analyzer is ``failed``; one that lost some,
-    or had files cut by JS_RECON_MAX_FILES, is ``partial``, with the reasons.
-    A fatal error fails every host, since none of its findings reached output.
+    A host with no JS candidate is ``no_input``. Every selected-but-unread URL
+    feeds the row with the reason code it actually earned - an HTTP status,
+    ``too_large``, ``empty``, ``not_js``, an SSRF-guard refusal, a timeout or
+    a transport failure - never a blanket "host unreachable". A host that read
+    some of its files is ``partial``; one that read none is ``failed``, except
+    when its candidates simply turned out not to be JavaScript, which stays
+    ``no_input`` with that reason named. One that had files cut by
+    JS_RECON_MAX_FILES is ``partial``. A fatal error fails every host, since
+    none of its findings reached output.
 
     ``trufflehog_reason`` (a TruffleHog run that did not complete) is added to
     the reason of each host whose files TruffleHog was given
@@ -1922,10 +2017,22 @@ def _js_coverage(combined_result: dict, settings: dict, at: str, *, js_urls=(), 
                 counts[key] += 1
         return counts
 
+    outcome_by_url = {}
+    for outcome in outcomes or ():
+        url = (outcome.get('url') if isinstance(outcome, dict)
+               else getattr(outcome, 'url', None))
+        if isinstance(url, str) and url:
+            outcome_by_url.setdefault(url, outcome)
+
     candidates = by_host(set(js_urls))
     chosen = by_host(selected)
     read = by_host(f.get('url') for f in downloaded)
-    lost = by_host(unreachable)
+    lost_codes = {}
+    for url in unreachable:
+        key = base_url_key(url)
+        if not key:
+            continue
+        lost_codes.setdefault(key, Counter())[_loss_reason(outcome_by_url.get(url))] += 1
     dropped = by_host(u for u in unanalyzed if u)
     found = by_host(
         f.get('source_url') or f.get('js_url')
@@ -1939,22 +2046,32 @@ def _js_coverage(combined_result: dict, settings: dict, at: str, *, js_urls=(), 
         if error:
             hosts[key] = coverage_row('failed', reason=error)
             continue
-        reasons = [reason for reason, hit in (
-            ('file cap', candidates[key] > chosen[key]),
-            ('host unreachable', lost[key]),
-            ('analyzer failed or timed out', dropped[key]),
-        ) if hit]
-        if not candidates[key] or (not read[key] and not reasons):
+        codes = lost_codes.get(key) or Counter()
+        distinct = sorted(code for code in codes if code)
+        reasons = ['file cap'] if candidates[key] > chosen[key] else []
+        if distinct == ['host unreachable']:
+            reasons.append('host unreachable')
+        elif distinct:
+            reasons.extend(distinct)
+        if dropped[key]:
+            reasons.append('analyzer failed or timed out')
+        if not candidates[key]:
             status = 'no_input'
-        elif not reasons:
+        elif read[key] > 0 and not reasons:
             status = 'complete'
-        elif not read[key] and 'file cap' not in reasons:
-            status = 'failed'
-        else:
+        elif read[key] > 0:
             status = 'partial'
+        elif codes:
+            # All selected files were lost: that is a failure, unless they
+            # simply were not JavaScript (still no input, now explained).
+            status = 'no_input' if distinct == ['not_js'] else 'failed'
+        elif reasons:
+            status = 'partial'
+        else:
+            status = 'no_input'
         if trufflehog_hosts.get(key):
             reasons.append(trufflehog_reason)
-        hosts[key] = coverage_row(status, read[key], found[key], ', '.join(reasons))
+        hosts[key] = coverage_row(status, read[key], found[key], ', '.join(reasons) or None)
     return {'at': at, 'hosts': hosts}
 
 
@@ -2126,7 +2243,8 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
                 'scan_metadata': {
                     'mode': 'post_recon', 'js_files_analyzed': 0, 'file_budget': file_budget,
                     'coverage': _js_coverage(combined_result, settings, coverage_at, js_urls=js_urls,
-                                             selected=selected_urls, unreachable=unreachable),
+                                             selected=selected_urls, unreachable=unreachable,
+                                             outcomes=fetch_outcomes),
                 },
                 'secrets': [], 'endpoints': [], 'summary': {},
             }
@@ -2288,7 +2406,7 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
                     combined_result, settings, coverage_at, js_urls=js_urls, selected=selected_urls,
                     downloaded=downloaded, unreachable=unreachable, unanalyzed=unanalyzed or (),
                     results=results, trufflehog_reason=trufflehog_reason,
-                    trufflehog_urls=trufflehog_urls),
+                    trufflehog_urls=trufflehog_urls, outcomes=fetch_outcomes),
                 **({'trufflehog': trufflehog} if trufflehog else {}),
             },
             # Where the downloaded JS lives. GROUP 5.5 (supply-chain recon)

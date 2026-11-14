@@ -111,12 +111,28 @@ def record_outcome(plan: dict, status: str, *, completed: int = 0, partial: int 
         return plan
 
 
+def _execution_status(counts: dict, exhaustive: bool, deferred: bool) -> str:
+    """The status a set of pass counts proves. Shared by recording and merging."""
+    if counts["partial"] or (counts["completed"] and
+                             (counts["failed"] or counts["unknown"] or deferred)):
+        return "partial"
+    if counts["failed"] or counts["unknown"]:
+        return "failed"
+    if counts["completed"]:
+        return "complete" if exhaustive else "partial"
+    return "not_scanned"
+
+
 def record_execution(plan: dict, passes=(), *, deferred: bool = False) -> dict:
     """Account for subprocess passes/chunks, NOT matches or template tests.
 
     Exit success proves only completion of the selected invocation. It does not
     prove every target responded or that every template ran. Deferred is a
     pass-group marker (the planner owns exact deferred task counts).
+
+    A pass reported ``complete`` with ``ran=False`` proves nothing - the
+    invocation never happened - so it is counted as ``unknown``, never as
+    completed coverage.
     """
     passes = list(passes)
     counts = {field: 0 for field in OUTCOME_FIELDS}
@@ -124,27 +140,26 @@ def record_execution(plan: dict, passes=(), *, deferred: bool = False) -> dict:
     rows = []
     for urls, status, reason, ran in passes:
         urls = set(urls)
-        field = {"complete": "completed", "partial": "partial",
-                 "failed": "failed"}.get(status, "unknown")
-        counts[field] += 1
         if ran:
+            field = {"complete": "completed", "partial": "partial",
+                     "failed": "failed"}.get(status, "unknown")
             attempted.update(urls)
-        if status == "complete" and ran:
-            completed.update(urls)
-        else:
+            if status == "complete":
+                completed.update(urls)
+            else:
+                incomplete.update(urls)
+        elif status == "complete":
+            # A clean verdict on a pass that never ran is not evidence.
+            field = "unknown"
             incomplete.update(urls)
+        else:
+            field = {"partial": "partial", "failed": "failed"}.get(status, "unknown")
+            incomplete.update(urls)
+        counts[field] += 1
         rows.append({"status": status, "reason": reason, "attempted": bool(ran),
                      "targets": len(urls)})
     counts["deferred"] = int(bool(deferred))
-    if counts["partial"] or (counts["completed"] and
-                              (counts["failed"] or counts["unknown"] or deferred)):
-        status = "partial"
-    elif counts["failed"] or counts["unknown"]:
-        status = "failed"
-    elif counts["completed"]:
-        status = "complete" if is_exhaustive(plan) else "partial"
-    else:
-        status = "not_scanned"
+    status = _execution_status(counts, is_exhaustive(plan), bool(deferred))
     out = record_outcome(plan, status, **counts)
     out["outcome_unit"] = "subprocess_pass_or_chunk"
     out["deferred_unit"] = "pass_group_with_deferred_work"
@@ -189,6 +204,43 @@ def _worst(status: str) -> int:
         return len(STATUS_ORDER)
 
 
+def _merge_execution(plans: list) -> Optional[dict]:
+    """Aggregate several groups' ``execution`` blocks into one honest block.
+
+    Pass rows are concatenated, every scalar (attempted/completed passes,
+    attempted/completed URL counts) is SUMMED, and the status is the worst of
+    the groups' own - never the first group's stale verdict. Without this, a
+    merged batch reported only whichever group happened to merge first.
+    """
+    executions: list = []
+    for plan in plans:
+        execution = plan.get("execution") if isinstance(plan, dict) else None
+        if isinstance(execution, dict):
+            executions.append(execution)
+    if not executions:
+        return None
+    rows: list = []
+    totals = {"attempted_passes": 0, "completed_passes": 0, "attempted_urls": 0,
+              "urls_in_completed_passes": 0,
+              "urls_with_all_selected_passes_completed": 0}
+    for execution in executions:
+        for row in execution.get("passes") or []:
+            if isinstance(row, dict):
+                rows.append(dict(row))
+        for key in totals:
+            try:
+                totals[key] += int(execution.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+    template = executions[0]
+    return {
+        "status": min((e.get("status") or "complete" for e in executions), key=_worst),
+        "passes": rows,
+        **totals,
+        "completion_basis": template.get(
+            "completion_basis", "subprocess exit; not per-target/template verification"),
+    }
+
 def merge_plans(plans: Iterable[dict]) -> Optional[dict]:
     """Merge several groups' plans into one canonical plan.
 
@@ -231,6 +283,12 @@ def merge_plans(plans: Iterable[dict]) -> Optional[dict]:
     outcomes = out.setdefault("outcomes", {})
     for field in OUTCOME_FIELDS:
         outcomes[field] = sum(int((p.get("outcomes") or {}).get(field) or 0) for p in plans)
+
+    # The first group's execution block is stale for the batch: aggregate every
+    # group's passes and counters so the canonical plan describes the whole run.
+    merged_execution = _merge_execution(plans)
+    if merged_execution is not None:
+        out["execution"] = merged_execution
 
     out["exhaustive"] = all(is_exhaustive(p) for p in plans)
     out["scope"] = "partial" if any(p.get("scope") == "partial" for p in plans) else "full"

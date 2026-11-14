@@ -74,6 +74,35 @@ def _body_title(body):
     except Exception:  # noqa: BLE001 - malformed HTML is not a reason to lose the response
         return None
     return " ".join("".join(parser.parts).split())[:4096] or None
+
+
+def _is_html_media_type(content_type) -> bool:
+    """True only for media types that confirm an HTML document.
+
+    Title fallback needs explicit confirmation: ``text/html`` or
+    ``application/xhtml+xml``. JSON/plain-text bodies (and base64 payloads
+    that were never explicitly decoded) are never title candidates.
+    """
+    if not isinstance(content_type, str):
+        return False
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type in ("text/html", "application/xhtml+xml")
+
+
+def _looks_like_html_document(body: str) -> bool:
+    """Require a structural HTML marker, not merely tag-like text.
+
+    The media type alone can be wrong (a JSON body served as text/html). A
+    genuine HTML document carries one of these markers; arbitrary fragments
+    and embedded strings do not.
+    """
+    if not body:
+        return False
+    head = body[:8192].lower()
+    return any(marker in head for marker in (
+        "<!doctype html", "<html", "</html>", "<head", "</head>",
+        "<body", "</body>",
+    ))
 from helpers.ai_signal_catalog import (
     AI_HEADER_PATTERNS,
     match_ai_title,
@@ -1094,102 +1123,222 @@ _FOREIGN_PAGE_FIELDS = frozenset({
 _HTTP_BODY_EVIDENCE_CAP = 256 * 1024
 
 
-def _text_from_httpx_fields(entry: dict):
-    """Best-effort decoded response body, preferring httpx's decoded value.
+#: Status line that starts the RESPONSE block inside a raw HTTP transaction.
+_STATUS_LINE_RE = re.compile(r"^HTTP/\d+(?:\.\d+)?\s+\d{3}(?:\s|$)")
 
-    httpx has already decompressed the transport response and extracted the
-    title. Only a raw/base64 field from an older/newer tool shape needs local
-    decoding; if that value is already lossy, reconstructing it is not possible,
-    so the caller keeps the status/header evidence instead of inventing a title.
+#: Field names that explicitly mark their value as a base64-encoded body.
+_BASE64_BODY_KEYS = ("body_base64", "response_body_base64")
+
+#: Fields whose value declares the encoding of the accompanying body. Only an
+#: explicit ``base64`` value licenses binary decoding; ``gzip``/``deflate``
+#: alone describes compression, not the transport alphabet.
+_ENCODING_META_KEYS = ("body_encoding", "encoding", "content_encoding")
+
+#: Raw fields scanned for a response header block, best-first. ``raw_header``
+#: is the pure response header block; ``raw_response`` may also carry the
+#: request before it.
+_RAW_HEADER_KEYS = (
+    "response_headers", "response-headers", "raw_header", "raw-header",
+    "raw_response", "raw-response", "response",
+)
+
+
+def _response_block_parts(raw):
+    """Return ``(headers, body)`` for the RESPONSE part of a raw block.
+
+    A raw transaction may hold the request first (request headers, blank line,
+    then the response). Only the response status block is authoritative here:
+    skip to the first ``HTTP/x.y NNN`` line, collect header lines, then stop at
+    the first blank line. Request/auth headers and body lines containing ":"
+    are never returned as response headers.
     """
-    if not isinstance(entry, dict):
+    if not isinstance(raw, str) or not raw:
         return None, None
-    body = entry.get("body")
-    source = "body"
-    if isinstance(body, (bytes, bytearray)):
-        raw = bytes(body)
-    elif isinstance(body, str) and body:
-        raw = body.encode("utf-8", "surrogatepass")
-        import base64
-        try:
-            decoded = base64.b64decode(body, validate=True)
-            raw = decoded
-            source = "body_base64"
-        except Exception:  # noqa: BLE001
-            source = "body_text"
-        # httpx -irrb gives the raw wire header separately. Its Content-Encoding
-        # is authoritative: a base64 body below is still compressed even when
-        # the older named header field was dropped or normalized.
-        raw_header = entry.get("raw_header") if isinstance(entry.get("raw_header"), str) else ""
-        header_text = raw_header.lower()
-        if "content-encoding: gzip" in header_text:
-            source = "body_gzip"
-    else:
-        for key in ("response_body", "response-body", "raw_response", "raw-response"):
-            value = entry.get(key)
-            if isinstance(value, str) and value:
-                raw = value.encode("utf-8", "surrogatepass")
-                source = key
-                break
-        else:
-            return None, None
-    if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
-        return None, "too_large"
-    import base64
-    import gzip
-    import io
+    lines = raw.split("\n")
+    start = None
+    for idx, line in enumerate(lines):
+        if _STATUS_LINE_RE.match(line.strip()):
+            start = idx
+            break
+    if start is None:
+        return None, None
+    rest = lines[start + 1:]
+    headers = {}
+    last_name = None
+    body_start = len(rest)
+    for idx, line in enumerate(rest):
+        stripped = line.rstrip("\r")
+        if stripped == "":
+            body_start = idx + 1
+            break
+        # Obsolete line folding: a continuation of the previous header.
+        if stripped[:1] in (" ", "\t") and last_name:
+            headers[last_name] = f"{headers[last_name]} {stripped.strip()}".strip()
+            continue
+        if ":" in stripped:
+            name, value = stripped.split(":", 1)
+            name = name.strip()
+            if name:
+                headers[name] = value.strip()
+                last_name = name
+    return headers, "\n".join(rest[body_start:])
+
+
+def _bounded_decompress(raw):
+    """Decompress gzip/zlib with output bounded to the evidence cap.
+
+    Returns ``(status, data)`` where status is ``"uncompressed"``, ``"ok"``,
+    ``"truncated"`` or ``"malformed"``. ``decompressobj(..., max_length=cap+1)``
+    bounds allocation before a compression bomb can expand; a stream that
+    reaches the cap is reported as truncated rather than returned as a silent
+    prefix.
+    """
     import zlib
-    decompressed = None
-    if source in ("body_gzip", "body_base64"):
-        try:
-            decoded = base64.b64decode(body, validate=True)
-            if decoded[:2] == b"\x1f\x8b":
-                decompressed = gzip.GzipFile(fileobj=io.BytesIO(decoded)).read(_HTTP_BODY_EVIDENCE_CAP)
-        except Exception:  # noqa: BLE001 - malformed/base64 is evidence, not a clean page
-            decompressed = None
-    if decompressed is None and raw[:2] == b"\x1f\x8b":
-        try:
-            decompressed = gzip.GzipFile(fileobj=io.BytesIO(raw)).read(_HTTP_BODY_EVIDENCE_CAP)
-        except Exception:  # noqa: BLE001
-            decompressed = None
-    elif decompressed is None and raw[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
-        try:
-            decompressed = zlib.decompress(raw, bufsize=_HTTP_BODY_EVIDENCE_CAP)
-        except Exception:  # noqa: BLE001
-            decompressed = None
-    if decompressed is not None:
-        raw = decompressed
-        if source in ("body", "body_gzip", "body_base64"):
-            source = "body_gzip_decoded"
-    if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
-        return None, "too_large"
+    if raw[:2] == b"\x1f\x8b":
+        wbits = zlib.MAX_WBITS | 16
+    elif raw[:2] in (b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+        wbits = zlib.MAX_WBITS
+    else:
+        return "uncompressed", raw
+    try:
+        decomp = zlib.decompressobj(wbits)
+        out = decomp.decompress(raw, _HTTP_BODY_EVIDENCE_CAP + 1)
+    except zlib.error:
+        return "malformed", None
+    if len(out) > _HTTP_BODY_EVIDENCE_CAP:
+        return "truncated", None
+    if not decomp.eof or decomp.unconsumed_tail:
+        return "truncated", None
+    return "ok", out
+
+
+def _decode_bytes_evidence(raw, source):
+    """Decode already-binary evidence, decompressing safely when applicable."""
+    status, data = _bounded_decompress(raw)
+    if status == "ok" and data is not None:
+        return data.decode("utf-8", errors="replace"), "body_gzip_decoded"
+    if status == "truncated":
+        return None, "truncated"
+    if status == "malformed":
+        # Malformed compression is still evidence; show what was received.
+        return raw.decode("utf-8", errors="replace"), source
     return raw.decode("utf-8", errors="replace"), source
 
 
-def _record_response_headers(url_entry: dict, entry: dict) -> None:
-    """Keep the wire header evidence httpx already put in its JSON object.
+def _base64_decoded_upper_bound(encoded_len):
+    """Upper bound on decoded size, so the cap applies before allocating."""
+    return (encoded_len // 4) * 3 + 3
 
-    The transport parser reads a few named keys. A raw response block, when a
-    future httpx shape supplies one, is parsed only for header lines. Request
-    headers are deliberately not copied: this row describes the target's
-    response and must never be used as a record of what RedAmon sent.
+
+def _text_from_httpx_fields(entry: dict):
+    """Best-effort decoded response body, preserving default httpx -irr text.
+
+    Default ``-irr`` emits plain-text ``body`` (and plain-text ``header`` /
+    ``request`` / ``raw_header``); only ``-irrb`` base64-encodes them, and that
+    shape carries no per-entry marker. So a string is NEVER guessed to be
+    base64 from its alphabet: binary decoding requires explicit schema
+    metadata (a ``*_base64`` key or ``body_encoding: base64``). A
+    Content-Encoding header alone does not mark the body as base64; plain text
+    is preserved exactly instead of being transformed.
+
+    Compressed streams are bounded to ``_HTTP_BODY_EVIDENCE_CAP`` before they
+    can expand; oversize/truncated evidence is marked, never silently prefixed.
+    """
+    if not isinstance(entry, dict):
+        return None, None
+
+    import base64
+    candidates = []
+    for key in _BASE64_BODY_KEYS:
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            candidates.append((value, key, True))
+
+    encoding_meta = ""
+    for key in _ENCODING_META_KEYS:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            encoding_meta = value.strip().lower()
+            break
+    base64_allowed = encoding_meta == "base64"
+
+    body = entry.get("body")
+    if isinstance(body, (bytes, bytearray)):
+        candidates.append((bytes(body), "body", False))
+    elif isinstance(body, str) and body:
+        candidates.append((body, "body", base64_allowed))
+    if not candidates:
+        for key in ("response_body", "response-body", "raw_response", "raw-response"):
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                candidates.append((value, key, base64_allowed))
+                break
+    if not candidates:
+        return None, None
+
+    value, source_name, is_base64 = candidates[0]
+
+    if isinstance(value, bytes):
+        if len(value) > _HTTP_BODY_EVIDENCE_CAP:
+            return None, "too_large"
+        return _decode_bytes_evidence(value, source_name)
+
+    if is_base64:
+        # Base64 expands ~4/3: reject values whose decoded size cannot fit
+        # the cap before base64 allocates the full plaintext.
+        if _base64_decoded_upper_bound(len(value)) > _HTTP_BODY_EVIDENCE_CAP:
+            return None, "too_large"
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except Exception:  # noqa: BLE001 - malformed evidence stays unparsed
+            return None, "undecodable_base64"
+        if len(decoded) > _HTTP_BODY_EVIDENCE_CAP:
+            return None, "too_large"
+        return _decode_bytes_evidence(decoded, "body_base64")
+
+    # A raw transaction's body lives after its response status block.
+    if source_name in ("raw_response", "raw-response") and _STATUS_LINE_RE.search(value):
+        _headers, body_text = _response_block_parts(value)
+        if body_text is None:
+            return None, None
+        if len(body_text) > _HTTP_BODY_EVIDENCE_CAP:
+            return None, "too_large"
+        return body_text, f"{source_name}_body"
+
+    # Plain text: preserve it exactly. Only an actual compression magic starts
+    # bounded decompression; arbitrary alphabet strings are never "decoded".
+    if len(value) > _HTTP_BODY_EVIDENCE_CAP:
+        return None, "too_large"
+    raw = value.encode("utf-8", "surrogatepass")
+    if len(raw) > _HTTP_BODY_EVIDENCE_CAP:
+        return None, "too_large"
+    if raw[:2] in (b"\x1f\x8b", b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+        status, data = _bounded_decompress(raw)
+        if status == "ok" and data is not None:
+            return data.decode("utf-8", errors="replace"), "body_gzip_decoded"
+        if status == "truncated":
+            return None, "truncated"
+        return value, "body_text"
+    return value, "body_text"
+
+
+def _record_response_headers(url_entry: dict, entry: dict) -> None:
+    """Keep only the RESPONSE header evidence from httpx's JSON object.
+
+    The named ``header`` dict is used when present. Otherwise a raw block is
+    parsed with :func:`_response_block_parts`, which skips the request, starts
+    at the response status line, and stops at the first blank line — so auth
+    request headers and body pseudoheaders can never enter ``url_entry``.
     """
     headers = entry.get("header") if isinstance(entry.get("header"), dict) else None
     if not headers:
-        for key in ("response_headers", "response-headers", "raw_response", "raw-response"):
+        for key in _RAW_HEADER_KEYS:
             raw = entry.get(key)
             if isinstance(raw, str) and raw:
-                parsed = {}
-                in_headers = False
-                for line in raw.splitlines():
-                    if not in_headers and line.strip() == "":
-                        in_headers = True
-                        continue
-                    if ":" in line:
-                        name, value = line.split(":", 1)
-                        parsed[name.strip()] = value.strip()
-                headers = parsed
-                break
+                parsed, _body = _response_block_parts(raw)
+                if parsed is not None:
+                    headers = parsed
+                    break
     if headers:
         url_entry["headers"] = headers
 
@@ -1396,19 +1545,34 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
             if entry.get("hash"):
                 url_entry["body_hash"] = entry.get("hash")
 
+            # Response headers first: the media type gates the title fallback,
+            # and a raw block must yield only its response header section.
+            if not redirected_off_scope:
+                _record_response_headers(url_entry, entry)
+
             # Response body evidence (if included). Keep a bounded value even
             # for a non-HTML error page so a shared-edge signature can be
             # distinguished from an application response without another probe.
-            body_text, body_source = _text_from_httpx_fields(entry)
+            body_text, body_source = ((None, None) if redirected_off_scope
+                                      else _text_from_httpx_fields(entry))
             if body_text:
                 url_entry["body"] = body_text[:_HTTP_BODY_EVIDENCE_CAP]
-                if _body_title and not url_entry.get("title"):
+                content_type = url_entry.get("content_type")
+                if not isinstance(content_type, str) or not content_type:
+                    response_headers = url_entry.get("headers")
+                    if isinstance(response_headers, dict):
+                        for header_name, header_value in response_headers.items():
+                            if str(header_name).lower() == "content-type":
+                                content_type = header_value
+                                break
+                if (_body_title and not url_entry.get("title")
+                        and _is_html_media_type(content_type)
+                        and _looks_like_html_document(body_text[:_HTTP_BODY_EVIDENCE_CAP])):
                     decoded_title = _body_title(body_text[:_HTTP_BODY_EVIDENCE_CAP])
                     if decoded_title:
                         url_entry["title"] = decoded_title
             elif body_source:
                 url_entry["body_decode"] = body_source
-            _record_response_headers(url_entry, entry)
 
             # AI surface recon: annotate header / favicon / title / wappalyzer
             ai_fired = _annotate_ai_http_signals(url_entry, settings)

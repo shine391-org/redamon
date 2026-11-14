@@ -184,7 +184,11 @@ def summarize_selection(data):
         if not isinstance(plan, dict):
             continue
         status = plan.get("status")
-        modules[tool] = {"status": status if status in {"planned", "complete", "partial", "failed"} else "unknown",
+        # ``not_scanned`` is a real recorded outcome (record_execution with no
+        # pass), not an unknown one: a plan that ran nothing must be shown as
+        # such rather than collapsed to "unknown".
+        modules[tool] = {"status": status if status in {"planned", "complete", "partial",
+                                                        "failed", "not_scanned"} else "unknown",
                          "exhaustive": plan.get("exhaustive") is True,
                          "targets": numeric_fields(plan.get("targets"), ["count"]),
                          "outcomes": numeric_fields(plan.get("outcomes"),

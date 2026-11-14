@@ -1407,9 +1407,20 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             if not target_urls:
                 print("[*][Nuclei] DETECTION pass not scanned (no selected targets)")
                 d_findings, d_fps, d_duration = [], [], 0
+                # Nothing was selected, so nothing of Nuclei's was re-checked:
+                # its earlier findings are kept, and a failed pass is recorded
+                # BEFORE record_execution so plan, coverage and the prune guard
+                # all agree that this run proved nothing.
+                _keep_nuclei_findings("no selected Nuclei targets")
+                coverage_passes.append((_live_web_urls(recon_data), "failed",
+                                        "no selected targets", False))
             elif skip_detection_pass:
                 print("[*][Nuclei] DETECTION pass skipped (no tags + no custom templates)")
                 d_findings, d_fps, d_duration = [], [], 0
+                # The detection pass did not run even though DAST may have:
+                # keep the previous Nuclei findings this pass would have
+                # re-checked, and record the pass as failed for the plan.
+                _keep_nuclei_findings("no Nuclei templates selected")
                 coverage_passes.append((target_urls, "failed", "no Nuclei templates selected", False))
             elif not use_routed:
                 # Off/shadow mode: run legacy single detection pass
@@ -1667,6 +1678,11 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 if len(false_positives_filtered) > 5:
                     print(f"[*][Nuclei]   ... and {len(false_positives_filtered) - 5} more")
         
+            # Reconcile the no-executable-chunk guard BEFORE recording the
+            # plan, so execution and per-host coverage tell the same story.
+            if not coverage_passes and target_urls:
+                _keep_nuclei_findings("no selected Nuclei chunks executed")
+                coverage_passes.append((target_urls, "failed", "no selected chunks executed", False))
             selection_plan = record_execution(selection_plan, coverage_passes, deferred=_deferred)
             execution = selection_plan["execution"]
             attempted_urls = sorted({u for urls, _, _, ran in coverage_passes if ran for u in urls})
@@ -1676,9 +1692,6 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             # No executable routed chunks is not proof of coverage. Keep the
             # existing conservative host guard, without inventing an executed pass.
             host_passes = coverage_passes
-            if not coverage_passes and target_urls:
-                _keep_nuclei_findings("no selected Nuclei chunks executed")
-                host_passes = [(target_urls, "failed", "no selected chunks executed", False)]
 
             # Organize results
             nuclei_results = {
