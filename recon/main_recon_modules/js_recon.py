@@ -107,8 +107,57 @@ def _identity_request_headers(settings) -> dict:
     return identity_header_dict(settings)
 
 
+def _capture_session(tool="js_recon"):
+    """A Requests session that keeps JS fetches on the canonical capture path.
+
+    Explicit routing wins. The environment is consulted only when it names the
+    same proxy host the capture configuration uses; an arbitrary inherited
+    proxy is ignored, because requests would otherwise carry X-Redamon-Ctx to a
+    third-party proxy. No route means a normal direct session.
+    """
+    try:
+        from helpers.proxy_routing import get_capture_routing
+        proxy_url, ctx_token = get_capture_routing(tool)
+    except Exception:  # noqa: BLE001 - capture is an attribution aid, not a gate
+        return requests.Session(), False
+    session = requests.Session()
+    if not proxy_url:
+        # No canonical route was configured. A pre-existing environment proxy
+        # is usable only when it points at the capture host: the environment
+        # cannot carry X-Redamon-Ctx, and a session that silently trusts it
+        # would leak that header to an unrelated third-party proxy.
+        env_proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                     or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "")
+        try:
+            from helpers import proxy_routing as _proxy_routing
+            configured_host = str(getattr(_proxy_routing, "_PROXY_HOST", "") or "")
+        except Exception:  # noqa: BLE001
+            configured_host = ""
+        env_host = urlparse(env_proxy).hostname if env_proxy else None
+        if env_proxy and configured_host and env_host and env_host == configured_host:
+            session.proxies.update({"http": env_proxy, "https": env_proxy})
+            session.trust_env = False
+            return session, False
+        return session, False
+    if not ctx_token or not str(ctx_token).strip():
+        # Never add an empty context header; without a token the proxy cannot
+        # attribute the request, so keep the ordinary transport.
+        return session, False
+    parsed = urlparse(proxy_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return session, False
+    session.proxies.update({"http": proxy_url, "https": proxy_url})
+    # The proxy removes this header before connecting to the origin. It is the
+    # same header the other JS-aware tools carry; it is never sent direct.
+    session.headers.update({"X-Redamon-Ctx": str(ctx_token)})
+    # An inherited proxy that is not the capture route must not silently take
+    # these requests. The explicit session proxy above is authoritative.
+    session.trust_env = False
+    return session, True
+
+
 def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
-                       extra_headers=None):
+                       extra_headers=None, session=None):
     """GET that validates the SSRF guard on every hop (STRIDE I14).
 
     Follows redirects manually (allow_redirects=False) so a target-hosted JS URL
@@ -119,9 +168,11 @@ def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
     ``extra_headers`` (engagement identity) is merged into every hop with
     the caller's per-request headers taking precedence (case-insensitively),
     so attribution survives a redirect without ever duplicating a name.
+    ``session`` is the caller's capture-aware session when one was created.
     """
     from recon.helpers.auth_profile import merge_identity_headers
     merged = merge_identity_headers(headers or {}, extra_headers or {})
+    client = session if session is not None else requests
     current = url
     for _hop in range(max_redirects + 1):
         if not _download_allowed(current):
@@ -130,8 +181,8 @@ def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
         # The target's own files: its certificate may be self-signed or from an
         # internal CA, as httpx and katana already accepted. Never the key
         # validators, which send a secret to a third party.
-        resp = requests.get(current, timeout=timeout, headers=merged, allow_redirects=False,
-                            verify=False)
+        resp = client.get(current, timeout=timeout, headers=merged, allow_redirects=False,
+                          verify=False)
         if resp.status_code in (301, 302, 303, 307, 308):
             loc = resp.headers.get('Location') or resp.headers.get('location')
             if not loc:
@@ -748,6 +799,9 @@ def _download_js_files(
     if unreachable is None:
         unreachable = []
     identity_headers = _identity_request_headers(settings)
+    fetch_session, capture_routed = _capture_session("js_recon")
+    if capture_routed:
+        print("[*][JsRecon] JS downloads routed through capture proxy")
 
     print(f"[*][JsRecon] Downloading {len(urls_to_fetch)} JS files (max {max_files})...")
 
@@ -792,6 +846,7 @@ def _download_js_files(
                     timeout=min(timeout // 10, 30),
                     headers={'User-Agent': 'Mozilla/5.0 (compatible; RedAmon/1.0)'},
                     extra_headers=identity_headers,
+                    session=fetch_session,
                 )
                 if resp is None:
                     _record(url, 'unsafe', reason='ssrf_guard', retries=attempt - 1)
@@ -801,6 +856,10 @@ def _download_js_files(
                     print(f"[!][JsRecon] {url} -- HTTP {resp.status_code}")
                     _record(url, f'http_{resp.status_code}', status_code=resp.status_code,
                             retries=attempt - 1)
+                    # The response is evidence that this candidate was selected
+                    # and NOT read. It must reach _js_coverage, or all-403 and
+                    # mixed success/failure collapse into the same false state.
+                    unreachable.append(url)
                     return None
 
                 # Check content length (pre-download check if header available)
