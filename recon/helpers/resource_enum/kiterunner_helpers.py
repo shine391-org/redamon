@@ -31,6 +31,24 @@ except ImportError:  # direct/script import outside the package
     from tar_safe import safe_extract_tar  # type: ignore[import-not-found]
 
 
+# System-wide image location: the orchestrator may override USER to root, so
+# the capture executable must not be resolved only relative to Path.home().
+CAPTURE_BINARY_PATH = Path("/usr/local/bin/kr-capture")
+LEGACY_CAPTURE_BINARY_PATH = Path("/home/redamon/.redamon/tools/kiterunner/kr-capture")
+
+
+def resolve_kiterunner_capture_binary(binary_path: str) -> Optional[str]:
+    """Find the image binary independently of runtime HOME; never select stock kr."""
+    for candidate in (
+        CAPTURE_BINARY_PATH,
+        Path(binary_path).with_name("kr-capture"),
+        LEGACY_CAPTURE_BINARY_PATH,
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def _create_temp_dir(prefix: str = "kr") -> Path:
     """Create a temp directory under /tmp/redamon for Docker-in-Docker compatibility."""
     temp_dir = Path(f"/tmp/redamon/.{prefix}_{uuid.uuid4().hex[:8]}")
@@ -321,12 +339,18 @@ def run_kiterunner_discovery(
             # Only the patched transport understands --proxy. A stock binary
             # would exit 1 with "unknown flag"; sending it direct instead would
             # lose capture and hand the context header to the origin.
-            patched = Path(binary_path).with_name("kr-capture")
-            if patched.exists() and os.access(patched, os.X_OK):
-                cmd[0] = str(patched)
+            patched = resolve_kiterunner_capture_binary(binary_path)
+            if patched:
+                cmd[0] = patched
                 cmd.extend(["--proxy", _cap_url, "-H", f"X-Redamon-Ctx: {_cap_token}"])
             else:
                 print("[!][Kiterunner] Capture route requested but proxy-capable binary is unavailable")
+                from recon.helpers.resource_enum import tool_health
+                tool_health.report_empty(
+                    "kiterunner", tool_health.FAILURE, return_code=None,
+                    seeds=len(target_urls), elapsed_s=0,
+                    stderr="capture-capable binary unavailable; scan not executed",
+                )
                 return []
 
         from recon.helpers.resource_enum import tool_health
