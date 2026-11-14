@@ -20,7 +20,7 @@ import ipaddress
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # noqa: F401 - the tool tests fake docker through uncover_enrich.subprocess
 import tempfile
 import time
 import uuid
@@ -219,6 +219,20 @@ def _cleanup_uncover_container(container_name: str) -> bool:
     return False
 
 
+def _note_timed_out(queries: int) -> None:
+    """A gap for a search cut short: what the engines had not answered is
+    unknown. Uncover's results are assets, so there is no prune effect."""
+    try:
+        from recon.helpers import circuit_breaker as cb
+        cb.note_degraded("uncover", entries=[{
+            "source": "uncover",
+            "reason": f"timed out after {UNCOVER_TIMEOUT}s; the results written before it are kept",
+            "skipped": queries,
+        }])
+    except Exception:  # noqa: BLE001 - a lost note must not fail the expansion
+        pass
+
+
 def _run_uncover_docker(
     queries: list[str],
     engines: list[str],
@@ -253,16 +267,19 @@ def _run_uncover_docker(
 
     print(f"[*][Uncover] Running: engines={engines}, queries={queries}")
 
+    from recon.helpers.docker_helpers import run_tool_container
     result = None
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=UNCOVER_TIMEOUT,
+        # The helper and finally must own the same UUID. Otherwise the helper
+        # prepends a second --name and its timeout kill targets the wrong one.
+        result = run_tool_container(
+            cmd, tool="uncover", timeout=UNCOVER_TIMEOUT, name=container_name,
         )
 
-        if result.returncode != 0:
+        if result.timed_out:
+            print("[!][Uncover] Timed out: stopped it, keeping the results it wrote")
+            _note_timed_out(len(queries))
+        elif result.returncode != 0:
             stderr = (result.stderr or '').strip()
             if stderr:
                 for line in stderr.split('\n')[:5]:
@@ -270,8 +287,6 @@ def _run_uncover_docker(
                     if line and not line.startswith('[WRN]'):
                         print(f"[!][Uncover] stderr: {line}")
 
-    except subprocess.TimeoutExpired:
-        print("[!][Uncover] Timed out — partial results may be available")
     except FileNotFoundError:
         print("[!][Uncover] Docker not found — skipping")
         return []
@@ -560,6 +575,29 @@ def run_uncover_expansion(
             pass
 
 
+def _drop_refused_urls(uncover_data: dict, refused: set, settings: Optional[dict]) -> None:
+    """Keep only the URLs on a host the merge did not refuse, in place.
+
+    update_graph_from_uncover writes each URL as a BaseURL and an Endpoint,
+    and partial scans read those back as targets. ``refused`` is the names the
+    gates dropped; the RoE is checked on every URL host as well, because a
+    search-engine row's url can name a host its host field does not, and no
+    gate saw that one.
+    """
+    from recon.helpers.roe_scope import _filter_roe_excluded
+
+    urls = uncover_data.get("urls") or []
+    if not urls:
+        return
+    hosts = {_extract_hostname_from_url(u) for u in urls} - refused
+    admitted = set(_filter_roe_excluded(sorted(hosts), settings or {}, label="Uncover URL host"))
+    kept = [u for u in urls if _extract_hostname_from_url(u) in admitted]
+    if len(kept) != len(urls):
+        print(f"[*][Uncover] {len(urls) - len(kept)} URL(s) dropped: their host failed the "
+              f"scope gates or the RoE excludes it")
+    uncover_data["urls"] = kept
+
+
 def merge_uncover_into_pipeline(
     combined_result: dict,
     uncover_data: dict,
@@ -574,6 +612,8 @@ def merge_uncover_into_pipeline(
     discovered name (merge_discovered_hostnames): apex allow-list, RoE
     exclusions, hostname syntax, and no name resolving to a non-routable
     address. ``domain`` empty means no apex to test against: nothing is added.
+    A URL whose host those gates refused, or the RoE excludes, leaves the
+    payload too.
 
     Returns count of new assets merged.
     """
@@ -592,6 +632,7 @@ def merge_uncover_into_pipeline(
                                 if scope.admits(_extract_hostname_from_url(u))]
         if dropped:
             print(f"[*][Uncover] Listed hosts only (exact scope): {dropped} discovered name(s)/IP(s) not merged")
+        _drop_refused_urls(uncover_data, set(), settings)
         return 0
 
     dns = combined_result.setdefault("dns", {})
@@ -599,6 +640,7 @@ def merge_uncover_into_pipeline(
     merged = 0
 
     new_hosts = [h for h in uncover_data.get("hosts", []) if h not in subdomains]
+    rejected: set = set()
     if new_hosts:
         from recon.helpers.target_helpers import merge_discovered_hostnames
         before = set(subdomains)
@@ -612,6 +654,7 @@ def merge_uncover_into_pipeline(
         if rejected:
             uncover_data["hosts"] = [h for h in uncover_data.get("hosts", []) if h not in rejected]
             print(f"[*][Uncover] {len(rejected)} hostname(s) failed the scope gates and are dropped")
+    _drop_refused_urls(uncover_data, rejected, settings)
 
     existing_ips = set()
     domain_dns = dns.get("domain", {})

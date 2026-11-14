@@ -23,7 +23,16 @@ vi.mock('next/headers', () => ({
   })),
 }))
 
-import { getEffectiveUser } from './session'
+// getSession reads role and existence from the database (HD-10): every account these
+// tests sign in as, or act as, exists with the role its token claims.
+const DB_ROLES: Record<string, string> = { 'std-1': 'standard', 'admin-1': 'admin', 'user-X': 'standard', 'victim': 'standard' }
+const dbUser = async ({ where }: { where: { id: string } }) =>
+  DB_ROLES[where.id]
+    ? { id: where.id, email: `${where.id}@e2e.local`, role: DB_ROLES[where.id], password: 'h', createdAt: new Date(0) }
+    : null
+vi.mock('@/lib/prisma', () => ({ default: { user: { findUnique: (a: { where: { id: string } }) => dbUser(a) } } }))
+
+import { getEffectiveUser, getAuthzIdentity, getSession, authzIdentityOf } from './session'
 import { createToken, createActAsToken } from './auth'
 
 describe('getEffectiveUser', () => {
@@ -75,5 +84,97 @@ describe('getEffectiveUser', () => {
     authCookie = await createToken('admin-1', 'admin')
     actAsCookie = 'not-a-jwt'
     expect(await getEffectiveUser()).toEqual({ userId: 'admin-1' })
+  })
+})
+
+/**
+ * getAuthzIdentity (step 3.5): what can() decides on. The real account and the account acted
+ * as, read exactly as getSession and getEffectiveUser read them.
+ */
+describe('getAuthzIdentity', () => {
+  beforeEach(() => {
+    authCookie = undefined
+    actAsCookie = undefined
+  })
+
+  test('null when there is no session', async () => {
+    expect(await getAuthzIdentity()).toBeNull()
+  })
+
+  test('the real session and its account; no act-as', async () => {
+    authCookie = await createToken('admin-1', 'admin')
+    const id = await getAuthzIdentity()
+    expect(id?.session).toEqual({ userId: 'admin-1', role: 'admin' })
+    expect(id?.principal).toMatchObject({ id: 'admin-1', role: 'admin', email: 'admin-1@e2e.local' })
+    expect(id?.actingAs).toBeNull()
+  })
+
+  test('an admin acting as X: the session stays the admin, actingAs is X', async () => {
+    authCookie = await createToken('admin-1', 'admin')
+    actAsCookie = await createActAsToken('admin-1', 'user-X')
+    const id = await getAuthzIdentity()
+    expect(id?.session.userId).toBe('admin-1')
+    expect(id?.actingAs).toMatchObject({ id: 'user-X', role: 'standard' })
+  })
+
+  test('acting as oneself is no act-as', async () => {
+    authCookie = await createToken('admin-1', 'admin')
+    actAsCookie = await createActAsToken('admin-1', 'admin-1')
+    expect((await getAuthzIdentity())?.actingAs).toBeNull()
+  })
+
+  test('the effective user it gives is getEffectiveUser\'s, in every case above', async () => {
+    const cases: Array<[string, string, (() => Promise<string>) | null]> = [
+      ['std-1', 'standard', () => createActAsToken('std-1', 'victim')],
+      ['std-1', 'standard', () => createActAsToken('some-admin', 'victim')],
+      ['admin-1', 'admin', null],
+      ['admin-1', 'admin', () => createActAsToken('admin-1', 'user-X')],
+      ['admin-1', 'admin', () => createActAsToken('admin-2', 'user-X')],
+      ['admin-1', 'admin', () => createActAsToken('admin-1', 'nobody')],
+      ['admin-1', 'admin', async () => 'not-a-jwt'],
+    ]
+    for (const [sub, role, actAs] of cases) {
+      authCookie = await createToken(sub, role)
+      actAsCookie = actAs ? await actAs() : undefined
+      const id = await getAuthzIdentity()
+      const effective = await getEffectiveUser()
+      expect([sub, actAsCookie && 'act-as', { userId: (id!.actingAs ?? id!.principal).id }]).toEqual([sub, actAsCookie && 'act-as', effective])
+    }
+  })
+})
+
+/**
+ * authzIdentityOf (step 3.12): getAuthzIdentity for a session getSession already answered, so a
+ * route that reads the session itself (/api/auth/me) reads the act-as cookie once more and the
+ * login cookie and the account not again.
+ */
+describe('authzIdentityOf', () => {
+  beforeEach(() => {
+    authCookie = undefined
+    actAsCookie = undefined
+  })
+
+  test('the same answer as getAuthzIdentity, in every act-as case', async () => {
+    const cases: Array<[string, string, (() => Promise<string>) | null]> = [
+      ['std-1', 'standard', () => createActAsToken('std-1', 'victim')],
+      ['admin-1', 'admin', null],
+      ['admin-1', 'admin', () => createActAsToken('admin-1', 'user-X')],
+      ['admin-1', 'admin', () => createActAsToken('admin-1', 'admin-1')],
+      ['admin-1', 'admin', () => createActAsToken('admin-2', 'user-X')],
+      ['admin-1', 'admin', () => createActAsToken('admin-1', 'nobody')],
+    ]
+    for (const [sub, role, actAs] of cases) {
+      authCookie = await createToken(sub, role)
+      actAsCookie = actAs ? await actAs() : undefined
+      const session = await getSession()
+      const of = await authzIdentityOf(session!)
+      const whole = await getAuthzIdentity()
+      expect([sub, of.session, of.principal.id, of.actingAs?.id ?? null])
+        .toEqual([sub, whole!.session, whole!.principal.id, whole!.actingAs?.id ?? null])
+    }
+  })
+
+  test('a session object getSession did not answer throws: no account was read for it', async () => {
+    await expect(authzIdentityOf({ userId: 'admin-1', role: 'admin' })).rejects.toThrow(/no account read/)
   })
 })

@@ -261,6 +261,37 @@ def _uid() -> str:
     return str(uuid.uuid4())
 
 
+# ---------------------------------------------------------------------------
+# Tenant scope of every chain write
+# ---------------------------------------------------------------------------
+#
+# A chain id is the ticket's session id, which the browser chooses, and a person
+# who can read a shared project's graph sees its chain ids. So every chain and
+# step write keys on its id AND the tenant's user_id AND project_id, and a chain
+# id another tenant or project already holds is refused before anything is
+# written: merging into it would rewrite the owner's chain from another project.
+# This probe is the one query that matches a chain by its id alone.
+CHAIN_HELD_ELSEWHERE_CYPHER = """
+MATCH (ac:AttackChain {chain_id: $chain_id})
+WHERE coalesce(ac.user_id, '') <> $user_id
+   OR coalesce(ac.project_id, '') <> $project_id
+RETURN ac.chain_id AS chain_id
+LIMIT 1
+"""
+
+
+def _chain_held_elsewhere(session, chain_id, user_id, project_id, write: str) -> bool:
+    """True (and logged) when `chain_id` names another tenant's or project's chain."""
+    held = session.run(CHAIN_HELD_ELSEWHERE_CYPHER, {
+        "chain_id": chain_id, "user_id": user_id, "project_id": project_id,
+    }).single()
+    if held is None:
+        return False
+    logger.warning("[rbac] chain_tenant_mismatch write=%s chain=%s user=%s project=%s: nothing written",
+                   write, chain_id, user_id, project_id)
+    return True
+
+
 _IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
 
 
@@ -391,10 +422,8 @@ def _write_attack_chain(
 ):
     driver = _get_driver(uri, user, password)
     cypher = """
-    MERGE (ac:AttackChain {chain_id: $chain_id})
+    MERGE (ac:AttackChain {chain_id: $chain_id, user_id: $user_id, project_id: $project_id})
     ON CREATE SET
-        ac.user_id       = $user_id,
-        ac.project_id    = $project_id,
         ac.title          = $title,
         ac.objective      = $objective,
         ac.status         = 'active',
@@ -442,6 +471,8 @@ def _write_attack_chain(
         MERGE (ac)-[:CHAIN_TARGETS]->(d))
     """
     with _session(driver) as session:
+        if _chain_held_elsewhere(session, chain_id, user_id, project_id, "AttackChain"):
+            return
         session.run(cypher, {
             "chain_id": chain_id,
             "user_id": user_id,
@@ -591,11 +622,9 @@ def _write_step(
 
     # Main step node (always created)
     cypher = """
-    MERGE (s:ChainStep {step_id: $step_id})
+    MERGE (s:ChainStep {step_id: $step_id, user_id: $user_id, project_id: $project_id})
     ON CREATE SET
         s.chain_id          = $chain_id,
-        s.user_id           = $user_id,
-        s.project_id        = $project_id,
         s.iteration         = $iteration,
         s.phase             = $phase,
         s.tool_name         = $tool_name,
@@ -634,18 +663,21 @@ def _write_step(
         "fireteam_id": fireteam_id,
     }
 
+    tenant = {"user_id": user_id, "project_id": project_id}
     with _session(driver) as session:
+        if _chain_held_elsewhere(session, chain_id, user_id, project_id, "ChainStep"):
+            return
         session.run(cypher, params)
 
         # Only the first step links to AttackChain (no prev = first step)
         if not prev_step_id:
             session.run(
                 """
-                MATCH (ac:AttackChain {chain_id: $chain_id})
-                MATCH (s:ChainStep {step_id: $step_id})
+                MATCH (ac:AttackChain {chain_id: $chain_id, user_id: $user_id, project_id: $project_id})
+                MATCH (s:ChainStep {step_id: $step_id, user_id: $user_id, project_id: $project_id})
                 MERGE (ac)-[:HAS_STEP]->(s)
                 """,
-                {"chain_id": chain_id, "step_id": step_id},
+                {"chain_id": chain_id, "step_id": step_id, **tenant},
             )
 
         # Link to previous step: either through a decision or directly
@@ -653,11 +685,12 @@ def _write_step(
             # Check if previous step has a ChainDecision attached
             result = session.run(
                 """
-                MATCH (prev:ChainStep {step_id: $prev_id})-[:LED_TO]->(d:ChainDecision)
+                MATCH (prev:ChainStep {step_id: $prev_id, user_id: $user_id, project_id: $project_id})
+                      -[:LED_TO]->(d:ChainDecision)
                 RETURN d.decision_id AS did
                 LIMIT 1
                 """,
-                {"prev_id": prev_step_id},
+                {"prev_id": prev_step_id, **tenant},
             )
             has_decision = result.single() is not None
 
@@ -665,21 +698,22 @@ def _write_step(
                 # Route through the decision: decision -> current step
                 session.run(
                     """
-                    MATCH (prev:ChainStep {step_id: $prev_id})-[:LED_TO]->(d:ChainDecision)
-                    MATCH (curr:ChainStep {step_id: $curr_id})
+                    MATCH (prev:ChainStep {step_id: $prev_id, user_id: $user_id, project_id: $project_id})
+                          -[:LED_TO]->(d:ChainDecision)
+                    MATCH (curr:ChainStep {step_id: $curr_id, user_id: $user_id, project_id: $project_id})
                     MERGE (d)-[:DECISION_PRECEDED]->(curr)
                     """,
-                    {"prev_id": prev_step_id, "curr_id": step_id},
+                    {"prev_id": prev_step_id, "curr_id": step_id, **tenant},
                 )
             else:
                 # Direct sequential link
                 session.run(
                     """
-                    MATCH (prev:ChainStep {step_id: $prev_id})
-                    MATCH (curr:ChainStep {step_id: $curr_id})
+                    MATCH (prev:ChainStep {step_id: $prev_id, user_id: $user_id, project_id: $project_id})
+                    MATCH (curr:ChainStep {step_id: $curr_id, user_id: $user_id, project_id: $project_id})
                     MERGE (prev)-[:NEXT_STEP]->(curr)
                     """,
-                    {"prev_id": prev_step_id, "curr_id": step_id},
+                    {"prev_id": prev_step_id, "curr_id": step_id, **tenant},
                 )
 
         # Bridge relationships (skip for query_graph — it only reads existing data)
@@ -744,7 +778,7 @@ def _resolve_step_bridges(session, step_id, extracted_info, user_id, project_id)
         if _looks_like_ip(primary_target):
             session.run(
                 """
-                MATCH (s:ChainStep {step_id: $step_id})
+                MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
                 OPTIONAL MATCH (ip:IP {address: $ip, user_id: $uid, project_id: $pid})
                 FOREACH (_ IN CASE WHEN ip IS NOT NULL THEN [1] ELSE [] END |
                     MERGE (s)-[:STEP_TARGETED]->(ip))
@@ -754,7 +788,7 @@ def _resolve_step_bridges(session, step_id, extracted_info, user_id, project_id)
         else:
             session.run(
                 """
-                MATCH (s:ChainStep {step_id: $step_id})
+                MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
                 OPTIONAL MATCH (sub:Subdomain {name: $hostname, user_id: $uid, project_id: $pid})
                 FOREACH (_ IN CASE WHEN sub IS NOT NULL THEN [1] ELSE [] END |
                     MERGE (s)-[:STEP_TARGETED]->(sub))
@@ -768,7 +802,7 @@ def _resolve_step_bridges(session, step_id, extracted_info, user_id, project_id)
         session.run(
             """
             UNWIND $ports AS port_num
-            MATCH (s:ChainStep {step_id: $step_id})
+            MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
             OPTIONAL MATCH (p:Port {number: port_num, user_id: $uid, project_id: $pid})
             FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
                 MERGE (s)-[:STEP_TARGETED]->(p))
@@ -782,7 +816,7 @@ def _resolve_step_bridges(session, step_id, extracted_info, user_id, project_id)
         session.run(
             """
             UNWIND $vulns AS cve_id
-            MATCH (s:ChainStep {step_id: $step_id})
+            MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
             OPTIONAL MATCH (c:CVE {id: cve_id})   // K1: no tenant keys on CVE
             FOREACH (_ IN CASE WHEN c IS NOT NULL THEN [1] ELSE [] END |
                 MERGE (s)-[:STEP_EXPLOITED]->(c))
@@ -796,7 +830,7 @@ def _resolve_step_bridges(session, step_id, extracted_info, user_id, project_id)
         session.run(
             """
             UNWIND $techs AS tech_name
-            MATCH (s:ChainStep {step_id: $step_id})
+            MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
             OPTIONAL MATCH (t:Technology {user_id: $uid, project_id: $pid})
                 WHERE toLower(t.name) = toLower(tech_name)
             WITH s, tech_name, head(collect(t)) AS t
@@ -882,7 +916,7 @@ def _write_finding(
     # MATCH step first so the finding is only created if the step exists
     # (prevents orphaned findings when fire_record_step hasn't completed yet)
     cypher = """
-    MATCH (s:ChainStep {step_id: $step_id})
+    MATCH (s:ChainStep {step_id: $step_id, user_id: $user_id, project_id: $project_id})
     CREATE (f:ChainFinding {
         finding_id:   $finding_id,
         chain_id:     $chain_id,
@@ -925,6 +959,8 @@ def _write_finding(
     }
 
     with _session(driver) as session:
+        if _chain_held_elsewhere(session, chain_id, user_id, project_id, "ChainFinding"):
+            return
         result = session.run(cypher, params)
         if result.single() is None:
             logger.warning("ChainStep %s not found — skipping finding %s", step_id, title[:60])
@@ -1221,10 +1257,12 @@ def _write_failure(
     })
     SET fl.updated_at = datetime()
     WITH fl
-    MATCH (s:ChainStep {step_id: $step_id})
+    MATCH (s:ChainStep {step_id: $step_id, user_id: $user_id, project_id: $project_id})
     MERGE (s)-[:FAILED_WITH]->(fl)
     """
     with _session(driver) as session:
+        if _chain_held_elsewhere(session, chain_id, user_id, project_id, "ChainFailure"):
+            return
         session.run(cypher, {
             "failure_id": failure_id,
             "chain_id": chain_id,
@@ -1324,16 +1362,19 @@ def _write_decision(
     }
 
     with _session(driver) as session:
+        if _chain_held_elsewhere(session, chain_id, user_id, project_id, "ChainDecision"):
+            return
         session.run(cypher, params)
         # Link to the step that triggered this decision
         if step_id:
             session.run(
                 """
-                MATCH (s:ChainStep {step_id: $step_id})
+                MATCH (s:ChainStep {step_id: $step_id, user_id: $user_id, project_id: $project_id})
                 MATCH (d:ChainDecision {decision_id: $decision_id})
                 MERGE (s)-[:LED_TO]->(d)
                 """,
-                {"step_id": step_id, "decision_id": decision_id},
+                {"step_id": step_id, "decision_id": decision_id,
+                 "user_id": user_id, "project_id": project_id},
             )
     logger.debug("[%s/%s] ChainDecision created: %s -> %s", user_id, project_id, from_state, to_state)
 
@@ -1448,13 +1489,16 @@ def _write_exploit_success(
         props["password"] = password_found
 
     with _session(driver) as session:
+        if _chain_held_elsewhere(session, chain_id, user_id, project_id, "exploit success"):
+            return
         # Guard: skip if an exploit_success finding already exists for this step
         dup_check = session.run(
             """
-            MATCH (s:ChainStep {step_id: $step_id})-[:PRODUCED]->(f:ChainFinding {finding_type: 'exploit_success'})
+            MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
+                  -[:PRODUCED]->(f:ChainFinding {finding_type: 'exploit_success'})
             RETURN f.finding_id AS fid LIMIT 1
             """,
-            {"step_id": step_id},
+            {"step_id": step_id, "uid": user_id, "pid": project_id},
         )
         if dup_check.single() is not None:
             logger.debug("Exploit success finding already exists for step %s — skipping", step_id)
@@ -1462,14 +1506,14 @@ def _write_exploit_success(
 
         # Create ChainFinding(exploit_success) node — only if step exists
         cypher = """
-        MATCH (s:ChainStep {step_id: $step_id})
+        MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
         CREATE (f:ChainFinding $props)
         SET f.created_at = datetime()
         SET f.updated_at = datetime()
         MERGE (s)-[:PRODUCED]->(f)
         RETURN f.finding_id AS fid
         """
-        result = session.run(cypher, {"props": props, "step_id": step_id})
+        result = session.run(cypher, {"props": props, "step_id": step_id, "uid": user_id, "pid": project_id})
         if result.single() is None:
             logger.warning("ChainStep %s not found — skipping exploit success finding", step_id)
             return
@@ -1516,7 +1560,7 @@ def _write_exploit_success(
             if _looks_like_ip(target_ip):
                 session.run(
                     """
-                    MATCH (s:ChainStep {step_id: $step_id})
+                    MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
                     OPTIONAL MATCH (ip:IP {address: $ip, user_id: $uid, project_id: $pid})
                     FOREACH (_ IN CASE WHEN ip IS NOT NULL THEN [1] ELSE [] END |
                         MERGE (s)-[:STEP_TARGETED]->(ip))
@@ -1526,7 +1570,7 @@ def _write_exploit_success(
             else:
                 session.run(
                     """
-                    MATCH (s:ChainStep {step_id: $step_id})
+                    MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
                     OPTIONAL MATCH (sub:Subdomain {name: $hostname, user_id: $uid, project_id: $pid})
                     FOREACH (_ IN CASE WHEN sub IS NOT NULL THEN [1] ELSE [] END |
                         MERGE (s)-[:STEP_TARGETED]->(sub))
@@ -1539,7 +1583,7 @@ def _write_exploit_success(
             session.run(
                 """
                 UNWIND $cves AS cve_id
-                MATCH (s:ChainStep {step_id: $step_id})
+                MATCH (s:ChainStep {step_id: $step_id, user_id: $uid, project_id: $pid})
                 OPTIONAL MATCH (c:CVE {id: cve_id})   // K1: no tenant keys on CVE
                 FOREACH (_ IN CASE WHEN c IS NOT NULL THEN [1] ELSE [] END |
                     MERGE (s)-[:STEP_EXPLOITED]->(c))
@@ -1569,13 +1613,23 @@ def fire_update_chain_status(
     successful_steps: int = 0,
     failed_steps: int = 0,
     phases_reached: Optional[List[str]] = None,
+    user_id: str = "",
+    project_id: str = "",
 ) -> None:
+    """Close the chain `chain_id` of the tenant `user_id` (the project's owner) in
+    `project_id`. Without both nothing is written: a chain id alone could match
+    another project's chain (session ids come from the browser)."""
     if not neo4j_uri or not neo4j_password:
+        return
+    if not user_id or not project_id:
+        logger.warning("AttackChain %s status not written: no tenant", chain_id)
         return
     _fire_and_forget(
         _write_chain_status,
         neo4j_uri, neo4j_user, neo4j_password,
         chain_id=chain_id,
+        user_id=user_id,
+        project_id=project_id,
         status=status,
         final_outcome=final_outcome,
         total_steps=total_steps,
@@ -1588,12 +1642,12 @@ def fire_update_chain_status(
 def _write_chain_status(
     uri, user, password,
     *,
-    chain_id, status, final_outcome,
+    chain_id, user_id, project_id, status, final_outcome,
     total_steps, successful_steps, failed_steps, phases_reached,
 ):
     driver = _get_driver(uri, user, password)
     cypher = """
-    MATCH (ac:AttackChain {chain_id: $chain_id})
+    MATCH (ac:AttackChain {chain_id: $chain_id, user_id: $user_id, project_id: $project_id})
     SET ac.status           = $status,
         ac.final_outcome    = $final_outcome,
         ac.total_steps      = $total_steps,
@@ -1605,6 +1659,8 @@ def _write_chain_status(
     with _session(driver) as session:
         session.run(cypher, {
             "chain_id": chain_id,
+            "user_id": user_id,
+            "project_id": project_id,
             "status": status or "completed",
             "final_outcome": final_outcome or "",
             "total_steps": total_steps,
@@ -1612,6 +1668,7 @@ def _write_chain_status(
             "failed_steps": failed_steps,
             "phases_reached": phases_reached or [],
         })
+    logger.info("AttackChain %s status -> %s (steps=%d)", chain_id, status, total_steps)
 
 
 def fire_update_chain_attack_path(
@@ -1621,35 +1678,44 @@ def fire_update_chain_attack_path(
     *,
     chain_id: str,
     attack_path_type: str,
+    user_id: str = "",
+    project_id: str = "",
 ) -> None:
     """Persist a mid-run attack-skill switch to the AttackChain node.
 
     Called from the think_node switch_skill handler so the graph/UI reflect the
     new class. Fire-and-forget; core skill behavior does not depend on it.
+    Scoped to the tenant `user_id` and `project_id` as fire_update_chain_status.
     """
     if not neo4j_uri or not neo4j_password:
+        return
+    if not user_id or not project_id:
+        logger.warning("AttackChain %s attack path not written: no tenant", chain_id)
         return
     _fire_and_forget(
         _write_chain_attack_path,
         neo4j_uri, neo4j_user, neo4j_password,
         chain_id=chain_id,
+        user_id=user_id,
+        project_id=project_id,
         attack_path_type=attack_path_type,
     )
 
 
-def _write_chain_attack_path(uri, user, password, *, chain_id, attack_path_type):
+def _write_chain_attack_path(uri, user, password, *, chain_id, user_id, project_id, attack_path_type):
     driver = _get_driver(uri, user, password)
     cypher = """
-    MATCH (ac:AttackChain {chain_id: $chain_id})
+    MATCH (ac:AttackChain {chain_id: $chain_id, user_id: $user_id, project_id: $project_id})
     SET ac.attack_path_type = $attack_path_type,
         ac.updated_at       = datetime()
     """
     with _session(driver) as session:
         session.run(cypher, {
             "chain_id": chain_id,
+            "user_id": user_id,
+            "project_id": project_id,
             "attack_path_type": attack_path_type or "",
         })
-    logger.info("AttackChain %s status -> %s (steps=%d)", chain_id, status, total_steps)
 
 
 # -------------------------------------------------------------------

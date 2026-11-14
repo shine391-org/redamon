@@ -8,6 +8,7 @@ Supports phase tracking, LLM-managed todo lists, and checkpoint-based approval.
 import asyncio
 import os
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -16,12 +17,16 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from state import (
+    NO_APPROVAL_ANSWER,
+    NO_TOOL_CONFIRMATION_ANSWER,
     AgentState,
     InvokeResponse,
     summarize_trace_for_response,
 )
 from project_settings import get_setting
-from orchestrator_helpers.key_rotation import KeyRotator
+from mcp_toolset_guard import (
+    MCP_TOOLSET_BUSY_RESUME_MESSAGE, McpToolsetBusy, server_set_hash, toolset_guard,
+)
 from tools import (
     MCPToolsManager,
     Neo4jToolManager,
@@ -34,8 +39,9 @@ from orchestrator_helpers import (
     set_checkpointer,
     create_config,
     get_config_values,
+    get_thread_id,
 )
-from orchestrator_helpers.llm_setup import setup_llm, apply_project_settings
+from orchestrator_helpers.llm_setup import apply_project_settings
 from agent_context import current_llm, current_llm_wait_listener
 from agent_in_the_loop.broker import get_broker
 from agent_in_the_loop import is_loop_llm
@@ -67,6 +73,16 @@ set_checkpointer(checkpointer)
 
 logger = logging.getLogger(__name__)
 
+NO_PENDING_REQUEST_MESSAGE = (
+    "Nothing is waiting for this answer: the request was already answered, or a newer "
+    "message replaced it. Your answer was not applied."
+)
+
+# A new message never approves or confirms anything. Set to None in its graph input, so an
+# answer left in a checkpoint beside a request can never be applied by the next message
+# (initialize resumes on "answer + request"), with no permission check and no audit row.
+_NO_ANSWER = {**NO_APPROVAL_ANSWER, **NO_TOOL_CONFIRMATION_ANSWER}
+
 # Base URL for session manager (kali-sandbox HTTP server on port 8013)
 _SESSION_MANAGER_BASE = os.environ.get(
     "MCP_METASPLOIT_PROGRESS_URL", "http://kali-sandbox:8013/progress"
@@ -91,8 +107,6 @@ class AgentOrchestrator:
         self.neo4j_user = os.getenv("NEO4J_USER", "neo4j")
         self.neo4j_password = os.getenv("NEO4J_PASSWORD")
 
-        self.model_name: Optional[str] = None
-        self.llm: Optional[BaseChatModel] = None
         self.tool_executor: Optional[PhaseAwareToolExecutor] = None
         self.neo4j_manager: Optional[Neo4jToolManager] = None
         self.graph = None
@@ -119,6 +133,21 @@ class AgentOrchestrator:
         self._initialized = True
 
         logger.info("AgentOrchestrator initialized (LLM deferred until project settings loaded)")
+
+    @property
+    def llm(self) -> Optional[BaseChatModel]:
+        """This run's model client, or None outside a run (RBAC T17).
+
+        There is no shared slot: `apply_project_settings` binds each run's own
+        client (llm_setup.LlmClientCache) to its task through `current_llm`, which
+        the graph's nodes and Fireteam members inherit. A task that never loaded a
+        project reads None, never the client of whichever run loaded last.
+        """
+        return current_llm.get()
+
+    @llm.setter
+    def llm(self, value: Optional[BaseChatModel]) -> None:
+        current_llm.set(value)
 
     async def recover_orphaned_fireteams(self) -> None:
         """Mark fireteams from a prior process (still 'running') as cancelled.
@@ -207,87 +236,24 @@ class AgentOrchestrator:
     # =========================================================================
 
     def _apply_project_settings(self, project_id: str) -> None:
-        """Load project settings and reconfigure LLM if model changed."""
+        """Load project settings and bind this run's model client and tradecraft catalog.
+
+        No credential is written onto a shared manager here (RBAC T17): the search
+        tools, their rotation pools and the tradecraft GitHub token are read at call
+        time from the run's own USER_SETTINGS (tools.run_user_settings), so an empty
+        key means none, never the previous run's. The user MCP toolset is admitted at
+        run start (_mcp_toolset_lease), under the guard of mcp_toolset_guard.
+        """
         apply_project_settings(self, project_id)
 
-        # Update tool API keys and rotation from user settings
-        user_settings = getattr(self, '_user_settings', {})
-        rotation_configs = user_settings.get('rotationConfigs', {})
-
-        def _build_rotator(main_key: str, tool_name: str) -> KeyRotator:
-            cfg = rotation_configs.get(tool_name, {})
-            extra = cfg.get('extraKeys', [])
-            rotate_n = cfg.get('rotateEveryN', 10)
-            return KeyRotator([main_key] + extra, rotate_n)
-
-        # Tavily (web_search)
-        tavily_key = user_settings.get('tavilyApiKey', '')
-        if tavily_key and self._web_search_manager and self._web_search_manager.api_key != tavily_key:
-            self._web_search_manager.api_key = tavily_key
-            new_tool = self._web_search_manager.get_tool()
-            if new_tool and self.tool_executor:
-                self.tool_executor.update_web_search_tool(new_tool)
-                logger.info("Updated Tavily web search tool with user settings key")
-        if tavily_key and self._web_search_manager:
-            self._web_search_manager.key_rotator = _build_rotator(tavily_key, 'tavily')
-
-        # Knowledge Base config (KB_ENABLED, KB_SCORE_THRESHOLD, KB_TOP_K,
-        # KB_MMR_*, KB_OVERFETCH_FACTOR, KB_SOURCE_BOOSTS, KB_ENABLED_SOURCES) is
-        # NO LONGER stamped onto the shared KB / web-search manager here (which
-        # raced across concurrent sessions). It is read per-session at use-time
-        # from the task-isolated settings inside the web_search tool closure
-        # (tools.py), which passes each knob as a per-call override to
-        # PentestKnowledgeBase.query()/is_sufficient(); unset (None) project
-        # values fall back to the KB's own kb_config.yaml baseline, preserving the
-        # prior precedence. The KB instance stays attached to the web-search
-        # manager from construction; the closure gates on KB_ENABLED per session.
-
-        # Shodan. The per-project enable/disable is NO LONGER done by swapping the
-        # tool in/out of the shared _all_tools registry (which raced across
-        # concurrent sessions). Shodan stays registered; PhaseAwareToolExecutor
-        # .execute() gates it per-session on the task-isolated SHODAN_ENABLED. Here
-        # we only refresh the (user-global) API key on the shared manager.
-        shodan_key = user_settings.get('shodanApiKey', '')
-        if self._shodan_manager and self.tool_executor:
-            if shodan_key and self._shodan_manager.api_key != shodan_key:
-                self._shodan_manager.api_key = shodan_key
-                shodan_tool = self._shodan_manager.get_tool()
-                self.tool_executor.update_shodan_tool(shodan_tool)
-                logger.info("Updated Shodan OSINT tool with user settings key")
-        if shodan_key and self._shodan_manager:
-            self._shodan_manager.key_rotator = _build_rotator(shodan_key, 'shodan')
-
-        # WPScan / URLScan / PDCP API keys are no longer stamped onto the shared
-        # tool_executor here (which raced across concurrent sessions). They are
-        # read at tool-execution time from the task-isolated USER_SETTINGS via
-        # get_setting() inside PhaseAwareToolExecutor.execute() (tools.py), so each
-        # session injects its own key.
-
-        # Google dork (SerpAPI)
-        serp_api_key = user_settings.get('serpApiKey', '')
-        if self._google_dork_manager and self.tool_executor:
-            if serp_api_key and self._google_dork_manager.api_key != serp_api_key:
-                self._google_dork_manager.api_key = serp_api_key
-                google_dork_tool = self._google_dork_manager.get_tool()
-                self.tool_executor.update_google_dork_tool(google_dork_tool)
-                logger.info("Updated Google dork tool with SerpAPI key")
-        if serp_api_key and self._google_dork_manager:
-            self._google_dork_manager.key_rotator = _build_rotator(serp_api_key, 'serp')
-
-        # Tradecraft Lookup
         if self._tradecraft_manager and self.tool_executor:
-            tc_enabled = get_setting('TRADECRAFT_TOOL_ENABLED', True)
-            tc_resources = get_setting('TRADECRAFT_RESOURCES', []) or []
-            github_token = user_settings.get('githubAccessToken', '')
             # The tradecraft tool stays permanently registered on the executor
             # (get_tool no longer swapped per turn, which raced). Per session we
             # only bind this project's resources + prompt catalog; a disabled
             # project clears its own resources so the always-registered tool
             # returns "resource not configured".
-            if tc_enabled:
-                self._tradecraft_manager.set_resources(tc_resources)
-                self._tradecraft_manager.set_github_token(github_token)
-                self._tradecraft_manager.llm = self.llm
+            if get_setting('TRADECRAFT_TOOL_ENABLED', True):
+                self._tradecraft_manager.set_resources(get_setting('TRADECRAFT_RESOURCES', []) or [])
                 self._tradecraft_manager.section_picker_llm = self._build_section_picker_llm()
                 # tier2_threshold_bytes / fetch_timeout / default_ttl are read per
                 # session at use-time from the task-isolated TRADECRAFT_* settings.
@@ -298,47 +264,16 @@ class AgentOrchestrator:
                     f"Tradecraft Lookup: {len(self._tradecraft_manager._resources)} resources"
                 )
             else:
-                # Disabled for this project: no resources, no prompt catalog.
                 self._tradecraft_manager.set_resources([])
                 from prompts.tool_registry import pop_tradecraft_entry
                 pop_tradecraft_entry()
 
-        # User-managed MCP servers: trigger an async reload when the user's
-        # mcpServers list has changed since the last apply. Hash-based check
-        # keeps the prompt-prefix cache stable when nothing's changed (a fresh
-        # fetch returning identical data is a no-op).
-        try:
-            import hashlib
-            import json as _json
-            user_mcp_raw = get_setting('USER_MCP_SERVERS', []) or []
-            digest = hashlib.sha256(
-                _json.dumps(user_mcp_raw, sort_keys=True, default=str).encode("utf-8")
-            ).hexdigest()
-            last_digest = getattr(self, '_last_user_mcp_hash', None)
-            if digest != last_digest:
-                self._last_user_mcp_hash = digest
-                try:
-                    import asyncio
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(self.reload_mcp_manifests(user_mcp_raw))
-                    logger.info(
-                        f"User MCP manifest changed (hash {digest[:12]}); "
-                        f"reload scheduled."
-                    )
-                except RuntimeError:
-                    # No running loop — apply must be running outside async ctx.
-                    # Skip; reload will fire on the next async-context apply.
-                    logger.debug("User MCP manifest changed but no running loop; deferred.")
-        except Exception as e:
-            logger.warning(f"User MCP manifest reload check failed: {e}")
-
     def _build_section_picker_llm(self):
         """This session's "Tradecraft section picker" LLM, or None.
 
-        Read from the task-isolated USER_SETTINGS / USER_LLM_PROVIDERS (never
-        the shared `self._user_settings`, which holds whichever project loaded
-        last). None means no model is set or it cannot be built, and the picker
-        then chooses the page by text match.
+        Read from the task-isolated USER_SETTINGS / USER_LLM_PROVIDERS, never
+        another run's. None means no model is set or it cannot be built, and the
+        picker then chooses the page by text match.
         """
         from feature_models import feature_model
         user_settings = get_setting('USER_SETTINGS', {}) or {}
@@ -354,50 +289,6 @@ class AgentOrchestrator:
                 f"Section picker model {model} could not be built "
                 f"({e.__class__.__name__}); pages are picked by text match")
             return None
-
-    def _setup_llm(self) -> None:
-        """Initialize the LLM based on current model_name.
-
-        Resolves keys from the cached project settings (if loaded)
-        or from whatever user providers are available.
-        """
-        from project_settings import get_settings
-        from orchestrator_helpers.llm_setup import _resolve_provider_key
-
-        settings = get_settings()
-        user_providers = settings.get('USER_LLM_PROVIDERS', [])
-        custom_config = settings.get('CUSTOM_LLM_CONFIG')
-
-        openai_p = _resolve_provider_key(user_providers, "openai")
-        anthropic_p = _resolve_provider_key(user_providers, "anthropic")
-        openrouter_p = _resolve_provider_key(user_providers, "openrouter")
-        bedrock_p = _resolve_provider_key(user_providers, "bedrock")
-        deepseek_p = _resolve_provider_key(user_providers, "deepseek")
-        gemini_p = _resolve_provider_key(user_providers, "gemini")
-        glm_p = _resolve_provider_key(user_providers, "glm")
-        kimi_p = _resolve_provider_key(user_providers, "kimi")
-        qwen_p = _resolve_provider_key(user_providers, "qwen")
-        xai_p = _resolve_provider_key(user_providers, "xai")
-        mistral_p = _resolve_provider_key(user_providers, "mistral")
-
-        self.llm = setup_llm(
-            self.model_name,
-            openai_api_key=(openai_p or {}).get("apiKey"),
-            anthropic_api_key=(anthropic_p or {}).get("apiKey"),
-            openrouter_api_key=(openrouter_p or {}).get("apiKey"),
-            deepseek_api_key=(deepseek_p or {}).get("apiKey"),
-            gemini_api_key=(gemini_p or {}).get("apiKey"),
-            glm_api_key=(glm_p or {}).get("apiKey"),
-            kimi_api_key=(kimi_p or {}).get("apiKey"),
-            qwen_api_key=(qwen_p or {}).get("apiKey"),
-            xai_api_key=(xai_p or {}).get("apiKey"),
-            mistral_api_key=(mistral_p or {}).get("apiKey"),
-            aws_access_key_id=(bedrock_p or {}).get("awsAccessKeyId"),
-            aws_secret_access_key=(bedrock_p or {}).get("awsSecretKey"),
-            aws_bearer_token=(bedrock_p or {}).get("awsBearerToken"),
-            aws_region=(bedrock_p or {}).get("awsRegion") or "us-east-1",
-            custom_llm_config=custom_config,
-        )
 
     # =========================================================================
     # TOOLS & GRAPH SETUP
@@ -421,12 +312,13 @@ class AgentOrchestrator:
         mcp_manager = MCPToolsManager(server_configs=server_configs)
         mcp_tools = await mcp_manager.get_tools()
 
-        # Setup Neo4j graph query tool (LLM is None until project settings are loaded)
+        # No client of its own: text-to-Cypher runs on the calling run's client
+        # (current_llm), so it is never another owner's.
         self.neo4j_manager = Neo4jToolManager(
             uri=self.neo4j_uri,
             user=self.neo4j_user,
             password=self.neo4j_password,
-            llm=self.llm
+            llm=None,
         )
         # Docker daemon restarts do not honor Compose dependency ordering.
         graph_tool = None
@@ -455,28 +347,20 @@ class AgentOrchestrator:
             from prompts.tool_registry import TOOL_REGISTRY, WEB_SEARCH_TAVILY_ONLY
             TOOL_REGISTRY["web_search"] = WEB_SEARCH_TAVILY_ONLY
 
-        # Setup Tavily web search tool (key resolved later via update_tavily_key)
+        # The search tools are always registered and read each run's own key at
+        # call time: a run without a key gets "not configured".
         # KB is passed in so web_search can check it before falling back to Tavily
-        self._web_search_manager = WebSearchToolManager(
-            knowledge_base=self._knowledge_base,
-        )
+        self._web_search_manager = WebSearchToolManager(knowledge_base=self._knowledge_base)
         web_search_tool = self._web_search_manager.get_tool()
-
-        # Setup Shodan OSINT tool (key resolved later via _apply_project_settings)
         self._shodan_manager = ShodanToolManager()
         shodan_tool = self._shodan_manager.get_tool()
-
-        # Setup Google dork tool (key resolved later via _apply_project_settings)
         self._google_dork_manager = GoogleDorkToolManager()
         google_dork_tool = self._google_dork_manager.get_tool()
 
         # Setup Tradecraft Lookup tool (resources resolved later via _apply_project_settings).
         # get_tool() returns None until at least one enabled resource is loaded.
         from orchestrator_helpers.tradecraft_lookup import TradecraftLookupManager
-        self._tradecraft_manager = TradecraftLookupManager(
-            llm=self.llm,
-            mcp_manager=mcp_manager,
-        )
+        self._tradecraft_manager = TradecraftLookupManager(mcp_manager=mcp_manager)
         # Tool starts as None; orchestrator hot-swaps it once resources load.
         tradecraft_tool = self._tradecraft_manager.get_tool()
         # Strip the registry entry until resources are loaded so the
@@ -502,30 +386,70 @@ class AgentOrchestrator:
 
         logger.info(f"Tools initialized: {len(self.tool_executor.get_all_tools())} available")
 
-    async def reload_mcp_manifests(self, user_servers_raw=None) -> dict:
+    async def reload_mcp_manifests(self, user_servers_raw=None, owner_id=None) -> dict:
         """Re-merge system + user MCP servers, refresh registry, reconnect MCP client.
 
-        Called from:
-        - Webapp's POST /mcp/reload after a user adds/edits/deletes an MCP server.
-        - Implicitly during project session startup once user settings are
-          fetched (so per-user MCPs activate without a manual reload click).
+        Called by the webapp's POST /mcp/reload after a user adds/edits/deletes an
+        MCP server, once mcp_toolset_guard admitted it. Always reloads, even the set
+        already loaded. A run loads its owner's set through _ensure_mcp_toolset.
 
         Args:
-            user_servers_raw: list of dicts from UserSettings.mcpServers. When
-                None, reads from the most recent project_settings cache via
-                get_setting('USER_MCP_SERVERS', []).
+            user_servers_raw: list of dicts from UserSettings.mcpServers. None
+                reloads the set already loaded, never the last-loaded project's
+                settings (another owner's, possibly).
+            owner_id: whose set it is (None: an administrator's reload).
+
+        Raises McpToolsetBusy when, by the time its turn comes, another owner's run
+        on a different set is live.
 
         Returns:
             dict with the new manifest snapshot (servers, errors, warnings,
-            declared_tool_names) — same shape as GET /mcp/manifest body.
+            declared_tool_names) — same shape as GET /mcp/manifest body — and
+            `loaded`, False when the set could not be loaded.
+        """
+        return await self._load_mcp_toolset(user_servers_raw, owner_id, force=True)
+
+    async def _ensure_mcp_toolset(self, servers: list, owner_id) -> None:
+        """Load the run's owner's set unless it is the loaded one. Awaited before the
+        run streams, so its first tool call reaches its own owner's servers."""
+        await self._load_mcp_toolset(servers, owner_id, force=False)
+
+    async def _load_mcp_toolset(self, user_servers_raw, owner_id, *, force: bool):
+        """One load at a time, in the order asked. The guard is asked again under the
+        lock, because a run admitted while this load waited is live on its own set.
+        A set is recorded as loaded only once it loaded."""
+        guard = toolset_guard()
+        async with self.__dict__.setdefault("_mcp_reload_lock", asyncio.Lock()):
+            if user_servers_raw is None:
+                user_servers_raw = guard.loaded_servers or []
+            if not force and guard.loaded_hash == server_set_hash(user_servers_raw):
+                return None
+            if not guard.admit_reload(owner_id, user_servers_raw, via="reload" if force else "run"):
+                raise McpToolsetBusy()
+            try:
+                result, loaded = await self._load_user_mcp_servers(user_servers_raw)
+            except BaseException:
+                # Cut short (a stopped run, a crash): the client may already hold the
+                # new configs, so the previous record no longer describes it.
+                guard.clear_loaded()
+                raise
+            if loaded:
+                guard.record_loaded(user_servers_raw, owner_id)
+            else:
+                guard.clear_loaded()
+            return {**result, "loaded": loaded}
+
+    async def _load_user_mcp_servers(self, user_servers_raw: list) -> tuple:
+        """Load system + user servers. Returns (manifest snapshot, loaded).
+
+        A load that fails keeps no user MCP tool: the client answers all-or-nothing,
+        and keeping the previous tools would route a call to the previous owner's
+        server (and token) under a name this set declared. The system servers are
+        loaded alone instead, so the Kali tools stay.
         """
         from tools import _build_system_mcp_servers
         from prompts.tool_registry import apply_mcp_manifests_to_registry
-        from project_settings import get_setting
         import mcp_registry
-
-        if user_servers_raw is None:
-            user_servers_raw = get_setting('USER_MCP_SERVERS', []) or []
 
         user_servers, parse_errors = mcp_registry.parse_user_servers(user_servers_raw)
         system_servers = _build_system_mcp_servers()
@@ -535,14 +459,15 @@ class AgentOrchestrator:
         mcp_registry.set_current(all_servers, errors=parse_errors, warnings=env_warnings)
 
         declared_user_tools = apply_mcp_manifests_to_registry(user_servers)
+        loaded = True
 
         # Swap the manager's config and force a reconnect to bind a fresh
-        # MultiServerMCPClient that includes any new user-MCP URLs.
+        # MultiServerMCPClient that includes any new user-MCP URLs. Forced: a
+        # transport-error rebuild that finished meanwhile used the previous configs.
         if hasattr(self, '_mcp_manager') and self._mcp_manager is not None:
             self._mcp_manager.replace_server_configs(server_configs)
-            seen_gen = self._mcp_manager.generation
             new_gen, new_tools = await self._mcp_manager.reconnect(
-                seen_gen, reason="mcp_manifest_reload",
+                self._mcp_manager.generation, reason="mcp_manifest_reload", force=True,
             )
             if new_tools:
                 self.tool_executor.register_mcp_tools(
@@ -555,9 +480,22 @@ class AgentOrchestrator:
                     f"{len(new_tools)} live tool(s) registered."
                 )
             else:
+                loaded = False
+                system_tools = []
+                if user_servers:
+                    system_configs, _ = mcp_registry.to_mcp_servers_dict(system_servers)
+                    self._mcp_manager.replace_server_configs(system_configs)
+                    _, system_tools = await self._mcp_manager.reconnect(
+                        self._mcp_manager.generation, reason="mcp_manifest_reload_system_only",
+                        force=True,
+                    )
+                self.tool_executor.register_mcp_tools(system_tools or [], declared_tool_names=set())
+                # A disabled server was never part of this load, so it is not a failed one.
+                tried = sum(1 for s in user_servers if s.enabled)
                 logger.warning(
-                    "MCP manifest reload: reconnect returned no tools; "
-                    "system tools may be temporarily unavailable."
+                    f"MCP manifest reload failed: {tried} user server(s) not loaded; "
+                    f"no user MCP tool is registered, {len(system_tools or [])} system tool(s). "
+                    "The next run loads the set again."
                 )
 
         return {
@@ -565,7 +503,7 @@ class AgentOrchestrator:
             "errors": [e.model_dump() for e in parse_errors],
             "warnings": [w.model_dump() for w in env_warnings],
             "declared_user_tool_names": sorted(declared_user_tools),
-        }
+        }, loaded
 
     def _setup_knowledge_base(self):
         """
@@ -624,10 +562,10 @@ class AgentOrchestrator:
 
         # Add nodes — async wrappers that pass instance state to extracted functions
         async def _initialize(state, config=None):
-            return await initialize_node(state, config, llm=(current_llm.get() or self.llm), neo4j_creds=neo4j_creds)
+            return await initialize_node(state, config, llm=self.llm, neo4j_creds=neo4j_creds)
 
         async def _think(state, config=None):
-            return await think_node(state, config, llm=(current_llm.get() or self.llm), guidance_queues=self._guidance_queues, neo4j_creds=neo4j_creds, streaming_callbacks=self._streaming_callbacks, graph_view_cyphers=self._graph_view_cyphers)
+            return await think_node(state, config, llm=self.llm, guidance_queues=self._guidance_queues, neo4j_creds=neo4j_creds, streaming_callbacks=self._streaming_callbacks, graph_view_cyphers=self._graph_view_cyphers)
 
         async def _execute_tool(state, config=None):
             return await execute_tool_node(state, config, tool_executor=self.tool_executor, streaming_callbacks=self._streaming_callbacks, session_manager_base=_SESSION_MANAGER_BASE, graph_view_cyphers=self._graph_view_cyphers)
@@ -650,7 +588,7 @@ class AgentOrchestrator:
 
         async def _generate_response(state, config=None):
             await sweep_session_bodies(self.tool_executor, state)
-            return await generate_response_node(state, config, llm=(current_llm.get() or self.llm), streaming_callbacks=self._streaming_callbacks, neo4j_creds=neo4j_creds)
+            return await generate_response_node(state, config, llm=self.llm, streaming_callbacks=self._streaming_callbacks, neo4j_creds=neo4j_creds)
 
         async def _await_tool_confirmation(state, config=None):
             return await await_tool_confirmation_node(state, config)
@@ -659,10 +597,10 @@ class AgentOrchestrator:
             return await process_tool_confirmation_node(state, config)
 
         # --- Fireteam (multi-agent) ---
-        # Prebuild the member graph once. Reads self.llm at call time via
-        # getter (self.llm is None here; populated by _setup_llm later).
+        # Prebuild the member graph once. Reads the member run's own client at
+        # call time (self.llm is the task's current_llm).
         self.fireteam_member_graph = build_fireteam_member_graph(
-            llm_getter=lambda: (current_llm.get() or self.llm),
+            llm_getter=lambda: self.llm,
             tool_executor=self.tool_executor,
             streaming_callbacks=self._streaming_callbacks,
             session_manager_base=_SESSION_MANAGER_BASE,
@@ -682,7 +620,7 @@ class AgentOrchestrator:
         async def _fireteam_collect(state, config=None):
             return await fireteam_collect_node(
                 state, config,
-                llm=(current_llm.get() or self.llm),
+                llm=self.llm,
                 neo4j_creds=neo4j_creds,
                 streaming_callbacks=self._streaming_callbacks,
             )
@@ -996,9 +934,10 @@ class AgentOrchestrator:
         question: str,
         user_id: str,
         project_id: str,
-        session_id: str
+        session_id: str,
+        tenant_user_id: Optional[str] = None,
     ) -> InvokeResponse:
-        """Main entry point for agent invocation."""
+        """Main entry point for agent invocation. `tenant_user_id`: create_config."""
         if not self._initialized:
             raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
 
@@ -1013,13 +952,14 @@ class AgentOrchestrator:
         logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with: {question[:10000]}")
 
         try:
-            config = create_config(user_id, project_id, session_id)
+            config = create_config(user_id, project_id, session_id, tenant_user_id)
             input_data = {
                 # A node-scoped question carries scanner text: fenced (B20).
                 "messages": [HumanMessage(content=fence_node_context(question))]
             }
 
-            final_state = await self.graph.ainvoke(input_data, config)
+            async with self._mcp_toolset_lease(tenant_user_id or user_id):
+                final_state = await self.graph.ainvoke(input_data, config)
 
             return self._build_response(final_state)
 
@@ -1078,12 +1018,19 @@ class AgentOrchestrator:
 
         "No key" is only the message when a key or provider row is really
         missing; any other build failure names the model and the exception's
-        class (llm_setup_failed), so a broken provider is not read as a missing key.
+        class (llm_setup_failed), so a broken provider is not read as a missing key,
+        and an administrator's model the owner's list lacks
+        (instance_provider_unavailable) sends the person to the administrator.
         """
         failure = getattr(self, "llm_setup_failure", None) or {}
         if failure.get("code") == "llm_setup_failed":
             msg = (f"Could not set up the model {failure.get('model')}. "
                    "Check its provider in Global Settings.")
+        elif failure.get("code") == "instance_provider_unavailable":
+            # An instance/ model is served only by the administrator's assignment;
+            # the person's own keys never serve it, so sending them there misleads.
+            msg = ("This project uses a model provided by your administrator, "
+                   "which is not available now. Ask your administrator.")
         else:
             msg = "LLM not configured. Please add an API key in Global Settings."
             failure = {"code": "llm_not_configured", **failure}
@@ -1094,40 +1041,125 @@ class AgentOrchestrator:
     async def _report_run_failure(self, streaming_callback, msg: str,
                                   exc: BaseException) -> InvokeResponse:
         """Fail a run with its exception's class and provider HTTP status, never
-        its text: a provider message can quote a key, the prompt or target data."""
+        its text: a provider message can quote a key, the prompt or target data.
+        A run refused for the MCP toolset says so with its own code."""
+        if isinstance(exc, McpToolsetBusy):
+            await streaming_callback.on_error(str(exc), recoverable=False, code=exc.code)
+            return InvokeResponse(error=str(exc))
         from llm_builder import provider_error_details
         await streaming_callback.on_error(
             msg, recoverable=False, code="agent_run_failed", **provider_error_details(exc))
         return InvokeResponse(error=msg)
 
+    async def _refuse_resume(self, streaming_callback, exc: McpToolsetBusy,
+                             kind: str, pending) -> InvokeResponse:
+        """A refused resume leaves the run paused on the same request: the answer was
+        neither applied nor saved, so the refusal is recoverable and the request is
+        shown again for the person to answer once the other run has finished."""
+        await streaming_callback.on_error(
+            MCP_TOOLSET_BUSY_RESUME_MESSAGE, recoverable=True, code=exc.code)
+        resend = getattr(streaming_callback, "resend_pending_request", None)
+        if pending and resend is not None:
+            await resend(kind, pending)
+        return InvokeResponse(error=MCP_TOOLSET_BUSY_RESUME_MESSAGE)
+
+    async def _refuse_stray_answer(self, config, session_id: str, field: str, kind: str,
+                                   streaming_callback) -> Optional[InvokeResponse]:
+        """Refuse an answer whose request (`field` of the run's state) is no longer pending.
+
+        Another tab answered it, or a newer message dropped it. Stored, such an answer would
+        hide the next request of its kind (the stream skips a request that already has an
+        answer) and the next message would apply it, unchecked and unaudited. Called before
+        the resume registers its callback, so a live run of the session keeps its own, and
+        before on_admitted, so nothing is saved or audited. An empty session, or a read that
+        fails, is left to the resume's own read, which reports it.
+        """
+        try:
+            state = await self.graph.aget_state(config)
+        except Exception:
+            return None
+        values = state.values if state else None
+        if not values or values.get(field):
+            return None
+        logger.warning("[%s] %s answer refused: no pending request", session_id, kind)
+        await streaming_callback.on_error(
+            NO_PENDING_REQUEST_MESSAGE, recoverable=True, code="no_pending_request", answer=kind)
+        return InvokeResponse(error=NO_PENDING_REQUEST_MESSAGE)
+
+    async def pending_tool_confirmation_mode(self, *, user_id: str, project_id: str,
+                                             session_id: str) -> Optional[str]:
+        """The mode of the tool confirmation the person's run waits for: `fireteam_escalation`
+        when it answers a Fireteam member's escalation (approving it redeploys the member), else
+        the request's own (`single`, `plan`); None when none waits. Read from the run's state,
+        for the socket to ask the decision's permissions before anything runs. Raises when the
+        state cannot be read. The thread is the person's (create_config)."""
+        state = await self.graph.aget_state(
+            {"configurable": {"thread_id": get_thread_id(user_id, project_id, session_id)}})
+        values = (state.values if state else None) or {}
+        pending = values.get("tool_confirmation_pending")
+        if not pending:
+            return None
+        if values.get("_tool_confirmation_mode") == "fireteam_escalation":
+            return "fireteam_escalation"
+        return (pending.get("mode") if isinstance(pending, dict) else None) or "single"
+
     # =========================================================================
     # STREAMING PUBLIC API
     # =========================================================================
 
+    @asynccontextmanager
+    async def _mcp_toolset_lease(self, tenant_id: str):
+        """Hold the agent's user MCP toolset for this run (RBAC OQ-41, NF-06).
+
+        Raises McpToolsetBusy when the run's owner's server set is not the loaded
+        one and another owner's run on a different set is live. Admission and the
+        lease are one synchronous step; then the owner's set is loaded (after any
+        load already queued) and only then does the run go on, so it never sees or
+        calls a tool of a set it was not admitted on.
+
+        Keyed on `tenant_id`, the project's owner, never the person running: the
+        set is the owner's USER_MCP_SERVERS, and one person's runs under two owners
+        would otherwise count as one owner and swap the set under a live run.
+        """
+        servers = get_setting('USER_MCP_SERVERS', []) or []
+        lease = toolset_guard().admit_run(tenant_id, servers)
+        try:
+            await self._ensure_mcp_toolset(servers, tenant_id)
+            yield
+        finally:
+            toolset_guard().release_run(lease)
+
     async def _stream_graph(self, graph_input, config, streaming_callback,
-                            user_id: str, project_id: str, session_id: str):
+                            user_id: str, project_id: str, session_id: str, on_admitted=None):
         """Run the graph with streaming inside a run scope; return the final state.
 
         The scope lets an Agent in the Loop model open steps for this session
         (and only while it runs), and reports the run's end state to its driver.
-        For a provider model it only registers the run.
+        For a provider model it only registers the run. The run holds the user MCP
+        toolset for as long as it streams, and streams only once its owner's set is
+        loaded (_mcp_toolset_lease). `on_admitted` runs once the run is admitted and
+        its set loaded: a resume saves the person's answer there, never before.
         """
-        uses_loop = is_loop_llm(current_llm.get() or self.llm)
+        uses_loop = is_loop_llm(self.llm)
         final_state = None
-        # Every node and Fireteam member runs in a task created inside astream,
-        # so it inherits this listener and a rate-limit wait reaches the drawer.
-        listener = current_llm_wait_listener.set(
-            getattr(streaming_callback, "on_rate_limit_wait", None))
-        try:
-            async with get_broker().run_scope(
-                    user_id, project_id, session_id, streaming_callback, uses_loop=uses_loop,
-                    tool_confirmation=bool(get_setting('REQUIRE_TOOL_CONFIRMATION', True))) as scope:
-                async for event in self.graph.astream(graph_input, config, stream_mode="values"):
-                    final_state = event
-                    scope.final_state = event
-                    await emit_streaming_events(event, streaming_callback)
-        finally:
-            current_llm_wait_listener.reset(listener)
+        tenant_id = (config.get("configurable") or {}).get("tenant_user_id") or user_id
+        async with self._mcp_toolset_lease(tenant_id):
+            if on_admitted is not None:
+                on_admitted()
+            # Every node and Fireteam member runs in a task created inside astream,
+            # so it inherits this listener and a rate-limit wait reaches the drawer.
+            listener = current_llm_wait_listener.set(
+                getattr(streaming_callback, "on_rate_limit_wait", None))
+            try:
+                async with get_broker().run_scope(
+                        user_id, project_id, session_id, streaming_callback, uses_loop=uses_loop,
+                        tool_confirmation=bool(get_setting('REQUIRE_TOOL_CONFIRMATION', True))) as scope:
+                    async for event in self.graph.astream(graph_input, config, stream_mode="values"):
+                        final_state = event
+                        scope.final_state = event
+                        await emit_streaming_events(event, streaming_callback)
+            finally:
+                current_llm_wait_listener.reset(listener)
         return final_state
 
     async def invoke_with_streaming(
@@ -1139,9 +1171,15 @@ class AgentOrchestrator:
         streaming_callback,
         guidance_queue=None,
         graph_view_cypher=None,
+        tenant_user_id: Optional[str] = None,
     ) -> InvokeResponse:
         """
         Invoke agent with streaming callbacks for real-time updates.
+
+        `user_id` is the person running the session (the thread, the chat, the run
+        and the Agent in the Loop scope are theirs); `tenant_user_id` the project's
+        owner, whose graph the nodes read and write (create_config). Every resume
+        below takes the same pair.
 
         The streaming_callback should have methods:
         - on_thinking(iteration, phase, thought, reasoning)
@@ -1164,10 +1202,8 @@ class AgentOrchestrator:
 
         # Fail fast: if no LLM could be configured, return an error immediately
         # instead of letting the guardrail's fail-closed mask it as "Target Blocked".
-        # Mirror EXACTLY the resolution the graph nodes use (current_llm.get() or
-        # self.llm): the per-session LLM is authoritative when set, with the shared
-        # self.llm as fallback.
-        if (current_llm.get() or self.llm) is None:
+        # The same read the graph nodes make: this run's own client.
+        if self.llm is None:
             return await self._report_llm_unavailable(streaming_callback, user_id, project_id, session_id)
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with streaming: {question[:10000]}")
@@ -1178,10 +1214,11 @@ class AgentOrchestrator:
         self._graph_view_cyphers[session_id] = graph_view_cypher
 
         try:
-            config = create_config(user_id, project_id, session_id)
+            config = create_config(user_id, project_id, session_id, tenant_user_id)
             input_data = clear_stale_streaming_state({
                 # A node-scoped question carries scanner text: fenced (B20).
-                "messages": [HumanMessage(content=fence_node_context(question))]
+                "messages": [HumanMessage(content=fence_node_context(question))],
+                **_NO_ANSWER,
             })
 
             # Stream graph execution
@@ -1224,9 +1261,12 @@ class AgentOrchestrator:
         decision: str,
         modification: Optional[str],
         streaming_callback,
-        guidance_queue=None
+        guidance_queue=None,
+        on_admitted=None,
+        tenant_user_id: Optional[str] = None,
     ) -> InvokeResponse:
-        """Resume after approval with streaming callbacks."""
+        """Resume after approval with streaming callbacks. `on_admitted` saves the
+        decision once the run is admitted (_stream_graph)."""
         if not self._initialized:
             raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
 
@@ -1237,16 +1277,24 @@ class AgentOrchestrator:
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming approval: {decision}")
 
+        refusal = await self._refuse_stray_answer(
+            create_config(user_id, project_id, session_id, tenant_user_id), session_id,
+            "phase_transition_pending", "approval", streaming_callback)
+        if refusal is not None:
+            return refusal
+
         self._streaming_callbacks[session_id] = streaming_callback
         self._guidance_queues[session_id] = guidance_queue
 
+        pending = None
         try:
-            config = create_config(user_id, project_id, session_id)
+            config = create_config(user_id, project_id, session_id, tenant_user_id)
 
             current_state = await self.graph.aget_state(config)
             if not current_state or not current_state.values:
                 await streaming_callback.on_error("No pending session found", recoverable=False)
                 return InvokeResponse(error="No pending session found")
+            pending = current_state.values.get("phase_transition_pending")
 
             update_data = {
                 "user_approval_response": decision,
@@ -1258,7 +1306,8 @@ class AgentOrchestrator:
             }
 
             final_state = await self._stream_graph(
-                update_data, config, streaming_callback, user_id, project_id, session_id)
+                update_data, config, streaming_callback, user_id, project_id, session_id,
+                on_admitted=on_admitted)
 
             if final_state:
                 response = self._build_response(final_state)
@@ -1279,6 +1328,8 @@ class AgentOrchestrator:
             else:
                 raise RuntimeError("No final state returned")
 
+        except McpToolsetBusy as e:
+            return await self._refuse_resume(streaming_callback, e, "approval", pending)
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
             return await self._report_run_failure(streaming_callback, "The agent run failed after the approval", e)
@@ -1294,9 +1345,12 @@ class AgentOrchestrator:
         project_id: str,
         answer: str,
         streaming_callback,
-        guidance_queue=None
+        guidance_queue=None,
+        on_admitted=None,
+        tenant_user_id: Optional[str] = None,
     ) -> InvokeResponse:
-        """Resume after answer with streaming callbacks."""
+        """Resume after answer with streaming callbacks. `on_admitted` saves the
+        answer once the run is admitted (_stream_graph)."""
         if not self._initialized:
             raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
 
@@ -1310,13 +1364,15 @@ class AgentOrchestrator:
         self._streaming_callbacks[session_id] = streaming_callback
         self._guidance_queues[session_id] = guidance_queue
 
+        pending = None
         try:
-            config = create_config(user_id, project_id, session_id)
+            config = create_config(user_id, project_id, session_id, tenant_user_id)
 
             current_state = await self.graph.aget_state(config)
             if not current_state or not current_state.values:
                 await streaming_callback.on_error("No pending session found", recoverable=False)
                 return InvokeResponse(error="No pending session found")
+            pending = current_state.values.get("pending_question")
 
             update_data = {
                 "user_question_answer": answer,
@@ -1327,7 +1383,8 @@ class AgentOrchestrator:
             }
 
             final_state = await self._stream_graph(
-                update_data, config, streaming_callback, user_id, project_id, session_id)
+                update_data, config, streaming_callback, user_id, project_id, session_id,
+                on_admitted=on_admitted)
 
             if final_state:
                 response = self._build_response(final_state)
@@ -1348,6 +1405,8 @@ class AgentOrchestrator:
             else:
                 raise RuntimeError("No final state returned")
 
+        except McpToolsetBusy as e:
+            return await self._refuse_resume(streaming_callback, e, "question", pending)
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
             return await self._report_run_failure(streaming_callback, "The agent run failed after the answer", e)
@@ -1364,9 +1423,12 @@ class AgentOrchestrator:
         decision: str,
         modifications: Optional[dict],
         streaming_callback,
-        guidance_queue=None
+        guidance_queue=None,
+        on_admitted=None,
+        tenant_user_id: Optional[str] = None,
     ) -> InvokeResponse:
-        """Resume after tool confirmation with streaming callbacks."""
+        """Resume after tool confirmation with streaming callbacks. `on_admitted`
+        saves the decision once the run is admitted (_stream_graph)."""
         if not self._initialized:
             raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
 
@@ -1377,16 +1439,24 @@ class AgentOrchestrator:
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming tool confirmation: {decision}")
 
+        refusal = await self._refuse_stray_answer(
+            create_config(user_id, project_id, session_id, tenant_user_id), session_id,
+            "tool_confirmation_pending", "tool_confirmation", streaming_callback)
+        if refusal is not None:
+            return refusal
+
         self._streaming_callbacks[session_id] = streaming_callback
         self._guidance_queues[session_id] = guidance_queue
 
+        pending = None
         try:
-            config = create_config(user_id, project_id, session_id)
+            config = create_config(user_id, project_id, session_id, tenant_user_id)
 
             current_state = await self.graph.aget_state(config)
             if not current_state or not current_state.values:
                 await streaming_callback.on_error("No pending session found", recoverable=False)
                 return InvokeResponse(error="No pending session found")
+            pending = current_state.values.get("tool_confirmation_pending")
 
             update_data = {
                 "tool_confirmation_response": decision,
@@ -1401,7 +1471,8 @@ class AgentOrchestrator:
             }
 
             final_state = await self._stream_graph(
-                update_data, config, streaming_callback, user_id, project_id, session_id)
+                update_data, config, streaming_callback, user_id, project_id, session_id,
+                on_admitted=on_admitted)
 
             if final_state:
                 response = self._build_response(final_state)
@@ -1422,6 +1493,8 @@ class AgentOrchestrator:
             else:
                 raise RuntimeError("No final state returned")
 
+        except McpToolsetBusy as e:
+            return await self._refuse_resume(streaming_callback, e, "tool_confirmation", pending)
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
             return await self._report_run_failure(streaming_callback, "The agent run failed after the tool confirmation", e)
@@ -1436,7 +1509,8 @@ class AgentOrchestrator:
         project_id: str,
         session_id: str,
         streaming_callback,
-        guidance_queue=None
+        guidance_queue=None,
+        tenant_user_id: Optional[str] = None,
     ) -> InvokeResponse:
         """Resume execution from last checkpoint (after stop)."""
         if not self._initialized:
@@ -1453,7 +1527,7 @@ class AgentOrchestrator:
         self._guidance_queues[session_id] = guidance_queue
 
         try:
-            config = create_config(user_id, project_id, session_id)
+            config = create_config(user_id, project_id, session_id, tenant_user_id)
 
             current_state = await self.graph.aget_state(config)
             if not current_state or not current_state.values:

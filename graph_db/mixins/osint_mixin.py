@@ -19,6 +19,7 @@ import logging
 import re
 import json
 from datetime import datetime, timezone
+from typing import Optional
 
 from graph_db.cert_key import build_cert_key
 from graph_db.cpe_resolver import _is_ip_address
@@ -133,6 +134,14 @@ def _split_url(url: str) -> tuple[str, str]:
 # the handler raised NameError while handling an error and took the whole
 # ExternalDomain batch with it.
 logger = logging.getLogger(__name__)
+
+
+def _names_left_to_the_hostnames_hook(recon_data: dict) -> bool:
+    """IP mode: a hostname a source saw on a target address is written only by
+    update_graph_from_ip_hostnames, which knows every source's evidence and
+    the selection rule's reason. Written here as well, it became a Subdomain
+    or an ExternalDomain with one source's partial view (B-14, B-15)."""
+    return bool(((recon_data or {}).get("metadata") or {}).get("ip_mode"))
 
 
 class OsintMixin:
@@ -331,7 +340,9 @@ class OsintMixin:
             # source 'shodan_rdns' (and a domain-DNS record's 'shodan_dns'), so
             # readers that mean "resolves now" skip it. ON CREATE only: an edge
             # DNS wrote first stays forward DNS.
-            for ip, hostnames in shodan_data.get("reverse_dns", {}).items():
+            reverse_dns = ({} if _names_left_to_the_hostnames_hook(recon_data)
+                           else shodan_data.get("reverse_dns", {}))
+            for ip, hostnames in reverse_dns.items():
                 for hostname in hostnames:
                     if not hostname:
                         continue
@@ -893,6 +904,7 @@ class OsintMixin:
                 base_url = url_entry.get("base_url", "")
                 path = normalize_endpoint_path(url_entry.get("path", "")) if url_entry.get("path") else ""
                 full_url = url_entry.get("full_url", "")
+                unmasked_url = url_entry.get("unmasked_url") or None
                 params = url_entry.get("params", {})
 
                 if not base_url or not path:
@@ -909,12 +921,13 @@ class OsintMixin:
                         ON CREATE SET e.source = 'urlscan', e.full_url = $full_url,
                                       e.has_parameters = $has_params, e.updated_at = datetime()
                         SET e.full_url = CASE WHEN e.source = 'urlscan' THEN $full_url ELSE e.full_url END
+                        SET e.unmasked_url = CASE WHEN e.source = 'urlscan' THEN $unmasked_url ELSE e.unmasked_url END
                         SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                         SET e += $file_props
                         MERGE (bu)-[:HAS_ENDPOINT]->(e)
                         RETURN e.path AS path
                         """,
-                        base_url=base_url, path=path, full_url=full_url,
+                        base_url=base_url, path=path, full_url=full_url, unmasked_url=unmasked_url,
                         has_params=has_params, uid=user_id, pid=project_id,
                         # Item 3: a document's type, its content type, and a
                         # sensitive file's kind (partial Route Exposure reads it).
@@ -1002,12 +1015,26 @@ class OsintMixin:
             # the operator see it, flagged so every reader that turns graph
             # Endpoints into requests skips it. A plain SET flags one another
             # tool wrote too; its full_url and parameter values are removed.
+            # The links themselves go to unmasked_url / unmasked_urls, which no
+            # request builder reads: they are for the operator to open.
             stats["endpoints_quarantined"] = 0
-            for row in urlscan_data.get("quarantined_urls", []) or []:
+            quarantined_rows = [r for r in urlscan_data.get("quarantined_urls", []) or []
+                                if isinstance(r, dict)]
+            unmasked_by_endpoint: dict = {}
+            for row in sorted(quarantined_rows, key=lambda r: str(r.get("scan_time") or ""),
+                              reverse=True):
+                key = (row.get("base_url", ""),
+                       normalize_endpoint_path(row.get("path", "")) if row.get("path") else "")
+                links = unmasked_by_endpoint.setdefault(key, [])
+                link = row.get("unmasked_url")
+                if isinstance(link, str) and link and link not in links and len(links) < 25:
+                    links.append(link)
+            for row in quarantined_rows:
                 base_url = row.get("base_url", "")
                 path = normalize_endpoint_path(row.get("path", "")) if row.get("path") else ""
                 if not base_url or not path:
                     continue
+                unmasked_urls = unmasked_by_endpoint.get((base_url, path)) or []
                 try:
                     rec = session.run(
                         """
@@ -1018,6 +1045,8 @@ class OsintMixin:
                         SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                         SET e.quarantined = true, e.quarantine_reasons = $reasons,
                             e.has_parameters = coalesce(e.has_parameters, false) OR size($names) > 0
+                        SET e.unmasked_url = CASE WHEN size($unmasked_urls) > 0 THEN $unmasked_urls[0] ELSE e.unmasked_url END,
+                            e.unmasked_urls = CASE WHEN size($unmasked_urls) > 0 THEN $unmasked_urls ELSE e.unmasked_urls END
                         REMOVE e.full_url
                         MERGE (bu)-[:HAS_ENDPOINT]->(e)
                         WITH e
@@ -1032,6 +1061,7 @@ class OsintMixin:
                         RETURN count(DISTINCT e) AS n
                         """,
                         base_url=base_url, path=path, reasons=list(row.get("reasons") or []),
+                        unmasked_urls=unmasked_urls,
                         names=[n for n in row.get("param_names") or [] if isinstance(n, str) and n],
                         uid=user_id, pid=project_id,
                     ).single()
@@ -1060,8 +1090,24 @@ class OsintMixin:
         return self.update_graph_from_urlscan_findings(recon_data, user_id, project_id,
                                                        keys=("takeover_findings",))
 
+    def update_graph_from_archive_leaks(self, recon_data: dict, user_id: str, project_id: str) -> dict:
+        """The leaked one-time links and secrets the web archives' URLs carried
+        (GAU, ParamSpider: `resource_enum.archive_leaks`): the URLs the
+        quarantine keeps out of every request list. Same shape and writer as
+        urlscan's, as Vulnerability / Secret {source: 'url_archive'}."""
+        leaks = (recon_data.get("resource_enum") or {}).get("archive_leaks") or {}
+        return self.update_graph_from_urlscan_findings(
+            recon_data, user_id, project_id, keys=("findings",), data=leaks,
+            source="url_archive", secret_source="url_archive", id_prefix="archive",
+            label="Archive leaks")
+
     def update_graph_from_urlscan_findings(self, recon_data: dict, user_id: str, project_id: str,
-                                           keys: tuple = ("findings", "problem_pages")) -> dict:
+                                           keys: tuple = ("findings", "problem_pages"),
+                                           data: Optional[dict] = None,
+                                           source: str = "urlscan_leak",
+                                           secret_source: str = "urlscan",
+                                           id_prefix: str = "urlscan",
+                                           label: str = "URLScan findings") -> dict:
         """The findings urlscan's history gives about the target: leaked links,
         exposed files, open redirects, problem and takeover pages (Vulnerability
         {source: 'urlscan_leak'}) and secrets written in URLs (Secret {source:
@@ -1077,7 +1123,7 @@ class OsintMixin:
         needs_agent_confirmation. History alone is at most high.
         """
         stats = {"findings_written": 0, "secrets_written": 0, "skipped_out_of_scope": 0, "errors": []}
-        urlscan_data = recon_data.get("urlscan") or {}
+        urlscan_data = data if data is not None else (recon_data.get("urlscan") or {})
         rows = [f for key in keys for f in (urlscan_data.get(key) or []) if isinstance(f, dict)]
         secrets = [s for s in (urlscan_data.get("url_secrets") or []) if isinstance(s, dict)] \
             if "findings" in keys else []
@@ -1101,14 +1147,15 @@ class OsintMixin:
                 f"""
                 MATCH (d:Domain {{name: $org, user_id: $uid, project_id: $pid}})
                 MERGE (s:Subdomain {{name: $host, user_id: $uid, project_id: $pid}})
-                ON CREATE SET s.source = 'urlscan', s.discovered_by = 'urlscan',
+                ON CREATE SET s.source = $src, s.discovered_by = $src,
                               s.status = 'unverified', s.updated_at = datetime()
                 MERGE (d)-[:HAS_SUBDOMAIN]->(s)
                 MERGE (s)-[:BELONGS_TO]->(d)
                 WITH s
                 MATCH (n:{label} {{id: $id, user_id: $uid, project_id: $pid}})
                 MERGE (s)-[:{rel}]->(n)
-                """, org=org, host=host.strip().lower(), id=node_id, uid=user_id, pid=project_id)
+                """, org=org, host=host.strip().lower(), id=node_id, uid=user_id, pid=project_id,
+                src=secret_source)
             return True
 
         with self.driver.session() as session:
@@ -1119,8 +1166,8 @@ class OsintMixin:
                     continue
                 kind = f.get("kind") or ""
                 path = f.get("path") or "/"
-                vid = "urlscan-" + stable_vuln_id(f"{ftype}:{kind}" if kind else ftype, path, host,
-                                                  user_id, project_id)
+                vid = f"{id_prefix}-" + stable_vuln_id(f"{ftype}:{kind}" if kind else ftype, path, host,
+                                                       user_id, project_id)
                 props = {k: v for k, v in (f.get("props") or {}).items()
                          if v is not None and not isinstance(v, (dict, list)) or isinstance(v, list)
                          and all(not isinstance(x, (dict, list)) for x in v)}
@@ -1143,9 +1190,9 @@ class OsintMixin:
                     session.run(
                         """
                         MERGE (v:Vulnerability {id: $id, user_id: $uid, project_id: $pid})
-                        ON CREATE SET v.source = 'urlscan_leak', v.created_at = datetime()
+                        ON CREATE SET v.source = $source, v.created_at = datetime()
                         SET v += $props, v.updated_at = datetime()
-                        """, id=vid, props=props, uid=user_id, pid=project_id)
+                        """, id=vid, props=props, uid=user_id, pid=project_id, source=source)
                     if _parent(session, host, "HAS_VULNERABILITY", "Vulnerability", vid):
                         stats["findings_written"] += 1
                     else:
@@ -1164,7 +1211,7 @@ class OsintMixin:
                 # One Secret per distinct value (its HMAC); with no HMAC key, one
                 # per host, type and parameter.
                 ident = sec.get("value_hmac") or sec.get("param_name") or ""
-                sid = "secret-urlscan-" + stable_vuln_id(stype, ident, host, user_id, project_id)
+                sid = f"secret-{id_prefix}-" + stable_vuln_id(stype, ident, host, user_id, project_id)
                 props = {k: v for k, v in {
                     "secret_type": stype,
                     "param_name": sec.get("param_name"),
@@ -1173,6 +1220,9 @@ class OsintMixin:
                     "jwt_alg": sec.get("jwt_alg"),
                     "jwt_expired": sec.get("jwt_expired"),
                     "masked_url": sec.get("masked_url"),
+                    "secret_value": sec.get("secret_value") or None,
+                    "unmasked_url": sec.get("unmasked_url") or None,
+                    "archive_sources": sec.get("archive_sources") or None,
                     "base_url": sec.get("base_url"),
                     "severity": _history_severity(sec.get("severity"), False),
                     "first_seen": sec.get("first_seen") or "",
@@ -1183,9 +1233,9 @@ class OsintMixin:
                     session.run(
                         """
                         MERGE (s:Secret {id: $id, user_id: $uid, project_id: $pid})
-                        ON CREATE SET s.source = 'urlscan', s.created_at = datetime()
+                        ON CREATE SET s.source = $source, s.created_at = datetime()
                         SET s += $props, s.updated_at = datetime()
-                        """, id=sid, props=props, uid=user_id, pid=project_id)
+                        """, id=sid, props=props, uid=user_id, pid=project_id, source=secret_source)
                     if _parent(session, host, "HAS_SECRET", "Secret", sid):
                         stats["secrets_written"] += 1
                     else:
@@ -1196,7 +1246,7 @@ class OsintMixin:
                 except Exception as e:
                     stats["errors"].append(f"urlscan secret {stype}: {e}")
 
-        print(f"[+][graph-db] URLScan findings: {stats['findings_written']} findings, "
+        print(f"[+][graph-db] {label}: {stats['findings_written']} findings, "
               f"{stats['secrets_written']} secrets")
         if stats["errors"]:
             print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
@@ -1214,11 +1264,18 @@ class OsintMixin:
         domain = home_domain(recon_data)
         if not external_domains:
             return
-        # Each module judged "external" against the one scan root it scanned, so
-        # in a Domain batch a host under a SIBLING scan root lands here too. It
-        # is not foreign: it joins that root's org as a Subdomain. A scan root
-        # itself is left to the domain writer, which makes it a node only when
-        # it is a target.
+        # Each module judged "external" against its own target list, so a host
+        # under a scan root lands here too: a crawler's or an archive's link, a
+        # redirect, a sibling scan root's host in a Domain batch. It is not
+        # foreign, so it gets no ExternalDomain. A link is no admission either
+        # (D2): the RoE, an EXACT group's list or the wildcard control may have
+        # refused the name, and partial scans read every Subdomain back as a
+        # target. So it only joins a Subdomain the run's own steps wrote, as an
+        # Uncover URL or a certificate SAN does. IP mode's in-scope names are
+        # the ones its hostname rule selected, written under their org. A scan
+        # root itself is left to the domain writer, which makes it a node only
+        # when it is a target.
+        ip_mode = bool((recon_data.get("metadata") or {}).get("ip_mode"))
 
         print(f"\n[GRAPH] External Domains: {len(external_domains)} foreign domains")
 
@@ -1230,7 +1287,19 @@ class OsintMixin:
                     continue
                 kind, root = classify_host(ed_domain, recon_data)
                 if kind != OUT_OF_SCOPE:
-                    if kind == IN_SCOPE and ed_domain.strip().lower() != root.strip().lower():
+                    owned = kind == IN_SCOPE and ed_domain.strip().lower() != root.strip().lower()
+                    if owned and not ip_mode:
+                        try:
+                            session.run("""
+                                MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
+                                MATCH (s:Subdomain {name: $name, user_id: $uid, project_id: $pid})
+                                MERGE (d)-[:HAS_SUBDOMAIN]->(s)
+                                MERGE (s)-[:BELONGS_TO]->(d)
+                            """, domain=org_for_scan_root(root, recon_data), name=ed_domain.strip().lower(),
+                                uid=user_id, pid=project_id)
+                        except Exception as e:
+                            logger.warning(f"Subdomain link error for {ed_domain}: {e}")
+                    elif owned:
                         try:
                             session.run("""
                                 MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
@@ -1254,6 +1323,7 @@ class OsintMixin:
                         ON CREATE SET ed.first_seen_at = datetime()
                         SET ed.sources = coalesce(ed.sources, []) + [x IN $sources WHERE NOT x IN coalesce(ed.sources, [])],
                             ed.redirect_from_urls = coalesce(ed.redirect_from_urls, []) + [x IN $redirect_from WHERE NOT x IN coalesce(ed.redirect_from_urls, [])],
+                            ed.unmasked_redirect_from_urls = ([x IN $unmasked_from WHERE NOT x IN coalesce(ed.unmasked_redirect_from_urls, [])] + coalesce(ed.unmasked_redirect_from_urls, []))[0..25],
                             ed.redirect_to_urls = coalesce(ed.redirect_to_urls, []) + [x IN $redirect_to WHERE NOT x IN coalesce(ed.redirect_to_urls, [])],
                             ed.status_codes_seen = coalesce(ed.status_codes_seen, []) + [x IN $status_codes WHERE NOT x IN coalesce(ed.status_codes_seen, [])],
                             ed.titles_seen = coalesce(ed.titles_seen, []) + [x IN $titles WHERE NOT x IN coalesce(ed.titles_seen, [])],
@@ -1266,6 +1336,7 @@ class OsintMixin:
                     """, ed_domain=ed_domain, uid=user_id, pid=project_id,
                         sources=ed.get("sources", []),
                         redirect_from=ed.get("redirect_from_urls", []),
+                        unmasked_from=ed.get("unmasked_redirect_from_urls", []),
                         redirect_to=ed.get("redirect_to_urls", []),
                         status_codes=ed.get("status_codes_seen", []),
                         titles=ed.get("titles_seen", []),
@@ -1388,7 +1459,7 @@ class OsintMixin:
 
                                 sname = (svc.get("service_name") or "").strip()
                                 if sname:
-                                    svc_props: dict = {"source": "censys"}
+                                    svc_props: dict = {}
                                     ext = (svc.get("extended_service_name") or "").strip()
                                     if ext:
                                         svc_props["extended_service_name"] = ext
@@ -1416,7 +1487,7 @@ class OsintMixin:
                                         """
                                         MERGE (svc:Service {name: $name, port_number: $port, ip_address: $ip,
                                                             user_id: $user_id, project_id: $project_id})
-                                        ON CREATE SET svc.updated_at = datetime()
+                                        ON CREATE SET svc.source = 'censys'
                                         SET svc += $props, svc.updated_at = datetime()
                                         WITH svc
                                         MATCH (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
@@ -1478,8 +1549,13 @@ class OsintMixin:
                                         except Exception as e:
                                             stats["errors"].append(f"Censys cert {subject_cn}: {e}")
 
-                            # Reverse DNS → Subdomain nodes
-                            for hostname in host.get("reverse_dns_names") or []:
+                            # Reverse DNS → Subdomain nodes. Status and source are
+                            # first-writer fields: DNS's `resolved` must survive a
+                            # passive sighting, or http_probe (which demotes only
+                            # `resolved` hosts) never marks a silent one `no_http`.
+                            rdns_names = ([] if _names_left_to_the_hostnames_hook(recon_data)
+                                          else host.get("reverse_dns_names") or [])
+                            for hostname in rdns_names:
                                 root = attach_for_host(hostname, recon_data)[1] if hostname else None
                                 if not root:
                                     continue
@@ -1487,9 +1563,9 @@ class OsintMixin:
                                     session.run(
                                         """
                                         MERGE (s:Subdomain {name: $name, user_id: $user_id, project_id: $project_id})
-                                        ON CREATE SET s.discovered_at = datetime(), s.updated_at = datetime()
-                                        SET s.source = 'censys_rdns', s.status = 'unverified',
-                                            s.updated_at = datetime()
+                                        ON CREATE SET s.discovered_at = datetime(), s.source = 'censys_rdns',
+                                                      s.status = 'unverified'
+                                        SET s.updated_at = datetime()
                                         MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                         SET i.updated_at = datetime()
                                         MERGE (s)-[r:RESOLVES_TO]->(i)
@@ -1604,8 +1680,8 @@ class OsintMixin:
                                     """
                                     MERGE (svc:Service {name: $name, port_number: $port, ip_address: $ip,
                                                         user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET svc.updated_at = datetime()
-                                    SET svc.source = 'fofa', svc.updated_at = datetime(),
+                                    ON CREATE SET svc.source = 'fofa'
+                                    SET svc.updated_at = datetime(),
                                         svc.http_title   = CASE WHEN $http_title <> '' THEN $http_title ELSE svc.http_title END,
                                         svc.product      = CASE WHEN $product <> '' THEN $product ELSE svc.product END,
                                         svc.version      = CASE WHEN $version <> '' THEN $version ELSE svc.version END,
@@ -1666,13 +1742,15 @@ class OsintMixin:
                             # FOFA host may carry port suffix (e.g. "sub.example.com:8080") — strip it
                             host_raw = (row.get("host") or "").strip()
                             host = host_raw.split(":")[0] if ":" in host_raw else host_raw
-                            root = attach_for_host(host, recon_data)[1] if host and host != ip else None
+                            root = (attach_for_host(host, recon_data)[1]
+                                    if host and host != ip and not _names_left_to_the_hostnames_hook(recon_data)
+                                    else None)
                             if root:
                                 session.run(
                                     """
                                     MERGE (s:Subdomain {name: $name, user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET s.status = 'unverified', s.discovered_at = datetime(), s.updated_at = datetime()
-                                    SET s.source = 'fofa', s.updated_at = datetime()
+                                    ON CREATE SET s.status = 'unverified', s.source = 'fofa', s.discovered_at = datetime()
+                                    SET s.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (s)-[r:RESOLVES_TO]->(i)
@@ -1769,8 +1847,10 @@ class OsintMixin:
 
                         # ── passive DNS hostnames ────────────────────────
                         pdns_records = rep.get("passive_dns") or []
+                        if _names_left_to_the_hostnames_hook(recon_data):
+                            pdns_records = []
                         # Fallback to legacy hostname list if new format absent
-                        if not pdns_records:
+                        elif not pdns_records:
                             pdns_records = [
                                 {"hostname": h, "first": "", "last": "", "record_type": ""}
                                 for h in (rep.get("passive_dns_hostnames") or [])
@@ -1793,11 +1873,14 @@ class OsintMixin:
                                     # The edge usually exists already from DNS
                                     # resolution, so the passive-DNS dates widen
                                     # its window rather than being set on create.
+                                    # The node's status and source stay the first
+                                    # writer's, as in the Censys rDNS write.
                                     session.run(
                                         """
                                         MERGE (s:Subdomain {name: $name, user_id: $user_id, project_id: $project_id})
-                                        ON CREATE SET s.discovered_at = datetime(), s.updated_at = datetime()
-                                        SET s.source = 'otx_passive_dns', s.status = 'unverified', s.updated_at = datetime()
+                                        ON CREATE SET s.discovered_at = datetime(), s.source = 'otx_passive_dns',
+                                                      s.status = 'unverified'
+                                        SET s.updated_at = datetime()
                                         WITH s
                                         MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                         SET i.updated_at = datetime()
@@ -2146,8 +2229,11 @@ class OsintMixin:
                                 pnum = 0
                             if not pnum:
                                 continue
-                            proto = (row.get("protocol") or "tcp")
-                            protocol = (proto.lower() if isinstance(proto, str) else "tcp") or "tcp"
+                            # The Port key is the transport. The row's `protocol` is the
+                            # application (http, ssh) and names the Service below; a row
+                            # parsed before `transport` existed is tcp.
+                            transport = str(row.get("transport") or "").lower()
+                            protocol = transport if transport in ("tcp", "udp") else "tcp"
                             session.run(
                                 """
                                 MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
@@ -2166,7 +2252,7 @@ class OsintMixin:
                             # --- Service node (enriched) ---
                             prot_name = (row.get("protocol") or "").strip()
                             if prot_name:
-                                svc_props: dict = {"source": "netlas"}
+                                svc_props: dict = {}
                                 title = row.get("title") or ""
                                 if title:
                                     svc_props["http_title"] = title
@@ -2183,7 +2269,7 @@ class OsintMixin:
                                     """
                                     MERGE (svc:Service {name: $name, port_number: $port, ip_address: $ip,
                                                         user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET svc.updated_at = datetime()
+                                    ON CREATE SET svc.source = 'netlas'
                                     SET svc += $props, svc.updated_at = datetime()
                                     WITH svc
                                     MATCH (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
@@ -2469,7 +2555,7 @@ class OsintMixin:
                                 # Service node — use app name; fall back to service field
                                 svc_name = (row.get("app") or row.get("service") or "").strip()
                                 if svc_name:
-                                    svc_props: dict = {"source": "zoomeye"}
+                                    svc_props: dict = {}
                                     banner = (row.get("banner") or "")[:500]
                                     if banner:
                                         svc_props["banner"] = banner
@@ -2487,7 +2573,7 @@ class OsintMixin:
                                         MERGE (svc:Service {name: $name, port_number: $port,
                                                             ip_address: $ip,
                                                             user_id: $user_id, project_id: $project_id})
-                                        ON CREATE SET svc.updated_at = datetime()
+                                        ON CREATE SET svc.source = 'zoomeye'
                                         SET svc += $props, svc.updated_at = datetime()
                                         WITH svc
                                         MATCH (p:Port {number: $port, protocol: $protocol,
@@ -2502,7 +2588,9 @@ class OsintMixin:
                                     stats["relationships_created"] += 1
 
                             # Hostname / rDNS → Subdomain node (in-scope only)
-                            for hostname_val in {row.get("hostname"), row.get("rdns")}:
+                            row_names = (set() if _names_left_to_the_hostnames_hook(recon_data)
+                                         else {row.get("hostname"), row.get("rdns")})
+                            for hostname_val in row_names:
                                 if not hostname_val:
                                     continue
                                 hostname_val = hostname_val.strip().lower()
@@ -2688,14 +2776,18 @@ class OsintMixin:
                                 app_name = pentry.get("app_name")
                                 if app_name:
                                     svc_name = app_name.lower()
+                                    # CriminalIP lists many ports with no version or
+                                    # banner, and SETting a null deletes the property:
+                                    # what nmap measured or Censys / ZoomEye stored on
+                                    # this Service must survive a bare listing.
                                     session.run(
                                         """
                                         MERGE (svc:Service {name: $svc_name, port_number: $port,
                                                             ip_address: $ip, user_id: $user_id,
                                                             project_id: $project_id})
-                                        SET svc.source = 'criminalip',
-                                            svc.version = $version,
-                                            svc.banner  = $banner,
+                                        ON CREATE SET svc.source = 'criminalip'
+                                        SET svc.version = coalesce($version, svc.version),
+                                            svc.banner  = coalesce($banner, svc.banner),
                                             svc.updated_at = datetime()
                                         WITH svc
                                         MATCH (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
@@ -2703,7 +2795,7 @@ class OsintMixin:
                                         MERGE (p)-[:RUNS_SERVICE]->(svc)
                                         """,
                                         svc_name=svc_name, port=pnum, protocol=proto, ip=ip,
-                                        version=pentry.get("app_version"),
+                                        version=str(pentry.get("app_version") or "").strip() or None,
                                         banner=(pentry.get("banner") or "")[:500] or None,
                                         user_id=user_id, project_id=project_id,
                                     )
@@ -2959,19 +3051,26 @@ class OsintMixin:
                         # it ("1.2.3.4" -> "1-2-3-4", http_mixin), so a dotted
                         # Subdomain would be a duplicate host nothing else
                         # links to. Those fall through to the Domain.
+                        # A URL never creates the Subdomain (D2): a URL keeps
+                        # its host when merge_uncover_into_pipeline refuses the
+                        # name (RoE, group scope, non-routable), and partial
+                        # scans read every Subdomain back as a target. The
+                        # names the merge admitted were written above.
                         host = _urlparse(url).hostname or ""
+                        owned = False
                         if host and not _is_ip_address(host):
-                            session.run(
+                            rec = session.run(
                                 """
                                 MATCH (u:BaseURL {url: $base_url, user_id: $user_id, project_id: $project_id})
-                                MERGE (s:Subdomain {name: $host, user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET s.source = 'uncover', s.status = 'unverified',
-                                              s.updated_at = datetime()
+                                MATCH (s:Subdomain {name: $host, user_id: $user_id, project_id: $project_id})
                                 MERGE (s)-[:HAS_BASE_URL]->(u)
+                                RETURN count(s) AS n
                                 """,
                                 base_url=base_url, host=host,
                                 user_id=user_id, project_id=project_id,
-                            )
+                            ).single()
+                            owned = bool(rec and rec["n"])
+                        if owned:
                             stats["relationships_created"] += 1
                         elif domain:
                             session.run(

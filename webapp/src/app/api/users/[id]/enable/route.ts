@@ -1,0 +1,47 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { requireAdmin } from '@/lib/session'
+import { withRouteErrors } from '@/lib/routeErrors'
+import { readJsonBody } from '@/lib/jsonBody'
+import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
+import { rbacFlags } from '@/lib/authz/flags'
+import { requireStepUp } from '@/lib/authz/stepUp'
+import { ROOT_ONLY_REFUSAL, enableAccount, forbiddenAs, isAdminAccount } from '@/lib/authz/accountStatus'
+import { rootProtectedRefusal } from '@/lib/authz/rootProtection'
+import { adminTargetGate } from '@/lib/authz/rootPowers'
+import { requireSessionPermission } from '@/lib/authz/adminPermission'
+
+interface RouteParams {
+  params: Promise<{ id: string }>
+}
+
+/**
+ * POST: enable a disabled account again (ID-13): its password comes back and it can sign in.
+ * Open whatever the identity switch, so an account disabled while the switch was on can
+ * always be restored after it is turned off. With the switch on another admin needs the
+ * confirmed Root (`root_only` for anyone else) and Root's password, or with the permissions
+ * switch on an `admins:manage` holder over a strict subset and its own (step 3.11); with it off
+ * the Phase 1 rule holds: another admin needs the acting admin's own password. Either way the
+ * password goes as `{stepUpPassword}` (ID-25). Body: a JSON object.
+ */
+export const POST = withRouteErrors('Could not enable the account', async (request: NextRequest, { params }: RouteParams) => {
+  const session = await requireAdmin({ fresh: true })
+  if (session instanceof NextResponse) return forbiddenAs(session, 'users:disable')
+  const denied = await requireSessionPermission(session, 'users:disable', { fresh: true })
+  if (denied) return denied
+  if (!sameOrigin(request)) return crossOriginResponse(request)
+  const parsed = await readJsonBody(request)
+  if (parsed instanceof NextResponse) return parsed
+  const { id } = await params
+  const rootRefusal = await rootProtectedRefusal(request, session, id, 'enable')
+  if (rootRefusal) return rootRefusal
+  if (rbacFlags().identity) {
+    const gate = await adminTargetGate(request, session, id, parsed.body.stepUpPassword, ROOT_ONLY_REFUSAL.error, 'enable')
+    if (gate instanceof NextResponse) return gate
+    return enableAccount(request, session, id, gate)
+  }
+  if (id !== session.userId && await isAdminAccount(id)) {
+    const refusal = await requireStepUp(request, parsed.body.stepUpPassword)
+    if (refusal) return refusal
+  }
+  return enableAccount(request, session, id, { adminTarget: true })
+})

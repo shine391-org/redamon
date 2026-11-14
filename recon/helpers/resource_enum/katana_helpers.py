@@ -11,13 +11,23 @@ import ssl
 import time
 import urllib.request
 import uuid
-from typing import Dict, List, Tuple
-from urllib.parse import urlparse
+from typing import Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urlparse, urlsplit
 
-from recon.helpers.docker_helpers import pull_image_or_use_local
+from recon.helpers import request_pacer
+from recon.helpers.docker_helpers import kill_container, pull_image_or_use_local, tool_container_name
 from recon.helpers.system_resolvers import resolver_args
 from recon.helpers.js_recon.urls import is_js_url
+from recon.helpers.target_admission import admission_context
 from .form_helpers import parse_forms_from_html
+
+
+def redirects_contained(settings: Optional[Mapping], recon_data: Optional[Mapping]) -> bool:
+    """True when the run admits its targets one by one: RoE exclusions are in
+    force, or IP mode keeps it to the target list. A crawler may then reach only
+    the hosts it was seeded with, since a redirect or a sibling-subdomain link
+    can name a host the run refused. With neither, crawling is unchanged."""
+    return admission_context(settings, recon_data).active
 
 
 def run_katana_crawler(
@@ -34,6 +44,9 @@ def run_katana_crawler(
     exclude_patterns: List[str],
     parallelism: int = 5,
     concurrency: int = 10,
+    *,
+    settings: Optional[Mapping] = None,
+    recon_data: Optional[Mapping] = None,
 ) -> Tuple[List[str], Dict[str, str]]:
     """
     Run Katana crawler to discover all endpoints.
@@ -62,6 +75,7 @@ def run_katana_crawler(
         exclude_patterns: URL patterns to exclude
         parallelism: Number of target URLs to crawl simultaneously (-p flag)
         concurrency: Number of concurrent fetchers per target (-c flag)
+        settings, recon_data: the run's, for redirects_contained
 
     Returns:
         Tuple of (discovered_urls, url_to_response_body)
@@ -80,6 +94,9 @@ def run_katana_crawler(
     print(f"[*][Katana] Concurrency: {concurrency} (fetchers per target)")
     print(f"[*][Katana] Params only: {params_only}")
     print(f"[*][Katana] Allowed hosts: {len(allowed_hosts)} ({', '.join(sorted(allowed_hosts)[:5])}{'...' if len(allowed_hosts) > 5 else ''})")
+    no_redirects = redirects_contained(settings, recon_data)
+    if no_redirects:
+        print("[*][Katana] Redirects not followed: RoE exclusions or the IP target list are in force")
 
     discovered_urls = set()
     js_urls = set()
@@ -121,7 +138,11 @@ def run_katana_crawler(
         # the full crawl-duration window. For non-loopback targets host
         # networking is equivalent to bridge — both have internet egress —
         # so the flag is strictly an upgrade.
-        cmd = ["docker", "run", "--rm", "--net=host"]
+        #
+        # Named because every stop below kills only the docker CLI: the
+        # container is then killed by this name, or it would go on crawling.
+        container_name = tool_container_name("katana")
+        cmd = ["docker", "run", "--rm", "--net=host", "--name", container_name]
 
         cmd.extend(["-v", "/tmp/redamon:/tmp/redamon"])
 
@@ -136,11 +157,22 @@ def run_katana_crawler(
             "-c", str(concurrency),
             "-timeout", "30",
             "-crawl-duration", crawl_duration,
-            # Use FQDN scope: restricts crawl to exact hostnames of seed URLs
-            # This prevents crawling parent domains (e.g. sub.example.com won't
-            # crawl example.com). Post-hoc filtering provides additional safety.
+            # FQDN scope keeps the crawl on the seed URLs' exact hostnames. It is
+            # fixed, not a setting: the filter below keeps only allowed_hosts,
+            # which both callers build from those same seeds, so a wider scope
+            # (rdn, dn) would only send requests to hosts no scan admitted,
+            # RoE-excluded names included, and then discard the results.
             "-fs", "fqdn",
         ])
+        if no_redirects:
+            # katana follows a redirect inside its HTTP client, before any scope
+            # check: -fs, -cos and -exclude judge only the links it queues
+            # (v1.8.0, run against a loopback 302 into an excluded host), so a
+            # seed answering 302 to an RoE-excluded host or to an address
+            # outside the IP target list had that host requested. -dr is the
+            # only flag that stops the hop. It also drops same-host redirect
+            # targets, which is the coverage this costs.
+            cmd.append("-dr")
         # Resolve as the DNS step did (recon/helpers/system_resolvers.py).
         cmd.extend(resolver_args())
 
@@ -171,6 +203,7 @@ def run_katana_crawler(
                 text=True,
             )
 
+            cut = False
             try:
                 start_time = time.time()
                 deadline = start_time + timeout + 60
@@ -183,12 +216,14 @@ def run_katana_crawler(
                     if time.time() > deadline:
                         print(f"[!][Katana] Overall timeout reached")
                         process.kill()
+                        cut = True
                         break
 
                     # Check idle timeout (no output for too long)
                     if time.time() - last_output_time > idle_timeout:
                         print(f"[!][Katana] Idle timeout ({idle_timeout}s with no output)")
                         process.kill()
+                        cut = True
                         break
 
                     # Poll stdout with 10s timeout so we can re-check deadlines
@@ -245,13 +280,17 @@ def run_katana_crawler(
                     if len(discovered_urls) >= max_urls:
                         print(f"[+][Katana] Reached max URL limit ({max_urls}), stopping Katana")
                         process.kill()
+                        cut = True
                         break
 
             finally:
                 # Ensure process is cleaned up
                 if process.poll() is None:
                     process.kill()
+                    cut = True
                 process.wait()
+                if cut:
+                    kill_container(container_name)
 
                 # Surface stderr WHENEVER the crawl found nothing.
                 #
@@ -316,10 +355,52 @@ def run_katana_crawler(
                        "js_urls": sorted(js_urls)}
 
 
+class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to the host the request went to. A refused hop
+    ends that fetch with an HTTPError, which the caller skips like any other."""
+
+    def __init__(self):
+        super().__init__()
+        self.refused = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _url_host(newurl) != _url_host(req.full_url):
+            self.refused += 1
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _PacedRequests(urllib.request.BaseHandler):
+    """Every request the opener sends takes a slot of the RoE pacer first,
+    each redirect hop included: urllib sends a hop through the opener again,
+    so this runs per hop. A refused hop is never sent and takes none. A 429
+    backs every in-process requester off. Inert with no ceiling."""
+
+    def http_request(self, req):
+        request_pacer.acquire()
+        return req
+
+    def http_response(self, req, response):
+        request_pacer.back_off_on_429(response)
+        return response
+
+    https_request = http_request
+    https_response = http_response
+
+
+def _url_host(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
 def fetch_forms_from_urls(
     urls: List[str],
     max_urls: int = 50,
-    settings=None
+    *,
+    settings: Optional[Mapping] = None,
+    recon_data: Optional[Mapping] = None,
 ) -> List[Dict]:
     """
     Fetch HTML from URLs and extract forms.
@@ -327,6 +408,9 @@ def fetch_forms_from_urls(
     Args:
         urls: URLs to fetch (will filter to HTML pages only)
         max_urls: Maximum URLs to fetch for form extraction
+        settings, recon_data: the run's. Under redirects_contained a redirect
+            is followed only on the same host: the crawlers report a 3xx URL
+            whose Location may name a host the run refused.
 
     Returns:
         List of form dictionaries
@@ -357,7 +441,12 @@ def fetch_forms_from_urls(
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl_context))
+    # Sequential on purpose: under the RoE ceiling every fetch waits for its slot.
+    handlers = [urllib.request.HTTPSHandler(context=ssl_context), _PacedRequests()]
+    same_host = _SameHostRedirects() if redirects_contained(settings, recon_data) else None
+    if same_host is not None:
+        handlers.append(same_host)
+    opener = urllib.request.build_opener(*handlers)
 
     from recon.helpers.auth_profile import identity_header_dict, merge_identity_headers
     _base_headers = merge_identity_headers({
@@ -380,6 +469,9 @@ def fetch_forms_from_urls(
         except Exception:
             continue
 
+    if same_host is not None and same_host.refused:
+        print(f"[-][Katana] Form fetch: {same_host.refused} redirect(s) to another host not followed "
+              f"(RoE exclusions or the IP target list are in force)")
     print(f"[+][Katana] Extracted {len(all_forms)} forms from HTML pages")
     return all_forms
 

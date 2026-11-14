@@ -11,7 +11,7 @@ import os
 import logging
 import contextvars
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # The engagement-limit derivation, shared with recon and the orchestrator so the
 # three services cannot disagree about whether a project's limits are live.
@@ -782,6 +782,16 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
     settings['TARGET_DOMAIN'] = project.get('targetDomain', '')
     settings['IP_MODE'] = project.get('ipMode', False)
     settings['TARGET_IPS'] = project.get('targetIps', [])
+    # The hostname policy of an IP-mode project, read ad hoc like the two keys
+    # above and kept out of DEFAULT_AGENT_SETTINGS: it is scope, not an agent
+    # tuning knob, and an absent column must read as the strictest mode.
+    settings['IP_HOSTNAME_MODE'] = project.get('ipHostnameMode') or 'ip_only'
+    settings['IP_HOSTNAME_INCLUDE'] = list(project.get('ipHostnameInclude') or [])
+    settings['IP_HOSTNAME_EXCLUDE'] = list(project.get('ipHostnameExclude') or [])
+    settings['IP_HOSTNAME_PASSIVE_EXPAND'] = project.get('ipHostnamePassiveExpand', True) is True
+    settings['IP_HOSTNAME_SCAN_ALL_CONFIRMED'] = project.get('ipHostnameScanAllConfirmed') is True
+    settings['IP_HOSTNAME_MAX_SCANNED'] = project.get('ipHostnameMaxScanned', 100)
+    settings['IP_HOSTNAME_PASSIVE_MAX_NAMES'] = project.get('ipHostnamePassiveMaxNames', 500)
     # Domain batch has an EMPTY targetDomain: its scope is the derived group roots.
     # Without these two the agent's guardrails see no target at all and skip
     # themselves, which is the opposite of fail-closed. See target_scope_domains().
@@ -800,6 +810,9 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
 
     # --- Fetch user-level LLM providers and settings from DB ---
     user_id = project.get('userId', '')
+    # Half of the graph's tenant key, for a reader holding only this dict (the
+    # website mirror reads an IP-mode project's scanned hostnames with it).
+    settings['PROJECT_USER_ID'] = user_id or ''
     if user_id and webapp_url:
         # Fetch LLM providers (with full API keys via ?internal=true)
         try:
@@ -863,6 +876,17 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
             else:
                 logger.warning(f"Custom LLM config {config_id} not found and no providers available")
                 settings['CUSTOM_LLM_CONFIG'] = None
+        elif model_id.startswith('instance/'):
+            from llm_builder import exact_instance_provider
+
+            # Exact or nothing: the owner's list holds an instance row only while
+            # an administrator assigns it to a set the owner holds (C1), so no
+            # fallback; setup_llm then refuses the run (instance_provider_unavailable).
+            matched = exact_instance_provider(settings.get('USER_LLM_PROVIDERS', []), model_id)
+            if matched is None:
+                logger.warning(f"[rbac] instance_provider_unavailable: model {model_id} "
+                               f"is not in the owner's provider list (project {project_id})")
+            settings['CUSTOM_LLM_CONFIG'] = matched
     else:
         settings['USER_LLM_PROVIDERS'] = []
         settings['USER_SETTINGS'] = {}
@@ -995,6 +1019,18 @@ def seen_project_updated_at(project_id: str) -> Optional[str]:
     return _SEEN_UPDATED_AT.get(project_id)
 
 
+# Whether the last settings load of a project saw it in IP mode. The replay and
+# browser prepare (api._ip_mode_send_refusal) read the project row from the
+# webapp; when that read fails, this tells a project whose sends must stay on
+# its target IPs (refused: the list is unknown) from a domain-mode one.
+_SEEN_IP_MODE: dict[str, bool] = {}
+
+
+def seen_project_ip_mode(project_id: str) -> Optional[bool]:
+    """True / False from this process's last settings load; None if none ran."""
+    return _SEEN_IP_MODE.get(project_id)
+
+
 def load_project_settings(project_id: str) -> dict[str, Any]:
     """
     Fetch settings for a specific project from webapp API.
@@ -1023,6 +1059,7 @@ def load_project_settings(project_id: str) -> dict[str, Any]:
             settings[SETTINGS_SOURCE_KEY] = "api"
             if settings.get('PROJECT_UPDATED_AT'):
                 _SEEN_UPDATED_AT[project_id] = settings['PROJECT_UPDATED_AT']
+            _SEEN_IP_MODE[project_id] = bool(settings.get('IP_MODE'))
         except Exception as e:
             logger.error(f"Failed to fetch agent settings for project {project_id}: {e}")
             logger.warning("Falling back to DEFAULT_AGENT_SETTINGS")
@@ -1138,16 +1175,92 @@ def auth_scope_patterns() -> list[str]:
 
 def scope_signature() -> str:
     """Changes exactly when the project's scope does; a running session re-runs
-    its guardrails when it does."""
-    return _scope_groups.scope_signature(
-        target_scope_groups(), ip_mode=bool(get_setting('IP_MODE', False)),
-        target_ips=get_setting('TARGET_IPS', []) or [],
-    )
+    its guardrails when it does. In IP mode that includes the hostname policy
+    and the scanned hostnames bound for this turn."""
+    if get_setting('IP_MODE', False):
+        return _scope_groups.scope_signature(
+            [], ip_mode=True, target_ips=get_setting('TARGET_IPS', []) or [],
+            ip_hostname_policy=ip_hostname_policy(), ip_hostnames=ip_hostnames_scanned(),
+        )
+    return _scope_groups.scope_signature(target_scope_groups())
 
 
 def compact_scope_text() -> Optional[str]:
-    """The scope as a few prompt lines, or None (IP mode, no target)."""
+    """The scope as a few prompt lines, or None (no target)."""
+    if get_setting('IP_MODE', False):
+        return _scope_groups.compact_ip_scope_text(
+            get_setting('TARGET_IPS', []) or [], get_setting('IP_HOSTNAME_MODE'), ip_hostnames_scanned())
     return _scope_groups.compact_scope_text(target_scope_groups())
+
+
+# --- IP mode: hostnames on the target IPs (design §10) -----------------------
+
+#: The settings key holding this turn's scanned hostnames (see
+#: bind_ip_hostnames_scanned). Not a webapp field: read from the graph.
+IP_HOSTNAMES_SCANNED_KEY = 'IP_HOSTNAMES_SCANNED'
+
+_IP_HOSTNAME_POLICY_KEYS = (
+    'IP_HOSTNAME_MODE', 'IP_HOSTNAME_INCLUDE', 'IP_HOSTNAME_EXCLUDE', 'IP_HOSTNAME_PASSIVE_EXPAND',
+    'IP_HOSTNAME_SCAN_ALL_CONFIRMED', 'IP_HOSTNAME_MAX_SCANNED', 'IP_HOSTNAME_PASSIVE_MAX_NAMES',
+)
+
+
+def ip_hostname_policy() -> dict[str, Any]:
+    """The seven policy fields as this turn read them, for the scope signature."""
+    return {key: get_setting(key) for key in _IP_HOSTNAME_POLICY_KEYS}
+
+
+def scans_ip_hostnames(get: Optional[Callable[..., Any]] = None) -> bool:
+    """Whether the project is in IP mode with a mode that scans hostnames, i.e.
+    whether its scope has names to read from the graph. `get` reads a settings
+    dict other than this session's (the website mirror passes its own)."""
+    read = get or get_setting
+    return bool(read('IP_MODE', False)) and \
+        _scope_groups.ip_hostname_mode(read('IP_HOSTNAME_MODE')) in ('record_filter', 'scan_all')
+
+
+def scanned_hostnames_in_scope(names, get: Optional[Callable[..., Any]] = None) -> list[str]:
+    """The graph's scanned hostnames that are still targets: those the current
+    policy admits (a name marked scanned outlives a narrowing until the next
+    full run), minus any the hard guardrail blocks. Recon's selection already
+    refused those; a list updated since, or a restored graph, must not put one
+    in the prompt. Sorted, canonical; [] outside IP mode."""
+    read = get or get_setting
+    if not read('IP_MODE', False):
+        return []
+    from orchestrator_helpers.hard_guardrail import is_hard_blocked
+    admitted = _scope_groups.admitted_ip_hostnames(
+        names, read('IP_HOSTNAME_MODE'), read('IP_HOSTNAME_INCLUDE', []), read('IP_HOSTNAME_EXCLUDE', []))
+    return [n for n in admitted if not is_hard_blocked(n)[0]]
+
+
+def bind_ip_hostnames_scanned(names) -> list[str]:
+    """Bind this turn's scanned hostnames (from the graph) to the session's
+    settings, filtered by scanned_hostnames_in_scope, and return them.
+
+    Written into the settings dict itself: it is the one object initialize_node,
+    think_node and the Fireteam members of a turn share, and a new turn loads a
+    new dict, so the names never outlive the turn that read them. Not a state
+    key (every key a node writes is declared on AgentState) nor a ContextVar of
+    its own (a value set inside one node's task does not reach the next node).
+    """
+    kept = scanned_hostnames_in_scope(names)
+    get_settings()[IP_HOSTNAMES_SCANNED_KEY] = kept
+    return kept
+
+
+def ip_hostnames_scanned() -> list[str]:
+    """The scanned hostnames bound for this turn; [] when none were."""
+    return list(get_setting(IP_HOSTNAMES_SCANNED_KEY, None) or [])
+
+
+def ip_soft_guardrail_names() -> list[str]:
+    """The names the LLM guardrail judges besides an IP project's addresses:
+    the base names of the include entries, in record_filter only."""
+    if not get_setting('IP_MODE', False):
+        return []
+    return _scope_groups.ip_soft_guardrail_names(get_setting('IP_HOSTNAME_MODE'),
+                                                 get_setting('IP_HOSTNAME_INCLUDE', []))
 
 
 def guardrail_names() -> list[str]:
@@ -1157,9 +1270,15 @@ def guardrail_names() -> list[str]:
     Otherwise a Domain batch adds its listed hosts (wildcard marker stripped)
     before its group roots: a host under a multi-label government name
     (`www.isa.org.jm`) groups under a root no rule names (`org.jm`), so checking
-    the roots alone lets it through. Single-domain mode is the target itself;
-    IP mode is []. Callers must treat an EMPTY list in batch mode as a refusal.
+    the roots alone lets it through. Single-domain mode is the target itself.
+    IP mode is the base names of the hostname include entries, in every
+    hostname mode, as the webapp and the orchestrator check them: an address is
+    never hard-blocked, the names a record_filter run scans under are, and a
+    rescope to record_filter does not write the list again. Callers must treat
+    an EMPTY list in batch mode as a refusal.
     """
+    if get_setting('IP_MODE', False):
+        return _scope_groups.ip_hostname_include_bases(get_setting('IP_HOSTNAME_INCLUDE', []))
     if _from_webapp_groups():
         names = _scope_groups.guardrail_names(target_scope_groups())
         if not get_setting('DOMAIN_BATCH_MODE', False):

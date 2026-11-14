@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSession, requireUserAccess } from '@/lib/session'
+import { requireUserAccess } from '@/lib/session'
+import { signedInActor } from '@/lib/auditActor'
 import prisma from '@/lib/prisma'
 import { writeAudit } from '@/lib/audit'
 import { DESCRIPTION_MAX_CHARS, UserSkillError } from '@/lib/userSkills'
@@ -8,6 +9,8 @@ import {
 } from '@/lib/userSkillWrites'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { refuseWhileActingAsOn } from '@/lib/authz/actAsRefusals'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -32,8 +35,13 @@ const SKIP_FOR_CODE: Record<string, SkipReason> = {
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'write' })
     if (__denied) return __denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:attack_skills')
+    if (selfRefused) return selfRefused
+    // It writes through createUserSkillTx under its own lock, past userSkillWrites' guard (step 3.14).
+    const actingAs = await refuseWhileActingAsOn(id, 'write_agent_skills')
+    if (actingAs) return actingAs
 
     let catalogRes: Response
     try {
@@ -97,8 +105,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       return out
     }, { timeout: 30_000 })
 
-    const session = await getSession()
-    const actor = auditActorFor(session?.userId, id)
+    const actor = auditActorFor((await signedInActor())?.id, id)
     for (const s of created) {
       await writeAudit({
         actorId: actor.actorId,

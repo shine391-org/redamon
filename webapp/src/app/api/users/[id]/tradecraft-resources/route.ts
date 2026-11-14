@@ -5,6 +5,9 @@ import { agentFetch } from '@/lib/agentFetch'
 import { internalError, readUpstreamBody } from '@/lib/routeErrors'
 import { agentAnswerLastError, thrownLastError } from './agentLastError'
 import { isLoopModel } from '@/lib/agentInTheLoop'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { refuseWhileActingAsOn } from '@/lib/authz/actAsRefusals'
+import { rbacFlags } from '@/lib/authz/flags'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -87,8 +90,10 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     // Ownership + secret-unmask gate (STRIDE I1): unmasked githubTokenOverride
     // requires a valid X-Internal-Key header (the agent), not ?internal=true.
-    const denied = await requireUserAccess(request, id)
+    const denied = await requireUserAccess(request, id, { mode: 'read' })
     if (denied) return denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:tradecraft')
+    if (selfRefused) return selfRefused
     const internal = isInternalRequest(request) && request.nextUrl.searchParams.get('internal') === 'true'
 
     const resources = await prisma.userTradecraftResource.findMany({
@@ -114,8 +119,10 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    const denied = await requireUserAccess(request, id)
+    const denied = await requireUserAccess(request, id, { mode: 'write' })
     if (denied) return denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:tradecraft')
+    if (selfRefused) return selfRefused
 
     const body = await request.json()
     const skipVerify = request.nextUrl.searchParams.get('skipVerify') === 'true'
@@ -142,6 +149,16 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     const v = validateUrl(body.url)
     if (!v.ok) {
       return NextResponse.json({ error: v.error }, { status: 400 })
+    }
+
+    // The crawl below would send the account's GitHub token, which stays with the account while
+    // someone acts as it (permissions switch on, step 3.14): refused before anything is written.
+    if (rbacFlags().permissions && !skipVerify && !body.githubTokenOverride) {
+      const settings = await prisma.userSettings.findUnique({ where: { userId: id }, select: { githubAccessToken: true } })
+      if (settings?.githubAccessToken) {
+        const actingAs = await refuseWhileActingAsOn(id, 'use_github_token')
+        if (actingAs) return actingAs
+      }
     }
 
     const slug = await uniqueSlug(id, slugify(body.name))

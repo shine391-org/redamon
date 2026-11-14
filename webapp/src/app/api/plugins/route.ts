@@ -1,20 +1,30 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, type NextRequest } from 'next/server'
 import { requireEffectiveUser } from '@/lib/access'
+import { pluginAccessFor } from '@/lib/plugins/accessRules'
 import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import { buildPluginsPage, viewerIsAdmin } from '@/lib/plugins/pageModel'
 import { getSession } from '@/lib/session'
+import { requirePermission } from '@/lib/authz/guards'
 
 /**
- * GET /api/plugins: the Plugins page model (lib/plugins/pageModel.ts) for any signed-in
- * user; management details only for an admin, by the role read from the database.
+ * GET /api/plugins: the Plugins page model (lib/plugins/pageModel.ts) for whoever holds
+ * plugins:use; management details only for whoever holds platform:plugins, read fresh from the database.
+ * Whoever does not manage plugins sees only those available to the effective user (accessRules.ts).
  */
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-export const GET = pluginRoute('plugins page', 'The Plugins page could not be read; see the webapp log.', async () => {
+export const GET = pluginRoute('plugins page', 'The Plugins page could not be read; see the webapp log.', async (request: NextRequest) => {
+  const auth = await requirePermission(request, 'plugins:use')
+  if (auth instanceof NextResponse) return auth
   const user = await requireEffectiveUser()
   if (user instanceof NextResponse) return user
   const session = await getSession()
-  const isAdmin = !!session && (await viewerIsAdmin(session.userId))
-  return NextResponse.json(await buildPluginsPage(isAdmin), { headers: { 'Cache-Control': 'no-store' } })
+  const managesPlugins = !!session && (await viewerIsAdmin(session.userId))
+  const page = await buildPluginsPage(managesPlugins)
+  if (!managesPlugins) {
+    const access = await pluginAccessFor(user.userId)
+    page.plugins = page.plugins.filter((p) => access.allows(p.id))
+  }
+  return NextResponse.json(page, { headers: { 'Cache-Control': 'no-store' } })
 })

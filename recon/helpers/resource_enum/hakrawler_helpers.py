@@ -10,12 +10,13 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
-from recon.helpers.docker_helpers import pull_image_or_use_local
+from recon.helpers.docker_helpers import kill_container, pull_image_or_use_local, tool_container_name
 from recon.helpers.js_recon.urls import is_js_url
 from recon.helpers.resource_enum import tool_health
+from recon.helpers.resource_enum.katana_helpers import redirects_contained
 
 
 def per_url_budget(timeout: int) -> int:
@@ -92,7 +93,11 @@ def _crawl_single_url(
     # --net=host is ALWAYS passed so Hakrawler can reach loopback / local-lab
     # targets. See recon/helpers/resource_enum/katana_helpers.py for the long
     # comment on why sibling docker containers can't see 127.0.0.1 otherwise.
-    cmd = ["docker", "run", "--rm", "--net=host", "-i"]
+    #
+    # Named because the watchdog and the URL cap kill only the docker CLI: the
+    # container is then killed by this name, or it would go on crawling.
+    container_name = tool_container_name("hakrawler")
+    cmd = ["docker", "run", "--rm", "--net=host", "-i", "--name", container_name]
 
     cmd.append(docker_image)
 
@@ -220,9 +225,13 @@ def _crawl_single_url(
         finally:
             watchdog.cancel()
             heartbeat_stop.set()
+            stopped = capped or overran.is_set()
             if process.poll() is None:
                 process.kill()
+                stopped = True
             process.wait()
+            if stopped:
+                kill_container(container_name)
             heartbeat_thread.join(timeout=1)
             return_code = process.returncode if isinstance(process.returncode, int) else None
 
@@ -261,6 +270,9 @@ def run_hakrawler_crawler(
     custom_headers: List[str],
     exclude_patterns: List[str],
     parallelism: int = 4,
+    *,
+    settings: Optional[Mapping] = None,
+    recon_data: Optional[Mapping] = None,
 ) -> Tuple[List[str], Dict]:
     """
     Run Hakrawler crawler to discover endpoints via stdin-based Docker execution.
@@ -282,6 +294,8 @@ def run_hakrawler_crawler(
         custom_headers: Custom HTTP headers
         exclude_patterns: URL patterns to exclude
         parallelism: Number of URLs to crawl in parallel
+        settings, recon_data: the run's; under redirects_contained (RoE
+            exclusions, IP mode) include_subs is turned off
 
     Returns:
         Tuple of (discovered_urls, {"external_domains": [...], "failed": bool,
@@ -290,6 +304,15 @@ def run_hakrawler_crawler(
         keeps last run's jsluice secrets out of the prune.
     """
     print(f"\n[*][Hakrawler] Running Hakrawler crawler for endpoint discovery...")
+    if include_subs and redirects_contained(settings, recon_data):
+        # -subs widens hakrawler's URL filter to every subdomain of the seed,
+        # and the filter is all it checks before a request: it follows links
+        # and redirects into a sibling the RoE excludes, or a name outside the
+        # IP target list. Without it hakrawler stays on the seed's own host,
+        # same-host redirects included.
+        include_subs = False
+        print("[*][Hakrawler] Seed hosts only (RoE exclusions or the IP target list are in force): "
+              "subdomain crawling off")
     print(f"[*][Hakrawler] Crawl depth: {depth}")
     print(f"[*][Hakrawler] Threads per instance: {threads}")
     print(f"[*][Hakrawler] Per-URL timeout: {timeout}s")

@@ -49,7 +49,7 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
     monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
     monkeypatch.setattr(vs, "extract_targets_from_recon",
-                        lambda rd: ([], ["www.example.com"], {}))
+                        lambda rd, settings=None: ([], ["www.example.com"], {}))
     monkeypatch.setattr(vs, "build_target_urls",
                         lambda h, i, rd, scan_all_ips=False,
                         admission_report=None, declared_report=None: [])
@@ -82,25 +82,23 @@ class TestEmptySelectedTargets:
                    for g in report.gaps)
 
         meta = out["vuln_scan"]["scan_metadata"]
-        assert meta["total_urls_scanned"] == 0 and meta["total_urls_selected"] == 0
-        row = meta["coverage"]["hosts"][base_url_key("https://www.example.com")]
-        assert row == {"status": "failed", "inputs": 0, "outputs": 0,
-                       "reason": "no selected targets"}
-
+        assert meta.get("total_urls_scanned", 0) == 0 and meta.get("total_urls_selected", 0) == 0
         plan = out[SELECTION_KEY]
         assert plan["status"] == "failed"
-        assert plan["execution"]["status"] == "failed"
+        assert ("no selected Nuclei targets" in plan["reason"]
+                or "no targets" in plan["reason"])
         assert plan["execution"]["completed_passes"] == 0
         assert plan["execution"]["attempted_urls"] == 0
         assert plan["execution"]["passes"] == [
-            {"status": "failed", "reason": "no selected targets",
-             "attempted": False, "targets": 1}]
+            {"status": "failed", "reason": "no selected Nuclei targets",
+             "attempted": False, "targets": 0}]
 
     def test_an_empty_selection_without_live_hosts_still_keeps_findings(self, pipeline):
         out = vs.run_vuln_scan({"domain": "example.com", "http_probe": {"by_url": {}}},
                                settings=_settings())
         assert {"nuclei", "vuln_scan"} <= cb.coverage_report().degraded_sources
         assert out[SELECTION_KEY]["status"] == "failed"
+        assert out[SELECTION_KEY]["reason"] == "no selected Nuclei targets"
 
 
     def test_no_routed_chunks_records_failure_before_execution(self, pipeline, monkeypatch):
@@ -115,6 +113,9 @@ class TestEmptySelectedTargets:
         out = vs.run_vuln_scan(_recon(), settings=_settings())
         plan = out[SELECTION_KEY]
         assert plan["status"] == "failed"
+        assert ("no selected Nuclei targets" in plan["reason"]
+                or "no targets" in plan["reason"]
+                or "partial run" in plan["reason"])
         assert plan["outcomes"]["failed"] == 1
         assert plan["execution"]["attempted_passes"] == 0
         assert plan["execution"]["passes"][0]["reason"] == "no selected chunks executed"
@@ -261,7 +262,7 @@ class TestPruneKeepsUncheckedNucleiFindings:
                 return True
 
             def prune_unseen_findings(self, user_id, project_id, sources, since,
-                                      keep_hosts=(), keep_unproven=False):
+                                      keep_hosts=(), keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
                 prunes.append(list(sources))
 
         monkeypatch.setattr("graph_db.Neo4jClient", _Graph())

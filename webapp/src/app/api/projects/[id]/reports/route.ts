@@ -2,14 +2,16 @@ import { NextRequest, NextResponse } from 'next/server'
 import { projectTargetLabel } from '@/lib/projectSummary'
 import prisma from '@/lib/prisma'
 import { gatherReportData } from '@/lib/report/reportData'
+import { reportHoldsStepContent } from '@/lib/report/stepContent'
 import { generateReportHtml, type LLMNarratives } from '@/lib/report/reportTemplate'
 import { writeFileSync, mkdirSync, existsSync } from 'fs'
 import path from 'path'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
 import { callFeatureAgent } from '@/lib/featureAgentCall'
 import { providerFailureDetail } from '@/lib/llmFeatures'
 import { internalError } from '@/lib/routeErrors'
+import { ownerCredentialRefusal, recordFeatureSpend } from '@/lib/authz/ownerSpend'
 
 const REPORT_OUTPUT_PATH = process.env.REPORT_OUTPUT_PATH || '/data/reports'
 const NARRATIVES_TIMEOUT_MS = 300_000
@@ -19,14 +21,12 @@ interface RouteParams {
 }
 
 /** GET /api/projects/{id}/reports - List all reports for a project */
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'reports:read', { projectId: id })
+    if (auth instanceof NextResponse) return auth
 
     const reports = await prisma.report.findMany({
       where: { projectId: id },
@@ -49,19 +49,28 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
 }
 
 /** POST /api/projects/{id}/reports - Generate a new report */
-export async function POST(_request: NextRequest, { params }: RouteParams) {
+export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
-
-    // The narratives run on the caller's own "Report narratives" model and keys.
-    // Checked before the (slow) data gathering so the model picker opens at once.
-    const model = await readFeatureModel(eff.userId, 'report_narratives')
-    if (!model) return featureModelErrorResponse('model_required', 'report_narratives')
+    const auth = await requirePermission(request, 'reports:generate', { projectId: id })
+    if (auth instanceof NextResponse) return auth
+    const ownerId = auth.access!.project.userId
+    // The narratives spend the project owner's "Report narratives" model and keys (step 5.6, C1; a
+    // custom/ model resolves only against its owner's providers). A report itself is W: a
+    // collaborator without Use AI agent (which counts only with the owner's consent) gets one
+    // without narratives, and so does one whose owner chose no model (the picker is the owner's).
+    const isOwner = auth.access!.level === 'owner'
+    let narrativesSkipped: string | null = null
+    let model = ''
+    if (!isOwner && ownerCredentialRefusal(auth)) {
+      narrativesSkipped = 'use_agent_required'
+    } else {
+      // Checked before the (slow) data gathering so the owner's model picker opens at once.
+      model = await readFeatureModel(ownerId, 'report_narratives')
+      if (!model && isOwner) return featureModelErrorResponse('model_required', 'report_narratives')
+      if (!model) narrativesSkipped = 'owner_model_required'
+    }
 
     // 1. Gather all data from Neo4j + PostgreSQL
     const reportData = await gatherReportData(id)
@@ -70,28 +79,31 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
     // reached at all falls back to a report without narratives; a model, key or
     // version problem is the person's to fix, so it is shown instead of hidden.
     let narratives: LLMNarratives | null = null
-    let narrativesSkipped: string | null = null
-    const agent = await callFeatureAgent({
-      featureId: 'report_narratives',
-      path: '/api/report/summarize',
-      model,
-      body: { data: condenseForAgent(reportData), model, user_id: eff.userId },
-      timeoutMs: NARRATIVES_TIMEOUT_MS,
-    })
-    if (agent.ok) {
-      const { model_used: _modelUsed, narratives_failed: failed, ...rest } = agent.body
-      // The agent answers empty narratives with a marker when the model call
-      // failed or its answer was unreadable: a report without them, and the reason.
-      if (typeof failed === 'string' && /^[a-z_]{1,40}$/.test(failed)) {
-        narrativesSkipped = [failed, providerFailureDetail(agent.body)].filter(Boolean).join(' · ')
+    if (model) {
+      const unrecorded = await recordFeatureSpend(auth, 'report_narratives')
+      if (unrecorded) return unrecorded
+      const agent = await callFeatureAgent({
+        featureId: 'report_narratives',
+        path: '/api/report/summarize',
+        model,
+        body: { data: condenseForAgent(reportData), model, user_id: ownerId },
+        timeoutMs: NARRATIVES_TIMEOUT_MS,
+      })
+      if (agent.ok) {
+        const { model_used: _modelUsed, narratives_failed: failed, ...rest } = agent.body
+        // The agent answers empty narratives with a marker when the model call
+        // failed or its answer was unreadable: a report without them, and the reason.
+        if (typeof failed === 'string' && /^[a-z_]{1,40}$/.test(failed)) {
+          narrativesSkipped = [failed, providerFailureDetail(agent.body)].filter(Boolean).join(' · ')
+        } else {
+          narratives = rest as unknown as LLMNarratives
+        }
+      } else if (agent.code === 'agent_unreachable') {
+        console.warn('Agent unavailable for report narratives, generating without them')
+        narrativesSkipped = agent.code
       } else {
-        narratives = rest as unknown as LLMNarratives
+        return agent.response
       }
-    } else if (agent.code === 'agent_unreachable') {
-      console.warn('Agent unavailable for report narratives, generating without them')
-      narrativesSkipped = agent.code
-    } else {
-      return agent.response
     }
 
     // 3. Generate HTML
@@ -133,6 +145,8 @@ export async function POST(_request: NextRequest, { params }: RouteParams) {
           cveLowCount: reportData.metrics.cveLowCount,
           totalRemediations: reportData.metrics.totalRemediations,
           exploitableCount: reportData.metrics.exploitableCount,
+          // Opening a report that holds fireteam step content needs Raw data & files (lib/report/stepContent.ts).
+          stepContent: reportHoldsStepContent(reportData),
         },
       },
     })

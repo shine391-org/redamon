@@ -22,7 +22,8 @@ from sse_starlette.sse import EventSourceResponse
 
 from auth import is_orchestrator_request_authorized
 from recon_settings.engagement import derive_roe_enabled
-from container_manager import ContainerManager
+from container_manager import ContainerManager, scanner_key
+from job_credential import JobCredentialRefused, master_key_is_weak, verify_job_credential
 from admission_ledger import AdmissionError
 
 
@@ -264,13 +265,72 @@ def _refuse_failed_spawn(state) -> None:
         )
 
 
-def _check_roe_time_window(project: dict) -> None:
+def _refuse_job_credential(code: str, project_id: str) -> HTTPException:
+    logger.warning(f"[rbac] job credential refused reason={code} project={project_id}")
+    if code == "weak_master_key":
+        return HTTPException(status_code=503, detail={
+            "detail": "INTERNAL_API_KEY is not configured, so the scan's job credential cannot be "
+                      "verified. Run ./redamon.sh update to generate it.",
+            "code": "job_credential_unverifiable"})
+    return HTTPException(status_code=403, detail={
+        "detail": f"This scan start carries no valid job credential ({code}).",
+        "code": f"job_credential_{code}"})
+
+
+def _job_tenant(project_id: str, request, *, calls_back: bool) -> str:
+    """The tenant a scan start is admitted and run under: the `ten` of the job
+    credential the webapp minted for it (step 1.16, NF-08), never the body's
+    user_id, which must name the same account.
+
+    `calls_back`: the scan's container calls the webapp and the agent with the
+    scanner key and its credential. Without a scanner key it would get no key at
+    all (NF-16), so the start is refused here with the fix, not left to fail
+    inside the container.
+    """
+    if calls_back and not scanner_key():
+        logger.error("[rbac] scanner key missing: run ./redamon.sh update to generate it")
+        raise HTTPException(status_code=503, detail={
+            "detail": "SCANNER_API_KEY is not configured, so the scan could not read its settings. "
+                      "Run ./redamon.sh update to generate it.",
+            "code": "scanner_key_missing"})
+    # Before "missing": a webapp with a weak master key mints nothing, so its starts
+    # arrive bare, and the remedy (generate the key) is what the operator needs.
+    if master_key_is_weak():
+        raise _refuse_job_credential("weak_master_key", project_id)
+    if not request.job_credential:
+        raise _refuse_job_credential("missing", project_id)
+    try:
+        claims = verify_job_credential(request.job_credential, project_id)
+    except JobCredentialRefused as e:
+        raise _refuse_job_credential(e.code, project_id)
+    if request.user_id != claims["ten"]:
+        raise _refuse_job_credential("user_mismatch", project_id)
+    return claims["ten"]
+
+
+def _job_actor(kind: str, project_id: str, request, tenant: str) -> str:
+    """The person a start counts against (step 5.5, D-14): the body's actor_user_id,
+    else the tenant. It reaches admission's per-user ceiling and the run's state only;
+    the container, its graph writes and its credential stay the tenant's. The body
+    comes from the webapp alone (ORCHESTRATOR_API_KEY), which took the actor from the
+    start's own permission check."""
+    actor = request.actor_user_id or tenant
+    logger.info(f"[scan] start {kind} project={project_id} tenant={tenant} actor={actor}")
+    return actor
+
+
+def _check_roe_time_window(project: dict, _now=None) -> None:
     """Enforce the RoE time-window. Raises 403 outside the window.
 
     A malformed timezone is a bad *setting*, not an unknown scope, so it raises
     400 naming the offending setting instead of silently passing (mcp_plan.md
     P0-1). Only that narrow carve-out is tolerated; every other failure
     propagates.
+
+    A mirror of recon/helpers/roe_scope.py ``_check_roe_time_window``, which
+    this image cannot import: a start admitted here that the scan container
+    refuses exits 1 after the orchestrator reported it started. Both run
+    recon/tests/fixtures/roe_time_window_vectors.json. Pass _now for testing.
     """
     # The THIRD enforcement point, after recon and the agent. It gates on the
     # DERIVED value like the other two: gating on the column would leave this
@@ -297,9 +357,9 @@ def _check_roe_time_window(project: dict) -> None:
             ),
         )
 
-    now_local = datetime.now(tz)
+    now_local = (_now or datetime.now(tz)).astimezone(tz)
     day_name = now_local.strftime('%A').lower()
-    allowed_days = project.get('roeTimeWindowDays', [])
+    allowed_days = [str(d).lower() for d in project.get('roeTimeWindowDays') or []]
     start_time = project.get('roeTimeWindowStartTime', '09:00')
     end_time = project.get('roeTimeWindowEndTime', '18:00')
     current_time = now_local.strftime('%H:%M')
@@ -426,6 +486,18 @@ def _reset_plugin_reconcile_state() -> None:
     _plugin_reconcile_gone = False
 
 
+# RBAC expiry sweep (step 4.15, T19): the webapp writes the .expired audit rows and removes
+# expired shares, overrides, break-glass rows and links. Expiry is already judged lazily at
+# every access check, so the interval only bounds how late those rows land.
+RBAC_SWEEP_INTERVAL_S = _interval_from_env("RBAC_SWEEP_INTERVAL", 300)
+_last_rbac_sweep = 0.0
+
+
+def _reset_rbac_sweep_state() -> None:
+    global _last_rbac_sweep
+    _last_rbac_sweep = 0.0
+
+
 async def _post_job_queue_reconcile(cm) -> None:
     """Post the set of projects with a live scan so the webapp can close finished
     'running' JobQueue rows (Scan Queue C-6). Best-effort; never raises."""
@@ -505,6 +577,23 @@ async def _post_plugin_reconcile(key: str) -> None:
         logger.debug("[plugins] reconcile: the webapp answered %s; retried at the next interval", status)
 
 
+async def _maybe_rbac_sweep() -> None:
+    """POST /api/internal/rbac/sweep at most once per interval. Best-effort; never raises on I/O.
+    Posted through _post_status because request_json returns no status, and a refused sweep
+    must log the code it got. The webapp answers 200 with every RBAC switch off."""
+    global _last_rbac_sweep
+    now = time.monotonic()
+    if _last_rbac_sweep and now - _last_rbac_sweep < RBAC_SWEEP_INTERVAL_S:
+        return
+    _last_rbac_sweep = now
+    key = _webapp_internal_key()
+    if not key:
+        return
+    status = await asyncio.to_thread(_post_status, f"{_webapp_base()}/api/internal/rbac/sweep", key, 30.0)
+    if status is None or not 200 <= status < 300:
+        logger.warning("[rbac] sweep failed status=%s", "unreachable" if status is None else status)
+
+
 async def _maybe_reconcile_plugins() -> None:
     """Starts POST /api/internal/plugins/reconcile at most once per interval, as a background
     task never awaited here: the reaper awaits each step, and the same loop releases governor
@@ -567,6 +656,12 @@ async def _ai_attack_reaper():
                     await _maybe_prune_mcp_tokens()
                 except Exception as e:
                     logger.warning(f"mcp token prune failed: {e}")
+                # Here and not in the scan scheduler, which exits at start when
+                # SCAN_SCHEDULER_ENABLED=false.
+                try:
+                    await _maybe_rbac_sweep()
+                except Exception as e:
+                    logger.warning(f"[rbac] sweep tick failed: {e}")
                 try:
                     await _maybe_reconcile_plugins()
                 except Exception as e:
@@ -704,7 +799,8 @@ async def lifespan(app: FastAPI):
     # local-fixture sources find an empty directory rather than a guessed one.
     container_manager.trufflehog_scan_targets = _host_mounts.get("/app/scan_targets", "")
     # Copies of target JS a JS Recon run left behind (its container was killed
-    # or crashed); a live, re-adopted run keeps its own.
+    # or crashed). A scan outlives an orchestrator restart without being
+    # adopted, so a run the daemon still lists as live keeps its own.
     await container_manager._run_blocking(container_manager.sweep_trufflehog_stages)
     reaper = asyncio.create_task(_ai_attack_reaper())
     capture_reconciler = asyncio.create_task(_capture_config_reconcile())
@@ -872,6 +968,7 @@ async def system_active_scans():
             "group_number": getattr(state, "group_number", None),
             "total_groups": getattr(state, "total_groups", None),
             "started_at": started.isoformat() if started else None,
+            "actor_user_id": getattr(state, "actor_user_id", None),
         })
 
     # One state per project.
@@ -1063,7 +1160,7 @@ async def get_defaults():
             from recon.settings_registry import runtime_only as _registry_runtime_only
 
         RUNTIME_ONLY_KEYS = set(_registry_runtime_only())
-        # Plus the four the registry cannot infer. Each is a Project COLUMN, so
+        # Plus the five the registry cannot infer. Each is a Project COLUMN, so
         # it is not runtime-only in the registry's sense; it is simply not a
         # global default. The rest of the targeting block legitimately has one:
         # an empty subdomain list, and the shipped `_redamon-verify` TXT prefix.
@@ -1072,6 +1169,9 @@ async def get_defaults():
             "TARGET_DOMAIN",    # per-project, provided by the operator
             "DOMAIN_BATCH_MODE",
             "DOMAIN_BATCH_GROUPS",
+            # Generated per project at creation. The form POSTs back what this
+            # payload seeds, so a value here became every new project's token.
+            "OWNERSHIP_TOKEN",
         })
 
 
@@ -1215,18 +1315,31 @@ async def start_recon(project_id: str, request: ReconStartRequest):
         hit = first_hard_blocked(targets)
         if hit:
             raise HTTPException(status_code=403, detail=f"Hard guardrail: {hit[1]}")
+    else:
+        # IP mode: the addresses are not hard-blocked, but a record_filter run
+        # scans names under the hostname include entries, so their base names are.
+        from hard_guardrail import first_hard_blocked
+        from batch_scope import guardrail_targets
+        hit = first_hard_blocked(guardrail_targets(project))
+        if hit:
+            raise HTTPException(status_code=403, detail=f"Hard guardrail: {hit[1]}")
 
     _check_roe_time_window(project)
+    tenant = _job_tenant(project_id, request, calls_back=True)
+    actor = _job_actor("full_recon", project_id, request, tenant)
 
     try:
         state = await container_manager.start_recon(
             project_id=project_id,
-            user_id=request.user_id,
+            user_id=tenant,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
             webapp_api_url=_spawned_webapp_url(),
             recon_path=RECON_PATH,
             custom_templates_path=CUSTOM_TEMPLATES_PATH,
             scan_mode=request.mode,
             project_revision=__import__("recon_evidence").project_revision(project),
+            job_credential=request.job_credential,
         )
     except ValueError as e:
         raise _value_error_http(e)
@@ -1554,6 +1667,14 @@ async def start_partial_recon(project_id: str, request: PartialReconStartRequest
         hit = first_hard_blocked(names + [r for r in roots if r not in names])
         if hit:
             raise HTTPException(status_code=403, detail=f"Hard guardrail: {hit[1]}")
+    else:
+        # IP mode: only the hostname include entries' base names, never the
+        # synthetic root, as for a full recon.
+        from hard_guardrail import first_hard_blocked
+        from batch_scope import guardrail_targets
+        hit = first_hard_blocked(guardrail_targets(project))
+        if hit:
+            raise HTTPException(status_code=403, detail=f"Hard guardrail: {hit[1]}")
 
     _check_roe_time_window(project)
 
@@ -1568,6 +1689,8 @@ async def start_partial_recon(project_id: str, request: PartialReconStartRequest
     kept = bool(user_inputs) or any((user_targets or {}).get(k) for k in ('subdomains', 'urls', 'ips'))
     if typed and not kept and not request.include_graph_targets:
         raise HTTPException(status_code=400, detail=f"No typed target is in this project's scope: {refused[:10]}")
+    tenant = _job_tenant(project_id, request, calls_back=True)
+    actor = _job_actor("partial_recon", project_id, request, tenant)
 
     # Settings, and with them each root's group scope, are fetched by the recon
     # container itself via get_settings() (PROJECT_ID + WEBAPP_API_URL env vars,
@@ -1582,7 +1705,7 @@ async def start_partial_recon(project_id: str, request: PartialReconStartRequest
         "user_targets": user_targets,
         "include_graph_targets": request.include_graph_targets,
         "settings_overrides": overrides,
-        "user_id": request.user_id,
+        "user_id": tenant,
         "webapp_api_url": _spawned_webapp_url(),
     }
 
@@ -1593,6 +1716,9 @@ async def start_partial_recon(project_id: str, request: PartialReconStartRequest
             config=config,
             recon_path=RECON_PATH,
             custom_templates_path=CUSTOM_TEMPLATES_PATH,
+            job_credential=request.job_credential,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
         )
         logger.info(
             f"Partial recon run {state.run_id}: project {project_id}, "
@@ -1839,6 +1965,10 @@ async def start_ai_attack_surface(project_id: str, request: AiAttackSurfaceStart
             detail={"detail": "AI Attack Surface source not mounted into the orchestrator",
                      "code": "not_configured"},
         )
+    # Its container calls nothing back, so it gets neither the credential nor a
+    # need for the scanner key; the credential still decides its admission.
+    tenant = _job_tenant(project_id, request, calls_back=False)
+    actor = _job_actor("ai_attack", project_id, request, tenant)
 
     run_config = {
         "tool": request.tool,
@@ -1854,14 +1984,20 @@ async def start_ai_attack_surface(project_id: str, request: AiAttackSurfaceStart
         "api_key": request.api_key,
         "auth_header": request.auth_header,
         "auth_scheme": request.auth_scheme,
-        "user_id": request.user_id,
+        "ip_mode": request.ip_mode,
+        "target_ips": request.target_ips,
+        "roe_excluded_hosts": request.roe_excluded_hosts,
+        "ip_hostname_policy": request.ip_hostname_policy,
+        "user_id": tenant,
         "webapp_api_url": _spawned_webapp_url(),
     }
 
     try:
         state = await container_manager.start_ai_attack_surface(
             project_id=project_id,
-            user_id=request.user_id,
+            user_id=tenant,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
             webapp_api_url=_spawned_webapp_url(),
             run_config=run_config,
             ai_attack_path=AI_ATTACK_SURFACE_PATH,
@@ -1951,13 +2087,19 @@ async def start_gvm_scan(project_id: str, request: GvmStartRequest):
             detail="Recon data required. Run reconnaissance first.",
         )
 
+    tenant = _job_tenant(project_id, request, calls_back=True)
+    actor = _job_actor("gvm", project_id, request, tenant)
+
     try:
         state = await container_manager.start_gvm_scan(
             project_id=project_id,
-            user_id=request.user_id,
+            user_id=tenant,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
             webapp_api_url=_spawned_webapp_url(),
             recon_path=RECON_PATH,
             gvm_scan_path=GVM_SCAN_PATH,
+            job_credential=request.job_credential,
         )
         return state
     except ValueError as e:
@@ -2080,12 +2222,18 @@ async def start_github_hunt(project_id: str, request: GithubHuntStartRequest):
             detail="Recon data required. Run reconnaissance first.",
         )
 
+    tenant = _job_tenant(project_id, request, calls_back=True)
+    actor = _job_actor("github_hunt", project_id, request, tenant)
+
     try:
         state = await container_manager.start_github_hunt(
             project_id=project_id,
-            user_id=request.user_id,
+            user_id=tenant,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
             webapp_api_url=_spawned_webapp_url(),
             github_hunt_path=GITHUB_HUNT_PATH,
+            job_credential=request.job_credential,
         )
         return state
     except ValueError as e:
@@ -2202,11 +2350,17 @@ async def start_trufflehog(project_id: str, request: TrufflehogStartRequest):
     """
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    # The TruffleHog container is the dirty half of a dirty/clean split and calls
+    # nothing back: no key, no credential; the credential decides its admission.
+    tenant = _job_tenant(project_id, request, calls_back=False)
+    actor = _job_actor("trufflehog", project_id, request, tenant)
 
     try:
         state = await container_manager.start_trufflehog(
             project_id=project_id,
-            user_id=request.user_id,
+            user_id=tenant,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
             trufflehog_path=TRUFFLEHOG_PATH,
             source=request.source,
             config=request.config,
@@ -2318,10 +2472,14 @@ async def start_supply_chain(project_id: str, request: SupplyChainStartRequest):
     """Start a Supply-Chain scan (offline OSV audit of an uploaded SBOM/lockfile)."""
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    tenant = _job_tenant(project_id, request, calls_back=True)
+    actor = _job_actor("supply_chain", project_id, request, tenant)
     try:
         return await container_manager.start_supply_chain(
             project_id=project_id,
-            user_id=request.user_id,
+            user_id=tenant,
+            actor_user_id=actor,
+            actor_max_concurrent=request.actor_max_concurrent,
             webapp_api_url=_spawned_webapp_url(),
             supply_chain_path=SUPPLY_CHAIN_PATH,
             repo_override_url=request.repo_override_url,
@@ -2329,6 +2487,7 @@ async def start_supply_chain(project_id: str, request: SupplyChainStartRequest):
             repo_override_ref=request.repo_override_ref,
             repo_override_scope=request.repo_override_scope,
             repo_override_deep=request.repo_override_deep,
+            job_credential=request.job_credential,
         )
     except ValueError as e:
         raise _value_error_http(e)

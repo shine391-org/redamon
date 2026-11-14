@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
+import { triageCaller, triagePerson } from '@/lib/triage/routeCaller'
 import prisma from '@/lib/prisma'
 import { readJsonBody } from '@/lib/jsonBody'
-import { requireProjectOwner, graphTriage, realActorUserId } from '@/lib/triageClient'
+import { graphTriage, realActorUserId } from '@/lib/triageClient'
 import { activationBusy } from '@/lib/activationLock'
 import { invalidateCache } from '@/app/api/graph/cache'
 import { writeAudit } from '@/lib/audit'
@@ -49,8 +51,9 @@ export async function POST(request: NextRequest) {
     projectId?: string; batchId?: unknown; keys?: unknown; includeSeed?: unknown; concept?: unknown
   }
 
-  const caller = await requireProjectOwner(projectId)
-  if (caller instanceof NextResponse) return caller
+  const auth = await requirePermission(request, 'triage:mute', { projectId })
+  if (auth instanceof NextResponse) return auth
+  const caller = triageCaller(auth)
 
   if (typeof batchId !== 'string' || !MULTI_BATCH_PATTERN.test(batchId)) {
     return NextResponse.json({ error: 'batchId must be a Multi mute batch id' }, { status: 400 })
@@ -86,7 +89,7 @@ export async function POST(request: NextRequest) {
     keys: wanted,
     include_seed: includeSeed === true,
     concept,
-    muted_by: caller.userId,
+    muted_by: triagePerson(auth),
     exempt_pairs: pairs,
   })
   // An agent that predates Multi mute refuses the op, or answers without the marker.
@@ -114,13 +117,13 @@ export async function POST(request: NextRequest) {
   if (muted.length > 0) {
     const realActor = await realActorUserId()
     await writeAudit({
-      actorId: realActor ?? caller.userId,
+      actorId: realActor ?? triagePerson(auth),
       action: 'muted_nodes.multi_muted',
       targetType: 'project',
       targetId: caller.projectId,
       after: {
         realActorUserId: realActor,
-        effectiveUserId: caller.userId,
+        effectiveUserId: triagePerson(auth),
         batchId,
         model: typeof result.body.model === 'string' ? result.body.model : null,
         promptVersion: typeof result.body.prompt_version === 'string' ? result.body.prompt_version : null,

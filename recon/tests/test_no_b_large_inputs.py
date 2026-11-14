@@ -86,7 +86,7 @@ def _run_pipeline(monkeypatch, resource, dast):
     monkeypatch.setattr(vs, "is_docker_running", lambda: True)
     monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
     monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
-    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["a.example.com"], {}))
+    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd, settings=None: ([], ["a.example.com"], {}))
     monkeypatch.setattr(vs, "build_target_urls", spy_urls)
     monkeypatch.setattr(vs, "build_nuclei_command", real_command)
     monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kwargs: None)

@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   catalog: null as unknown,
   catalogError: null as unknown,
 }))
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSessionEffectiveUser()))
 vi.mock('@/lib/prisma', () => ({ default: new Proxy({}, { get: (_t, k) => h.db[k as string] }) }))
 vi.mock('@/lib/session', async (orig) => ({
   ...((await orig()) as Record<string, unknown>),
@@ -84,7 +85,7 @@ afterEach(() => {
 })
 
 const list = async () => {
-  const res = await listRoute()
+  const res = await listRoute(new NextRequest('http://localhost/api/plugins'))
   return { status: res.status, body: await res.json() }
 }
 const detail = async (id = 'echo') => {
@@ -107,7 +108,7 @@ describe('GET /api/plugins', () => {
   test('a plugin not installed: the newest release this platform can run, with consent text', async () => {
     const { status, body } = await list()
     expect(status).toBe(200)
-    expect(body).toMatchObject({ platformVersion: '1.1.0', isAdmin: false, catalog: { state: 'ok', official: true } })
+    expect(body).toMatchObject({ platformVersion: '1.1.0', managesPlugins: false, catalog: { state: 'ok', official: true } })
     expect(body.plugins).toHaveLength(1)
     const e = body.plugins[0]
     expect(e).toMatchObject({ id: 'echo', displayName: 'Echo', inCatalog: true, state: 'not_installed', installed: null, installBlocked: null })
@@ -118,9 +119,9 @@ describe('GET /api/plugins', () => {
 
   test('the role comes from the database: a standard token of an admin is an admin', async () => {
     h.session = { userId: 'user-admin', role: 'standard' }
-    expect((await list()).body.isAdmin).toBe(true)
+    expect((await list()).body.managesPlugins).toBe(true)
     h.session = { userId: 'user-alice', role: 'admin' }
-    expect((await list()).body.isAdmin).toBe(false)
+    expect((await list()).body.managesPlugins).toBe(false)
   })
 
   test.each([

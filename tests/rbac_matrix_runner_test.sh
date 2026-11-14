@@ -1,0 +1,838 @@
+#!/usr/bin/env bash
+# =============================================================================
+# The live route matrix runner's switch tags (tests/rbac_matrix_live.sh):
+#   - a row tagged identity:on|off or permissions:on|off runs only while the
+#     webapp's switch is so, and is a SKIP naming the switch otherwise;
+#   - the permissions switch reads off while the identity switch is off, as the
+#     webapp's own flags.ts chain does (permissions requires identity), so the
+#     PE-28 equivalence runs (step 3.2: identity on, permissions on and off)
+#     select the rows the webapp really serves;
+#   - sharing:on|off the same for RBAC_SHARING_ENABLED, which reads off while
+#     the permissions switch is off (step 4.1: the Phase 4 rows written before
+#     a share can exist skip until the switch is on), and also while Root's
+#     sharing policy is not enabled: sharing is in force only with both
+#     (sharingPolicy.ts), so with the switch on and the policy still `{}` the
+#     owner-only rows run; the policy is read once, by psql, only when a selected
+#     row needs it, and an unreadable policy fails the rows that need it;
+#   - sharingswitch:on|off follows RBAC_SHARING_ENABLED alone (its chain, never the
+#     policy, which it never reads): the S3a red, rows of a route gated on the switch
+#     itself that ran as sharing:off with the switch on and the policy `{}`; the
+#     committed p4/p5 rows of that kind, and their switch-on/policy-off answers,
+#     run against the hand-checked answers of each state;
+#   - sharingwrite:on|off the same for RBAC_SHARING_WRITE_ENABLED (step 5.2), which
+#     reads off while sharing is not in force, and also while Root's policy does
+#     not allow write (`maxLevel` "write", maxShareLevel); both policy reads happen
+#     once, only when a selected row needs them;
+#   - sharingwriteswitch:on|off follows RBAC_SHARING_WRITE_ENABLED alone (its chain,
+#     never the policy): the S4r/S5 red, p4's write grant rows written for the switch
+#     off, which met `above_max_level` with the switch on and Root's policy at Read
+#     and, with write sharing in force, promoted the seeded viewer to Read + Write for
+#     every later row of the run; the committed rows pass each state's answer, and no
+#     row that runs with write sharing in force leaves a seeded account at write;
+#   - the runner's own policy SQL, run in the stack's postgres image (a throwaway
+#     container, skipped without Docker or the image), reads each stored policy as
+#     parseSharingPolicy does: a missing `maxLevel` is write (SHARING_POLICY_DEFAULTS),
+#     so `{"enabled":true}` with the write switch on is write sharing in force;
+#   - governance:on|off the same for RBAC_GOVERNANCE_ENABLED (step 6.13), which
+#     reads off while the permissions switch is off (flags.ts: governance requires
+#     permissions, not sharing) and reads no policy;
+#   - the committed rows of the S3 red (the terminal ticket's level refusal, the
+#     overseeing admin's delete and its sharing:off 404 twin) pass the hand-checked
+#     answers and fail the answer of each regression;
+#   - on/true/1/yes in any case and with spaces are on, anything else is off;
+#   - the switches are read from the webapp container once per run, and not at
+#     all when no selected row needs them.
+# A copy of the runner runs in a throwaway tree with `docker` and `curl` stubs on
+# PATH and an unreachable BASE_URL: no stack, no network, no fixture account.
+# Run:  bash tests/rbac_matrix_runner_test.sh
+# =============================================================================
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNNER="$REPO_ROOT/tests/rbac_matrix_live.sh"
+PASS=0; FAIL=0
+ok()    { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
+bad()   { FAIL=$((FAIL+1)); printf '  FAIL %s (got: %s want: %s)\n' "$1" "$2" "$3"; }
+eq()    { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "$2" "$3"; fi; }
+has()   { if grep -qF -- "$2" <<<"$3"; then ok "$1"; else bad "$1" "absent" "$2"; fi; }
+section() { printf '\n== %s ==\n' "$1"; }
+
+W="$(mktemp -d)"; PG=""
+# -v: a --rm container removed with rm -f keeps its anonymous volume (postgres declares one).
+trap 'rm -rf "$W"; [ -z "$PG" ] || docker rm -f -v "$PG" >/dev/null 2>&1' EXIT
+T="$W/root"
+mkdir -p "$T/tests/fixtures/rbac_matrix" "$T/webapp/scripts" "$T/testing/e2e" "$W/bin"
+cp "$RUNNER" "$T/tests/rbac_matrix_live.sh"
+echo 'SEED' > "$T/webapp/scripts/e2e-rbac-seed.mjs"
+echo 'CLEANUP' > "$T/webapp/scripts/e2e-rbac-cleanup.mjs"
+printf '%s\n' \
+  $'t-plain\t3.2\tanon\tGET\t/api/t/plain\t-\t200\treq:PE-28' \
+  $'t-perm-on\t3.2\tanon\tGET\t/api/t/perm-on\t-\t200\tpermissions:on' \
+  $'t-perm-off\t3.2\tanon\tGET\t/api/t/perm-off\t-\t200\treq:PE-28 permissions:off' \
+  $'t-both-on\t3.2\tanon\tGET\t/api/t/both-on\t-\t200\tidentity:on permissions:on' \
+  $'t-id-off\t3.2\tanon\tGET\t/api/t/id-off\t-\t200\tidentity:off' \
+  > "$T/tests/fixtures/rbac_matrix/t.tsv"
+printf '%s\n' $'u-revoked\t3.2\tmember_a_revoked\tGET\t/api/t/revoked\t-\t200\tpermissions:on' \
+  > "$T/tests/fixtures/rbac_matrix/u.tsv"
+printf '%s\n' \
+  $'s-plain\t4.1\tanon\tGET\t/api/s/plain\t-\t200\treq:HD-27' \
+  $'s-share-on\t4.1\tanon\tGET\t/api/s/share-on\t-\t200\treq:HD-27 sharing:on' \
+  $'s-share-off\t4.1\tanon\tGET\t/api/s/share-off\t-\t200\tsharing:off' \
+  > "$T/tests/fixtures/rbac_matrix/s.tsv"
+printf '%s\n' \
+  $'v-plain\t4.3\tanon\tGET\t/api/v/plain\t-\t200\treq:SH-21' \
+  $'v-share-on\t4.3\tanon\tGET\t/api/v/share-on\t-\t200\tsharing:on' \
+  $'v-share-on-2\t4.3\tanon\tGET\t/api/v/share-on-2\t-\t200\tsharing:on' \
+  $'v-share-off\t4.3\tanon\tGET\t/api/v/share-off\t-\t200\tsharing:off' \
+  > "$T/tests/fixtures/rbac_matrix/v.tsv"
+printf '%s\n' \
+  $'w-plain\t5.2\tanon\tGET\t/api/w/plain\t-\t200\treq:SH-02' \
+  $'w-write-on\t5.2\tanon\tGET\t/api/w/write-on\t-\t200\treq:SH-02 sharing:on sharingwrite:on' \
+  $'w-write-off\t5.2\tanon\tGET\t/api/w/write-off\t-\t200\tsharing:on sharingwrite:off' \
+  $'w-write-only\t5.2\tanon\tGET\t/api/w/write-only\t-\t200\tsharingwrite:on' \
+  > "$T/tests/fixtures/rbac_matrix/w.tsv"
+printf '%s\n' \
+  $'g-plain\t6.13\tanon\tGET\t/api/g/plain\t-\t200\treq:GV-01' \
+  $'g-gov-on\t6.13\tanon\tGET\t/api/g/gov-on\t-\t200\treq:GV-01 governance:on' \
+  $'g-gov-off\t6.13\tanon\tGET\t/api/g/gov-off\t-\t200\tgovernance:off' \
+  $'g-gov-share-on\t6.13\tanon\tGET\t/api/g/gov-share-on\t-\t200\tgovernance:on sharing:on' \
+  > "$T/tests/fixtures/rbac_matrix/g.tsv"
+printf '%s\n' \
+  $'x-plain\t4.3\tanon\tGET\t/api/x/plain\t-\t200\treq:DV-30' \
+  $'x-switch-off\t4.3\tanon\tGET\t/api/x/switch-off\t-\t200\treq:DV-30 sharingswitch:off' \
+  $'x-switch-on\t4.3\tanon\tGET\t/api/x/switch-on\t-\t200\tsharingswitch:on' \
+  $'x-switch-on-policy-off\t4.3\tanon\tGET\t/api/x/switch-on-policy-off\t-\t200\tsharingswitch:on sharing:off' \
+  $'x-share-off\t4.3\tanon\tGET\t/api/x/share-off\t-\t200\tsharing:off' \
+  > "$T/tests/fixtures/rbac_matrix/x.tsv"
+printf '%s\n' \
+  $'y-plain\t5.14\tanon\tGET\t/api/y/plain\t-\t200\treq:SH-06' \
+  $'y-wswitch-off\t5.14\tanon\tGET\t/api/y/wswitch-off\t-\t200\treq:SH-06 sharing:on sharingwrite:off sharingwriteswitch:off' \
+  $'y-wswitch-capped\t5.14\tanon\tGET\t/api/y/wswitch-capped\t-\t200\tsharing:on sharingwrite:off sharingwriteswitch:on' \
+  $'y-wswitch-only\t5.14\tanon\tGET\t/api/y/wswitch-only\t-\t200\tsharingwriteswitch:on' \
+  > "$T/tests/fixtures/rbac_matrix/y.tsv"
+
+# docker: the webapp's switches come from FAKE_* through the runner's own in-container
+# command (run here by sh), the seed prints the keys the runner requires, every call is logged.
+# Root's sharing policy is FAKE_POLICY (on by default; FAIL makes psql fail), or, with
+# REAL_PG set, the runner's SQL runs in that throwaway postgres container.
+cat > "$W/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "docker $*" >> "$STUB_LOG"
+case "$*" in
+  *"ps --status running"*) echo fake-webapp ;;
+  *" postgres "*)
+    sql="$(cat)"
+    if [ -n "${REAL_PG:-}" ] && grep -q sharing_policy <<<"$sql"; then
+      if grep -q rbac-write-policy <<<"$sql"; then echo "write-policy-read" >> "$STUB_LOG"; else echo "policy-read" >> "$STUB_LOG"; fi
+      printf '%s\n' "$sql" | "$REAL_DOCKER" exec -i "$REAL_PG" psql -X -q -t -A -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres
+    elif grep -q rbac-write-policy <<<"$sql"; then
+      echo "write-policy-read" >> "$STUB_LOG"
+      [ "${FAKE_WRITE_POLICY-on}" = FAIL ] && exit 1
+      printf '%s\n' "${FAKE_WRITE_POLICY-on}"
+    elif grep -q sharing_policy <<<"$sql"; then
+      echo "policy-read" >> "$STUB_LOG"
+      [ "${FAKE_POLICY-on}" = FAIL ] && exit 1
+      printf '%s\n' "${FAKE_POLICY-on}"
+    else
+      sed -n "s/.*where id = '\([^']*\)'.*/\1/p" <<<"$sql"
+    fi ;;
+  *" webapp sh -c "*)
+    script=""; prev=""
+    for a in "$@"; do [ "$prev" = -c ] && script="$a"; prev="$a"; done
+    echo "switches-read" >> "$STUB_LOG"
+    env -i PATH="$PATH" RBAC_IDENTITY_ENABLED="${FAKE_IDENTITY-}" RBAC_PERMISSIONS_ENABLED="${FAKE_PERMISSIONS-}" \
+      RBAC_SHARING_ENABLED="${FAKE_SHARING-}" RBAC_SHARING_WRITE_ENABLED="${FAKE_SHARING_WRITE-}" \
+      RBAC_GOVERNANCE_ENABLED="${FAKE_GOVERNANCE-}" RBAC_AUTHZ_CACHE_MS="${FAKE_CACHE_MS-}" sh -c "$script" ;;
+  *" node "*)
+    if grep -q SEED; then
+      printf 'PA_ID=pa\nPB_ID=pb\nPSHARED_ID=ps\nPA_TMP1_ID=pt1\nMEMBER_A_ID=ma\nMEMBER_B_ID=mb\nADMIN_A_ID=aa\nRBAC_PASSWORD=pw\n'
+      printf 'VIEWER_ID=vw\nVIEWER_EMAIL=rbac-viewer@e2e.local\nVIEWER_TMP_ID=vt\nVIEWER_TMP_EMAIL=rbac-viewer-tmp@e2e.local\n'
+    fi ;;
+  *) echo "unexpected docker call" >&2; exit 1 ;;
+esac
+STUB
+# curl: every request answers 200 with an empty body; the URL of each row's request is logged.
+# A row's request (not the health probe or a sign-in) answers FAKE_STATUS with the body in the file
+# FAKE_BODY when they are set.
+cat > "$W/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+url=""; prev=""; out=""; row=1
+for a in "$@"; do
+  case "$prev" in
+    -o) [ "$a" = /dev/null ] || out="$a" ;;
+    -D) printf 'HTTP/1.1 200 OK\r\n' > "$a" ;;
+  esac
+  case "$a" in */api/health|*/api/auth/login) row="" ;; esac
+  prev="$a"; url="$a"
+done
+if [ -n "$out" ]; then
+  if [ -n "$row" ] && [ -n "${FAKE_BODY:-}" ]; then cat "$FAKE_BODY" > "$out"; else : > "$out"; fi
+fi
+case "$url" in */api/health) ;; *) echo "request ${url#*://*/}" >> "$STUB_LOG" ;; esac
+if [ -n "$row" ]; then printf '%s' "${FAKE_STATUS:-200}"; else printf 200; fi
+STUB
+printf '#!/usr/bin/env bash\necho "sleep $*" >> "$STUB_LOG"\n' > "$W/bin/sleep"
+chmod +x "$W/bin/docker" "$W/bin/curl" "$W/bin/sleep"
+
+# run <identity> <permissions> [row filter] [matrix file] [cache ms] [sharing] [policy] [write] [write policy] [governance]:
+# OUT holds the output, RC the status, LOG the stub calls.
+run() {
+  : > "$W/calls.log"
+  OUT="$(cd "$W" && PATH="$W/bin:$PATH" STUB_LOG="$W/calls.log" BASE_URL=http://rbac-runner-test.invalid \
+    FAKE_IDENTITY="$1" FAKE_PERMISSIONS="$2" FAKE_CACHE_MS="${5:-5000}" FAKE_SHARING="${6:-}" RBAC_MATRIX_ROWS="${3:-}" \
+    FAKE_POLICY="${7-on}" FAKE_SHARING_WRITE="${8:-}" FAKE_WRITE_POLICY="${9-on}" FAKE_GOVERNANCE="${10:-}" \
+    REAL_PG="${REAL_PG:-}" REAL_DOCKER="${REAL_DOCKER:-}" \
+    bash "$T/tests/rbac_matrix_live.sh" "${4:-t}" 2>&1)"; RC=$?
+  LOG="$(cat "$W/calls.log")"
+}
+line()     { grep -E "^(PASS|SKIP|FAIL) +$1 " <<<"$OUT" | head -1; }
+verdict()  { line "$1" | awk '{print $1}'; }
+requests() { grep '^request ' <<<"$LOG" | sed 's/^request //' | tr '\n' ' '; }
+reads()    { grep -c '^switches-read$' <<<"$LOG"; }
+policy_reads() { grep -c '^policy-read$' <<<"$LOG"; }
+write_policy_reads() { grep -c '^write-policy-read$' <<<"$LOG"; }
+
+# =============================================================================
+section "identity on, permissions on"
+run true true
+eq "exit 0" "$RC" "0"
+eq "untagged row runs" "$(verdict t-plain)" "PASS"
+eq "permissions:on runs" "$(verdict t-perm-on)" "PASS"
+eq "permissions:off skips" "$(verdict t-perm-off)" "SKIP"
+has "the skip names the switch and its state" "(permissions switch on)" "$(line t-perm-off)"
+eq "identity:on permissions:on runs" "$(verdict t-both-on)" "PASS"
+eq "identity:off skips" "$(verdict t-id-off)" "SKIP"
+has "the identity skip still names its switch" "(identity switch on)" "$(line t-id-off)"
+eq "only the selected rows reach the webapp" "$(requests)" "api/t/plain api/t/perm-on api/t/both-on "
+has "result line" "== RESULT: 3 passed, 0 failed, 2 skipped ==" "$OUT"
+eq "the switches are read once" "$(reads)" "1"
+
+section "identity on, permissions off (the PE-28 off half)"
+run true ""
+eq "untagged row runs" "$(verdict t-plain)" "PASS"
+eq "permissions:on skips" "$(verdict t-perm-on)" "SKIP"
+has "the skip says off" "(permissions switch off)" "$(line t-perm-on)"
+eq "permissions:off runs" "$(verdict t-perm-off)" "PASS"
+eq "identity:on permissions:on skips on the permissions switch" "$(verdict t-both-on)" "SKIP"
+has "named" "(permissions switch off)" "$(line t-both-on)"
+eq "identity:off skips" "$(verdict t-id-off)" "SKIP"
+has "result line" "== RESULT: 2 passed, 0 failed, 3 skipped ==" "$OUT"
+eq "the switches are read once" "$(reads)" "1"
+
+section "identity off: the permissions switch reads off, whatever it says"
+run false true
+eq "permissions:on skips" "$(verdict t-perm-on)" "SKIP"
+has "named off" "(permissions switch off)" "$(line t-perm-on)"
+eq "permissions:off runs" "$(verdict t-perm-off)" "PASS"
+eq "identity:off runs" "$(verdict t-id-off)" "PASS"
+eq "identity:on permissions:on skips" "$(verdict t-both-on)" "SKIP"
+has "result line" "== RESULT: 3 passed, 0 failed, 2 skipped ==" "$OUT"
+
+section "values: on/true/1/yes in any case are on, anything else off"
+run ' YES ' 1
+eq "' YES ' and 1: permissions:on runs" "$(verdict t-perm-on)" "PASS"
+eq "' YES ' and 1: identity:off skips" "$(verdict t-id-off)" "SKIP"
+run TRUE On
+eq "On is not a value the webapp knows: permissions reads off" "$(verdict t-perm-on)" "SKIP"
+run true maybe
+eq "maybe: permissions:off runs" "$(verdict t-perm-off)" "PASS"
+run 0 true
+eq "identity 0: permissions:on skips" "$(verdict t-perm-on)" "SKIP"
+
+section "no selected row needs a switch: none is read"
+run true true '^t-plain$'
+eq "the row runs" "$(verdict t-plain)" "PASS"
+eq "no switch read" "$(reads)" "0"
+has "result line" "== RESULT: 1 passed, 0 failed, 0 skipped ==" "$OUT"
+
+section "the cache bound still comes from the same read"
+run true true '' u 1500
+eq "a revoked actor's row runs" "$(verdict u-revoked)" "PASS"
+eq "each SQL change waits the 1500 ms bound, rounded up, plus 1 s" "$(grep '^sleep ' <<<"$LOG" | tr '\n' ' ')" "sleep 3 sleep 3 "
+eq "the switches and the bound are read once" "$(reads)" "1"
+run true true '' u ''
+eq "no bound set: 5 s, plus 1 s" "$(grep -m1 '^sleep ' <<<"$LOG")" "sleep 6"
+
+section "the sharing switch (step 4.1)"
+run true true '' s 5000 true
+eq "sharing on: untagged row runs" "$(verdict s-plain)" "PASS"
+eq "sharing on: sharing:on runs" "$(verdict s-share-on)" "PASS"
+eq "sharing on: sharing:off skips" "$(verdict s-share-off)" "SKIP"
+has "the skip names the sharing switch" "(sharing switch on)" "$(line s-share-off)"
+eq "the switches are read once" "$(reads)" "1"
+run true true '' s 5000 ''
+eq "sharing unset: sharing:on skips" "$(verdict s-share-on)" "SKIP"
+has "named off" "(sharing switch off)" "$(line s-share-on)"
+eq "sharing unset: sharing:off runs" "$(verdict s-share-off)" "PASS"
+eq "the skipped row never reaches the webapp" "$(requests)" "api/s/plain api/s/share-off "
+run true '' '' s 5000 true
+eq "permissions off: sharing reads off, whatever it says" "$(verdict s-share-on)" "SKIP"
+has "named off" "(sharing switch off)" "$(line s-share-on)"
+run false true '' s 5000 true
+eq "identity off: permissions and sharing read off" "$(verdict s-share-off)" "PASS"
+run true true '' u 1500 true
+eq "the cache bound still parses after the sharing value" "$(grep '^sleep ' <<<"$LOG" | tr '\n' ' ')" "sleep 3 sleep 3 "
+
+section "Root's sharing policy (4.3 review finding 6): the tag follows the effective state"
+run true true '' v 5000 true off
+eq "switch on, policy off: exit 0" "$RC" "0"
+eq "switch on, policy off: untagged row runs" "$(verdict v-plain)" "PASS"
+eq "switch on, policy off: the owner-only sharing:off row runs" "$(verdict v-share-off)" "PASS"
+eq "switch on, policy off: sharing:on skips" "$(verdict v-share-on)" "SKIP"
+has "the skip names the policy, not the switch alone" "(sharing switch on, Root's policy off)" "$(line v-share-on)"
+eq "the skipped rows never reach the webapp" "$(requests)" "api/v/plain api/v/share-off "
+eq "the policy is read once for three tagged rows" "$(policy_reads)" "1"
+has "result line" "== RESULT: 2 passed, 0 failed, 2 skipped ==" "$OUT"
+run true true '' v 5000 true on
+eq "switch on, policy on: sharing:on runs" "$(verdict v-share-on)" "PASS"
+eq "switch on, policy on: sharing:off skips" "$(verdict v-share-off)" "SKIP"
+has "named as before" "(sharing switch on)" "$(line v-share-off)"
+eq "read once" "$(policy_reads)" "1"
+run true true '' v 5000 '' on
+eq "switch off: sharing:off runs whatever the policy" "$(verdict v-share-off)" "PASS"
+eq "switch off: the policy is not read" "$(policy_reads)" "0"
+run true '' '' v 5000 true on
+eq "permissions off: the policy is not read" "$(policy_reads)" "0"
+run true true '^v-plain$' v 5000 true on
+eq "no tagged row selected: the policy is not read" "$(policy_reads)" "0"
+run true true '' v 5000 true FAIL
+eq "policy unreadable: the tagged rows fail" "$(verdict v-share-on) $(verdict v-share-off)" "FAIL FAIL"
+has "and say why" "could not read Root's sharing policy" "$(line v-share-off)"
+eq "policy unreadable: untagged row still runs" "$(verdict v-plain)" "PASS"
+eq "policy unreadable: exit 1" "$RC" "1"
+eq "policy unreadable: read once" "$(policy_reads)" "1"
+run true true '' v 5000 true 'garbage'
+eq "an answer that is neither on nor off fails the tagged rows" "$(verdict v-share-on)" "FAIL"
+run true true '' v 5000 true ''
+eq "an empty answer fails them too (the query always returns one row)" "$(verdict v-share-off)" "FAIL"
+
+section "write sharing (step 5.2): the sharingwrite tag follows the effective state"
+run true true '' w 5000 true on true on
+eq "all on, policy at write: sharingwrite:on runs" "$(verdict w-write-on)" "PASS"
+eq "all on, policy at write: sharingwrite:off skips" "$(verdict w-write-off)" "SKIP"
+has "named" "(sharingwrite switch on)" "$(line w-write-off)"
+eq "the write policy is read once for two tagged rows" "$(write_policy_reads)" "1"
+run true true '' w 5000 true on true off
+eq "Root's policy at read: sharingwrite:on skips" "$(verdict w-write-on)" "SKIP"
+has "the skip names the policy" "(sharingwrite switch on, Root's policy off)" "$(line w-write-on)"
+eq "Root's policy at read: the write-off row runs" "$(verdict w-write-off)" "PASS"
+run true true '' w 5000 true off true on
+eq "sharing policy off: write is not in force either" "$(verdict w-write-on)" "SKIP"
+run true true '' w 5000 true on '' on
+eq "write switch unset: sharingwrite:off runs" "$(verdict w-write-off)" "PASS"
+eq "write switch unset: no write policy read" "$(write_policy_reads)" "0"
+run true true '' w 5000 '' on true on
+eq "sharing switch off: the write switch reads off, whatever it says" "$(verdict w-write-on)" "SKIP"
+has "named off" "(sharing switch off)" "$(line w-write-on)"
+eq "a row tagged sharingwrite:on alone skips too (the chain, not the sharing tag)" "$(verdict w-write-only)" "SKIP"
+has "named as the write switch, off" "(sharingwrite switch off)" "$(line w-write-only)"
+run true true '' w 5000 true on true FAIL
+eq "write policy unreadable: the write rows fail" "$(verdict w-write-on) $(verdict w-write-off)" "FAIL FAIL"
+eq "write policy unreadable: the untagged row runs" "$(verdict w-plain)" "PASS"
+run true true '' u 1500 true on true on
+eq "the cache bound still parses after the write value" "$(grep '^sleep ' <<<"$LOG" | tr '\n' ' ')" "sleep 3 sleep 3 "
+
+section "the governance switch (step 6.13): governance:on|off follows RBAC_GOVERNANCE_ENABLED"
+run true true '' g 5000 '' on '' on true
+eq "governance on: exit 0" "$RC" "0"
+eq "governance on: untagged row runs" "$(verdict g-plain)" "PASS"
+eq "governance on: governance:on runs" "$(verdict g-gov-on)" "PASS"
+eq "governance on: governance:off skips" "$(verdict g-gov-off)" "SKIP"
+has "the skip names the governance switch" "(governance switch on)" "$(line g-gov-off)"
+eq "governance on, sharing unset: a row that also needs sharing skips on it" "$(verdict g-gov-share-on)" "SKIP"
+has "named as the sharing switch" "(sharing switch off)" "$(line g-gov-share-on)"
+eq "only the selected rows reach the webapp" "$(requests)" "api/g/plain api/g/gov-on "
+eq "the switches are read once" "$(reads)" "1"
+eq "no policy is read for governance" "$(policy_reads) $(write_policy_reads)" "0 0"
+has "result line" "== RESULT: 2 passed, 0 failed, 2 skipped ==" "$OUT"
+run true true '' g 5000 '' on '' on ''
+eq "governance unset: governance:on skips" "$(verdict g-gov-on)" "SKIP"
+has "named off" "(governance switch off)" "$(line g-gov-on)"
+eq "governance unset: governance:off runs" "$(verdict g-gov-off)" "PASS"
+run true '' '' g 5000 '' on '' on true
+eq "permissions off: governance reads off, whatever it says" "$(verdict g-gov-on)" "SKIP"
+has "named off" "(governance switch off)" "$(line g-gov-on)"
+eq "permissions off: governance:off runs" "$(verdict g-gov-off)" "PASS"
+run false true '' g 5000 '' on '' on true
+eq "identity off: permissions and governance read off" "$(verdict g-gov-off)" "PASS"
+eq "identity off: governance:on skips" "$(verdict g-gov-on)" "SKIP"
+run true true '' g 5000 true on '' on true
+eq "governance and sharing on, policy on: the combined row runs" "$(verdict g-gov-share-on)" "PASS"
+eq "read once" "$(policy_reads)" "1"
+run true true '' g 5000 true off '' on true
+eq "Root's sharing policy off: the combined row skips on sharing" "$(verdict g-gov-share-on)" "SKIP"
+has "named as the policy" "(sharing switch on, Root's policy off)" "$(line g-gov-share-on)"
+eq "Root's sharing policy off: governance:on still runs (governance reads no policy)" "$(verdict g-gov-on)" "PASS"
+run true true '' g 5000 '' on '' on ' Yes '
+eq "' Yes ' is on" "$(verdict g-gov-on)" "PASS"
+run true true '' g 5000 '' on '' on 'On'
+eq "On is not a value the webapp knows: governance reads off" "$(verdict g-gov-off)" "PASS"
+run true true '^g-plain$' g 5000 '' on '' on true
+eq "no tagged row selected: no switch read" "$(reads)" "0"
+run true true '' u 1500 true on true on true
+eq "the cache bound still parses after the governance value" "$(grep '^sleep ' <<<"$LOG" | tr '\n' ' ')" "sleep 3 sleep 3 "
+
+section "the console pages with governance off (p6.tsv as committed): Next's not-found page, never the console"
+# The admin layout's notFound() streams under the root <Suspense> after a 200 (S0 red, 2026-11-13), so the
+# rows accept 200 or 404 and decide on the body. The bodies hold the markers a real answer of each kind
+# carries: the digest notFound() leaves, Next's not-found text (in every page's payload, so not a marker),
+# and, when the layout renders the console, its client reference and its loading state.
+cp "$REPO_ROOT/tests/fixtures/rbac_matrix/p6.tsv" "$T/tests/fixtures/rbac_matrix/p6.tsv"
+NOT_FOUND_PAGE='<meta name="robots" content="noindex"/><title>404: This page could not be found.</title><h1 class="next-error-h1">404</h1><h2>This page could not be found.</h2><script>self.__next_f.push([1,"a:E{\"digest\":\"NEXT_HTTP_ERROR_FALLBACK;404\"}\n"])</script>'
+CONSOLE_REF='<script>self.__next_f.push([1,"7:I[749583,[\"/_next/static/chunks/e2db446e.js\"],\"AdminConsole\"]\n"])</script>'
+printf '%s' "$NOT_FOUND_PAGE" > "$W/body.soft404"
+printf '%s<div><p role="status">Loading the admin console…</p></div><h2>This page could not be found.</h2>' "$CONSOLE_REF" > "$W/body.console"
+printf '<nav aria-label="Admin console"><p aria-hidden="true">Admin console</p></nav>%s' "$NOT_FOUND_PAGE" > "$W/body.console_around_404"
+printf '%s%s' "$CONSOLE_REF" "$NOT_FOUND_PAGE" > "$W/body.console_ref_only"
+: > "$W/body.empty"
+OFF_ROWS='^p6-page-admin(-users|-instance)?-off$'
+ON_ROWS='^p6-page-admin(-instance)?-on$'
+page_rows() { # body status rows governance -> OUT
+  FAKE_BODY="$W/body.$1" FAKE_STATUS="$2"; export FAKE_BODY FAKE_STATUS
+  run true true "$3" p6 5000 '' on '' on "$4"
+  unset FAKE_BODY FAKE_STATUS
+}
+page_rows soft404 200 "$OFF_ROWS" ''
+eq "off, the soft 404 (200 + the not-found page): the three rows pass" \
+  "$(verdict p6-page-admin-off) $(verdict p6-page-admin-users-off) $(verdict p6-page-admin-instance-off)" "PASS PASS PASS"
+has "result line" "== RESULT: 3 passed, 0 failed, 0 skipped ==" "$OUT"
+page_rows soft404 404 "$OFF_ROWS" ''
+eq "off, a real 404 with the same page: pass" "$(verdict p6-page-admin-off) $(verdict p6-page-admin-users-off)" "PASS PASS"
+page_rows console 200 "$OFF_ROWS" ''
+eq "mutation: the console rendered (200, its loading state): the three rows fail" \
+  "$(verdict p6-page-admin-off) $(verdict p6-page-admin-users-off) $(verdict p6-page-admin-instance-off)" "FAIL FAIL FAIL"
+has "and say the not-found digest is missing" "body lacks NEXT_HTTP_ERROR_FALLBACK" "$(line p6-page-admin-off)"
+page_rows console_around_404 200 "$OFF_ROWS" ''
+eq "mutation: the console's shell around a not-found (gate moved into a page): fail" "$(verdict p6-page-admin-off)" "FAIL"
+has "on the console's markup" "body contains Admin console" "$(line p6-page-admin-off)"
+page_rows console_ref_only 200 "$OFF_ROWS" ''
+eq "mutation: the not-found digest but the console's client reference in the payload: fail" "$(verdict p6-page-admin-users-off)" "FAIL"
+has "on the reference" "body contains AdminConsole" "$(line p6-page-admin-users-off)"
+page_rows empty 200 "$OFF_ROWS" ''
+eq "mutation: a 200 with no not-found page (status alone no longer passes): fail" "$(verdict p6-page-admin-instance-off)" "FAIL"
+has "on the body" "body lacks NEXT_HTTP_ERROR_FALLBACK" "$(line p6-page-admin-instance-off)"
+page_rows soft404 500 "$OFF_ROWS" ''
+eq "mutation: another status with the not-found page: fail" "$(verdict p6-page-admin-off)" "FAIL"
+has "on the status" "expected 200|404, got 500" "$(line p6-page-admin-off)"
+page_rows console 200 "$ON_ROWS" true
+eq "on, the console rendered: the two rows pass" "$(verdict p6-page-admin-on) $(verdict p6-page-admin-instance-on)" "PASS PASS"
+page_rows soft404 200 "$ON_ROWS" true
+eq "mutation: on but the not-found page (the switch not read on): the two rows fail" \
+  "$(verdict p6-page-admin-on) $(verdict p6-page-admin-instance-on)" "FAIL FAIL"
+has "on the body" "body lacks AdminConsole" "$(line p6-page-admin-on)"
+page_rows soft404 200 "$ON_ROWS" ''
+eq "governance off: the on rows skip" "$(verdict p6-page-admin-on)" "SKIP"
+
+section "the switch-only sharing tag (S3a red): sharingswitch:on|off follows RBAC_SHARING_ENABLED alone"
+run true true '' x 5000 true off
+eq "switch on, policy off: exit 0" "$RC" "0"
+eq "switch on, policy off: sharingswitch:off skips (the route exists with the switch on)" "$(verdict x-switch-off)" "SKIP"
+has "the skip names the switch" "(sharing switch on)" "$(line x-switch-off)"
+eq "and not the policy" "$(grep -c "Root's policy" <<<"$(line x-switch-off)")" "0"
+eq "switch on, policy off: sharingswitch:on runs" "$(verdict x-switch-on)" "PASS"
+eq "switch on, policy off: sharingswitch:on sharing:off runs" "$(verdict x-switch-on-policy-off)" "PASS"
+eq "switch on, policy off: sharing:off keeps its meaning and runs" "$(verdict x-share-off)" "PASS"
+eq "the policy is read once, for the sharing-tagged rows" "$(policy_reads)" "1"
+has "result line" "== RESULT: 4 passed, 0 failed, 1 skipped ==" "$OUT"
+run true true '' x 5000 true on
+eq "sharing in force: sharingswitch:off skips" "$(verdict x-switch-off)" "SKIP"
+eq "sharing in force: sharingswitch:on runs" "$(verdict x-switch-on)" "PASS"
+eq "sharing in force: sharingswitch:on sharing:off skips on the policy" "$(verdict x-switch-on-policy-off)" "SKIP"
+has "named as sharing" "(sharing switch on)" "$(line x-switch-on-policy-off)"
+eq "sharing in force: sharing:off skips" "$(verdict x-share-off)" "SKIP"
+run true true '' x 5000 '' on
+eq "switch off: sharingswitch:off runs" "$(verdict x-switch-off)" "PASS"
+eq "switch off: sharingswitch:on skips" "$(verdict x-switch-on)" "SKIP"
+has "named off" "(sharing switch off)" "$(line x-switch-on)"
+eq "switch off: sharingswitch:on sharing:off skips" "$(verdict x-switch-on-policy-off)" "SKIP"
+eq "switch off: sharing:off runs" "$(verdict x-share-off)" "PASS"
+eq "switch off: the policy is not read" "$(policy_reads)" "0"
+run true '' '' x 5000 true on
+eq "permissions off: the sharing switch reads off for the switch-only tag too" \
+  "$(verdict x-switch-off) $(verdict x-switch-on)" "PASS SKIP"
+run true true '^x-switch-(on|off)$' x 5000 true FAIL
+eq "only switch-only rows selected: the policy is never read" "$(policy_reads)" "0"
+eq "so an unreadable policy fails none of them" "$(verdict x-switch-off) $(verdict x-switch-on)" "SKIP PASS"
+eq "the switches are read once" "$(reads)" "1"
+run true true '' x 5000 ' Yes ' off
+eq "' Yes ' is on" "$(verdict x-switch-on)" "PASS"
+# Two mutants of the runner: the tag read as sharing in force (the policy-aware branch), and the
+# tag not read at all. Each brings back the S3a red: the switch-off row runs with the switch on.
+sed '/^      sharingswitch) /d' "$RUNNER" > "$T/tests/rbac_matrix_live.sh"
+eq "mutant 1 differs from the runner" "$(cmp -s "$RUNNER" "$T/tests/rbac_matrix_live.sh"; echo $?)" "1"
+run true true '' x 5000 true off
+eq "mutation: the tag read as sharing in force runs the switch-off row with the switch on (S3a)" "$(verdict x-switch-off)" "PASS"
+sed 's/ sharing sharingswitch sharingwrite / sharing sharingwrite /' "$RUNNER" > "$T/tests/rbac_matrix_live.sh"
+eq "mutant 2 differs from the runner" "$(cmp -s "$RUNNER" "$T/tests/rbac_matrix_live.sh"; echo $?)" "1"
+run true true '' x 5000 true on
+eq "mutation: the tag not read runs the switch-off row even with sharing in force" "$(verdict x-switch-off)" "PASS"
+cp "$RUNNER" "$T/tests/rbac_matrix_live.sh"
+
+section "p4.tsv and p5.tsv as committed: the switch-only rows and their switch-on/policy-off answers (S3a hand check)"
+# Each row runs alone against the answer the webapp gave in that state (S3a/p4_off_rows_handcheck.txt for the
+# switch on with the policy {}; the route code's 404 for the switch off), then against the other state's answer.
+cp "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" "$REPO_ROOT/tests/fixtures/rbac_matrix/p5.tsv" "$T/tests/fixtures/rbac_matrix/"
+printf '%s' '{"myAccess":{"level":"owner","toggles":{"rawData":true},"via":"owner","owner":{"name":"RBAC Member A","email":"rbac-member-a@e2e.local"}}}' > "$W/body.myaccess_owner"
+printf '%s' '{"id":"pa","name":"rbac-PA","myAccess":{"level":"owner","toggles":{"rawData":true},"via":"owner"}}' > "$W/body.project_owner"
+printf '%s' '{"id":"pa","name":"rbac-PA"}' > "$W/body.project_plain"
+printf '%s' '[{"id":"ps","name":"rbac-PSHARED","myAccess":{"level":"owner","toggles":{"rawData":true},"via":"owner"}}]' > "$W/body.list_owner"
+printf '%s' '[{"id":"ps","name":"rbac-PSHARED"}]' > "$W/body.list_plain"
+printf '%s' '{"id":"ps","name":"rbac-PSHARED","myAccess":{"level":"read","via":"share"}}' > "$W/body.project_shared"
+printf '%s' '{"error":"Not found"}' > "$W/body.notfound"
+printf '%s' '{"error":"You do not hold the permission this action needs (projects:administer).","code":"forbidden","permission":"projects:administer"}' > "$W/body.forbidden"
+printf '%s' '{"providers":[],"keys":{"tavilyApiKey":true},"mcpServers":[{"id":"s1","name":"rbac fake server"}]}' > "$W/body.catalog"
+one_row() { # row-id file status body sharing policy -> OUT
+  FAKE_BODY="$W/body.$4" FAKE_STATUS="$3"; export FAKE_BODY FAKE_STATUS
+  run true true "^$1\$" "$2" 5000 "$5" "$6"
+  unset FAKE_BODY FAKE_STATUS
+}
+SWITCH_ROWS='^p4-(myaccess-owner-off|proj-read-no-myaccess-off|list-off-owner|breakglass-off)$'
+POLICY_OFF_ROWS='^p4-(myaccess-owner-policy-off|proj-read-myaccess-policy-off|list-policy-off-owner|breakglass-policy-off)$'
+run true true "$SWITCH_ROWS" p4 5000 true off
+eq "switch on, policy {}: the four switch-only rows skip" \
+  "$(verdict p4-myaccess-owner-off) $(verdict p4-proj-read-no-myaccess-off) $(verdict p4-list-off-owner) $(verdict p4-breakglass-off)" "SKIP SKIP SKIP SKIP"
+has "on the switch" "(sharing switch on)" "$(line p4-breakglass-off)"
+run true true '^p5-owner-catalog-owner-off$' p5 5000 true off
+eq "switch on, policy {}: p5-owner-catalog-owner-off skips too" "$(verdict p5-owner-catalog-owner-off)" "SKIP"
+one_row p4-myaccess-owner-policy-off p4 200 myaccess_owner true off
+eq "switch on, policy {}: my-access answers the owner's own access" "$(verdict p4-myaccess-owner-policy-off)" "PASS"
+one_row p4-proj-read-myaccess-policy-off p4 200 project_owner true off
+eq "switch on, policy {}: the project GET carries the owner's myAccess" "$(verdict p4-proj-read-myaccess-policy-off)" "PASS"
+one_row p4-list-policy-off-owner p4 200 list_owner true off
+eq "switch on, policy {}: the list carries the owner's myAccess" "$(verdict p4-list-policy-off-owner)" "PASS"
+one_row p4-breakglass-policy-off p4 403 forbidden true off
+eq "switch on, policy {}: break-glass refuses a non-Root admin 403" "$(verdict p4-breakglass-policy-off)" "PASS"
+one_row p4-viewer-read-off p4 404 notfound true off
+eq "switch on, policy {}: a Read collaborator gets 404 (no share in force)" "$(verdict p4-viewer-read-off)" "PASS"
+one_row p5-owner-catalog-owner-policy-off p5 200 catalog true off
+eq "switch on, policy {}: the owner reads its own catalog" "$(verdict p5-owner-catalog-owner-policy-off)" "PASS"
+one_row p4-myaccess-owner-policy-off p4 404 notfound true off
+eq "mutation: my-access absent with the switch on: fail" "$(verdict p4-myaccess-owner-policy-off)" "FAIL"
+one_row p4-proj-read-myaccess-policy-off p4 200 project_plain true off
+eq "mutation: no myAccess on the project GET: fail" "$(verdict p4-proj-read-myaccess-policy-off)" "FAIL"
+one_row p4-list-policy-off-owner p4 200 list_plain true off
+eq "mutation: no myAccess on the list: fail" "$(verdict p4-list-policy-off-owner)" "FAIL"
+one_row p4-breakglass-policy-off p4 404 notfound true off
+eq "mutation: break-glass 404 with the switch on: fail" "$(verdict p4-breakglass-policy-off)" "FAIL"
+one_row p4-viewer-read-off p4 200 project_shared true off
+eq "mutation: the Read share in force with the policy off: fail" "$(verdict p4-viewer-read-off)" "FAIL"
+one_row 'p4-(share-off-leave|activity-off|oversee-list-off)' p4 404 notfound true off
+eq "the policy-aware sharing:off rows still run with the switch on and the policy {}" \
+  "$(verdict p4-share-off-leave) $(verdict p4-activity-off) $(verdict p4-oversee-list-off)" "PASS PASS PASS"
+one_row p4-myaccess-owner-off p4 404 notfound '' off
+eq "switch off: my-access 404" "$(verdict p4-myaccess-owner-off)" "PASS"
+one_row p4-proj-read-no-myaccess-off p4 200 project_plain '' off
+eq "switch off: the project GET without myAccess" "$(verdict p4-proj-read-no-myaccess-off)" "PASS"
+one_row p4-list-off-owner p4 200 list_plain '' off
+eq "switch off: the list without myAccess" "$(verdict p4-list-off-owner)" "PASS"
+one_row p4-breakglass-off p4 404 notfound '' off
+eq "switch off: break-glass 404" "$(verdict p4-breakglass-off)" "PASS"
+one_row p5-owner-catalog-owner-off p5 404 notfound '' off
+eq "switch off: the owner catalog 404" "$(verdict p5-owner-catalog-owner-off)" "PASS"
+one_row p4-viewer-read-off p4 404 notfound '' off
+eq "switch off: a Read collaborator gets 404" "$(verdict p4-viewer-read-off)" "PASS"
+one_row p4-myaccess-owner-off p4 200 myaccess_owner '' off
+eq "mutation: my-access present with the switch off: fail" "$(verdict p4-myaccess-owner-off)" "FAIL"
+run true true "$POLICY_OFF_ROWS" p4 5000 '' off
+has "switch off: the four policy-off rows skip" "== RESULT: 0 passed, 0 failed, 4 skipped ==" "$OUT"
+has "on the switch" "(sharing switch off)" "$(line p4-breakglass-policy-off)"
+run true true "^p4-(myaccess-owner-off|proj-read-no-myaccess-off|list-off-owner|breakglass-off|myaccess-owner-policy-off|proj-read-myaccess-policy-off|list-policy-off-owner|breakglass-policy-off|viewer-read-off)\$" p4 5000 true on
+has "sharing in force: all nine skip" "== RESULT: 0 passed, 0 failed, 9 skipped ==" "$OUT"
+
+section "the S3 rows as committed: the terminal ticket below Exploitation & shells, the overseeing admin's delete"
+# The answers hand-checked in S3 (sharing in force): a Read share and oversight get the terminal's level refusal
+# and no ticket (72877043); admin_a's delete of PA_TMP1, which it oversees at Read, names project:delete; a
+# stranger's is 404. Each answer a regression would give instead must fail its row.
+cp "$REPO_ROOT/tests/fixtures/rbac_matrix/baseline.tsv" "$T/tests/fixtures/rbac_matrix/"
+cat > "$W/body.terminal_level" <<'BODY'
+{"error":"Opening the Kali terminal on this project needs Exploitation & shells on it: the project's owner, or a collaborator whose share includes it.","code":"forbidden","permission":"platform:kali_terminal","level":"W+X"}
+BODY
+cat > "$W/body.terminal_level_ticket" <<'BODY'
+{"error":"Opening the Kali terminal on this project needs Exploitation & shells on it.","code":"forbidden","permission":"platform:kali_terminal","level":"W+X","ticket":"rbac-fake-ticket"}
+BODY
+printf '%s' '{"ticket":"rbac-fake-ticket"}' > "$W/body.ticket"
+printf '%s' '{"error":"The Kali terminal is open to whoever holds platform:kali_terminal, and to accounts that kept it at the upgrade.","code":"forbidden","permission":"platform:kali_terminal"}' > "$W/body.terminal_refused"
+printf '%s' '{"error":"Only the project owner can open the Kali terminal.","code":"owner_only","permission":"platform:kali_terminal"}' > "$W/body.terminal_owner_only"
+printf '%s' '{"error":"You do not hold the permission this action needs (project:delete).","code":"forbidden","permission":"project:delete"}' > "$W/body.forbidden_delete"
+for r in p4-viewer-ws-ticket-terminal p4-oversee-ws-ticket-terminal; do
+  one_row "$r" p4 403 terminal_level true on
+  eq "sharing in force: $r passes on the level refusal" "$(verdict "$r")" "PASS"
+  one_row "$r" p4 200 ticket true on
+  eq "mutation: $r with a ticket minted: fail" "$(verdict "$r")" "FAIL"
+  one_row "$r" p4 403 terminal_level_ticket true on
+  eq "mutation: $r refused with a ticket in the body: fail" "$(verdict "$r")" "FAIL"
+  one_row "$r" p4 403 terminal_refused true on
+  eq "mutation: $r refused for the platform tool, not the level: fail" "$(verdict "$r")" "FAIL"
+  one_row "$r" p4 403 terminal_owner_only true on
+  eq "the answer before 72877043 (owner_only) fails $r" "$(verdict "$r")" "FAIL"
+done
+run true true '^p4-(viewer|oversee)-ws-ticket-terminal$' p4 5000 true off
+has "policy {}: both terminal rows skip" "== RESULT: 0 passed, 0 failed, 2 skipped ==" "$OUT"
+one_row bl-proj-delete-admin-oversee baseline 403 forbidden_delete true on
+eq "sharing in force: the overseeing admin's delete names project:delete" "$(verdict bl-proj-delete-admin-oversee)" "PASS"
+one_row bl-proj-delete-admin-oversee baseline 404 notfound true on
+eq "mutation: the overseeing admin's delete 404: fail" "$(verdict bl-proj-delete-admin-oversee)" "FAIL"
+one_row bl-proj-delete-admin-oversee baseline 403 forbidden true on
+eq "mutation: a 403 naming another permission: fail" "$(verdict bl-proj-delete-admin-oversee)" "FAIL"
+one_row bl-proj-delete-admin-oversee baseline 200 notfound true on
+eq "mutation: the delete allowed: fail" "$(verdict bl-proj-delete-admin-oversee)" "FAIL"
+one_row bl-proj-delete-admin baseline 403 forbidden_delete true on
+eq "sharing in force: the 404 admin row skips instead of failing (the S3 red)" "$(verdict bl-proj-delete-admin)" "SKIP"
+has "on sharing in force" "(sharing switch on)" "$(line bl-proj-delete-admin)"
+one_row bl-proj-delete-other baseline 404 notfound true on
+eq "sharing in force: a stranger's delete is still 404" "$(verdict bl-proj-delete-other)" "PASS"
+one_row bl-proj-delete-other baseline 403 forbidden_delete true on
+eq "mutation: a stranger told the project exists: fail" "$(verdict bl-proj-delete-other)" "FAIL"
+for sw in true ''; do # the switch on with the policy {}, then the switch off
+  one_row bl-proj-delete-admin baseline 404 notfound "$sw" off
+  eq "sharing switch '${sw:-off}', not in force: the admin's delete 404" "$(verdict bl-proj-delete-admin)" "PASS"
+  one_row bl-proj-delete-admin-oversee baseline 404 notfound "$sw" off
+  eq "sharing switch '${sw:-off}', not in force: the oversight twin skips" "$(verdict bl-proj-delete-admin-oversee)" "SKIP"
+done
+twin_n="$(grep -n $'^bl-proj-delete-admin-oversee\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/baseline.tsv" | cut -d: -f1)"
+owner_n="$(grep -n $'^bl-proj-delete-owner\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/baseline.tsv" | cut -d: -f1)"
+eq "the twin runs before bl-proj-delete-owner removes PA_TMP1" "$([ -n "$twin_n" ] && [ "$twin_n" -lt "${owner_n:-0}" ] && echo yes)" "yes"
+
+section "the write switch alone (S4r/S5 red): sharingwriteswitch:on|off follows RBAC_SHARING_WRITE_ENABLED"
+# run args 6-9: sharing switch, Root's policy, write switch, Root's policy at write.
+run true true '' y 5000 true on '' on
+eq "write switch off (S3): the switch-off row runs, the capped row skips" "$(verdict y-wswitch-off) $(verdict y-wswitch-capped)" "PASS SKIP"
+has "named as the write switch, off" "(sharingwrite switch off)" "$(line y-wswitch-capped)"
+eq "write switch off: neither policy query for the write tags" "$(write_policy_reads)" "0"
+run true true '' y 5000 true on true off
+eq "write switch on, policy at Read (S4r): the switch-off row skips, the capped row runs" \
+  "$(verdict y-wswitch-off) $(verdict y-wswitch-capped)" "SKIP PASS"
+has "named as the write switch, on" "(sharingwrite switch on)" "$(line y-wswitch-off)"
+eq "and not the policy: write sharing is off there, only the switch tag skips it" "$(grep -c "Root's policy" <<<"$(line y-wswitch-off)")" "0"
+run true true '' y 5000 true on true on
+eq "write sharing in force (S5): both write-off rows skip" "$(verdict y-wswitch-off) $(verdict y-wswitch-capped)" "SKIP SKIP"
+eq "write sharing in force: the switch-only row runs" "$(verdict y-wswitch-only)" "PASS"
+run true true '^y-wswitch-only$' y 5000 true FAIL true FAIL
+eq "only switch-only rows selected: neither policy is read" "$(policy_reads) $(write_policy_reads)" "0 0"
+eq "so an unreadable policy fails none of them" "$(verdict y-wswitch-only)" "PASS"
+run true true '' y 5000 '' on true on
+eq "sharing switch off: the write switch reads off, whatever it says" "$(verdict y-wswitch-only)" "SKIP"
+has "named off" "(sharingwrite switch off)" "$(line y-wswitch-only)"
+run true true '' y 5000 true on ' Yes ' on
+eq "' Yes ' is on" "$(verdict y-wswitch-only)" "PASS"
+
+section "p4.tsv as committed: the write grant rows in each write state (S4r/S5 red)"
+# The answers of each state (S4r/RED_matrix_p4_write_rows_above_max_level.txt, S5/RED_matrix_all_p4_write_rows_
+# promote_viewer.txt and the levelRefusal / grantShare / updateShare code): every row runs alone against its own
+# state's answer, then against the answer a regression would give.
+cp "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" "$T/tests/fixtures/rbac_matrix/"
+printf '%s' '{"error":"Read + Write sharing is not available yet: share at Read.","code":"write_sharing_off"}' > "$W/body.write_off"
+printf '%s' '{"error":"The instance sharing policy allows Read shares only.","code":"above_max_level","maxLevel":"read"}' > "$W/body.capped"
+printf '%s' '{"error":"This person already holds a share of the project: change it instead.","code":"already_shared"}' > "$W/body.already"
+printf '%s' '{"collaborator":{"user":{"id":"vt","email":"rbac-viewer-tmp@e2e.local","accountType":"member"},"access":"write","rawData":false,"runScans":false,"useAgent":false,"exploit":false,"manage":false}}' > "$W/body.collab_write"
+printf '%s' '{"collaborator":{"user":{"id":"vt","email":"rbac-viewer-tmp@e2e.local","accountType":"member"},"access":"read","rawData":false,"runScans":false,"useAgent":false,"exploit":false,"manage":false}}' > "$W/body.collab_read"
+printf '%s' '{"collaborator":{"user":{"id":"vw","email":"rbac-viewer@e2e.local","accountType":"member"},"access":"write","rawData":false}}' > "$W/body.collab_viewer_write"
+printf '%s' '{"myAccess":{"level":"write","toggles":{"rawData":false,"manage":false},"via":"share"}}' > "$W/body.myaccess_write"
+printf '%s' '{"myAccess":{"level":"read","toggles":{"rawData":false},"via":"share"}}' > "$W/body.myaccess_read"
+printf '%s' '{"left":{"projectId":"ps"},"socketsClosed":true}' > "$W/body.left"
+WRITE_ROWS='p4-share-(grant|update)-write(-capped|-on|-on-.*)?'
+write_row() { # row-regex status body write-switch write-policy -> OUT (sharing in force)
+  FAKE_BODY="$W/body.$3" FAKE_STATUS="$2"; export FAKE_BODY FAKE_STATUS
+  run true true "^($1)\$" p4 5000 true on "$4" "$5"
+  unset FAKE_BODY FAKE_STATUS
+}
+write_row "$WRITE_ROWS" 409 write_off '' on
+eq "S3 (write switch off): the two switch-off rows pass write_sharing_off" \
+  "$(verdict p4-share-grant-write) $(verdict p4-share-update-write)" "PASS PASS"
+has "the other ten rows skip" "== RESULT: 2 passed, 0 failed, 10 skipped ==" "$OUT"
+has "the capped rows on the write switch" "(sharingwrite switch off)" "$(line p4-share-update-write-capped)"
+write_row 'p4-share-(grant|update)-write' 409 capped '' on
+eq "mutation: S3 answering above_max_level fails both rows" "$(verdict p4-share-grant-write) $(verdict p4-share-update-write)" "FAIL FAIL"
+write_row "$WRITE_ROWS" 409 capped true off
+eq "S4r (switch on, policy at Read): the two capped rows pass above_max_level" \
+  "$(verdict p4-share-grant-write-capped) $(verdict p4-share-update-write-capped)" "PASS PASS"
+eq "S4r: the switch-off rows skip instead of failing (the S4r red)" \
+  "$(verdict p4-share-grant-write) $(verdict p4-share-update-write)" "SKIP SKIP"
+has "on the write switch" "(sharingwrite switch on)" "$(line p4-share-grant-write)"
+has "the write-on twins skip on Root's policy" "(sharingwrite switch on, Root's policy off)" "$(line p4-share-grant-write-on)"
+has "result line" "== RESULT: 2 passed, 0 failed, 10 skipped ==" "$OUT"
+write_row 'p4-share-(grant|update)-write-capped' 409 write_off true off
+eq "mutation: S4r answering write_sharing_off fails the capped rows" \
+  "$(verdict p4-share-grant-write-capped) $(verdict p4-share-update-write-capped)" "FAIL FAIL"
+write_row 'p4-share-(grant|update)-write-capped' 409 already true off
+eq "mutation: S4r reaching the lookup (already_shared) fails them too" "$(verdict p4-share-grant-write-capped)" "FAIL"
+write_row "$WRITE_ROWS" 409 already true on
+eq "S5 (write sharing in force): the four write-off rows skip, never promoting the seeded viewer" \
+  "$(verdict p4-share-grant-write) $(verdict p4-share-update-write) $(verdict p4-share-grant-write-capped) $(verdict p4-share-update-write-capped)" \
+  "SKIP SKIP SKIP SKIP"
+has "on write sharing in force" "(sharingwrite switch on)" "$(line p4-share-update-write)"
+eq "S5: no request names the seeded viewer's share" "$(requests | grep -c 'collaborators/vw')" "0"
+has "S5: the write rows act on viewer_tmp's share" "api/projects/ps/collaborators/vt" "$(requests)"
+s5_case() { # row status body want what
+  write_row "$1" "$2" "$3" true on
+  eq "$5" "$(verdict "$1")" "$4"
+}
+s5_case p4-share-update-write-on 200 collab_write PASS "S5: viewer_tmp's share changed to write"
+s5_case p4-share-update-write-on-read 200 myaccess_write PASS "S5: viewer_tmp reads the project at write"
+s5_case p4-share-update-write-on-restore 200 collab_read PASS "S5: viewer_tmp's share put back to Read"
+s5_case p4-share-update-write-on-restored 200 myaccess_read PASS "S5: viewer_tmp reads it at Read again"
+s5_case p4-share-grant-write-on 201 collab_write PASS "S5: a write share granted to viewer_tmp (no share after the leave)"
+s5_case p4-share-grant-write-on-read 200 myaccess_write PASS "S5: viewer_tmp reads the project at write"
+s5_case p4-share-grant-write-on-leave 200 left PASS "S5: viewer_tmp leaves the write share"
+s5_case p4-share-grant-write-on-left 404 notfound PASS "S5: viewer_tmp holds no share again"
+s5_case p4-share-update-write-on 409 capped FAIL "mutation: S5 refusing the write change fails the row"
+s5_case p4-share-update-write-on 200 collab_viewer_write FAIL "mutation: S5 changing the seeded viewer's share fails the row"
+s5_case p4-share-grant-write-on 409 already FAIL "mutation: S5 refusing the write grant (already_shared) fails the row"
+s5_case p4-share-grant-write-on 201 collab_read FAIL "mutation: S5 granting Read instead fails the row"
+s5_case p4-share-update-write-on-read 200 myaccess_read FAIL "mutation: the change not in force (still Read) fails the read"
+s5_case p4-share-update-write-on-restore 200 collab_write FAIL "mutation: the share left at write fails the restore"
+s5_case p4-share-update-write-on-restored 200 myaccess_write FAIL "mutation: still write after the restore fails the check"
+s5_case p4-share-grant-write-on-left 200 myaccess_write FAIL "mutation: a share still held after the leave fails the check"
+# Two mutants of the runner: the tag read as sharing in force (the case line gone), and the tag not read.
+sed '/^      sharingwriteswitch) /d' "$RUNNER" > "$T/tests/rbac_matrix_live.sh"
+eq "mutant 3 differs from the runner" "$(cmp -s "$RUNNER" "$T/tests/rbac_matrix_live.sh"; echo $?)" "1"
+write_row "$WRITE_ROWS" 409 write_off '' on
+eq "mutation: the tag read as sharing in force skips S3's switch-off rows and runs the capped ones" \
+  "$(verdict p4-share-grant-write) $(verdict p4-share-grant-write-capped)" "SKIP FAIL"
+sed 's/ sharingwrite sharingwriteswitch governance/ sharingwrite governance/' "$RUNNER" > "$T/tests/rbac_matrix_live.sh"
+eq "mutant 4 differs from the runner" "$(cmp -s "$RUNNER" "$T/tests/rbac_matrix_live.sh"; echo $?)" "1"
+write_row "$WRITE_ROWS" 409 capped true off
+eq "mutation: the tag not read runs the switch-off rows in S4r, the S4r red" \
+  "$(verdict p4-share-grant-write) $(verdict p4-share-update-write)" "FAIL FAIL"
+has "on the body" "body lacks write_sharing_off" "$(line p4-share-update-write)"
+cp "$RUNNER" "$T/tests/rbac_matrix_live.sh"
+
+section "no row that runs with write sharing in force leaves a seeded account at write (the S5 cascade)"
+# The runner seeds once per run, so a share a row raises to Read + Write stays so for every later row. A row
+# that can run with write sharing in force (not sharingwrite:off) and asks a write level or toggle on a share
+# must act on viewer_tmp, and a later row of the same file must put viewer_tmp back (to Read, a revoke, a leave).
+write_promotions() { # matrix file -> one line per offending row
+  awk -F'\t' '
+    /^#/ || NF != 8 { next }
+    index(" " $8 " ", " sharingwrite:off ") { next }
+    {
+      share = index($5, "/collaborators") > 0
+      asks = index($6, "\"access\":\"write\"") || index($6, "\"runScans\":true") || index($6, "\"useAgent\":true") ||
+             index($6, "\"exploit\":true") || index($6, "\"manage\":true")
+      on_tmp = index($5, "/collaborators/${VIEWER_TMP_ID}") || index($6, "${VIEWER_TMP_EMAIL}")
+    }
+    share && asks && ($4 == "POST" || $4 == "PATCH" || $4 == "PUT") {
+      if (!on_tmp) { print $1 " raises a seeded account other than viewer_tmp"; next }
+      pending[$1] = 1; next
+    }
+    ($4 == "PATCH" && index($5, "/collaborators/${VIEWER_TMP_ID}") && index($6, "\"access\":\"read\"")) ||
+    ($4 == "DELETE" && index($5, "/collaborators/${VIEWER_TMP_ID}")) ||
+    ($3 == "viewer_tmp" && $4 == "POST" && $5 ~ /\/leave$/) { for (k in pending) delete pending[k] }
+    END { for (k in pending) print k " leaves viewer_tmp at write" }
+  ' "$1"
+}
+for f in "$REPO_ROOT"/tests/fixtures/rbac_matrix/*.tsv; do
+  eq "$(basename "$f"): no row leaves a seeded account at write" "$(write_promotions "$f")" ""
+done
+sed 's/ sharingwrite:off sharingwriteswitch:off$//' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" > "$W/p4.untagged"
+eq "the rows as bcf0a204 tagged them (sharing:on only) are caught" "$(write_promotions "$W/p4.untagged" | LC_ALL=C sort | tr '\n' '|')" \
+  "p4-share-grant-write raises a seeded account other than viewer_tmp|p4-share-update-write raises a seeded account other than viewer_tmp|"
+sed '/^p4-share-update-write-on-restore\t/d' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" > "$W/p4.norestore"
+eq "the restore row gone: the 4.4 revoke of viewer_tmp still removes the raised share" "$(write_promotions "$W/p4.norestore")" ""
+{ cat "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv"
+  grep $'^p4-share-update-write-on\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" | sed 's/^p4-share-update-write-on\t/p4-share-update-write-late\t/'
+} > "$W/p4.late"
+eq "mutation: a write change after every row that puts viewer_tmp back is caught" "$(write_promotions "$W/p4.late")" \
+  "p4-share-update-write-late leaves viewer_tmp at write"
+sed '/^p4-share-grant-write-on-leave\t/d' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" > "$W/p4.noleave"
+eq "mutation: the leave row gone leaves viewer_tmp at write" "$(write_promotions "$W/p4.noleave")" "p4-share-grant-write-on leaves viewer_tmp at write"
+sed 's#collaborators/${VIEWER_TMP_ID}\t{"access":"write"}#collaborators/${VIEWER_ID}\t{"access":"write"}#' \
+  "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" > "$W/p4.onviewer"
+eq "mutation: the write-on twin aimed at the seeded viewer is caught" "$(write_promotions "$W/p4.onviewer")" \
+  "p4-share-update-write-on raises a seeded account other than viewer_tmp"
+upd_n="$(grep -n $'^p4-share-update-write-on\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" | cut -d: -f1)"
+rev_n="$(grep -n $'^p4-share-revoke\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" | cut -d: -f1)"
+eq "the write change of viewer_tmp's seeded share runs before p4-share-revoke removes it" \
+  "$([ -n "$upd_n" ] && [ "$upd_n" -lt "${rev_n:-0}" ] && echo yes)" "yes"
+twice_n="$(grep -n $'^p4-share-leave-twice\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" | cut -d: -f1)"
+grant_n="$(grep -n $'^p4-share-grant-write-on\t' "$REPO_ROOT/tests/fixtures/rbac_matrix/p4.tsv" | cut -d: -f1)"
+eq "the write grant runs after viewer_tmp left (no share to collide with)" \
+  "$([ -n "$grant_n" ] && [ "$grant_n" -gt "${twice_n:-999999}" ] && echo yes)" "yes"
+
+section "Root's stored policy through the runner's own SQL (Phase 7 kickoff: no maxLevel means write)"
+# The stubbed answers above cannot catch a wrong query. Here each policy is stored in a
+# throwaway container of the stack's own postgres image (never pulled, no network) and the
+# runner's SQL reads it, so every case is parseSharingPolicy + maxShareLevel on that value.
+if command -v docker >/dev/null 2>&1 && docker image inspect postgres:16-alpine >/dev/null 2>&1; then
+  PG="rbac-runner-test-pg-$$"
+  docker run -d --rm --network none --name "$PG" -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16-alpine >/dev/null 2>&1 || PG=""
+fi
+pg_ready=""
+if [ -n "$PG" ]; then
+  # The image's init server listens on no TCP port, so a TCP answer is the final server.
+  for _ in $(seq 1 120); do
+    docker exec "$PG" pg_isready -q -h 127.0.0.1 -U postgres 2>/dev/null && { pg_ready=1; break; }
+    sleep 0.5
+  done
+fi
+pg() { docker exec -i "$PG" psql -X -q -t -A -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres; }
+if [ -n "$pg_ready" ] && echo "create table instance_settings (id text primary key, sharing_policy jsonb not null default '{}');" | pg; then
+  REAL_PG="$PG"; REAL_DOCKER="$(command -v docker)"
+  store() { # the stored policy as JSON, or NOROW for no instance row
+    { echo "delete from instance_settings;"
+      [ "$1" = NOROW ] || printf "insert into instance_settings (id, sharing_policy) values ('instance', '%s'::jsonb);\n" "$1"
+    } | pg
+  }
+  # policy_case <stored policy> <write switch> <want w-write-on> <want w-write-off> <want w-write-only> [what]
+  policy_case() {
+    store "$1"
+    run true true '' w 5000 true '' "$2" ''
+    eq "${6:-$1}, write switch '${2:-unset}': sharing:on sharingwrite:on / sharing:on sharingwrite:off / sharingwrite:on" \
+      "$(verdict w-write-on) $(verdict w-write-off) $(verdict w-write-only)" "$3 $4 $5"
+  }
+  policy_case '{"enabled":true}' true PASS SKIP PASS "no maxLevel (the 5.2b form)"
+  has "the sharingwrite:off row is skipped as write in force" "(sharingwrite switch on)" "$(line w-write-off)"
+  eq "each policy query read once" "$(policy_reads) $(write_policy_reads)" "1 1"
+  policy_case '{"enabled":true,"maxLevel":"write"}' true PASS SKIP PASS
+  policy_case '{"enabled":true,"maxLevel":"read"}' true SKIP PASS SKIP
+  has "capped at read: the skip names the policy" "(sharingwrite switch on, Root's policy off)" "$(line w-write-on)"
+  policy_case '{"enabled":true}' '' SKIP PASS SKIP "no maxLevel"
+  has "write switch off: the skip names the switch" "(sharingwrite switch off)" "$(line w-write-on)"
+  eq "write switch off: the write policy is not read" "$(write_policy_reads)" "0"
+  policy_case '{"enabled":true,"maxLevel":"write"}' false SKIP PASS SKIP
+  policy_case '{"enabled":true,"maxLevel":"read"}' '' SKIP PASS SKIP
+  policy_case '{"enabled":true,"defaultExpiryDays":30,"membersMayGrantExploit":true,"adminsSeeAllShares":false}' true PASS SKIP PASS \
+    "every other setting valid, no maxLevel"
+  policy_case '{"enabled":true,"defaultExpiryDays":null}' true PASS SKIP PASS
+  policy_case '{"enabled":true,"aFutureSetting":"x"}' true PASS SKIP PASS "an unknown setting is ignored, no maxLevel"
+  policy_case '{"maxLevel":"write"}' true SKIP SKIP SKIP "enabled missing (default false)"
+  policy_case '{"enabled":false}' true SKIP SKIP SKIP
+  policy_case '{}' true SKIP SKIP SKIP
+  policy_case NOROW true SKIP SKIP SKIP "no instance row (the defaults)"
+  policy_case '{"enabled":true,"maxLevel":"admin"}' true SKIP SKIP SKIP "an invalid maxLevel: the whole policy reads as the defaults"
+  policy_case '{"enabled":true,"maxLevel":null}' true SKIP SKIP SKIP
+  policy_case '{"enabled":true,"defaultExpiryDays":0}' true SKIP SKIP SKIP "another setting invalid, no maxLevel"
+  policy_case '{"enabled":true,"defaultExpiryDays":1.5}' true SKIP SKIP SKIP
+  policy_case '{"enabled":true,"membersMayGrantExploit":"yes"}' true SKIP SKIP SKIP
+  policy_case '{"enabled":"true"}' true SKIP SKIP SKIP "enabled as a string"
+  policy_case '[{"enabled":true}]' true SKIP SKIP SKIP "not an object"
+  store '{"enabled":true,"maxLevel":"read"}'
+  run true true '' v 5000 true '' true ''
+  eq "capped at read is still sharing in force: sharing:on runs, sharing:off skips" \
+    "$(verdict v-share-on) $(verdict v-share-off)" "PASS SKIP"
+  unset REAL_PG REAL_DOCKER
+else
+  printf '  skip %s (%s)\n' "the runner's policy SQL against stored policies" \
+    "needs Docker and the local postgres:16-alpine image (the stack's own); never pulled here"
+fi
+
+section "the runner documents the tag"
+HEADER="$(sed -n '1,/^set -uo pipefail/p' "$RUNNER")"
+has "permissions:on | permissions:off in the row format" "permissions:on | permissions:off" "$HEADER"
+has "and the chain" "RBAC_PERMISSIONS_ENABLED" "$HEADER"
+has "sharing:on | sharing:off in the row format" "sharing:on | sharing:off" "$HEADER"
+has "and its chain" "RBAC_SHARING_ENABLED" "$HEADER"
+has "and Root's policy" "instance_settings.sharing_policy" "$HEADER"
+has "sharingswitch:on | sharingswitch:off in the row format" "sharingswitch:on | sharingswitch:off" "$HEADER"
+has "sharingwrite:on | sharingwrite:off in the row format" "sharingwrite:on | sharingwrite:off" "$HEADER"
+has "and its switch" "RBAC_SHARING_WRITE_ENABLED" "$HEADER"
+has "and the maxLevel default" "a policy without \`maxLevel\` allows write" "$HEADER"
+has "sharingwriteswitch:on | sharingwriteswitch:off in the row format" "sharingwriteswitch:on | sharingwriteswitch:off" "$HEADER"
+has "and the two refusals it splits" "\`write_sharing_off\` with the switch off and \`above_max_level\`" "$HEADER"
+has "governance:on | governance:off in the row format" "governance:on | governance:off" "$HEADER"
+has "and its switch" "RBAC_GOVERNANCE_ENABLED" "$HEADER"
+
+echo
+echo "-----------------------------------------"
+printf 'Matrix runner suite: %d passed, %d failed\n' "$PASS" "$FAIL"
+[[ $FAIL -eq 0 ]]

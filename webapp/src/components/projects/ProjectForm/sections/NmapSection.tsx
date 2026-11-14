@@ -75,7 +75,7 @@ export function NmapSection({ data, updateField, onRun }: NmapSectionProps) {
               <div className={styles.toggleRow}>
                 <div>
                   <span className={styles.toggleLabel}>NSE Vulnerability Scripts (--script vuln)</span>
-                  <p className={styles.toggleDescription}>Run Nmap Scripting Engine vulnerability checks (vsftpd backdoor, Log4Shell, etc.). Disabled in stealth mode.</p>
+                  <p className={styles.toggleDescription}>Run Nmap Scripting Engine vulnerability checks (vsftpd backdoor, Log4Shell, etc.). Disabled in stealth mode. In IP mode and while RoE excluded hosts are set, nmap runs with -n and without http-cross-domain-policy, so no script follows a redirect off the target address.</p>
                 </div>
                 <Toggle
                   checked={data.nmapScriptScan}
@@ -129,8 +129,8 @@ export function NmapSection({ data, updateField, onRun }: NmapSectionProps) {
                   <input
                     type="number"
                     className="textInput"
-                    value={data.nmapParallelism ?? 2}
-                    onChange={(e) => updateField('nmapParallelism', parseInt(e.target.value) || 2)}
+                    value={data.nmapParallelism ?? 5}
+                    onChange={(e) => updateField('nmapParallelism', parseInt(e.target.value) || 5)}
                     min={1}
                     max={10}
                   />

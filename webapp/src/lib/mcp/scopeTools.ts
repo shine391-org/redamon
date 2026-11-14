@@ -3,10 +3,11 @@
  *
  * Scope was create-only on this surface for every token. This reopens exactly
  * the target lists the project form already lets a person edit after creation -
- * a batch project's host list and the standalone scanners' targets - and
- * nothing else. The target domain, the address list, the targeting mode,
- * ownership verification and the target guardrail stay refused whatever the
- * token holds (the registry's `rescope` attribute is the list).
+ * a batch project's host list, the standalone scanners' targets and an IP
+ * project's hostname policy (which names on its addresses are recorded or
+ * scanned) - and nothing else. The target domain, the address list, the
+ * targeting mode, ownership verification and the target guardrail stay refused
+ * whatever the token holds (the registry's `rescope` attribute is the list).
  *
  * The controls, in the order they run:
  *  - its own permission, never auto-ticked by any profile;
@@ -19,24 +20,29 @@
  *    record, written in the same transaction, and passing one needs
  *    engagement:authorize as well;
  *  - a compare-and-swap on `updatedAt`, and an audit row with every before/after;
- *  - a batch that gains hosts pauses the project's scan schedules in the same
- *    transaction, so no unattended run reaches the new hosts before a person
- *    has looked at them;
- *  - an active login recording is re-pointed at the new scope.
+ *  - a batch that gains hosts, or a hostname policy that widens, pauses the
+ *    project's scan schedules in the same transaction, so no unattended run
+ *    reaches the new hosts before a person has looked at them;
+ *  - an active login recording is re-pointed at the new scope;
+ *  - a hostname policy that narrows marks the names earlier runs scanned and it
+ *    no longer admits, after the commit (`hostnamePolicyMarked`).
  */
 import prisma from '@/lib/prisma'
 import { writeAudit } from '@/lib/audit'
 import { validateDomainBatch } from '@/lib/domainBatch'
 import {
-  type ScopeGroup, isScopeWidening, resolveScopeGroups, sameScope, scopeGuardrailNames, scopeSignature,
+  IP_HOSTNAME_FIELDS, type ScopeFields, type ScopeGroup, ipHostnameIncludeBases, ipHostnamePolicyNarrowed,
+  ipHostnameWidenings, isScopeWidening, resolveScopeGroups, sameScope, scopeGuardrailNames, scopeSignature,
   softGuardrailNames,
 } from '@/lib/scopeGroups'
+import { markOutOfPolicy } from '@/lib/ipHostnamePolicy'
 import { refreshActiveRecordingScope } from '@/lib/recordingSession'
 import { activationBusy } from '@/lib/activationLock'
+import { ACTIVATION_STATE_TRANSFERRING, TRANSFER_IN_PROGRESS_MESSAGE, holdOf } from '@/lib/graphHold'
 import { describeLiveGraphWriters } from '@/lib/graphWriters'
 import { seedDomainNames, seedProjectDomains } from '@/lib/graphSeedDomains'
 import { LEGACY_GRAPH_MESSAGE, legacyGraphDomains } from '@/lib/legacyGraph'
-import { assertMcpProjectAccess, requireScope } from '@/lib/mcpAuth'
+import { McpLevelDenied, mcpProjectAccess, requireScope } from '@/lib/mcpAuth'
 import { assertReadableSelect } from '@/lib/mcpReadableFields'
 import { auditableKey, filterReconSettings } from '@/lib/reconSettings/filter'
 import { rescopableFields } from '@/lib/reconSettings/registry'
@@ -46,7 +52,9 @@ import { enforceRate, type McpContext } from '@/lib/mcp/tools'
 import {
   normaliseAuthorization, refuseHardBlocked, softGuardrailRefusal, type AuthorizationArgs,
 } from '@/lib/mcp/engagementTools'
-import { busyHint, casVersion, countQueuedJobsNeedingReview, describeAffectedSchedules } from '@/lib/mcp/writeTools'
+import {
+  busyHint, casVersion, countQueuedJobsNeedingReview, describeAffectedSchedules, refuseSettingsChange,
+} from '@/lib/mcp/writeTools'
 
 export interface UpdateProjectScopeArgs {
   projectId: string
@@ -117,14 +125,29 @@ function wideningsOf(row: Row, data: Record<string, unknown>): string[] {
   if ('supplyChainRepoUrl' in data && text(data.supplyChainRepoUrl) && text(data.supplyChainRepoUrl) !== text(row.supplyChainRepoUrl)) {
     out.push('the supply-chain scan points at a different repository')
   }
+  out.push(...hostnameWideningsOf(row, data))
   return out
+}
+
+/** The hostname-policy half of wideningsOf (design §9): a move towards scan_all,
+ *  an include entry added, an exclude entry removed, passive expansion turned on,
+ *  a cap raised. ip_only -> record_only adds lookups, not target traffic. */
+function hostnameWideningsOf(row: Row, data: Record<string, unknown>): string[] {
+  if (!IP_HOSTNAME_FIELDS.some(k => k in data)) return []
+  return ipHostnameWidenings(row as ScopeFields, { ...row, ...data } as ScopeFields)
 }
 
 export async function updateProjectScope(ctx: McpContext, args: UpdateProjectScopeArgs) {
   requireScope(ctx.token, 'project:rescope')
   // Recording what authorized a widening is its own durable claim.
   if (args.authorization !== undefined) requireScope(ctx.token, 'engagement:authorize')
-  await assertMcpProjectAccess(ctx.token.userId, args.projectId)
+  // project:rescope (M): a co-owner narrows, widening is the owner's (classifyChange), and the
+  // `authorization` argument stays the owner's below.
+  const { project: { userId: owner }, access } = await mcpProjectAccess(ctx.token, args.projectId, 'M')
+  // What authorized a wider scope is the owner's to record (OQ-23), whatever level reaches the rest.
+  if (args.authorization !== undefined && access.level !== 'owner') {
+    throw new McpLevelDenied("Recording an engagement authorization is the project owner's. Nothing was written.")
+  }
   enforceRate(ctx, 'write')
 
   const busy = await describeLiveGraphWriters(args.projectId)
@@ -145,12 +168,18 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
   const select = {
     ...Object.fromEntries(rescopableFields().map(f => [f.key, true])),
     engagementKind: true, domainBatchMode: true, domainBatchHosts: true, domainBatchGroups: true, updatedAt: true,
-    // Not changed here; read for the soft guardrail and the recording scope.
-    targetGuardrailEnabled: true, roeExcludedHosts: true,
+    // Not changed here; read for the soft guardrail and the recording scope, and
+    // ipMode because the hostname policy applies only to an IP project.
+    targetGuardrailEnabled: true, roeExcludedHosts: true, ipMode: true,
+    activationState: true, activationStartedAt: true,
   }
   assertReadableSelect(select, 'update_project_scope')
   const row = await prisma.project.findUnique({ where: { id: args.projectId }, select }) as Row | null
   if (!row) throw new McpToolError('Project not found', 'not_found')
+  // The project changes owner meanwhile (step 5.12): its scope waits for the transfer to end.
+  if (holdOf(row as { activationState?: string; activationStartedAt?: Date | null }) === ACTIVATION_STATE_TRANSFERRING) {
+    throw new McpToolError(TRANSFER_IN_PROGRESS_MESSAGE, 'project_transfer_in_progress')
+  }
 
   const data: Record<string, unknown> = { ...filtered.data }
   let addedRoots: string[] = []
@@ -183,8 +212,24 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
     data.domainBatchGroups = batch.legacy
   }
 
-  const crossField = await validateCrossFieldRules({ ...row, ...data }, Object.keys(data), ctx.token.userId)
+  // The hostname include entries are names a run may scan: the permanent
+  // guardrail refuses them as it refuses a batch host.
+  if ('ipHostnameInclude' in data) refuseHardBlocked(ipHostnameIncludeBases(data.ipHostnameInclude as string[]))
+
+  const effective: Record<string, unknown> = { ...row, ...data }
+  const crossField = await validateCrossFieldRules(effective, Object.keys(data), ctx.token.userId)
   if (crossField) throw new McpToolError(crossField, 'setting_rejected')
+  // The rule stores the policy normalized: canonical filter entries, and no
+  // scan_all confirmation left behind when the mode moves away from scan_all.
+  for (const key of IP_HOSTNAME_FIELDS) {
+    if (key in data || JSON.stringify(effective[key] ?? null) !== JSON.stringify(row[key] ?? null)) {
+      data[key] = effective[key]
+    }
+  }
+
+  // A collaborator's change judged as the project form's save judges it; the derived grouping and
+  // the normalized policy columns follow the list and mode the caller changed, which decide.
+  refuseSettingsChange(row, data, access, 'project:rescope')
 
   const widenings = wideningsOf(row, data)
   if (widenings.length > 0 && row.engagementKind === 'third_party' && args.authorization === undefined) {
@@ -203,8 +248,10 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
   }
 
   // A version activation swaps the graph out and back; a scope written between
-  // its clear and its restore would describe neither graph.
-  if ('domainBatchHosts' in data && await activationBusy(args.projectId)) {
+  // its clear and its restore would describe neither graph. The hostname policy
+  // decides which restored names count as scanned, so it waits too.
+  const policyTouched = IP_HOSTNAME_FIELDS.some(k => k in data)
+  if (('domainBatchHosts' in data || policyTouched) && await activationBusy(args.projectId)) {
     throw new McpToolError(
       'A version activation is in progress for this project. Nothing was written; retry once it finishes.',
       'busy'
@@ -229,6 +276,7 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
 
   const version = casVersion(row.updatedAt, args.expectedUpdatedAt)
   const batchGained = batchEntriesAdded(row, data) > 0
+  const hostnamesWidened = hostnameWideningsOf(row, data).length > 0
   const { authorizationId, paused } = await prisma.$transaction(async tx => {
     const { count } = await tx.project.updateMany({
       where: { id: args.projectId, updatedAt: version },
@@ -240,10 +288,10 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
         'conflict'
       )
     }
-    // A scheduled run is a full recon of the whole batch that nobody watches
-    // start. Only the batch pauses them: the GitHub and supply-chain targets
+    // A scheduled run is a full recon that nobody watches start. Only the batch
+    // and the hostname policy pause them: the GitHub and supply-chain targets
     // are never read by a scheduled run, and a narrowing takes nothing new.
-    const paused = batchGained
+    const paused = batchGained || hostnamesWidened
       ? await tx.scanSchedule.findMany({
           where: { projectId: args.projectId, enabled: true },
           select: { id: true, label: true },
@@ -270,20 +318,33 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
   })
   const pausedSchedules = { count: paused.length, names: paused.map(s => s.label || s.id) }
 
+  // A narrowed hostname policy marks the names earlier runs scanned that it no
+  // longer admits (design §6.3). After the commit and best-effort: every reader
+  // re-applies the current policy, so a failure leaves only the graph behind.
+  let hostnamePolicyMarked: boolean | undefined
+  if (policyTouched && ipHostnamePolicyNarrowed(row as ScopeFields, { ...row, ...data } as ScopeFields)) {
+    try {
+      hostnamePolicyMarked = await markOutOfPolicy(args.projectId, owner, { ...row, ...data } as ScopeFields)
+    } catch (e) {
+      console.warn('[mcp] update_project_scope: hostname policy marker failed:', e)
+      hostnamePolicyMarked = false
+    }
+  }
+
   // After the commit, and best-effort: the partial-recon picker lists Domain
   // nodes, so a new root without one could not be scanned on its own.
-  // The owner is the token's user: assertMcpProjectAccess proved it, and the
-  // row's own userId is not an MCP-readable column.
+  // The graph's tenant is the project's owner as mcpProjectAccess
+  // answered it; the row's own userId is not an MCP-readable column.
   // Seeding attaches to Domain nodes too, so on a graph built under the old
   // scope model (§4.11.6) it waits for the full recon that rebuilds it.
   const legacyGraph = addedRoots.length > 0
-    ? (await legacyGraphDomains(ctx.token.userId, args.projectId, batchScope(data.domainBatchHosts))) ?? []
+    ? (await legacyGraphDomains(owner, args.projectId, batchScope(data.domainBatchHosts))) ?? []
     : []
   // The orgs of the added scan roots: the graph names its Domain after the org.
   const addedOrgs = seedDomainNames(
     batchScope(data.domainBatchHosts).filter(g => addedRoots.includes(g.scanRoot)))
   const graphSeeded = legacyGraph.length === 0
-    && await seedProjectDomains(addedOrgs, ctx.token.userId, args.projectId)
+    && await seedProjectDomains(addedOrgs, owner, args.projectId)
 
   const recordingScopeUpdated = batchRescoped && await refreshActiveRecordingScope(prisma, args.projectId, {
     domainBatchMode: true,
@@ -329,12 +390,19 @@ export async function updateProjectScope(ctx: McpContext, args: UpdateProjectSco
     graphSeeded,
     legacyGraph,
     recordingScopeUpdated,
+    ...(hostnamePolicyMarked === undefined ? {} : { hostnamePolicyMarked }),
     note:
       (graphSeeded ? '' : "The new registrable domains' Domain nodes could not be added to the graph yet; the next full recon adds them. ") +
       (legacyGraph.length > 0 ? `${LEGACY_GRAPH_MESSAGE} (old domain nodes: ${legacyGraph.join(', ')}). ` : '') +
       (pausedSchedules.count > 0
-        ? `The batch gained hosts, so ${pausedSchedules.count} scheduled scan(s) were paused; a person ` +
+        ? `${batchGained ? 'The batch gained hosts' : 'The hostname policy widened'}, so ` +
+          `${pausedSchedules.count} scheduled scan(s) were paused; a person ` +
           're-enables them in the Scans tab once they have reviewed the new scope. '
+        : '') +
+      (hostnamePolicyMarked === false
+        ? 'The hostnames earlier runs scanned and the narrower policy no longer admits could not be ' +
+          'marked out_of_policy in the graph; every reader still applies the current policy, so none ' +
+          'of them is treated as a target. '
         : '') +
       'The change applies to the NEXT scan. Call preflight_scope_check and report what it says.',
   }

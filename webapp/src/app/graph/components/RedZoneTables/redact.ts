@@ -1,15 +1,10 @@
-export function redactSecret(value: string | null | undefined): string {
-  if (!value) return '-'
-  const s = String(value)
-  if (s.length <= 8) return s.slice(0, 2) + '***'
-  return s.slice(0, 4) + '***' + s.slice(-4)
-}
-
 /**
  * A recon evidence snippet, masked again before display: e-mails, digit runs of
  * six or more and token-shaped strings become placeholders. The route exposure
- * scan already masks them; this keeps a snippet from an older or foreign writer
- * from showing a value. Render the result as text, never as HTML.
+ * scan already masks them (the agent reads the snippet too); this keeps a
+ * snippet from an older or foreign writer from showing a value. The secrets a
+ * response held are shown whole-on-copy in the Secrets column instead. Render
+ * the result as text, never as HTML.
  */
 export function maskSnippet(value: string | null | undefined): string {
   if (!value) return '-'

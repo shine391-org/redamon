@@ -40,6 +40,10 @@ class CodeFixState:
         self.remediation_id: str = ""
         self.remediation_title: str = ""
         self.user_id: str = ""
+        #: The person who runs the fix (the ticket's `sub`) and the admin acting as them
+        #: (`act`); `user_id` is the project's tenant. A push is asked for them (step 5.4).
+        self.actor_user_id: str = ""
+        self.real_actor_user_id: Optional[str] = None
         self.project_id: str = ""
         self.session_id: str = ""
         # Identifies the per-job CodeFix build sandbox (T6/E10). Set in
@@ -50,13 +54,18 @@ class CodeFixState:
         self.branch_name: str = ""
         self.base_branch: str = "main"
         self.files_read: set = set()
+        # Every file a change was written to, pending ones included. The commit
+        # uses `committable`, not this.
         self.files_modified: set = set()
+        # Repo-relative path -> the content the PR carries: what a person
+        # accepted (or, with approval off, what the edit tools wrote). Only
+        # tools/review_gate.py writes it, and _finalize commits exactly this.
+        self.committable: dict = {}
         self.diff_blocks: list = []
         self.pending_approval: bool = False
         self.pending_block_id: Optional[str] = None
-        # block_id -> (file_path, content before the edit, was the file already
-        # in files_modified). A rejected block has to be undone on disk: only
-        # approved changes may reach the commit in _finalize.
+        # block_id -> review_gate.ProposedChange, for the change awaiting a
+        # person's decision; a rejected one is undone on disk.
         self.block_backups: dict = {}
         self.settings: CodeFixSettings = CodeFixSettings()
         self.streaming_callback = None

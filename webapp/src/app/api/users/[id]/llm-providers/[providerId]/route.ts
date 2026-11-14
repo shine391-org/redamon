@@ -4,25 +4,26 @@ import { isInternalRequest, requireUserAccess } from '@/lib/session'
 import { isJevProvider, jevPinnedConfig } from '@/lib/llmProviderKinds'
 import { isReasoningEffort } from '@/lib/llmReasoning'
 import { internalError } from '@/lib/routeErrors'
+import { isMaskedSecret, llmProviderEndpointChange, llmProviderSecretReentry, secretReentryResponse } from '@/lib/authz/secretEndpointRebind'
+import { refuseWhileActingAsOn } from '@/lib/authz/actAsRefusals'
+import { requireStepUp } from '@/lib/authz/stepUp'
+import { maskProvider, restoreMaskedHeaders } from '@/lib/llmProviderMask'
+import { requireSelfPermission } from '@/lib/authz/selfService'
 
 interface RouteParams {
   params: Promise<{ id: string; providerId: string }>
 }
 
-function maskSecret(value: string): string {
-  if (!value || value.length <= 4) return value ? '••••' : ''
-  return '••••••••' + value.slice(-4)
-}
-
-function maskProvider(provider: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...provider,
-    apiKey: maskSecret(provider.apiKey as string),
-    awsAccessKeyId: maskSecret(provider.awsAccessKeyId as string),
-    awsSecretKey: maskSecret(provider.awsSecretKey as string),
-    awsBearerToken: maskSecret(provider.awsBearerToken as string),
-  }
-}
+/**
+ * The settings a PUT may write. A spread body would also carry relation inputs that
+ * Prisma applies as nested writes: `user: {connect}` moves the row to another account,
+ * `jevProjects: {connect}` selects it in other accounts' projects.
+ */
+const UPDATABLE_FIELDS = [
+  'providerType', 'name', 'apiKey', 'baseUrl', 'modelIdentifier', 'defaultHeaders', 'timeout',
+  'temperature', 'maxTokens', 'sslVerify', 'reasoningEnabled', 'reasoningEffort', 'awsRegion',
+  'awsAccessKeyId', 'awsSecretKey', 'awsBearerToken',
+] as const
 
 // GET /api/users/[id]/llm-providers/[providerId]
 export async function GET(request: NextRequest, { params }: RouteParams) {
@@ -30,10 +31,12 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const { id, providerId } = await params
 
     // Ownership + secret-unmask gate (STRIDE I1): browser callers must own the
-    // account (or be admin) and always get masked rows; unmasked rows require a
-    // valid X-Internal-Key header, never the ?internal=true query param.
-    const denied = await requireUserAccess(request, id)
+    // account (or be admin: the read rule) and always get masked rows; unmasked
+    // rows require a valid X-Internal-Key header, never the ?internal=true param.
+    const denied = await requireUserAccess(request, id, { mode: 'read' })
     if (denied) return denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:llm_providers')
+    if (selfRefused) return selfRefused
 
     const provider = await prisma.userLlmProvider.findFirst({
       where: { id: providerId, userId: id },
@@ -58,10 +61,15 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, providerId } = await params
 
-    const denied = await requireUserAccess(request, id)
+    const denied = await requireUserAccess(request, id, { mode: 'write' })
     if (denied) return denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:llm_providers')
+    if (selfRefused) return selfRefused
 
     const body = await request.json()
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return NextResponse.json({ error: 'The body must be a JSON object' }, { status: 400 })
+    }
 
     if (body.reasoningEnabled !== undefined && typeof body.reasoningEnabled !== 'boolean') {
       return NextResponse.json(
@@ -96,13 +104,42 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       )
     }
 
+    // Its endpoint, type, keys and Extra Headers values (provider secrets, secretEndpointRebind.ts)
+    // decide where the account's keys and prompts go: never while acting as it (§4.7). A name, model
+    // or reasoning change, a masked header kept or a header removed stays allowed.
+    const typesKey = ['apiKey', 'awsAccessKeyId', 'awsSecretKey', 'awsBearerToken']
+      .some((f) => typeof body[f] === 'string' && body[f] !== '' && !isMaskedSecret(body[f]))
+    const storedHeaders = (existing.defaultHeaders ?? {}) as Record<string, unknown>
+    const typesHeader = body.defaultHeaders !== null && typeof body.defaultHeaders === 'object'
+      && Object.entries(body.defaultHeaders as Record<string, unknown>)
+        .some(([name, v]) => typeof v === 'string' && v !== '' && !isMaskedSecret(v) && v !== storedHeaders[name])
+    if (typesKey || typesHeader || llmProviderEndpointChange(existing, body)) {
+      const actingAs = await refuseWhileActingAsOn(id, 'change_llm_endpoint')
+      if (actingAs) return actingAs
+    }
+
+    // A new base URL or type must come with the key typed again (HD-24): the
+    // masked key below would otherwise follow the row to the new endpoint. A Jev
+    // row's transport is pinned, so it never re-points.
+    if (!isJevProvider(existing)) {
+      const reentry = llmProviderSecretReentry(existing, body)
+      if (reentry) return secretReentryResponse(reentry)
+      // Re-pointing also takes the signed-in person's password (ID-25): with a key typed
+      // again the re-entry rule passes, yet the account's prompts follow the endpoint, so
+      // a stolen session could re-point a provider with a junk key and read every later
+      // run. The internal key has no password and is a machine's, not a session's.
+      if (!isInternalRequest(request) && llmProviderEndpointChange(existing, body)) {
+        const refused = await requireStepUp(request, body.stepUpPassword)
+        if (refused) return refused
+      }
+    }
+
     // Preserve masked secrets
     const secretFields = ['apiKey', 'awsAccessKeyId', 'awsSecretKey', 'awsBearerToken'] as const
-    const updateData: Record<string, unknown> = { ...body }
-    delete updateData.id
-    delete updateData.userId
-    delete updateData.createdAt
-    delete updateData.updatedAt
+    const updateData: Record<string, unknown> = {}
+    for (const field of UPDATABLE_FIELDS) {
+      if (field in body) updateData[field] = body[field]
+    }
 
     for (const field of secretFields) {
       if (field in updateData) {
@@ -111,6 +148,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
           updateData[field] = existing[field]
         }
       }
+    }
+    if ('defaultHeaders' in updateData) {
+      updateData.defaultHeaders = restoreMaskedHeaders(updateData.defaultHeaders, existing.defaultHeaders)
     }
 
     // Reasoning controls only apply to OpenAI-compatible providers. For any
@@ -158,8 +198,10 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, providerId } = await params
 
-    const denied = await requireUserAccess(request, id)
+    const denied = await requireUserAccess(request, id, { mode: 'write' })
     if (denied) return denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:llm_providers')
+    if (selfRefused) return selfRefused
 
     const existing = await prisma.userLlmProvider.findFirst({
       where: { id: providerId, userId: id },

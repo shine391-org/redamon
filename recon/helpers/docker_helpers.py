@@ -5,11 +5,13 @@ Utilities for Docker container operations, image management, and file permission
 """
 
 import os
+import re
 import shutil
 import subprocess
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 # Volume name for persistent nuclei templates
 NUCLEI_TEMPLATES_VOLUME = "nuclei-templates"
@@ -86,6 +88,88 @@ def kill_container(name: str) -> None:
                        capture_output=True, text=True, timeout=15, check=False)
     except Exception as e:  # noqa: BLE001
         print(f"[!][Docker] failed to kill {name}: {type(e).__name__}")
+
+
+@dataclass(frozen=True)
+class ToolContainerRun:
+    """What a `run_tool_container` call produced.
+
+    ``returncode`` is None when the timeout cut the run; ``stdout`` and
+    ``stderr`` then hold what the tool printed before it was killed.
+    """
+    name: str
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool
+
+
+def _name_part(value: str, limit: int) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "-", value.lower()).strip("-_")[:limit]
+
+
+def tool_container_name(tool: str) -> str:
+    """`<tool>-<run id>-<8 hex>`: unique, and readable as this run's in `docker ps`.
+
+    The run id is the one recon/entrypoint.sh names to the broker (a partial
+    run's first), so the name and the broker's `redamon.run_id` label agree.
+    Outside a run a random id stands in.
+    """
+    run = os.environ.get("PARTIAL_RECON_RUN_ID") or os.environ.get("RECON_RUN_ID") or ""
+    return (f"{_name_part(tool, 24) or 'tool'}-{_name_part(run, 64) or uuid.uuid4().hex[:8]}"
+            f"-{uuid.uuid4().hex[:8]}")
+
+
+def _with_name(cmd: list, name: str) -> list:
+    if any(cmd[i:i + 2] == ["--name", name] for i in range(2, len(cmd) - 1)) \
+            or f"--name={name}" in cmd:
+        return cmd
+    # After the argv's opening self-contained flags (`--rm`, `--net=host`), so
+    # the familiar head of each tool's command stays put and the name can never
+    # land between an option and its value.
+    i = 2
+    while i < len(cmd) and (cmd[i] == "--rm" or (cmd[i].startswith("--") and "=" in cmd[i])):
+        i += 1
+    return [*cmd[:i], "--name", name, *cmd[i:]]
+
+
+def _text(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    return data.replace("\r\n", "\n")
+
+
+def run_tool_container(cmd: Sequence[str], *, tool: str, timeout: float,
+                       input: Optional[str] = None,
+                       name: Optional[str] = None) -> ToolContainerRun:
+    """Run a `docker run` argv to completion or `timeout`, never leaving its container behind.
+
+    A timeout on `subprocess.run` kills only the docker CLI: the daemon-owned
+    container goes on scanning the target after the run has moved on. So the
+    container gets a name (``name``, else ``tool_container_name(tool)``; an
+    argv that already carries ``--name <name>`` is left as it is) and, on
+    timeout, is killed by it once the CLI has exited. The run labels come from
+    the broker, which stamps every container this process creates
+    (recon/entrypoint.sh).
+
+    Returns the exit code and output; on timeout, ``timed_out`` and the output
+    read so far, for the caller to parse and to record what went unchecked.
+    A failure to start (no docker binary) raises as `subprocess.run` does.
+    """
+    cmd = list(cmd)
+    if len(cmd) < 2 or cmd[0] != "docker" or cmd[1] != "run":
+        raise ValueError("run_tool_container takes a `docker run` argv")
+    name = name or tool_container_name(tool)
+    argv = _with_name(cmd, name)
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              input=input, check=False)
+    except subprocess.TimeoutExpired as expired:
+        kill_container(name)
+        return ToolContainerRun(name, None, _text(expired.stdout), _text(expired.stderr), True)
+    return ToolContainerRun(name, done.returncode, done.stdout or "", done.stderr or "", False)
 
 
 def get_real_user_ids() -> tuple:
@@ -179,16 +263,16 @@ def ensure_templates_volume(docker_image: str, auto_update: bool = False) -> boo
             needs_download = True  # New volume, definitely needs templates
         else:
             # Volume exists - check if it has templates by counting .yaml files
-            check_result = subprocess.run(
-                ["docker", "run", "--rm", 
+            check_result = run_tool_container(
+                ["docker", "run", "--rm",
                  "-v", f"{NUCLEI_TEMPLATES_VOLUME}:/root/nuclei-templates",
-                 "alpine", 
+                 "alpine",
                  "sh", "-c", "find /root/nuclei-templates -name '*.yaml' 2>/dev/null | head -5 | wc -l"],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
+                tool="nuclei-templates-count", timeout=30)
+            if check_result.timed_out:
+                print("[!][Docker] Timeout while counting the nuclei templates")
+                return False
+
             template_count = int(check_result.stdout.strip()) if check_result.stdout.strip().isdigit() else 0
             needs_download = template_count == 0
         
@@ -199,22 +283,16 @@ def ensure_templates_volume(docker_image: str, auto_update: bool = False) -> boo
             print(f"[*][Docker] Checking for template updates...")
         
         if needs_download or auto_update:
-            # Named so a timed-out update can be stopped: the timeout kills only
-            # the docker CLI, and the container would go on rewriting the volume
-            # the scan is about to read.
-            updater = f"redamon-nuclei-update-{uuid.uuid4().hex[:12]}"
-            try:
-                update_result = subprocess.run(
-                    ["docker", "run", "--rm", "--name", updater,
-                     "-v", f"{NUCLEI_TEMPLATES_VOLUME}:/root/nuclei-templates",
-                     docker_image,
-                     "-ut"],  # Update templates
-                    capture_output=True,
-                    text=True,
-                    timeout=600  # 10 minutes for initial download
-                )
-            except subprocess.TimeoutExpired:
-                kill_container(updater)
+            # Stopped on a timeout: the container would go on rewriting the
+            # volume the scan is about to read.
+            update_result = run_tool_container(
+                ["docker", "run", "--rm",
+                 "-v", f"{NUCLEI_TEMPLATES_VOLUME}:/root/nuclei-templates",
+                 docker_image,
+                 "-ut"],  # Update templates
+                tool="nuclei-update", timeout=600,  # 10 minutes for initial download
+                name=f"redamon-nuclei-update-{uuid.uuid4().hex[:12]}")
+            if update_result.timed_out:
                 # Stopped mid-write, the volume can hold half-updated templates
                 # that fail to load, so Nuclei is skipped (its findings kept)
                 # rather than run on them.

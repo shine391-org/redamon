@@ -129,9 +129,12 @@ def main():
     check("apoc.atomic.* rejected 403", resp.status_code == 403)
 
     print("=== S8/I8/D7: /graph/exec and /emergency-stop-all require internal auth ===")
-    # Both use the AUTH-ONLY dependency (no LLM rate-limit / daily cap) — graph
-    # reads are cheap high-frequency, not billed LLM calls (regression guard).
-    from llm_guard import require_internal_auth, require_internal_auth_only
+    # Neither is LLM-rate-limited — graph reads are cheap high-frequency, not
+    # billed LLM calls (regression guard). /graph/exec takes the master key or a
+    # graph run credential (RBAC 1.15, NF-01), never the bare scanner key.
+    from llm_guard import (require_configured_master_auth, require_internal_auth,
+                           require_internal_auth_only, require_master_or_run_credential)
+    graph_gate = require_master_or_run_credential("graph")
 
     def _route_deps(path):
         for r in api.app.routes:
@@ -141,8 +144,12 @@ def main():
 
     ge_deps = _route_deps("/graph/exec")
     es_deps = _route_deps("/emergency-stop-all")
-    check("/graph/exec requires internal auth (auth-only)", ge_deps is not None and require_internal_auth_only in ge_deps)
-    check("/emergency-stop-all requires internal auth (auth-only)", es_deps is not None and require_internal_auth_only in es_deps)
+    check("/graph/exec requires the master key or a graph run credential",
+          ge_deps is not None and graph_gate in ge_deps and not graph_gate.run_credential_billed)
+    # The webapp is its only caller: the master key, fail-closed (NF-01, step 1.9).
+    check("/emergency-stop-all requires the configured master key (auth-only)",
+          es_deps is not None and require_configured_master_auth in es_deps
+          and require_internal_auth_only not in es_deps and require_internal_auth not in es_deps)
     check("/graph/exec is NOT LLM-rate-limited (no require_internal_auth)", require_internal_auth not in (ge_deps or []))
 
     # Regression: auth-only dependency authenticates but never throttles, even
@@ -179,8 +186,8 @@ def main():
     check("/graph/triage requires the MASTER key", require_master_internal_auth in (tri_deps or []))
     check("/graph/triage does NOT accept the scoped scanner key",
           require_internal_auth_only not in (tri_deps or []))
-    check("/graph/exec still accepts the scanner key (the worker needs reads)",
-          require_internal_auth_only in (ge_deps or []))
+    check("/graph/exec no longer accepts the bare scanner key (the worker reads with a run credential)",
+          require_internal_auth_only not in (ge_deps or []) and require_internal_auth not in (ge_deps or []))
 
     os.environ["INTERNAL_API_KEY"] = "master-key"
     os.environ["SCANNER_API_KEY"] = "scanner-key"

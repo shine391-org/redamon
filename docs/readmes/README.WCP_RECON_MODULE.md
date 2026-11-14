@@ -242,11 +242,13 @@ flowchart TD
     U["target_urls"] --> TF["write targets.txt<br/>/tmp/redamon/.cache_scan/run_id/"]
     TF --> CMD["build_wcvs_command<br/>docker run --net=host redamon-wcvs"]
     CMD --> SKIP["safety_skip_tests<br/>-st dos / deception / css"]
-    CMD --> RUN["subprocess.run · timeout"]
+    CMD --> RUN["run_tool_container · timeout<br/>container wcvs-run_id-8hex"]
     RUN --> RPT["WCVS_date_rand_Report.json<br/>written incrementally per URL"]
     RPT --> PARSE["parse_wcvs_report"]
     PARSE --> CAND["candidates[]<br/>url · technique · vector_name · …"]
-    RUN -.->|"timeout / no report / bad JSON"| EMPTY["return [] · non-fatal"]
+    RUN -.->|"timeout"| KILL["container killed by name<br/>partial report parsed"]
+    KILL --> PARSE
+    RUN -.->|"no report / bad JSON"| EMPTY["return [] · non-fatal"]
 
     classDef g fill:#e8e8e8,stroke:#555,color:#000
     classDef d fill:#bdbdbd,stroke:#444,color:#000
@@ -264,12 +266,22 @@ docker run --rm --net=host \
   -u file:/targets/targets.txt \   # batch input: one URL per line
   -gr -gp /output/ \               # generate JSON report into /output
   -v 1 -t <concurrency> \          # verbosity, threads
-  [-rr <rps>] [-ch <header>] \     # optional rate cap, custom cache header
+  [-rr <rps>] [-ch <header>] \     # optional rate cap (one for the whole process), custom cache header
   -stime \                         # skip time-based cache detection (FP-prone)
   [-st dos,deception,css]          # SAFETY skips (see below)
 ```
 
 - `--net=host` so loopback/lab targets are reachable from the sibling container.
+- `-rr` is one `golang.org/x/time/rate` limiter (burst 1) shared by every thread and
+  URL, not a per-host rate. Under an RoE rate ceiling C (`ROE_GLOBAL_MAX_RPS`)
+  `run_wcvs` sets `-t 1` and `-rr` to `wcvs_ceiling_rate(C)` (C − 1 for C ≥ 2,
+  1 / (2 + 1/C) below 2, rounded down to a thousandth), or to
+  `WEB_CACHE_POISON_MAX_RPS_PER_HOST` when that is lower. On a cache that answers
+  with an `Age` header WCVS's cache-buster checks take a token, sleep 2 s and
+  only then send, so the delayed request leaves together with the next token's;
+  the rate leaves room for that pair. The run logs
+  `[*][CachePoison] WCVS paced to the 2 rps RoE ceiling: one thread, -rr 1`. With
+  no ceiling the command is unchanged.
 - `get_host_path()` translates `/tmp/redamon` container paths to host paths for the
   bind mounts.
 - Targets and report live under `/tmp/redamon/.cache_scan/<run_id>/`; the directory is
@@ -304,7 +316,11 @@ flowchart TD
 
 WCVS writes the report **incrementally** after every scanned URL (the package-global
 `report` is re-serialized per website). So the file always exists and contains all
-completed websites - on a timeout we parse the partial report gracefully. Only
+completed websites - on a timeout we parse the partial report gracefully.
+WCVS runs through `docker_helpers.run_tool_container` (tool `wcvs`), which names
+the container `wcvs-<run id>-<8 hex>` and, on a timeout, kills it by that name
+before the partial report is read: a timeout of `subprocess.run` alone stops
+only the docker CLI, and the daemon-owned container would scan on. Only
 `isVulnerable` websites and results are kept; each `check` becomes one candidate. Any
 error returns `[]` (non-fatal; native hypotheses still run).
 
@@ -517,6 +533,18 @@ subgraph). Node id is deterministic and tenant-scoped so re-scans dedupe via MER
 cache_{user_id}_{project_id}_{technique}_{baseurl}_{path}_{vector}   (sanitised)
 ```
 
+The formula is `cache_vuln_id` in `cache_mixin.py`, and every input must be the same
+on every run. A per-run token (a cache buster, the deception plant's marker) stays in
+the evidence. A native deception finding (`deception.py`) is therefore keyed on the
+**page** it leaked (`/account`, without a trailing slash) and on the URL shape that
+leaked it as its vector: `cache_param` is `static-suffix:/.css` or `static-suffix:;.js`
+(`deception_vector`). The plant URL with its random marker
+(`/account/rdmn1a2b3c.css`) is the reproduction in `poc_link` / `curl_verify`, and
+the finding hangs off the page's Endpoint. Findings written before this keying hold
+a plant URL in their id; `tooling/scripts/cache_deception_rekey.py --all` (a dry
+run; `--apply` with the agent, webapp and orchestrator stopped) moves them to the
+stable id with their mute, Priority Board layers and Postgres references.
+
 Persisted properties: `source`, `vulnerability_type="web_cache_poisoning"`, `name`,
 `description`, `severity`, `cvss_score`, `confidence`, `confidence_tier`,
 `cache_header`, `cache_param`, `cache_vector_type`, `cache_impact`, `cache_technique`,
@@ -633,7 +661,7 @@ Naming convention: `web_cache_poison_*` (DB column) → `webCachePoison*`
 | `…_TIMEOUT_PER_REQ` | `10` | native confirmation per-request timeout (s) |
 | `…_CONCURRENCY` | `10` | WCVS threads (breadth sweep) |
 | `…_CONFIRM_WORKERS` | `6` | native confirmation parallel workers - URLs tested concurrently (1 = sequential, max 16); bounds in-flight requests (speed + stealth) |
-| `…_MAX_RPS_PER_HOST` | `0` | rate cap (0 = unlimited) |
+| `…_MAX_RPS_PER_HOST` | `0` | WCVS `-rr`: one rate for the whole WCVS process, all threads and URLs, despite the name (0 = unlimited); under an RoE ceiling WCVS runs at the lower of this and `wcvs_ceiling_rate(C)` |
 | `…_MIN_CONFIDENCE` | `0.8` | finding gate (keeps Confirmed + Strong) |
 | `…_ALLOW_FRAMEWORK_PACKS` | `true` | Next.js/Nuxt/Remix hypothesis packs |
 | `…_ALLOW_DECEPTION` | `true` | web-cache-deception techniques |

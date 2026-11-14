@@ -13,6 +13,7 @@ import { RunnerStatusBanner } from '@/components/plugins/RunnerStatusBanner'
 import { UninstallDialog } from '@/components/plugins/UninstallDialog'
 import { PluginApiError, usePluginAction, usePluginsPage } from '@/hooks/usePlugins'
 import { errorMessage } from '@/lib/apiError'
+import { ForbiddenNotice, forbiddenPermission } from '@/components/auth/ForbiddenNotice'
 import type { PluginEntry } from '@/lib/plugins/pageModel'
 import styles from './page.module.css'
 
@@ -108,6 +109,14 @@ export function PluginsPageClient() {
       </div>
     )
   }
+  const refusedFor = forbiddenPermission(error)
+  if (refusedFor) {
+    return (
+      <div className={styles.page}>
+        <ForbiddenNotice permission={refusedFor} />
+      </div>
+    )
+  }
   if (isError || !data) {
     return (
       <div className={styles.page}>
@@ -143,7 +152,7 @@ export function PluginsPageClient() {
           </p>
           <div className={styles.platform}>RedAmon plugin platform {data.platformVersion}</div>
         </div>
-        {data.isAdmin && (
+        {data.managesPlugins && (
           <button type="button" className="secondaryButton" onClick={() => setDialog({ kind: 'offline' })} disabled={busy}>
             <Upload size={14} /> Install from file
           </button>
@@ -169,7 +178,7 @@ export function PluginsPageClient() {
       ) : (
         <div className={styles.grid}>
           {data.plugins.map((p) => (
-            <PluginCard key={p.id} entry={p} isAdmin={data.isAdmin} busy={busy} onAction={onAction} />
+            <PluginCard key={p.id} entry={p} manages={data.managesPlugins} busy={busy} onAction={onAction} />
           ))}
         </div>
       )}

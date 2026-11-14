@@ -110,7 +110,7 @@ def test_actual_two_pass_parse_merge_artifact_graph_and_prune(monkeypatch, tmp_p
     generated = []
     for name in ("is_docker_installed", "is_docker_running", "pull_nuclei_docker_image", "ensure_templates_volume"):
         monkeypatch.setattr(vs, name, lambda *args: True)
-    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["a.example.test", "b.example.test"], {}))
+    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd, settings=None: ([], ["a.example.test", "b.example.test"], {}))
     monkeypatch.setattr(proxy_routing, "get_capture_routing", lambda tool: (None, None))
 
     def fake_popen(cmd, **kwargs):

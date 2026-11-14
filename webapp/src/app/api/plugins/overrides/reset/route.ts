@@ -3,17 +3,19 @@ import { readJsonBody } from '@/lib/jsonBody'
 import { getEffectiveUser, getSession } from '@/lib/session'
 import { auditPlugin } from '@/lib/plugins/audit'
 import { isBuiltinSkill } from '@/lib/plugins/builtinSkills'
-import { bodyOwnerMatches, ownsScope } from '@/lib/plugins/changeSetAccess'
+import { bodyOwnerMatches, scopeRefusal, scopeRefusalResponse, userScopeWriteRefusal } from '@/lib/plugins/changeSetAccess'
 import { internalErrorResponse, pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
+import { requirePermission } from '@/lib/authz/guards'
 
 /**
  * POST /api/plugins/overrides/reset: the scope's active version of a skill becomes `cleared`,
  * so factory text (or, for a project, the owner's user-scope version) runs again (design §6;
  * TD-18, OQ-23). Core UI, so it works whatever state the plugin is in — disabled, uninstalled
  * with data kept — because it never touches the plugin. Only the scope owner, or an admin
- * acting as them; a user-scope reset carries the scope owner id (X9).
+ * acting as them, or on a project a co-owner with Manage (step 5.10); a user-scope reset carries
+ * the scope owner id (X9) and follows the account write rule (HD-23).
  */
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -22,6 +24,8 @@ const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 
 export const POST = pluginRoute('override reset', 'The skill could not be reset; see the webapp log.', async (request: NextRequest) => {
   if (!sameOrigin(request)) return crossOriginResponse(request)
+  const auth = await requirePermission(request, 'plugins:approve_overrides')
+  if (auth instanceof NextResponse) return auth
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await getEffectiveUser()
@@ -45,9 +49,13 @@ export const POST = pluginRoute('override reset', 'The skill could not be reset;
     return NextResponse.json({ error: 'scopeType is user or project.', code: 'bad_request' }, { status: 400 })
   }
 
-  if (!(await ownsScope(scope, eff.userId)) || !bodyOwnerMatches(scope, eff.userId, isObj(body) ? body.scopeOwnerId : undefined)) {
+  if (!bodyOwnerMatches(scope, eff.userId, isObj(body) ? body.scopeOwnerId : undefined)) {
     return NextResponse.json({ error: 'Not found', code: 'not_found' }, { status: 404 })
   }
+  const refused = await scopeRefusal(scope, eff.userId, { actingAs: !!auth.actingAs })
+  if (refused) return scopeRefusalResponse(refused, 'plugins:approve_overrides')
+  const notAccountWriter = await userScopeWriteRefusal(scope)
+  if (notAccountWriter) return notAccountWriter
 
   const session = await getSession()
   const actor = session?.userId ?? eff.userId

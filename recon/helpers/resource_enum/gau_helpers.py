@@ -8,7 +8,7 @@ import json
 import os
 import platform
 import shutil
-import subprocess
+import subprocess  # noqa: F401 - the tool tests fake docker through gau_helpers.subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, parse_qs
 
-from recon.helpers.docker_helpers import pull_image_or_use_local
+from recon.helpers.docker_helpers import pull_image_or_use_local, run_tool_container
 from .classification import classify_parameter, classify_endpoint, infer_parameter_type
 
 
@@ -198,15 +198,14 @@ def _run_gau_docker(
     from recon.helpers.resource_enum import tool_health
     started = time.time()
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout * len(providers) + 120
-        )
+        result = run_tool_container(cmd, tool="gau", timeout=timeout * len(providers) + 120)
 
-        if result.stdout:
-            for line in result.stdout.strip().split('\n'):
+        stdout = result.stdout
+        if result.timed_out and not stdout.endswith("\n"):
+            # The kill can cut the last URL mid-way: only whole lines were printed.
+            stdout = stdout.rpartition("\n")[0]
+        if stdout:
+            for line in stdout.strip().split('\n'):
                 url = line.strip()
                 if url and filter_gau_url(url, blacklist_extensions):
                     discovered_urls.add(url)
@@ -214,16 +213,18 @@ def _run_gau_docker(
                     if max_urls > 0 and len(discovered_urls) >= max_urls:
                         break
 
-        if result.stderr and verbose:
-            print(f"[*][GAU] GAU stderr: {result.stderr[:200]}")
-        if not result.stdout.strip():
-            tool_health.check_empty("gau", seeds=1, return_code=result.returncode,
-                                    stderr=result.stderr, elapsed_s=time.time() - started)
+        if result.timed_out:
+            print(f"[!][GAU] Timeout for {domain}: stopped it, keeping the "
+                  f"{len(discovered_urls)} URL(s) it printed")
+            tool_health.report_empty("gau", tool_health.FAILURE, return_code=None, seeds=1,
+                                     elapsed_s=time.time() - started)
+        else:
+            if result.stderr and verbose:
+                print(f"[*][GAU] GAU stderr: {result.stderr[:200]}")
+            if not result.stdout.strip():
+                tool_health.check_empty("gau", seeds=1, return_code=result.returncode,
+                                        stderr=result.stderr, elapsed_s=time.time() - started)
 
-    except subprocess.TimeoutExpired:
-        print(f"[!][GAU] Timeout for {domain}")
-        tool_health.report_empty("gau", tool_health.FAILURE, return_code=None, seeds=1,
-                                 elapsed_s=time.time() - started)
     except Exception as e:
         print(f"[!][GAU] Error for {domain}: {e}")
         tool_health.report_empty("gau", tool_health.FAILURE, return_code=None, seeds=1,
@@ -243,7 +244,8 @@ def run_gau_discovery(
     year_range: Optional[List[str]] = None,
     verbose: bool = False,
     urlscan_api_key: str = "",
-    workers: int = 10
+    workers: int = 10,
+    quarantined_out: Optional[list] = None,
 ) -> Tuple[List[str], Dict[str, List[str]]]:
     """
     Run GAU passive URL discovery for multiple domains.
@@ -302,23 +304,27 @@ def run_gau_discovery(
 
     urls_list = sorted(list(all_discovered_urls))
     print(f"[+][GAU] Discovered {len(urls_list)} total URLs")
-    return quarantine_archive_urls(urls_list, urls_by_domain, "GAU")
+    return quarantine_archive_urls(urls_list, urls_by_domain, "GAU", collect=quarantined_out)
 
 
 def quarantine_archive_urls(urls_list: List[str], urls_by_domain: Dict[str, List[str]],
-                            label: str) -> Tuple[List[str], Dict[str, List[str]]]:
+                            label: str, collect: Optional[list] = None
+                            ) -> Tuple[List[str], Dict[str, List[str]]]:
     """Drop the archive URLs that must never be requested (a leaked reset or
     invite link, a secret, a state-changing link with a value, a web-shell
     trace) before verification, method detection or a merge sees them. The
     archives (Wayback, OTX, urlscan through GAU's own provider) hold the same
-    links urlscan does."""
+    links urlscan does. `collect` receives each held URL as (archive, url), for
+    the archive-leak findings (recon/helpers/archive_leaks.py)."""
     from recon.helpers.url_leaks import split_quarantined
     kept, quarantined = split_quarantined(urls_list)
     if not quarantined:
         return urls_list, urls_by_domain
     dropped = set(quarantined)
+    if collect is not None:
+        collect.extend((label.lower(), u) for u in quarantined)
     print(f"[*][{label}] Quarantined {len(dropped)} URL(s) carrying tokens or one-time links: "
-          f"never requested or stored")
+          f"never requested; reported as archive leaks")
     return kept, {d: [u for u in urls if u not in dropped] for d, urls in urls_by_domain.items()}
 
 
@@ -423,9 +429,9 @@ def verify_gau_urls(
         # A URL counts as verified only when httpx says so: on a timeout the
         # lines httpx already wrote are kept, and nothing else is.
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            print("[!][GAU] URL verification timeout: keeping only the URLs verified so far")
+            if run_tool_container(cmd, tool="gau-verify", timeout=300).timed_out:
+                print("[!][GAU] URL verification timeout: stopped httpx, keeping only the "
+                      "URLs verified so far")
         except Exception as e:
             print(f"[!][GAU] URL verification error: {e}")
             return set()
@@ -510,13 +516,13 @@ def detect_gau_methods(
         ]
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            print("[!][GAU] Method detection timeout")
-            return {url: ["GET"] for url in urls}
+            options_cut = run_tool_container(cmd, tool="gau-methods", timeout=300).timed_out
         except Exception as e:
             print(f"[!][GAU] Method detection error: {e}")
             return {url: ["GET"] for url in urls}
+        if options_cut:
+            print("[!][GAU] Method detection timeout: stopped httpx, keeping the methods "
+                  "read so far and GET for the rest")
 
         options_responded = set()
 
@@ -559,7 +565,11 @@ def detect_gau_methods(
         # GET fallback for URLs that didn't respond to OPTIONS
         urls_needing_get_check = [url for url in urls if url not in options_responded]
 
-        if urls_needing_get_check and filter_dead:
+        if options_cut:
+            # The probe budget is spent: what it did not reach is kept, unchecked.
+            for url in urls_needing_get_check:
+                url_methods[url] = ["GET"]
+        elif urls_needing_get_check and filter_dead:
             print(f"[*][GAU] Checking {len(urls_needing_get_check)} endpoints with GET fallback...")
 
             get_urls_file = temp_dir / "get_urls.txt"
@@ -586,7 +596,7 @@ def detect_gau_methods(
             ]
 
             try:
-                subprocess.run(get_cmd, capture_output=True, text=True, timeout=300)
+                get_cut = run_tool_container(get_cmd, tool="gau-methods", timeout=300).timed_out
 
                 if get_output_file.exists():
                     with open(get_output_file, 'r') as f:
@@ -600,6 +610,11 @@ def detect_gau_methods(
                                     url_methods[url] = ["GET"]
                             except json.JSONDecodeError:
                                 continue
+                if get_cut:
+                    print("[!][GAU] GET fallback timeout: stopped httpx, keeping the "
+                          "endpoints it did not reach")
+                    for url in urls_needing_get_check:
+                        url_methods.setdefault(url, ["GET"])
             except Exception as e:
                 print(f"[!][GAU] GET fallback error: {e}")
                 for url in urls_needing_get_check:

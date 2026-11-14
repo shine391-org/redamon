@@ -59,11 +59,21 @@ _FINDING_LABEL_PREDICATE = " OR ".join(f"n:`{label}`" for label in FINDING_LABEL
 #: `ip_address`. ai_surface_recon stores none, so its skips are source-level.
 #: GVM's Vulnerability and ExploitGvm use `target_ip`/`target_hostname`, which
 #: no other finding label carries, so they change no other source's prune.
+#: `domain` is the org of a security_check DNS finding (SPF, DMARC, DNSSEC,
+#: zone transfer), its only host field; no other finding stores it.
 _KEEP_HOST_FIELDS = (
     "host", "hostname", "ip", "ip_address", "matched_ip",
     "url", "matched_at", "base_url", "source_url", "endpoint", "probe_url",
-    "target_ip", "target_hostname",
+    "target_ip", "target_hostname", "domain",
 )
+
+#: Host fields holding a list, each element naming a host the finding is
+#: about: a dependency-confusion finding's `source_urls` names every JS file
+#: that imports its package, on up to five hosts, while `source_url` and
+#: `base_url` name the first one only. A listed host counts as a scalar
+#: field's does: cut, it keeps the finding; re-checked, it lets the prune
+#: reach it.
+_KEEP_HOST_LIST_FIELDS = ("source_urls",)
 
 #: What a hostname in `keep_hosts` must look like before it is regex-escaped:
 #: a DNS name, or an IPv6 literal without brackets. Underscores are allowed
@@ -75,6 +85,69 @@ _KEEP_HOST_CHARS = re.compile(r"^[a-z0-9._\-]+$|^[0-9a-f:]+$")
 #: patterns rather than one enormous alternation.
 _KEEP_HOSTS_PER_PATTERN = 100
 
+#: `n.updated_at` as a DateTime when it is stored as an ISO string, else null.
+#: A project export and a scan-version snapshot flatten DateTimes to strings,
+#: and a restore before R-38 wrote them back as such; against a DateTime a
+#: string compares as null, so those findings were never pruned nor revived.
+#: Shape-checked first because one value datetime() cannot parse would fail
+#: the whole prune; an unreadable one keeps its finding instead.
+_ISO_DATETIME = (
+    "[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]"
+    "(:[0-5][0-9]([.][0-9]{1,9})?)?(Z|[+-][0-9]{2}(:?[0-9]{2})?)?")
+_RESTORED_UPDATED_AT = (
+    f"CASE WHEN n.updated_at IS :: STRING AND n.updated_at =~ '{_ISO_DATETIME}' "
+    "THEN datetime(n.updated_at) END")
+
+
+def _list_field_values(field: str) -> str:
+    """Cypher for the elements of a list host field, lower-cased (null for one
+    toStringOrNull cannot read). A scalar left in the field is read as a
+    one-element list: iterating it would fail the statement, and with it the
+    whole prune."""
+    return (f"CASE WHEN n.{field} IS :: LIST<ANY> NOT NULL "
+            f"THEN [x IN n.{field} | toLower(toStringOrNull(x))] "
+            f"ELSE [toLower(toStringOrNull(n.{field}))] END")
+
+
+#: Every host value of the finding, scalars and list elements, as one list.
+_HOST_FIELD_VALUES = (
+    "[" + ", ".join(f"toLower(toStringOrNull(n.{f}))" for f in _KEEP_HOST_FIELDS) + "]"
+    + "".join(f" + {_list_field_values(f)}" for f in _KEEP_HOST_LIST_FIELDS))
+
+#: Whether a host field names a host the keep pattern `rx` matches. A null
+#: value reads as '', since one null would make the whole test null and so
+#: keep every finding.
+_KEEP_HOST_CHECKS = " OR ".join(
+    [f"coalesce(toLower(toStringOrNull(n.{f})), '') =~ rx" for f in _KEEP_HOST_FIELDS]
+    + [f"any(v IN {_list_field_values(f)} WHERE coalesce(v, '') =~ rx)"
+       for f in _KEEP_HOST_LIST_FIELDS])
+
+#: Positive coverage (D1): only findings about a host the source re-checked.
+#: Each host field, and each element of a list one, is read the way
+#: keep_host_patterns reads one (a bare host, host:port, [v6]:port, or a URL
+#: whose authority is the host, userinfo only after a scheme) and its
+#: hostname is looked up in $only_hosts. An exact
+#: lookup, not the keep regexes: the checked set is the whole scanned surface,
+#: and a regex per hundred hosts per field per candidate measured 10.8 s for
+#: 2,000 stale findings over 3,000 hosts, against 0.5 s for the lookup. A
+#: value it cannot read names no host, so its finding is kept.
+_ONLY_HOSTS_CLAUSE = f"""
+        WITH n, [v IN {_HOST_FIELD_VALUES} WHERE v IS NOT NULL |
+                 CASE WHEN v =~ '[a-z][a-z0-9+.-]*://.*'
+                      THEN {{scheme: true, rest: substring(v, size(split(v, '://')[0]) + 3)}}
+                      ELSE {{scheme: false, rest: v}} END] AS parsed
+        WITH n, [p IN parsed | {{scheme: p.scheme,
+                 authority: split(split(split(p.rest, '/')[0], '?')[0], '#')[0]}}] AS authorities
+        WITH n, [a IN authorities |
+                 CASE WHEN NOT a.authority CONTAINS '@' THEN a.authority
+                      WHEN a.scheme AND size(split(a.authority, '@')) = 2
+                           THEN split(a.authority, '@')[1] END] AS hostports
+        WHERE any(hp IN hostports WHERE hp IS NOT NULL AND
+                  CASE WHEN hp STARTS WITH '[' THEN substring(split(hp, ']')[0], 1)
+                       WHEN size(split(hp, ':')) = 2 AND split(hp, ':')[1] =~ '[0-9]+'
+                            THEN split(hp, ':')[0]
+                       ELSE hp END IN $only_hosts)"""
+
 
 def _keep_host_name(host) -> str:
     """A keep_hosts entry as findings store it: lowercased, and without the
@@ -83,6 +156,12 @@ def _keep_host_name(host) -> str:
         return ""
     name = str(host).strip().lower()
     return name[:-1] if name.endswith(".") else name
+
+
+def _host_names(hosts) -> list:
+    """The entries of `keep_hosts` / `only_hosts` that are hostnames, as findings store them."""
+    return sorted({n for n in (_keep_host_name(h) for h in hosts or ())
+                   if _KEEP_HOST_CHARS.match(n)})
 
 
 def keep_host_patterns(keep_hosts) -> list:
@@ -94,8 +173,7 @@ def keep_host_patterns(keep_hosts) -> list:
     set and `re.escape`d, and the patterns travel as query parameters - never
     concatenated into the Cypher text.
     """
-    names = sorted({n for n in (_keep_host_name(h) for h in keep_hosts or ())
-                    if _KEEP_HOST_CHARS.match(n)})
+    names = _host_names(keep_hosts)
     patterns = []
     for i in range(0, len(names), _KEEP_HOSTS_PER_PATTERN):
         alternation = "|".join(re.escape(n) for n in names[i:i + _KEEP_HOSTS_PER_PATTERN])
@@ -225,7 +303,8 @@ class BaseMixin:
         return stats
 
     def prune_unseen_findings(self, user_id: str, project_id: str,
-                              sources, run_started_at: str, keep_hosts=(),
+                              sources, run_started_at: str, keep_hosts=(), *,
+                              only_hosts=None, types=None, exclude_types=None,
                               keep_unproven=False) -> dict:
         """Ingest-then-prune: remove a source's findings it stopped reporting.
 
@@ -257,10 +336,26 @@ class BaseMixin:
            cannot tell.
 
         `keep_hosts` are hostnames a degraded run skipped as unreachable: every
-        finding about one of them is left exactly as it is (neither deleted
-        nor stamped stale), since the run never re-checked it. Per host rather
+        finding about one of them (named by any host field, or by any element
+        of a list one) is left exactly as it is (neither deleted nor stamped
+        stale), since the run never re-checked it. Per host rather
         than per source, so one permanently dead host cannot keep a whole
         source unpruned for ever. With it empty the query is unchanged.
+
+        `only_hosts` is the positive-coverage rule (design decision D1): when
+        given, only findings about one of these hostnames (the hosts the
+        sources re-checked this run, `CoverageReport.checked_hostnames`) are
+        deleted or stamped stale, and every other finding of the sources is
+        left as it is. Empty, nothing is pruned; the revive still runs.
+        `keep_hosts` still wins over it, finding by finding. `types` narrows
+        the prune to findings whose `type` is one of these, for a source that
+        records coverage per check type (`security_check`). With both None the
+        query is the older, source-level one.
+
+        `exclude_types` leaves findings of these types out: the source-level
+        rule for the types such a source did not record, so a check that has
+        not adopted D1, or is switched off, prunes exactly as before while the
+        recorded types prune on their own hosts. None changes nothing.
         """
         sources = [s for s in (sources or []) if s]
         if not sources or not run_started_at:
@@ -269,9 +364,15 @@ class BaseMixin:
         keep_patterns = keep_host_patterns(keep_hosts)
         keep_clause = ""
         if keep_patterns:
-            checks = " OR ".join(
-                f"coalesce(toLower(toStringOrNull(n.{f})), '') =~ rx" for f in _KEEP_HOST_FIELDS)
-            keep_clause = f"\n          AND NOT any(rx IN $keep_patterns WHERE {checks})"
+            keep_clause = f"\n          AND NOT any(rx IN $keep_patterns WHERE {_KEEP_HOST_CHECKS})"
+        only = None if only_hosts is None else _host_names(only_hosts)
+        types = None if types is None else sorted({str(t) for t in types if t})
+        types_clause = "" if types is None else "\n          AND coalesce(n.type, '') IN $types"
+        excluded = None if exclude_types is None else sorted({str(t) for t in exclude_types if t})
+        if excluded:
+            types_clause += "\n          AND NOT coalesce(n.type, '') IN $exclude_types"
+        only_clause = "" if only is None else _ONLY_HOSTS_CLAUSE
+        prunes_something = only != [] and types != []
         unproven_clause = ""
         if keep_unproven:
             unproven_clause = """
@@ -281,13 +382,13 @@ class BaseMixin:
                    AND coalesce(n.endpoint, '') = '' AND coalesce(n.matched_ip, '') = ''
                    AND coalesce(n.ip_address, '') = '' AND coalesce(n.probe_url, '') = '')"""
 
-
         query = f"""
         MATCH (n)
         WHERE n.user_id = $uid AND n.project_id = $pid
           AND ({_FINDING_LABEL_PREDICATE})
           AND coalesce(n.source, '') IN $sources
-          AND (n.updated_at IS NULL OR n.updated_at < datetime($since)){keep_clause}{unproven_clause}
+          AND (n.updated_at IS NULL OR n.updated_at < datetime($since)
+               OR {_RESTORED_UPDATED_AT} < datetime($since)){keep_clause}{types_clause}{only_clause}{unproven_clause}
         // The write lock BEFORE `keep` reads n:Muted: a mute that committed
         // first is then kept, and one that starts later waits for the delete
         // and matches nothing. Without it a mute can land between the read
@@ -323,7 +424,8 @@ class BaseMixin:
           AND ({_FINDING_LABEL_PREDICATE})
           AND coalesce(n.source, '') IN $sources
           AND n.stale_since IS NOT NULL
-          AND n.updated_at >= datetime($since)
+          AND (n.updated_at >= datetime($since)
+               OR {_RESTORED_UPDATED_AT} >= datetime($since))
         REMOVE n.stale_since
         RETURN count(n) AS revived
         """
@@ -337,15 +439,22 @@ class BaseMixin:
                       "since": run_started_at}
             if keep_patterns:
                 params["keep_patterns"] = keep_patterns
-            record = session.run(query, **params).single()
+            if only is not None:
+                params["only_hosts"] = only
+            if types is not None:
+                params["types"] = types
+            if excluded:
+                params["exclude_types"] = excluded
+            record = session.run(query, **params).single() if prunes_something else None
 
         stats = {
             "pruned": int((record["pruned"] if record else 0) or 0),
             "stale": int((record["stale"] if record else 0) or 0),
             "revived": int((revived["revived"] if revived else 0) or 0),
         }
+        scope = "" if only is None else f" on {len(only)} re-checked host(s)"
         print(f"[*][graph-db] Pruned {stats['pruned']} findings no longer "
-              f"reported by {', '.join(sources)}; kept {stats['stale']} muted "
+              f"reported by {', '.join(sources)}{scope}; kept {stats['stale']} muted "
               f"or human-judged as stale; revived {stats['revived']}")
         return stats
 

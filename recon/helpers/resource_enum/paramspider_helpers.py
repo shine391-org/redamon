@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -103,6 +103,7 @@ def run_paramspider_discovery(
     placeholder: str,
     timeout: int,
     workers: int = 5,
+    quarantined_out: Optional[list] = None,
 ) -> Tuple[List[str], Dict[str, List[str]]]:
     """
     Run ParamSpider passive parameter discovery for multiple domains.
@@ -156,7 +157,8 @@ def run_paramspider_discovery(
         print(f"[+][ParamSpider] Discovered {len(urls_list)} total parameterized URLs")
 
         from recon.helpers.resource_enum.gau_helpers import quarantine_archive_urls
-        return quarantine_archive_urls(urls_list, urls_by_domain, "ParamSpider")
+        return quarantine_archive_urls(urls_list, urls_by_domain, "ParamSpider",
+                                       collect=quarantined_out)
 
     finally:
         # Clean up temp directory
@@ -165,6 +167,32 @@ def run_paramspider_discovery(
                 shutil.rmtree(tmp_dir)
             except Exception:
                 pass
+
+
+def paramspider_urls_in_scope(
+    paramspider_urls: List[str],
+    target_hosts: Set[str],
+    settings: Dict,
+) -> List[str]:
+    """The ParamSpider URLs whose host is one of the run's target hosts and is
+    not RoE-excluded.
+
+    `paramspider -d` returns every archived host under the domain: a sibling
+    the RoE excludes, a child of a listed host. Its URLs feed the graph and, in
+    the full pipeline, nuclei's targets and DAST list, so only a host the run
+    scans passes, as for GAU. The merge's own filter admits any subdomain of a
+    target host, so the full pipeline and partial recon both call this first.
+    """
+    from recon.helpers.roe_scope import _is_roe_excluded, _url_hostname
+
+    hosts = {str(h).lower() for h in target_hosts or () if h}
+    excluded = settings.get('ROE_EXCLUDED_HOSTS') if settings.get('ROE_ENABLED') else None
+    kept = []
+    for url in paramspider_urls:
+        host = _url_hostname(url)
+        if host in hosts and not (excluded and _is_roe_excluded(host, excluded)):
+            kept.append(url)
+    return kept
 
 
 def merge_paramspider_into_by_base_url(

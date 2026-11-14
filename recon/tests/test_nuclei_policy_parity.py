@@ -203,7 +203,7 @@ def captured(monkeypatch):
     monkeypatch.setattr(vs, "is_docker_running", lambda: True)
     monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
     monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
-    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["example.com"], {}))
+    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd, settings=None: ([], ["example.com"], {}))
     monkeypatch.setattr(vs, "build_target_urls", lambda h, i, rd, scan_all_ips=False,
                         admission_report=None, declared_report=None: ["https://example.com"])
     monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
@@ -293,7 +293,7 @@ class TestEmptySelectionGuardAtTheCaller:
         monkeypatch.setattr(vs, "is_docker_running", lambda: True)
         monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
         monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
-        monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["example.com"], {}))
+        monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd, settings=None: ([], ["example.com"], {}))
         monkeypatch.setattr(vs, "build_target_urls", lambda h, i, rd, scan_all_ips=False,
                         admission_report=None, declared_report=None: ["https://example.com"])
         monkeypatch.setattr(vs, "set_fp_ai_ctx", lambda **kw: None)
@@ -340,7 +340,7 @@ class TestEmptySelectionRefusalAtBothCallSites:
         monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
         monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
         monkeypatch.setattr(vs, "extract_targets_from_recon",
-                            lambda rd: ([], ["example.com"], {}))
+                            lambda rd, settings=None: ([], ["example.com"], {}))
         monkeypatch.setattr(vs, "build_target_urls",
                             lambda h, i, rd, scan_all_ips=False,
                             admission_report=None, declared_report=None: ["https://example.com"])

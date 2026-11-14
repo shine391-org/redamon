@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
 import { internalError } from '@/lib/routeErrors'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { assertGraphNotActivating } from '@/lib/activationLock'
 import { defaultRecordingScope, publicRecordingSession, RECORDING_TTL_MS } from '@/lib/recordingSession'
 import { isCaptureGloballyEnabled } from '@/lib/captureStatus'
@@ -10,17 +10,15 @@ interface RouteParams {
   params: Promise<{ id: string }>
 }
 
-// POST /api/projects/[id]/recording/start — owner-only. Begins an operator login
+// POST /api/projects/[id]/recording/start — auth_profile:manage (the owner, or a co-owner with Manage). Begins an operator login
 // recording: gated on global proxy enabled AND per-project captureProxyEnabled,
 // single-active across all projects (G10), max-TTL bounded (G2), and refused mid
 // graph-activation (G11).
-export async function POST(_request: NextRequest, { params }: RouteParams) {
+export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'auth_profile:manage', { projectId: id })
+    if (auth instanceof NextResponse) return auth
 
     // G11: never begin a recording while the live graph is being swapped. Fail
     // closed — a lock-check error refuses rather than proceeds.

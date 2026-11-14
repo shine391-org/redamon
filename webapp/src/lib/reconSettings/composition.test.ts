@@ -156,6 +156,9 @@ describe('T45 each disposition behaves the way it is documented', () => {
     expect(problems).toEqual([])
     expect(fieldsWhere(s => s.rescope === true).map(f => f.key).sort()).toEqual([
       'domainBatchHosts', 'githubTargetOrg', 'githubTargetRepos', 'gvmScanTargets',
+      // Hostnames on target IPs: the policy and its caps move with the scope (D-04, D-05).
+      'ipHostnameExclude', 'ipHostnameInclude', 'ipHostnameMaxScanned', 'ipHostnameMode',
+      'ipHostnamePassiveExpand', 'ipHostnamePassiveMaxNames', 'ipHostnameScanAllConfirmed',
       'supplyChainOrgName', 'supplyChainRepoRef', 'supplyChainRepoScope', 'supplyChainRepoUrl',
     ])
   })
@@ -240,7 +243,8 @@ describe('the surface is the size it claims to be', () => {
     // parameters at all: the client, the contacts, the dates and the document
     // with its text and parse. Everything a scan is configured by is still open.
     // OpenAPI source URLs may carry credentials and remain project-specific.
-    expect(fieldsWhere(f => f.mcp === 'never' && f.group !== 'engagement_record').length)
+    // Retired columns configure nothing, so closing them closes no parameter.
+    expect(fieldsWhere(f => f.mcp === 'never' && f.group !== 'engagement_record' && f.group !== 'retired').length)
       .toBeLessThan(26)
   })
 

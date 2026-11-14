@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireProjectOwner, realActorUserId } from '@/lib/triageClient'
+import { requirePermission } from '@/lib/authz/guards'
+import { triageCaller, triagePerson } from '@/lib/triage/routeCaller'
+import { realActorUserId } from '@/lib/triageClient'
 import { readJsonBody } from '@/lib/jsonBody'
 import { writeAudit } from '@/lib/audit'
 import { FINDING_ID_RE, recordVerdict, VERDICT_STATUSES, type VerdictStatus } from '@/lib/triage/actions'
@@ -25,8 +27,9 @@ export async function POST(request: NextRequest) {
     projectId?: string; nodeId?: unknown; status?: string; reason?: unknown; label?: unknown
   }
 
-  const caller = await requireProjectOwner(projectId)
-  if (caller instanceof NextResponse) return caller
+  const auth = await requirePermission(request, 'triage:verdict', { projectId })
+  if (auth instanceof NextResponse) return auth
+  const caller = triageCaller(auth)
   const ref = parseFindingRef(nodeId, label)
   if (ref instanceof NextResponse) {
     // This route names the id `nodeId`; a bad label keeps its own message.
@@ -42,6 +45,10 @@ export async function POST(request: NextRequest) {
     )
   }
 
+  // The person the decision is attributed to; the owner stays the tenant. A collaborator's verdict
+  // names them (`triage_verdict_by`), so it never trains the owner's detectors, which learn from the
+  // owner's own decisions only. The owner's request is the one sent before step 5.2.
+  const person = triagePerson(auth)
   try {
     const result = await recordVerdict(caller, {
       findingId: ref.findingId,
@@ -49,9 +56,10 @@ export async function POST(request: NextRequest) {
       status: status as VerdictStatus,
       reason: typeof reason === 'string' ? reason.slice(0, 500) : '',
       channel: 'app',
+      ...(person !== caller.userId ? { verdictBy: person } : {}),
     })
     void writeAudit({
-      actorId: caller.userId,
+      actorId: person,
       action: 'triage.verdict',
       targetType: 'finding',
       targetId: ref.findingId,

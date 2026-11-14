@@ -56,6 +56,7 @@ vi.mock('@/lib/prisma', () => ({
     },
   },
 }))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/session', () => ({
   requireUserAccess: async () => null,
   isInternalRequest: () => false,
@@ -66,7 +67,7 @@ vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: vi.fn() }))
 
 import { PUT } from './route'
 
-const put = (body: unknown) => new NextRequest('http://x', { method: 'PUT', body: JSON.stringify(body) })
+const put = (body: unknown) => new NextRequest('http://x', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
 const params = (id: string) => ({ params: Promise.resolve({ id }) })
 
 beforeEach(() => {

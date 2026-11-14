@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { guardProject } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { reportCountable } from '@/lib/triage/reportable'
@@ -12,18 +12,19 @@ function toNum(val: unknown): number {
 
 export async function GET(request: NextRequest) {
   const projectId = request.nextUrl.searchParams.get('projectId')
-  const __denied = await guardProject(projectId || '')
-  if (__denied) return __denied
+  const auth = await requirePermission(request, 'graph:read', { projectId })
+  if (auth instanceof NextResponse) return auth
   if (!projectId) {
     return NextResponse.json({ error: 'projectId is required' }, { status: 400 })
   }
 
   const session = getGraphSession()
   try {
-    // Q1: Chain summary
+    // Q1: Chain summary. A chain id is the agent's session id: the tenant and the project keep
+    // another project's step written under the same id out of this chain's counts.
     const chainsResult = await session.run(
       `MATCH (ac:AttackChain {project_id: $pid})
-       OPTIONAL MATCH (step:ChainStep {chain_id: ac.chain_id})
+       OPTIONAL MATCH (step:ChainStep {chain_id: ac.chain_id, user_id: ac.user_id, project_id: $pid})
        WITH ac, collect(step) AS allSteps
        UNWIND CASE WHEN size(allSteps) = 0 THEN [null] ELSE allSteps END AS step
        OPTIONAL MATCH (step)-[:PRODUCED]->(f:ChainFinding)

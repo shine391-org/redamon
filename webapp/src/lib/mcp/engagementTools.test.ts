@@ -31,6 +31,9 @@ const h = vi.hoisted(() => ({
   busy: vi.fn(),
   audit: vi.fn(),
   fetch: vi.fn(),
+  // Hostnames on target IPs: the names the graph holds for preflight's last-run counts.
+  graphNames: [] as Record<string, unknown>[],
+  graphRuns: [] as Record<string, unknown>[],
 }))
 
 vi.mock('@/lib/prisma', () => {
@@ -56,6 +59,18 @@ vi.mock('@/lib/prisma', () => {
 })
 vi.mock('@/lib/graphWriters', () => ({ describeScanWriters: (...a: unknown[]) => h.busy(...a) }))
 vi.mock('@/lib/audit', () => ({ writeAudit: (...a: unknown[]) => h.audit(...a) }))
+vi.mock('@/app/api/graph/neo4j', () => ({
+  getGraphSession: () => ({
+    run: async (q: string, p: Record<string, unknown>) => {
+      h.graphRuns.push(p)
+      const rows = q.includes('UNION ALL')
+        ? h.graphNames
+        : [{ ipCount: 1, sharedEdge: [], attributionFailed: [], attributed: 1, legacyNames: 0, seenEdges: 1 }]
+      return { records: rows.map(r => ({ get: (k: string) => r[k] })) }
+    },
+    close: async () => {},
+  }),
+}))
 
 import { McpScopeError, __resetRateLimiter } from '@/lib/mcpAuth'
 import {
@@ -671,6 +686,28 @@ describe('preflight_scope_check reports RESOLVED values', () => {
     expect(ffuf.wasUnlimited).toBe(true)
   })
 
+  test.each([0, -1])(
+    'a rate written as %s is reported at the ceiling whatever its zero_means, as the scan runs it',
+    async written => {
+      // R-7: apply_roe_rate_cap raises every capped value at or below 0. A
+      // stored nucleiRateLimit of 0 (min 1, no zero_means) was reported as 0
+      // while the scan ran it at the ceiling.
+      h.findProject.mockResolvedValue(projectRow({
+        roeEnabled: true, roeGlobalMaxRps: 3, nucleiRateLimit: written,
+      }))
+      const r = await preflightScopeCheck(ctx(), 'p1')
+      const nuclei = r.resolvedRates.find(x => x.field === 'nucleiRateLimit')!
+      expect(nuclei).toMatchObject({ written, resolved: 3, capped: true, wasUnlimited: false })
+    },
+  )
+
+  test('with no ceiling, a zero rate without zero_means is reported as written', async () => {
+    h.findProject.mockResolvedValue(projectRow({ nucleiRateLimit: 0 }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    const nuclei = r.resolvedRates.find(x => x.field === 'nucleiRateLimit')!
+    expect(nuclei).toMatchObject({ written: 0, resolved: 0, capped: false, wasUnlimited: false })
+  })
+
   test('no rate ever resolves above the ceiling', async () => {
     h.findProject.mockResolvedValue(projectRow({
       roeEnabled: true, roeGlobalMaxRps: 3,
@@ -678,7 +715,10 @@ describe('preflight_scope_check reports RESOLVED values', () => {
     }))
     const r = await preflightScopeCheck(ctx(), 'p1')
     expect(r.ratesExceedingCeiling).toEqual([])
-    for (const rate of r.resolvedRates) expect(rate.resolved, rate.field).toBeLessThanOrEqual(3)
+    for (const rate of r.resolvedRates) {
+      expect(rate.resolved, rate.field).toBeLessThanOrEqual(3)
+      expect(rate.resolved, `${rate.field}: a 0 is no limit at all`).toBeGreaterThan(0)
+    }
   })
 
   test('an escaping wordlist path is reported as dropped', async () => {
@@ -992,6 +1032,129 @@ describe('MCP-06: preflight_scope_check reports the derived scope', () => {
     const r = await preflightScopeCheck(ctx(), 'p1')
     expect(r.scope.scopeGroups.map(g => [g.scanRoot, g.mode, g.exactHosts])).toEqual([['example.com', 'exact', ['www.example.com']]])
     expect(r.scope.domainBatchGroupShape).toEqual([])
+  })
+})
+
+// --- Hostnames on target IPs (design §9, 04_ui_spec §6) --------------------------------
+
+const IP_ARGS = { name: 'ip', engagementKind: 'internal' as const, targetIps: ['203.0.113.0/30'] }
+
+describe('create_project and the hostname policy of an IP project', () => {
+  test('a new IP project writes no mode, so the column default ip_only applies (D-02)', async () => {
+    await createProject(ctx(), IP_ARGS)
+    const data = h.createProject.mock.calls[0][0].data
+    expect(data.ipMode).toBe(true)
+    expect(data).not.toHaveProperty('ipHostnameMode')
+  })
+
+  test('the policy is set through settings and stored canonical', async () => {
+    await createProject(ctx(), { ...IP_ARGS, settings: {
+      ipHostnameMode: 'record_filter', ipHostnameInclude: ['*Example.com'], ipHostnameMaxScanned: 20,
+    } })
+    expect(h.createProject.mock.calls[0][0].data).toMatchObject({
+      ipHostnameMode: 'record_filter', ipHostnameInclude: ['*.example.com'], ipHostnameMaxScanned: 20,
+    })
+  })
+
+  test('scan_all without its confirmation is refused, and nothing is written', async () => {
+    await expect(createProject(ctx(), { ...IP_ARGS, settings: { ipHostnameMode: 'scan_all' } }))
+      .rejects.toMatchObject({ code: 'setting_rejected', message: expect.stringMatching(/ipHostnameScanAllConfirmed/) })
+    expect(h.createProject).not.toHaveBeenCalled()
+  })
+
+  test('scan_all with its confirmation is created', async () => {
+    await createProject(ctx(), { ...IP_ARGS, settings: { ipHostnameMode: 'scan_all', ipHostnameScanAllConfirmed: true } })
+    expect(h.createProject.mock.calls[0][0].data.ipHostnameScanAllConfirmed).toBe(true)
+  })
+
+  test('scan_all is refused on a third-party engagement, whatever the confirmation (D-03)', async () => {
+    await expect(createProject(ctx(), {
+      ...IP_ARGS, engagementKind: 'third_party', authorization: AUTH,
+      settings: { roeGlobalMaxRps: 3, ipHostnameMode: 'scan_all', ipHostnameScanAllConfirmed: true },
+    } as never)).rejects.toMatchObject({ code: 'setting_rejected', message: expect.stringMatching(/third_party/) })
+    expect(h.createProject).not.toHaveBeenCalled()
+  })
+
+  test('record_filter without an include entry is refused', async () => {
+    await expect(createProject(ctx(), { ...IP_ARGS, settings: { ipHostnameMode: 'record_filter' } }))
+      .rejects.toThrow(/ipHostnameInclude/)
+  })
+
+  test('a hard-blocked include entry is refused as target_blocked', async () => {
+    await expect(createProject(ctx(), { ...IP_ARGS, settings: {
+      ipHostnameMode: 'record_filter', ipHostnameInclude: ['*.example.com', '*.agency.gov.uk'],
+    } })).rejects.toMatchObject({ code: 'target_blocked' })
+    expect(h.createProject).not.toHaveBeenCalled()
+  })
+
+  test('an unknown mode is refused by the registry vocabulary', async () => {
+    await expect(createProject(ctx(), { ...IP_ARGS, settings: { ipHostnameMode: 'scan_more' } }))
+      .rejects.toMatchObject({ code: 'setting_rejected' })
+  })
+
+  test('a domain project carrying a hostname policy is refused', async () => {
+    await expect(createProject(ctx(), {
+      name: 'd', engagementKind: 'internal', targetDomain: 'example.com', settings: { ipHostnameMode: 'record_only' },
+    })).rejects.toThrow(/only to IP-mode projects/)
+  })
+})
+
+describe('preflight_scope_check shows an IP project\'s hostname policy', () => {
+  const ipRow = (over: Record<string, unknown> = {}) => projectRow({
+    targetDomain: '', ipMode: true, targetIps: ['203.0.113.0/30'],
+    ipHostnameMode: 'record_filter', ipHostnameInclude: ['*.example.com'], ipHostnameExclude: ['old.example.com'],
+    ipHostnamePassiveExpand: true, ipHostnameScanAllConfirmed: false,
+    ipHostnameMaxScanned: 100, ipHostnamePassiveMaxNames: 500,
+    tlsxRevPtrSni: false, shodanReverseDns: true, vhostSniUseGraphCandidates: true,
+    ...over,
+  })
+
+  test('the policy, with the last-run counts null until a run records hostnames', async () => {
+    h.findProject.mockResolvedValue(ipRow())
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.hostnamePolicy).toEqual({
+      ipHostnameMode: 'record_filter', include: ['*.example.com'], exclude: ['old.example.com'],
+      passiveExpand: true, scanAllConfirmed: false, maxScanned: 100, passiveMaxNames: 500,
+      recordedLastRun: null, wouldScanLastRun: null, problem: null,
+    })
+    expect(r.startable).toBe(true)
+    expect(r.notes.join(' ')).toMatch(/scope\.hostnamePolicy/)
+  })
+
+  test('the last-run counts: every name found, and how many the saved policy would scan', async () => {
+    h.graphNames = [
+      { name: 'app.example.com', kind: 'recorded', reason: 'record_only', org: 'example.com', ips: ['203.0.113.1'], sources: ['ptr'] },
+      { name: 'old.example.com', kind: 'recorded', reason: 'record_only', org: 'example.com', ips: ['203.0.113.1'], sources: ['ptr'] },
+      { name: 'blog.other.test', kind: 'recorded', reason: 'record_only', org: 'other.test', ips: ['203.0.113.2'], sources: ['otx_passive_dns'] },
+    ]
+    h.findProject.mockResolvedValue(ipRow())
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.hostnamePolicy).toMatchObject({ recordedLastRun: 3, wouldScanLastRun: 1 })
+    // The graph is read as the project's owner, for this project only.
+    expect(h.graphRuns.every(p => p.pid === 'p1' && typeof p.uid === 'string' && p.uid !== '')).toBe(true)
+    h.graphNames = []
+  })
+
+  test('an unconfirmed scan_all makes the project unstartable, with the reason', async () => {
+    h.findProject.mockResolvedValue(ipRow({ ipHostnameMode: 'scan_all' }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.hostnamePolicy?.problem).toMatch(/not confirmed/)
+    expect(r.startable).toBe(false)
+  })
+
+  test('the toggles the mode forces are reported as rewritten at scan start (D-20)', async () => {
+    h.findProject.mockResolvedValue(ipRow({ ipHostnameMode: 'ip_only' }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.rewrittenAtScanStart).toEqual(expect.arrayContaining([
+      { field: 'shodanReverseDns', written: true, willRun: false, why: 'forced by Hostnames on target IPs: ip_only' },
+      { field: 'vhostSniUseGraphCandidates', written: true, willRun: false, why: 'forced by Hostnames on target IPs: ip_only' },
+    ]))
+    expect(r.rewrittenAtScanStart.map(x => x.field)).not.toContain('tlsxRevPtrSni')
+  })
+
+  test('a domain project has none', async () => {
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.hostnamePolicy).toBeNull()
   })
 })
 

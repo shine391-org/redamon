@@ -59,6 +59,11 @@ try:
 except Exception as _cap_cfg_err:  # noqa: BLE001 — never block a scan on this
     print(f"[!][capture] routing not configured: {_cap_cfg_err}")
 
+# The RoE ceiling for the requests recon sends itself (security checks, OpenAPI
+# and the other in-process requesters), before any of them runs.
+from recon.helpers import request_pacer
+request_pacer.configure(_settings)
+
 # Extract commonly used settings as module-level variables for compatibility
 TARGET_DOMAIN = _settings['TARGET_DOMAIN']
 SUBDOMAIN_LIST = _settings['SUBDOMAIN_LIST']
@@ -524,6 +529,62 @@ def _eligible_batch_roots(groups: list) -> list:
     return roots
 
 
+def _root_refusal(group: dict) -> list:
+    """Why run_domain_group would refuse this group's root, as the lines it
+    prints; empty when the root may be scanned. The same checks in the same
+    order as there and in _eligible_batch_roots: RoE first (an excluded root
+    gets no TXT lookup), then the cached ownership answer. A check that raises
+    refuses."""
+    root = group.get('scanRoot') if isinstance(group, dict) else ''
+    if not root:
+        return ["[!][Pipeline] A scope group has no scan root"]
+    if _roe_refuses_root(root):
+        return [f"[RoE] BLOCKED: Root domain '{root}' is in ROE excluded hosts list."]
+    if not VERIFY_DOMAIN_OWNERSHIP:
+        return []
+    try:
+        ownership = _group_ownership(group)
+    except Exception as e:  # noqa: BLE001 - an unanswered check is a failed check
+        return [f"[!][Pipeline] Domain ownership verification failed for {root}: "
+                f"the check raised {type(e).__name__}"]
+    if ownership['verified']:
+        return []
+    lines = [f"[!][Pipeline] Domain ownership verification failed for {root}"]
+    if ownership.get('error'):
+        lines.append(f"[!][Pipeline] {ownership['error']}")
+    lines.append(f"[!][Pipeline] Add TXT {' OR '.join(ownership['record_names'])} → "
+                 f"\"{ownership['expected_value']}\"")
+    return lines
+
+
+def _refuse_before_clear(groups: list) -> bool:
+    """True when no scan root of this run may be scanned. Asked BEFORE the
+    one-time graph clear (R-5).
+
+    run_domain_group refuses a root the RoE excludes or whose ownership does
+    not verify, but it runs after the clear: a refused run deleted the
+    project's assets and rebuilt none. The ownership answers given here are
+    cached for the run, so the group's own check does not ask again. A batch
+    with one eligible root clears and runs; its refused groups still refuse
+    in the loop.
+    """
+    # A latch left open would refuse the TXT lookup as "resolver down" (12.10).
+    from recon.main_recon_modules.domain_recon import resolver_breaker
+    resolver_breaker.recheck()
+    refusals = []
+    for group in groups:
+        lines = _root_refusal(group)
+        if not lines:
+            return False
+        refusals.extend(lines)
+    print("\n[!][Pipeline] SCAN ABORTED: no scan root passed the Rules of Engagement "
+          "and ownership checks")
+    for line in refusals:
+        print(line)
+    print("[!][Pipeline] Nothing was cleared: the project's graph is left as it was")
+    return True
+
+
 def _stamp_project_roots(recon_data: dict) -> dict:
     """Carry the project's scope groups and roots (§4.10 output contract).
 
@@ -574,6 +635,84 @@ def _graph_reset():
     _graph_futures = []
 
 
+#: The background writers that write recon findings, each with the
+#: `_PHASE_FINDING_SOURCES` phase whose sources it writes. The findings a failed
+#: write did not MERGE keep last run's `updated_at`, so the prune would read
+#: them as gone: a writer that raises, reports an item error, finds Neo4j
+#: unreachable or is never queued notes those sources degraded instead, which
+#: wins over whatever the modules recorded as checked (R-20, D1).
+#: Left out on purpose: writers of assets only (domain discovery, IP recon,
+#: ports, httpx, tlsx, IP attribution, Uncover, external domains, urlscan
+#: discovery and enrichment, Censys, FOFA, OTX, VirusTotal, ZoomEye, wildcard
+#: zones) and supply chain, whose findings the recon prune never touches.
+_WRITER_SOURCES = {
+    'update_graph_from_vuln_scan': 'vuln_scan',
+    'update_graph_from_nmap': 'nmap',
+    'update_graph_from_resource_enum': 'resource_enum',
+    'update_graph_from_ai_surface_recon': 'ai_surface_recon',
+    'update_graph_from_js_recon': 'js_recon',
+    'update_graph_from_serialized_scan': 'serialized_scan',
+    'update_graph_from_graphql_scan': 'graphql_scan',
+    'update_graph_from_subdomain_takeover': 'subdomain_takeover',
+    'update_graph_from_vhost_sni': 'vhost_sni',
+    'update_graph_from_cache_scan': 'cache_scan',
+    'update_graph_from_origin_discovery': 'origin_discovery',
+    'update_graph_from_route_exposure': 'route_exposure',
+    'update_graph_from_urlscan_findings': 'urlscan',
+    'update_graph_from_urlscan_takeover': 'urlscan',
+    'update_graph_from_shodan': 'shodan',
+    'update_graph_from_netlas': 'netlas',
+    'update_graph_from_criminalip': 'criminalip',
+}
+
+#: Writer errors that cost no finding: nothing to write ("No vuln_scan data
+#: found"), and the housekeeping passes that run after the findings are
+#: written (BaseURL re-links, Domain counters, the OpenAPI status, coverage
+#: stamps). Any other item error degrades the writer's sources.
+_HOUSEKEEPING_WRITE_ERROR = re.compile(
+    r"No \w+ (?:data|results)\b|(?:Orphan|Apex) BaseURL cleanup failed"
+    r"|Domain update failed|OpenAPI source status update failed|[\w ]+ coverage stamp failed")
+
+
+class _WriteResult(tuple):
+    """``(writer, stats, failure)`` of one background write; ``failure`` is
+    empty for a clean one."""
+
+    def __new__(cls, writer: str, stats, failure: str):
+        return super().__new__(cls, (writer, stats, failure))
+
+
+def _writer_sources(update_method_name: str) -> set:
+    """The finding sources a background writer writes; empty for an asset writer."""
+    return set(_PHASE_FINDING_SOURCES.get(_WRITER_SOURCES.get(update_method_name), ()))
+
+
+def _finding_write_errors(stats) -> str:
+    errors = stats.get("errors") if isinstance(stats, dict) else None
+    lost = [e for e in errors or [] if not _HOUSEKEEPING_WRITE_ERROR.match(str(e))]
+    return f"{len(lost)} item error(s)" if lost else ""
+
+
+def _note_writer_failed(update_method_name: str, why: str) -> None:
+    """Keep this run's findings of a writer whose write failed. Never raises."""
+    phase = _WRITER_SOURCES.get(update_method_name)
+    if not phase:
+        return
+    sources = ", ".join(sorted(_writer_sources(update_method_name)))
+    print(f"[!][graph-db] {update_method_name}: {why} - the findings of {sources} "
+          f"are kept this run")
+    _note_phase_error(phase, reason=f"graph write failed ({update_method_name})")
+
+
+def _note_write_errors(update_method_name: str, stats) -> str:
+    """Treat a finished write's item errors on findings as a failed write.
+    Returns them summarised, or "" for a clean write."""
+    failure = _finding_write_errors(stats)
+    if failure:
+        _note_writer_failed(update_method_name, failure)
+    return failure
+
+
 def _graph_update_bg(update_method_name: str, combined_result: dict,
                      user_id: str, project_id: str):
     """Submit a graph DB update to the background thread.
@@ -583,10 +722,16 @@ def _graph_update_bg(update_method_name: str, combined_result: dict,
     the stopper is landing what is already queued within its deadline.
 
     Returns the Future, or None when no write was queued. The future's result
-    is True when the write landed and False when it was skipped or failed, so
-    a caller can tell a durable graph update from a silently dropped one.
+    is a _WriteResult so a caller can tell a durable graph update from a
+    silently dropped one.
+    A graph error never fails the scan; a write of findings that fails, or
+    never lands, keeps their sources out of this run's prune (R-20).
     """
-    if not UPDATE_GRAPH_DB or _graph_executor is None:
+    if not UPDATE_GRAPH_DB:
+        return None
+    if _graph_executor is None:
+        # The group's writer is already drained: this write would be dropped.
+        _note_writer_failed(update_method_name, "not queued, the graph writer was closed")
         return None
     if _shutdown.stop_requested():
         print(f"[!][graph-db] Stop requested: {update_method_name} not queued")
@@ -594,19 +739,23 @@ def _graph_update_bg(update_method_name: str, combined_result: dict,
     snapshot = copy.deepcopy(combined_result)
 
     def _do_update():
+        stats = None
         try:
             from graph_db import Neo4jClient
             with Neo4jClient() as client:
                 if client.verify_connection():
                     method = getattr(client, update_method_name)
-                    method(snapshot, user_id, project_id)
+                    stats = method(snapshot, user_id, project_id)
                     print(f"[graph-db] {update_method_name} complete")
-                    return True
+                    return _WriteResult(update_method_name, stats,
+                                        _note_write_errors(update_method_name, stats))
+                failure = "Neo4j not reachable"
                 print(f"[!][graph-db] Neo4j not reachable — skipped {update_method_name}")
-                return False
         except Exception as e:
+            failure = type(e).__name__
             print(f"[!][graph-db] Background graph update ({update_method_name}) failed: {e}")
-            return False
+        _note_writer_failed(update_method_name, failure)
+        return _WriteResult(update_method_name, stats, failure)
 
     future = _graph_executor.submit(_do_update)
     _graph_futures.append(future)
@@ -622,16 +771,27 @@ def _stamp_wildcard_zones(combined_result: dict) -> None:
 
 
 def _graph_wait_all():
-    """Wait for every queued graph DB update to finish, then tear down the executor."""
+    """Wait for every queued graph DB update to finish, then tear down the executor.
+
+    Returns ``[(writer, stats, failure), ...]``, ``failure`` empty for a clean
+    write. A failed one has already noted its finding sources degraded.
+    """
     global _graph_executor
     if _graph_executor is None:
-        return
+        return []
     _graph_executor.shutdown(wait=True)
+    results = []
     for f in _graph_futures:
         exc = f.exception()
         if exc:
             print(f"[!][graph-db] Graph update error: {exc}")
+        elif isinstance(f.result(), _WriteResult):
+            results.append(f.result())
+    failed = [writer for writer, _stats, failure in results if failure]
+    if failed:
+        print(f"[!][graph-db] {len(failed)} graph write(s) failed: {', '.join(failed)}")
     _graph_executor = None
+    return results
 
 
 def _drain_graph_writes(deadline: float) -> None:
@@ -677,6 +837,13 @@ def should_skip_active_scans(recon_data: dict) -> tuple:
     Returns:
         Tuple of (should_skip: bool, reason: str)
     """
+    failed = _http_probe_failure(recon_data)
+    if failed:
+        # Nothing was probed, which is not "nothing is live": run on no URL,
+        # the scanners report nothing and the prune reads that as "gone".
+        # Skipped, they keep their findings by host (_note_gate_skipped, R-21).
+        return True, f"http_probe failed ({failed}) - no host was probed"
+
     http_probe_data = recon_data.get('http_probe', {})
     http_summary = http_probe_data.get('summary', {})
     
@@ -692,6 +859,22 @@ def should_skip_active_scans(recon_data: dict) -> tuple:
                 return True, "No live URLs found by http_probe - nothing to scan"
     
     return False, ""
+
+
+def _http_probe_failure(result: dict) -> str:
+    """Why httpx probed nothing this run (run_http_probe's phase error), or ""."""
+    return str(((result.get("metadata") or {}).get("phase_errors") or {}).get("http_probe") or "")
+
+
+def _note_module_ran(result: dict, module: str) -> None:
+    """List ``module`` in modules_executed unless it recorded a failure: a probe
+    that could not run checked nothing (R-21)."""
+    metadata = result.setdefault("metadata", {})
+    if module in (metadata.get("phase_errors") or {}):
+        return
+    executed = metadata.setdefault("modules_executed", [])
+    if module not in executed:
+        executed.append(module)
 
 
 # The per-group scope rules live in a module with no import side effects, so
@@ -732,6 +915,36 @@ def _gate_injected_hosts(extra_hosts, known: list, target_info: dict, root_domai
             return wildcard_control.filter_late_names(names, [root], settings, label="urlscan").kept
     kept = wildcard_filter(kept) if kept else []
     return {h: picked[h] for h in kept}
+
+
+def _roe_refused_discoveries(hosts, resolved: dict, root_domain: str, listed: set,
+                             injected: dict, settings: dict) -> set:
+    """The discovered names (urlscan's included) the admission gate refuses
+    on the addresses discovery's DNS pass resolved (no new query), under RoE
+    IP or CIDR entries: any excluded address refuses the name whole, never
+    narrowed, as a late name is (target_helpers._admit_late_names). Each
+    refusal is noted roe_excluded under the source that found the name.
+
+    A name with no address is not judged here: the builders refuse it as not
+    checked. The root and the operator's listed hosts are left to the
+    builders' gate, as for the SSRF guard: what the operator named is theirs.
+    """
+    from recon.helpers.target_admission import admission_context, admit_targets
+    if not admission_context(settings).ip_rules:
+        return set()
+    by_source: dict = {}
+    for host in hosts:
+        if host == root_domain or host in listed:
+            continue
+        ips = (resolved.get(host) or {}).get("ips") or {}
+        addresses = [a for a in list(ips.get("ipv4") or []) + list(ips.get("ipv6") or []) if a]
+        if addresses:
+            by_source.setdefault(injected.get(host) or "domain_recon", {})[host] = addresses
+    refused = set()
+    for source, names in by_source.items():
+        admission = admit_targets(settings, None, names=names, module=source, resolves_names=True)
+        refused.update(h for h in names if h not in admission.names)
+    return refused
 
 
 def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
@@ -851,6 +1064,18 @@ def merge_group_hosts(recon_result, target_info: dict, root_domain: str,
                   f"loopback/link-local/multicast is never a scan target")
         discovered_subs = kept
         for host, _ in dropped:
+            resolved.pop(host, None)
+        discovered_dns["subdomains"] = resolved
+
+    # D2 on the addresses: the RoE checks above are by name, and a discovered
+    # name in an excluded range would be written as a Subdomain with
+    # RESOLVES_TO to the excluded address. Ahead of the injected names' guard,
+    # so its joined count is what joined.
+    refused = _roe_refused_discoveries(discovered_subs, resolved, root_domain, listed,
+                                       injected, settings)
+    if refused:
+        discovered_subs = [h for h in discovered_subs if h not in refused]
+        for host in refused:
             resolved.pop(host, None)
         discovered_dns["subdomains"] = resolved
 
@@ -986,27 +1211,59 @@ def _dns_names(result: dict) -> set:
 
 
 def _late_names(result: dict, before: set, settings: dict, output_file: Path, *,
-                after_port_scan: bool, probe_http: bool, label: str) -> None:
+                after_port_scan: bool, probe_http: bool, label: str) -> "dict | None":
     """F2: names a step merged into dns.subdomains after GROUP 1 get their DNS;
     after the port scan, their ports; after httpx, a probe of their own. The
-    graph gets their Subdomain -> IP edges and what was scanned."""
+    graph gets their Subdomain -> IP edges and what was scanned.
+
+    IP mode scans only the names the hostname rule selected
+    (metadata.ip_mode_hosts), on their pinned answer and on target IPs only,
+    and writes nothing: the hostnames hook writes them through the IP-mode
+    writer once its post-probe guard has run, never through the domain
+    writer, which would hang them off the synthetic root. Returns the subset
+    recon dict the late scan produced, or None."""
     new = sorted(_dns_names(result) - set(before))
     if not new:
-        return
+        return None
     from recon.helpers import late_names
+    if (result.get("metadata") or {}).get("ip_mode"):
+        return _ip_mode_late_names(result, new, settings, label)
     if not after_port_scan:
         if late_names.give_dns(result, new, settings):
             save_recon_file(result, output_file)
-        return
+        return None
     sub = late_names.scan_late_names(result, new, settings, probe_http=probe_http, label=label)
     if not sub:
-        return
+        return None
     save_recon_file(result, output_file)
     _graph_update_bg("update_graph_from_domain_discovery", {**sub, "whois": {}}, USER_ID, PROJECT_ID)
     if sub.get("port_scan"):
         _graph_update_bg("update_graph_from_port_scan", sub, USER_ID, PROJECT_ID)
     if sub.get("http_probe"):
         _graph_update_bg("update_graph_from_http_probe", sub, USER_ID, PROJECT_ID)
+    return sub
+
+
+def _ip_mode_late_names(result: dict, names: list, settings: dict, label: str) -> "dict | None":
+    """The IP-mode branch of _late_names: selected names only, pinned answer,
+    target IPs only. A failure reports the http_probe phase, so the prune
+    keeps its findings (the late scan also notes every name)."""
+    from recon.helpers import late_names
+    from recon.helpers.target_admission import target_set
+    metadata = result.get("metadata") or {}
+    selected = metadata.get("ip_mode_hosts") or {}
+    picked = [n for n in names if n in selected]
+    if len(picked) < len(names):
+        print(f"[-][{label}] {len(names) - len(picked)} name(s) the hostname rule did not select: not scanned")
+    if not picked:
+        return None
+    subs = (result.get("dns") or {}).get("subdomains") or {}
+    pinned = {n: [a for a in ((subs.get(n) or {}).get("ips") or {}).get("ipv4") or []]
+              + [a for a in ((subs.get(n) or {}).get("ips") or {}).get("ipv6") or []] for n in picked}
+    return late_names.scan_late_names(
+        result, picked, settings, probe_http=True, label=label, pinned=pinned,
+        targets=target_set(metadata.get("expanded_ips") or ()),
+        on_error=lambda e: _note_phase_error("http_probe", f"late-name scan failed: {type(e).__name__}"))
 
 
 _TLS_HYGIENE_CHECK_SETTINGS = {
@@ -1063,6 +1320,186 @@ def _maybe_run_cert_hygiene(result: dict, settings: dict, output_file: Path) -> 
         result.setdefault("metadata", {}).setdefault("phase_errors", {})["cert_hygiene"] = str(e)
         _note_phase_error("cert_hygiene")
     return result
+
+
+_PORT_CHECK_SETTINGS = {
+    "admin_port_exposed": "SECURITY_CHECK_ADMIN_PORT_EXPOSED",
+    "database_exposed": "SECURITY_CHECK_DATABASE_EXPOSED",
+    "redis_no_auth": "SECURITY_CHECK_REDIS_NO_AUTH",
+    "kubernetes_api_exposed": "SECURITY_CHECK_KUBERNETES_API_EXPOSED",
+    "smtp_open_relay": "SECURITY_CHECK_SMTP_OPEN_RELAY",
+}
+
+
+def _port_checks_enabled(settings: dict) -> dict:
+    """The port and service checks this run's settings turn on, as vuln_scan
+    reads them; empty when none is. Every key is given:
+    run_port_service_checks reads a missing one as on."""
+    if "vuln_scan" not in SCAN_MODULES or not settings.get('SECURITY_CHECK_ENABLED', True):
+        return {}
+    enabled = {name: bool(settings.get(key, True)) for name, key in _PORT_CHECK_SETTINGS.items()}
+    return enabled if any(enabled.values()) else {}
+
+
+def _dns_checks_enabled(settings: dict) -> dict:
+    """The org DNS checks this run's settings turn on; empty when none is."""
+    from recon.helpers.security_checks import DNS_CHECK_TYPES
+    if "vuln_scan" not in SCAN_MODULES or not settings.get('SECURITY_CHECK_ENABLED', True):
+        return {}
+    enabled = {t: bool(settings.get(f"SECURITY_CHECK_{t.upper()}", True)) for t in DNS_CHECK_TYPES}
+    return enabled if any(enabled.values()) else {}
+
+
+def _run_skipped_scan_checks(result: dict, settings: dict, output_file: Path, phase: str,
+                             label: str, enabled: dict, run) -> dict:
+    """Run one security check family the live-URL skip took out of vuln_scan,
+    and add its findings to vuln_scan.security_checks, the envelope the graph
+    writer and the report read. Never raises: a crash is `phase`'s error."""
+    try:
+        from recon.helpers import security_checks
+        print(f"\n[*][Pipeline] {label} (active scans skipped)")
+        roe = (settings.get('ROE_EXCLUDED_HOSTS') or None) if settings.get('ROE_ENABLED') else None
+        findings = run(security_checks, roe)
+        print(f"[+][Pipeline] {label}: {len(findings)} finding(s)")
+        if not findings:
+            return result
+        vuln = result.setdefault("vuln_scan", {})
+        vuln["security_checks"] = security_checks.add_security_findings(
+            vuln.get("security_checks"), findings, enabled)
+        save_recon_file(result, output_file)
+        _graph_update_bg("update_graph_from_vuln_scan", result, USER_ID, PROJECT_ID)
+    except Exception as e:
+        print(f"[!][Pipeline] {label} failed: {e}")
+        result.setdefault("metadata", {}).setdefault("phase_errors", {})[phase] = str(e)
+        _note_phase_error(phase)
+    return result
+
+
+def _maybe_run_port_checks(result: dict, settings: dict, output_file: Path) -> dict:
+    """The port and service checks when the active scans were skipped (R-22).
+
+    Admin and database ports, Redis without auth, an SMTP open relay and a
+    Kubernetes API read the port scan, not http_probe, but they live in
+    run_security_checks inside the skipped vuln_scan. A database server with no
+    web server trips the skip by construction, so the host these checks exist
+    for was the one never checked. They send only the probes they send in the
+    full path, under the same settings (stealth turns those off), RoE
+    exclusions and host health (a host down on :80 and :443 is skipped and
+    keeps its findings); the Redis and SMTP probes record per IP what they
+    checked (D1). Their findings join the certificate hygiene ones.
+    """
+    enabled = _port_checks_enabled(settings)
+    if not enabled:
+        return result
+    return _run_skipped_scan_checks(
+        result, settings, output_file, "port_checks", "Port and service checks", enabled,
+        lambda sc, roe: sc.run_port_checks_only(
+            result, enabled, timeout=settings.get('SECURITY_CHECK_TIMEOUT', 10),
+            max_workers=settings.get('SECURITY_CHECK_MAX_WORKERS', 10), roe_excluded_hosts=roe))
+
+
+def _maybe_run_dns_checks(result: dict, settings: dict, output_file: Path) -> dict:
+    """The org DNS checks (SPF, DMARC, DNSSEC, zone transfer) when the active
+    scans were skipped (R-22).
+
+    They ask resolvers and the org's nameservers, not a web server, but live in
+    run_security_checks inside the skipped vuln_scan, so a group with no live
+    URL never re-checked its org and the prune could only keep the old findings
+    (_note_unchecked_dns_orgs). As in the full path: the same settings (stealth
+    turns the zone transfer off), an org or nameserver the RoE excludes never
+    asked, each org once per run, a per-org verdict record (D1). IP mode has no
+    org, so nothing runs there.
+    """
+    enabled = _dns_checks_enabled(settings)
+    if not enabled:
+        return result
+    return _run_skipped_scan_checks(
+        result, settings, output_file, "dns_checks", "Org DNS checks", enabled,
+        lambda sc, roe: sc.run_dns_checks_only(
+            result, enabled, timeout=settings.get('SECURITY_CHECK_TIMEOUT', 10),
+            roe_excluded_hosts=roe))
+
+
+#: The GROUP 6 Phase A tools that need a live URL, with the setting that turns
+#: each on (vuln_scan is a SCAN_MODULES phase). Subdomain Takeover is not one:
+#: it runs with no live URL (R-22).
+_LIVE_URL_PHASE_A = {
+    "graphql_scan": "GRAPHQL_SECURITY_ENABLED",
+    "vhost_sni": "VHOST_SNI_ENABLED",
+    "cache_scan": "WEB_CACHE_POISON_ENABLED",
+    "origin_discovery": "ORIGIN_DISCOVERY_ENABLED",
+    "route_exposure": "ROUTE_EXPOSURE_ENABLED",
+}
+
+
+def _gate_skip_hosts(result: dict) -> list:
+    """Every name and address of this group the skipped scanners would have read."""
+    from recon.helpers import extract_targets_from_recon
+    ips, names, _ = extract_targets_from_recon(result)
+    port_scan = result.get("port_scan") or {}
+    return sorted({*ips, *names,
+                   *(port_scan.get("by_ip") or {}), *(port_scan.get("by_host") or {})})
+
+
+def _note_gate_skipped(result: dict, settings: dict, *, phase_a: bool = True) -> None:
+    """Keep, on this group's hosts, the findings of every source the live-URL
+    skip stopped from running (R-22). Never raises.
+
+    These sources record nothing they re-checked, so the prune would read "not
+    reported" as "gone". They were meant to run and could not: degraded, not
+    switched off, and by host, so the groups of a Domain batch that had live
+    URLs still prune them. security_check is kept on the group's names and
+    addresses except the addresses the port checks read and the orgs the DNS
+    checks asked: those checks re-checked them and prune there on their own
+    (an apex that is also the org loses the keep for its web findings). A tool
+    switched off by configuration notes nothing and prunes as before.
+    `phase_a` False: the caller never runs Phase A (the legacy path, which
+    keeps those sources already).
+    """
+    from recon.helpers import circuit_breaker
+    phases = [p for p in ("resource_enum", "vuln_scan") if p in SCAN_MODULES]
+    if phase_a:
+        phases += [p for p, key in _LIVE_URL_PHASE_A.items() if settings.get(key, False)]
+    # A failed httpx probed nothing, so the web checks on what the port and
+    # DNS checks read were not re-checked either: keep security_check there too.
+    probe_failed = bool(_http_probe_failure(result))
+    why = "http_probe failed, no host probed" if probe_failed else "not run: no live HTTP URL"
+    if probe_failed:
+        # These still run, without the pages httpx would have handed them.
+        phases += [p for p, key, default in (("js_recon", "JS_RECON_ENABLED", False),
+                                             ("ai_surface_recon", "AI_SURFACE_RECON_ENABLED", True))
+                   if settings.get(key, default)]
+    try:
+        hosts = _gate_skip_hosts(result)
+        if not phases or not hosts:
+            return
+        read = set()
+        if not probe_failed and _port_checks_enabled(settings):
+            by_ip = (result.get("port_scan") or {}).get("by_ip") or {}
+            read = {ip for ip, entry in by_ip.items() if isinstance(entry, dict) and entry.get("ports")}
+        if not probe_failed and _dns_checks_enabled(settings):
+            from recon.helpers.org_work import claimed_orgs
+            read |= set(claimed_orgs("dns_checks"))
+        kept = []
+        for phase in phases:
+            for source in _PHASE_FINDING_SOURCES[phase]:
+                if source == "nuclei" and not settings.get('NUCLEI_ENABLED', True):
+                    continue
+                if source == "security_check" and not settings.get('SECURITY_CHECK_ENABLED', True):
+                    continue
+                on = [h for h in hosts if h not in read] if source == "security_check" else hosts
+                if on:
+                    circuit_breaker.note_degraded(phase, hosts=on, host_source=source,
+                                                  source_only_hosts=True, reason=why)
+                    kept.append(source)
+        if kept:
+            print(f"[*][Pipeline] Earlier findings kept on {len(hosts)} host(s) ({why}): "
+                  f"{', '.join(kept)}")
+    except Exception as e:  # noqa: BLE001 - unknown hosts: keep the sources whole
+        print(f"[!][Pipeline] Could not list the hosts the skipped scanners keep: {type(e).__name__}")
+        circuit_breaker.note_degraded(
+            "active_scans", sources=[s for p in phases for s in _PHASE_FINDING_SOURCES[p]],
+            reason=why)
 
 
 def _maybe_run_ai_surface(result: dict, settings: dict, output_file: Path) -> dict:
@@ -1142,7 +1579,13 @@ def merge_port_scan_results(combined_result: dict) -> None:
         }
         return
 
-    # Both scanners ran — merge masscan into port_scan, deduplicating
+    # Both scanners ran — merge masscan into port_scan, deduplicating. A domain
+    # run's detail names its address (a name can sit on several), so a port is
+    # one per address: by port alone, masscan's 443 on a name's second address
+    # was dropped once naabu had 443 on the first.
+    def _detail_key(entry: dict, pd: dict) -> tuple:
+        return (pd.get("ip") or entry.get("ip"), pd["port"])
+
     for host, mdata in masscan_data.get("by_host", {}).items():
         if host not in port_scan["by_host"]:
             port_scan["by_host"][host] = mdata
@@ -1151,8 +1594,10 @@ def merge_port_scan_results(combined_result: dict) -> None:
             for port in mdata.get("ports", []):
                 if port not in existing["ports"]:
                     existing["ports"].append(port)
+            have = {_detail_key(existing, x) for x in existing.get("port_details", [])}
             for pd in mdata.get("port_details", []):
-                if pd["port"] not in [x["port"] for x in existing.get("port_details", [])]:
+                if _detail_key(mdata, pd) not in have:
+                    have.add(_detail_key(mdata, pd))
                     existing.setdefault("port_details", []).append(pd)
             existing["ports"].sort()
             if "port_details" in existing:
@@ -1221,10 +1666,11 @@ def _drop_shodan_cdn_ips(combined_result: dict) -> None:
 def _reachcheck_shodan_cves(combined_result: dict, settings: dict) -> None:
     """Mark each Shodan CVE with whether this run's port scan found its port open.
 
-    Shodan runs beside the port scan, so this is the first point where both
-    are known; nmap re-probes only what the port scan found, so nothing else
-    looks at a port only Shodan reported. No traffic. Never raises: a CVE left
-    unmarked keeps whatever it had.
+    Called just before _write_shodan_cves, after the nmap merge: nmap probes
+    every IP with the union of all IPs' ports, so it can confirm open a port
+    naabu missed on one of them, and a check made at GROUP 3 would call that
+    CVE's port closed (R-39). No traffic. Never raises: a CVE left unmarked
+    keeps whatever it had.
     """
     shodan_data = combined_result.get("shodan")
     if not shodan_data or not shodan_data.get("cves"):
@@ -1303,6 +1749,49 @@ def _run_ip_attribution(combined_result: dict, settings: dict, output_file) -> N
     except Exception as e:  # noqa: BLE001 - the tag is optional; the run is not
         print(f"[!][IpAttribution] failed: {type(e).__name__}")
         combined_result["metadata"].setdefault("phase_errors", {})["ip_attribution"] = str(e)
+
+
+def _ip_hostnames_step(combined_result: dict, settings: dict, output_file, passive_search=None) -> None:
+    """IP mode: collect the hostnames seen on the target IPs, scan the ones the
+    hostname rule selects (M4/M1) and record the rest
+    (recon/helpers/ip_hostnames.py). Never raises: a failure records no name
+    and the run goes on with its addresses. `passive_search` is M4's running
+    search of the filter domains (recon/helpers/ip_hostnames_expand.py),
+    joined there.
+
+    The writer is queued in every mode, ip_only included, because it also
+    stamps the run's hostname mode on the mock root. The selected names' pages
+    are written after it (their Subdomains must exist first) and after the
+    post-probe guard has dropped any that moved. In the record modes the hook
+    rewrites the attributed IPs' current_dns_names (D-10), so their
+    attribution write goes again, after the first on the serial queue.
+    """
+    from recon.helpers import ip_hostnames
+    late = {}
+
+    def late_scan(result, names, pinned, targets):
+        before = _dns_names(result) - set(names)
+        late["sub"] = _late_names(result, before, settings, output_file, after_port_scan=True,
+                                  probe_http=True, label="IpNames")
+        return late["sub"]
+
+    try:
+        block = ip_hostnames.hostname_step(combined_result, settings, late_scan=late_scan,
+                                           passive_search=passive_search)
+    except Exception as e:  # noqa: BLE001 - the addresses are the run; names are extra
+        print(f"[!][IpNames] Hostname recording failed ({type(e).__name__}): no name is recorded this run")
+        combined_result["metadata"].setdefault("phase_errors", {})["ip_hostnames"] = str(e)
+        return
+    if block is None:
+        return
+    if block["mode"] != "ip_only":
+        combined_result["metadata"].setdefault("modules_executed", []).append("ip_hostnames")
+    save_recon_file(combined_result, output_file)
+    _graph_update_bg("update_graph_from_ip_hostnames", combined_result, USER_ID, PROJECT_ID)
+    if (late.get("sub") or {}).get("http_probe"):
+        _graph_update_bg("update_graph_from_http_probe", late["sub"], USER_ID, PROJECT_ID)
+    if block["mode"] != "ip_only" and "ip_attribution" in combined_result:
+        _graph_update_bg("update_graph_from_ip_attribution", combined_result, USER_ID, PROJECT_ID)
 
 
 # The Nmap merge lives in recon.helpers.nmap_merge, so partial recon reaches it
@@ -1412,12 +1901,24 @@ def _continue_phase_a():
     return 0
 
 
+def _fan_out_snapshot(combined_result: dict) -> dict:
+    """The one copy of combined_result that every worker of a fan-out is handed.
+
+    Take it before the first submit. A wrapper deep-copies its input in its
+    own thread while the main thread merges finished answers into
+    combined_result, and a copy of the live dict then raises "dictionary
+    changed size during iteration" and loses that tool (R-31). Nothing writes
+    this copy: each wrapper deep-copies it again before its module runs.
+    """
+    return copy.deepcopy(combined_result)
+
+
 def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                          output_file, group_id: str = "") -> None:
-    """GROUP 6 Phase A: run the active scanners concurrently on deep copies.
+    """GROUP 6 Phase A: run the active scanners on their own deep copies.
 
-    Each answer is merged before its graph update is queued, because the
-    update snapshots combined_result at queue time.
+    Each answer is merged as soon as it lands, before its graph update is
+    queued, because the update snapshots combined_result at queue time.
 
     F16 checkpoint: each tool is a durable chunk scoped to ``group_id`` (the
     batch group / IP target), so two groups never share a chunk key. Before
@@ -1445,12 +1946,21 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                 _checkpoint_budget.set_limit(group_id, settings["CHECKPOINT_BUDGET_PER_TOOL"],
                                              check_family=tool)
     lease_id = uuid.uuid4().hex
-    print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning (fan-out: {', '.join(tools.keys())})")
+    # Under an RoE ceiling each scanner is held to the whole ceiling, so running
+    # them together would multiply it (D3): one at a time, in the same order.
+    sequential = bool(request_pacer.ceiling_rps(settings))
+    mode = "one at a time under the RoE ceiling" if sequential else "fan-out"
+    print(f"\n[*][Pipeline] GROUP 6 Phase A: Active Vulnerability Scanning ({mode}: {', '.join(tools.keys())})")
     print("-" * 40)
     for entry in _checkpoint_report_uncertain():
         print(f"    [checkpoint] uncertain chunk {entry.origin}:{entry.chunk_index} "
               f"(status={entry.status}) -> reported for safe-policy retry")
-    with ThreadPoolExecutor(max_workers=len(tools)) as pool:
+    with ThreadPoolExecutor(max_workers=1 if sequential else len(tools)) as pool:
+        # One shared copy of combined_result handed to every worker: a wrapper
+        # deep-copies its input before its module runs, so the main thread can
+        # keep merging finished answers without "dictionary changed size during
+        # iteration" (R-31).
+        snapshot = _fan_out_snapshot(combined_result)
         futures = {}
         for key, fn in tools.items():
             origin = _checkpoint_chunk_origin(group_id, key)
@@ -1469,7 +1979,7 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                 print(f"    [checkpoint] {key}: already complete, skipping")
                 continue
             _checkpoint_budget_record(budget_origin, key, admitted=True)
-            futures[pool.submit(fn, combined_result, settings)] = key
+            futures[pool.submit(fn, snapshot, settings)] = key
         for fut in as_completed(futures):
             key = futures[fut]
             origin = _checkpoint_chunk_origin(group_id, key)
@@ -1547,7 +2057,6 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         Complete reconnaissance data dict (same shape as run_domain_recon output)
     """
     import ipaddress
-    from recon.main_recon_modules.domain_recon import dns_lookup
 
     print("\n" + "=" * 70)
     print("               RedAmon - IP-Based Reconnaissance")
@@ -1587,7 +2096,13 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
             except ValueError as e:
                 print(f"[!][Pipeline] Invalid CIDR {entry}: {e}")
         else:
-            expanded_ips.append(entry)
+            # One spelling per address (`2001:DB8:0::1` is `2001:db8::1`): the
+            # tools report the canonical one, and a second spelling would be a
+            # second IP node that no finding and no SEEN_ON edge ever meets.
+            try:
+                expanded_ips.append(str(ipaddress.ip_address(entry)))
+            except ValueError:
+                expanded_ips.append(entry)
 
     expanded_ips = list(dict.fromkeys(expanded_ips))  # deduplicate preserving order
     print(f"[*][Pipeline] Expanded {len(target_ips)} entries to {len(expanded_ips)} individual IPs")
@@ -1595,24 +2110,39 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     # RoE: filter out excluded hosts (supports exact match + CIDR)
     expanded_ips = _filter_roe_excluded(expanded_ips, settings, label="IP")
 
+    # record_filter's passive search of the filter domains asks third-party
+    # indexes only, never a target, so it runs beside PTR, WHOIS and the scans.
+    # It gets the settings alone and the hostnames hook joins it.
+    from recon.helpers import ip_hostnames_expand
+    passive_search = ip_hostnames_expand.start(settings)
+
     # Step 2: Reverse DNS for each IP
-    ip_to_hostname = {}
-    all_hostnames = []
+    from recon.helpers.ip_hostnames import hostname_mode
+    from recon.helpers.ip_placeholders import placeholder_for
+    from recon.main_recon_modules.domain_recon import reverse_dns_lookup_all
+    # Every target keeps its label: it carries the address to naabu, httpx's
+    # DNS fallback, GVM and the graph, whatever its PTR says (R-4).
+    ip_to_hostname = {ip: placeholder_for(ip) for ip in expanded_ips}
+    # A PTR answer is evidence for the hostnames hook, never a scope entry:
+    # the name's own A/AAAA can point anywhere (B-01), and only the selection
+    # rule may make a name a target.
+    ptr_answers = {}
     subdomains_dns = {}
 
     dns_enabled = settings.get('DNS_ENABLED', True)
+    names_mode = hostname_mode(settings)
 
     # The orchestrator takes the progress label from these GROUP headers only
     # (PIPELINE_HEADER_PHASES in recon_orchestrator/container_manager.py).
     print(f"\n[*][Pipeline] GROUP 1: Reverse DNS + DNS + IP WHOIS (IP mode)")
 
-    if dns_enabled:
+    if dns_enabled and names_mode != "ip_only":
         print(f"\n[*][DNS] IP STEP 1: Reverse DNS Lookup")
         print("-" * 40)
 
         # Parallel PTR lookups: one IP at a time serialised the whole /24 sweep.
-        # A per-/24 reverse-zone breaker inside reverse_dns_lookup skips a zone
-        # whose PTR authority stopped answering (and the resolver breaker skips
+        # A per-/24 reverse-zone breaker inside the lookup skips a zone whose
+        # PTR authority stopped answering (and the resolver breaker skips
         # everything if the resolver itself is down), so a dead range no longer
         # costs one timeout per IP.
         _rdns_retries = settings.get('DNS_MAX_RETRIES', 3)
@@ -1620,7 +2150,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         _rdns_results = {}
         with ThreadPoolExecutor(max_workers=_rdns_workers, thread_name_prefix="rdns") as _rdns_pool:
             _rdns_futs = {
-                _rdns_pool.submit(reverse_dns_lookup, ip, _rdns_retries): ip
+                _rdns_pool.submit(reverse_dns_lookup_all, ip, _rdns_retries): ip
                 for ip in expanded_ips
             }
             for _fut in as_completed(_rdns_futs):
@@ -1628,70 +2158,36 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                 try:
                     _rdns_results[_ip] = _fut.result()
                 except Exception:  # noqa: BLE001 - a lookup crash is a miss
-                    _rdns_results[_ip] = None
+                    _rdns_results[_ip] = []
         # Apply results in the original order for deterministic output.
         for ip in expanded_ips:
-            hostname = _rdns_results.get(ip)
-            if hostname:
-                ip_to_hostname[ip] = hostname
-                all_hostnames.append(hostname)
-                print(f"[+][DNS] {ip} -> {hostname}")
+            names = [n for n in _rdns_results.get(ip) or []
+                     if not n.replace('-', '').replace('.', '').isdigit()]
+            if names:
+                ptr_answers[ip] = names
+                print(f"[+][DNS] {ip} -> {', '.join(names)}")
             else:
-                # Use IP with dashes as mock subdomain name
-                mock_name = ip.replace('.', '-').replace(':', '-')
-                ip_to_hostname[ip] = mock_name
-                print(f"[-][DNS] {ip} -> no PTR (using {mock_name})")
+                print(f"[-][DNS] {ip} -> no PTR (using {ip_to_hostname[ip]})")
+    elif dns_enabled:
+        print(f"\n[-][DNS] IP STEP 1: Reverse DNS Lookup — SKIPPED (IP only: no hostname is looked up)")
     else:
         print(f"\n[-][DNS] IP STEP 1: Reverse DNS Lookup — SKIPPED (disabled)")
-        for ip in expanded_ips:
-            mock_name = ip.replace('.', '-').replace(':', '-')
-            ip_to_hostname[ip] = mock_name
 
     # Step 3: Build DNS data structure for each "subdomain"
     subdomain_names = []
-    if dns_enabled:
-        print(f"\n[*][DNS] IP STEP 2: DNS Resolution for Discovered Hosts")
-        print("-" * 40)
-
-        for ip, hostname in ip_to_hostname.items():
-            # Determine if this is a real hostname or mock
-            is_real_hostname = hostname in all_hostnames and not hostname.replace('-', '').replace('.', '').isdigit()
-
-            if is_real_hostname:
-                # Resolve DNS for real hostnames
-                print(f"[*][DNS] Resolving: {hostname}")
-                host_dns = dns_lookup(hostname)
-                subdomains_dns[hostname] = host_dns
-                subdomain_names.append(hostname)
-            else:
-                # Mock entry - create minimal DNS data with the IP
-                is_v6 = ':' in ip
-                subdomains_dns[hostname] = {
-                    "has_records": True,
-                    "ips": {
-                        "ipv4": [] if is_v6 else [ip],
-                        "ipv6": [ip] if is_v6 else [],
-                    },
-                    "records": {},
-                    "is_mock": True,
-                    "actual_ip": ip,
-                }
-                subdomain_names.append(hostname)
-    else:
-        print(f"\n[-][DNS] IP STEP 2: DNS Resolution — SKIPPED (disabled)")
-        for ip, hostname in ip_to_hostname.items():
-            is_v6 = ':' in ip
-            subdomains_dns[hostname] = {
-                "has_records": True,
-                "ips": {
-                    "ipv4": [] if is_v6 else [ip],
-                    "ipv6": [ip] if is_v6 else [],
-                },
-                "records": {},
-                "is_mock": True,
-                "actual_ip": ip,
-            }
-            subdomain_names.append(hostname)
+    for ip in expanded_ips:
+        is_v6 = ':' in ip
+        subdomains_dns[ip_to_hostname[ip]] = {
+            "has_records": True,
+            "ips": {
+                "ipv4": [] if is_v6 else [ip],
+                "ipv6": [ip] if is_v6 else [],
+            },
+            "records": {},
+            "is_mock": True,
+            "actual_ip": ip,
+        }
+        subdomain_names.append(ip_to_hostname[ip])
 
     # Step 4: IP WHOIS (best-effort)
     ip_whois = {}
@@ -1728,9 +2224,9 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     else:
         print(f"\n[-][WHOIS] IP STEP 3: IP WHOIS Lookup — SKIPPED (disabled)")
 
-    # Build the subdomain_filter (all IPs + any PTR-resolved hostnames)
+    # Build the subdomain_filter (all IPs and their labels)
     # This becomes allowed_hosts for http_probe scope checking
-    subdomain_filter = list(set(expanded_ips + all_hostnames + subdomain_names))
+    subdomain_filter = list(dict.fromkeys(expanded_ips + subdomain_names))
 
     # Build result structure compatible with domain-based pipeline
     combined_result = {
@@ -1755,10 +2251,12 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
             "subdomain_filter": subdomain_filter,
             "anonymous_mode": False,
             "bruteforce_mode": False,
-            "modules_executed": ["ip_recon", "reverse_dns"],
+            "modules_executed": ["ip_recon"] + (
+                ["reverse_dns"] if dns_enabled and names_mode != "ip_only" else []),
             "circuit_breakers": _breaker_mode(),
         },
         "domain": mock_domain,
+        "ip_hostnames": {"mode": names_mode, **({"ptr": ptr_answers} if names_mode != "ip_only" else {})},
         "whois": {"ip_whois": ip_whois},
         "subdomains": subdomain_names,
         "subdomain_count": len(subdomain_names),
@@ -1817,18 +2315,19 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         max_workers = max(max_workers, 1)
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ip-g3") as g3_exec:
             g3_futures = {}
+            g3_input = _fan_out_snapshot(combined_result)
             if shodan_enabled:
                 from recon.main_recon_modules.shodan_enrich import run_shodan_enrichment_isolated
                 g3_futures["shodan"] = g3_exec.submit(
-                    run_shodan_enrichment_isolated, combined_result, settings
+                    run_shodan_enrichment_isolated, g3_input, settings
                 )
             if naabu_enabled and "port_scan" in SCAN_MODULES:
                 g3_futures["port_scan"] = g3_exec.submit(
-                    run_port_scan_isolated, combined_result, settings
+                    run_port_scan_isolated, g3_input, settings
                 )
             if masscan_enabled and "port_scan" in SCAN_MODULES:
                 g3_futures["masscan_scan"] = g3_exec.submit(
-                    run_masscan_scan_isolated, combined_result, settings
+                    run_masscan_scan_isolated, g3_input, settings
                 )
 
             for name, future in g3_futures.items():
@@ -1845,6 +2344,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                         combined_result["metadata"]["modules_executed"].append("masscan_scan")
                 except Exception as e:
                     print(f"[!][{name}] Failed: {e}")
+                    combined_result["metadata"].setdefault("phase_errors", {})[name] = str(e)
                     _note_phase_error(name)
 
         # Merge masscan results into port_scan for downstream consumers
@@ -1852,7 +2352,6 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
             merge_port_scan_results(combined_result)
 
         _drop_shodan_cdn_ips(combined_result)
-        _reachcheck_shodan_cves(combined_result, settings)
 
         save_recon_file(combined_result, output_file)
 
@@ -1910,12 +2409,14 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         try:
             from recon.main_recon_modules.tls_scan import run_tlsx_enrichment
             combined_result = run_tlsx_enrichment(combined_result, settings=settings)
-            combined_result["metadata"]["modules_executed"].append("tlsx")
+            _note_module_ran(combined_result, "tlsx")
             save_recon_file(combined_result, output_file)
             _graph_update_bg("update_graph_from_tlsx", combined_result, USER_ID, PROJECT_ID)
         except Exception as e:
             print(f"[!][Pipeline] tlsx failed: {e}")
             combined_result["metadata"].setdefault("phase_errors", {})["tlsx"] = str(e)
+            if "tlsx" not in combined_result:
+                _note_phase_error("tlsx")
 
     # OSINT Enrichment (parallel, same logic as domain recon Group 3b)
     _ip_osint_tools = {
@@ -1946,10 +2447,11 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         osint_workers = min(len(enabled_ip_osint), 5)
         with ThreadPoolExecutor(max_workers=osint_workers, thread_name_prefix="ip-osint") as osint_exec:
             osint_futures = {}
+            osint_input = _fan_out_snapshot(combined_result)
             for name, (_, module_path, func_name, _) in enabled_ip_osint.items():
                 mod = importlib.import_module(module_path)
                 fn = getattr(mod, func_name)
-                osint_futures[name] = osint_exec.submit(fn, combined_result, settings)
+                osint_futures[name] = osint_exec.submit(fn, osint_input, settings)
             for name, future in osint_futures.items():
                 try:
                     data = future.result()
@@ -1959,6 +2461,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                         print(f"[+][{name.upper()}] Enrichment merged")
                 except Exception as e:
                     print(f"[!][{name.upper()}] Enrichment failed: {e}")
+                    combined_result["metadata"].setdefault("phase_errors", {})[name] = str(e)
                     _note_phase_error(name)
         save_recon_file(combined_result, output_file)
         for name, (_, _, _, graph_method) in enabled_ip_osint.items():
@@ -1975,7 +2478,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
             print(f"\n[*][Pipeline] GROUP 4: HTTP Probing")
             try:
                 combined_result = run_http_probe(combined_result, output_file=output_file, settings=settings)
-                combined_result["metadata"]["modules_executed"].append("http_probe")
+                _note_module_ran(combined_result, "http_probe")
                 save_recon_file(combined_result, output_file)
 
                 _graph_update_bg("update_graph_from_http_probe", combined_result, USER_ID, PROJECT_ID)
@@ -1986,8 +2489,12 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
                 save_recon_file(combined_result, output_file)
 
     _run_ip_attribution(combined_result, settings, output_file)
+    _reachcheck_shodan_cves(combined_result, settings)
     _write_shodan_cves(combined_result)
     _write_netlas(combined_result)
+    # Every name source has answered (PTR, certificates, redirects, the OSINT
+    # indexes, the IP attribution's default certificate): collect and record.
+    _ip_hostnames_step(combined_result, settings, output_file, passive_search=passive_search)
 
     # Check if active scans should be skipped
     skip_active_scans, skip_reason = should_skip_active_scans(combined_result)
@@ -1998,6 +2505,9 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         combined_result["metadata"]["active_scans_skip_reason"] = skip_reason
         save_recon_file(combined_result, output_file)
         combined_result = _maybe_run_cert_hygiene(combined_result, settings, output_file)
+        combined_result = _maybe_run_port_checks(combined_result, settings, output_file)
+        combined_result = _maybe_run_dns_checks(combined_result, settings, output_file)
+        _note_gate_skipped(combined_result, settings)
     else:
         if "resource_enum" in SCAN_MODULES:
             print(f"\n[*][Pipeline] GROUP 5: Resource Enumeration")
@@ -2045,6 +2555,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     # source_maps + technologies). Black-box package harvest + offline OSV verdict.
     combined_result = _maybe_run_supply_chain(combined_result, settings, output_file)
 
+    ip_phase_a: dict = {}
     if not skip_active_scans:
         if "vuln_scan" in SCAN_MODULES:
             print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
@@ -2077,7 +2588,6 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         # so an IP target also gets GraphQL / Subdomain-Takeover / VHost-SNI / Web Cache
         # Poisoning coverage (previously these only ran for domain targets, so an IP
         # scan silently skipped them).
-        ip_phase_a: dict = {}
         if settings.get('GRAPHQL_SECURITY_ENABLED', False):
             from recon.graphql_scan import run_graphql_scan_isolated
             ip_phase_a['graphql_scan'] = run_graphql_scan_isolated
@@ -2096,6 +2606,11 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         if settings.get('ROUTE_EXPOSURE_ENABLED', False):
             from recon.route_exposure import run_route_exposure_isolated
             ip_phase_a['route_exposure'] = run_route_exposure_isolated
+    elif settings.get('SUBDOMAIN_TAKEOVER_ENABLED', False):
+        # Takeover reads the names and their CNAMEs, not live URLs: a host set
+        # with no web server is still checked (R-22).
+        from recon.main_recon_modules.subdomain_takeover import run_subdomain_takeover_isolated
+        ip_phase_a['subdomain_takeover'] = run_subdomain_takeover_isolated
 
         _run_phase_a_fan_out(ip_phase_a, combined_result, settings, output_file,
                              group_id="ip")
@@ -2120,7 +2635,14 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     print(f"\n{'=' * 70}")
     print(f"[✓][Pipeline] IP RECON COMPLETE")
     print(f"[+][Pipeline] IPs scanned: {len(expanded_ips)}")
-    print(f"[+][Pipeline] Hostnames resolved: {len(all_hostnames)}")
+    hostnames = combined_result.get("ip_hostnames") or {}
+    if hostnames.get("mode", names_mode) == "ip_only":
+        print("[-][Pipeline] Hostnames on target IPs: not looked up (IP only)")
+    else:
+        counts = hostnames.get("summary") or {}
+        print(f"[+][Pipeline] Hostnames on target IPs ({names_mode}): {counts.get('found', 0)} found, "
+              f"{counts.get('scanned', 0)} scanned, {counts.get('recorded', 0)} recorded"
+              + (f", {counts['truncated']} not kept (volume limit)" if counts.get("truncated") else ""))
     print(f"[+][Pipeline] Output saved: {output_file}")
     print(f"{'=' * 70}")
 
@@ -2505,21 +3027,22 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         max_workers = max(max_workers, 1)
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="group3") as g3_exec:
             g3_futures = {}
+            g3_input = _fan_out_snapshot(combined_result)
 
             if shodan_enabled:
                 from recon.main_recon_modules.shodan_enrich import run_shodan_enrichment_isolated
                 g3_futures["shodan"] = g3_exec.submit(
-                    run_shodan_enrichment_isolated, combined_result, _settings
+                    run_shodan_enrichment_isolated, g3_input, _settings
                 )
 
             if naabu_enabled and "port_scan" in SCAN_MODULES:
                 g3_futures["port_scan"] = g3_exec.submit(
-                    run_port_scan_isolated, combined_result, _settings
+                    run_port_scan_isolated, g3_input, _settings
                 )
 
             if masscan_enabled and "port_scan" in SCAN_MODULES:
                 g3_futures["masscan_scan"] = g3_exec.submit(
-                    run_masscan_scan_isolated, combined_result, _settings
+                    run_masscan_scan_isolated, g3_input, _settings
                 )
 
             # Fan-in: merge results sequentially (safe — each writes different key)
@@ -2540,6 +3063,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                         print(f"[+][Masscan] Port scan merged")
                 except Exception as e:
                     print(f"[!][{name}] Failed: {e}")
+                    combined_result["metadata"].setdefault("phase_errors", {})[name] = str(e)
                     _note_phase_error(name)
 
         # Merge masscan results into port_scan for downstream consumers
@@ -2547,7 +3071,6 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             merge_port_scan_results(combined_result)
 
         _drop_shodan_cdn_ips(combined_result)
-        _reachcheck_shodan_cves(combined_result, _settings)
 
         save_recon_file(combined_result, output_file)
 
@@ -2592,8 +3115,10 @@ def run_domain_recon(target: str, bruteforce: bool = False,
 
     # =====================================================================
     # GROUP 3.6 — TLS certificate grab (tlsx)
-    # Depends on: merged port_scan data. Runs BEFORE http_probe so SAN-derived
-    # hostnames become probe targets, and before GROUP 6 so vhost_sni can use them.
+    # Depends on: merged port_scan data. Runs BEFORE http_probe so the SAN names
+    # merge_discovered_hostnames admits (the group's scope, RoE, not wildcard-only)
+    # get their DNS and port_scan rows here (_late_names) and GROUP 4 probes them;
+    # before GROUP 6 so vhost_sni can read tlsx's SAN lists.
     # Sequential (not a fan-out peer) because the SAN injection mutates shared
     # state GROUP 4 reads.
     # =====================================================================
@@ -2603,7 +3128,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         try:
             from recon.main_recon_modules.tls_scan import run_tlsx_enrichment
             combined_result = run_tlsx_enrichment(combined_result, settings=_settings)
-            combined_result["metadata"]["modules_executed"].append("tlsx")
+            _note_module_ran(combined_result, "tlsx")
             if _settings.get('TLSX_INJECT_HOSTNAMES', True):
                 from recon.helpers.target_helpers import merge_discovered_hostnames
                 _before = _dns_names(combined_result)
@@ -2626,6 +3151,8 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         except Exception as e:
             print(f"[!][Pipeline] tlsx failed: {e}")
             combined_result["metadata"].setdefault("phase_errors", {})["tlsx"] = str(e)
+            if "tlsx" not in combined_result:
+                _note_phase_error("tlsx")
 
     # =====================================================================
     # GROUP 3b — OSINT Enrichment (parallel, passive — no packets to target)
@@ -2662,10 +3189,11 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         osint_workers = min(len(enabled_osint), 5)
         with ThreadPoolExecutor(max_workers=osint_workers, thread_name_prefix="osint") as osint_exec:
             osint_futures = {}
+            osint_input = _fan_out_snapshot(combined_result)
             for name, (_, module_path, func_name, _) in enabled_osint.items():
                 mod = importlib.import_module(module_path)
                 fn = getattr(mod, func_name)
-                osint_futures[name] = osint_exec.submit(fn, combined_result, _settings)
+                osint_futures[name] = osint_exec.submit(fn, osint_input, _settings)
 
             for name, future in osint_futures.items():
                 try:
@@ -2676,6 +3204,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
                         print(f"[+][{name.upper()}] Enrichment merged")
                 except Exception as e:
                     print(f"[!][{name.upper()}] Enrichment failed: {e}")
+                    combined_result["metadata"].setdefault("phase_errors", {})[name] = str(e)
                     _note_phase_error(name)
 
         save_recon_file(combined_result, output_file)
@@ -2698,7 +3227,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
             print(f"\n[*][Pipeline] GROUP 4: HTTP Probing")
             try:
                 combined_result = run_http_probe(combined_result, output_file=output_file, settings=_settings)
-                combined_result["metadata"]["modules_executed"].append("http_probe")
+                _note_module_ran(combined_result, "http_probe")
                 save_recon_file(combined_result, output_file)
 
                 # Background graph updates
@@ -2741,6 +3270,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
 
     # After the SAN feedback: a name it resolved counts as a current DNS name.
     _run_ip_attribution(combined_result, _settings, output_file)
+    _reachcheck_shodan_cves(combined_result, _settings)
     _write_shodan_cves(combined_result)
     _write_netlas(combined_result)
 
@@ -2768,6 +3298,9 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         combined_result["metadata"]["active_scans_skip_reason"] = skip_reason
         save_recon_file(combined_result, output_file)
         combined_result = _maybe_run_cert_hygiene(combined_result, _settings, output_file)
+        combined_result = _maybe_run_port_checks(combined_result, _settings, output_file)
+        combined_result = _maybe_run_dns_checks(combined_result, _settings, output_file)
+        _note_gate_skipped(combined_result, _settings)
     else:
         # GROUP 5 — Resource Enum (already parallel internally: Katana || GAU || Kiterunner)
         if "resource_enum" in SCAN_MODULES:
@@ -2828,16 +3361,15 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     # GROUP 5.5 -- Supply-Chain Recon, after JS Recon as in IP mode.
     combined_result = _maybe_run_supply_chain(combined_result, _settings, output_file)
 
+    phase_a_tools: dict = {}
     if not skip_active_scans:
         # ================================================================
-        # GROUP 6 Phase A — Parallel active vuln scanners (Nuclei || GraphQL)
+        # GROUP 6 Phase A — Parallel active vuln scanners
         # ================================================================
-        # Both scanners read BaseURL/Endpoint/Technology, both write Vulnerability,
-        # and they have zero data dependency on each other. Run concurrently via
-        # ThreadPoolExecutor using _isolated wrappers (each deep-copies the
-        # combined_result so there's no shared-dict race).
+        # The scanners read BaseURL/Endpoint/Technology, write their own
+        # findings, and have zero data dependency on each other, so their
+        # _isolated wrappers run concurrently (_run_phase_a_fan_out).
         # ----------------------------------------------------------------
-        phase_a_tools: dict = {}
         if "vuln_scan" in SCAN_MODULES:
             from recon.main_recon_modules.vuln_scan import run_vuln_scan_isolated
             # The group's canonical artifact: the wrapper merges its selection
@@ -2865,6 +3397,11 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         if _settings.get('ROUTE_EXPOSURE_ENABLED', False):
             from recon.route_exposure import run_route_exposure_isolated
             phase_a_tools['route_exposure'] = run_route_exposure_isolated
+    elif _settings.get('SUBDOMAIN_TAKEOVER_ENABLED', False):
+        # Takeover reads the names and their CNAMEs, not live URLs: a group of
+        # dangling names, the case it exists for, is still checked (R-22).
+        from recon.main_recon_modules.subdomain_takeover import run_subdomain_takeover_isolated
+        phase_a_tools['subdomain_takeover'] = run_subdomain_takeover_isolated
 
         # Planner job context flows into the actual vuln_scan boundary via the
         # phase-A fan-out settings; the detailed run-scoped manifest is written
@@ -2874,6 +3411,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         _run_phase_a_fan_out(phase_a_tools, combined_result, staged, output_file,
                              group_id=str(root_domain or ""))
 
+    if not skip_active_scans:
         # ================================================================
         # GROUP 6 Phase B — MITRE enrichment (depends on Nuclei CVEs)
         # ================================================================
@@ -3105,18 +3643,72 @@ def _note_run_org(org: str) -> None:
         _RUN_ORGS.append(org)
 
 
+def _enabled_dns_check_types() -> list:
+    """The DNS check types this run's settings mean to run, as vuln_scan reads them."""
+    from recon.helpers.security_checks import DNS_CHECK_TYPES
+    if "vuln_scan" not in SCAN_MODULES or not _settings.get("SECURITY_CHECK_ENABLED", True):
+        return []
+    return [t for t in DNS_CHECK_TYPES if _settings.get(f"SECURITY_CHECK_{t.upper()}", True)]
+
+
 def _note_unchecked_dns_orgs() -> None:
-    """Mark the security_check source degraded for each org whose DNS checks
-    (SPF, DMARC, DNSSEC) ran in no group this run: no live URL, the module or
-    the checks switched off. "Not reported" then means "not re-checked", and
-    the prune keeps the org's previous findings instead of deleting them."""
+    """Keep the previous DNS findings (SPF, DMARC, DNSSEC, zone transfer) of
+    each org whose DNS checks ran in no group this run (no live URL, an RoE
+    refusal), and only those.
+
+    The enabled DNS check types are recorded as re-checked on no host
+    (positive coverage, D1), so the prune deletes their findings only on the
+    orgs run_dns_checks did check, and every other security_check finding
+    prunes as usual. DNS checks switched off by configuration record nothing:
+    their findings are pruned (README "Degraded vs. switched off").
+    """
     from recon.helpers import circuit_breaker
     from recon.helpers.org_work import claimed_orgs
+    enabled = _enabled_dns_check_types()
+    if not enabled:
+        return
     checked = set(claimed_orgs("dns_checks"))
-    for org in _RUN_ORGS:
-        if org.lower() not in checked:
-            circuit_breaker.note_degraded(
-                "vuln_scan", sources=["security_check"], reason=f"dns checks not run for {org}")
+    unchecked = [org for org in _RUN_ORGS if org.lower() not in checked]
+    if not unchecked:
+        return
+    print(f"[*][graph-db] DNS checks ran for no group of {', '.join(unchecked)}: "
+          f"their DNS findings are kept")
+    circuit_breaker.note_checked("security_check", checks=enabled, module="security_checks")
+
+
+def _checked_prune_batches(report, sources) -> dict:
+    """``(keep_hosts, only_hosts, types, exclude_types)`` -> the positive
+    sources pruned with them.
+
+    A source that recorded what it re-checked (``circuit_breaker.note_checked``)
+    is pruned once per check it recorded, on the hosts it re-checked minus
+    those cut for it. The cut hosts are also passed as kept, so a finding that
+    names one in any host field stays (degraded wins). Sources with the same
+    record share one call, as Shodan's source values do.
+
+    A source that recorded only some of its checks (security_check's DNS and
+    service probes) is also pruned once by the source-level rule for every
+    other finding type (``only_hosts`` None, those checks excluded), so a
+    check that records nothing, or is switched off, prunes as before.
+    """
+    batches: dict = {}
+    for source in sources:
+        keep = report.keep_hostnames(source)
+        checks = report.checked_types(source)
+        for check in checks:
+            key = (keep, report.checked_hostnames(source, check),
+                   None if check == "*" else (check,), None)
+            batches.setdefault(key, []).append(source)
+        if "*" not in checks:
+            batches.setdefault((keep, None, None, checks), []).append(source)
+    return batches
+
+
+def _org_check_batch(key) -> bool:
+    """A per-type batch of a check whose findings name only their org (DNS)."""
+    from recon.helpers.security_checks import DNS_CHECK_TYPES
+    types = key[2]
+    return bool(types) and set(types) <= set(DNS_CHECK_TYPES)
 
 
 def _persisted_selection_plans() -> list:
@@ -3156,6 +3748,12 @@ def _prune_recon_findings():
     host timeout) keeps that tool's findings alone, since the others re-checked
     it. If the run's coverage cannot be established at all, nothing is pruned
     (fail closed).
+
+    A source that recorded the hosts it re-checked (positive coverage, D1) is
+    pruned on those hosts only, so a host it never reached keeps its findings
+    even when nothing noted it degraded. Every other source keeps the rule
+    above, and so do the finding types a source recorded nothing for
+    (security_check records only its DNS and service probes).
     """
     if not UPDATE_GRAPH_DB or not _RUN_STARTED_AT:
         return
@@ -3197,11 +3795,17 @@ def _prune_recon_findings():
               f"findings on {len(keep_hosts)} unreachable host(s)")
         for source, hosts in report.source_hosts:
             print(f"[*][graph-db]   {len(hosts)} of those host(s) only for {source}")
+    positive = [s for s in sources if s in report.positive_sources]
+    if positive:
+        print(f"[*][graph-db] {len(positive)} source(s) prune only the hosts they "
+              f"re-checked ({', '.join(positive)})")
     # One prune per distinct keep set. With no per-source host every source
     # shares one set, which is the single call a run has always made.
     batches: dict = {}
     for source in sources:
-        batches.setdefault(report.keep_hostnames(source), []).append(source)
+        if source not in report.positive_sources:
+            batches.setdefault(report.keep_hostnames(source), []).append(source)
+    checked_batches = _checked_prune_batches(report, positive)
     try:
         from graph_db import Neo4jClient
         with Neo4jClient() as graph_client:
@@ -3216,11 +3820,39 @@ def _prune_recon_findings():
                     passive = {s for group in PASSIVE_CVE_SOURCES.values() for s in group}
                     batches = {keep: [s for s in batch if s not in passive]
                                for keep, batch in batches.items()}
+                    checked_batches = {key: [s for s in batch if s not in passive]
+                                       for key, batch in checked_batches.items()}
+                # DNS findings are matched on their org, which ones written
+                # before they stored it get first.
+                if any("security_check" in batch and _org_check_batch(key)
+                       for key, batch in checked_batches.items()):
+                    try:
+                        graph_client.backfill_security_check_domains(USER_ID, PROJECT_ID)
+                    except Exception as e:  # noqa: BLE001 - fail closed for those checks only
+                        print(f"[!][graph-db] Could not backfill DNS finding orgs ({e}) - "
+                              f"DNS security findings are not pruned this run")
+                        checked_batches = {
+                            key: [s for s in batch
+                                  if not (s == "security_check" and _org_check_batch(key))]
+                            for key, batch in checked_batches.items()}
                 for keep, batch in batches.items():
                     graph_client.prune_unseen_findings(
                         USER_ID, PROJECT_ID, batch, _RUN_STARTED_AT,
                         keep_hosts=keep,
                         keep_unproven=selective)
+                for (keep, hosts, types, others), batch in checked_batches.items():
+                    if not batch:
+                        continue
+                    if hosts is None:
+                        graph_client.prune_unseen_findings(
+                            USER_ID, PROJECT_ID, batch, _RUN_STARTED_AT,
+                            keep_hosts=keep, exclude_types=others,
+                            keep_unproven=selective)
+                    else:
+                        graph_client.prune_unseen_findings(
+                            USER_ID, PROJECT_ID, batch, _RUN_STARTED_AT,
+                            keep_hosts=keep, only_hosts=hosts, types=types,
+                            keep_unproven=selective)
     except Exception as e:
         # Never fail a completed scan over housekeeping: a finding that should
         # have been pruned is visible and wrong, which beats losing the run.
@@ -3232,11 +3864,15 @@ def _prune_recon_findings():
 _PHASE_FINDING_SOURCES = {
     "http_probe": ("http_probe",),
     "nmap": ("nmap_nse",),
-    "resource_enum": ("resource_enum", "jsluice"),
+    "resource_enum": ("resource_enum", "jsluice", "url_archive"),
     "ai_surface_recon": ("ai_surface_recon",),
     "js_recon": ("js_recon",),
     "vuln_scan": ("nuclei", "security_check", "vuln_scan"),
+    # The TLS-hygiene findings are built from tlsx's certificates.
+    "tlsx": ("security_check",),
     "cert_hygiene": ("security_check",),
+    "port_checks": ("security_check",),
+    "dns_checks": ("security_check",),
     "graphql_scan": ("graphql_scan", "graphql_cop"),
     "subdomain_takeover": ("takeover_scan",),
     "vhost_sni": ("vhost_sni_enum",),
@@ -3527,19 +4163,21 @@ def _run_pipeline():
         # through to a single-domain run with an empty target.
         print("[!][Batch] Domain batch with no group to run: refusing.")
         return 1
+    single = [] if groups else settings_scope_groups(_settings)
+    if not groups and not single:
+        print("[!][Pipeline] No target domain is configured: refusing.")
+        return 1
+    if _refuse_before_clear(groups or single[:1]):
+        return 1
 
     # ONCE per run, before any group: this is what lets a batch's groups
     # accumulate into a single graph instead of each wiping the last.
     _clear_recon_graph()
-    _start_urlscan_budget(groups or settings_scope_groups(_settings))
+    _start_urlscan_budget(groups or single)
 
     if groups:
         return run_domain_batch(groups, start_time)
 
-    single = settings_scope_groups(_settings)
-    if not single:
-        print("[!][Pipeline] No target domain is configured: refusing.")
-        return 1
     rc = run_domain_group(single[0], start_time=start_time)
     if rc == 0:
         _prune_recon_findings()
@@ -3564,7 +4202,7 @@ def _start_urlscan_budget(groups) -> None:
 # http_probe, resource_enum (with jsluice), AI Surface, JS Recon and vuln_scan
 # with its security checks. Every other recon source is never run there.
 _LEGACY_PATH_SOURCES = frozenset({
-    "http_probe", "resource_enum", "jsluice", "ai_surface_recon", "js_recon",
+    "http_probe", "resource_enum", "jsluice", "url_archive", "ai_surface_recon", "js_recon",
     "nuclei", "security_check", "vuln_scan",
 })
 
@@ -3824,8 +4462,7 @@ def run_domain_group(group: dict, start_time=None) -> int:
                 print(f"\n[*][Pipeline] GROUP 4: HTTP Probing")
                 domain_result = run_http_probe(domain_result, output_file=output_file, settings=_settings)
                 if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
-                    if "http_probe" not in domain_result["metadata"]["modules_executed"]:
-                        domain_result["metadata"]["modules_executed"].append("http_probe")
+                    _note_module_ran(domain_result, "http_probe")
                 with open(output_file, 'w') as f:
                     json.dump(domain_result, f, indent=2)
 
@@ -3870,6 +4507,9 @@ def run_domain_group(group: dict, start_time=None) -> int:
             with open(output_file, 'w') as f:
                 json.dump(domain_result, f, indent=2)
             domain_result = _maybe_run_cert_hygiene(domain_result, _settings, output_file)
+            domain_result = _maybe_run_port_checks(domain_result, _settings, output_file)
+            domain_result = _maybe_run_dns_checks(domain_result, _settings, output_file)
+            _note_gate_skipped(domain_result, _settings, phase_a=False)
         else:
             # Run resource_enum if in SCAN_MODULES (when domain_discovery is skipped)
             if "resource_enum" in SCAN_MODULES:
@@ -3893,16 +4533,20 @@ def run_domain_group(group: dict, start_time=None) -> int:
                                 domain_result["metadata"]["graph_db_resource_enum_updated"] = True
                                 domain_result["metadata"]["graph_db_resource_enum_stats"] = resource_stats
                                 print(f"[+][graph-db] Graph database updated with resource enumeration data")
+                                _note_write_errors("update_graph_from_resource_enum", resource_stats)
                             else:
                                 print(f"[!][graph-db] Could not connect to Neo4j - skipping resource enum graph update")
                                 domain_result["metadata"]["graph_db_resource_enum_updated"] = False
+                                _note_writer_failed("update_graph_from_resource_enum", "Neo4j not reachable")
                     except ImportError:
                         print(f"[!][graph-db] Neo4j client not available - skipping resource enum graph update")
                         domain_result["metadata"]["graph_db_resource_enum_updated"] = False
+                        _note_writer_failed("update_graph_from_resource_enum", "ImportError")
                     except Exception as e:
                         print(f"[!][graph-db] Resource enum graph update failed: {e}")
                         domain_result["metadata"]["graph_db_resource_enum_updated"] = False
                         domain_result["metadata"]["graph_db_resource_enum_error"] = str(e)
+                        _note_writer_failed("update_graph_from_resource_enum", type(e).__name__)
 
                     with open(output_file, 'w') as f:
                         json.dump(domain_result, f, indent=2)
@@ -3928,12 +4572,16 @@ def run_domain_group(group: dict, start_time=None) -> int:
                         from graph_db import Neo4jClient
                         with Neo4jClient() as graph_client:
                             if graph_client.verify_connection():
-                                graph_client.update_graph_from_js_recon(domain_result, USER_ID, PROJECT_ID)
+                                js_stats = graph_client.update_graph_from_js_recon(domain_result, USER_ID, PROJECT_ID)
                                 domain_result["metadata"]["graph_db_js_recon_updated"] = True
                                 print(f"[+][graph-db] Graph database updated with JS Recon data")
+                                _note_write_errors("update_graph_from_js_recon", js_stats)
+                            else:
+                                _note_writer_failed("update_graph_from_js_recon", "Neo4j not reachable")
                     except Exception as e:
                         print(f"[!][graph-db] JS Recon graph update failed: {e}")
                         domain_result["metadata"]["graph_db_js_recon_updated"] = False
+                        _note_writer_failed("update_graph_from_js_recon", type(e).__name__)
 
                     with open(output_file, 'w') as f:
                         json.dump(domain_result, f, indent=2)
@@ -3975,16 +4623,20 @@ def run_domain_group(group: dict, start_time=None) -> int:
                                 domain_result["metadata"]["graph_db_vuln_scan_updated"] = True
                                 domain_result["metadata"]["graph_db_vuln_scan_stats"] = vuln_stats
                                 print(f"[+][graph-db] Graph database updated with vuln scan data")
+                                _note_write_errors("update_graph_from_vuln_scan", vuln_stats)
                             else:
                                 print(f"[!][graph-db] Could not connect to Neo4j - skipping vuln scan graph update")
                                 domain_result["metadata"]["graph_db_vuln_scan_updated"] = False
+                                _note_writer_failed("update_graph_from_vuln_scan", "Neo4j not reachable")
                     except ImportError:
                         print(f"[!][graph-db] Neo4j client not available - skipping vuln scan graph update")
                         domain_result["metadata"]["graph_db_vuln_scan_updated"] = False
+                        _note_writer_failed("update_graph_from_vuln_scan", "ImportError")
                     except Exception as e:
                         print(f"[!][graph-db] Vuln scan graph update failed: {e}")
                         domain_result["metadata"]["graph_db_vuln_scan_updated"] = False
                         domain_result["metadata"]["graph_db_vuln_scan_error"] = str(e)
+                        _note_writer_failed("update_graph_from_vuln_scan", type(e).__name__)
 
                     with open(output_file, 'w') as f:
                         json.dump(domain_result, f, indent=2)

@@ -20,7 +20,9 @@ from recon.partial_recon_modules.helpers import (
     _is_valid_url,
     _should_include_root_domain,
     host_in_roots,
+    ip_mode_recon,
     partial_settings,
+    run_is_ip_mode,
     scope_roots,
 )
 from recon.partial_recon_modules.graph_builders import (
@@ -35,6 +37,7 @@ from recon.partial_recon_modules.graph_builders import (
 )
 from recon.partial_recon_modules.user_inputs import _create_user_subdomains_in_graph
 from recon.helpers import build_target_urls, extract_targets_from_recon
+from recon.helpers.archive_leaks import report_archive_leaks
 from recon.helpers.auth_profile import merge_auth_headers
 
 
@@ -50,6 +53,7 @@ def run_paramspider(config: dict) -> None:
     from recon.helpers.resource_enum.paramspider_helpers import (
         run_paramspider_discovery,
         merge_paramspider_into_by_base_url,
+        paramspider_urls_in_scope,
     )
 
     roots = scope_roots(config)
@@ -100,6 +104,11 @@ def run_paramspider(config: dict) -> None:
         target_domains.add(sub)
 
     print(f"[+][Partial Recon] Total target domains for ParamSpider: {len(target_domains)}")
+    if not target_domains and run_is_ip_mode():
+        # No name whose every address is a target: the archives index names,
+        # and the run's root is the project id (S-6).
+        print("[-][ParamSpider] IP mode: no hostname resolving only to target IPs, nothing to look up")
+        return
 
     # ParamSpider settings
     PARAMSPIDER_PLACEHOLDER = settings.get('PARAMSPIDER_PLACEHOLDER', 'FUZZ')
@@ -107,11 +116,13 @@ def run_paramspider(config: dict) -> None:
 
     # Run ParamSpider discovery
     print(f"[*][Partial Recon] Running ParamSpider on {len(target_domains)} domains...")
+    archive_quarantined: list = []
     paramspider_urls, paramspider_urls_by_domain = run_paramspider_discovery(
         target_domains,
         PARAMSPIDER_PLACEHOLDER,
         PARAMSPIDER_TIMEOUT,
         settings.get('PARAMSPIDER_WORKERS', 5),
+        quarantined_out=archive_quarantined,
     )
     print(f"[+][Partial Recon] ParamSpider discovered {len(paramspider_urls)} parameterized URLs")
 
@@ -124,12 +135,15 @@ def run_paramspider(config: dict) -> None:
 
     # Merge ParamSpider URLs into by_base_url structure
     print(f"[*][Partial Recon] Merging ParamSpider endpoints...")
+    in_scope_paramspider = paramspider_urls_in_scope(paramspider_urls, target_domains, settings)
     by_base_url = {}
     by_base_url, paramspider_stats = merge_paramspider_into_by_base_url(
-        paramspider_urls,
+        in_scope_paramspider,
         by_base_url,
         target_domains,
     )
+    paramspider_stats["paramspider_total"] = len(paramspider_urls)
+    paramspider_stats["paramspider_out_of_scope"] += len(paramspider_urls) - len(in_scope_paramspider)
 
     print(f"[+][Partial Recon] ParamSpider stats:")
     print(f"[+][Partial Recon]   Total: {paramspider_stats.get('paramspider_total', 0)}")
@@ -139,7 +153,7 @@ def run_paramspider(config: dict) -> None:
     print(f"[+][Partial Recon]   Out of scope: {paramspider_stats.get('paramspider_out_of_scope', 0)}")
 
     # Build resource_enum result structure (same shape as full pipeline)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": domain,
         "domains": roots,
         "subdomains": list(target_domains),
@@ -147,6 +161,7 @@ def run_paramspider(config: dict) -> None:
             "by_base_url": by_base_url,
             "forms": [],
             "jsluice_secrets": [],
+            "archive_leaks": report_archive_leaks(archive_quarantined, settings, domain),
             "scan_metadata": {
                 "paramspider_stats": paramspider_stats,
             },
@@ -158,7 +173,7 @@ def run_paramspider(config: dict) -> None:
             },
             "external_domains": [],
         },
-    }
+    }, settings)
 
     # Update the graph database
     print(f"[*][Partial Recon] Updating graph database...")
@@ -258,14 +273,14 @@ def run_kiterunner(config: dict) -> None:
         )
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "subdomains": [],
             "http_probe": {
                 "by_url": {},
             },
-        }
+        }, settings)
 
     # Inject user-provided URLs into the target list
     if user_urls:
@@ -278,7 +293,7 @@ def run_kiterunner(config: dict) -> None:
     # Union target-builder: BaseURLs ∪ uncovered Subdomains ∪ user URLs.
     # New subdomains get http(s)://<sub> fallback; httpx-covered hosts keep
     # only the verified scheme.
-    ips, hostnames, _ = extract_targets_from_recon(recon_data)
+    ips, hostnames, _ = extract_targets_from_recon(recon_data, settings)
     target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=False)
 
     target_domains = set()
@@ -349,6 +364,8 @@ def run_kiterunner(config: dict) -> None:
             KITERUNNER_MATCH_STATUS,
             KITERUNNER_MIN_CONTENT_LENGTH,
             KITERUNNER_HEADERS,
+            settings=settings,
+            recon_data=recon_data,
         )
 
     futures = {}
@@ -501,7 +518,7 @@ def run_kiterunner(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 
@@ -702,6 +719,7 @@ def run_arjun(config: dict) -> None:
         ARJUN_DISABLE_REDIRECTS,
         ARJUN_CUSTOM_HEADERS,
         target_domains,
+        settings=settings,
     )
 
     record_arjun_selection(arjun_meta, arjun_unexecuted)
@@ -730,11 +748,11 @@ def run_arjun(config: dict) -> None:
         print("[!][Partial Recon] Arjun found no parameters on any tested endpoint.")
 
     # Build recon_data for graph update (needs domain + subdomains for scope)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "subdomains": [],
-    }
+    }, settings)
 
     # Get subdomains for scope filtering
     if include_graph:
@@ -838,7 +856,7 @@ def run_arjun(config: dict) -> None:
                                     host=arjun_url_host(url),
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 

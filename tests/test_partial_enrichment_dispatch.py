@@ -64,7 +64,7 @@ def test_off_shadow_preserve_actual_native_argv_and_target_files(monkeypatch, da
     monkeypatch.setattr(vuln_scan, 'is_docker_running', lambda: True)
     monkeypatch.setattr(vuln_scan, 'pull_nuclei_docker_image', lambda image: True)
     monkeypatch.setattr(vuln_scan, 'ensure_templates_volume', lambda *args: True)
-    monkeypatch.setattr(vuln_scan, 'extract_targets_from_recon', lambda rd: ([], ['synthetic.test'], {}))
+    monkeypatch.setattr(vuln_scan, 'extract_targets_from_recon', lambda rd, settings=None: ([], ['synthetic.test'], {}))
     monkeypatch.setattr(vuln_scan, 'build_nuclei_command', nuclei_helpers.build_nuclei_command)
     monkeypatch.setattr(vuln_scan, '_execute_nuclei_pass', fake_pass)
     monkeypatch.setattr(vuln_scan, 'set_fp_ai_ctx', lambda **kw: None)

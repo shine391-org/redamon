@@ -1,26 +1,43 @@
 /** POST /api/mcp/test - proxy to agent's /mcp/test for live MCP draft validation.
  *
- * Body shape: { server: MCPServer, userId: string }.
- * userId is required (and explicit, not relying on middleware headers) so
- * we can restore a masked auth.token from the user's saved DB record. The
- * UI sends it from the same `userId` prop already used by the form's CRUD
- * endpoints - no JWT header juggling.
+ * Body shape: { server: MCPServer, userId?: string }. The account is the caller's
+ * own: a `userId` must be one the caller may write (the UI sends its own), and none
+ * means the caller. A masked auth.token is restored from that account's saved
+ * record. The agent spawns a stdio draft's command, so a stdio draft needs an
+ * administrator owner (NF-14), and no draft names an agent variable (OQ-R1).
  */
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { requireUserAccess } from '@/lib/session'
+import { isInternalRequest, requireSession, requireUserAccess } from '@/lib/session'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
-import { MASK_PREFIX, type MCPServer } from '@/lib/mcp/schema'
+import { MASK_PREFIX, isStdioServer, namesTokenEnvVar, type MCPServer } from '@/lib/mcp/schema'
+import { ownerRunsStdio, stdioRefusal, tokenEnvVarRefusal } from '@/lib/mcp/userServerAccess'
 import { internalError, readUpstreamBody, upstreamFailure } from '@/lib/routeErrors'
+import { mcpServerSecretReentry, secretReentryResponse } from '@/lib/authz/secretEndpointRebind'
+import { requireSelfPermission } from '@/lib/authz/selfService'
 
 /** Every answer keeps the panel's shape: McpServersTab renders these fields unconditionally. */
 const EMPTY_RESULT = { discovered_tools: [], warnings: [], elapsed_ms: 0 }
 
 export async function POST(request: NextRequest) {
   try {
+    const internal = isInternalRequest(request)
+    let caller: string | null = null
+    if (!internal) {
+      const session = await requireSession()
+      if (session instanceof NextResponse) return session
+      caller = session.userId
+    }
     const payload = await request.json() as { server: MCPServer; userId?: string }
     const body = payload.server
-    const userId = payload.userId
+    const userId = (typeof payload.userId === 'string' && payload.userId) || caller
+
+    if (!userId) {
+      return NextResponse.json(
+        { ok: false, error: 'request body must include `userId`', ...EMPTY_RESULT },
+        { status: 400 },
+      )
+    }
 
     if (!body) {
       return NextResponse.json(
@@ -31,28 +48,31 @@ export async function POST(request: NextRequest) {
 
     // The caller may only act on their OWN saved MCP secrets. Without this the
     // body-supplied userId could restore another user's token from the DB and
-    // echo it to the agent test-spawn path (cross-tenant secret exposure).
-    if (userId) {
-      const denied = await requireUserAccess(request, userId)
-      if (denied) return denied
+    // echo it to the agent test-spawn path (cross-tenant secret exposure). The
+    // write rule: an admin's read of another account never sends its token.
+    const denied = await requireUserAccess(request, userId, { mode: 'write' })
+    if (denied) return denied
+    const selfRefused = await requireSelfPermission(request, userId, 'self:mcp_servers')
+    if (selfRefused) return selfRefused
+
+    if (namesTokenEnvVar(body)) return tokenEnvVarRefusal({ ok: false, ...EMPTY_RESULT })
+    if (isStdioServer(body) && !(await ownerRunsStdio(userId))) {
+      return stdioRefusal({ actorId: caller, ownerId: userId, serverId: body.id, via: 'test' }, { ok: false, ...EMPTY_RESULT })
     }
 
     // If the user clicked Test on a saved server, the token field is the
     // mask. Substitute the real token from the DB before forwarding.
     if (body.auth?.token?.startsWith(MASK_PREFIX)) {
-      if (!userId) {
-        return NextResponse.json({
-          ok: false,
-          error: 'token is masked but request did not include userId - cannot restore from DB',
-          discovered_tools: [], warnings: [], elapsed_ms: 0,
-        }, { status: 400 })
-      }
       const settings = await prisma.userSettings.findUnique({
         where: { userId },
         select: { mcpServers: true },
       })
       const saved = (Array.isArray(settings?.mcpServers) ? settings!.mcpServers : []) as MCPServer[]
       const existing = saved.find(s => s.id === body.id)
+      // Only to the URL it was saved for (HD-24): a draft pointing elsewhere
+      // needs the token pasted again. This route restores the token alone.
+      const reentry = existing && mcpServerSecretReentry(existing, body as unknown as Record<string, unknown>, { headers: false })
+      if (reentry) return secretReentryResponse(reentry, { ok: false, ...EMPTY_RESULT })
       if (existing?.auth?.token && !existing.auth.token.startsWith(MASK_PREFIX)) {
         body.auth = { ...body.auth, token: existing.auth.token }
       } else {

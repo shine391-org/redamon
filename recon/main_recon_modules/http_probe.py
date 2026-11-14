@@ -17,6 +17,7 @@ Features:
 - Banner grabbing for non-HTTP ports (SSH, FTP, SMTP, MySQL, etc.)
 """
 
+import ipaddress
 import json
 import math
 import subprocess
@@ -29,6 +30,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 
@@ -108,6 +110,7 @@ from helpers.ai_signal_catalog import (
     match_ai_title,
     match_ai_body_fingerprint,
 )
+from recon.helpers import request_pacer
 
 # Settings are passed from main.py to avoid multiple database queries
 
@@ -377,9 +380,11 @@ def grab_banner(host: str, port: int, timeout: float = 5.0, use_ssl: bool = Fals
     """
 
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
+        # The banner grab connects in-process, so its connections share the
+        # RoE ceiling's clock with recon's other requests (inert with none).
+        request_pacer.acquire()
+        # Picks the address family from the target, so an IPv6 address connects too.
+        sock = socket.create_connection((host, port), timeout=timeout)
 
         # Wrap with SSL if needed
         if use_ssl:
@@ -480,6 +485,53 @@ def grab_banner_for_target(target: tuple, timeout: float = 5, max_length: int = 
     }
 
 
+def _admit_banner_targets(targets: List[tuple], recon_data: dict, settings: dict) -> List[tuple]:
+    """The ``(address, port, host)`` targets the RoE lets the banner grab reach.
+
+    It connects to each address itself, and by_host can hold one a passive
+    source or a partial run's graph rows added, so the RoE IP and CIDR
+    exclusions apply here as they do at httpx. Inert with no exclusion.
+    """
+    from recon.helpers.target_admission import admission_context, admit_targets
+    if not admission_context(settings, recon_data).active:
+        return targets
+    names: Dict[str, List[str]] = {}
+    ips: List[str] = []
+    for address, _port, host in targets:
+        if is_ip(host):
+            ips.append(address)
+        else:
+            known = names.setdefault(host, [])
+            if address != host and address not in known:
+                known.append(address)
+    adm = admit_targets(settings, recon_data, names=names, ips=ips, module="banner_grab")
+    reachable = {**adm.names, **adm.split}
+
+    def admitted(address: str, host: str) -> bool:
+        if is_ip(host):
+            return address in adm.ips
+        if address == host:
+            # No address known: the connect resolves the name itself.
+            return host in adm.names
+        return address in reachable.get(host, ())
+
+    return [t for t in targets if admitted(t[0], t[2])]
+
+
+def _one_grab_per_address(targets: List[tuple]) -> List[tuple]:
+    """IP mode: one connection per address and port (design §5.3). A PTR name
+    kept beside its address reaches the same socket, so the address's own
+    entry is grabbed and the name takes its banner. Order kept."""
+    chosen: Dict[tuple, tuple] = {}
+    for target in targets:
+        address, port, host = target
+        key = (_canonical_ip(address), port)
+        held = chosen.get(key)
+        if held is None or (host == address and held[2] != held[0]):
+            chosen[key] = target
+    return [t for t in targets if chosen.get((_canonical_ip(t[0]), t[1])) is t]
+
+
 def run_banner_grab(recon_data: dict, settings: dict = None) -> Dict:
     """
     Run banner grabbing on non-HTTP ports from naabu results.
@@ -511,18 +563,31 @@ def run_banner_grab(recon_data: dict, settings: dict = None) -> Dict:
     if not by_host:
         return {}
 
-    # Build target list for non-HTTP ports
+    # Build target list for non-HTTP ports. A domain run's name on several
+    # addresses lists every address's ports, each detail naming its own: the
+    # connect goes there, never to the name's first address. A detail with no
+    # `ip` (IP mode, older rows) is on the entry's address.
     targets = []
     for hostname, host_data in by_host.items():
         ip = host_data.get("ip", hostname)
-        ports = host_data.get("ports", [])
+        pairs = [(d.get("ip") or ip, d.get("port"))
+                 for d in host_data.get("port_details") or [] if isinstance(d, dict)]
+        if any(isinstance(d, dict) and d.get("ip") for d in host_data.get("port_details") or []):
+            listed = {port for _, port in pairs}
+            pairs += [(ip, port) for port in host_data.get("ports", []) if port not in listed]
+        else:
+            pairs = [(ip, port) for port in host_data.get("ports", [])]
 
-        for port in ports:
+        for address, port in pairs:
             # Web ports are httpx's; a plaintext connect there only waits.
             if port in BANNER_GRAB_SKIP_PORTS:
                 continue
-            targets.append((ip, port, hostname))
+            targets.append((address, port, hostname))
 
+    targets = _admit_banner_targets(targets, recon_data, settings)
+    ip_mode = bool((recon_data.get("metadata") or {}).get("ip_mode"))
+    if ip_mode:
+        targets = _one_grab_per_address(targets)
     if not targets:
         return {}
 
@@ -588,13 +653,21 @@ def run_banner_grab(recon_data: dict, settings: dict = None) -> Dict:
                 "version": result.get("version")
             })
     
-    # Also enrich naabu port_details with banner info
+    # Also enrich naabu port_details with banner info. In IP mode a name grabbed
+    # through its address's entry takes that banner.
     for host, host_data in naabu_data.get("by_host", {}).items():
         if "port_details" in host_data:
+            address = _canonical_ip(str(host_data.get("ip", host)))
             for port_detail in host_data["port_details"]:
                 port = port_detail.get("port")
+                own = _canonical_ip(str(port_detail["ip"])) if port_detail.get("ip") else None
                 for result in results:
-                    if result["host"] == host and result["port"] == port:
+                    reached = _canonical_ip(str(result.get("ip") or result["host"]))
+                    if own is not None and reached != own:
+                        continue
+                    if result["port"] == port and (
+                            result["host"] == host
+                            or (ip_mode and reached == address)):
                         if result.get("banner"):
                             port_detail["banner"] = result["banner"]
                         if result.get("version"):
@@ -658,22 +731,35 @@ def url_port(url: str) -> int:
 
     Returns -1 when the URL can't be parsed.
     """
-    m = re.match(r"^(https?)://([^/:]+)(?::(\d+))?", url.strip(), re.IGNORECASE)
-    if not m:
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
         return -1
-    scheme, _host, port = m.group(1).lower(), m.group(2), m.group(3)
-    if port:
-        try:
-            return int(port)
-        except ValueError:
-            return -1
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        return -1
+    if port is not None:
+        return port
     return 443 if scheme == "https" else 80
+
+
+def _url_authority(host: str) -> str:
+    """``host`` as a URL's authority needs it: an IPv6 literal in brackets
+    (B-12; unbracketed, ``https://2001:db8::1:8443`` names no port at all)."""
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            return f"[{host}]"
+    except ValueError:
+        pass
+    return host
 
 
 def _urls_for_host_ports(host: str, ports) -> List[str]:
     """Build candidate http/https URLs for ``host`` across ``ports`` using the
     same protocol heuristic as :func:`build_targets_from_naabu`."""
     urls: List[str] = []
+    host = _url_authority(host)
     for port in sorted(set(ports)):
         if port == 443:
             urls.append(f"https://{host}")
@@ -736,7 +822,8 @@ def build_targets_from_naabu(recon_data: dict, settings: dict = None) -> List[st
     http_ports = HTTP_PORTS
 
     if naabu_data:
-        for host, data in naabu_data.get("by_host", {}).items():
+        for key, data in naabu_data.get("by_host", {}).items():
+            host = _url_authority(key)
             for port_info in data.get("port_details", []):
                 port = port_info.get("port")
                 service = port_info.get("service", "").lower()
@@ -797,6 +884,7 @@ def build_targets_from_dns(recon_data: dict, settings: dict = None) -> List[str]
         extra_https_ports = [8443, 4443, 9443]
 
         def _add_host(host: str) -> None:
+            host = _url_authority(host)
             urls.append(f"http://{host}")
             urls.append(f"https://{host}")
             for port in extra_http_ports:
@@ -860,17 +948,72 @@ def get_host_path(container_path: str) -> str:
     return container_path
 
 
-def httpx_budget(url_count: int, threads: int, timeout: int, retries: int) -> int:
+def httpx_budget(url_count: int, threads: int, timeout: int, retries: int,
+                 delay: float = 0.0) -> int:
     """Worst-case seconds for one httpx run (after hakrawler_job_budget).
 
     httpx works through the URLs `threads` at a time, each taking up to
-    `timeout * (retries + 1)`, plus 60s of startup/parse slack. The old
+    `timeout * (retries + 1)`, plus `delay` seconds between URLs (its -delay,
+    set under the RoE ceiling) and 60s of startup/parse slack. The old
     `url_count * timeout` was ~2.8h for 1,000 URLs, so it never fired and a hung
     probe ran for hours.
     """
     per_url = max(1, int(timeout)) * (max(0, int(retries)) + 1)
     waves = math.ceil(max(0, int(url_count)) / max(1, int(threads)))
-    return waves * per_url + 60
+    return waves * per_url + math.ceil(max(0, int(url_count)) * max(0.0, float(delay))) + 60
+
+
+def httpx_ceiling_pacing(settings: dict) -> Optional[dict]:
+    """httpx's flags under the RoE ceiling C, or None with no ceiling.
+
+    httpx (v1.12) holds -rl in fixed one-second windows (projectdiscovery/ratelimit:
+    a window's tokens can all go out at its start, so two windows' worth can land
+    within one second) and counts only each URL's main request: its retries, its
+    redirect hops, the favicon fetch and JARM's ten handshakes take no token, and
+    `-t 1` still keeps two URLs in flight. So under a ceiling: one thread, no
+    retries, -rl at half the ceiling (at least 1, never above the project's rate),
+    2/C seconds between URLs, and no favicon or JARM probe (``drop``), whose
+    requests no setting can count. On a loopback lab at C = 2 that took the
+    busiest second from 7 connections to 2; redirect hops still take no token.
+    """
+    ceiling = request_pacer.ceiling_rps(settings)
+    if not ceiling:
+        return None
+    rate = max(1, math.floor(ceiling / 2))
+    configured = settings.get('HTTPX_RATE_LIMIT', 50)
+    if isinstance(configured, (int, float)) and not isinstance(configured, bool) and configured > 0:
+        rate = max(1, min(rate, int(configured)))
+    drop = [probe for probe, key in (("jarm", 'HTTPX_PROBE_JARM'), ("favicon", 'HTTPX_PROBE_FAVICON'))
+            if settings.get(key, True)]
+    return {"ceiling": ceiling, "threads": 1, "retries": 0, "rate_limit": rate,
+            "delay_ms": math.ceil(2000 / ceiling), "drop": drop}
+
+
+_FINGERPRINT_LABELS = {"jarm": "JARM", "favicon": "favicon"}
+
+
+def _note_fingerprints_not_collected(pacing: dict, url_count: int) -> None:
+    """Log and record, as a coverage gap, the probes the ceiling turned off.
+
+    A URL with no JARM or favicon hash from this run was not fingerprinted,
+    which is not the same as having none: the gap (sources ``httpx_jarm``,
+    ``httpx_favicon``) says so, and the graph writers keep the hashes an
+    earlier run stored, since they skip absent values. A probe the project
+    itself turned off is not a gap. Never raises.
+    """
+    drop = pacing.get("drop") or []
+    if not drop:
+        return
+    ceiling = f"{pacing['ceiling']:g} rps RoE ceiling"
+    print(f"[-][httpx] {' and '.join(_FINGERPRINT_LABELS[p] for p in drop)} not collected while "
+          f"the {ceiling} is in force: httpx's limiter does not count their requests")
+    try:
+        from recon.helpers import circuit_breaker
+        circuit_breaker.note_degraded("http_probe", entries=[
+            {"source": f"httpx_{p}", "reason": f"not collected under the {ceiling}",
+             "skipped": url_count} for p in drop])
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stop_httpx_at_budget(process, container: str, budget: int, url_count: int) -> None:
@@ -900,8 +1043,31 @@ def _stop_httpx_at_budget(process, container: str, budget: int, url_count: int) 
         pass
 
 
+def _probe_failed(recon_data: dict, reason: str, detail: str = "") -> dict:
+    """httpx could not run, so it checked nothing. Never raises.
+
+    Returning without an ``http_probe`` payload looked like "no live URL" to
+    the pipeline, which then ran its scanners on no URL and pruned their
+    findings as gone. The phase error tells the live-URL gate why nothing was
+    probed (`should_skip_active_scans`), and the http_probe source is kept.
+    ``detail`` (stderr, an exception message) may name a target, so it stays
+    out of the coverage record.
+    """
+    error = f"{reason}: {detail}" if detail else reason
+    print(f"[!][httpx] {error} - nothing was probed; earlier findings are kept")
+    recon_data.setdefault("metadata", {}).setdefault("phase_errors", {})["http_probe"] = error
+    try:
+        from recon.helpers import circuit_breaker
+        circuit_breaker.note_degraded("http_probe", sources=["http_probe"],
+                                      reason=f"httpx failed: {reason}")
+    except Exception:  # noqa: BLE001
+        pass
+    return recon_data
+
+
 def build_httpx_command(targets_file: str, output_file: str, settings: dict,
-                        probe_hosts: List[str] = None, container_name: str = None) -> List[str]:
+                        probe_hosts: List[str] = None, container_name: str = None,
+                        ip_mode: Optional[bool] = None) -> List[str]:
     """
     Build the Docker command for running httpx.
 
@@ -909,10 +1075,21 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
         targets_file: Path to file containing URLs (one per line)
         output_file: Path for JSON output
         settings: Settings dictionary from main.py
+        ip_mode: the run is an IP-mode one (default: ``settings["IP_MODE"]``).
+            Its targets are addresses, so httpx stays on them: redirects only
+            on the same host (-fhr), and no -tls-probe, which sends requests
+            to the names a certificate lists (B-05, B-06).
+        Under RoE exclusions (``settings``) the same two limits as IP mode:
+        an admitted host's redirect, or its certificate's names, can lead to an
+        excluded host, and httpx requests it before any check (R-2).
 
     Returns:
         List of command arguments
     """
+    if ip_mode is None:
+        ip_mode = bool(settings.get('IP_MODE'))
+    from recon.helpers.target_admission import admission_context
+    roe_exclusions = bool(admission_context(settings).excluded)
     # Extract settings from passed dict
     HTTPX_DOCKER_IMAGE = settings.get('HTTPX_DOCKER_IMAGE', 'projectdiscovery/httpx:latest')
     HTTPX_THREADS = settings.get('HTTPX_THREADS', 50)
@@ -958,6 +1135,12 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
     HTTPX_CUSTOM_HEADERS = _append_identity(HTTPX_CUSTOM_HEADERS, settings)
     HTTPX_MATCH_CODES = settings.get('HTTPX_MATCH_CODES', [])
     HTTPX_FILTER_CODES = settings.get('HTTPX_FILTER_CODES', [])
+    pacing = httpx_ceiling_pacing(settings)
+    if pacing:
+        HTTPX_THREADS = pacing["threads"]
+        HTTPX_RETRIES = pacing["retries"]
+        HTTPX_RATE_LIMIT = pacing["rate_limit"]
+        HTTPX_PROBE_FAVICON = HTTPX_PROBE_JARM = False
 
     # Convert container paths to host paths for sibling container volume mounts
     targets_host_path = get_host_path(str(Path(targets_file).parent))
@@ -1004,12 +1187,14 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
 
     if HTTPX_RATE_LIMIT > 0:
         cmd.extend(["-rl", str(HTTPX_RATE_LIMIT)])
+    if pacing:
+        cmd.extend(["-delay", f"{pacing['delay_ms']}ms"])
 
     # Redirect handling. httpx re-sends its -H set to whatever host a redirect
     # names, so with a session attached -fhr (same-host only) keeps redirect
     # coverage without handing the credentials to an off-scope host.
     if HTTPX_FOLLOW_REDIRECTS:
-        cmd.append("-fhr" if _has_auth else "-fr")
+        cmd.append("-fhr" if _has_auth or ip_mode or roe_exclusions else "-fr")
         cmd.extend(["-maxr", str(HTTPX_MAX_REDIRECTS)])
 
     # Probing options
@@ -1041,7 +1226,7 @@ def build_httpx_command(targets_file: str, output_file: str, settings: dict,
         cmd.append("-cname")
 
     # TLS info
-    if HTTPX_PROBE_TLS_INFO:
+    if HTTPX_PROBE_TLS_INFO and not ip_mode and not roe_exclusions:
         cmd.append("-tls-probe")
     if HTTPX_PROBE_TLS_GRAB:
         cmd.append("-tls-grab")
@@ -1357,7 +1542,7 @@ def _redirect_chain(chain_codes, status_code) -> Optional[List[int]]:
 
 
 def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list = None, settings: dict = None,
-                       *, exact: bool = False, include_root: bool = True) -> Dict:
+                       *, exact: bool = False, include_root: bool = True, run_addresses=()) -> Dict:
     """
     Parse httpx JSON Lines output into structured format.
 
@@ -1374,6 +1559,8 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
                   TITLE_DETECTION_ENABLED / WAPPALYZER_ENABLED).
         exact, include_root: passed to is_host_in_scope (an EXACT group's list
                   is authoritative even when empty; the root needs Include Root).
+        run_addresses: the run's own addresses (``_run_addresses``); an IP
+                  literal outside them is out of scope like a foreign name.
 
     Returns:
         Structured dictionary with by_url, by_host, technologies_found, and summary
@@ -1383,6 +1570,7 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
     technologies_found = {}
     servers_found = {}
     filtered_count = 0  # Track URLs filtered out due to domain/host mismatch
+    run_addresses = frozenset(_canonical_ip(a) for a in run_addresses or () if isinstance(a, str))
     external_domain_entries = []  # Collect out-of-scope domains for situational awareness
     ai_summary: dict = {}  # AI surface recon counters: {header_matches, favicon_matches, title_matches, wappalyzer_matches}
 
@@ -1420,7 +1608,8 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
             # In full discovery mode: allow any host within root_domain scope
             # Also check the original input URL host (httpx may follow redirects to a different host)
             in_scope = lambda h: is_host_in_scope(  # noqa: E731
-                h, root_domain, allowed_hosts, exact=exact, include_root=include_root)
+                h, root_domain, allowed_hosts, exact=exact, include_root=include_root,
+                run_addresses=run_addresses)
             if root_domain and not in_scope(host):
                 input_url = entry.get("input", "")
                 input_host = extract_host_from_url(input_url) if input_url else ""
@@ -1693,16 +1882,14 @@ def parse_httpx_output(output_file: str, root_domain=None, allowed_hosts: list =
 
 
 def extract_host_from_url(url: str) -> str:
-    """Extract hostname from URL."""
+    """The URL's host as written, without port or userinfo. An IPv6 literal
+    comes back bare (``2001:db8::10``), the form the graph keys an IP by."""
     try:
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        host = parsed.netloc
-        # Remove port if present
-        if ':' in host:
-            host = host.split(':')[0]
-        return host
-    except Exception:
+        netloc = urlsplit(url).netloc.rpartition("@")[2]
+        if netloc.startswith("["):
+            return netloc[1:].partition("]")[0]
+        return netloc.partition(":")[0]
+    except Exception:  # noqa: BLE001 - httpx output is untrusted; no URL, no host
         return ""
 
 
@@ -1720,7 +1907,8 @@ def httpx_scope_roots(recon_data: dict):
 
 
 def is_host_in_scope(host: str, root_domain, allowed_hosts: list = None, *,
-                     exact: bool = False, include_root: bool = True) -> bool:
+                     exact: bool = False, include_root: bool = True,
+                     run_addresses=()) -> bool:
     """
     Check if a hostname is within the target scope.
     
@@ -1737,6 +1925,10 @@ def is_host_in_scope(host: str, root_domain, allowed_hosts: list = None, *,
                nothing (rather than falling back to the root's subdomains).
         include_root: whether a root itself is a target; False keeps only its
                strict subdomains (§4.6).
+        run_addresses: the run's own addresses (``_run_addresses``), in
+               canonical form. Outside filtered mode an IP literal is in scope
+               only as one of them: a redirect to someone else's address is not
+               the target's page.
 
     Returns:
         True if host is in scope, False otherwise
@@ -1755,12 +1947,34 @@ def is_host_in_scope(host: str, root_domain, allowed_hosts: list = None, *,
         allowed_set = {h.lower().strip() for h in allowed_hosts or []}
         return host in allowed_set
 
-    # IP addresses bypass domain scope check
     if is_ip(host):
-        return True
+        return _canonical_ip(host) in run_addresses
 
     # Check if host is within the root domain scope
     return any((host == root and include_root) or host.endswith(f".{root}") for root in roots)
+
+
+def _canonical_ip(value: str) -> str:
+    """One spelling per address (``2001:DB8:0::10`` is ``2001:db8::10``)."""
+    try:
+        return str(ipaddress.ip_address(value.strip().strip("[]")))
+    except ValueError:
+        return value
+
+
+def _run_addresses(recon_data: dict, urls: List[str], settings: dict = None) -> frozenset:
+    """The addresses an IP-literal httpx result may carry and still be the
+    target's: every address the run resolved or port-scanned and every IP it
+    asked httpx to probe, less those the RoE excludes. Canonical form."""
+    from recon.helpers.target_admission import admit_targets, known_addresses
+    found = {a for addrs in known_addresses(recon_data).values() for a in addrs}
+    port_scan = recon_data.get("port_scan") or {}
+    found.update(port_scan.get("by_ip") or {})
+    found.update(h for h in (port_scan.get("by_host") or {}) if is_ip(h))
+    found.update(str(a) for a in (recon_data.get("metadata") or {}).get("expanded_ips") or [] if a)
+    found.update(h for h in (extract_host_from_url(u) for u in urls) if is_ip(h))
+    found = sorted({_canonical_ip(a) for a in found if isinstance(a, str) and a})
+    return frozenset(admit_targets(settings, recon_data, ips=found, module="httpx", record=False).ips)
 
 
 def is_ip(value: str) -> bool:
@@ -2245,19 +2459,23 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
     HTTPX_INCLUDE_RESPONSE = settings.get('HTTPX_INCLUDE_RESPONSE', True)
     BANNER_GRAB_ENABLED = settings.get('BANNER_GRAB_ENABLED', True)
 
+    # This probe's outcome replaces an earlier one's: the legacy path reloads
+    # the previous run's file, phase errors and all.
+    ((recon_data.get("metadata") or {}).get("phase_errors") or {}).pop("http_probe", None)
+
     # Check Docker
     if not is_docker_installed():
         print("[!][httpx] Docker is not installed. Please install Docker first.")
-        return recon_data
+        return _probe_failed(recon_data, "Docker is not installed")
 
     if not is_docker_running():
         print("[!][httpx] Docker daemon is not running. Please start Docker.")
-        return recon_data
+        return _probe_failed(recon_data, "Docker daemon is not running")
 
     # Pull image if needed
     if not pull_httpx_docker_image(HTTPX_DOCKER_IMAGE):
         print("[!][httpx] Failed to get httpx Docker image")
-        return recon_data
+        return _probe_failed(recon_data, "httpx Docker image unavailable")
 
     # Build target URLs
     print("\n[*][httpx] Building target URLs...")
@@ -2282,6 +2500,11 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
     if dropped:
         print(f"[*][httpx] Custom-port scope active {sorted(custom_ports)} — "
               f"dropped {dropped} out-of-scope URL(s)")
+
+    # httpx resolves each name itself: a host the RoE excludes, by name or by
+    # any address it resolved to, never reaches targets.txt.
+    from recon.helpers.target_admission import admit_urls
+    urls, _ = admit_urls(settings, recon_data, urls, module="httpx")
 
     if not urls:
         print("[!][httpx] No URLs to probe")
@@ -2308,19 +2531,44 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
         from urllib.parse import urlparse as _urlparse
         _probe_hosts = sorted({h for h in (_urlparse(u).hostname for u in urls) if h})
         httpx_container = f"redamon-httpx-{uuid.uuid4().hex[:12]}"
-        cmd = build_httpx_command(str(targets_file), str(httpx_output), settings,
+        # The builder reads IP mode from IP_MODE; a recon dict that says IP mode
+        # (a partial run's builder) decides it too.
+        ip_mode = bool((recon_data.get("metadata") or {}).get("ip_mode") or settings.get("IP_MODE"))
+        cmd_settings = {**settings, "IP_MODE": True} if ip_mode and not settings.get("IP_MODE") else settings
+        # A partial run's RoE can come in the recon dict (metadata.roe) only;
+        # the builder reads it from its settings.
+        from recon.helpers.target_admission import admission_context
+        excluded = admission_context(settings, recon_data).excluded
+        roe_exclusions = bool(excluded)
+        if roe_exclusions and not admission_context(cmd_settings).excluded:
+            cmd_settings = {**cmd_settings, "ROE_ENABLED": True, "ROE_EXCLUDED_HOSTS": list(excluded)}
+        cmd = build_httpx_command(str(targets_file), str(httpx_output), cmd_settings,
                                   probe_hosts=_probe_hosts, container_name=httpx_container)
 
+        pacing = httpx_ceiling_pacing(cmd_settings)
         print(f"\n[*][httpx] Starting httpx probe...")
         print(f"[*][httpx] URLs to probe: {len(urls)}")
-        print(f"[*][httpx] Threads: {HTTPX_THREADS}")
+        print(f"[*][httpx] Threads: {pacing['threads'] if pacing else HTTPX_THREADS}")
         print(f"[*][httpx] Timeout: {HTTPX_TIMEOUT}s")
-        print(f"[*][httpx] Rate limit: {HTTPX_RATE_LIMIT} req/s")
+        print(f"[*][httpx] Rate limit: {pacing['rate_limit'] if pacing else HTTPX_RATE_LIMIT} req/s")
         print(f"[*][httpx] Follow redirects: {HTTPX_FOLLOW_REDIRECTS}")
+        if HTTPX_FOLLOW_REDIRECTS and roe_exclusions:
+            print("[*][httpx] Redirects followed on the same host only: RoE exclusions are in force")
+        if pacing:
+            caveat = ("; its redirect hops take no token of httpx's limiter and can exceed it"
+                      if HTTPX_FOLLOW_REDIRECTS else "")
+            print(f"[*][httpx] Paced to the {pacing['ceiling']:g} rps RoE ceiling: one URL at a time, "
+                  f"-rl {pacing['rate_limit']}, -delay {pacing['delay_ms']}ms, no retries{caveat}")
+            _note_fingerprints_not_collected(pacing, len(urls))
 
         if HTTPX_PROBE_TECH_DETECT:
             print(f"[*][httpx] Technology detection: enabled")
-        if HTTPX_PROBE_TLS_INFO:
+        if HTTPX_PROBE_TLS_INFO and ip_mode:
+            print(f"[-][httpx] TLS probing: off in IP mode (it would request the certificate's names)")
+        elif HTTPX_PROBE_TLS_INFO and roe_exclusions:
+            print("[-][httpx] TLS probing: off while RoE exclusions are in force "
+                  "(it would request the certificate's names)")
+        elif HTTPX_PROBE_TLS_INFO:
             print(f"[*][httpx] TLS probing: enabled")
         if HTTPX_INCLUDE_RESPONSE:
             print(f"[*][httpx] Response body: included")
@@ -2336,8 +2584,12 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
             text=True
         )
 
-        safety_timeout = httpx_budget(len(urls), HTTPX_THREADS, HTTPX_TIMEOUT,
-                                      settings.get('HTTPX_RETRIES', 2))
+        if pacing:
+            safety_timeout = httpx_budget(len(urls), pacing["threads"], HTTPX_TIMEOUT,
+                                          pacing["retries"], delay=pacing["delay_ms"] / 1000)
+        else:
+            safety_timeout = httpx_budget(len(urls), HTTPX_THREADS, HTTPX_TIMEOUT,
+                                          settings.get('HTTPX_RETRIES', 2))
         timed_out = False
         try:
             _, stderr = process.communicate(timeout=safety_timeout)
@@ -2354,11 +2606,12 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
 
         if timed_out and not httpx_output.exists():
             print("[!][httpx] Nothing was written before the budget ran out")
-            return recon_data
+            return _probe_failed(recon_data, "httpx stopped at its runtime budget")
 
         if process.returncode != 0 and not httpx_output.exists():
             print(f"[!][httpx] Probe failed: {stderr[:200] if stderr else 'Unknown error'}")
-            return recon_data
+            return _probe_failed(recon_data, f"httpx exited {process.returncode}",
+                                 (stderr or "")[:200])
 
         # Parse results (filter URLs outside target scope)
         print(f"\n[*][httpx] Parsing results...")
@@ -2388,7 +2641,8 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
 
         results = parse_httpx_output(str(httpx_output), root_domain=scope_roots, allowed_hosts=allowed_hosts,
                                      settings=settings, exact=exact,
-                                     include_root=scope.include_root or scope.mode is None)
+                                     include_root=scope.include_root or scope.mode is None,
+                                     run_addresses=_run_addresses(recon_data, urls, settings))
 
         # Log if any URLs were filtered out
         filtered_count = results.get("summary", {}).get("filtered_out_of_scope", 0)
@@ -2499,7 +2753,7 @@ def run_http_probe(recon_data: dict, output_file: Path = None, settings: dict = 
 
     except Exception as e:
         print(f"[!][httpx] Error during probe: {e}")
-        return recon_data
+        return _probe_failed(recon_data, f"httpx error ({type(e).__name__})", str(e))
     finally:
         # Cleanup temp files
         try:

@@ -16,9 +16,16 @@ const mockRequireUserAccess = vi.fn()
 const mockUserSettingsFindUnique = vi.fn()
 const mockFetch = vi.fn()
 
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/session', () => ({
   requireUserAccess: (...a: unknown[]) => mockRequireUserAccess(...a),
+  requireSession: async () => ({ userId: 'u1', role: 'admin' }),
+  isInternalRequest: () => false,
 }))
+// The drafts here are stdio servers: their owner is an administrator, so the stdio
+// rule (step 1.9, route.test.ts) lets them through to the checks this file covers.
+vi.mock('@/lib/authz/principal', () => ({ loadPrincipal: async (id: string) => ({ id, role: 'admin' }) }))
+vi.mock('@/lib/audit', () => ({ writeAudit: vi.fn() }))
 vi.mock('@/lib/agentAuth', () => ({
   internalKeyHeaders: (base: Record<string, string> = {}) => ({ ...base, 'x-internal-key': 'IK-TEST' }),
 }))
@@ -50,7 +57,8 @@ describe('POST /api/mcp/test — ownership + secret echo', () => {
     const server = { id: 's1', name: 's1', transport: 'stdio', command: 'node', auth: { token: 'whatever' } }
     const res = await POST(req(server, 'victim'))
     expect(res.status).toBe(403)
-    expect(mockRequireUserAccess).toHaveBeenCalledWith(expect.anything(), 'victim')
+    // the write rule (HD-23): an admin, who may read the account, cannot send its token anywhere
+    expect(mockRequireUserAccess).toHaveBeenCalledWith(expect.anything(), 'victim', { mode: 'write' })
     expect(mockUserSettingsFindUnique).not.toHaveBeenCalled()
     expect(mockFetch).not.toHaveBeenCalled()
   })
@@ -69,11 +77,12 @@ describe('POST /api/mcp/test — ownership + secret echo', () => {
     expect(opts.headers['x-internal-key']).toBe('IK-TEST')
   })
 
-  test('no userId + literal token forwards directly (no ownership lookup)', async () => {
+  test('no userId + literal token: the caller\'s own account is checked, then it forwards (step 1.9)', async () => {
+    mockRequireUserAccess.mockResolvedValue(null)
     const server = { id: 's1', name: 's1', transport: 'stdio', command: 'node', auth: { token: 'literal' } }
     const res = await POST(req(server, undefined))
     expect(res.status).toBe(200)
-    expect(mockRequireUserAccess).not.toHaveBeenCalled()
+    expect(mockRequireUserAccess).toHaveBeenCalledWith(expect.anything(), 'u1', { mode: 'write' })
     expect(mockUserSettingsFindUnique).not.toHaveBeenCalled()
     expect(mockFetch).toHaveBeenCalledTimes(1)
     expect(mockFetch.mock.calls[0][1].headers['x-internal-key']).toBe('IK-TEST')
@@ -86,5 +95,38 @@ describe('POST /api/mcp/test — ownership + secret echo', () => {
     expect(res.status).toBe(403)
     expect(mockUserSettingsFindUnique).not.toHaveBeenCalled()
     expect(mockFetch).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /api/mcp/test — a masked token goes only to the URL it was saved for (HD-24)', () => {
+  const SAVED = { id: 's1', transport: 'streamable_http', url: 'https://mcp.example.com/mcp', auth: { type: 'bearer', token: 'REALTOKEN' } }
+
+  beforeEach(() => {
+    mockRequireUserAccess.mockResolvedValue(null)
+    mockUserSettingsFindUnique.mockResolvedValue({ mcpServers: [SAVED] })
+  })
+
+  test('mcp test does not restore a token for a changed URL', async () => {
+    const draft = { ...SAVED, name: 's1', url: 'https://elsewhere.example.net/mcp', auth: { type: 'bearer', token: `${MASK}OKEN` } }
+    const res = await POST(req(draft, 'u1'))
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toMatchObject({ ok: false, code: 'secret_reentry_required', field: 'auth.token', discovered_tools: [] })
+    expect(JSON.stringify(body)).not.toContain('REALTOKEN')
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  test('the saved URL restores the token', async () => {
+    const draft = { ...SAVED, name: 's1', auth: { type: 'bearer', token: `${MASK}OKEN` } }
+    const res = await POST(req(draft, 'u1'))
+    expect(res.status).toBe(200)
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).auth.token).toBe('REALTOKEN')
+  })
+
+  test('a changed URL with a token pasted again is tested as typed', async () => {
+    const draft = { ...SAVED, name: 's1', url: 'https://elsewhere.example.net/mcp', auth: { type: 'bearer', token: 'typed-again' } }
+    const res = await POST(req(draft, 'u1'))
+    expect(res.status).toBe(200)
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).auth.token).toBe('typed-again')
   })
 })

@@ -83,7 +83,7 @@ Three ideas explain almost every design decision in the module:
    prior values (write-once-keep).
 
 **Failure-soft everywhere.** The heavy third-party libraries (`mcp`, `yara`,
-`prance`, `jq`, `PyYAML`) are imported *lazily inside the function that needs
+`jq`, `PyYAML`) are imported *lazily inside the function that needs
 them*. If one is missing (e.g. the image wasn't rebuilt yet), only that one
 workload degrades — the rest of the module, and the whole recon job, keep going.
 A per-host exception is caught and logged; one bad host never aborts the others.
@@ -135,7 +135,7 @@ module touches six node types and creates one:
 | **`Technology`** | confirmed AI products (`ai-runtime`, `ai-vector-db`, …). | MERGE, linked `USES_TECHNOLOGY` (from Endpoint) or `HAS_TECHNOLOGY` (from Port) |
 | **`Port` / `IP`** | vector-DB confirmation attaches Technology to the Port. | reused (read-only match) |
 | **`BaseURL` / `Subdomain` / `Domain`** | fallback attachment points for findings. | reused (read-only match) |
-| **`Vulnerability`** | MCP tool-poisoning / injection findings. | **CREATE** (idempotent by deterministic id) |
+| **`Vulnerability`** | MCP tool-poisoning / injection findings, one per YARA rule that fired. | **CREATE** (idempotent by deterministic id: type, base URL, path, tool and the YARA rule) |
 
 **Naming convention:** every AI property is prefixed `ai_` or `is_ai_`, and any
 AI *value* on a generically-named field (`Technology.category`) is prefixed
@@ -171,6 +171,15 @@ candidates = {
 Workloads 1→2→3→4 run **sequentially** on one shared `requests.Session`.
 Workload 5 (vector DBs) runs **after** the pool drains, single-threaded, because
 it iterates ports, not crawl candidates.
+
+**RoE ceiling:** every probe first takes a slot of recon's process-wide request
+clock (`recon/helpers/request_pacer.py`, inert with no ceiling), so the host pool
+shares the ceiling with every other in-process requester. That covers every
+workload's requests (each sent with `allow_redirects=False`, so one call is one
+request), the probe-pack engine's, and every request the MCP SDK sends while it
+lists a server, through httpx event hooks (handshake, listings, event stream,
+closing DELETE, each redirect hop). A target's `429` pushes every requester's next
+slot back by its `Retry-After` (1 s floor, 30 s cap).
 
 ---
 
@@ -215,7 +224,7 @@ proves the protocol without a successful completion.
 3. Classify via [`classify_ai_chat_response`](../../recon/helpers/ai_signal_catalog.py#L1537): match the JSON's top-level keys (OpenAI→`choices`, Anthropic→`content`+`stop_reason`, Ollama→`response`, Gemini→`candidates`, LangServe→`output`).
 4. Edge case: `401`/`422` + `{"error":…}` body ⇒ still `llm-chat`.
 5. `Content-Type: text/event-stream` ⇒ `supports_streaming = True`.
-6. Record each response's latency; emit the **median (p50)**. First classified path wins (`break`).
+6. Record each response's latency, timed after the request's RoE slot so a ceiling wait never counts; emit the **median (p50)**. First classified path wins (`break`).
 
 #### Output (JSON)
 ```python
@@ -263,11 +272,11 @@ tools can't be called.
 
 #### How it works
 1. **Detect** ([`_mcp_detect`](../../recon/main_recon_modules/ai_surface_recon.py#L178)) — a **raw** `POST initialize` (JSON-RPC 2.0). Raw, not the SDK, so it can read headers/status the SDK hides. Four outcomes: `401 + WWW-Authenticate` (MCP, `auth_required=True`); a valid `result` (confirmed, captures `serverInfo`/caps/instructions); an SSE-wrapped result (parsed via `_first_sse_json`); or a version-mismatch error that *leaks supported protocol versions*.
-2. **Enumerate** ([`_mcp_enumerate`](../../recon/main_recon_modules/ai_surface_recon.py#L223)) — only if listing is on **and** not auth-gated. Uses the real **MCP SDK** to call `tools/list` + `resources/list` + `prompts/list`, returning structured tool schemas.
+2. **Enumerate** ([`_mcp_enumerate`](../../recon/main_recon_modules/ai_surface_recon.py#L223)) — only if listing is on **and** not auth-gated. Uses the real **MCP SDK** to call `tools/list` + `resources/list` + `prompts/list`, returning structured tool schemas. The listing's deadline (`timeout * 4`) moves by each RoE slot wait, since that queue is the ceiling's, not a slow server's.
 3. **Statically analyze each tool:**
    - **hash** each tool (`{name, description, inputSchema}`) + an aggregate `tools_hash` + `instructions_hash` — **rug-pull pins**: a silent later swap changes the hash.
    - **annotation mismatch** — a tool declaring `readOnlyHint:true` but whose name implies mutation (`delete`/`write`/`exec`…) → finding.
-   - **YARA** — run vendored Cisco MCP rules over each tool's description + inputSchema + the server instructions; each hit maps through `_MCP_THREAT_MAP` to a kind + OWASP-LLM id + MITRE ATLAS technique.
+   - **YARA** — run vendored Cisco MCP rules over each tool's description + inputSchema + the server instructions; each hit maps through `_MCP_THREAT_MAP` to a kind + OWASP-LLM id + MITRE ATLAS technique. Each rule that fires is its own finding: the id (`_mk_finding`) is a hash of type, base URL, path, tool and the rule name (from the vendored pack, never the target's text), so several rules on the server instructions, or several rules of one threat type on a tool, never collapse into one node. A finding with no rule (`mcp_annotation_mismatch`) keeps the id without it. Findings written before the rule joined the id are moved by `tooling/scripts/aisr_finding_rekey.py` (dry run by default; `--apply` with the agent, webapp and orchestrator stopped, before the first scan on the new release).
 
 #### Output (JSON)
 ```python
@@ -284,7 +293,7 @@ Three distinct graph effects:
 |---|---|---|
 | `Endpoint` (**POST `/mcp`**) | the MCP server | `ai_interface_type='mcp'`, `ai_mcp_server_name/version`, `ai_mcp_protocol_version`, `ai_mcp_tool_count/resource_count/prompt_count`, `ai_mcp_caps`, `ai_mcp_auth_required`, `ai_mcp_tools_hash`, `ai_mcp_instructions_hash` |
 | `Parameter` (one per tool arg) | injectable surface | `is_ai_prompt_injectable`, `ai_tool_arg_path`; linked `(:Endpoint POST /mcp)-[:HAS_PARAMETER]->(:Parameter)` |
-| `Vulnerability` (per finding) | tool poisoning / injection | `type`, `severity`, `ai_owasp_llm_id`, `ai_atlas_technique`, `ai_payload_class='mcp_static'`; attached most-specific-first to `Endpoint` → `BaseURL` → `Subdomain` → `Domain` via `HAS_VULNERABILITY` |
+| `Vulnerability` (per finding, one per YARA rule) | tool poisoning / injection | `type`, `severity`, `ai_owasp_llm_id`, `ai_atlas_technique`, `ai_payload_class='mcp_static'`; attached most-specific-first to `Endpoint` → `BaseURL` → `Subdomain` → `Domain` via `HAS_VULNERABILITY` |
 
 `Input node: Endpoint(mcp) → Output nodes: Endpoint(POST /mcp) + N×Parameter + M×Vulnerability.`
 
@@ -314,9 +323,9 @@ inject tool arguments.
 - **Originating graph nodes (input nodes):** `BaseURL` / its AI `Technology` signal.
 
 #### How it works
-1. **Model-listing paths** → [`_extract_model_ids`](../../recon/main_recon_modules/ai_surface_recon.py#L425): jq `.data[].id` / `.models[].name` / `.models[].details.family`, with a plain-Python fallback when `jq` is unavailable.
-2. **Spec paths** → [`_parse_spec`](../../recon/main_recon_modules/ai_surface_recon.py#L448): `ai-plugin.json` ⇒ `supports_tools`; OpenAPI ⇒ optionally `$ref`-resolved with **prance**, then a lowercased blob scan sets `supports_tools` (`"tools"`/`"function"`/`"input_schema"`), `supports_vision` (`"image_url"`/`"image"`), `supports_streaming` (`"stream"`/`text/event-stream`).
-3. The resolved spec is cached to `/tmp/redamon/ai_surface_recon/<project>/specs/<hash>.json`; the path becomes `tool_schema_ref`.
+1. **Model-listing paths** → [`_extract_model_ids`](../../recon/main_recon_modules/ai_surface_recon.py#L468): jq `.data[].id` / `.models[].name` / `.models[].details.family`, with a plain-Python fallback when `jq` is unavailable.
+2. **Spec paths** → [`_parse_spec`](../../recon/main_recon_modules/ai_surface_recon.py#L579) (JSON only): `ai-plugin.json` ⇒ `supports_tools`; OpenAPI ⇒ `_resolve_local_refs` inlines only in-document `"#/..."` JSON pointers, with no I/O and node, character and depth budgets (over a budget the document is cached unresolved). Every other `$ref` (absolute, scheme-relative, relative, `file:`) and every cyclic or dangling one stays as data: the target's document never makes the recon container fetch a URL or read a file. A lowercased blob scan of the served document sets `supports_tools` (`"tools"`/`"function"`/`"input_schema"`), `supports_vision` (`"image_url"`/`"image"`), `supports_streaming` (`"stream"`/`text/event-stream`).
+3. The spec (local refs inlined) is cached to `/tmp/redamon/ai_surface_recon/<project>/specs/<hash>.json`; the path becomes `tool_schema_ref`.
 4. `guess_model_family(model_ids)` → a family token (`gpt`/`claude`/`llama`/…; longest token wins so `codellama` beats `llama`).
 
 #### Output (JSON)
@@ -429,13 +438,15 @@ For each candidate, try each recipe in [`AI_VECTOR_DB_READS`](../../recon/helper
 "vector_db": [ {service, host, ip, port, tech_name, confirmed_via: "read"} ]
 ```
 
+`ip` is the address httpx recorded for the candidate, else the host when it is an IP literal.
+
 #### Output nodes / enrichment
 Unlike the others, this attaches to a **`Port`**:
 
 | Output node | What | Properties / edge |
 |---|---|---|
 | `Technology` | the confirmed vector DB | `category='ai-vector-db'`, `source='ai-surface-recon'` |
-| `HAS_TECHNOLOGY` edge | links it to the port | `(:Port)-[:HAS_TECHNOLOGY {detected_by:'ai-surface-recon-probe'}]->(:Technology)` (only if the `IP`/`Port` exist — otherwise the Technology stands unlinked, no crash) |
+| `HAS_TECHNOLOGY` / `USES_TECHNOLOGY` edge | links it to the service | `(:IP)-[:HAS_PORT]->(:Port)-[:HAS_TECHNOLOGY {detected_by:'ai-surface-recon-probe'}]->(:Technology)` when that IP's Port exists; else `(:BaseURL)-[:USES_TECHNOLOGY]->` from the BaseURL of exactly that host and port (the url compared whole, a default port matching the bare host); else `(:IP)-[:HAS_TECHNOLOGY]->`. A candidate with neither a host nor an IP writes nothing |
 
 `Input node: IP→Port (or BaseURL fingerprint) → Output nodes: Technology(ai-vector-db) + HAS_TECHNOLOGY edge.`
 
@@ -521,7 +532,7 @@ Add a YARA rule under `ai_surface_probes/yara_rules/` with `meta.threat_type` +
 (kind, OWASP-LLM id, ATLAS technique).
 
 ### Testing
-Tests run **inside the recon image** (they need `mcp`/`yara`/`prance`/`jq`/`yaml`):
+Tests run **inside the recon image** (they need `mcp`/`yara`/`jq`/`yaml`):
 ```bash
 docker run --rm --entrypoint python3 \
   -v "$PWD/recon:/app/recon:ro" -v "$PWD/graph_db:/app/graph_db:ro" \

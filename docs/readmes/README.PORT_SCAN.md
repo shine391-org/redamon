@@ -186,6 +186,7 @@ With `"s"`, a run that crashes (SIGSEGV), fails with an error, or finds no open 
 | `NAABU_THREADS` | `int` | `25` | Concurrent threads |
 | `NAABU_TIMEOUT` | `int` | `10000` | Timeout per port (ms) |
 | `NAABU_RETRIES` | `int` | `1` | Retries for failed probes |
+| `NAABU_RUN_TIMEOUT` | `int` | `1800` | Cap on the whole naabu run (s); a cut run keeps the ports it wrote |
 
 **Recommended Settings:**
 
@@ -400,9 +401,9 @@ Three scanners can say an IP is a CDN edge, and all three reach the graph:
 
 | Source | When | Graph write |
 |---|---|---|
-| naabu `-cdn` | GROUP 3, port scan | `update_graph_from_port_scan` sets `is_cdn` / `cdn_name` from `port_scan.by_ip` and `port_scan.by_host` (no `cdn_source`) |
+| naabu `-cdn` | GROUP 3, port scan | `update_graph_from_port_scan` raises `is_cdn` from `port_scan.by_ip` and `port_scan.by_host` and fills a blank `cdn_name` (no `cdn_source`). It never lowers `is_cdn` and keeps the first `cdn_name`, so a later port write (masscan, late names, a second batch group, a partial run) cannot untag an edge |
 | httpx `-cdn` | GROUP 4, per URL | on the `Endpoint` (`is_cdn`, `cdn`); readers that need an IP's tag also read `http_probe.by_url` |
-| tlsx certificate issuer | GROUP 3.6 | `_attribute_cdn` (`recon/main_recon_modules/tls_scan.py`) fills a **blank** tag on `port_scan.by_ip` from the issuer (Cloudflare, Akamai, Fastly, Sucuri, Incapsula/Imperva; never Amazon, since ACM certificates sit on real origins) and lists those IPs in the tlsx payload as `cdn_by_ip` |
+| tlsx certificate issuer | GROUP 3.6 | `_attribute_cdn` (`recon/main_recon_modules/tls_scan.py`) fills a **blank** tag on `port_scan.by_ip` from the issuer (Cloudflare, Akamai, Fastly, Sucuri, Incapsula/Imperva; never Amazon, since ACM certificates sit on real origins, and never a Cloudflare Origin CA issuer, whose certificate only an origin presents; `cdn_from_certificate` in `recon/helpers/cdn_ranges.py`) and lists those IPs in the tlsx payload as `cdn_by_ip` |
 
 The port graph write runs **before** tlsx in a full run, so the tlsx graph writer
 (`update_graph_from_tlsx`) carries its own tag: for each IP in `cdn_by_ip` it
@@ -411,8 +412,19 @@ unless another tool tagged the IP first. It MATCHes the tenant-scoped IP (never
 creates one) and never writes `is_cdn = false`.
 
 Partial runs rebuild `port_scan` from the graph (`_build_port_scan_data_from_graph`)
-and carry each IP's existing `is_cdn` / `cdn_name`, so the port write a partial
-tlsx, httpx or nmap run makes does not reset a tagged IP to false.
+and carry each IP's existing `is_cdn` / `cdn_name`. Every port detail the builder
+makes names its own IP and carries the graph's `passive_only` mark, so a
+hostname's second address keeps its own ports. Partial Nmap, httpx and tlsx then
+write back only what they measured (`measured_port_data`): Nmap the custom ports
+still open, httpx the typed targets' ports that answered, tlsx none of the
+graph's own ports. The writer lowers `Port.passive_only` only for a port its
+caller saw, so a Shodan-only port does not turn into an actively found one.
+nmap, httpx and GVM lower it too, in a full and a partial run alike:
+`update_graph_from_nmap` on every open port nmap reports on an address, on the
+Port of the protocol it scanned (a TCP answer says nothing of UDP),
+`update_graph_from_http_probe` on the TCP Port it got an HTTP answer from, and
+`update_graph_from_gvm_scan` on the Port of the protocol it detected a service
+on. A Port no active tool reported keeps its mark.
 
 **One CDN list.** `recon/helpers/cdn_ranges.py` is the single source every module
 reads for "is this a CDN edge?": edge prefixes for Cloudflare, Fastly, CloudFront,
@@ -430,7 +442,7 @@ prefix cannot tell an Akamai edge from a customer's server.
 
 ## Architecture & Flow
 
-> **Pipeline context:** Port scanning runs in **GROUP 3** of the recon pipeline (`recon/main.py`), in one `ThreadPoolExecutor` with Shodan enrichment: `run_port_scan_isolated()` and `run_masscan_scan_isolated()` each run on a shallow copy of the combined result and return only their own payload (`port_scan`, `masscan_scan`). After the fan-in, `merge_port_scan_results()` folds `masscan_scan` into `port_scan`, the results are saved, and `update_graph_from_port_scan` writes them to the graph in the background. Nmap (GROUP 3.5) and tlsx (GROUP 3.6) then read the merged `port_scan`.
+> **Pipeline context:** Port scanning runs in **GROUP 3** of the recon pipeline (`recon/main.py`), in one `ThreadPoolExecutor` with Shodan enrichment: `run_port_scan_isolated()` and `run_masscan_scan_isolated()` are handed the fan-out's shared snapshot (`_fan_out_snapshot`, a deep copy taken before the first submit), deep-copy it again, and return only their own payload (`port_scan`, `masscan_scan`). After the fan-in, `merge_port_scan_results()` folds `masscan_scan` into `port_scan`, the results are saved, and `update_graph_from_port_scan` writes them to the graph in the background. Nmap (GROUP 3.5) and tlsx (GROUP 3.6) then read the merged `port_scan`.
 
 ### Execution Flow (`run_port_scan`)
 
@@ -445,15 +457,23 @@ prefix cannot tell an Akamai edge from a customer's server.
        (recon_scope(...).include_root)
    └── dns.subdomains: every subdomain with records, and its IPv4/IPv6 IPs
    └── Build the IP-to-hostnames mapping
+   └── RoE admission (admit_host_targets, module naabu): drop an excluded
+       address, a name the RoE excludes, and a name left with no admitted
+       address; under RoE IP/CIDR entries, hand naabu addresses only
    └── Target list = the hostnames followed by the IPs
 
 3. SCAN EXECUTION
    └── Write targets.txt in a per-run dir /tmp/redamon/.naabu_temp_<id>
        (/tmp/redamon is the same path on the host, so no translation;
         get_host_path() maps /app/recon/output via HOST_RECON_OUTPUT_PATH)
-   └── build_naabu_command() → docker run ... -json
-   └── Run with a 30-minute timeout
+   └── build_naabu_command() → docker run --name naabu-<run id>-<8 hex> ... -json
+   └── Run with NAABU_RUN_TIMEOUT (1800 s by default)
    └── SYN run crashed, failed or found nothing → retry once as CONNECT
+   └── Timeout → kill the container by its name, no CONNECT retry; keep the
+       ports it wrote, list the targets it wrote none for in
+       scan_metadata.unchecked_targets (timed_out set) and note them as not
+       checked (module port_scan, source naabu); nothing written → no
+       port_scan, plus a naabu coverage gap
 
 4. RESULT PROCESSING  (parse_naabu_output)
    └── Parse the JSON Lines output line by line
@@ -469,6 +489,36 @@ prefix cannot tell an Akamai edge from a customer's server.
        none and saves after the fan-in)
    └── The temp dir is removed
 ```
+
+**RoE exclusions on resolved addresses.** An RoE IP or CIDR entry is checked on
+every address a name resolved to, not only on IP targets
+(`recon/helpers/target_admission.py`). An excluded address is never a naabu,
+masscan or nmap target, and a name with one excluded and one allowed address is
+scanned on the allowed one only. naabu resolves a name itself, so while an IP or
+CIDR entry is set it is handed addresses only; each name still gets the ports
+found on its addresses through `ip_to_hostnames`. Masscan and nmap pass their
+address lists through the same gate (`admit_ip_map`), since the port scan's map
+can carry an address a passive source added. Each refusal is logged once as
+`[-][RoE] <tool>: not sent to ...` and noted under the coverage source
+`roe_excluded`. With no exclusion in force every target list is unchanged.
+
+**NSE redirects under RoE exclusions and in IP mode.** The NSE http scripts
+follow a redirect through `http.lua`, whose default rule allows any host in the
+domain of the target's reverse-DNS (PTR) name, and `--exclude` does not bind NSE
+(nmap 7.93, the recon image's). So while any RoE exclusion is in force, and in IP
+mode, `build_nmap_command` (`recon/main_recon_modules/nmap_scan.py`) adds `-n`,
+which leaves the target no name, so the rule allows only the same IP literal.
+With `NMAP_SCRIPT_SCAN` on it also passes `--script "vuln and not
+http-cross-domain-policy"` (`NSE_SCRIPTS_SAME_HOST`) instead of `--script vuln`:
+`http-cross-domain-policy` hands `http.get` a redirect rule of its own (three
+hops, no host rule). Under exclusions the run logs `[*][Nmap] NSE redirects kept
+on the target address (-n, no http-cross-domain-policy): RoE exclusions are in
+force`. The NSE requests then carry the address, not the PTR name, as `Host`. No
+stored field changes: the XML parser keys hosts by the run's own
+`ip_to_hostnames` map and never reads nmap's hostnames. A partial run reads the
+exclusions from `metadata.roe`. Domain mode with no exclusion keeps
+`--script vuln` and no `-n` (`recon/tests/test_roe_redirect_following.py`,
+`recon/tests/test_nmap_ip_mode_no_dns.py`).
 
 ### Docker Command Structure
 
@@ -529,17 +579,20 @@ docker run --rm \
           {
             "port": 80,
             "protocol": "tcp",
-            "service": "http"
+            "service": "http",
+            "ip": "93.184.216.34"
           },
           {
             "port": 443,
             "protocol": "tcp",
-            "service": "https"
+            "service": "https",
+            "ip": "93.184.216.34"
           },
           {
             "port": 11434,
             "protocol": "tcp",
             "service": "ollama",
+            "ip": "93.184.216.34",
             "ai_service": {
               "name": "ollama",
               "category": "ai-runtime",
@@ -591,6 +644,8 @@ docker run --rm \
 ```
 
 - `scan_type` is the type that actually ran; `scan_type_fallback` is true when a SYN scan was retried as CONNECT.
+- In a domain run every naabu and masscan port detail names the address it was found on (`ip`), one detail per address and port, so a name on two addresses keeps each address's ports apart: the graph writer puts a detail under its own `ip` (else under the entry's `ip`, the first address). The entry's `ports` lists every address's port numbers, which is what httpx builds its targets from. IP mode, whose `by_host` is keyed by address, has no detail `ip`. The readers keep the split: `merge_port_scan_results` (`recon/main.py`) folds masscan into naabu one detail per address and port, a name found after the port scan gets one detail per address and port, copied from that address's own (`recon/helpers/late_names.py`), and the banner grab and the tlsx enrichment of the port details read each detail's own `ip`. The http probe's graph writer reads them too: an httpx answer goes (Port, Service, `SERVES_URL`) to the name's address whose details have that port open, not always to the address httpx names, which on a name with several addresses is not always the one it connected to.
+- nmap's newly confirmed ports (`new_open_ports`, `recon/helpers/nmap_merge.py`) are judged per address: a port the name lists only for its other address is still new on this one, it joins every entry that spans the address (tagged with it when the entry's details are), and nmap's versions go to the detail on nmap's own address.
 - `ai_service` appears only on ports the AI port catalogue (`recon/helpers/ai_signal_catalog.py`) knows. Ports the catalogue marks ambiguous (e.g. 8000, 8080) are not annotated here.
 - When Masscan also ran, `merge_port_scan_results()` adds its hosts, ports and hostnames, sets `scan_metadata.scanners` to `["naabu", "masscan"]`, and recomputes `summary` (without `ai_ports_annotated`). When only Masscan ran, its payload becomes `port_scan` as it is.
 
@@ -628,7 +683,7 @@ The port-scan phase runs when the project's scan modules include `port_scan` (th
 
 ### Partial Recon
 
-`recon/partial_recon_modules/port_scanning.py` runs one scanner on demand (`run_naabu`, `run_masscan`) against the graph's IPs and subdomains and any targets the user typed in, and writes the result with `update_graph_from_port_scan`.
+`recon/partial_recon_modules/port_scanning.py` runs one scanner on demand (`run_naabu`, `run_masscan`) against the graph's IPs and subdomains and any targets the user typed in, and writes only its own scan output with `update_graph_from_port_scan`.
 
 ### Standalone Enrichment
 
@@ -718,7 +773,10 @@ NAABU_PASSIVE_MODE = True
 
 #### Scan too slow
 
-A Naabu or Masscan run is stopped after 30 minutes.
+A Naabu run is stopped at `NAABU_RUN_TIMEOUT` (30 minutes by default), a Masscan
+run after 30 minutes. A cut naabu run keeps the ports it wrote, and the targets it
+wrote none for are recorded as not checked: their earlier findings are kept and
+none of their ports reads as closed.
 
 ```python
 # Increase performance
@@ -819,7 +877,7 @@ The `masscan_scan.py` module integrates Robert David Graham's Masscan — the fa
 `run_masscan_scan()`:
 
 1. Skips when `MASSCAN_ENABLED` is off or `is_masscan_installed()` finds no binary.
-2. Picks the targets. In IP mode it takes `metadata.expanded_ips` (which may hold CIDRs) and `metadata.ip_to_hostname`, replacing each mock hostname (`10-0-0-1` for an IP with no PTR record, `_is_mock_hostname`) with the IP itself. Otherwise `resolve_targets_to_ips()` collects the IPs of the scan root (only when it is a target) and of every subdomain with records.
+2. Picks the targets. In IP mode it takes `metadata.expanded_ips` (which may hold CIDRs) and files every port under the address itself (`ip_to_hostnames = {ip: [ip]}`), whatever `metadata.ip_to_hostname` names it: neither a placeholder (`10-0-0-1`) nor a reverse-DNS name becomes a host key, so the address is always probed and no name reaches tlsx as an SNI. Otherwise `resolve_targets_to_ips()` collects the IPs of the scan root (only when it is a target) and of every subdomain with records.
 3. Writes `targets.txt` in a temp dir, runs the command from `build_masscan_command()` with a 30-minute timeout, and parses the NDJSON with `parse_masscan_output()`: only `status` records with `open` count, `banner` records are skipped, and each port is filed under every hostname mapped to its IP (or under the IP when there is none).
 4. Stores the result as `recon_data["masscan_scan"]`, with the same `by_host` / `by_ip` / `all_ports` / `ip_to_hostnames` / `summary` shape as Naabu (CDN fields are always empty) and a `scan_metadata` of `scanner`, `scan_timestamp`, `scan_duration_seconds`, `scan_type` (`syn`), `ports_config`, `rate_limit`, `banners_enabled` and `total_targets`.
 
@@ -859,7 +917,7 @@ MASSCAN_CUSTOM_PORTS = "8080-8090"     # Port range
 - **NDJSON output (`-oD`)** instead of `-oJ` to avoid Masscan's known trailing-comma JSON bug
 - **Native binary** (built from source in multi-stage Dockerfile) instead of Docker-in-Docker for simplicity
 - **Results merged** into existing `port_scan` key so all downstream modules work unchanged
-- **Mock hostname detection** prevents invalid URLs in IP mode (e.g., `10-0-0-1` replaced with `10.0.0.1`)
+- **IP mode keys every port by its address**, so no placeholder (`10-0-0-1`) or reverse-DNS name becomes a host or a URL
 - **Raw SYN packets** bypass the TCP stack for maximum scanning speed
 
 ---

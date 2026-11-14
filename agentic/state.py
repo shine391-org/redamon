@@ -168,7 +168,9 @@ class TodoItem(BaseModel):
 
 class ExecutionStep(BaseModel):
     """Single step in the Thought-Tool-Output execution trace."""
-    step_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+    # Full length: the ChainStep it becomes sits under a database-wide uniqueness
+    # constraint on step_id, where 32 bits collide across tenants.
+    step_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     iteration: int
     timestamp: datetime = Field(default_factory=utc_now)
     phase: Phase
@@ -624,6 +626,9 @@ class FireteamMemberState(TypedDict):
     current_phase: Phase
     attack_path_type: str
     user_id: str
+    # The graph tenant (the project's owner), whose id the member's chain writes and
+    # tools carry; user_id stays the person (config.get_tenant_id).
+    tenant_user_id: str
     project_id: str
     session_id: str
     parent_target_info: dict     # snapshot of parent target_info at deploy time
@@ -1017,6 +1022,8 @@ class AgentState(TypedDict):
 
     # Session context
     user_id: str
+    # The graph tenant: the project's owner (config.get_tenant_id). user_id is the person.
+    tenant_user_id: str
     project_id: str
     session_id: str
 
@@ -1198,6 +1205,14 @@ class AgentState(TypedDict):
     # LATS_RESET_DEBOUNCE, so transient jitter (a one-turn blank/oscillation in
     # phase/skill/target) never falsely resets a healthy tree.
     _lats_reset_streak: Optional[int]
+
+
+# A request the agent raises starts with no answer. An answer stored before it (a stray one,
+# sent when nothing was pending) would hide the request from the drawer (the stream skips a
+# request that already has an answer) and let the next message apply it, unchecked. Merged
+# into the update of every node that raises a request of its kind.
+NO_APPROVAL_ANSWER = {"user_approval_response": None, "user_modification": None}
+NO_TOOL_CONFIRMATION_ANSWER = {"tool_confirmation_response": None, "tool_confirmation_modification": None}
 
 
 # =============================================================================

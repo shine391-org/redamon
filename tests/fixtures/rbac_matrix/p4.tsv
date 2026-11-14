@@ -1,0 +1,276 @@
+# Live RBAC route matrix: Phase 4 (sharing, read-only). Each step adds the rows of the behaviour it
+# changes; a row of an earlier file whose answer a step changes is tagged superseded-by:p4 there.
+# Columns: id, since, actor, method, path, body, expect, tags (see tests/rbac_matrix_live.sh).
+#
+# A row that needs a share or sharing in force is tagged sharing:on and SKIPs unless sharing is in force:
+# RBAC_SHARING_ENABLED reads on (it reads off while the permissions switch is off) AND Root's
+# instance_settings.sharing_policy is enabled (the runner reads it once through psql, as parseSharingPolicy reads it).
+# On the shared instance, whose Root is unconfirmed, a switch-on pass sets the policy by SQL and puts {} back after.
+# A sharing:off row runs only while sharing is not in force. A sharingswitch:off row runs only while RBAC_SHARING_ENABLED
+# reads off, whatever Root's policy says: its route or field is gated on the switch itself and exists with the switch on
+# and the policy {}, where `sharingswitch:on sharing:off` rows hold its answer. The seed (webapp/scripts/e2e-rbac-seed.mjs, step 4.4)
+# provides:
+#   viewer      a member account (rbac-viewer@e2e.local) holding a Read share, without Raw data,
+#               on PSHARED
+#   viewer_raw  a member account (rbac-viewer-raw@e2e.local) holding a Read share with Raw data & files on PSHARED
+#   viewer_tmp  a member account (rbac-viewer-tmp@e2e.local) holding the Read share the 4.4 rows revoke, grant
+#               again and leave (the next seed puts it back)
+#   PSHARED_ID  a project owned by member_c, never PA (baseline rows expect member_b to get 404 on
+#               PA), whose cypherfixGithubToken, graphqlAuthValue and one httpxCustomHeaders entry
+#               hold the literal rbac-fake-share-secret-0001
+#
+# id	since	actor	method	path	body	expect	tags
+#
+# ---- step 4.1: owner secrets withheld from every non-owner read ----
+# The owner row proves the fake secret is really on the row, so the viewer's lacks= is not vacuous.
+# The RoE downloads refuse a non-owner before any lookup (OQ-53), so no document needs seeding: the
+# owner reaches the lookup (404, nothing uploaded), the viewer gets owner_only for both downloads,
+# and the revision list (metadata) stays a read.
+p4-viewer-secrets-owner	4.1	member_c	GET	/api/projects/${PSHARED_ID}	-	200;has=rbac-fake-share-secret-0001	req:HD-27 sharing:on
+p4-viewer-secrets	4.1	viewer	GET	/api/projects/${PSHARED_ID}	-	200;has=${PSHARED_ID};lacks=rbac-fake-share-secret-0001	req:HD-27 req:SH-28 sharing:on
+p4-viewer-roe-download-owner	4.1	member_c	GET	/api/projects/${PSHARED_ID}/roe/download	-	404;has=No RoE document uploaded	req:SH-28 sharing:on
+p4-viewer-roe-download	4.1	viewer	GET	/api/projects/${PSHARED_ID}/roe/download	-	403;has=owner_only;has=roe:read	req:SH-28 sharing:on
+p4-viewer-roe-revision-download	4.1	viewer	GET	/api/projects/${PSHARED_ID}/roe/revisions/rbac-no-such-revision/download	-	403;has=owner_only	req:SH-28 sharing:on
+p4-viewer-roe-revisions	4.1	viewer	GET	/api/projects/${PSHARED_ID}/roe/revisions	-	200;has="revisions"	req:SH-28 sharing:on
+
+# ---- step 4.3: projectAccess() with shares, oversight; my-access; the terminal below Exploitation & shells ----
+# p4-myaccess-other needs no share and runs in either switch state. With RBAC_SHARING_ENABLED off
+# /my-access does not exist (404, the owner too) and the project GET carries no myAccess (DV-30):
+# the two *-off rows (sharingswitch:off). Both follow the switch, not Root's policy: with the switch on and
+# the policy {} the owner reads its own access (the *-policy-off rows) and a Read share is not in force, so
+# the viewer gets 404. The owner's my-access answer with sharing in force is a sharing:on row. With sharing in force admin_a
+# (Full admin, projects:oversee) reads rbac-PA at Read without Raw data: the twelve admin_a rows of
+# baseline.tsv are tagged sharing:off, and these are their answers for the routes whose oversight
+# answer is settled; the graph, conversation, remediation, report, schedule, triage and recon status
+# rows come with the read waves (4.6-4.8) and 4.14.
+p4-myaccess-owner	4.3	member_a	GET	/api/projects/${PA_ID}/my-access	-	200;has="level":"owner";has="via":"owner"	req:PE-21 sharing:on
+p4-myaccess-other	4.3	member_b	GET	/api/projects/${PA_ID}/my-access	-	404;lacks="myAccess"	req:PE-21
+p4-myaccess-owner-off	4.3	member_a	GET	/api/projects/${PA_ID}/my-access	-	404;lacks="myAccess"	req:PE-21 req:DV-30 sharingswitch:off
+p4-proj-read-no-myaccess-off	4.3	member_a	GET	/api/projects/${PA_ID}	-	200;has=rbac-PA;lacks="myAccess"	req:PE-21 req:DV-30 sharingswitch:off
+p4-myaccess-owner-policy-off	4.3	member_a	GET	/api/projects/${PA_ID}/my-access	-	200;has="level":"owner";has="via":"owner"	req:PE-21 req:DV-30 sharingswitch:on sharing:off
+p4-proj-read-myaccess-policy-off	4.3	member_a	GET	/api/projects/${PA_ID}	-	200;has=rbac-PA;has="myAccess";has="via":"owner"	req:PE-21 req:DV-30 sharingswitch:on sharing:off
+p4-viewer-read-off	4.3	viewer	GET	/api/projects/${PSHARED_ID}	-	404;lacks="myAccess"	req:SH-02 req:DV-30 sharing:off
+p4-myaccess-viewer	4.3	viewer	GET	/api/projects/${PSHARED_ID}/my-access	-	200;has="level":"read";has="rawData":false;has="via":"share"	req:PE-21 req:SH-02 sharing:on
+p4-viewer-myaccess-on-read	4.3	viewer	GET	/api/projects/${PSHARED_ID}	-	200;has="myAccess";has="via":"share"	req:PE-21 sharing:on
+p4-viewer-settings-write	4.3	viewer	PUT	/api/projects/${PSHARED_ID}	{"updatedAt":"rbac-not-a-date"}	403;has=project:settings	req:SH-02 sharing:on
+p4-viewer-traffic-no-raw	4.3	viewer	GET	/api/traffic/${PSHARED_ID}	-	403;has=traffic:read	req:SH-03 sharing:on
+p4-viewer-ws-ticket-agent	4.3	viewer	POST	/api/agent/ws-ticket	{"projectId":"${PSHARED_ID}","sessionId":"rbac-ws","socket":"agent"}	403;has=agent:chat;lacks="ticket"	req:SH-02 sharing:on
+p4-viewer-ws-ticket-terminal	4.3	viewer	POST	/api/agent/ws-ticket	{"projectId":"${PSHARED_ID}","sessionId":"rbac-ws","socket":"kali-terminal"}	403;has="code":"forbidden";has=platform:kali_terminal;has="level":"W+X";lacks="ticket"	req:SH-02 sharing:on
+p4-oversee-proj-read	4.3	admin_a	GET	/api/projects/${PA_ID}	-	200;has=rbac-PA;has="via":"oversight"	req:SH-18 sharing:on
+p4-oversee-myaccess	4.3	admin_a	GET	/api/projects/${PA_ID}/my-access	-	200;has="level":"read";has="via":"oversight"	req:SH-18 sharing:on
+p4-oversee-proj-update	4.3	admin_a	PUT	/api/projects/${PA_ID}	{"updatedAt":"rbac-not-a-date"}	403;has=project:settings	req:SH-18 sharing:on
+p4-oversee-proj-export	4.3	admin_a	GET	/api/projects/${PA_ID}/export	-	403;has=project:export	req:SH-18 sharing:on
+p4-oversee-traffic	4.3	admin_a	GET	/api/traffic/${PA_ID}	-	403;has=traffic:read	req:SH-18 sharing:on
+p4-oversee-workspace	4.3	admin_a	GET	/api/agent/workspace/list?projectId=${PA_ID}&path=.	-	403;has=workspace:read	req:SH-18 sharing:on
+p4-oversee-ws-ticket-terminal	4.3	admin_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws","socket":"kali-terminal"}	403;has="code":"forbidden";has=platform:kali_terminal;has="level":"W+X";lacks="ticket"	req:SH-18 sharing:on
+
+# ---- step 4.4: share, change, revoke and leave ----
+# member_c shares PSHARED (the seed's Read shares: viewer, viewer_raw with Raw data, viewer_tmp). Refusals are
+# built to write nothing: an unknown email, oneself, a write level and an existing share are refused before or
+# without a change (each counted lookup is audited). viewer_tmp's share is then revoked (its next read is 404, a
+# second revoke 404), granted again (the answer names the recipient, D-24) and left (its next read 404, a second
+# leave 404); the next seed puts it back. The note PATCH is rewritten by the next seed too.
+# A write grant or change is refused while write sharing is not in force: `write_sharing_off` with the write switch
+# off, `above_max_level` with it on and Root's policy at Read (sharingwriteswitch: splits the two); both refusals
+# come before any lookup, so they may name the seeded viewer. With write sharing in force the write grant and
+# change are allowed, so those rows act on viewer_tmp only and put it back where the block left it (Read before
+# the revoke, no share after the leave): viewer and the later Read-viewer rows of p4, p4_generated and p5 stay Read.
+p4-share-list-owner	4.4	member_c	GET	/api/projects/${PSHARED_ID}/collaborators	-	200;has=${VIEWER_EMAIL};has=${VIEWER_RAW_EMAIL};has="rawData":true	req:SH-09 sharing:on
+p4-share-list-viewer	4.4	viewer	GET	/api/projects/${PSHARED_ID}/collaborators	-	403;has=project:share;lacks=${VIEWER_RAW_EMAIL}	req:SH-09 sharing:on
+p4-share-list-other	4.4	member_b	GET	/api/projects/${PSHARED_ID}/collaborators	-	404;lacks=${VIEWER_EMAIL}	req:SH-09 sharing:on
+p4-share-list-oversee	4.4	admin_a	GET	/api/projects/${PSHARED_ID}/collaborators	-	200;has=${VIEWER_EMAIL}	req:SH-18 req:SH-21 sharing:on
+p4-share-grant-unknown	4.4	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"rbac-nobody@e2e.local","access":"read"}	404;has=no_such_account	req:SH-19 sharing:on
+p4-share-grant-self	4.4	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${MEMBER_C_EMAIL}","access":"read"}	400;has=share_with_self	req:SH-09 sharing:on
+p4-share-grant-write	4.4	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_EMAIL}","access":"write"}	409;has=write_sharing_off	req:SH-06 sharing:on sharingwrite:off sharingwriteswitch:off
+p4-share-grant-write-capped	5.14	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_EMAIL}","access":"write"}	409;has="code":"above_max_level";has="maxLevel":"read"	req:SH-06 req:SH-21 sharing:on sharingwrite:off sharingwriteswitch:on
+p4-share-grant-existing	4.4	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_EMAIL}","access":"read"}	409;has=already_shared	req:SH-09 sharing:on
+p4-share-grant-viewer	4.4	viewer	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${MEMBER_B_EMAIL}","access":"read"}	403;has=project:share	req:SH-09 sharing:on
+p4-share-grant-other	4.4	member_b	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${MEMBER_A_EMAIL}","access":"read"}	404;lacks=no_such_account	req:SH-09 sharing:on
+p4-share-grant-cross-origin	4.4	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_TMP_EMAIL}","access":"read"}	403;has=cross_origin	req:SH-09 sharing:on origin:https://rbac-other-site.example
+p4-share-grant-acting	4.4	admin_a_as_member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_TMP_EMAIL}","access":"read"}	403;has=not_while_acting_as	req:SH-09 sharing:on
+p4-share-update-owner	4.4	member_c	PATCH	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_ID}	{"note":"rbac matrix note"}	200;has="note":"rbac matrix note";has="rawData":false	req:SH-10 sharing:on
+p4-share-update-write	4.4	member_c	PATCH	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_ID}	{"access":"write"}	409;has=write_sharing_off	req:SH-06 sharing:on sharingwrite:off sharingwriteswitch:off
+p4-share-update-write-capped	5.14	member_c	PATCH	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_ID}	{"access":"write"}	409;has="code":"above_max_level";has="maxLevel":"read"	req:SH-06 req:SH-21 sharing:on sharingwrite:off sharingwriteswitch:on
+p4-share-update-write-on	5.14	member_c	PATCH	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_TMP_ID}	{"access":"write"}	200;has=${VIEWER_TMP_EMAIL};has="access":"write"	req:SH-02 req:SH-10 sharing:on sharingwrite:on
+p4-share-update-write-on-read	5.14	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	200;has="level":"write";has="via":"share"	req:SH-02 sharing:on sharingwrite:on
+p4-share-update-write-on-restore	5.14	member_c	PATCH	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_TMP_ID}	{"access":"read"}	200;has=${VIEWER_TMP_EMAIL};has="access":"read"	req:SH-10 sharing:on sharingwrite:on
+p4-share-update-write-on-restored	5.14	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	200;has="level":"read";has="via":"share"	req:SH-10 sharing:on sharingwrite:on
+p4-share-update-viewer	4.4	viewer	PATCH	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_ID}	{"rawData":true}	403;has=project:share	req:SH-10 sharing:on
+p4-share-revoke-none	4.4	member_c	DELETE	/api/projects/${PSHARED_ID}/collaborators/${MEMBER_B_ID}	-	404;has=no_such_share	req:SH-11 sharing:on
+p4-share-tmp-read	4.4	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	200;has="via":"share"	req:SH-11 sharing:on
+p4-share-revoke	4.4	member_c	DELETE	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_TMP_ID}	-	200;has="revoked"	req:SH-11 sharing:on
+p4-share-revoked-read	4.4	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	404;lacks="myAccess"	req:SH-11 sharing:on
+p4-share-revoked-project	4.4	viewer_tmp	GET	/api/projects/${PSHARED_ID}	-	404;lacks=rbac-PSHARED	req:SH-11 sharing:on
+p4-share-revoke-twice	4.4	member_c	DELETE	/api/projects/${PSHARED_ID}/collaborators/${VIEWER_TMP_ID}	-	404;has=no_such_share	req:SH-11 sharing:on
+p4-share-grant	4.4	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_TMP_EMAIL}","access":"read"}	201;has=${VIEWER_TMP_EMAIL};has=RBAC Viewer Tmp	req:SH-09 req:SH-19 req:SH-20 sharing:on
+p4-share-granted-read	4.4	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	200;has="level":"read"	req:SH-09 sharing:on
+p4-share-leave-owner	4.4	member_c	POST	/api/projects/${PSHARED_ID}/leave	{}	404;has=no_such_share	req:SH-13 sharing:on
+p4-share-leave	4.4	viewer_tmp	POST	/api/projects/${PSHARED_ID}/leave	{}	200;has="left"	req:SH-13 sharing:on
+p4-share-left-read	4.4	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	404;lacks="myAccess"	req:SH-13 sharing:on
+p4-share-leave-twice	4.4	viewer_tmp	POST	/api/projects/${PSHARED_ID}/leave	{}	404;has=no_such_share	req:SH-13 sharing:on
+p4-share-grant-write-on	5.14	member_c	POST	/api/projects/${PSHARED_ID}/collaborators	{"email":"${VIEWER_TMP_EMAIL}","access":"write"}	201;has=${VIEWER_TMP_EMAIL};has="access":"write"	req:SH-02 req:SH-09 sharing:on sharingwrite:on
+p4-share-grant-write-on-read	5.14	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	200;has="level":"write";has="via":"share"	req:SH-02 sharing:on sharingwrite:on
+p4-share-grant-write-on-leave	5.14	viewer_tmp	POST	/api/projects/${PSHARED_ID}/leave	{}	200;has="left"	req:SH-13 sharing:on sharingwrite:on
+p4-share-grant-write-on-left	5.14	viewer_tmp	GET	/api/projects/${PSHARED_ID}/my-access	-	404;lacks="myAccess"	req:SH-13 sharing:on sharingwrite:on
+# With sharing off the share routes do not exist (DV-30).
+p4-share-off-list	4.4	member_c	GET	/api/projects/${PSHARED_ID}/collaborators	-	404;lacks=${VIEWER_EMAIL}	req:SH-01 sharing:off
+p4-share-off-leave	4.4	viewer	POST	/api/projects/${PSHARED_ID}/leave	{}	404	req:SH-01 sharing:off
+
+# ---- step 4.8: the Priority Board and remediations at Read ----
+# The viewer reads PSHARED's board, muted list, mute rules and remediations, from member_c's graph and
+# rows (the seed puts no finding or remediation there, so the answers are empty), and every triage
+# and remediation write answers 403 naming its permission. The remediation write probe also names a
+# column that does not exist, so a guard that let it through would fail in Prisma (500), never create
+# a row; the verdict and mute probes carry no node, so nothing is written past the guard either.
+# admin_a reads rbac-PA by oversight: the sharing:on answers of bl-triage-list-admin and
+# bl-rem-list-admin (tagged sharing:off in baseline.tsv).
+p4-viewer-triage-board	4.8	viewer	GET	/api/triage/findings?projectId=${PSHARED_ID}	-	200;has="findings"	req:SH-07 sharing:on
+p4-viewer-triage-muted	4.8	viewer	GET	/api/triage/muted?projectId=${PSHARED_ID}	-	200;has="findings"	req:SH-07 sharing:on
+p4-viewer-mute-rules	4.8	viewer	GET	/api/projects/${PSHARED_ID}/node-filters	-	200;has="exemptionCounts"	req:SH-07 sharing:on
+p4-viewer-remediations	4.8	viewer	GET	/api/remediations?projectId=${PSHARED_ID}	-	200	req:SH-07 sharing:on
+p4-viewer-triage-verdict	4.8	viewer	POST	/api/triage/verdict	{"projectId":"${PSHARED_ID}"}	403;has=triage:verdict	req:SH-07 sharing:on
+p4-viewer-triage-mute	4.8	viewer	POST	/api/triage/mute	{"projectId":"${PSHARED_ID}"}	403;has=triage:mute	req:SH-07 sharing:on
+p4-viewer-mute-rules-write	4.8	viewer	PUT	/api/projects/${PSHARED_ID}/node-filters	{}	403;has=node_filters:manage	req:SH-07 sharing:on
+p4-viewer-remediation-write	4.8	viewer	POST	/api/remediations	{"projectId":"${PSHARED_ID}","title":"rbac-share-probe","description":"rbac-share-probe","rbacNotAColumn":true}	403;has=remediation:write	req:SH-07 sharing:on
+p4-viewer-ws-ticket-triage	4.8	viewer	POST	/api/agent/ws-ticket	{"projectId":"${PSHARED_ID}","sessionId":"rbac-ws","socket":"cypherfix-triage"}	403;has=triage:run;lacks="ticket"	req:SH-07 sharing:on
+p4-oversee-triage-board	4.8	admin_a	GET	/api/triage/findings?projectId=${PA_ID}	-	200;has="findings"	req:SH-18 sharing:on
+p4-oversee-triage-verdict	4.8	admin_a	POST	/api/triage/verdict	{"projectId":"${PA_ID}"}	403;has=triage:verdict	req:SH-18 sharing:on
+p4-oversee-rem-list	4.8	admin_a	GET	/api/remediations?projectId=${PA_ID}	-	200;has=rbac-remediation	req:SH-18 sharing:on
+p4-oversee-rem-read	4.8	admin_a	GET	/api/remediations/${REM_PA_ID}	-	200;has=rbac-remediation	req:SH-18 sharing:on
+p4-oversee-rem-write	4.8	admin_a	PUT	/api/remediations/${REM_PA_ID}	{"status":"rbac-not-a-status"}	403;has=remediation:write	req:SH-18 sharing:on
+
+# ---- step 4.7: collaborator reads, wave B: recon, reports, versions, RoE, auth profile, schedules ----
+# A read share reads recon status (the logs are an event stream: unit-tested only), the RoE read view (OQ-53:
+# metadata and the enforced scope, never the contacts, text or document), the auth profile's metadata, the recording
+# status, the schedules and the run history.
+# The six scan-result downloads and the AI attack-surface transcript are raw outputs: recon:read plus Raw data & files
+# (requireLevel R*), so the viewer gets 403 naming recon:read and R*, viewer_raw reaches the route (nothing was
+# scanned on PSHARED: the lookup's 404), the owner likewise. One row per permission and write level for the viewer
+# and the overseer is generated: p4_generated.tsv. The oversight rows of the reports, schedules and recon status
+# routes (admin_a on rbac-PA) answer baseline's sharing:off admin_a rows.
+p4-viewer-recon-status	4.7	viewer	GET	/api/recon/${PSHARED_ID}/status	-	200|404|502|503;lacks="code":"forbidden"	req:SH-07 sharing:on
+p4-recon-download-owner	4.7	member_c	GET	/api/recon/${PSHARED_ID}/download	-	404;has=Recon data not found	req:SH-07 sharing:on
+p4-viewer-recon-download	4.7	viewer	GET	/api/recon/${PSHARED_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-raw-recon-download	4.7	viewer_raw	GET	/api/recon/${PSHARED_ID}/download	-	404;has=Recon data not found	req:SH-07 req:SH-03 sharing:on
+p4-viewer-github-hunt-download	4.7	viewer	GET	/api/github-hunt/${PSHARED_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-trufflehog-download	4.7	viewer	GET	/api/trufflehog/${PSHARED_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-gvm-download	4.7	viewer	GET	/api/gvm/${PSHARED_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-supply-chain-download	4.7	viewer	GET	/api/supply-chain/${PSHARED_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-js-recon-download	4.7	viewer	GET	/api/js-recon/${PSHARED_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-ai-transcript	4.7	viewer	GET	/api/ai-attack-surface/${PSHARED_ID}/transcript?ref=rbac-no-such-ref	-	403;has=recon:read;has="level":"R*"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-raw-ai-transcript	4.7	viewer_raw	GET	/api/ai-attack-surface/${PSHARED_ID}/transcript?ref=rbac-no-such-ref	-	400|404|500|503;lacks="code":"forbidden"	req:SH-07 req:SH-03 sharing:on
+p4-viewer-roe-read	4.7	viewer	GET	/api/projects/${PSHARED_ID}/roe	-	200;has="limits";has="enforced";lacks=roeRawText;lacks=roeClientContactEmail	req:SH-28 sharing:on
+p4-viewer-auth-profile	4.7	viewer	GET	/api/projects/${PSHARED_ID}/auth-profile	-	200;has="authProfile";lacks="authValue"	req:SH-29 sharing:on
+p4-viewer-recording-status	4.7	viewer	GET	/api/projects/${PSHARED_ID}/recording/status	-	200;has="otherProjectRecording"	req:SH-29 sharing:on
+p4-viewer-schedules	4.7	viewer	GET	/api/projects/${PSHARED_ID}/schedules	-	200;has="schedules";has="jobs"	req:SH-07 req:SH-24 sharing:on
+p4-viewer-reports	4.7	viewer	GET	/api/projects/${PSHARED_ID}/reports	-	200	req:SH-07 sharing:on
+p4-viewer-reports-all	4.7	viewer	GET	/api/reports	-	200;lacks="code":"forbidden"	req:SH-07 req:SH-39 sharing:on
+p4-viewer-versions	4.7	viewer	GET	/api/projects/${PSHARED_ID}/versions	-	200;has="versions"	req:SH-07 sharing:on
+p4-viewer-delta	4.7	viewer	GET	/api/projects/${PSHARED_ID}/delta	-	200|400|404|409;lacks="code":"forbidden"	req:SH-07 sharing:on
+p4-viewer-schedule-create	4.7	viewer	POST	/api/projects/${PSHARED_ID}/schedules	{"mode":"rbac-bogus"}	403;has=recon:schedule	req:SH-07 sharing:on
+p4-oversee-reports	4.7	admin_a	GET	/api/projects/${PA_ID}/reports	-	200	req:SH-18 sharing:on
+p4-oversee-schedules	4.7	admin_a	GET	/api/projects/${PA_ID}/schedules	-	200;has="schedules"	req:SH-18 sharing:on
+p4-oversee-recon-status	4.7	admin_a	GET	/api/recon/${PA_ID}/status	-	200|404|502|503;lacks="code":"forbidden"	req:SH-18 sharing:on
+p4-oversee-recon-download	4.7	admin_a	GET	/api/recon/${PA_ID}/download	-	403;has=recon:read;has="level":"R*"	req:SH-18 req:SH-47 sharing:on
+
+# ---- step 4.6: collaborator reads, wave A: graph, Insights, attack chains, text-to-cypher ----
+# The viewer reads the owner's graph and Insights of PSHARED (every graph read filters on the project, never the
+# caller); every graph write and the NL generator (agent:assistants, a write level that spends a key) answer 403.
+# The owner rows keep the viewer's 200s from being vacuous. admin_a (projects:oversee) reads rbac-PA the same way:
+# these are the graph answers of baseline's sharing:off admin_a rows. Identical node counts for owner, viewer and
+# overseer (RM:p4-graph-counts) need seeded graph nodes: tests/rbac_graph_counts_live.sh.
+p4-graph-read-owner	4.6	member_c	GET	/api/graph?projectId=${PSHARED_ID}	-	200;has="nodes"	req:SH-07 sharing:on
+p4-viewer-graph-read	4.6	viewer	GET	/api/graph?projectId=${PSHARED_ID}	-	200;has="nodes";has=${PSHARED_ID}	req:SH-07 sharing:on
+p4-viewer-graph-overview	4.6	viewer	GET	/api/analytics/graph-overview?projectId=${PSHARED_ID}	-	200;has="nodeCounts"	req:SH-07 sharing:on
+p4-viewer-attack-chains	4.6	viewer	GET	/api/analytics/attack-chains?projectId=${PSHARED_ID}	-	200;lacks="code":"forbidden"	req:SH-07 sharing:on
+p4-viewer-redzone-secrets	4.6	viewer	GET	/api/analytics/redzone/secrets?projectId=${PSHARED_ID}	-	200;lacks="code":"forbidden"	req:SH-07 sharing:on
+p4-viewer-unseen	4.6	viewer	POST	/api/analytics/unseen	{"projectId":"${PSHARED_ID}"}	200;has="counts"	req:SH-07 sharing:on
+p4-viewer-graph-views-list	4.6	viewer	GET	/api/graph-views?projectId=${PSHARED_ID}	-	200;lacks="code":"forbidden"	req:SH-07 sharing:on
+p4-viewer-graph-views-execute	4.6	viewer	POST	/api/graph-views/execute	{"projectId":"${PSHARED_ID}","cypherQuery":"MATCH (d:Domain) RETURN d"}	200;has="nodes"	req:SH-07 sharing:on
+p4-viewer-graph-views-create	4.6	viewer	POST	/api/graph-views	{"projectId":"${PSHARED_ID}","name":"rbac-viewer-view","cypherQuery":"MATCH (d:Domain) RETURN d"}	403;has=graph:views	req:SH-07 sharing:on
+p4-viewer-graph-node-delete	4.6	viewer	DELETE	/api/graph?projectId=${PSHARED_ID}&nodeId=rbac-no-such-node	-	403;has=graph:edit	req:SH-07 sharing:on
+p4-viewer-purge-orphan-chains	4.6	viewer	POST	/api/projects/${PSHARED_ID}/purge-orphan-chains	-	403;has=graph:edit	req:SH-07 sharing:on
+p4-graph-t2c-owner	4.6	member_c	POST	/api/agent/text-to-cypher	{"project_id":"${PSHARED_ID}"}	422;has="upstreamStatus":422	req:SH-35 req:NF-11 sharing:on
+p4-viewer-text-to-cypher	4.6	viewer	POST	/api/agent/text-to-cypher	{"project_id":"${PSHARED_ID}"}	403;has=agent:assistants;lacks="upstreamStatus"	req:SH-35 req:NF-11 sharing:on
+p4-graph-read-not-shared	4.6	member_b	GET	/api/graph?projectId=${PSHARED_ID}	-	404;lacks="nodes"	req:SH-07 sharing:on
+p4-oversee-graph-read	4.6	admin_a	GET	/api/graph?projectId=${PA_ID}	-	200;has="nodes"	req:SH-18 sharing:on
+p4-oversee-graph-overview	4.6	admin_a	GET	/api/analytics/graph-overview?projectId=${PA_ID}	-	200;has="nodeCounts"	req:SH-18 sharing:on
+p4-oversee-graph-views-execute	4.6	admin_a	POST	/api/graph-views/execute	{"projectId":"${PA_ID}","cypherQuery":"MATCH (d:Domain) RETURN d"}	200;has="nodes"	req:SH-18 sharing:on
+p4-oversee-graph-node-delete	4.6	admin_a	DELETE	/api/graph?projectId=${PA_ID}&nodeId=rbac-no-such-node	-	403;has=graph:edit	req:SH-18 sharing:on
+p4-oversee-text-to-cypher	4.6	admin_a	POST	/api/agent/text-to-cypher	{"project_id":"${PA_ID}"}	403;has=agent:assistants;lacks="upstreamStatus"	req:SH-18 sharing:on
+
+# ---- step 4.5: owned and shared lists, Shared with me ----
+# The project list holds the projects shared with the person, each row with `myAccess` (owner, or read with its Raw
+# data toggle, and the owner who shared it); member_b (no share) never lists PSHARED. With RBAC_SHARING_ENABLED off
+# the list carries no myAccess (DV-30) and the viewer lists nothing of member_c's. The scan activity view answers the
+# viewer; the seed queues nothing on PSHARED, so a shared project's jobs with their initiator, and the count as their
+# complement, are unit-tested (system/jobs/route.shared.test.ts). The reports list is p4-viewer-reports-all (4.7).
+# The list's myAccess follows the switch, not Root's policy: with the switch on and the policy {} each row carries the
+# caller's own access (owner, p4-list-policy-off-owner), so p4-list-off-owner is sharingswitch:off.
+p4-list-viewer	4.5	viewer	GET	/api/projects	-	200;has=${PSHARED_ID};has="level":"read";has="via":"share";has="rawData":false	req:SH-39 req:SH-09 sharing:on
+p4-list-viewer-raw	4.5	viewer_raw	GET	/api/projects	-	200;has=${PSHARED_ID};has="via":"share";has="rawData":true	req:SH-39 sharing:on
+p4-list-owner	4.5	member_c	GET	/api/projects	-	200;has=${PSHARED_ID};has="level":"owner";lacks="via":"share"	req:SH-39 sharing:on
+p4-list-not-shared	4.5	member_b	GET	/api/projects	-	200;lacks=${PSHARED_ID}	req:SH-39 sharing:on
+p4-list-off-owner	4.5	member_c	GET	/api/projects	-	200;has=${PSHARED_ID};lacks="myAccess"	req:SH-39 req:DV-30 sharingswitch:off
+p4-list-policy-off-owner	4.5	member_c	GET	/api/projects	-	200;has=${PSHARED_ID};has="level":"owner";lacks="via":"share"	req:SH-39 req:DV-30 sharingswitch:on sharing:off
+p4-list-off-viewer	4.5	viewer	GET	/api/projects	-	200;lacks=${PSHARED_ID}	req:SH-39 req:DV-30 sharing:off
+p4-jobs-viewer	4.5	viewer	GET	/api/system/jobs	-	200;has="mine";has="others"	req:SH-39 sharing:on
+
+# ---- step 4.13: the project activity feed ----
+# After the 4.4 block's grant, revoke and leave of viewer_tmp on PSHARED, the owner's feed names those rows and the
+# collaborator (IdentityLabel: email and account type), never a lookup's email hash nor a row's before/after. The
+# viewer (Read share) is refused, a stranger gets 404, admin_a (projects:oversee; adminsSeeAllShares defaults to true)
+# reads it by oversight, admin_a acting as member_c reads it as the owner. With sharing off the route does not exist.
+p4-activity-owner	4.13	member_c	GET	/api/projects/${PSHARED_ID}/activity	-	200;has="action":"project.share.grant";has="action":"project.share.revoke";has="action":"project.share.leave";has=${VIEWER_TMP_EMAIL};has="accountType":"member";lacks=emailSha256;lacks="before"	req:UI-08 req:AU-07 req:AU-09 sharing:on
+p4-activity-group	4.13	member_c	GET	/api/projects/${PSHARED_ID}/activity?group=sharing	-	200;has="group":"sharing";lacks="group":"project"	req:UI-08 sharing:on
+p4-activity-bad-group	4.13	member_c	GET	/api/projects/${PSHARED_ID}/activity?group=rbac-nope	-	400;has=invalid_field	req:UI-08 sharing:on
+p4-activity-viewer	4.13	viewer	GET	/api/projects/${PSHARED_ID}/activity	-	403;has=project:share;lacks=project.share.grant	req:AU-09 sharing:on
+p4-activity-other	4.13	member_b	GET	/api/projects/${PSHARED_ID}/activity	-	404;lacks=project.share	req:AU-09 sharing:on
+p4-activity-oversee	4.13	admin_a	GET	/api/projects/${PSHARED_ID}/activity	-	200;has="action":"project.share.grant"	req:AU-09 req:SH-18 sharing:on
+p4-activity-acting	4.13	admin_a_as_member_c	GET	/api/projects/${PSHARED_ID}/activity	-	200;has="events";lacks="code":"forbidden"	req:IM-07 sharing:on
+p4-activity-off	4.13	member_c	GET	/api/projects/${PSHARED_ID}/activity	-	404;lacks="events"	req:UI-08 req:DV-30 sharing:off
+
+# ---- step 4.9: collaborator reads, wave D: traffic, workspace, raw outputs, step content ----
+# Traffic and the workspace are raw data (traffic:read, traffic:export, workspace:read at R*): viewer_raw (Raw data &
+# files on PSHARED) reads the owner's captured traffic (every query on the project and its owner, never the reader)
+# and workspace; the viewer gets 403 naming the permission (its list and export denials are p4-viewer-traffic-no-raw
+# and the generated p4g rows); traffic delete and every workspace write stay refused at read. The seed captures no
+# traffic on PSHARED, so the owner and viewer_raw both answer an empty page and a detail id that is not there gets
+# 404 past the guard; the agent answers the workspace listing 200, or 404 for a project whose workspace was never
+# created. Step content (the chain's thought, command line, outputs, error, decision reason) needs seeded chain
+# nodes: tests/rbac_step_content_live.sh (RM:p4-step-content).
+p4-traffic-owner	4.9	member_c	GET	/api/traffic/${PSHARED_ID}	-	200;has="rows"	req:SH-23 sharing:on
+p4-viewer-raw-traffic	4.9	viewer_raw	GET	/api/traffic/${PSHARED_ID}	-	200;has="rows";has="total"	req:SH-23 req:SH-03 sharing:on
+p4-viewer-raw-traffic-facets	4.9	viewer_raw	GET	/api/traffic/${PSHARED_ID}/facets	-	200;has="tools";has="hosts"	req:SH-23 sharing:on
+p4-viewer-raw-traffic-export	4.9	viewer_raw	GET	/api/traffic/${PSHARED_ID}/export?format=json	-	200;has="rows";has="truncated"	req:SH-23 sharing:on
+p4-viewer-raw-traffic-detail	4.9	viewer_raw	GET	/api/traffic/${PSHARED_ID}/rbac-no-such-txn	-	404;has=Not found;lacks="code":"forbidden"	req:SH-23 sharing:on
+p4-viewer-traffic-facets	4.9	viewer	GET	/api/traffic/${PSHARED_ID}/facets	-	403;has=traffic:read	req:SH-23 req:SH-03 sharing:on
+p4-viewer-traffic-detail	4.9	viewer	GET	/api/traffic/${PSHARED_ID}/rbac-no-such-txn	-	403;has=traffic:read	req:SH-23 req:SH-03 sharing:on
+p4-viewer-raw-traffic-delete	4.9	viewer_raw	DELETE	/api/traffic/${PSHARED_ID}	{"ids":["rbac-no-such-txn"]}	403;has=traffic:delete	req:SH-23 sharing:on
+p4-viewer-raw-workspace-list	4.9	viewer_raw	GET	/api/agent/workspace/list?projectId=${PSHARED_ID}&path=.	-	200|404;lacks="code":"forbidden"	req:SH-27 req:SH-03 sharing:on
+p4-viewer-workspace-tree	4.9	viewer	GET	/api/agent/workspace/tree?projectId=${PSHARED_ID}	-	403;has=workspace:read	req:SH-27 req:SH-03 sharing:on
+p4-viewer-raw-workspace-mkdir	4.9	viewer_raw	POST	/api/agent/workspace/mkdir	{"projectId":"${PSHARED_ID}","path":"rbac-viewer-dir"}	403;has=workspace:write	req:SH-27 sharing:on
+p4-viewer-raw-graph-read	4.9	viewer_raw	GET	/api/graph?projectId=${PSHARED_ID}	-	200;has="nodes"	req:SH-30 sharing:on
+
+# ---- step 4.14: oversight and break-glass ----
+# admin_a (Full admin) holds projects:oversee, never projects:administer (Root's own). The "All projects (oversight)"
+# list lists rbac-PA by oversight; usermgr (User manager) and a member are refused it, and acting as someone hides it.
+# Private conversations are never reached by oversight (agent:chat is a write level). The read of rbac-PA writes the
+# day's project.oversee row, which member_a (the owner) then reads in the feed. Break-glass itself needs the confirmed
+# Root with its password: an admin and a member are refused here, Root's rows run on the disposable instance
+# (tests/rbac_breakglass_live.sh: the shared instance's Root is unconfirmed). The break-glass route exists with the
+# switch on whatever Root's policy says and asks projects:administer before reading the policy: with the switch off
+# 404 (p4-breakglass-off, sharingswitch:off), with the switch on and the policy {} an admin is refused 403.
+p4-oversee-list	4.14	admin_a	GET	/api/projects/oversight	-	200;has=${PA_ID};has="via":"oversight"	req:SH-47 sharing:on
+p4-oversee-list-member	4.14	member_b	GET	/api/projects/oversight	-	403;has=projects:oversee	req:SH-47 sharing:on
+p4-oversee-list-usermgr	4.14	usermgr	GET	/api/projects/oversight	-	403;has=projects:oversee	req:SH-47 permissions:on sharing:on
+p4-oversee-list-acting	4.14	admin_a_as_member_a	GET	/api/projects/oversight	-	403;has=not_while_acting_as	req:SH-47 req:IM-07 sharing:on
+p4-oversee-list-off	4.14	admin_a	GET	/api/projects/oversight	-	404	req:SH-47 req:DV-30 sharing:off
+p4-oversee-conversations	4.14	admin_a	GET	/api/conversations?projectId=${PA_ID}	-	403;has=agent:chat	req:SH-47 sharing:on
+p4-oversee-day-read	4.14	admin_a	GET	/api/projects/${PA_ID}	-	200;has="via":"oversight"	req:SH-47 req:DV-24 sharing:on
+p4-oversee-owner-feed	4.14	member_a	GET	/api/projects/${PA_ID}/activity?group=oversight	-	200;has="action":"project.oversee";has="label":"Read the project by oversight"	req:SH-47 req:AU-09 sharing:on
+p4-breakglass-admin	4.14	admin_a	POST	/api/projects/${PA_ID}/breakglass	{"reason":"rbac matrix","durationMinutes":5,"stepUpPassword":"rbac-not-the-password"}	403;has=projects:administer	req:SH-18 sharing:on
+p4-breakglass-member	4.14	member_b	POST	/api/projects/${PA_ID}/breakglass	{"reason":"rbac matrix","durationMinutes":5}	403;has=projects:administer	req:SH-18 sharing:on
+p4-breakglass-close-admin	4.14	admin_a	DELETE	/api/projects/${PA_ID}/breakglass	-	403;has=projects:administer	req:SH-18 sharing:on
+p4-breakglass-off	4.14	admin_a	POST	/api/projects/${PA_ID}/breakglass	{"reason":"rbac matrix","durationMinutes":5}	404	req:SH-18 req:DV-30 sharingswitch:off
+p4-breakglass-policy-off	4.14	admin_a	POST	/api/projects/${PA_ID}/breakglass	{"reason":"rbac matrix","durationMinutes":5}	403;has=projects:administer	req:SH-18 req:DV-30 sharingswitch:on sharing:off

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requireLevel, requirePermission } from '@/lib/authz/guards'
+import { reportMayHoldStepContent } from '@/lib/report/stepContent'
 import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
@@ -9,20 +10,23 @@ interface RouteParams {
 }
 
 /** GET /api/projects/{id}/reports/{reportId} - Download report HTML */
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, reportId } = await params
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'reports:read', { projectId: id })
+    if (auth instanceof NextResponse) return auth
 
     const report = await prisma.report.findFirst({
       where: { id: reportId, projectId: id },
     })
     if (!report) {
       return NextResponse.json({ error: 'Report not found' }, { status: 404 })
+    }
+    // A report that holds fireteam step content, or predates the record of it, is raw data.
+    if (reportMayHoldStepContent(report.metrics)) {
+      const raw = requireLevel(auth, 'R*')
+      if (raw) return raw
     }
 
     if (!existsSync(report.filePath)) {
@@ -55,14 +59,12 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
 }
 
 /** DELETE /api/projects/{id}/reports/{reportId} - Delete report (file + DB) */
-export async function DELETE(_request: NextRequest, { params }: RouteParams) {
+export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, reportId } = await params
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'reports:delete', { projectId: id })
+    if (auth instanceof NextResponse) return auth
 
     const report = await prisma.report.findFirst({
       where: { id: reportId, projectId: id },

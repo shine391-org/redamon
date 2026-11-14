@@ -41,6 +41,8 @@ if __name__ == "__main__":
     shutdown.install()
 
 from recon.project_settings import get_settings
+from recon.helpers import request_pacer
+from recon.helpers.ip_hostnames import hostname_mode
 from recon.helpers.roe_scope import _is_roe_excluded
 from recon.partial_recon_modules.helpers import (
     _classify_ip,
@@ -50,11 +52,13 @@ from recon.partial_recon_modules.helpers import (
     _is_valid_url,
     STATUS_OK,
     filter_partial_user_input,
+    ip_mode_refusal,
     partial_domain_groups,
     print_run_report,
     run_exit_code,
     scope_roots,
     set_project_scope,
+    set_run_ip_targets,
     set_run_roe,
     settings_project_roots,
     settings_scope_groups,
@@ -122,6 +126,70 @@ ALLOWED_SETTINGS_OVERRIDES = frozenset({
     "MITRE_ENABLED",
     "SECURITY_CHECK_ENABLED",
 })
+
+# The on/off switch(es) each partial tool runs under: its module forces them on,
+# because the operator asked for that tool. Only the tool -> switch link lives
+# here; whether stealth turns a switch off is read from the registry's stealth
+# profile (_stealth_refusal). test_partial_stealth_refusal.py fails a dispatched
+# tool with no row and a forced switch missing from every row.
+PARTIAL_TOOL_SWITCHES = {
+    "SubdomainDiscovery": ("SUBDOMAIN_DISCOVERY_ENABLED",),
+    "Naabu": ("NAABU_ENABLED",),
+    "Masscan": ("MASSCAN_ENABLED",),
+    "Nmap": ("NMAP_ENABLED",),
+    "Tlsx": ("TLSX_ENABLED",),
+    "Httpx": ("HTTPX_ENABLED",),
+    "IpAttribution": ("IP_ATTRIBUTION_ENABLED",),
+    "Katana": ("KATANA_ENABLED",),
+    "Hakrawler": ("HAKRAWLER_ENABLED",),
+    "ZapAjaxSpider": ("ZAP_AJAX_SPIDER_ENABLED",),
+    "Gau": ("GAU_ENABLED",),
+    "Jsluice": ("JSLUICE_ENABLED",),
+    "Kiterunner": ("KITERUNNER_ENABLED",),
+    "ParamSpider": ("PARAMSPIDER_ENABLED",),
+    "Ffuf": ("FFUF_ENABLED",),
+    "Arjun": ("ARJUN_ENABLED",),
+    "EndpointAiClassifier": ("RESOURCE_ENUM_AI_CLASSIFIER_ENABLED",),
+    "OpenAPI": ("OPENAPI_ENABLED",),
+    "AiSurfaceRecon": ("AI_SURFACE_RECON_ENABLED",),
+    "JsRecon": ("JS_RECON_ENABLED",),
+    "SerializedScan": ("SERIALIZED_SCAN_ENABLED",),
+    "RouteExposure": ("ROUTE_EXPOSURE_ENABLED",),
+    "SupplyChainRecon": ("SUPPLY_CHAIN_RECON_ENABLED", "JS_RECON_ENABLED"),
+    "GraphqlScan": ("GRAPHQL_SECURITY_ENABLED",),
+    "Nuclei": ("NUCLEI_ENABLED",),
+    "SubdomainTakeover": ("SUBDOMAIN_TAKEOVER_ENABLED",),
+    "VhostSni": ("VHOST_SNI_ENABLED",),
+    "WebCachePoison": ("WEB_CACHE_POISON_ENABLED",),
+    "SecurityChecks": ("SECURITY_CHECK_ENABLED",),
+    "Shodan": ("SHODAN_ENABLED",),
+    "Urlscan": ("URLSCAN_ENABLED",),
+    "Uncover": ("UNCOVER_ENABLED", "OSINT_ENRICHMENT_ENABLED"),
+    "OsintEnrichment": ("OSINT_ENRICHMENT_ENABLED",),
+    "OriginDiscovery": ("ORIGIN_DISCOVERY_ENABLED",),
+}
+
+
+def _stealth_refusal(tool_id: str, settings: dict):
+    """Why stealth mode refuses this partial tool, or None.
+
+    The module would force its switch back on after get_settings() applied the
+    stealth profile, so a partial FFuf in a stealth project ran unthrottled. A
+    tool is refused when the profile sets one of its switches to false; a tool
+    stealth only throttles runs, on the stealth values already applied. A tool
+    with no row is refused too: stealth never assumes an unknown tool is quiet.
+    """
+    if not settings.get("STEALTH_MODE"):
+        return None
+    switches = PARTIAL_TOOL_SWITCHES.get(tool_id)
+    if switches is None:
+        return f"{tool_id} has no recorded on/off switch, so it does not run in stealth mode"
+    from recon.settings_registry import stealth_profile
+    profile = stealth_profile()
+    off = [key for key in switches if (profile.get(key) or {}).get("set", True) is False]
+    if off:
+        return f"{tool_id} is off in stealth mode ({', '.join(off)})"
+    return None
 
 
 
@@ -203,7 +271,10 @@ def _refusal_reason(root: str, settings: dict, project_roots: list):
 def _prepare_scope(config: dict, settings: dict, project_id: str):
     """Refuse roots and write the scope the modules read.
 
-    Returns {root: reason} for each refused root, for the report.
+    Returns {root: reason} for each refused root, for the report. In IP mode
+    also the run's hostnames (S), computed once here with the current policy
+    and live DNS (ip_hostname_scope); the report then lists each typed name it
+    refused and each name an earlier run scanned that it refuses now.
     """
     project_roots = settings_project_roots(settings, project_id)
     refused, kept = {}, []
@@ -222,7 +293,10 @@ def _prepare_scope(config: dict, settings: dict, project_id: str):
     # root rule and the writers' org attach (the graph names a Domain after the org).
     set_project_scope(settings_scope_groups(settings))
     set_run_roe(settings)
+    # Before the typed-input filter and every builder: both keep to this list.
+    set_run_ip_targets(settings)
     config["ip_mode"] = bool(settings.get("IP_MODE"))
+    config["ip_hostname_mode"] = hostname_mode(settings) if config["ip_mode"] else None
     config["batch_mode"] = bool(settings.get("DOMAIN_BATCH_MODE"))
     config["settings_overrides"] = _allowlist_overrides(config.get("settings_overrides"))
     config["_settings"] = settings
@@ -231,6 +305,11 @@ def _prepare_scope(config: dict, settings: dict, project_id: str):
     dropped = filter_partial_user_input(config, settings)
     for item in dropped:
         print(f"[!][Partial Recon] Not using typed input outside the scope: {item}")
+    if config["ip_mode"]:
+        # After the typed-input filter: a typed name reaches the live check
+        # only once its pattern, the guardrail and the RoE admitted it.
+        from recon.partial_recon_modules.ip_hostname_scope import run_hostname_scope
+        refused.update(run_hostname_scope(config, settings, os.environ.get("USER_ID", ""), project_id))
     if typed and not _typed_anything(config) and not config.get("include_graph_targets", True):
         print("[!][Partial Recon] No typed target is in this project's scope.")
         for root in kept:
@@ -341,6 +420,22 @@ def main():
         print(f"[!][Partial Recon] Cannot load the project settings ({type(e).__name__}). "
               f"Refusing to scan.")
         sys.exit(1)
+    # The RoE ceiling for the requests the tool sends in-process (security
+    # checks, OpenAPI...), before any of them runs.
+    request_pacer.configure(settings)
+
+    # Before the scope pass: a refused tool should not even make its ownership
+    # TXT lookups or graph reads.
+    stealth = _stealth_refusal(tool_id, settings)
+    if stealth:
+        print(f"[!][Partial Recon] Refusing to run: {stealth}")
+        print_run_report(tool_id, {}, {root: f"refused: {stealth}" for root in scope_roots(config)})
+        sys.exit(1)
+    ip_refusal = ip_mode_refusal(tool_id, settings)
+    if ip_refusal:
+        print(f"[!][Partial Recon] Refusing to run {tool_id}: {ip_refusal}")
+        print_run_report(tool_id, {}, {root: ip_refusal for root in scope_roots(config)})
+        sys.exit(1)
 
     refused = _prepare_scope(config, settings, project_id)
     if not scope_roots(config):
@@ -403,6 +498,13 @@ def _apply_node_filters(started_at):
 
 def _dispatch(tool_id: str, config: dict):
     """Run one tool. Loop tools return {root: status}; the rest return None."""
+    # main() refuses these before the scope pass; this holds for any other
+    # caller that dispatches an IP-mode config.
+    ip_refusal = ip_mode_refusal(tool_id, {"IP_MODE": config.get("ip_mode"),
+                                           "IP_HOSTNAME_MODE": config.get("ip_hostname_mode")})
+    if ip_refusal:
+        print(f"[!][Partial Recon] Refusing to run {tool_id}: {ip_refusal}")
+        return {root: ip_refusal for root in scope_roots(config)}
     if tool_id == "SubdomainDiscovery":
         return run_subdomain_discovery(config)
     elif tool_id == "Naabu":

@@ -80,6 +80,16 @@ class PortMixin:
         - Updates IP nodes with CDN information
         - Relationships: IP -[:HAS_PORT]-> Port, Port -[:RUNS_SERVICE]-> Service
 
+        It never lowers what it did not measure (D5). A full run clears the
+        assets first, so there it sets exactly what the scanner reported; a
+        partial run, or a later write in the same run, lands on nodes other
+        tools already tagged. So IP.is_cdn only ever goes up and the first
+        cdn_name stays, and Port.passive_only goes false only for a port the
+        caller saw itself: a port detail that carries a passive_only other
+        than false (port data rebuilt from the graph: true, or null on a Port
+        from before the mark) is none. A detail's own `ip` names the address
+        the port is on, for a host whose addresses have different ports.
+
         Args:
             recon_data: The recon JSON data containing port_scan results
             user_id: User identifier for multi-tenant isolation
@@ -122,13 +132,14 @@ class PortMixin:
 
                     # Update IP node with CDN info if available
                     cdn_name = ip_info.get("cdn")
-                    is_cdn = ip_info.get("is_cdn", False)
+                    # A bool, never None: `false OR null` is null, which would drop a stored true.
+                    is_cdn = bool(ip_info.get("is_cdn"))
 
                     session.run(
                         """
                         MERGE (i:IP {address: $address, user_id: $user_id, project_id: $project_id})
-                        SET i.is_cdn = $is_cdn,
-                            i.cdn_name = $cdn_name,
+                        SET i.is_cdn = coalesce(i.is_cdn, false) OR $is_cdn,
+                            i.cdn_name = coalesce(i.cdn_name, $cdn_name),
                             i.updated_at = datetime()
                         """,
                         address=ip_addr, user_id=user_id, project_id=project_id,
@@ -141,32 +152,34 @@ class PortMixin:
 
             # Process by_host data - this gives us hostname -> port details with services
             for hostname, host_info in by_host.items():
-                ip_addr = host_info.get("ip")
+                host_ip = host_info.get("ip")
                 port_details = host_info.get("port_details", [])
                 cdn_name = host_info.get("cdn")
-                is_cdn = host_info.get("is_cdn", False)
+                is_cdn = bool(host_info.get("is_cdn"))
 
                 # Update IP node with CDN info (if not already done)
-                if ip_addr:
+                if host_ip:
                     try:
                         session.run(
                             """
                             MERGE (i:IP {address: $address, user_id: $user_id, project_id: $project_id})
-                            SET i.is_cdn = $is_cdn,
-                                i.cdn_name = $cdn_name,
+                            SET i.is_cdn = coalesce(i.is_cdn, false) OR $is_cdn,
+                                i.cdn_name = coalesce(i.cdn_name, $cdn_name),
                                 i.updated_at = datetime()
                             """,
-                            address=ip_addr, user_id=user_id, project_id=project_id,
+                            address=host_ip, user_id=user_id, project_id=project_id,
                             is_cdn=is_cdn, cdn_name=cdn_name
                         )
                     except Exception as e:
-                        stats["errors"].append(f"IP {ip_addr} update failed: {e}")
+                        stats["errors"].append(f"IP {host_ip} update failed: {e}")
 
                 # Create Port and Service nodes
                 for port_info in port_details:
                     port_number = port_info.get("port")
                     protocol = port_info.get("protocol", "tcp")
                     service_name = port_info.get("service")
+                    ip_addr = port_info.get("ip") or host_ip
+                    active = port_info.get("passive_only", False) is False
 
                     if not port_number:
                         continue
@@ -178,11 +191,12 @@ class PortMixin:
                             """
                             MERGE (p:Port {number: $port_number, protocol: $protocol, ip_address: $ip_addr, user_id: $user_id, project_id: $project_id})
                             SET p.state = 'open',
-                                p.passive_only = false,
                                 p.updated_at = datetime()
+                            WITH p WHERE $active
+                            SET p.passive_only = false
                             """,
                             port_number=port_number, protocol=protocol, ip_addr=ip_addr,
-                            user_id=user_id, project_id=project_id
+                            active=active, user_id=user_id, project_id=project_id
                         )
                         stats["ports_created"] += 1
 
@@ -329,9 +343,12 @@ class PortMixin:
         This function:
         - Creates Port (and Service) nodes for nmap_scan.new_open_ports, the open
           ports nmap confirmed that the port scan did not report
-        - Enriches existing Port nodes with product, version, CPE from Nmap -sV
+        - Enriches existing Port nodes with product, version, CPE from Nmap -sV,
+          and takes passive_only to false on each (nmap found it open)
         - Updates existing Service nodes with version info
-        - Creates Vulnerability nodes from NSE script findings
+        - Creates Vulnerability nodes from NSE script findings: a port script's
+          AFFECTS its Port, a host script's (host_level, port 0) hangs off its
+          existing IP via HAS_VULNERABILITY
         - Creates CVE nodes if NSE scripts report specific CVEs
         - Creates Technology nodes for detected services (for CVE lookup linkage)
         """
@@ -413,7 +430,9 @@ class PortMixin:
                         continue
 
                     try:
-                        # Enrich Port node
+                        # nmap lists only the ports it found open on this
+                        # address, so a passive provider's Port here is now an
+                        # active hit; a Port of the other protocol is not.
                         port_result = session.run(
                             """
                             MATCH (p:Port {number: $port_number, ip_address: $ip_addr, user_id: $user_id, project_id: $project_id})
@@ -421,10 +440,12 @@ class PortMixin:
                                 p.version = $version,
                                 p.cpe = $cpe,
                                 p.nmap_scanned = true,
+                                p.passive_only = CASE WHEN p.protocol = $protocol THEN false ELSE p.passive_only END,
                                 p.updated_at = datetime()
                             RETURN count(p) AS matched
                             """,
                             port_number=port_number, ip_addr=ip_addr,
+                            protocol=pd.get("protocol") or "tcp",
                             product=product, version=version, cpe=cpe,
                             user_id=user_id, project_id=project_id
                         )
@@ -536,7 +557,10 @@ class PortMixin:
             for vuln in nmap_data.get("nse_vulns", []):
                 script_id = vuln.get("script_id", "")
                 ip_addr = vuln.get("ip") or vuln.get("host", "")
-                port_number = vuln.get("port")
+                # A host-rule script (<hostscript>) is about the host, not a
+                # port: 0 is its port key, since a null port_number fails the MERGE.
+                host_level = bool(vuln.get("host_level"))
+                port_number = 0 if host_level else vuln.get("port")
                 output = vuln.get("output", "")
                 state = vuln.get("state", "")
                 cve_id = vuln.get("cve")
@@ -551,7 +575,8 @@ class PortMixin:
                     # K6: nmap_nse findings had NO `id`, so triage could never
                     # address one: it could not be muted, given a verdict, or
                     # linked to a remediation. The natural key is what the MERGE
-                    # already uses, hashed so the id is short and stable.
+                    # already uses, hashed so the id is short and stable (port 0
+                    # for a host-level finding).
                     nse_id = "nse-" + hashlib.sha1(
                         f"{script_id}|{ip_addr}|{port_number}".encode()
                     ).hexdigest()[:16]
@@ -572,17 +597,36 @@ class PortMixin:
                             v.cve_ids = CASE WHEN $cve_id IS NULL OR $cve_id = ''
                                              THEN coalesce(v.cve_ids, [])
                                              ELSE [$cve_id] END,
+                            // null on a port finding, so it stays absent there
+                            v.host_level = $host_level,
                             v.updated_at = datetime()
                         """,
                         name=script_id, ip_addr=ip_addr, port_number=port_number,
                         severity=severity, output=output[:2000], state=state,
-                        cve_id=cve_id, nse_id=nse_id,
+                        cve_id=cve_id, nse_id=nse_id, host_level=True if host_level else None,
                         user_id=user_id, project_id=project_id
                     )
                     stats["nse_vulns_created"] += 1
 
+                    if host_level:
+                        # MATCH, never MERGE: nmap scans only IPs the graph
+                        # already holds, and its output must not invent one.
+                        ip_link = session.run(
+                            """
+                            MATCH (i:IP {address: $ip_addr, user_id: $user_id, project_id: $project_id})
+                            MATCH (v:Vulnerability {name: $name, ip_address: $ip_addr, port_number: $port_number, user_id: $user_id, project_id: $project_id})
+                            MERGE (i)-[:HAS_VULNERABILITY]->(v)
+                            RETURN count(v) AS matched
+                            """,
+                            name=script_id, ip_addr=ip_addr, port_number=port_number,
+                            user_id=user_id, project_id=project_id
+                        )
+                        if _matched(ip_link):
+                            stats["relationships_created"] += 1
+                            stats["host_level_links"] = stats.get("host_level_links", 0) + 1
+
                     # Link Vulnerability to Port
-                    if port_number:
+                    elif port_number:
                         session.run(
                             """
                             MATCH (v:Vulnerability {name: $name, ip_address: $ip_addr, port_number: $port_number, user_id: $user_id, project_id: $project_id})
@@ -672,6 +716,8 @@ class PortMixin:
         print(f"[+][graph-db] Enriched {stats['services_enriched']} Service nodes")
         print(f"[+][graph-db] Created {stats['technologies_created']} Technology nodes")
         print(f"[+][graph-db] Created {stats['nse_vulns_created']} NSE Vulnerability nodes")
+        if stats.get("host_level_links"):
+            print(f"[+][graph-db] Linked {stats['host_level_links']} host-level NSE findings to their IP")
         print(f"[+][graph-db] Created {stats['cves_created']} CVE nodes")
         print(f"[+][graph-db] Created {stats['relationships_created']} relationships")
 

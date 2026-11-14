@@ -19,9 +19,9 @@
  * bytes are untouched), so re-running the activation simply rebuilds X.
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
-import { requireVersionInProject } from '@/lib/scanVersionAccess'
+import { requireVersionInProject, type OwnedVersion } from '@/lib/scanVersionAccess'
 import { writeAudit } from '@/lib/audit'
 import {
   captureGraphSnapshot,
@@ -35,21 +35,21 @@ import { clearProjectGraph, restoreGraph, sweepOrphanReferenceNodes } from '@/li
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { invalidateCache } from '@/app/api/graph/cache'
 import { acquireActivationLock, releaseActivationLock } from '@/lib/activationLock'
+import { GRAPH_LOCK_HOLDER_PHRASE, tryWithGraphLock } from '@/lib/projectGraphLock'
 import { describeLiveGraphWriters } from '@/lib/graphWriters'
 import { describeNodeFilterWriter } from '@/lib/nodeFilterRun'
-import { internalError, withRouteErrors } from '@/lib/routeErrors'
+import { internalError, safeErrorCode, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; versionId: string }>
 }
 
-export const POST = withRouteErrors('Activation failed', async (_request: NextRequest, { params }: RouteParams) => {
+export const POST = withRouteErrors('Activation failed', async (request: NextRequest, { params }: RouteParams) => {
   const { id, versionId } = await params
 
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'scan:versions', { projectId: id })
+  if (auth instanceof NextResponse) return auth
+  const eff = auth.effective
 
   // Anti-IDOR: never activate a version that belongs to another project.
   const target = await requireVersionInProject(id, versionId)
@@ -72,6 +72,60 @@ export const POST = withRouteErrors('Activation failed', async (_request: NextRe
     )
   }
 
+  // S-4: held from the writer check through the pointer move. A scan start that
+  // passed its own activation check, or a version save, would otherwise freeze
+  // the half-restored graph, and the start would spawn a scan into the swap.
+  const guardOwnerId = auth.access?.project.userId ?? eff.userId
+  const held = await tryWithGraphLock(id, 'activation', () => activateUnderLock(id, versionId, target, eff.userId, guardOwnerId))
+  if (held.acquired) return held.value
+  const holder = GRAPH_LOCK_HOLDER_PHRASE[held.heldBy]
+  return NextResponse.json(
+    { error: `Cannot activate a version while ${holder} for this project. Try again once it finishes.`, busy: holder },
+    { status: 409 }
+  )
+})
+
+/** The narrowing marker for the project's current policy, on its owner's
+ *  graph. Best-effort: the restore already committed, so a failure is only
+ *  reported (every reader re-applies the current policy). */
+async function markRestoredHostnames(projectId: string): Promise<boolean> {
+  try {
+    const row = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { userId: true, ipMode: true, ipHostnameMode: true, ipHostnameInclude: true, ipHostnameExclude: true },
+    })
+    if (!row) return false
+    const { markOutOfPolicy } = await import('@/lib/ipHostnamePolicy')
+    return await markOutOfPolicy(projectId, row.userId, row)
+  } catch (e) {
+    console.warn('[scanTimeline] hostname policy marker failed after activation:', e)
+    return false
+  }
+}
+
+/**
+ * The project's owner as read under the lock, which an ownership transfer takes too (step 5.12): a
+ * snapshot's nodes carry the user_id they were captured under, and a version saved before a transfer
+ * must come back under the new owner. Falls back to the owner the guard read (the same person unless a
+ * transfer ended between the two reads) when the row cannot be read.
+ */
+async function ownerUnderLock(projectId: string, guardOwnerId: string): Promise<string> {
+  try {
+    const row = await prisma.project.findUnique({ where: { id: projectId }, select: { userId: true } })
+    return row?.userId ?? guardOwnerId
+  } catch (err) {
+    console.warn(`[scanTimeline] owner re-read under the lock failed (${safeErrorCode(err)}); restoring under the owner the guard read`)
+    return guardOwnerId
+  }
+}
+
+async function activateUnderLock(
+  id: string,
+  versionId: string,
+  target: OwnedVersion,
+  actorId: string,
+  guardOwnerId: string,
+): Promise<NextResponse> {
   // 4A.3: mutually exclusive with anything else that touches the live graph.
   const busy = await describeLiveGraphWriters(id)
   if (busy) {
@@ -135,6 +189,7 @@ export const POST = withRouteErrors('Activation failed', async (_request: NextRe
     }
 
     // --- 2. swap the live graph ----------------------------------------------
+    const ownerId = await ownerUnderLock(id, guardOwnerId)
     const snapshot = await loadSnapshot(versionId)
     if (!snapshot) {
       // Defensive: hasSnapshot said there were bytes. Nothing has been deleted.
@@ -154,6 +209,7 @@ export const POST = withRouteErrors('Activation failed', async (_request: NextRe
           await clearProjectGraph(session, id, SESSION_LABELS, { sweep: false })
           await restoreGraph(session, snapshot.nodes, snapshot.relationships, {
             projectId: id,
+            userId: ownerId,
             ...(snapshot.referenceLinks ? { referenceLinks: snapshot.referenceLinks } : {}),
           })
           await sweepOrphanReferenceNodes(session)
@@ -183,11 +239,17 @@ export const POST = withRouteErrors('Activation failed', async (_request: NextRe
       await tx.scanVersion.update({ where: { id: versionId }, data: { isCurrent: true, snapshot: null } })
     })
 
+    // A version captured before a narrowing holds hostnames still marked
+    // scanned that the current policy no longer admits (design §6.3). Readers
+    // drop them anyway; the marker makes the graph agree before the cache
+    // is refreshed.
+    const hostnamePolicyMarked = await markRestoredHostnames(id)
+
     // --- 4. the next read must see X ----------------------------------------
     invalidateCache(id)
 
     await writeAudit({
-      actorId: eff.userId,
+      actorId,
       action: 'scan-version.activate',
       targetType: 'scanVersion',
       targetId: versionId,
@@ -204,6 +266,7 @@ export const POST = withRouteErrors('Activation failed', async (_request: NextRe
       restoredRelationships: snapshot.relationships.length,
       frozenVersionId: frozenNodeCount > 0 ? current.id : null,
       frozenNodeCount,
+      hostnamePolicyMarked,
       durationMs: Date.now() - startedAt,
       // F2: activation swaps ONLY the recon graph.
       notice: 'Derived artifacts (GVM/secret scan output, remediations, reports, captured traffic) ' +
@@ -214,4 +277,4 @@ export const POST = withRouteErrors('Activation failed', async (_request: NextRe
   } finally {
     await releaseActivationLock(id)
   }
-})
+}

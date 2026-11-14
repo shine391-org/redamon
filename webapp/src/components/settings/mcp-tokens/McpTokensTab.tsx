@@ -35,6 +35,7 @@ import {
   type ProfileId,
 } from '@/lib/mcp/profiles'
 import ScopeChecklist from './ScopeChecklist'
+import SharedProjectsField from './SharedProjectsField'
 import AgentOnboardingModal from './AgentOnboardingModal'
 import styles from './McpTokensTab.module.css'
 import { profileOffered } from '@/lib/agentInTheLoop'
@@ -54,6 +55,9 @@ interface TokenRow {
   expiresAt: string | null
   revokedAt: string | null
   createdAt: string
+  /** Present with the sharing switch on (step 4.10). */
+  includeSharedProjects?: boolean
+  projectAllowlist?: string[]
 }
 
 /**
@@ -91,6 +95,26 @@ const EDIT_EXPIRY_PRESETS: { value: EditExpiry; label: string }[] = [
 ]
 
 const DAY_MS = 86_400_000
+
+/** The account's token quotas as the list answers them (step 6.8); absent when neither applies. */
+interface TokenQuota { maxMcpTokens: number | null; maxMcpTokenExpiryDays: number | null; active: number }
+
+/** The mint's expiry choices a maxMcpTokenExpiryDays allows: no longer preset and no "No expiry". */
+export function mintExpiryOptions(maxDays: number | null): typeof EXPIRY_OPTIONS {
+  return maxDays === null ? EXPIRY_OPTIONS : EXPIRY_OPTIONS.filter(o => o.value !== 'never' && o.value <= maxDays)
+}
+
+/** The edit's expiry choices it allows: the longer presets and "No expiry" go; "Expire now" and a date stay. */
+export function editExpiryPresets(maxDays: number | null): typeof EDIT_EXPIRY_PRESETS {
+  return maxDays === null ? EDIT_EXPIRY_PRESETS : EDIT_EXPIRY_PRESETS.filter(o => o.value !== 'never' && !(Number(o.value) > maxDays))
+}
+
+/** The mint's starting expiry: the usual default when allowed, else the longest allowed preset. */
+export function defaultMintExpiry(maxDays: number | null): number | 'never' {
+  const allowed = mintExpiryOptions(maxDays)
+  if (allowed.some(o => o.value === MCP_DEFAULT_EXPIRY_DAYS)) return MCP_DEFAULT_EXPIRY_DAYS
+  return allowed.length ? allowed[allowed.length - 1].value : MCP_DEFAULT_EXPIRY_DAYS
+}
 
 /** What the chosen expiry would be, so the UI can tell widening before the server does. */
 function prospectiveExpiry(choice: EditExpiry, date: string, current: string | null): Date | null {
@@ -139,6 +163,13 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
   // and its profile are not offered.
   const [loopOn, setLoopOn] = useState(false)
   const profileList = PROFILE_LIST.filter(p => profileOffered(p.id, loopOn))
+  // The scopes this account cannot grant and why (permissions switch on; absent off). A profile
+  // or the defaults never tick one, and the checklist shows it disabled with the reason.
+  const [scopeLimits, setScopeLimits] = useState<Partial<Record<McpScope, readonly string[]>> | undefined>(undefined)
+  const grantable = useCallback(
+    (list: McpScope[]) => (scopeLimits ? list.filter(s => scopeLimits[s] === undefined) : list),
+    [scopeLimits],
+  )
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
@@ -146,6 +177,12 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
   // an admin is viewing someone else's settings the form is disabled WITH A
   // REASON rather than being a button that 403s on click.
   const [sessionUserId, setSessionUserId] = useState<string | null>(null)
+  // Sharing in force (/api/auth/me): only then can a token opt in to shared projects.
+  const [sharingOn, setSharingOn] = useState(false)
+  const [includeShared, setIncludeShared] = useState(false)
+  const [allowlist, setAllowlist] = useState<string[]>([])
+  const [editIncludeShared, setEditIncludeShared] = useState(false)
+  const [editAllowlist, setEditAllowlist] = useState<string[]>([])
 
   const [showForm, setShowForm] = useState(false)
   const [name, setName] = useState('')
@@ -163,6 +200,11 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     { profile: ProfileId; scopes: McpScope[]; name: string } | null
   >(null)
   const [copied, setCopied] = useState<'token' | 'snippet' | null>(null)
+
+  const [tokenQuota, setTokenQuota] = useState<TokenQuota | null>(null)
+  const maxExpiryDays = tokenQuota?.maxMcpTokenExpiryDays ?? null
+  const mintOptions = mintExpiryOptions(maxExpiryDays)
+  const mintDefault = defaultMintExpiry(maxExpiryDays)
 
   const [editing, setEditing] = useState<TokenRow | null>(null)
   const [editName, setEditName] = useState('')
@@ -186,19 +228,30 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     { profile: ProfileId; scopes: McpScope[]; name: string } | null
   >(null)
 
-  const draft = { name, profile, scopes, expiresInDays, password }
+  const draft = { name, profile, scopes, expiresInDays, password, includeShared, allowlist }
   const { isDirty, setBaseline } = useDirtyState(draft)
 
   const editScopesChanged = editing !== null && (
     editScopes.length !== editing.scopes.length || editScopes.some(s => !editing.scopes.includes(s))
   )
   const editProfileChanged = editing !== null && editProfile !== profileOrDefault(editing.profile)
+  const editSharedChanged = editing !== null && sharingOn && (
+    editIncludeShared !== (editing.includeSharedProjects === true)
+    || editAllowlist.length !== (editing.projectAllowlist ?? []).length
+    || editAllowlist.some(id => !(editing.projectAllowlist ?? []).includes(id))
+  )
   const editDirty = editing !== null && (
-    editName.trim() !== editing.name || editScopesChanged || editProfileChanged || editExpiry !== 'keep'
+    editName.trim() !== editing.name || editScopesChanged || editProfileChanged || editExpiry !== 'keep' || editSharedChanged
   )
   const editWidens = editing !== null && isTokenWidening(
-    { scopes: editing.scopes, expiresAt: editing.expiresAt ? new Date(editing.expiresAt) : null },
-    { scopes: editScopes, expiresAt: prospectiveExpiry(editExpiry, editDate, editing.expiresAt) },
+    {
+      scopes: editing.scopes, expiresAt: editing.expiresAt ? new Date(editing.expiresAt) : null,
+      includeSharedProjects: editing.includeSharedProjects === true, projectAllowlist: editing.projectAllowlist ?? [],
+    },
+    {
+      scopes: editScopes, expiresAt: prospectiveExpiry(editExpiry, editDate, editing.expiresAt),
+      ...(editSharedChanged ? { includeSharedProjects: editIncludeShared, projectAllowlist: editAllowlist } : {}),
+    },
   )
   const editNeedsPassword = editWidens || serverWantsPassword
 
@@ -221,6 +274,8 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
       const data = await r.json()
       setTokens(Array.isArray(data.tokens) ? data.tokens : [])
       setLoopOn(data.features?.agentInTheLoop === true)
+      setScopeLimits(data.ungrantableScopes && typeof data.ungrantableScopes === 'object' ? data.ungrantableScopes : undefined)
+      setTokenQuota(data.tokenQuota && typeof data.tokenQuota === 'object' ? data.tokenQuota : null)
     } catch (e) {
       // Never a silent empty list: that reads as "you have no tokens" and
       // prompts a duplicate mint.
@@ -241,7 +296,10 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
         const r = await fetch('/api/auth/me')
         if (!r.ok) return
         const data = await r.json()
-        if (!cancelled) setSessionUserId(typeof data?.id === 'string' ? data.id : null)
+        if (!cancelled) {
+          setSessionUserId(typeof data?.id === 'string' ? data.id : null)
+          setSharingOn(data?.sharing?.enabled === true)
+        }
       } catch {
         // Leaving it null keeps the form disabled, which is the safe direction.
       }
@@ -252,15 +310,17 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
   const resetForm = useCallback(() => {
     setName('')
     setProfile(DEFAULT_PROFILE)
-    setScopes([...DEFAULT_MCP_SCOPES])
-    setExpiresInDays(MCP_DEFAULT_EXPIRY_DAYS)
+    setScopes(grantable([...DEFAULT_MCP_SCOPES]))
+    setExpiresInDays(mintDefault)
     setPassword('')
+    setIncludeShared(false)
+    setAllowlist([])
     setFormError(null)
     setBaseline({
-      name: '', profile: DEFAULT_PROFILE, scopes: [...DEFAULT_MCP_SCOPES],
-      expiresInDays: MCP_DEFAULT_EXPIRY_DAYS, password: '',
+      name: '', profile: DEFAULT_PROFILE, scopes: grantable([...DEFAULT_MCP_SCOPES]),
+      expiresInDays: mintDefault, password: '', includeShared: false, allowlist: [],
     })
-  }, [setBaseline])
+  }, [setBaseline, grantable, mintDefault])
 
   const toggleScope = (s: McpScope) => {
     setScopes(prev => (prev.includes(s) ? prev.filter(x => x !== s) : [...prev, s]))
@@ -276,7 +336,12 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
    * `scopesForProfile` returns the recommended set only.
    */
   const changeProfile = async (next: ProfileId) => {
-    const diverged = profileScopeDiff(profile, scopes).modified
+    // Measured against what the profile could tick for this account, so the scopes it left out
+    // for want of a permission do not read as a hand edit.
+    const ticked = grantable(scopesForProfile(profile))
+    const diverged = scopeLimits
+      ? ticked.length !== scopes.length || scopes.some(s => !ticked.includes(s))
+      : profileScopeDiff(profile, scopes).modified
     if (diverged) {
       const ok = await confirm(
         `Switching to ${PROFILES[next].label} resets the permissions to that profile's ` +
@@ -289,7 +354,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     } else {
       setProfile(next)
     }
-    setScopes(scopesForProfile(next))
+    setScopes(grantable(scopesForProfile(next)))
   }
 
   const changeEditProfile = async (next: ProfileId) => {
@@ -313,7 +378,8 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     } else {
       setEditProfile(next)
     }
-    setEditScopes(scopesForProfile(next))
+    // A scope the account cannot grant is ticked only when the token already holds it.
+    setEditScopes(scopesForProfile(next).filter(s => scopeLimits?.[s] === undefined || editing.scopes.includes(s)))
   }
 
   const openEdit = (t: TokenRow) => {
@@ -325,6 +391,8 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
     setEditExpiry('keep')
     setEditDate('')
     setEditPassword('')
+    setEditIncludeShared(t.includeSharedProjects === true)
+    setEditAllowlist([...(t.projectAllowlist ?? [])])
     setEditError(null)
     setServerWantsPassword(false)
   }
@@ -345,6 +413,10 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
       if (editProfileChanged) body.profile = editProfile === 'custom' ? null : editProfile
       const expiry = expiryPayload(editExpiry, editDate)
       if (expiry !== undefined) body.expiry = expiry
+      if (editSharedChanged) {
+        body.includeSharedProjects = editIncludeShared
+        body.projectAllowlist = editAllowlist
+      }
       if (editNeedsPassword) body.password = editPassword
 
       const r = await fetch(`/api/users/${userId}/mcp-tokens/${editing.id}`, {
@@ -385,6 +457,8 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
           // already reads as. Storing the literal string would make the absence
           // of a choice indistinguishable from choosing Custom.
           profile: profile === 'custom' ? null : profile,
+          // Sent only with sharing in force, so the request is the one before sharing otherwise.
+          ...(sharingOn ? { includeSharedProjects: includeShared, projectAllowlist: allowlist } : {}),
         }),
       })
       if (!r.ok) {
@@ -626,15 +700,33 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
                 id="mcpTokenExpiry"
                 className={`select ${styles.control}`}
                 value={String(expiresInDays)}
+                aria-describedby={tokenQuota ? 'mcpTokenQuotaHint' : undefined}
                 onChange={e => setExpiresInDays(e.target.value === 'never' ? 'never' : Number(e.target.value))}
               >
-                {EXPIRY_OPTIONS.map(o => (
+                {mintOptions.map(o => (
                   <option key={String(o.value)} value={String(o.value)}>{o.label}</option>
                 ))}
               </select>
+              {tokenQuota && (
+                <span id="mcpTokenQuotaHint" className="formHint">
+                  {maxExpiryDays !== null && (mintOptions.length
+                    ? `Your administrator limits MCP tokens to ${maxExpiryDays} days. `
+                    : `Your administrator limits MCP tokens to ${maxExpiryDays} days, shorter than any choice here: ask them to raise it. `)}
+                  {tokenQuota.maxMcpTokens !== null && `${tokenQuota.active} of ${tokenQuota.maxMcpTokens} tokens in use.`}
+                </span>
+              )}
             </div>
 
-            <ScopeChecklist selected={scopes} onToggle={toggleScope} profile={profile} loopOff={!loopOn} />
+            <ScopeChecklist selected={scopes} onToggle={toggleScope} profile={profile} loopOff={!loopOn} limits={scopeLimits} />
+
+            {sharingOn && (
+              <SharedProjectsField
+                idPrefix="mcpToken"
+                include={includeShared}
+                allowlist={allowlist}
+                onChange={(include, ids) => { setIncludeShared(include); setAllowlist(ids) }}
+              />
+            )}
 
             <div className={`formGroup ${styles.field}`}>
               <label className="formLabel" htmlFor="mcpTokenPassword">Confirm your password</label>
@@ -733,7 +825,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
                     ? `Keep current (${tokenState(editing) === 'expired' ? 'expired ' : ''}${fmtDate(editing.expiresAt)})`
                     : 'Keep current (no expiry)'}
                 </option>
-                {EDIT_EXPIRY_PRESETS.map(o => (
+                {editExpiryPresets(maxExpiryDays).map(o => (
                   <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
               </select>
@@ -754,9 +846,13 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
                   className={`textInput ${styles.control}`}
                   value={editDate}
                   min={todayIso()}
+                  max={maxExpiryDays !== null ? new Date(Date.now() + maxExpiryDays * DAY_MS).toISOString().slice(0, 10) : undefined}
                   onChange={e => setEditDate(e.target.value)}
                 />
-                <span className="formHint">The token works until the end of that day (UTC).</span>
+                <span className="formHint">
+                  The token works until the end of that day (UTC).
+                  {maxExpiryDays !== null && ` Your administrator limits MCP tokens to ${maxExpiryDays} days.`}
+                </span>
               </div>
             )}
 
@@ -765,11 +861,26 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
               disabled={!!editing.revokedAt}
               profile={editProfile}
               loopOff={!loopOn}
+              limits={scopeLimits}
               onToggle={s => {
                 setEditScopes(prev => (prev.includes(s) ? prev.filter(x => x !== s) : [...prev, s]))
                 setServerWantsPassword(false)
               }}
             />
+
+            {sharingOn && (
+              <SharedProjectsField
+                idPrefix="mcpEdit"
+                include={editIncludeShared}
+                allowlist={editAllowlist}
+                disabled={!!editing.revokedAt}
+                onChange={(include, ids) => {
+                  setEditIncludeShared(include)
+                  setEditAllowlist(ids)
+                  setServerWantsPassword(false)
+                }}
+              />
+            )}
 
             {editScopesChanged && profileScopeDiff(editProfile, editScopes).modified && (
               <div className={styles.noticeBanner}>
@@ -787,8 +898,8 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
               <div className={styles.noticeBanner}>
                 <ShieldAlert size={14} />
                 <span>
-                  Only the token&apos;s own user can add a permission or extend the expiry. You can
-                  still remove permissions, shorten the expiry or revoke it.
+                  Only the token&apos;s own user can add a permission, extend the expiry or open it to
+                  more shared projects. You can still remove permissions, shorten the expiry or revoke it.
                 </span>
               </div>
             )}
@@ -805,8 +916,8 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
                   onChange={e => setEditPassword(e.target.value)}
                 />
                 <span className="formHint">
-                  Adding a permission or extending the expiry gives this token more power, so it asks
-                  for your password again.
+                  Adding a permission, extending the expiry or opening it to more shared projects gives
+                  this token more power, so it asks for your password again.
                 </span>
               </div>
             )}
@@ -846,6 +957,7 @@ export default function McpTokensTab({ userId, onDirtyChange }: Props) {
         initialScopes={onboarding?.scopes ?? [...DEFAULT_MCP_SCOPES]}
         tokenName={onboarding?.name}
         loopOn={loopOn}
+        limits={scopeLimits}
       />
 
       {!loading && !loadError && tokens.length > 0 && (

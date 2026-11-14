@@ -10,10 +10,15 @@
  *
  *  1. A caller who does not own the project gets 404 (never 403, which would
  *     confirm the project exists) and the agent is never called.
- *  2. The check does NOT honour `ACCESS_ENFORCE=0`. That log-only escape hatch
- *     exists so an ownership fix can be rolled out in observe mode, but a mute
- *     that "would have been blocked" still mutates the graph, so it must hard
- *     fail regardless of the flag. That is the regression this file exists for.
+ *  2. Ownership is always enforced: `ACCESS_ENFORCE=0` is ignored, so a
+ *     cross-user mute hard-fails whatever the variable says. A mute changes the
+ *     graph, so a check that only logged would still blind the agent; that is
+ *     the regression this file exists for.
+ *
+ * These cases run with sharing off, where only the owner sees a project. With
+ * sharing in force a collaborator at Read, or an admin by oversight, reads the
+ * board from the owner's graph and is refused every write (403):
+ * triage.shares.test.ts, with the real guard (this file doubles it).
  *
  * @vitest-environment node
  */
@@ -24,6 +29,7 @@ const mockRequireEff = vi.fn()
 const mockFindUnique = vi.fn()
 const mockAgentFetch = vi.fn()
 
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overProjectOwner()))
 vi.mock('@/lib/access', () => ({
   requireEffectiveUser: () => mockRequireEff(),
 }))
@@ -124,8 +130,8 @@ describe('a caller who does not own the project cannot reach the graph', () => {
 })
 
 describe('mute does not honour the ACCESS_ENFORCE log-only escape hatch', () => {
-  // The rest of the app can be rolled out in observe mode. Mute cannot: a mute
-  // that "would have been blocked" has still hidden a finding from the agent.
+  // Ownership is always enforced, whatever ACCESS_ENFORCE says: a mute that only
+  // logged would still have hidden a finding from the agent.
   test.each(['0', 'false'])('ACCESS_ENFORCE=%s still hard-blocks a cross-user mute', async flag => {
     process.env.ACCESS_ENFORCE = flag
     mockRequireEff.mockResolvedValue({ userId: ATTACKER })

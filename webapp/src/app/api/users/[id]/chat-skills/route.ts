@@ -3,6 +3,8 @@ import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
 import { internalError } from '@/lib/routeErrors'
 import { MAX_CHAT_SKILL_CONTENT_SIZE } from '@/lib/userSkills'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { refuseWhileActingAsOn } from '@/lib/authz/actAsRefusals'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -12,8 +14,10 @@ interface RouteParams {
 export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'read' })
     if (__denied) return __denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:chat_skills')
+    if (selfRefused) return selfRefused
 
     const skills = await prisma.userChatSkill.findMany({
       where: { userId: id },
@@ -33,8 +37,12 @@ const MAX_SKILLS_PER_USER = 50
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'write' })
     if (__denied) return __denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:chat_skills')
+    if (selfRefused) return selfRefused
+    const actingAs = await refuseWhileActingAsOn(id, 'write_chat_skills')
+    if (actingAs) return actingAs
     const body = await request.json()
 
     const { name, description, content, category } = body

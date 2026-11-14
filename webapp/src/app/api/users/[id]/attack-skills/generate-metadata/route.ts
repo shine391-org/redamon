@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getSession } from '@/lib/session'
+import { signedInActor } from '@/lib/auditActor'
 import { readJsonBody } from '@/lib/jsonBody'
 import { writeAudit } from '@/lib/audit'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
@@ -13,6 +13,7 @@ import { nameProblem, normalizeName } from '@/lib/userSkillNames'
 import { requireOwnBrowserRequest } from '@/lib/userSkillRouteGuard'
 import { USER_SKILL_AUDIT_TARGET, auditActorFor, contentSha256 } from '@/lib/userSkillWrites'
 import { withRouteErrors } from '@/lib/routeErrors'
+import { requireSelfPermission } from '@/lib/authz/selfService'
 
 // Above the agent's own 150 s cap (agentic/skill_metadata.py REQUEST_TIMEOUT_S), below undici's 300 s.
 const AGENT_TIMEOUT_MS = 180_000
@@ -84,6 +85,8 @@ async function generateMetadata(request: NextRequest, { params }: RouteParams): 
   const { id } = await params
   const eff = await requireOwnBrowserRequest(request, id)
   if (eff instanceof NextResponse) return eff
+  const selfRefused = await requireSelfPermission(request, id, 'self:attack_skills')
+  if (selfRefused) return selfRefused
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const read = readItems(parsed.body)
@@ -110,7 +113,7 @@ async function generateMetadata(request: NextRequest, { params }: RouteParams): 
   const model = await readFeatureModel(eff.userId, 'skill_metadata')
   if (!model) return featureModelErrorResponse('model_required', 'skill_metadata')
   // Read now: the agent call can outlast the session, and the audit row must still name the caller.
-  const actor = auditActorFor((await getSession())?.userId, id)
+  const actor = auditActorFor((await signedInActor())?.id, id)
 
   const agent = await callFeatureAgent({
     featureId: 'skill_metadata',

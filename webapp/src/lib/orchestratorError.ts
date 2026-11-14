@@ -11,8 +11,9 @@
  * generic "Application error: a client-side exception" and takes the page down.
  *
  * This helper guarantees `error` is ALWAYS a string (never an object), and puts
- * the structured payload in `limit` for the tailored limit modal. Every start
- * route must run its error body through here so the class of bug can't recur.
+ * a governor refusal's payload in `limit` for the tailored limit modal; no other
+ * part of the body is passed on. Every start route must run its error body
+ * through here so the class of bug can't recur.
  */
 
 export interface OrchestratorLimit {
@@ -35,6 +36,9 @@ export interface NormalizedStartError {
   code?: string
 }
 
+/** The setting name the orchestrator's admission gives a refusal by the actor's quota (admission_ledger.py). */
+const QUOTA_SETTING = 'maxConcurrentScans'
+
 export function normalizeOrchestratorStartError(
   errorData: unknown,
   fallback: string,
@@ -46,6 +50,13 @@ export function normalizeOrchestratorStartError(
 
   if (detail && typeof detail === 'object') {
     const d = detail as OrchestratorLimit
+    // The actor's maxConcurrentScans quota (step 6.8): an administrator's setting, not a restart knob.
+    if (d.limitType === 'hard' && d.settingName === QUOTA_SETTING) {
+      return {
+        error: `${d.detail || 'Scan quota reached'}. Wait for one of these scans to finish, or ask an administrator to raise your quota.`,
+        limit: d,
+      }
+    }
     if (d.limitType) {
       const msg =
         d.limitType === 'hard'
@@ -58,11 +69,12 @@ export function normalizeOrchestratorStartError(
       return { error: msg, limit: d }
     }
     // Unknown object shape: prefer its own `detail` string, else the fallback.
-    // Critically, NEVER return the object itself as `error`.
+    // Critically, NEVER return the object itself, as `error` or as `limit`: a
+    // FastAPI 422 is an array whose items echo the request in `input`, the scan's
+    // job credential included, and this result goes to the browser.
     const code = (detail as { code?: unknown }).code
     return {
       error: (typeof d.detail === 'string' ? d.detail : null) || fallback,
-      limit: d,
       ...(typeof code === 'string' ? { code } : {}),
     }
   }

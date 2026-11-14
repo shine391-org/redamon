@@ -156,12 +156,65 @@ def load_yaml() -> dict:
     return yaml.safe_load(YAML_PATH.read_text(encoding="utf-8"))
 
 
+#: The one MCP read refusal that is not the owner's secret: the owner's id names the owner,
+#: which every project read returns anyway.
+SHAREABLE_READ_DENY_REASONS = frozenset({"other_user"})
+
+
+#: Groups whose every field decides what the engagement targets or permits: `share: scope`,
+#: which a collaborator narrows only as a co-owner and widens never (or `secret`, the
+#: ownership token).
+SCOPE_GROUPS = frozenset({"scope", "engagement_limits"})
+
+
+def check_share_classes(fields: dict) -> None:
+    """Absent `share` means ordinary, which a collaborator reads and an editor writes, so a
+    column added without a class must not be one that needs more:
+
+    - a column withheld from MCP reads is withheld from collaborators too (`share: secret`),
+      or a credential column added with `readable: false` would reach every collaborator;
+    - a `roe_parse: tighten_only` switch is a safety gate (`share: gate`), or an editor could
+      loosen it;
+    - a field of a scope group is `share: scope`, or an editor could widen the engagement.
+    """
+    leaks = sorted(
+        name for name, f in fields.items()
+        if f.get("readable") is False
+        and f.get("read_deny_reason") not in SHAREABLE_READ_DENY_REASONS
+        and f.get("share") != "secret"
+    )
+    if leaks:
+        raise RegistryError(
+            "a column withheld from MCP reads must also be share: secret, or a collaborator "
+            "reads it: " + ", ".join(leaks)
+        )
+    open_gates = sorted(
+        name for name, f in fields.items()
+        if f.get("roe_parse") == "tighten_only" and f.get("share") != "gate"
+    )
+    if open_gates:
+        raise RegistryError(
+            "a roe_parse: tighten_only switch must also be share: gate, or an editor loosens "
+            "it: " + ", ".join(open_gates)
+        )
+    open_scope = sorted(
+        name for name, f in fields.items()
+        if f.get("group") in SCOPE_GROUPS and f.get("share") not in ("scope", "secret")
+    )
+    if open_scope:
+        raise RegistryError(
+            "a field of the scope or engagement_limits group must be share: scope, or an "
+            "editor widens the engagement: " + ", ".join(open_scope)
+        )
+
+
 def build(document: dict | None = None) -> dict:
     """Validate the YAML and join Prisma's type and default onto every field."""
     from prisma_project_columns import project_columns
 
     doc = document if document is not None else load_yaml()
     validate(doc)
+    check_share_classes(doc["fields"])
 
     columns = project_columns()
     fields = doc["fields"]

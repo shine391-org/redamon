@@ -86,14 +86,14 @@ The `resource_enum.py` module provides comprehensive endpoint discovery and clas
 | **Hakrawler Crawling** | DOM-aware web crawling via Docker (active) |
 | **jsluice JS Analysis** | JavaScript analysis to extract URLs, endpoints, and secrets (downloads JS files from target) |
 | **FFuf Directory Fuzzing** | Brute-force directory/endpoint discovery using wordlists (built-in SecLists + custom uploads) |
-| **ParamSpider Parameter Mining** | Passive Wayback Machine CDX query for parameterized URLs — returns only URLs with query parameters, values replaced by placeholder (FUZZ) |
+| **ParamSpider Parameter Mining** | Passive Wayback Machine CDX query for parameterized URLs — returns only URLs with query parameters, values replaced by placeholder (FUZZ). `paramspider -d` answers for every archived host under the domain, so only URLs on a host the run targets (`target_domains`, as for GAU) and not RoE-excluded reach the merge, `discovered_urls` (Nuclei DAST) and `archived_urls`; the rest count as `paramspider_out_of_scope`. Partial ParamSpider applies the same filter (`paramspider_urls_in_scope` in `paramspider_helpers`) before its merge |
 | **Arjun Parameter Discovery** | Discovers hidden HTTP query/body parameters on discovered endpoints using ~25,000 parameter names. Multi-method parallel execution (GET/POST/JSON/XML) |
 | **Parallel Execution** | Katana, Hakrawler, GAU, ParamSpider, and Kiterunner run simultaneously, then jsluice → FFuf → Arjun sequential (Arjun methods run in parallel internally) |
 | **URL Verification** | Verifies GAU URLs are live before adding to results |
 | **Method Detection** | OPTIONS probe detects allowed HTTP methods (GET, POST, PUT, DELETE) |
 | **Dead Endpoint Filtering** | Filters out endpoints that don't respond (404, 500, timeout) |
 | **JavaScript Parsing** | Discovers endpoints in JavaScript files |
-| **Form Extraction** | Parses HTML forms for POST endpoints |
+| **Form Extraction** | Parses HTML forms for POST endpoints. Under an RoE rate ceiling each page fetch, and each redirect hop, waits for its slot of the ceiling |
 | **Parameter Extraction** | Extracts query and body parameters |
 | **Type Inference** | Infers parameter data types (integer, email, URL, etc.) |
 | **Endpoint Classification** | Categorizes endpoints (auth, api, admin, file_access, etc.) |
@@ -170,15 +170,44 @@ All parameters are configured via the webapp project settings (stored in Postgre
 |-----------|------|---------|-------------|
 | `KATANA_JS_CRAWL` | `bool` | `True` | Parse JavaScript files for endpoints |
 | `KATANA_PARAMS_ONLY` | `bool` | `False` | Only keep URLs with query parameters |
-| `KATANA_SCOPE` | `str` | `"rdn"` | Scope: `rdn` (root domain), `dn` (domain), `fqdn` (full) |
 
-**Scope Options:**
+**Field scope:** Katana always runs with `-fs fqdn` (the seed's exact host); there
+is no setting for it. `run_katana_crawler` keeps only URLs on `allowed_hosts`, built
+from the seed URLs' hosts, so a wider field scope would only send requests to hosts
+no scan admitted and then discard what they return. The retired `katanaScope`
+column is kept in Prisma and read by nothing.
 
-| Scope | Description | Example |
-|-------|-------------|---------|
-| `rdn` | Root domain and all subdomains | `*.example.com` |
-| `dn` | Exact domain only | `www.example.com` |
-| `fqdn` | Exact FQDN only | `www.example.com` (no subdomains) |
+**Redirects:** katana follows a redirect inside its HTTP client, before `-fs`,
+`-cos` or `-e` judge anything (those see only the links it queues), so a seed
+answering 302 into an RoE-excluded host would get that host requested. While
+the run admits its targets one by one, that is while any RoE exclusion is in
+force or the project scans by IP (`target_admission.admission_context(...).active`,
+read through `redirects_contained`), Katana gets `-dr` and follows no redirect,
+a same-host one included, and logs `[*][Katana] Redirects not followed: RoE
+exclusions or the IP target list are in force`. The same condition turns off
+Hakrawler's `-subs` and limits the form fetch to same-host redirects (see
+[Hakrawler scope filtering](#2-scope-filtering) and [Form Parsing](#form-parsing)).
+Full and partial runs alike; with no exclusion outside IP mode, every argv and
+fetch is as configured (`recon/tests/test_crawler_redirects_roe.py`).
+
+**Arjun and FFuf redirects:** under the same condition neither fuzzer follows a
+redirect, since each would follow one to any host and has no same-host mode.
+Arjun 2.2.7's first request to a URL (`stable_request()`) follows redirects and
+returns the URL it landed on, and every later GET and POST for that target goes
+there. So `run_arjun_discovery` (`recon/helpers/resource_enum/arjun_helpers.py`)
+adds `--disable-redirects` whatever `ARJUN_DISABLE_REDIRECTS` says and logs
+`[*][Arjun] Redirects not followed: RoE exclusions or the IP target list are in
+force`. In the full pipeline its URLs also pass `admit_urls` (module `arjun`), as
+Nuclei's do, because crawler endpoints can name any host they saw; a partial
+run's graph and typed URLs were admitted before, so its list is kept as given.
+ffuf `-r` follows a redirect with Go's default client, so `run_ffuf_discovery`
+(`recon/helpers/resource_enum/ffuf_helpers.py`) drops `-r` when
+`FFUF_FOLLOW_REDIRECTS` is on and logs `[*][FFuf] Redirects not followed: RoE
+exclusions or the IP target list are in force`. Both take the run (`settings`,
+`recon_data`), from `resource_enum` and from partial Arjun and FFuf. The cost:
+neither tests what a redirect leads to, on the same host or not. With no
+exclusion outside IP mode, both argvs and Arjun's URL list are unchanged
+(`recon/tests/test_roe_redirect_following.py`).
 
 ---
 
@@ -208,7 +237,12 @@ Archive URLs go through the quarantine first (`recon/helpers/url_leaks.py`): a U
 carrying a one-time link, a secret, a state-changing value or a web-shell trace
 never reaches `discovered_urls`, and the Endpoint it would have made is written
 `quarantined` (no `full_url`, no parameter values). The remaining archive values
-are masked before they enter the lists DAST reads. urlscan's addresses join
+are masked before they enter the lists DAST reads. The held GAU and ParamSpider
+URLs are reported, never requested: `resource_enum["archive_leaks"]`
+(`recon/helpers/archive_leaks.py`) groups their leaked one-time links and
+secrets like urlscan's, written as Vulnerability / Secret `{source: 'url_archive'}`
+with the value and the full links in the display-only fields
+(`graph_db/display_only.py`) that the UI shows and the agent never reads. urlscan's addresses join
 `by_base_url` only on bases that are live in this scan
 (`recon/helpers/resource_enum/urlscan_helpers.py`), before OpenAPI, so a
 Swagger address urlscan saw seeds the OpenAPI step; every source writes the same
@@ -432,11 +466,38 @@ Kiterunner provides API endpoint bruteforcing using real Swagger/OpenAPI specifi
 | `KITERUNNER_ENABLED` | `bool` | `True` | Enable/disable Kiterunner discovery |
 | (Binary auto-download) | - | `~/.redamon/tools/kiterunner/kr` | Auto-downloaded from GitHub releases |
 | `KITERUNNER_WORDLIST` | `str` | `"apiroutes-251227"` | Wordlist (354k+ API routes) |
-| `KITERUNNER_RATE_LIMIT` | `int` | `100` | Requests per second |
+| `KITERUNNER_RATE_LIMIT` | `int` | `100` | Passed as kr's `--delay`, which kr v1.0.2 parses and never applies: it limits nothing |
 | `KITERUNNER_CONNECTIONS` | `int` | `100` | Concurrent connections |
 | `KITERUNNER_TIMEOUT` | `int` | `10` | Request timeout per endpoint (seconds) |
 | `KITERUNNER_SCAN_TIMEOUT` | `int` | `300` | Overall scan timeout (seconds) |
 | `KITERUNNER_THREADS` | `int` | `50` | Scanning threads |
+
+**Nothing bounds kr's request rate.** `-x` (connections per host) and `-j`
+(hosts at once) cap concurrency, not requests per second: even `-x 1 -j 1` sends
+back to back as fast as the target answers. So under an RoE rate ceiling
+(`ROE_GLOBAL_MAX_RPS`, in full and partial recon) Kiterunner does not run: it
+logs `[-][Kiterunner] Not run: kr cannot hold the N rps RoE ceiling`, returns no
+endpoints, and records a coverage gap entry (`resource_enum` / `kiterunner`),
+never a switch-off. Kiterunner writes Endpoint assets, not findings, so the gap
+keeps nothing from the prune. With no ceiling the command is unchanged.
+
+**Redirects:** kr v1.0.2 follows up to 3 redirects by default (`--max-redirects`,
+`scan` and `brute` alike), to any host. So under the same condition as Katana's
+`-dr` (`redirects_contained`: RoE exclusions, or IP mode's target list),
+`run_kiterunner_discovery` (`recon/helpers/resource_enum/kiterunner_helpers.py`)
+passes `--max-redirects 0` and logs `[*][Kiterunner] Redirects not followed: RoE
+exclusions or the IP target list are in force`, so an admitted target's 302 into
+an excluded host does not get every route sent on to it. It takes the run
+(`settings`, `recon_data`), from `resource_enum` and from partial Kiterunner. With
+no exclusion outside IP mode the argv is unchanged
+(`recon/tests/test_roe_redirect_following.py`). The method-detection probe runs
+httpx without `-fr`, so it follows no redirect in any mode.
+
+The method-detection probes (OPTIONS, then one httpx run per method) run in
+containers named `kiterunner-methods-<run id>-<8 hex>`, killed by that name at
+their timeout. What httpx wrote before the cut is read: the endpoints it
+answered keep their detected methods, the others keep Kiterunner's, and the
+cut is noted as a `kiterunner` coverage gap entry.
 
 ### 2. Kiterunner Wordlists
 
@@ -466,7 +527,6 @@ Run `kr wordlist list` to see all available wordlists.
 ```python
 KITERUNNER_ENABLED = True
 KITERUNNER_WORDLIST = "apiroutes-251227"
-KITERUNNER_RATE_LIMIT = 200
 KITERUNNER_SCAN_TIMEOUT = 120
 ```
 **Expected:** ~1-2 minutes per target
@@ -475,7 +535,6 @@ KITERUNNER_SCAN_TIMEOUT = 120
 ```python
 KITERUNNER_ENABLED = True
 KITERUNNER_WORDLIST = "apiroutes-251227"
-KITERUNNER_RATE_LIMIT = 100
 KITERUNNER_CONNECTIONS = 100
 KITERUNNER_SCAN_TIMEOUT = 300
 ```
@@ -485,7 +544,6 @@ KITERUNNER_SCAN_TIMEOUT = 300
 ```python
 KITERUNNER_ENABLED = True
 KITERUNNER_WORDLIST = "apiroutes-251227"
-KITERUNNER_RATE_LIMIT = 50
 KITERUNNER_CONNECTIONS = 50
 KITERUNNER_SCAN_TIMEOUT = 600
 ```
@@ -528,7 +586,7 @@ Hakrawler is a DOM-aware web crawler that runs as a Docker container (`jauderho/
 | `HAKRAWLER_THREADS` | `int` | `5` | Concurrent threads |
 | `HAKRAWLER_TIMEOUT` | `int` | `30` | Per-URL timeout in seconds |
 | `HAKRAWLER_MAX_URLS` | `int` | `500` | Maximum URLs to discover |
-| `HAKRAWLER_INCLUDE_SUBS` | `bool` | `True` | Include subdomains in crawl scope |
+| `HAKRAWLER_INCLUDE_SUBS` | `bool` | `True` | Include subdomains in crawl scope. Forced off on an EXACT group, while RoE exclusions are in force, and in IP mode |
 | `HAKRAWLER_INSECURE` | `bool` | `True` | Skip TLS certificate verification |
 | `HAKRAWLER_CUSTOM_HEADERS` | `list` | `[]` | Custom HTTP headers |
 
@@ -538,8 +596,8 @@ Hakrawler scope filtering works at two levels:
 
 | Level | Mechanism | Description |
 |-------|-----------|-------------|
-| **Crawl scope** | `-subs` flag | If `INCLUDE_SUBS=True`, Hakrawler follows links to subdomains of the target |
-| **Output scope** | Hostname exact match | After crawling, results are filtered against `target_domains` set (from http_probe). URLs with hostnames not in scope are captured as `ExternalDomain` nodes instead of `Endpoint` nodes |
+| **Crawl scope** | `-subs` flag | If `INCLUDE_SUBS=True`, Hakrawler follows links to subdomains of the target. Forced off on an EXACT (listed-hosts) group, in full and partial runs; a partial run passes one flag for every seed, so one EXACT group in it turns it off for the whole run. Also forced off while any RoE exclusion is in force and in IP mode (`redirects_contained`): `-subs` widens the only filter hakrawler applies before a request, so it would follow a link or a redirect into an excluded sibling; without it hakrawler stays on the seed's host, same-host redirects included. The log says `[*][Hakrawler] Seed hosts only (RoE exclusions or the IP target list are in force): subdomain crawling off` |
+| **Output scope** | Hostname exact match | After crawling, results are filtered against `target_domains` set (from http_probe). URLs with hostnames not in scope are recorded as external domains instead of `Endpoint` nodes: an `ExternalDomain` when the host is under none of the project's scan roots; a host under a scan root becomes neither an `ExternalDomain` nor a Subdomain, it only links to a Subdomain the graph already holds, so a link never adds a name the run did not admit |
 
 ### 3. What Hakrawler Finds
 
@@ -548,7 +606,7 @@ Hakrawler scope filtering works at two levels:
 | **DOM links** | `<a href="...">`, `<link>`, `<script src>` | Links that JS-rendered crawlers may miss |
 | **Form actions** | `<form action="/submit">` | POST endpoints for parameter fuzzing |
 | **Asset references** | CSS imports, image URLs, font files | Reveals directory structure |
-| **Subdomain links** | Links pointing to `api.example.com` | Discovers related subdomains |
+| **Subdomain links** | Links pointing to `api.example.com` | Shows links between the project's hosts; a linked name is never added as a Subdomain (see Output scope) |
 | **External domains** | Links to third-party services | Maps external dependencies |
 
 ### 4. Stealth Mode
@@ -580,7 +638,7 @@ jsluice sends HTTP requests to download each JS file from the target, then analy
 2. **Download**: Fetches JS files to a temporary directory (`/tmp/redamon/jsluice_<pid>/`)
 3. **Analyze URLs**: Runs `jsluice urls` to extract embedded URLs and API endpoints
 4. **Analyze Secrets**: Runs `jsluice secrets` to detect API keys, tokens, credentials
-5. **Scope filter**: Extracted URLs are filtered against `allowed_hosts`; out-of-scope URLs become `ExternalDomain` nodes
+5. **Scope filter**: Extracted URLs are filtered against `allowed_hosts`; an out-of-scope host becomes an `ExternalDomain` when it is under none of the project's scan roots, and otherwise only links to a Subdomain the graph already holds (never a new one)
 6. **Cleanup**: Temporary files are deleted in a `finally` block
 
 ### 3. What jsluice Finds
@@ -666,9 +724,13 @@ sit under the project scope).
 - **Credentials.** The Authenticated Session profile's headers go to the exact
   document origin (scheme, host, port) only; cookies are cleared per request and
   no ambient credentials are used.
-- **Rate.** One request clock per scan on the engagement ceiling
-  (`ROE_GLOBAL_MAX_RPS`), shared by every Domain-batch group and partial root;
-  redirects and references count.
+- **Rate.** Every request takes a slot of the process-wide request clock on the
+  engagement ceiling (`ROE_GLOBAL_MAX_RPS`, `recon/helpers/request_pacer.py`),
+  which the security checks, the cache scan, the GraphQL scan, Route Exposure
+  and the takeover AI probe share, as do every Domain-batch group and partial
+  root; redirects and references count. The wait for a slot extends the
+  document's `OPENAPI_TIMEOUT` deadline instead of counting against it: a long
+  queue for the ceiling is not a slow server.
 - **Capture proxy.** With traffic capture on, document requests go through the
   proxy with the signed context tag; direct requests never carry it. TLS is not
   verified, as for every recon fetcher.
@@ -1214,6 +1276,19 @@ The module infers parameter data types from names and sample values:
 
 The module parses HTML to extract form elements and their inputs.
 
+`fetch_forms_from_urls` requests up to 100 of the URLs Katana and Hakrawler
+reported (3xx ones included) with urllib. While any RoE exclusion is in force or
+the project scans by IP (`redirects_contained`), it follows a redirect only to
+the host the request went to; a refused hop ends that fetch, which is skipped
+like any other failed one. Otherwise it follows redirects as urllib does.
+
+The fetch is sequential, and under an RoE rate ceiling (`ROE_GLOBAL_MAX_RPS`)
+every request the opener sends takes a slot of recon's request clock
+(`request_pacer`) first, each redirect hop included, since urllib sends a hop
+through the opener again; a refused hop is never sent and takes none. A `429`
+pushes the next slot of every in-process requester back by its `Retry-After`.
+With no ceiling the pacer is inert and the requests are unchanged.
+
 ### Extracted Form Information
 
 ```json
@@ -1317,10 +1392,20 @@ Resource enumeration data is stored in Neo4j:
 
 | Node | Properties |
 |------|------------|
-| **Endpoint** | path, method, category, has_parameters, query_param_count, body_param_count |
+| **Endpoint** | path, method, category, has_parameters, query_param_count, body_param_count, path_param_count |
 | **Parameter** | name, position (query/body), type, category, sample_values |
 | **Secret** | secret_type, severity, source, source_url, base_url, sample |
 | **ExternalDomain** | domain, source (katana, hakrawler, jsluice, gau), url |
+
+Every crawler and most partial tools write through `update_graph_from_resource_enum`
+(`graph_db/mixins/recon/resource_mixin.py`), so a later tool must not undo what an
+earlier one observed. A fact the caller did not observe keeps the stored value:
+`has_parameters` only goes from false to true; each `*_param_count` keeps the stored
+count when the caller counted none there (a partial FFuf or Kiterunner run counts
+none), and a count it measured replaces it; a body Parameter's `input_type` and
+`required`, and a path Parameter's `required`, keep the stored value when the caller
+states none (the defaults apply only when nothing is stored). `Parameter.source` is the first
+writer's, like `Endpoint.source`.
 
 ### Relationships
 
@@ -1482,8 +1567,8 @@ Solutions:
 # Try different wordlist
 KITERUNNER_WORDLIST = "aspx-251227"  # For ASP.NET
 
-# Reduce rate to avoid WAF
-KITERUNNER_RATE_LIMIT = 50
+# Fewer concurrent requests to avoid WAF blocks (kr applies no rate limit)
+KITERUNNER_CONNECTIONS = 20
 
 # Add authentication headers
 KITERUNNER_HEADERS = ["Authorization: Bearer <token>"]
@@ -1504,9 +1589,11 @@ KITERUNNER_TIMEOUT = 15
 
 #### "Kiterunner too aggressive (WAF blocks)"
 
+Fewer connections and threads lower the concurrency; `KITERUNNER_RATE_LIMIT`
+does not slow kr down. When the engagement sets a request rate, set the RoE
+ceiling: Kiterunner then does not run.
+
 ```python
-# Stealth mode
-KITERUNNER_RATE_LIMIT = 30
 KITERUNNER_CONNECTIONS = 20
 KITERUNNER_THREADS = 10
 ```
@@ -1553,7 +1640,7 @@ Run Kiterunner manually (binary auto-downloads to ~/.redamon/tools/kiterunner/):
 
 | Risk | Mitigation |
 |------|------------|
-| Rate limiting/bans | Reduce `KATANA_RATE_LIMIT` and `KITERUNNER_RATE_LIMIT` |
+| Rate limiting/bans | Reduce `KATANA_RATE_LIMIT`; Kiterunner has no working rate limit, so lower its concurrency or set the RoE ceiling, under which it does not run |
 | WAF blocking | Use custom User-Agent, reduce rate |
 | API bruteforce detection | Lower `KITERUNNER_CONNECTIONS` and `KITERUNNER_THREADS` |
 | Legal issues | Only scan authorized targets |
@@ -1569,8 +1656,7 @@ KATANA_CUSTOM_HEADERS = [
     "User-Agent: Mozilla/5.0 (compatible; SecurityScanner/1.0)"
 ]
 
-# Kiterunner (API Bruteforce)
-KITERUNNER_RATE_LIMIT = 50
+# Kiterunner (API Bruteforce): concurrency only, kr applies no rate limit
 KITERUNNER_CONNECTIONS = 30
 KITERUNNER_THREADS = 20
 ```

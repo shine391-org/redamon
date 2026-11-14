@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, test, expect, vi, beforeEach } from 'vitest'
 import {
-  internalError, readUpstreamBody, safeErrorCode, upstreamErrorResponse, upstreamFailure,
+  internalError, logValue, readUpstreamBody, safeErrorCode, upstreamErrorResponse, upstreamFailure,
   upstreamFailureResponse, withRouteErrors,
 } from './routeErrors'
 
@@ -60,6 +60,21 @@ describe('internalError', () => {
     const err = new Error('boom')
     internalError(err, 'Failed to save', { log: 'PUT /x failed' })
     expect(console.error).toHaveBeenCalledWith('PUT /x failed:', err)
+  })
+
+  // A Prisma validation error renders the whole call, its arguments included: an apiKey or an AWS
+  // secret being written would reach the container log (fix of the 6.11 review, finding 4).
+  test('a Prisma validation error is logged by its class alone, never its rendering of the arguments', async () => {
+    const { Prisma } = await import('@prisma/client')
+    const err = new Prisma.PrismaClientValidationError(
+      'Invalid `prisma.userLlmProvider.create()` invocation:\n\n{\n  data: {\n    apiKey: "sk-LEAK-CANARY-123",\n    timeout: 99999999999\n  }\n}\n\nValue out of range for the type.',
+      { clientVersion: 'test' },
+    )
+    const res = internalError(err, 'Failed to create LLM provider')
+    expect(await res.json()).toEqual({ error: 'Failed to create LLM provider', code: 'PrismaClientValidationError' })
+    const logged = (console.error as unknown as { mock: { calls: unknown[][] } }).mock.calls.flat().map((x) => (x instanceof Error ? `${x.message} ${x.stack}` : String(x))).join('\n')
+    expect(logged).toContain('PrismaClientValidationError')
+    expect(logged).not.toContain('sk-LEAK-CANARY-123')
   })
 
   test('takes a status and extra safe fields', async () => {
@@ -158,5 +173,22 @@ describe('upstreamErrorResponse', () => {
     const out = await upstreamErrorResponse('runner', new Response('', { status: 401 }), 'Runner refused', { status: 502 })
     expect(out.status).toBe(502)
     expect(await out.json()).toEqual({ error: 'Runner refused', code: 'runner_error', upstreamStatus: 401 })
+  })
+})
+
+describe('logValue: a client-chosen value inside a log line', () => {
+  test('a CR/LF cannot start a forged line: control characters and line separators become ?', () => {
+    expect(logValue('sess\r\n[rbac] agent run allowed')).toBe('sess??[rbac] agent run allowed')
+    expect(logValue('a\u0000b\u001bc\u007fd\u0085e\u2028f\u2029g\th')).toBe('a?b?c?d?e?f?g?h')
+  })
+
+  test('bounded: cut at 200 characters by default, or at the bound given, and marked', () => {
+    expect(logValue('x'.repeat(200))).toBe('x'.repeat(200))
+    expect(logValue('x'.repeat(5000))).toBe(`${'x'.repeat(200)}...`)
+    expect(logValue('abcdef', 3)).toBe('abc...')
+  })
+
+  test('an ordinary id is unchanged', () => {
+    expect(logValue('session_0f0f-3f2c')).toBe('session_0f0f-3f2c')
   })
 })

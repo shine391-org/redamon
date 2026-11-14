@@ -3,10 +3,13 @@
 # Test suite for the admin-account creation logic in redamon.sh (issue #156).
 #   - _wait_for_webapp        -> returns 0 when healthy, 1 on timeout (no dead-end)
 #   - _admin_exists           -> parses check-admin.mjs count robustly
-#   - _prompt_and_create_admin-> non-interactive env path + min-length gate
+#   - _prompt_and_create_admin-> non-interactive env path + min-length and 72-byte gates,
+#                                FORCE_PROMOTE pass-through, exit-3 refusal
+#                                that does not abort the caller
 #   - ensure_admin            -> actionable skip message (points at create-admin)
 #   - cmd_create_admin        -> standalone recovery command (upsert = safe re-run)
-#   - dispatch + help wiring   for `create-admin`
+#   - cmd_set_root            -> `set-root <email>`: ROOT_EMAIL to set-root.mjs, its exit code kept
+#   - dispatch + help wiring   for `create-admin` and `set-root`
 #   - interactive prompts      -> arrow keys edit the line, never reach the value (issue #210)
 #
 # Pure unit tests: `docker`/`sleep` are stubbed, no daemon needed, CI-friendly.
@@ -79,6 +82,68 @@ assert_true "explains the minimum length"           "echo \"\$out\" | grep -qi '
 assert_false "did NOT reach create-admin.mjs"       "echo \"\$out\" | grep -q 'Admin user ready'"
 unset -f docker; unset ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD
 
+echo "== _prompt_and_create_admin: non-interactive rejects a password over bcrypt's 72 bytes =="
+# create-admin.mjs refuses it as well, but only after the build, and its non-zero
+# exit ends install; checked here the operator gets the reason first.
+CAPFILE="$(mktemp)"
+docker() { echo "$*" > "$CAPFILE"; return 0; }
+ADMIN_NAME="Bob" ADMIN_EMAIL="bob@example.com" ADMIN_PASSWORD="$(printf 'a%.0s' {1..73})" \
+  out="$(_prompt_and_create_admin 2>&1)"; rc=$?
+assert_eq    "73 bytes: exits non-zero"                 "$rc" "1"
+assert_true  "73 bytes: names the 72-byte bound"        "echo \"\$out\" | grep -q 'too long (maximum 72 bytes)'"
+assert_eq    "73 bytes: create-admin.mjs never runs"    "$(cat "$CAPFILE")" ""
+# Bytes, not characters: 37 x 'é' is 37 characters but 74 bytes.
+ADMIN_NAME="Bob" ADMIN_EMAIL="bob@example.com" ADMIN_PASSWORD="$(printf 'é%.0s' {1..37})" \
+  out="$(LC_ALL=C.UTF-8 _prompt_and_create_admin 2>&1)"; rc=$?
+assert_eq    "37 x 'é' (74 bytes): refused"             "$rc" "1"
+ADMIN_NAME="Bob" ADMIN_EMAIL="bob@example.com" ADMIN_PASSWORD="$(printf 'a%.0s' {1..72})" \
+  out="$(_prompt_and_create_admin 2>&1)"; rc=$?
+assert_eq    "72 bytes: accepted"                       "$rc" "0"
+assert_true  "72 bytes: reaches create-admin.mjs"       "grep -q 'scripts/create-admin.mjs' '$CAPFILE'"
+rm -f "$CAPFILE"; unset -f docker; unset ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD
+
+echo "== _prompt_and_create_admin: FORCE_PROMOTE reaches create-admin.mjs only when set =="
+CAPFILE="$(mktemp)"
+docker() { echo "$*" > "$CAPFILE"; return 0; }
+unset FORCE_PROMOTE
+ADMIN_NAME="Alice" ADMIN_EMAIL="alice@example.com" ADMIN_PASSWORD="supersecret123" \
+  out="$(_prompt_and_create_admin 2>&1)"; rc=$?
+assert_eq    "without FORCE_PROMOTE the call succeeds"   "$rc" "0"
+assert_false "without FORCE_PROMOTE nothing is forwarded" "grep -q 'FORCE_PROMOTE' '$CAPFILE'"
+FORCE_PROMOTE=1 ADMIN_NAME="Alice" ADMIN_EMAIL="alice@example.com" ADMIN_PASSWORD="supersecret123" \
+  out="$(_prompt_and_create_admin 2>&1)"; rc=$?
+assert_eq    "with FORCE_PROMOTE=1 the call succeeds"    "$rc" "0"
+assert_true  "forwards FORCE_PROMOTE=1 with exec -e"     "grep -q -- '-e FORCE_PROMOTE=1 ' '$CAPFILE'"
+assert_true  "still forwards the admin's email"          "grep -q 'ADMIN_EMAIL=alice@example.com' '$CAPFILE'"
+rm -f "$CAPFILE"; unset -f docker; unset ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD FORCE_PROMOTE
+
+echo "== _prompt_and_create_admin: exit 3 prints the refusal and redamon.sh does not abort =="
+# create-admin.mjs exits 3 when the email belongs to a member and FORCE_PROMOTE is
+# not set. Under redamon.sh's `set -e` a bare non-zero exec ended install/update/up
+# (ensure_admin calls this) right there; the caller must go on, told how to promote.
+docker() {
+    echo 'REFUSED: "bob@example.com": account exists as a member; set FORCE_PROMOTE=1 to promote it. Nothing was changed.' >&2
+    return 3
+}
+ADMIN_NAME="Bob" ADMIN_EMAIL="bob@example.com" ADMIN_PASSWORD="supersecret123" \
+  out="$( (set -e; _prompt_and_create_admin; echo '[caller continued]') 2>&1 )"; rc=$?
+assert_eq    "a refusal does not fail the caller"         "$rc" "0"
+assert_true  "the caller goes on under set -e"            "echo \"\$out\" | grep -qF '[caller continued]'"
+assert_true  "the script's refusal reaches the operator"  "echo \"\$out\" | grep -q 'account exists as a member'"
+assert_true  "redamon.sh says how to promote on purpose"  "echo \"\$out\" | grep -qF 'FORCE_PROMOTE=1 ./redamon.sh create-admin'"
+assert_false "no false 'Admin user ready'"                "echo \"\$out\" | grep -q 'Admin user ready'"
+unset -f docker; unset ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD
+
+echo "== _prompt_and_create_admin: any other failure still stops, with a message =="
+docker() { echo 'ERROR: Failed to create admin user: connection refused' >&2; return 1; }
+ADMIN_NAME="Bob" ADMIN_EMAIL="bob@example.com" ADMIN_PASSWORD="supersecret123" \
+  out="$( (set -e; _prompt_and_create_admin; echo '[caller continued]') 2>&1 )"; rc=$?
+assert_eq    "the script's exit code is kept"             "$rc" "1"
+assert_false "the caller does not go on"                  "echo \"\$out\" | grep -qF '[caller continued]'"
+assert_true  "redamon.sh names the failed script"         "echo \"\$out\" | grep -q 'create-admin.mjs failed'"
+assert_false "no false 'Admin user ready'"                "echo \"\$out\" | grep -q 'Admin user ready'"
+unset -f docker; unset ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD
+
 echo "== ensure_admin: webapp never ready -> actionable skip (points at create-admin) =="
 docker() { return 1; }   # health probe never succeeds -> _wait_for_webapp fails
 out="$(ensure_admin 2>&1)"; rc=$?
@@ -101,6 +166,19 @@ assert_true "explains add-new-or-reset semantics"    "echo \"\$out\" | grep -qiE
 assert_true "still proceeds to the prompt"           "echo \"\$out\" | grep -q '\[prompt ran\]'"
 unset -f print_banner check_prerequisites _wait_for_webapp _admin_exists _prompt_and_create_admin
 
+echo "== cmd_create_admin: says a member's email needs FORCE_PROMOTE, admin or not =="
+print_banner() { :; }
+check_prerequisites() { :; }
+_wait_for_webapp() { return 0; }
+_prompt_and_create_admin() { echo "[prompt ran]"; }
+for exists in 0 1; do
+    _admin_exists() { return "$exists"; }
+    out="$(cmd_create_admin 2>&1)"
+    assert_true "admin exists=$((1 - exists)): names FORCE_PROMOTE=1 before the prompt" \
+        "echo \"\$out\" | grep -q 'FORCE_PROMOTE=1'"
+done
+unset -f print_banner check_prerequisites _wait_for_webapp _admin_exists _prompt_and_create_admin
+
 echo "== cmd_create_admin: webapp down -> clear error, non-zero exit =="
 print_banner() { :; }
 check_prerequisites() { :; }
@@ -109,6 +187,41 @@ out="$(cmd_create_admin 2>&1)"; rc=$?
 assert_eq   "exits non-zero when webapp is down"     "$rc" "1"
 assert_true "tells the operator to start the stack"  "echo \"\$out\" | grep -q './redamon.sh up'"
 unset -f print_banner check_prerequisites _wait_for_webapp
+
+echo "== cmd_set_root: needs an email, passes it with exec -e, keeps the script's exit code =="
+# set-root.mjs makes the account the confirmed Root (break-glass). The .env read for the
+# switch note is a scratch one: the test never reads the checkout's real .env.
+print_banner() { :; }
+check_prerequisites() { :; }
+_wait_for_webapp() { return 0; }
+SR_DIR="$(mktemp -d)"; SR_SAVED_DIR="$SCRIPT_DIR"; SCRIPT_DIR="$SR_DIR"
+CAPFILE="$(mktemp)"
+docker() { echo "$*" >> "$CAPFILE"; return 0; }
+out="$(cmd_set_root 2>&1)"; rc=$?
+assert_eq    "no email: exits 1"                                "$rc" "1"
+assert_true  "no email: prints the usage"                       "echo \"\$out\" | grep -qF './redamon.sh set-root <email>'"
+assert_eq    "no email: nothing is run"                         "$(cat "$CAPFILE")" ""
+out="$(cmd_set_root root@example.com 2>&1)"; rc=$?
+assert_eq    "an email: exits 0"                                "$rc" "0"
+assert_eq    "runs set-root.mjs with ROOT_EMAIL passed by exec -e" "$(cat "$CAPFILE")" \
+    "compose exec -T -e ROOT_EMAIL=root@example.com webapp node scripts/set-root.mjs"
+assert_true  "says moving Root signs both accounts out"         "echo \"\$out\" | grep -q 'signs it and the previous Root out'"
+assert_true  "switch off: says Root takes effect once RBAC_IDENTITY_ENABLED is on" \
+    "echo \"\$out\" | grep -q 'RBAC_IDENTITY_ENABLED is off'"
+echo 'RBAC_IDENTITY_ENABLED=true' > "$SR_DIR/.env"
+out="$(cmd_set_root root@example.com 2>&1)"
+assert_false "switch on: no switch note"                        "echo \"\$out\" | grep -q 'RBAC_IDENTITY_ENABLED'"
+docker() { echo 'ERROR: "nopass@example.com" has no password' >&2; return 1; }
+out="$( (set -e; cmd_set_root nopass@example.com; echo '[caller continued]') 2>&1 )"; rc=$?
+assert_eq    "a refusal keeps the script's exit code"           "$rc" "1"
+assert_false "and stops there"                                  "echo \"\$out\" | grep -qF '[caller continued]'"
+assert_true  "the script's reason reaches the operator"         "echo \"\$out\" | grep -q 'has no password'"
+_wait_for_webapp() { return 1; }
+out="$(cmd_set_root root@example.com 2>&1)"; rc=$?
+assert_eq    "webapp down: exits 1"                             "$rc" "1"
+assert_true  "webapp down: tells the operator to start the stack" "echo \"\$out\" | grep -q './redamon.sh up'"
+SCRIPT_DIR="$SR_SAVED_DIR"; rm -rf "$SR_DIR"; rm -f "$CAPFILE"
+unset -f print_banner check_prerequisites _wait_for_webapp docker
 
 echo "== dispatch + help wiring for create-admin =="
 SRC="$REPO_ROOT/redamon.sh"
@@ -122,6 +235,9 @@ assert_true "cmd_create_admin is defined"            "grep -q '^cmd_create_admin
 # 40/40 pass serially, 14/24 FAIL when run concurrently.
 HELP_OUT="$(cd "$REPO_ROOT" && ./redamon.sh help 2>/dev/null || true)"
 assert_true "help lists create-admin"                "echo \"\$HELP_OUT\" | grep -qi 'create-admin'"
+assert_true "dispatch has a set-root) arm passing the email" "grep -qE '^\s*set-root\)\s*shift; cmd_set_root \"\\\$@\"' '$SRC'"
+assert_true "cmd_set_root is defined"                "grep -q '^cmd_set_root()' '$SRC'"
+assert_true "help lists set-root <email>"            "echo \"\$HELP_OUT\" | grep -q 'set-root <email>'"
 
 # Runs bash code ($1) on a fresh pseudo-terminal: the prompts read /dev/tty, so
 # only a real terminal shows what a person's keys turn into. $2 is typed before
@@ -197,6 +313,15 @@ docker() { printf "%q\n" "$@" > "$CAPFILE"; }
     assert_true "admin: Left fixes the email instead of storing \\e[D" "grep -qx 'ADMIN_EMAIL=admin@example.test' '$CAPFILE'"
     assert_true "admin: Left fixes the hidden password too"           "grep -qx 'ADMIN_PASSWORD=correct-horse-battery' '$CAPFILE'"
     assert_false "admin: the password is never shown on screen"       "grep -q 'horse' <<< \"\$SCREEN\""
+
+    : > "$CAPFILE"
+    LONG_KEYS="$(printf 'a%.0s' {1..73})${ENTER}"
+    SCREEN="$(_type_at_tty "${CHILD_PRELUDE}_prompt_and_create_admin" "" \
+        "Admin name:" "Alice${ENTER}" "Admin email:" "admin@example.test${ENTER}" \
+        "Admin password:" "$LONG_KEYS" "Confirm password:" "$LONG_KEYS" \
+        "Admin password:" "$PASS_KEYS" "Confirm password:" "$PASS_KEYS")"
+    assert_true "admin: a password over 72 bytes is asked again"      "grep -q 'too long (maximum 72 bytes)' <<< \"\$SCREEN\""
+    assert_true "admin: the second, valid password is the one used"   "grep -qx 'ADMIN_PASSWORD=correct-horse-battery' '$CAPFILE'"
 
     : > "$CAPFILE"
     SCREEN="$(_type_at_tty "${CHILD_PRELUDE}cmd_reset_password" "${UP}" \

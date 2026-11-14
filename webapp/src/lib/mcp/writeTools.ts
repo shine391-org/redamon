@@ -13,19 +13,23 @@
  *    recon reads its settings ONCE at container spawn. A mid-scan write is
  *    inert, and silently accepting it would report success for a change that
  *    does nothing.
+ *  - update_recon_settings judges a collaborator's change per column, as the
+ *    project form's save does (refuseSettingsChange, step 5.1b).
  *  - mode:"overwrite" needs its own scope. Discarding the current graph is the
  *    only irreversible action on this surface, and an agent can be talked into
  *    it by data it reads (the graph is full of attacker-controlled text), so
  *    the containment is a code check rather than prompt wording.
  */
 import prisma from '@/lib/prisma'
+import { ACTIVATION_STATE_TRANSFERRING, TRANSFER_IN_PROGRESS_MESSAGE, holdOf } from '@/lib/graphHold'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { describeLiveGraphWriters, describeScanWriters } from '@/lib/graphWriters'
 import { startFullScan } from '@/lib/startFullScan'
+import { reconcileScanJobStatus } from '@/lib/scanTimeline'
 import { writeAudit } from '@/lib/audit'
 import { FINGERPRINT_FIELDS } from '@/lib/jobQueue'
 import { currentFingerprintFor } from '@/lib/jobFingerprint'
-import { assertMcpProjectAccess, requireScope } from '@/lib/mcpAuth'
+import { assertMcpProjectAccess, mcpProjectAccess, requireScope } from '@/lib/mcpAuth'
 import { McpToolError } from '@/lib/mcp/errors'
 import {
   auditableKey,
@@ -36,6 +40,9 @@ import {
 import { enforceRate, type McpContext } from '@/lib/mcp/tools'
 import { validateCrossFieldRules, writeFireteamAudit } from '@/lib/reconSettings/crossField'
 import { validateJevEngineChange } from '@/lib/reconSettings/jevEngine'
+import { classifyChange, settingsRefusal } from '@/lib/authz/settingsRisk'
+import type { ProjectAccess } from '@/lib/authz/projectAccess'
+import type { PermissionId } from '@/lib/authz/permissions'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
@@ -50,7 +57,8 @@ export async function startRecon(
   // Split from recon:scan deliberately: 'overwrite' DISCARDS the current graph.
   if (mode === 'overwrite') requireScope(ctx.token, 'recon:overwrite')
 
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  // recon:scan (W+S), as POST /api/recon/[projectId]/start asks it; the scan carries its actor.
+  await assertMcpProjectAccess(ctx.token, projectId, 'W+S')
 
   // Stricter than the button (see the file header). describeLiveGraphWriters
   // also covers Conversation.agentRunning and live TriageRuns.
@@ -142,15 +150,16 @@ export async function startRecon(
  */
 export async function stopRecon(ctx: McpContext, projectId: string) {
   requireScope(ctx.token, 'recon:scan')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  await assertMcpProjectAccess(ctx.token, projectId, 'W+S')
   enforceRate(ctx, 'write')
 
-  // The orchestrator answers a stop with the POST-stop state, which is `idle`
-  // whether it just killed a scan or there was never one running. Returning
-  // that verbatim left an agent unable to report what it had done - and left a
-  // stray stop that really did kill a running scan looking like a no-op. So
-  // observe first, and say so. `null` where the observation failed: on this
-  // surface "I could not tell" is never reported as "nothing was running".
+  // The orchestrator answers a stop at once: `stopping` while the run drains
+  // (a repeated stop during that drain answers `stopping` too), or the state it
+  // already had (`idle`, `completed`, ...) when there was nothing to stop.
+  // Observe first and give the agent a plain `stopped` it can report instead
+  // of an orchestrator state to decode. `null` where the observation failed:
+  // on this surface "I could not tell" is never reported as "nothing was
+  // running".
   let wasRunning: boolean | null = null
   try {
     const pre = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/status`)
@@ -178,6 +187,13 @@ export async function stopRecon(ctx: McpContext, projectId: string) {
     console.error(`[mcp] stop_recon returned ${resp.status}`)
     throw new McpToolError('The scan could not be stopped.', 'stop_failed')
   }
+  const answer = await resp.json() as Record<string, unknown>
+
+  // The stop's answer is a status read too. `stopping` leaves the row to the
+  // get_recon_status that sees the drain end (the orchestrator reports `idle`
+  // then); a scan that had already ended is closed here, with its real outcome.
+  await reconcileScanJobStatus(
+    projectId, typeof answer?.status === 'string' ? answer.status : undefined)
 
   void writeAudit({
     actorId: ctx.token.userId,
@@ -196,7 +212,7 @@ export async function stopRecon(ctx: McpContext, projectId: string) {
     source: 'mcp',
   })
   return {
-    ...(await resp.json() as Record<string, unknown>),
+    ...answer,
     stopped: wasRunning,
     note: wasRunning === null
       ? 'The stop was issued, but the scan state could not be read beforehand, so '
@@ -251,7 +267,8 @@ export async function updateReconSettings(
   expectedUpdatedAt?: string
 ): Promise<UpdateSettingsResult> {
   requireScope(ctx.token, 'recon:settings')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  // project:settings (W), as the project PUT; a collaborator's change is then judged column by column.
+  const { access } = await mcpProjectAccess(ctx.token, projectId, 'W')
   enforceRate(ctx, 'write')
 
   // Recon reads its settings ONCE, at container spawn. A write after a start
@@ -276,9 +293,12 @@ export async function updateReconSettings(
 
   const before = await prisma.project.findUnique({
     where: { id: projectId },
-    select: { ...reconSettingsSelect(), updatedAt: true, userId: true },
+    select: { ...reconSettingsSelect(), updatedAt: true, userId: true, activationState: true, activationStartedAt: true },
   })
   if (!before) throw new McpToolError('Project not found', 'not_found')
+  // An ownership transfer clears the settings that name the old owner's own providers and templates
+  // (step 5.12): a write meanwhile could put one back.
+  if (holdOf(before) === ACTIVATION_STATE_TRANSFERRING) throw new McpToolError(TRANSFER_IN_PROGRESS_MESSAGE, 'project_transfer_in_progress')
 
   // The rules over several fields that the project form's save enforces. Judged
   // on the stored row with this change applied, so a rule over two fields sees
@@ -290,6 +310,8 @@ export async function updateReconSettings(
   if (crossField) throw new McpToolError(crossField, 'setting_rejected')
   // The cross-field check normalized the user-skill toggles in nextRow (foreign ids dropped).
   if ('attackSkillConfig' in filtered.data) filtered.data.attackSkillConfig = nextRow.attackSkillConfig
+  // The stored row holds every settable column, the RoE window's switch among them.
+  refuseSettingsChange(before as Record<string, unknown>, filtered.data, access, 'project:settings')
 
   // A switch onto the Jev engine needs a selected Jev provider on the project OWNER's
   // account (not the token's user): the agent resolves the key from the owner.
@@ -349,6 +371,27 @@ export async function updateReconSettings(
     queuedJobsNeedingReview,
     affectedSchedules,
     note: 'Settings apply to the NEXT scan. A scan already running read its settings when it started.',
+  }
+}
+
+/**
+ * A collaborator's change through an MCP tool, judged as the project form's save judges it
+ * (`classifyChange`, SH-08, OQ-23): each changed column against the token user's access, with the
+ * save's refusal text. The owner passes every change. Nothing is written after a refusal; the audit
+ * row names the refused keys (registry keys only) and the level they need.
+ */
+export function refuseSettingsChange(
+  stored: Record<string, unknown>,
+  change: Record<string, unknown>,
+  access: ProjectAccess,
+  permission: PermissionId,
+): void {
+  if (access.level === 'owner') return
+  const refusal = settingsRefusal(classifyChange(stored, change, access), permission)
+  if (refusal) {
+    throw new McpToolError(refusal.error, 'level_denied', {
+      refusedKeys: refusal.refused.map(r => auditableKey(r.key)), needs: refusal.needs,
+    })
   }
 }
 

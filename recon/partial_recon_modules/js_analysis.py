@@ -8,7 +8,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from recon.partial_recon_modules.graph_builders import declared_only_unsafe, graph_scope_subdomains, quarantined
-from recon.partial_recon_modules.helpers import _is_valid_url, _scope_partial_urls, partial_settings, scope_roots, root_orgs
+from recon.partial_recon_modules.helpers import (
+    _is_valid_url, _scope_partial_urls, ip_mode_recon, partial_settings, scope_roots, root_orgs,
+)
 
 
 def run_jsrecon(config: dict) -> None:
@@ -164,7 +166,7 @@ def run_jsrecon(config: dict) -> None:
     # It reads from resource_enum.discovered_urls and http_probe.by_url
     # We populate discovered_urls with all our target URLs
     # and http_probe.by_url as an empty dict (no live probe data in partial mode)
-    combined_result = {
+    combined_result = ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "subdomains": scope_hosts,
@@ -181,7 +183,7 @@ def run_jsrecon(config: dict) -> None:
         "metadata": {
             "project_id": project_id,
         },
-    }
+    }, settings)
 
     # Run JS Recon analysis (same function as the full pipeline)
     print(f"[*][Partial Recon] Running JS Recon analysis...")
@@ -194,8 +196,12 @@ def run_jsrecon(config: dict) -> None:
 
     # A host analyzed with nothing found still gets its coverage stamp: that
     # "analyzed, no findings" is what tells it apart from "never analyzed".
+    # Every finding category is a list the writer ingests; a run that covered
+    # no host (uploads only, or every host RoE-excluded) can still have found
+    # DOM sinks or dependency-confusion packages.
     covered = (js_recon_data.get("scan_metadata") or {}).get("coverage", {}).get("hosts")
-    if not js_recon_data or (not secrets_count and not endpoints_count and not covered):
+    found = any(isinstance(rows, list) and rows for rows in js_recon_data.values())
+    if not js_recon_data or (not found and not covered):
         print("[*][Partial Recon] No JS Recon findings to update in graph")
         if not js_recon_data.get("scan_metadata", {}).get("js_files_analyzed", 0):
             print("[*][Partial Recon] No JS files were found/analyzed. Ensure target URLs contain .js files.")
@@ -268,7 +274,7 @@ def run_jsrecon(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 

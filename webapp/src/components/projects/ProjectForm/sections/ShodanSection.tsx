@@ -5,8 +5,11 @@ import { ChevronDown, Radar, AlertTriangle, Info, Play } from 'lucide-react'
 import { Toggle, WikiInfoButton } from '@/components/ui'
 import type { Project } from '@prisma/client'
 import { useProject } from '@/providers/ProjectProvider'
+import { readKeySettings, useOwnerKeys } from '@/hooks/useOwnerCatalog'
+import { ipHostnameOverrides } from '@/lib/ipHostnameOverrides'
 import styles from '../ProjectForm.module.css'
 import { NodeInfoTooltip } from '../NodeInfoTooltip'
+import { IP_HOSTNAME_SECTION_LABEL, ipHostnameModeLabel } from '../ipHostnameModes'
 
 type FormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -19,23 +22,28 @@ interface ShodanSectionProps {
 export function ShodanSection({ data, updateField, onRun }: ShodanSectionProps) {
   const [isOpen, setIsOpen] = useState(true)
   const { userId } = useProject()
+  // A collaborator's form: the project owner's keys, whose scans these are (step 5.7).
+  const ownerKeys = useOwnerKeys()
   const [hasApiKey, setHasApiKey] = useState<boolean | null>(null) // null = loading
 
   const checkApiKey = useCallback(() => {
     if (!userId) return
-    fetch(`/api/users/${userId}/settings`)
-      .then(r => r.ok ? r.json() : null)
+    readKeySettings(userId, ownerKeys)
       .then(settings => {
         if (settings) {
           setHasApiKey(!!settings.shodanApiKey)
         }
       })
       .catch(() => setHasApiKey(false))
-  }, [userId])
+  }, [userId, ownerKeys])
 
   useEffect(() => { checkApiKey() }, [checkApiKey])
 
   const noKey = hasApiKey === false || hasApiKey === null
+  // An IP-mode project's hostname mode can force Reverse DNS off at scan start
+  // (apply_ip_hostname_overrides); the stored value is kept but never used, so
+  // the toggle shows the forced value and cannot be flipped.
+  const reverseDnsForced = ipHostnameOverrides(data).find(o => o.key === 'shodanReverseDns')
 
   return (
     <div className={`${styles.section} ${styles.formSkin}`}>
@@ -127,12 +135,20 @@ export function ShodanSection({ data, updateField, onRun }: ShodanSectionProps) 
                 <span className={styles.toggleLabel}>Reverse DNS</span>
                 <p className={styles.toggleDescription}>
                   Discover hostnames that resolve to known IPs. Can reveal additional subdomains not found by standard enumeration.
+                  {data.ipMode === true && !reverseDnsForced && (
+                    <> In this IP project the names are recorded on their IP and scanned only if {IP_HOSTNAME_SECTION_LABEL} selects them.</>
+                  )}
                   {noKey && <em> (InternetDB fallback)</em>}
+                  {reverseDnsForced && (
+                    <> Off: forced by {IP_HOSTNAME_SECTION_LABEL} ({ipHostnameModeLabel(data.ipHostnameMode)}).</>
+                  )}
                 </p>
               </div>
               <Toggle
-                checked={data.shodanReverseDns}
+                checked={reverseDnsForced ? reverseDnsForced.value : data.shodanReverseDns}
                 onChange={(checked) => updateField('shodanReverseDns', checked)}
+                disabled={!!reverseDnsForced}
+                aria-label="Reverse DNS"
               />
             </div>
 

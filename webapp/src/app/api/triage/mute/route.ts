@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
+import { triageCaller, triagePerson } from '@/lib/triage/routeCaller'
 import { withRouteErrors } from '@/lib/routeErrors'
-import { requireProjectOwner, callGraphTriage } from '@/lib/triageClient'
+import { graphTriage } from '@/lib/triageClient'
+import { auditSingleMute } from '@/lib/triage/muteAudit'
 import { readJsonBody } from '@/lib/jsonBody'
 import { invalidateCache } from '@/app/api/graph/cache'
 import { activationBusy, activationBusyResponse } from '@/lib/activationLock'
@@ -33,20 +36,24 @@ export const POST = withRouteErrors('The finding could not be muted.', async (re
     projectId?: string; nodeId?: unknown; reason?: unknown
   }
 
-  const caller = await requireProjectOwner(projectId)
-  if (caller instanceof NextResponse) return caller
+  const auth = await requirePermission(request, 'triage:mute', { projectId })
+  if (auth instanceof NextResponse) return auth
+  const caller = triageCaller(auth)
   if (!nodeId || typeof nodeId !== 'string') {
     return NextResponse.json({ error: 'nodeId is required' }, { status: 400 })
   }
   if (await activationBusy(caller.projectId)) return activationBusyResponse()
 
-  const res = await callGraphTriage('mute', caller, {
+  const muteReason = typeof reason === 'string' ? reason.slice(0, 500) : ''
+  const answer = await graphTriage('mute', caller, {
     node_id: nodeId,
-    reason: typeof reason === 'string' ? reason.slice(0, 500) : '',
-    muted_by: caller.userId,
+    reason: muteReason,
+    // The person, not the tenant: on a shared project the collaborator who muted it.
+    muted_by: triagePerson(auth),
   })
   // The Graph Map serves a cached copy for up to 10 s; a muted finding must
   // leave it now, not then.
-  if (res.ok) invalidateCache(caller.projectId)
-  return res
+  if (answer.status >= 200 && answer.status < 300) invalidateCache(caller.projectId)
+  await auditSingleMute(caller, answer, { key: nodeId, reason: muteReason }, triagePerson(auth))
+  return NextResponse.json(answer.body, { status: answer.status })
 })

@@ -227,7 +227,7 @@ on the direct (non-proxy) path, so internal identifiers cannot leak to a target.
 | nuclei | `-proxy` + `-H` | same |
 | ffuf | `-x` + `-H` | same |
 | hakrawler | `-proxy` + `-H` | same |
-| kiterunner | `--proxy` + `-H` | same |
+| kiterunner method detection (httpx) | `-proxy` + `-H` | same |
 | arjun | `HTTP_PROXY` env + `--headers` | same |
 | openapi | `requests` `proxies=` + `X-Redamon-Ctx` header, set in the same branch as the proxy | same |
 | agent curl | `-x` + `-H` | `redamon-capture-proxy:8888` (DNS) |
@@ -256,7 +256,11 @@ attacker-defined commands, so no per-tool flag can force them through the proxy.
 Closing this needs container-level transparent egress on the kali-sandbox plus a
 default-identity tag, tracked as future hardening. Recon-side Python probes
 (`security_checks`, cache-scan/WCVS, GraphQL, JS/AI-surface fetchers) and the
-`ai_attack_surface_scan` container are likewise not yet routed.
+`ai_attack_surface_scan` container are likewise not yet routed, and so is
+Kiterunner's brute force: `kr scan` (v1.0.2) has no proxy flag and ignores the
+proxy environment variables, so under capture it runs direct, untagged (the tag
+rides only with the proxy), and logs that its requests are not captured. Only
+its httpx method-detection probes are routed.
 
 ### The Phase-0 side door
 
@@ -573,15 +577,22 @@ never HTML**, because they are attacker-controlled.
 
 ### API routes
 
-All routes under [`webapp/src/app/api/traffic/`](../../webapp/src/app/api/traffic/)
-enforce `requireEffectiveUser` + `requireProjectAccess`. Tenant fields always come
-from the session / route, never the client.
+Each route under [`webapp/src/app/api/traffic/`](../../webapp/src/app/api/traffic/)
+asks its permission through `requirePermission` (`traffic:read` and `traffic:export`
+at the Raw data level `R*`, `traffic:delete` at `W`), which decides through
+`projectAccess()`: the owner, and, with project sharing in force, a collaborator
+whose share includes Raw data & files (or Root's break-glass) read the project's
+traffic; a share without it, or an admin's oversight, gets 403. Every read filters on
+`{projectId, userId: <the project's owner>}` (`trafficTenant.ts`, `trafficRows`),
+never on the caller: both ingest paths stamp the owner, so an owner sees the rows it
+saw before and a collaborator sees exactly those. Tenant fields always come from the
+session / route, never the client.
 
 - **`GET [projectId]`** : paginated filtered list. Summary columns only, bodies
   never in the list. Whitelisted `orderBy`, max page size 200. Shared predicate
   `buildTrafficWhere`.
 - **`GET [projectId]/[id]`** : one full transaction incl. headers and bodies.
-  `findFirst({id, projectId, ownerScope})`, so a cross-tenant id returns 404
+  `findFirst` on the id and `trafficRows(projectId, auth)`, so a cross-tenant id returns 404
   (anti-enumeration). Offloaded bodies resolved only through the owned row.
 - **`GET [projectId]/export`** : streams the current filtered set as CSV or JSON,
   keyset-paginated, 50k-row cap with a truncation marker, CSV formula-injection
@@ -714,7 +725,7 @@ ones are pushed to the orchestrator on the settings save.
 | `captureProxyEnabled` | UserSettings | false | global switch; spawns/stops containers |
 | `captureProxyEnabled` | Project | false | per-project routing gate |
 | `captureProxyScope` | UserSettings | `both` | which producers route (recon\|agent\|both) |
-| `captureProxyPort` | UserSettings | 8888 | proxy listen + publish port |
+| `captureProxyPort` | UserSettings | 8888 | proxy listen + publish port; forwarded to full and partial recon containers as `CAPTURE_PROXY_PORT` |
 | `captureProxyStoreBodies` | UserSettings | true | master switch: store bodies at all |
 | `captureProxyStoreReqBodies` | UserSettings | true | store request bodies (direction gate) |
 | `captureProxyStoreRespBodies` | UserSettings | true | store response bodies (direction gate) |
@@ -766,7 +777,8 @@ The eleven `captureEgress*` fields are pushed to the orchestrator on save (as th
 |---|---|---|---|
 | `CAPTURE_PROXY_ENABLED` | false | producers | routing gate (derived from `Project.captureProxyEnabled`) |
 | `CAPTURE_PROXY_IMAGE` | `redamon-capture-proxy:latest` | orchestrator | image (trusted env only) |
-| `CAPTURE_PROXY_MAX_BODY_KB` | 64 | proxy | inline (DB-vs-disk) text routing threshold |
+| `CAPTURE_PROXY_PORT` | 8888 | recon | the port recon dials the proxy on; the orchestrator sets it at each full or partial recon spawn to the port Docker publishes the proxy on (from `captureProxyPort`) |
+| `CAPTURE_PROXY_MAX_BODY_KB` | 64 | proxy, recon | inline (DB-vs-disk) text routing threshold; recon containers get `captureProxyMaxBodyKb` from the capture config at each spawn |
 | `CAPTURE_PROXY_STORE_BODIES` | true | proxy | master switch: store bodies at all |
 | `CAPTURE_STORE_REQ_BODIES` | true | proxy | store request bodies (direction gate) |
 | `CAPTURE_STORE_RESP_BODIES` | true | proxy | store response bodies (direction gate) |
@@ -883,16 +895,20 @@ flowchart LR
     end
     CP["redamon-capture-proxy<br/>egress guard + re-capture"]
     TGT["target host"]
-    RS -->|"HTTP: signed ctx tag + SCANNER_API_KEY header"| EP
+    RS -->|"HTTP: signed ctx tag + run credential header"| EP
     EP -->|"data / curl recipe / allow-or-deny"| RS
     RS -->|"live curl routed via -x proxy"| CP --> TGT
     TGT -->|response| CP --> RS
 ```
 
-The kali box is given only the **scoped** `SCANNER_API_KEY` (transport auth: "I am an
-allowed caller") and the agent's URL. It is deliberately **not** given
-`INTERNAL_API_KEY` or any database URL, so a foothold there cannot forge a tenant or
-read the store directly.
+The kali box holds no key for these calls. Each `proxy_brain` call carries, beside the
+signed tag, a **run credential** the agent minted for it (`REDAMON_RUN_CREDENTIAL` in the
+child's environment, sent as `X-Redamon-Run`: audience `traffic`, the run's user and
+project, 15 minutes; `agentic/machine_credential.py`). The routes refuse it unless its
+user and project equal the tag's, and its run equals the tag's session when the tag names
+one (the tag carries the run's phase, which another run's credential must not borrow). The box is deliberately **not** given
+`INTERNAL_API_KEY`, the scanner key or any database URL, so a foothold there cannot
+forge a tenant or read the store directly.
 
 #### Two hops: the agent triggers, then the code calls back
 
@@ -1041,7 +1057,7 @@ flowchart LR
 
 ### Tenant isolation (the signed tag)
 
-The kali worker presents the scoped `SCANNER_API_KEY` for transport auth but does
+The kali worker presents the call's run credential for transport auth but does
 **not** hold `INTERNAL_API_KEY`, so it cannot forge a tenant claim. Identity travels
 as an HMAC-signed tag the agent mints and the endpoint verifies:
 

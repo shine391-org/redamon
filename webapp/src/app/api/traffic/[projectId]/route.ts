@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { internalError } from '@/lib/routeErrors'
-import { requireEffectiveUser, requireProjectAccess, ownerScope } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
 import { gcOrphanBodies } from '@/lib/captureBodies'
 import type { Prisma } from '@prisma/client'
+import { trafficRows, trafficTenant } from './trafficTenant'
 
 // Summary columns only - bodies are fetched on demand via the [id] detail route,
 // so a large history never materializes in the list response.
@@ -55,14 +56,15 @@ function statusClassRange(cls: string | null): Prisma.IntFilter | undefined {
   }
 }
 
-// Build the tenant-scoped where clause shared by list + (future) export/delete.
-// eff/projectId are derived from the session + route, never from client fields.
+// The where clause shared by the list, the export and delete-all-matching: the project's rows
+// under its owner (`tenantUserId`, trafficTenant.ts), then the filters. Both ids come from the
+// route and the guard's access, never from client fields.
 export function buildTrafficWhere(
   projectId: string,
-  userId: string,
+  tenantUserId: string,
   sp: URLSearchParams,
 ): Prisma.CapturedHttpTransactionWhereInput {
-  const where: Prisma.CapturedHttpTransactionWhereInput = { projectId, userId }
+  const where: Prisma.CapturedHttpTransactionWhereInput = { projectId, userId: tenantUserId }
 
   const source = sp.get('source')
   if (source && source !== 'both') where.source = source
@@ -136,13 +138,11 @@ export async function GET(
   try {
     const { projectId } = await params
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, projectId)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'traffic:read', { projectId })
+    if (auth instanceof NextResponse) return auth
 
     const sp = request.nextUrl.searchParams
-    const where = buildTrafficWhere(projectId, eff.userId, sp)
+    const where = buildTrafficWhere(projectId, trafficTenant(auth), sp)
 
     const page = Math.max(0, parseInt(sp.get('page') || '0', 10) || 0)
     const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(sp.get('pageSize') || '50', 10) || 50))
@@ -171,22 +171,22 @@ export async function GET(
 
 // DELETE /api/traffic/[projectId] - batch delete (plan §12.2).
 // Body: { ids: [...] } OR { filter: {<same query params as GET>} } (delete-all-matching).
-// Tenant-enforced (projectId + ownerScope; cross-user -> 404 via requireProjectAccess),
-// body-GC-aware (ref-counted blob cleanup), and audited. Client tenant fields are
-// never trusted - projectId/userId come from the route + session.
+// Tenant-enforced (the project's rows under its owner, trafficRows; a project the caller cannot
+// see -> 404 from the guard), so a collaborator at traffic:delete (W) deletes the project's rows,
+// not nothing (step 5.2), body-GC-aware (ref-counted blob cleanup), and audited. Client tenant
+// fields are never trusted - projectId/userId come from the route + the guard's access.
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ projectId: string }> },
 ) {
   try {
     const { projectId } = await params
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, projectId)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'traffic:delete', { projectId })
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
 
     const body = await request.json().catch(() => ({}))
-    const where: Prisma.CapturedHttpTransactionWhereInput = { projectId, ...ownerScope(eff) }
+    const where: Prisma.CapturedHttpTransactionWhereInput = { ...trafficRows(projectId, auth) }
 
     let mode: string
     if (Array.isArray(body?.ids) && body.ids.length > 0) {
@@ -199,7 +199,7 @@ export async function DELETE(
       for (const [k, v] of Object.entries(body.filter)) {
         if (v !== undefined && v !== null && v !== '') sp.set(k, String(v))
       }
-      Object.assign(where, buildTrafficWhere(projectId, eff.userId, sp))
+      Object.assign(where, buildTrafficWhere(projectId, trafficTenant(auth), sp))
       mode = 'filter'
     } else {
       return NextResponse.json({ error: 'Provide { ids: [...] } or { filter: {...} }' }, { status: 400 })

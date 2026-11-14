@@ -12,15 +12,13 @@ Endpoints:
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
 import re
-import shlex
 import time
 from contextlib import asynccontextmanager
-from typing import Any, List, Literal, Optional
+from typing import Annotated, Any, List, Literal, Optional
 
 import httpx
 import websockets
@@ -34,19 +32,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from llm_guard import (master_key_is_weak, require_configured_master_auth,
                        require_internal_auth, require_internal_auth_only,
-                       require_master_internal_auth)
+                       require_master_auth_route_refuses_weak,
+                       require_master_internal_auth, require_master_or_job_credential,
+                       require_master_or_run_credential, run_credential_claims,
+                       scan_job_ids, set_run_liveness)
+from kali_auth import kali_auth_headers
 from logging_config import setup_logging
 from agent_in_the_loop import is_loop_llm, is_loop_model, loop_enabled
 from agent_in_the_loop.broker import get_broker
 from agent_in_the_loop.errors import LoopModelNotSupportedHere
 from agent_in_the_loop.routes import router as loop_router
 from orchestrator import AgentOrchestrator
+from project_settings import DEFAULT_AGENT_SETTINGS as _DEFAULT_AGENT_SETTINGS
 from orchestrator_helpers import normalize_content
 from plugin_api import router as plugin_router
 from prompt_safety import wrap_untrusted, UNTRUSTED_OUTPUT_GUIDANCE
 from startup_guard import check_single_worker
 from utils import get_session_count
-from websocket_api import WebSocketManager, websocket_endpoint, MessageType
+from websocket_api import (WebSocketManager, websocket_endpoint, MessageType,
+                           CLOSE_SCOPES, PROXIED_SOCKETS, SOCKET_KINDS, close_sockets)
 import workspace_fs
 import job_runner
 import ws_job_emitter
@@ -235,7 +239,10 @@ class GuardrailRequest(BaseModel):
     user_id: str = ""
 
 
-@app.post("/guardrail/check-target", tags=["Guardrail"], dependencies=[Depends(require_internal_auth)])
+# The routes only the webapp calls take the MASTER key, fail-closed (NF-01): the scanner
+# key sits in every target-facing scan container and opens only the scan routes. A billed
+# route keeps require_internal_auth behind it for the LLM rate limit and daily cap.
+@app.post("/guardrail/check-target", tags=["Guardrail"], dependencies=[Depends(require_configured_master_auth), Depends(require_internal_auth)])
 async def check_target_guardrail(body: GuardrailRequest):
     """
     Check if a target domain or IP list is safe to scan.
@@ -248,7 +255,6 @@ async def check_target_guardrail(body: GuardrailRequest):
     """
     from orchestrator_helpers.hard_guardrail import is_hard_blocked
     from orchestrator_helpers.guardrail import check_target_allowed
-    from project_settings import DEFAULT_AGENT_SETTINGS
 
     # Hard guardrail: deterministic, non-disableable. Checks EVERY domain the
     # caller named: a Domain-batch create sends its roots in target_domains and
@@ -262,72 +268,22 @@ async def check_target_guardrail(body: GuardrailRequest):
     if not orchestrator or not orchestrator._initialized:
         return {"allowed": True, "reason": "Agent not initialized, guardrail skipped"}
 
-    # Ensure LLM is set up. An Agent in the Loop adapter counts as no LLM: it
-    # answers only inside a chat run, and this check has no driver.
-    if not orchestrator.llm or is_loop_llm(orchestrator.llm):
-        if body.project_id:
-            try:
-                orchestrator._apply_project_settings(body.project_id)
-            except Exception as e:
-                logger.warning(f"Guardrail: failed to load project settings: {e}")
-        # Still no LLM? Bootstrap with default model + user's API keys from DB
-        if not orchestrator.llm or is_loop_llm(orchestrator.llm):
-            try:
-                from orchestrator_helpers.llm_setup import setup_llm, _resolve_provider_key
-                import requests as _requests
-
-                model_name = DEFAULT_AGENT_SETTINGS['OPENAI_MODEL']
-                user_providers = []
-
-                # Fetch user's LLM providers from DB (needed for API keys)
-                if body.user_id:
-                    webapp_url = os.environ.get('WEBAPP_API_URL', 'http://webapp:3000')
-                    try:
-                        resp = _requests.get(
-                            f"{webapp_url.rstrip('/')}/api/users/{body.user_id}/llm-providers?internal=true",
-                            headers={"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")},
-                            timeout=10,
-                        )
-                        resp.raise_for_status()
-                        user_providers = resp.json()
-                    except Exception as e:
-                        logger.warning(f"Guardrail: failed to fetch user LLM providers: {e}")
-
-                openai_p = _resolve_provider_key(user_providers, "openai")
-                anthropic_p = _resolve_provider_key(user_providers, "anthropic")
-                openrouter_p = _resolve_provider_key(user_providers, "openrouter")
-                deepseek_p = _resolve_provider_key(user_providers, "deepseek")
-                gemini_p = _resolve_provider_key(user_providers, "gemini")
-                glm_p = _resolve_provider_key(user_providers, "glm")
-                kimi_p = _resolve_provider_key(user_providers, "kimi")
-                qwen_p = _resolve_provider_key(user_providers, "qwen")
-                xai_p = _resolve_provider_key(user_providers, "xai")
-                mistral_p = _resolve_provider_key(user_providers, "mistral")
-
-                orchestrator.llm = setup_llm(
-                    model_name,
-                    openai_api_key=(openai_p or {}).get("apiKey"),
-                    anthropic_api_key=(anthropic_p or {}).get("apiKey"),
-                    openrouter_api_key=(openrouter_p or {}).get("apiKey"),
-                    deepseek_api_key=(deepseek_p or {}).get("apiKey"),
-                    gemini_api_key=(gemini_p or {}).get("apiKey"),
-                    glm_api_key=(glm_p or {}).get("apiKey"),
-                    kimi_api_key=(kimi_p or {}).get("apiKey"),
-                    qwen_api_key=(qwen_p or {}).get("apiKey"),
-                    xai_api_key=(xai_p or {}).get("apiKey"),
-                    mistral_api_key=(mistral_p or {}).get("apiKey"),
-                )
-                orchestrator.model_name = model_name
-                logger.info(f"Guardrail: bootstrapped LLM with default model {model_name}")
-            except Exception as e:
-                logger.warning(f"Guardrail: failed to bootstrap default LLM: {e}")
-                return {"allowed": True, "reason": "LLM not configured, guardrail skipped"}
-    if is_loop_llm(orchestrator.llm):
+    # The named user's own client (RBAC T17): the default model on their own keys,
+    # never the client or model of whichever project loaded last, and nothing is
+    # written for the next run. Built off the event loop: the provider fetch blocks.
+    try:
+        llm = await asyncio.to_thread(_build_llm_for_user, body.user_id or None, purpose="guardrail")
+    except LoopModelNotSupportedHere:
+        llm = None
+    except Exception as e:
+        logger.warning(f"Guardrail: no model for the user ({e.__class__.__name__})")
+        llm = None
+    if llm is None or is_loop_llm(llm):
         return {"allowed": True, "reason": "LLM not configured, guardrail skipped"}
 
     try:
         result = await check_target_allowed(
-            orchestrator.llm,
+            llm,
             target_domain=body.target_domain,
             target_ips=body.target_ips,
             target_domains=body.target_domains,
@@ -722,22 +678,23 @@ def _build_llm_with_model_for_user(model_name: str, user_id: Optional[str]):
     )
 
 
-@app.post("/llm/ffuf-extensions", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def llm_ffuf_extensions(body: FfufExtensionsRequest):
+@app.post("/llm/ffuf-extensions", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def llm_ffuf_extensions(body: FfufExtensionsRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     """Suggest FFuf file extensions for a target based on its response headers.
 
     Called by the recon container's AI planner when FFUF_AI_EXTENSIONS is on.
     Reuses the same per-user LLM provider resolution as the agent itself.
     """
+    user_id, _ = scan_job_ids(cred, body.user_id, body.project_id)
     import json as json_mod
 
     logger.info(
         "ffuf-extensions: url=%s model=%s user=%s headers=%d-keys",
-        body.url, body.model, body.user_id, len(body.headers or {}),
+        body.url, body.model, user_id, len(body.headers or {}),
     )
 
     try:
-        llm = _build_llm_with_model_for_user(body.model, body.user_id)
+        llm = _build_llm_with_model_for_user(body.model, user_id)
     except LoopModelNotSupportedHere:
         return _loop_model_refusal(body.model)
     except Exception as e:
@@ -822,23 +779,24 @@ Respond with ONLY a JSON object of this exact shape, no prose:
 {"tags": ["tag1", "tag2", ...]}"""
 
 
-@app.post("/llm/nuclei-tags", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def llm_nuclei_tags(body: NucleiTagsRequest):
+@app.post("/llm/nuclei-tags", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def llm_nuclei_tags(body: NucleiTagsRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     """Suggest Nuclei tags for a vuln scan based on tech fingerprint.
 
     Called by the recon container's AI planner when NUCLEI_AI_TAGS is on.
     Reuses the same per-user LLM provider resolution as the agent itself.
     """
+    user_id, _ = scan_job_ids(cred, body.user_id, body.project_id)
     import json as json_mod
 
     logger.info(
         "nuclei-tags: model=%s user=%s techs=%d servers=%d candidates=%d",
-        body.model, body.user_id, len(body.technologies or []),
+        body.model, user_id, len(body.technologies or []),
         len(body.servers or []), len(body.candidates or []),
     )
 
     try:
-        llm = _build_llm_with_model_for_user(body.model, body.user_id)
+        llm = _build_llm_with_model_for_user(body.model, user_id)
     except LoopModelNotSupportedHere:
         return _loop_model_refusal(body.model)
     except Exception as e:
@@ -936,23 +894,24 @@ Respond with ONLY a JSON object of this exact shape, no prose:
 {"waf_detected": true|false, "waf_type": "cloudflare"|null, "confidence": 0..100, "reasoning": "..."}"""
 
 
-@app.post("/llm/waf-classify", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def llm_waf_classify(body: WafClassifyRequest):
+@app.post("/llm/waf-classify", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def llm_waf_classify(body: WafClassifyRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     """Classify whether a response came through a WAF/CDN.
 
     Called by the recon container's WAF AI classifier when WAF_AI_CLASSIFIER is on.
     Reuses the same per-user LLM provider resolution as the agent itself.
     """
+    user_id, _ = scan_job_ids(cred, body.user_id, body.project_id)
     import json as json_mod
 
     logger.info(
         "waf-classify: url=%s status=%d model=%s user=%s headers=%d body=%dB rt=%dms",
-        body.url, body.status_code, body.model, body.user_id,
+        body.url, body.status_code, body.model, user_id,
         len(body.headers or {}), len(body.body_sample or ''), body.response_time_ms,
     )
 
     try:
-        llm = _build_llm_with_model_for_user(body.model, body.user_id)
+        llm = _build_llm_with_model_for_user(body.model, user_id)
     except LoopModelNotSupportedHere:
         return _loop_model_refusal(body.model)
     except Exception as e:
@@ -1064,8 +1023,8 @@ Respond with ONLY a JSON object of this exact shape, no prose:
 {"is_blocked": true|false, "confidence": 0..100, "reason": "..."}"""
 
 
-@app.post("/llm/nuclei-fp-filter", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def llm_nuclei_fp_filter(body: NucleiFpFilterRequest):
+@app.post("/llm/nuclei-fp-filter", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def llm_nuclei_fp_filter(body: NucleiFpFilterRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     """Classify whether a Nuclei response is a WAF/rate-limit block page
     rather than a real vulnerability hit.
 
@@ -1073,16 +1032,17 @@ async def llm_nuclei_fp_filter(body: NucleiFpFilterRequest):
     NUCLEI_AI_RESPONSE_FILTER is on. Reuses the same per-user LLM provider
     resolution as the agent itself.
     """
+    user_id, _ = scan_job_ids(cred, body.user_id, body.project_id)
     import json as json_mod
 
     logger.info(
         "nuclei-fp-filter: template=%s tags=%s status=%s body=%dB model=%s user=%s",
         body.template_id, body.tags, body.status_line[:60],
-        len(body.response_sample or ''), body.model, body.user_id,
+        len(body.response_sample or ''), body.model, user_id,
     )
 
     try:
-        llm = _build_llm_with_model_for_user(body.model, body.user_id)
+        llm = _build_llm_with_model_for_user(body.model, user_id)
     except LoopModelNotSupportedHere:
         return _loop_model_refusal(body.model)
     except Exception as e:
@@ -1200,24 +1160,25 @@ Respond with ONLY a JSON object of this exact shape, no prose:
 {"is_waf_block": true|false, "confidence": 0..100, "reason": "..."}"""
 
 
-@app.post("/llm/takeover-classify", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def llm_takeover_classify(body: TakeoverClassifyRequest):
+@app.post("/llm/takeover-classify", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def llm_takeover_classify(body: TakeoverClassifyRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     """Disambiguate a takeover finding from a WAF block masquerading as one.
 
     Called by the recon container's takeover scanner when
     TAKEOVER_AI_CLASSIFIER is on. Reuses the same per-user LLM provider
     resolution as the agent itself.
     """
+    user_id, _ = scan_job_ids(cred, body.user_id, body.project_id)
     import json as json_mod
 
     logger.info(
         "takeover-classify: host=%s provider=%s status=%d body=%dB model=%s user=%s",
         body.hostname, body.expected_provider, body.status_code,
-        len(body.response_sample or ''), body.model, body.user_id,
+        len(body.response_sample or ''), body.model, user_id,
     )
 
     try:
-        llm = _build_llm_with_model_for_user(body.model, body.user_id)
+        llm = _build_llm_with_model_for_user(body.model, user_id)
     except LoopModelNotSupportedHere:
         return _loop_model_refusal(body.model)
     except Exception as e:
@@ -1336,6 +1297,12 @@ def _log_jev(endpoint: str, user_id: str, project_id: str, n_questions: int,
     )
 
 
+def _scan_ids(cred, body) -> tuple:
+    """The (user, project) a /jev/* call acts for: its job credential's, else the body's."""
+    user_id, project_id = scan_job_ids(cred, body.user_id, body.project_id)
+    return user_id or "", project_id or ""
+
+
 async def _run_jev(endpoint: str, user_id: str, project_id: str, n_questions: int, coro):
     """Shared wrapper: owner/token preamble, timing, fixed-error mapping, log."""
     import time as _time
@@ -1368,42 +1335,42 @@ async def _run_jev(endpoint: str, user_id: str, project_id: str, n_questions: in
     return result
 
 
-@app.post("/jev/ffuf-extensions", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_ffuf_extensions(body: FfufExtensionsRequest):
+@app.post("/jev/ffuf-extensions", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_ffuf_extensions(body: FfufExtensionsRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "ffuf-extensions", body.user_id or "", body.project_id or "",
+        "ffuf-extensions", *_scan_ids(cred, body),
         len(jev_hooks.FFUF_JEV_CATALOG),
         lambda key: jev_hooks.ffuf_extensions(key, body.url, body.headers or {}, body.max_extensions),
     )
 
 
-@app.post("/jev/nuclei-tags", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_nuclei_tags(body: NucleiTagsRequest):
+@app.post("/jev/nuclei-tags", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_nuclei_tags(body: NucleiTagsRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "nuclei-tags", body.user_id or "", body.project_id or "",
+        "nuclei-tags", *_scan_ids(cred, body),
         len(body.candidates or []),
         lambda key: jev_hooks.nuclei_tags(key, body.technologies, body.servers,
                                           body.candidates, body.max_tags),
     )
 
 
-@app.post("/jev/waf-classify", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_waf_classify(body: WafClassifyRequest):
+@app.post("/jev/waf-classify", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_waf_classify(body: WafClassifyRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "waf-classify", body.user_id or "", body.project_id or "", 2,
+        "waf-classify", *_scan_ids(cred, body), 2,
         lambda key: jev_hooks.waf_classify(key, body.url, body.status_code, body.headers or {},
                                            body.body_sample, body.response_time_ms),
     )
 
 
-@app.post("/jev/takeover-classify", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_takeover_classify(body: TakeoverClassifyRequest):
+@app.post("/jev/takeover-classify", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_takeover_classify(body: TakeoverClassifyRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "takeover-classify", body.user_id or "", body.project_id or "", 1,
+        "takeover-classify", *_scan_ids(cred, body), 1,
         lambda key: jev_hooks.takeover_classify(key, body.hostname, body.expected_provider,
                                                 body.status_code, body.headers or {},
                                                 body.response_sample),
@@ -1551,74 +1518,74 @@ class RouteExposureAssessRequest(BaseModel):
     project_id: Optional[str] = None
 
 
-@app.post("/jev/ffuf-base-paths", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_ffuf_base_paths(body: FfufBasePathsRequest):
+@app.post("/jev/ffuf-base-paths", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_ffuf_base_paths(body: FfufBasePathsRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "ffuf-base-paths", body.user_id or "", body.project_id or "", len(body.candidates),
+        "ffuf-base-paths", *_scan_ids(cred, body), len(body.candidates),
         lambda key: jev_hooks.ffuf_base_paths(key, body.candidates, body.cap),
     )
 
 
-@app.post("/jev/page-type", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_page_type(body: PageTypeRequest):
+@app.post("/jev/page-type", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_page_type(body: PageTypeRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "page-type", body.user_id or "", body.project_id or "",
+        "page-type", *_scan_ids(cred, body),
         len(body.pages) * len(jev_hooks.PAGE_CLASSES),
         lambda key: jev_hooks.page_type(key, [p.model_dump() for p in body.pages]),
     )
 
 
-@app.post("/jev/tool-health", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_tool_health(body: ToolHealthRequest):
+@app.post("/jev/tool-health", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_tool_health(body: ToolHealthRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "tool-health", body.user_id or "", body.project_id or "", 1,
+        "tool-health", *_scan_ids(cred, body), 1,
         lambda key: jev_hooks.tool_health(key, body.tool, body.return_code, body.elapsed_s,
                                           body.seed_count, body.stderr),
     )
 
 
-@app.post("/jev/crawl-seed-order", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_crawl_seed_order(body: CrawlSeedOrderRequest):
+@app.post("/jev/crawl-seed-order", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_crawl_seed_order(body: CrawlSeedOrderRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "crawl-seed-order", body.user_id or "", body.project_id or "", len(body.hosts),
+        "crawl-seed-order", *_scan_ids(cred, body), len(body.hosts),
         lambda key: jev_hooks.crawl_seed_order(key, [h.model_dump() for h in body.hosts]),
     )
 
 
-@app.post("/jev/serialized-classify", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_serialized_classify(body: SerializedClassifyRequest):
+@app.post("/jev/serialized-classify", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_serialized_classify(body: SerializedClassifyRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "serialized-classify", body.user_id or "", body.project_id or "",
+        "serialized-classify", *_scan_ids(cred, body),
         len(body.blobs) * 2,
         lambda key: jev_hooks.serialized_classify(key, [b.model_dump() for b in body.blobs]),
     )
 
 
-@app.post("/jev/route-privacy-rank", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_route_privacy_rank(body: RoutePrivacyRankRequest):
+@app.post("/jev/route-privacy-rank", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_route_privacy_rank(body: RoutePrivacyRankRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "route-privacy-rank", body.user_id or "", body.project_id or "", len(body.routes),
+        "route-privacy-rank", *_scan_ids(cred, body), len(body.routes),
         lambda key: jev_hooks.route_privacy_rank(key, [r.model_dump() for r in body.routes]),
     )
 
 
-@app.post("/jev/route-exposure-assess", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
-async def jev_route_exposure_assess(body: RouteExposureAssessRequest):
+@app.post("/jev/route-exposure-assess", tags=["LLM"], dependencies=[Depends(require_master_or_job_credential)])
+async def jev_route_exposure_assess(body: RouteExposureAssessRequest, cred: Optional[dict] = Depends(require_master_or_job_credential)):
     import jev_hooks
     return await _run_jev(
-        "route-exposure-assess", body.user_id or "", body.project_id or "",
+        "route-exposure-assess", *_scan_ids(cred, body),
         len(body.candidates) * 2,
         lambda key: jev_hooks.route_exposure_assess(key, [c.model_dump() for c in body.candidates]),
     )
 
 
-@app.post("/emergency-stop-all", tags=["System"], dependencies=[Depends(require_internal_auth_only)])
+@app.post("/emergency-stop-all", tags=["System"], dependencies=[Depends(require_configured_master_auth)])
 async def emergency_stop_all():
     """Emergency stop: cancel every running agent task immediately."""
     if not ws_manager:
@@ -1629,9 +1596,81 @@ async def emergency_stop_all():
 
 
 class SessionStopRequest(BaseModel):
-    user_id: str
+    # The session's person (the ticket's `sub`, the Conversation's author). Absent: every
+    # run of that project and session, whoever's (purge-orphan-chains knows the chain's
+    # session but not its person, since a chain names the project's owner).
+    user_id: Optional[str] = None
     project_id: str
     session_id: str
+
+
+class StopForRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    # None is every project; an empty list is refused, so a caller's bug never
+    # reads as either.
+    project_ids: Optional[List[Annotated[str, Field(min_length=1)]]] = Field(None, min_length=1)
+
+
+@app.post("/agent-sessions/stop-for", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
+async def stop_agent_sessions_for(body: StopForRequest):
+    """Stop the running agent runs of ONE user (optionally only in `project_ids`).
+
+    A member's emergency stop: the webapp calls it with the signed-in member, so
+    the shared instance's other runs keep going. A run is the user's when its
+    session key names them (the effective user: an admin's act-as run is the
+    member's). Each run's in-flight tool tasks are cancelled with it. CypherFix
+    triage and CodeFix runs are not agent runs and are not reached.
+    """
+    if not ws_manager:
+        return JSONResponse(content={"stopped": 0}, status_code=503)
+    stopped = await ws_manager.stop_for_user(body.user_id, body.project_ids)
+    logger.warning("[rbac] stop-for user=%s projects=%s stopped=%d", body.user_id,
+                   "all" if body.project_ids is None else len(body.project_ids), stopped)
+    return {"stopped": stopped}
+
+
+class WsCloseRequest(BaseModel):
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+    kinds: List[Literal[SOCKET_KINDS]] = Field(..., min_length=1)
+    scope: Literal[CLOSE_SCOPES] = "access"
+    actor_id: Optional[str] = None
+
+
+@app.post("/ws/close", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
+async def close_open_sockets(body: WsCloseRequest):
+    """Close the open sockets of `kinds` that belong to a user and/or a project.
+
+    A ticket is checked only when its socket opens, so ending someone's access
+    must also end the sockets they hold open; the webapp calls this when an
+    admin removes a member's Kali terminal grant.
+    Closing an `agent` socket also stops its run. A user or a project is
+    required, so a caller's bug never closes every socket of the instance.
+
+    `scope` says what ended for `user_id`, which decides an admin's act-as
+    sockets: `access` (default), something the user's own access gave, such as
+    a legacy grant, leaves open the sockets an admin opened acting as the user;
+    `account` (a disabled or deleted account, revoked sessions) closes them too,
+    as does a `project_id` (the user's access to that project ended). `act_as`
+    (one impersonation ended) closes only what admin `actor_id` opened acting as
+    `user_id`, and needs both. An agent from before `act_as` answers 422 to it, so
+    a newer webapp never closes the member's own sockets by mistake.
+    """
+    if not body.user_id and not body.project_id:
+        return JSONResponse(status_code=400, content={"error": "user_id or project_id is required"})
+    if body.scope == "act_as" and not (body.user_id and body.actor_id):
+        return JSONResponse(status_code=400, content={"error": "the act_as scope needs user_id and actor_id"})
+    if body.scope != "act_as" and body.actor_id is not None:
+        return JSONResponse(status_code=400, content={"error": "actor_id belongs to the act_as scope"})
+    result = await close_sockets(ws_manager, PROXIED_SOCKETS, kinds=list(dict.fromkeys(body.kinds)),
+                                 user_id=body.user_id or None, project_id=body.project_id or None,
+                                 scope=body.scope, actor_id=body.actor_id or None)
+    logger.warning("[rbac] ws close user=%s project=%s actor=%s kinds=%s scope=%s closed=%d stopped_runs=%d",
+                   body.user_id or "-", body.project_id or "-", body.actor_id or "-", ",".join(body.kinds),
+                   body.scope, result["closed"], result["stopped_runs"])
+    return result
 
 
 @app.post("/agent-session/stop", tags=["Sessions"],
@@ -1641,9 +1680,15 @@ async def stop_agent_session(body: SessionStopRequest):
 
     Called when a conversation is deleted so its agent loop stops instead of
     continuing to run headlessly and re-seeding the Neo4j attack-chain graph.
+    Without `user_id`, the session's runs in that project whoever's (an orphan chain).
     """
     if not ws_manager:
         return JSONResponse(content={"stopped": False}, status_code=503)
+    if not body.user_id:
+        stopped = await ws_manager.stop_project_session(body.project_id, body.session_id)
+        logger.info(f"Agent session stop requested for *:{body.project_id}:{body.session_id}: "
+                    f"cancelled={stopped}")
+        return {"stopped": stopped}
     session_key = f"{body.user_id}:{body.project_id}:{body.session_id}"
     stopped = await ws_manager.stop_session(session_key)
     logger.info(f"Agent session stop requested for {session_key}: cancelled={stopped}")
@@ -1670,6 +1715,120 @@ async def live_agent_sessions(project_id: str):
     if loop_states:
         answer["loop_states"] = loop_states
     return answer
+
+
+@app.get("/agent-sessions/all", tags=["Sessions"], dependencies=[Depends(require_configured_master_auth)])
+async def all_agent_sessions():
+    """Every agent session of the instance, for the admin operations view (step 6.5).
+
+    Each one's person, project and session, whether a run is in progress, whether a
+    socket is open, and the admin behind an act-as run (WebSocketManager.all_sessions).
+    Master key only and fail-closed: it names every user's sessions, and a session id
+    is what /agent-session/stop needs. 503 when the manager is not up.
+    """
+    if not ws_manager:
+        return JSONResponse(content={"error": "agent not ready"}, status_code=503)
+    return {"sessions": ws_manager.all_sessions()}
+
+
+@app.get("/agent-sessions/count", tags=["Sessions"], dependencies=[Depends(require_configured_master_auth)])
+async def count_agent_sessions(user_id: str = Query(..., min_length=1)):
+    """How many of one person's agent runs are in progress, for the agent-run quota
+    (step 6.8): the webapp asks it before minting an agent ticket. Master key only and
+    fail-closed; 503 when the manager is not up, so the caller never reads it as zero.
+    """
+    if not ws_manager:
+        return JSONResponse(content={"error": "agent not ready"}, status_code=503)
+    return {"user_id": user_id, "count": ws_manager.live_run_count(user_id)}
+
+
+def _project_work(project_id: str) -> dict:
+    """What this agent runs on one project now: agent runs (whoever's), the project's
+    triage run and its CodeFix runs. Each keeps the tenant it started with, so an
+    ownership transfer must wait for them. A CodeFix run lives only as its open socket."""
+    from cypherfix_triage.websocket_handler import _active_run
+    return {
+        "session_ids": ws_manager.live_session_ids(project_id),
+        "codefix_sockets": len(PROXIED_SOCKETS.matching(kinds=("cypherfix-codefix",), project_id=project_id)),
+        "triage_run": _active_run(project_id) is not None,
+    }
+
+
+@app.get("/agent-sessions/project-work", tags=["Sessions"], dependencies=[Depends(require_master_internal_auth)])
+async def project_agent_work(project_id: str = Query(..., min_length=1)):
+    """The agent runs, CodeFix runs and triage run of one project, for the webapp's
+    ownership-transfer check (step 5.12). Master key only; 503 while the manager is
+    not up, so the caller never reads it as idle."""
+    if not ws_manager:
+        return JSONResponse(content={"error": "agent not ready"}, status_code=503)
+    return {"project_id": project_id, **_project_work(project_id)}
+
+
+class GraphRetenantRequest(BaseModel):
+    project_id: str
+    from_user_id: str
+    to_user_id: str
+
+
+#: The answer for each way the mixin's re-tenant can end short (RetenantError.code).
+_RETENANT_ANSWERS = {
+    "retenant_invalid": (400, "The re-tenant was refused: its arguments are invalid."),
+    "retenant_conflict": (409, "Nodes the new owner already holds in this project collide with the project's "
+                               "own; nothing was moved."),
+    "retenant_failed": (500, "The re-tenant failed and was run back: the graph is as it was."),
+    "retenant_rollback_failed": (500, "The re-tenant failed and could not be run back: the project's graph is "
+                                      "split between the two owners. The same call again completes it."),
+}
+
+
+@app.post("/graph/retenant", tags=["Graph"], dependencies=[Depends(require_master_internal_auth)])
+async def graph_retenant(body: GraphRetenantRequest):
+    """Move one project's graph from its old owner to its new one (RBAC step 5.12).
+
+    The webapp calls it while it holds the project lock (no new scan, ticket or
+    settings write) and after it found no live work, then moves the project in
+    Postgres; the reverse call runs the move back when that fails. Idempotent
+    (TenancyMixin.retenant_project): a repeated call moves what is left.
+
+    Refused (409 `project_busy`) while this agent runs anything on the project: such
+    a run writes under the tenant it started with. Scans are the webapp's check (the
+    orchestrator's status), since the agent does not see them.
+    """
+    for value in (body.project_id, body.from_user_id, body.to_user_id):
+        if not _RUN_ID_RE.fullmatch(value or ""):
+            return JSONResponse(status_code=400, content={"error": "invalid project or user id", "code": "retenant_invalid"})
+    if not ws_manager:
+        return JSONResponse(status_code=503, content={
+            "error": "The agent is not ready, so its live runs cannot be checked.", "code": "agent_not_ready"})
+    work = _project_work(body.project_id)
+    busy = [name for name, live in (("agent_run", work["session_ids"]), ("triage_run", work["triage_run"]),
+                                    ("codefix_run", work["codefix_sockets"])) if live]
+    if busy:
+        logger.warning("[rbac] retenant refused project=%s: live %s", body.project_id, ",".join(busy))
+        return JSONResponse(status_code=409, content={
+            "error": "The agent is running work on this project; it keeps the old owner until it ends.",
+            "code": "project_busy", "busy": busy})
+
+    from graph_db.mixins.tenancy_mixin import RetenantError
+    try:
+        result = await asyncio.to_thread(
+            lambda: _triage_graph_client().retenant_project(body.project_id, body.from_user_id, body.to_user_id))
+    except RetenantError as exc:
+        status, sentence = _RETENANT_ANSWERS.get(exc.code, (500, "The re-tenant failed."))
+        if status >= 500:
+            logger.error("[rbac] retenant %s project=%s", exc.code, body.project_id)
+        answer = {"error": sentence, "code": exc.code}
+        if exc.conflicts:
+            answer["conflicts"] = exc.conflicts
+        if exc.moved:
+            answer["moved"] = exc.moved
+        return JSONResponse(status_code=status, content=answer)
+    except Exception as exc:
+        # Raised before the mixin's first write (the client or the preflight): nothing moved.
+        logger.error("[rbac] retenant graph_unavailable project=%s: %s", body.project_id, type(exc).__name__)
+        return JSONResponse(status_code=503, content={
+            "error": "The graph database could not be reached; nothing was moved.", "code": "graph_unavailable"})
+    return result
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
@@ -1734,7 +1893,7 @@ class TradecraftVerifyRequest(BaseModel):
     force: bool = False
     # Per-resource model override. When set, the verify endpoint builds a
     # provider-agnostic LLM for THIS model (resolving the user's provider
-    # keys) instead of reusing orchestrator.llm. Decouples tradecraft
+    # keys) instead of the user's default model. Decouples tradecraft
     # ingestion from the agent's current chat model and from project-load
     # order (fixes the "agent reverted to default Anthropic after restart"
     # 401 path).
@@ -1754,10 +1913,18 @@ def _pick_custom_provider(user_providers: list, model_name: str) -> Optional[dic
     return custom_provider_or_fallback(user_providers, model_name)
 
 
-def _build_llm_for_user(user_id: Optional[str]):
+# The model of a user's out-of-run client (the guardrail, a tradecraft verify with
+# no model). Never get_settings()['OPENAI_MODEL']: outside a run that is whichever
+# project any owner loaded last, possibly a loop model or a provider this user
+# has no key for, and the check would then be skipped.
+DEFAULT_OUT_OF_RUN_MODEL = _DEFAULT_AGENT_SETTINGS.get('OPENAI_MODEL', 'claude-opus-4-6')
+
+
+def _build_llm_for_user(user_id: Optional[str], purpose: str = "tradecraft verify"):
     """Build an LLM for a non-project endpoint by loading the user's providers
-    via the internal webapp API. Falls back to env-based providers when user_id
-    is missing or the lookup fails.
+    via the internal webapp API: the default model on the user's own keys. Falls
+    back to env-based providers when user_id is missing or the lookup fails.
+    Blocking (an HTTP fetch): an async route calls it through asyncio.to_thread.
 
     When the user has only a custom (OpenAI-compatible / bedrock_custom /
     ollama_local) provider configured, this honors it instead of falling back
@@ -1767,13 +1934,10 @@ def _build_llm_for_user(user_id: Optional[str]):
     import os
     import requests
     from orchestrator_helpers.llm_setup import setup_llm, _resolve_provider_key
-    from project_settings import DEFAULT_AGENT_SETTINGS, get_settings
+    from agent_in_the_loop.errors import refuse_loop_model
 
-    model_name = (get_settings() or {}).get(
-        'OPENAI_MODEL', DEFAULT_AGENT_SETTINGS.get('OPENAI_MODEL', 'claude-opus-4-6')
-    )
-    if is_loop_model(model_name):
-        raise LoopModelNotSupportedHere()
+    model_name = DEFAULT_OUT_OF_RUN_MODEL
+    refuse_loop_model(model_name)
     user_providers: list = []
     if user_id:
         webapp_url = os.environ.get('WEBAPP_URL', 'http://webapp:3000')
@@ -1787,13 +1951,13 @@ def _build_llm_for_user(user_id: Optional[str]):
             resp.raise_for_status()
             user_providers = resp.json() or []
         except Exception as e:
-            logger.warning(f"tradecraft verify: failed to fetch user LLM providers: {e}")
+            logger.warning(f"{purpose}: failed to fetch user LLM providers: {e}")
 
     custom_provider = _pick_custom_provider(user_providers, model_name)
     if custom_provider:
         custom_model = f"custom/{custom_provider.get('id', '')}"
         logger.info(
-            f"tradecraft verify: using custom provider id={custom_provider.get('id')} "
+            f"{purpose}: using custom provider id={custom_provider.get('id')} "
             f"type={custom_provider.get('providerType')}"
         )
         return setup_llm(custom_model, custom_llm_config=custom_provider)
@@ -1830,7 +1994,7 @@ def _build_llm_for_user(user_id: Optional[str]):
 
 # Authenticated because it fetches a caller-chosen URL from inside the agent's
 # network and spends the named user's LLM keys (CVE-2026-111323).
-@app.post("/tradecraft/verify", tags=["Tradecraft"], dependencies=[Depends(require_internal_auth)])
+@app.post("/tradecraft/verify", tags=["Tradecraft"], dependencies=[Depends(require_configured_master_auth), Depends(require_internal_auth)])
 async def tradecraft_verify(body: TradecraftVerifyRequest):
     """
     Fetch a tradecraft resource URL, detect its type, build a sitemap, and
@@ -1857,20 +2021,18 @@ async def tradecraft_verify(body: TradecraftVerifyRequest):
             "crawl_stats": {},
             "last_error": err,
         }
-    # Resolve the LLM used for crawl decisions + summary:
+    # Resolve the LLM used for crawl decisions + summary, always from the named
+    # user's own providers (RBAC T17), never a chat run's client:
     #   1. If the request specifies a per-resource model, build a provider-
     #      agnostic LLM for THAT model from the user's saved providers.
     #      (Same path the 5 recon AI classifiers use.) This is the normal
     #      path — the webapp always sends a model now that the field is
     #      required at create/edit time.
     #   2. Otherwise (back-compat for direct API callers and old rows
-    #      written before this column existed), prefer the orchestrator's
-    #      loaded LLM, then fall back to _build_llm_for_user.
+    #      written before this column existed), _build_llm_for_user.
     try:
         if body.model:
             llm = _build_llm_with_model_for_user(body.model, body.user_id)
-        elif orchestrator.llm is not None and not is_loop_llm(orchestrator.llm):
-            llm = orchestrator.llm
         else:
             llm = _build_llm_for_user(body.user_id)
     except LoopModelNotSupportedHere:
@@ -1904,7 +2066,7 @@ async def tradecraft_verify(body: TradecraftVerifyRequest):
         )
 
 
-@app.get("/mcp/manifest", tags=["MCP"], dependencies=[Depends(require_internal_auth_only)])
+@app.get("/mcp/manifest", tags=["MCP"], dependencies=[Depends(require_configured_master_auth)])
 async def get_mcp_manifest():
     """
     Return the current MCP server manifest as seen by the agent.
@@ -1922,31 +2084,57 @@ async def get_mcp_manifest():
     }
 
 
-@app.post("/mcp/reload", tags=["MCP"], dependencies=[Depends(require_internal_auth_only)])
+@app.post("/mcp/reload", tags=["MCP"], dependencies=[Depends(require_configured_master_auth)])
 async def reload_mcp_manifest(payload: dict = None):
     """
     Re-merge system + user MCP servers and reconnect the MCP client.
 
     Called by the webapp after a user adds/edits/deletes an MCP server.
-    Body (optional): {"userMcpServers": [...]} — when omitted, uses the
-    most recent cached project settings.
+    Body (optional): {"ownerId": "<user id>", "userMcpServers": [...]}; when the
+    list is omitted (an administrator's reload) the loaded set is reloaded.
+
+    The agent holds one user MCP toolset (RBAC OQ-41): a new set while another
+    owner's run on a different set is live is deferred, 202 `mcp_toolset_busy`,
+    and loads at the owner's next run start (mcp_toolset_guard).
     """
     if orchestrator is None:
         return JSONResponse({"error": "orchestrator not ready"}, status_code=503)
 
+    from mcp_toolset_guard import (
+        MCP_RELOAD_DEFERRED_MESSAGE, MCP_TOOLSET_BUSY, McpToolsetBusy, toolset_guard,
+    )
+
     user_servers_raw = None
+    owner_id = None
     if isinstance(payload, dict):
         user_servers_raw = payload.get("userMcpServers")
+        owner = payload.get("ownerId")
+        owner_id = owner if isinstance(owner, str) and owner else None
+
+    deferred = JSONResponse(
+        {"deferred": True, "code": MCP_TOOLSET_BUSY, "message": MCP_RELOAD_DEFERRED_MESSAGE},
+        status_code=202,
+    )
+    guard = toolset_guard()
+    wanted = user_servers_raw if user_servers_raw is not None else (guard.loaded_servers or [])
+    if not guard.admit_reload(owner_id, wanted):
+        return deferred
 
     try:
-        result = await orchestrator.reload_mcp_manifests(user_servers_raw)
+        # Asked again when its turn comes: a run admitted meanwhile holds its own set.
+        result = await orchestrator.reload_mcp_manifests(user_servers_raw, owner_id)
+        if isinstance(result, dict) and result.get("loaded") is False:
+            # The save stands; the person learns no user MCP tool is loaded now.
+            return JSONResponse({**result, "code": "mcp_toolset_load_failed"}, status_code=502)
         return result
+    except McpToolsetBusy:
+        return deferred
     except Exception as exc:
         logger.exception(f"/mcp/reload failed: {exc}")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
-@app.post("/mcp/test", tags=["MCP"], dependencies=[Depends(require_internal_auth_only)])
+@app.post("/mcp/test", tags=["MCP"], dependencies=[Depends(require_configured_master_auth)])
 async def test_mcp_server(server: dict):
     """
     Test connectivity to a single MCP server draft (NOT yet persisted).
@@ -1968,6 +2156,19 @@ async def test_mcp_server(server: dict):
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "discovered_tools": [],
             "error": f"schema validation failed: {exc}",
+            "warnings": [],
+        }
+
+    # A draft is always a user's server, so it never names one of the agent's own
+    # variables as its bearer (OQ-R1): `INTERNAL_API_KEY` would go to the draft's URL.
+    if srv_obj.auth and srv_obj.auth.token_env_var:
+        logger.warning(f"[rbac] mcp token_env_var refused server={srv_obj.id} via=test")
+        return {
+            "ok": False,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "discovered_tools": [],
+            "error": mcp_registry.TOKEN_ENV_VAR_REFUSED_MESSAGE,
+            "code": mcp_registry.TOKEN_ENV_VAR_REFUSED,
             "warnings": [],
         }
 
@@ -2026,12 +2227,27 @@ async def test_mcp_server(server: dict):
         """
         if srv_obj.transport != "stdio" or not srv_obj.command:
             return None
+        import shutil
         import subprocess
-        spawn_env = {**os.environ, **(srv_obj.env or {})}
+        # Started exactly as the client spawn is: the server's own env and nothing
+        # of the agent's (NF-14), under the unprivileged uid (GHSA-8whg-rvcr-r88r).
+        launcher, launch_args = mcp_registry.stdio_launch(srv_obj)
+        spawn_path = mcp_registry.stdio_spawn_env(srv_obj).get("PATH")
+        # The launcher always exists, so a missing command would surface only as
+        # the launcher's exit code; name it the way a person can act on. A path
+        # (`./server.sh`) resolves against the server's cwd, so only a bare name
+        # is looked up here.
+        if "/" not in srv_obj.command and \
+                shutil.which(srv_obj.command, path=spawn_path) is None:
+            return (
+                f"command not found: '{srv_obj.command}'. Is it installed in "
+                f"the agent container? (e.g. for npx-based MCPs ensure node, "
+                f"for uvx ensure uv)"
+            )
         try:
             proc = subprocess.Popen(
-                [srv_obj.command, *list(srv_obj.args or [])],
-                env=spawn_env,
+                [launcher, *launch_args],
+                env={},
                 cwd=srv_obj.cwd or None,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -2251,7 +2467,7 @@ class ModelsRequest(BaseModel):
     providers: list[dict] | None = None
 
 
-@app.post("/models", tags=["System"], dependencies=[Depends(require_internal_auth)])
+@app.post("/models", tags=["System"], dependencies=[Depends(require_configured_master_auth), Depends(require_internal_auth)])
 async def get_models(body: ModelsRequest | None = None):
     """
     Fetch available AI models from all configured providers.
@@ -2365,7 +2581,7 @@ _JEV_TEST_ERRORS = {
 }
 
 
-@app.post("/llm-provider/test", tags=["System"], dependencies=[Depends(require_internal_auth)])
+@app.post("/llm-provider/test", tags=["System"], dependencies=[Depends(require_configured_master_auth), Depends(require_internal_auth)])
 async def test_llm_provider(body: LlmProviderTestRequest):
     """Test an LLM provider config by sending a simple message."""
     from orchestrator_helpers.llm_setup import setup_llm
@@ -2543,96 +2759,34 @@ async def test_llm_provider(body: LlmProviderTestRequest):
         )
 
 
-@app.get("/files", tags=["Files"], dependencies=[Depends(require_internal_auth_only)])
+@app.get("/files", tags=["Files"], dependencies=[Depends(require_configured_master_auth)])
 async def download_file(
-    path: str = Query(..., description="File path inside kali-sandbox (must be under /tmp/)"),
+    projectId: str = Query("", description="Project whose workspace holds the file"),
+    path: str = Query(..., description="/workspace/<projectId>/... or a workspace-relative path"),
 ):
     """
-    Download a file from kali-sandbox via the kali_shell MCP tool.
+    Download a file the agent wrote into a project's workspace (a chat download card).
 
-    Reads the file using base64 encoding through the existing MCP tool,
-    decodes it, and returns the binary content.
-    Security: Only paths under /tmp/ are allowed.
+    Only that project's workspace is served: a path anywhere else (the shared
+    sandbox's /tmp, another project's workspace, a `..` segment, a symlink out of
+    the workspace) answers 403, a missing file or anything but a regular file 404.
+    The bytes come from the bind mount through the descriptor that was checked
+    (open_download_for_project), never through a shell. The projectId is not an
+    authorization: the webapp checks the caller may read the project, then calls
+    with the master key.
     """
-    # Security: restrict to /tmp/ paths and prevent directory traversal
-    if not path.startswith("/tmp/"):
-        return Response(content="Forbidden: only /tmp/ paths allowed", status_code=403)
-    normalized = os.path.normpath(path)
-    if not normalized.startswith("/tmp/"):
-        return Response(content="Forbidden: path traversal detected", status_code=403)
-
-    # The file is read INSIDE kali-sandbox via kali_shell, which runs the command
-    # through `bash -c`, so `normalized` is interpolated into a shell string.
-    # `os.path.normpath` collapses `.`/`..`/`//` but does NOT strip shell
-    # metacharacters (`;`, `|`, `` ` ``, `$(...)`), so a path like `/tmp/x; id`
-    # would inject a second command. Quote it so it is always a single literal
-    # argument. This is the actual injection fix; the `/tmp/` prefix check above
-    # is not sufficient on its own.
-    safe_path = shlex.quote(normalized)
-
-    if not orchestrator or not orchestrator.tool_executor:
-        return Response(content="Agent not initialized", status_code=503)
-
+    if not projectId:
+        return Response(content="projectId required", status_code=400)
+    relative = workspace_fs.sandbox_workspace_relative(projectId, path)
+    if relative is None:
+        return Response(content="Forbidden: the file is outside this project's workspace", status_code=403)
     try:
-        # Check file exists first
-        check_result = await orchestrator.tool_executor.execute(
-            "kali_shell",
-            {"command": f"test -f {safe_path} && stat -c '%s' {safe_path}"},
-            "informational",
-            skip_phase_check=True,
-        )
-        if not check_result.get("success") or not check_result.get("output", "").strip():
+        fd, size, mime, filename = workspace_fs.open_download_for_project(projectId, relative)
+    except ValueError as e:
+        if str(e).startswith("not a file"):
             return Response(content="File not found", status_code=404)
-
-        # Read file as base64
-        b64_result = await orchestrator.tool_executor.execute(
-            "kali_shell",
-            {"command": f"base64 -w0 {safe_path}"},
-            "informational",
-            skip_phase_check=True,
-        )
-        if not b64_result.get("success"):
-            return Response(
-                content=f"Error reading file: {b64_result.get('error', 'unknown')}",
-                status_code=500,
-            )
-
-        b64_str = (b64_result.get("output") or "").strip()
-        file_bytes = base64.b64decode(b64_str)
-        filename = os.path.basename(normalized)
-
-        # Content type mapping for common payload/document types
-        ext = os.path.splitext(filename)[1].lower()
-        content_types = {
-            ".exe": "application/x-msdownload",
-            ".elf": "application/x-elf",
-            ".pdf": "application/pdf",
-            ".docm": "application/vnd.ms-word.document.macroEnabled.12",
-            ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
-            ".apk": "application/vnd.android.package-archive",
-            ".war": "application/x-webarchive",
-            ".ps1": "text/plain",
-            ".py": "text/plain",
-            ".sh": "text/plain",
-            ".hta": "text/html",
-            ".lnk": "application/x-ms-shortcut",
-            ".rtf": "application/rtf",
-            ".vba": "text/plain",
-            ".macho": "application/x-mach-binary",
-        }
-        content_type = content_types.get(ext, "application/octet-stream")
-
-        return Response(
-            content=file_bytes,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(file_bytes)),
-            },
-        )
-    except Exception as e:
-        logger.error(f"File download error: {e}")
-        return Response(content=f"Error reading file: {str(e)}", status_code=500)
+        return Response(content="Forbidden: the file is outside this project's workspace", status_code=403)
+    return _ws_downloads.stream_fd(fd, size, mime, filename)
 
 
 # =============================================================================
@@ -3141,6 +3295,19 @@ _SESSION_BASE = os.environ.get(
 ).rsplit("/progress", 1)[0]
 
 
+def _session_manager_reply(resp) -> JSONResponse:
+    """The session manager's answer, except its 401: passed on as a 401 it would read as
+    the webapp's key being refused, so it becomes a 502 that names the agent's bearer."""
+    if resp.status_code == 401:
+        logger.error("[rbac] session manager refused the agent's bearer: MCP_AUTH_TOKEN is "
+                     "unset in the agent or differs from kali-sandbox's")
+        return JSONResponse(
+            content={"error": "Session manager refused the agent's credential",
+                     "code": "session_manager_unauthorized"},
+            status_code=502)
+    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
 @app.get("/tunnel-status", tags=["System"])
 async def get_tunnel_status():
     """Return live status of ngrok and chisel tunnels."""
@@ -3162,8 +3329,8 @@ async def get_sessions():
     """List all active Metasploit sessions, background jobs, and non-MSF sessions."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{_SESSION_BASE}/sessions")
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            resp = await client.get(f"{_SESSION_BASE}/sessions", headers=kali_auth_headers())
+            return _session_manager_reply(resp)
     except httpx.TimeoutException:
         return JSONResponse(content={"error": "Session manager timeout"}, status_code=504)
     except Exception as e:
@@ -3178,9 +3345,10 @@ async def interact_session(session_id: int, body: dict):
     try:
         async with httpx.AsyncClient(timeout=40.0) as client:
             resp = await client.post(
-                f"{_SESSION_BASE}/sessions/{session_id}/interact", json=body
+                f"{_SESSION_BASE}/sessions/{session_id}/interact", json=body,
+                headers=kali_auth_headers(),
             )
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            return _session_manager_reply(resp)
     except httpx.TimeoutException:
         return JSONResponse(content={"error": "Session interaction timeout"}, status_code=504)
     except Exception as e:
@@ -3194,8 +3362,9 @@ async def kill_session(session_id: int):
     """Kill a specific Metasploit session."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{_SESSION_BASE}/sessions/{session_id}/kill")
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            resp = await client.post(f"{_SESSION_BASE}/sessions/{session_id}/kill",
+                                     headers=kali_auth_headers())
+            return _session_manager_reply(resp)
     except Exception as e:
         logger.error(f"Session kill proxy error: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=502)
@@ -3207,8 +3376,9 @@ async def kill_job(job_id: int):
     """Kill a background Metasploit job."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(f"{_SESSION_BASE}/jobs/{job_id}/kill")
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            resp = await client.post(f"{_SESSION_BASE}/jobs/{job_id}/kill",
+                                     headers=kali_auth_headers())
+            return _session_manager_reply(resp)
     except Exception as e:
         logger.error(f"Job kill proxy error: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=502)
@@ -3220,8 +3390,9 @@ async def session_chat_map(body: dict):
     """Register a mapping between a Metasploit session ID and agent chat session ID."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(f"{_SESSION_BASE}/session-chat-map", json=body)
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            resp = await client.post(f"{_SESSION_BASE}/session-chat-map", json=body,
+                                     headers=kali_auth_headers())
+            return _session_manager_reply(resp)
     except Exception as e:
         logger.error(f"Session chat map proxy error: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=502)
@@ -3233,8 +3404,9 @@ async def register_non_msf_session(body: dict):
     """Register a non-Metasploit session (netcat, socat, etc.)."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(f"{_SESSION_BASE}/non-msf-sessions", json=body)
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            resp = await client.post(f"{_SESSION_BASE}/non-msf-sessions", json=body,
+                                     headers=kali_auth_headers())
+            return _session_manager_reply(resp)
     except Exception as e:
         logger.error(f"Non-MSF session register proxy error: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=502)
@@ -3247,8 +3419,13 @@ async def register_non_msf_session(body: dict):
 class TextToCypherRequest(BaseModel):
     """Request model for text-to-cypher conversion."""
     question: str
+    # Whose provider key pays, and whose rate-limit bucket and daily cap count the call.
     user_id: str
     project_id: str
+    # The graph tenant: the project's owner, whose id the project's nodes carry (RBAC
+    # T9). It differs from `user_id` once a collaborator may ask on a shared project;
+    # absent or empty, it is `user_id` (redagraph and older webapps send none).
+    tenant_user_id: Optional[str] = None
     # Default True for backward compatibility with the webapp graph view, which
     # needs whole nodes/relationships to render. CLI callers (e.g. redagraph)
     # should send False so the LLM is free to return scalar properties.
@@ -3340,12 +3517,17 @@ async def _build_cypher_manager(user_id: str, project_id: str):
     except Exception as e:
         logger.warning(f"text-to-cypher: failed to fetch user LLM providers: {e}")
 
+    from llm_builder import (InstanceProviderUnavailable, custom_provider_or_fallback,
+                             split_instance_model)
+
     llm = None
     try:
-        if model_name.startswith("custom/"):
-            from llm_builder import custom_provider_or_fallback
+        is_instance = split_instance_model(model_name) is not None
+        if model_name.startswith("custom/") or is_instance:
+            # An `instance/` id gets its exact row of the owner's list or None, never a
+            # fallback; setup_llm refuses it without one.
             matched = custom_provider_or_fallback(user_providers, model_name)
-            if not matched:
+            if not matched and not is_instance:
                 raise _CypherSetupError(
                     400, "Custom LLM provider not found. Configure an AI model in settings."
                 )
@@ -3374,6 +3556,9 @@ async def _build_cypher_manager(user_id: str, project_id: str):
             )
     except _CypherSetupError:
         raise
+    except InstanceProviderUnavailable:
+        raise _CypherSetupError(400, InstanceProviderUnavailable.message,
+                                {"code": InstanceProviderUnavailable.code})
     except Exception as e:
         logger.error(f"text-to-cypher: failed to create LLM: {e}")
         raise _CypherSetupError(
@@ -3407,11 +3592,17 @@ async def _build_cypher_manager(user_id: str, project_id: str):
     return manager
 
 
+def _graph_tenant(body) -> str:
+    """The graph tenant a master-key request names: `tenant_user_id`, else `user_id`."""
+    return body.tenant_user_id or body.user_id
+
+
 async def _generate_validated_cypher(
-    manager, question: str, user_id: str, project_id: str, for_graph_view: bool
+    manager, question: str, tenant_user_id: str, project_id: str, for_graph_view: bool
 ) -> str:
-    """Generate Cypher and prove it parses, scopes and runs. Returns the RAW
-    (un-scoped) Cypher, which is what a caller saves or re-scopes itself.
+    """Generate Cypher and prove it parses, scopes and runs under the graph tenant
+    (the project's owner, never the key owner). Returns the RAW (un-scoped) Cypher,
+    which is what a caller saves or re-scopes itself.
 
     Raises _CypherSetupError. Retries feed the previous error back to the model;
     an unscopable pattern raises TenantScopeError, which the loop treats the same
@@ -3447,11 +3638,11 @@ async def _generate_validated_cypher(
             # Validate by executing (with the tenant filter) to catch syntax
             # errors. Bounded (P0-4): the rows are discarded, so ask for one
             # under a transaction timeout rather than materialising a result.
-            filtered = manager._scope_query(cypher, user_id, project_id)
+            filtered = manager._scope_query(cypher, tenant_user_id, project_id)
             await asyncio.to_thread(
                 _graph_exec_run,
                 filtered,
-                {"tenant_user_id": user_id, "tenant_project_id": project_id},
+                {"tenant_user_id": tenant_user_id, "tenant_project_id": project_id},
                 1,
             )
             return cypher
@@ -3475,12 +3666,24 @@ async def _generate_validated_cypher(
     )
 
 
+# The graph and traffic routes the sandbox calls back with a run credential (T15).
+# Each is declared in the route's dependencies and taken as a parameter too; FastAPI
+# solves it once per request.
+_GRAPH_GATE = require_master_or_run_credential("graph")
+_GRAPH_GATE_BILLED = require_master_or_run_credential("graph", billed=True)
+_TRAFFIC_GATE = require_master_or_run_credential("traffic")
+# A graph credential is honoured only while the terminal it was handed to is open:
+# the shell's environment is readable by every root process of the shared sandbox,
+# so a copy must die with that terminal (closed tab, /ws/close), not after 12 hours.
+set_run_liveness("graph", lambda claims: PROXIED_SOCKETS.holds_run(claims["run"], claims["ten"], claims["pid"]))
+
+
 @app.post(
     "/text-to-cypher",
     tags=["Graph"],
-    dependencies=[Depends(require_internal_auth)],
+    dependencies=[Depends(_GRAPH_GATE_BILLED)],
 )
-async def text_to_cypher(body: TextToCypherRequest):
+async def text_to_cypher(body: TextToCypherRequest, run_cred: Optional[dict] = Depends(_GRAPH_GATE_BILLED)):
     """
     Generate a Cypher query from a natural language description.
 
@@ -3490,16 +3693,27 @@ async def text_to_cypher(body: TextToCypherRequest):
     Returns the raw Cypher (without tenant filters) for the webapp to save and execute.
 
     BILLED: one request can cost up to 9 provider calls (3 attempts, each wrapped
-    in retry_llm_call), spending the key of the user named in the body. It was
-    previously unauthenticated, so anyone who could reach the agent port could
-    spend any user's LLM budget. `require_internal_auth` applies the token bucket
-    and the daily spend cap, and the caller is trusted to have resolved the
-    identity it sends (mcp_plan.md P0-3).
+    in retry_llm_call), spending one user's provider key. The gate applies the
+    token bucket and the daily spend cap. With the master key (the webapp, which
+    resolved the identity it sends) that user is the body's `user_id` and the graph
+    is scoped to its `tenant_user_id` (the project's owner); with a terminal's run
+    credential (redagraph `ask`) both are the credential's tenant, and the body's
+    ids are ignored. The scanner key alone is refused.
     """
+    from llm_guard import run_credential_actor
+
+    cred = run_credential_claims(run_cred)
+    if cred:
+        user_id = tenant_user_id = cred["ten"]
+        project_id = cred["pid"]
+        logger.info("text-to-cypher: run-credential tenant=%s actor=%s project=%s",
+                    tenant_user_id, run_credential_actor(cred), project_id)
+    else:
+        user_id, tenant_user_id, project_id = body.user_id, _graph_tenant(body), body.project_id
     try:
-        manager = await _build_cypher_manager(body.user_id, body.project_id)
+        manager = await _build_cypher_manager(user_id, project_id)
         cypher = await _generate_validated_cypher(
-            manager, body.question, body.user_id, body.project_id, body.for_graph_view
+            manager, body.question, tenant_user_id, project_id, body.for_graph_view
         )
     except _CypherSetupError as e:
         return JSONResponse(content={"error": e.message, **e.fields}, status_code=e.status)
@@ -3518,12 +3732,14 @@ class GraphNlQueryRequest(BaseModel):
     question: str
     user_id: str
     project_id: str
+    # As in TextToCypherRequest: the graph tenant, `user_id` when absent.
+    tenant_user_id: Optional[str] = None
 
 
 @app.post(
     "/graph/nl-query",
     tags=["Graph"],
-    dependencies=[Depends(require_internal_auth)],
+    dependencies=[Depends(require_configured_master_auth), Depends(require_internal_auth)],
 )
 async def graph_nl_query(body: GraphNlQueryRequest):
     """Natural language -> tenant-scoped rows, in one call.
@@ -3536,13 +3752,14 @@ async def graph_nl_query(body: GraphNlQueryRequest):
     """
     if not body.user_id or not body.project_id:
         return JSONResponse(status_code=400, content={"error": "missing tenant identity"})
+    tenant_user_id = _graph_tenant(body)
 
     try:
         manager = await _build_cypher_manager(body.user_id, body.project_id)
         # for_graph_view=False: an external agent wants the values it asked
         # about, not whole nodes to render.
         cypher = await _generate_validated_cypher(
-            manager, body.question, body.user_id, body.project_id, False
+            manager, body.question, tenant_user_id, body.project_id, False
         )
     except _CypherSetupError as e:
         return JSONResponse(
@@ -3552,7 +3769,7 @@ async def graph_nl_query(body: GraphNlQueryRequest):
     from graph_db.tenant_filter import scope_query, TenantScopeError
 
     try:
-        final = scope_query(cypher, body.user_id, body.project_id)
+        final = scope_query(cypher, tenant_user_id, body.project_id)
     except TenantScopeError:
         # The generator already proved this scopes, so reaching here means the
         # query changed under us. Refuse rather than run anything unscoped.
@@ -3562,7 +3779,7 @@ async def graph_nl_query(body: GraphNlQueryRequest):
             content={"error": "Could not scope that query to your project.", "stage": "generate"},
         )
 
-    params = {"tenant_user_id": body.user_id, "tenant_project_id": body.project_id}
+    params = {"tenant_user_id": tenant_user_id, "tenant_project_id": body.project_id}
     async with _graph_exec_mcp_semaphore():
         resp = await asyncio.to_thread(_graph_exec_respond, final, params)
 
@@ -3585,7 +3802,7 @@ async def graph_nl_query(body: GraphNlQueryRequest):
 @app.get(
     "/graph/schema-doc",
     tags=["Graph"],
-    dependencies=[Depends(require_internal_auth_only)],
+    dependencies=[Depends(require_configured_master_auth)],
 )
 async def graph_schema_doc():
     """The graph schema INCLUDING its semantics: what each node type means, what
@@ -3822,13 +4039,18 @@ def _graph_exec_node_id(node) -> int | None:
 
 
 def _graph_exec_coerce(v):
-    """Neo4j driver value -> JSON-serialisable primitive (mirrors redagraph)."""
+    """Neo4j driver value -> JSON-serialisable primitive (mirrors redagraph).
+
+    Every map loses its display-only keys (graph_db/display_only.py): a secret
+    or a full link with its secret is for the operator's UI, never a caller of
+    this endpoint (MCP clients, the Kali sandbox's redagraph)."""
+    from graph_db.display_only import DISPLAY_ONLY_PROPS as hidden
     if v is None or isinstance(v, (bool, int, float, str)):
         return v
     if isinstance(v, (list, tuple)):
         return [_graph_exec_coerce(x) for x in v]
     if isinstance(v, dict):
-        return {k: _graph_exec_coerce(x) for k, x in v.items()}
+        return {k: _graph_exec_coerce(x) for k, x in v.items() if k not in hidden}
     labels = getattr(v, "labels", None)
     if labels is not None and hasattr(v, "items"):
         # `nodeId` sits beside `properties`, not in it: many labels carry their
@@ -3836,13 +4058,13 @@ def _graph_exec_coerce(v):
         return {"_kind": "node",
                 "nodeId": _graph_exec_node_id(v),
                 "labels": sorted(labels) if hasattr(labels, "__iter__") else [str(labels)],
-                "properties": {k: _graph_exec_coerce(x) for k, x in v.items()}}
+                "properties": {k: _graph_exec_coerce(x) for k, x in v.items() if k not in hidden}}
     rel_type = getattr(v, "type", None)
     if rel_type is not None and hasattr(v, "items") and hasattr(v, "nodes"):
         return {"_kind": "relationship", "type": str(rel_type),
-                "properties": {k: _graph_exec_coerce(x) for k, x in v.items()}}
+                "properties": {k: _graph_exec_coerce(x) for k, x in v.items() if k not in hidden}}
     if hasattr(v, "items"):
-        return {k: _graph_exec_coerce(x) for k, x in v.items()}
+        return {k: _graph_exec_coerce(x) for k, x in v.items() if k not in hidden}
     return str(v)
 
 
@@ -4149,16 +4371,15 @@ async def graph_triage(body: GraphTriageRequest):
     own Neo4j driver, so the tenant scoping and the muteable-label guard have
     exactly one implementation (`graph_db/mixins/recon/triage_mixin.py`).
 
-    Auth is the MASTER key only, deliberately stricter than `/graph/exec`.
-    `/graph/exec` accepts the scoped SCANNER_API_KEY because the kali-sandbox
-    holds it and needs read-only graph access; this endpoint WRITES suppression
-    state, and the sandbox is the least-trusted, target-facing component. It
-    stays outside the LLM rate-limit bucket either way: these are cheap graph
-    operations, not billed LLM calls.
+    Auth is the MASTER key only, stricter than `/graph/exec`, which a Kali
+    terminal's graph run credential also opens for its read-only queries: this
+    endpoint WRITES suppression state, and the sandbox is the least-trusted,
+    target-facing component. Neither route takes the scanner key. It stays
+    outside the LLM rate-limit bucket: these are cheap graph operations, not
+    billed LLM calls.
     """
-    # `require_master_internal_auth` fails open with no key so a bare dev
-    # install still boots. This route writes suppression and verdict state, so
-    # it refuses for itself instead of accepting unauthenticated callers.
+    # The dependency already refuses a keyless agent; this keeps the
+    # `not_configured` code for a direct call of the handler.
     if master_key_is_weak():
         # `code`: refused before any graph work, so the webapp can report a
         # write as not done rather than as an unknown outcome.
@@ -4468,8 +4689,11 @@ class TriageRunStartRequest(BaseModel):
     (for an MCP start) the cooldown BEFORE calling: `stop_project_run` and this
     start are keyed on the project alone.
     """
-    user_id: str
+    user_id: str                     # the graph tenant: the project's owner
     project_id: str
+    # The person the run is for (`TriageRun.actorUserId`); absent, the tenant, as before
+    # (step 5.3: a collaborator's run reads the owner's graph and records them).
+    actor_user_id: Optional[str] = None
     real_actor_user_id: Optional[str] = None
     trigger: str = "app"             # app | mcp
     token_id: Optional[str] = None   # the MCP token's id, never the token
@@ -4502,12 +4726,14 @@ async def triage_run_start(body: TriageRunStartRequest):
         return JSONResponse(status_code=400, content={"error": "trigger must be app or mcp"})
     if body.token_id is not None and not _RUN_ID_RE.fullmatch(body.token_id):
         return JSONResponse(status_code=400, content={"error": "invalid token id"})
-    if body.real_actor_user_id is not None and not _RUN_ID_RE.fullmatch(body.real_actor_user_id):
-        return JSONResponse(status_code=400, content={"error": "invalid actor id"})
+    for actor in (body.actor_user_id, body.real_actor_user_id):
+        if actor is not None and not _RUN_ID_RE.fullmatch(actor):
+            return JSONResponse(status_code=400, content={"error": "invalid actor id"})
 
     from cypherfix_triage.websocket_handler import start_detached_run
     run, attached, refusal = start_detached_run(
         body.user_id, body.project_id,
+        actor_user_id=body.actor_user_id,
         real_actor_user_id=body.real_actor_user_id,
         trigger=body.trigger, token_id=body.token_id,
         max_review_budget=body.max_review_budget)
@@ -4577,15 +4803,15 @@ class MultiMuteSuggestRequest(BaseModel):
 
 
 @app.post("/graph/multi-mute/suggest", tags=["Graph"],
-          dependencies=[Depends(require_master_internal_auth), Depends(require_internal_auth)])
+          dependencies=[Depends(require_master_auth_route_refuses_weak), Depends(require_internal_auth)])
 async def multi_mute_suggest(body: MultiMuteSuggestRequest):
     """Suggest findings like the seed, grouped, for a person to confirm."""
     from multi_mute import service as multi_mute_service
 
     model = (body.model or "").strip()
-    # Stricter than the master-key dependency, which fails open on a dev install
-    # with no key: this spends a user's LLM keys and reads their whole findings
-    # pool, so it refuses for itself.
+    # A keyless agent reaches this handler (its dependency leaves that case
+    # here): answering with the `multi_mute` marker lets the webapp say "not
+    # configured" instead of "agent outdated".
     if master_key_is_weak():
         return JSONResponse(status_code=503, content={
             "error": "INTERNAL_API_KEY is not configured; Multi mute is disabled. "
@@ -4695,8 +4921,8 @@ class GraphExecRequest(BaseModel):
     source: str = ""
 
 
-@app.post("/graph/exec", tags=["Graph"], dependencies=[Depends(require_internal_auth_only)])
-async def graph_exec(body: GraphExecRequest):
+@app.post("/graph/exec", tags=["Graph"], dependencies=[Depends(_GRAPH_GATE)])
+async def graph_exec(body: GraphExecRequest, run_cred: Optional[dict] = Depends(_GRAPH_GATE)):
     from graph_db.tenant_filter import (
         find_disallowed_write_operation,
         has_labelled_node_pattern,
@@ -4704,18 +4930,15 @@ async def graph_exec(body: GraphExecRequest):
         TenantScopeError,
     )
 
-    if not body.user_id or not body.project_id:
+    # The tenant: a terminal's run credential decides it and the body's ids are
+    # ignored; the master key (the webapp, whose MCP graph client derived the
+    # tenant from the database) keeps the body's.
+    cred = run_credential_claims(run_cred)
+    user_id, project_id = (cred["ten"], cred["pid"]) if cred else (body.user_id, body.project_id)
+    if not user_id or not project_id:
         return JSONResponse(status_code=400, content={"error": "missing tenant identity"})
-
-    # R12 (phased): the caller is now authenticated (require_internal_auth), but
-    # the tenant is still derived from the request BODY. Log the legacy body-
-    # identity use so the migration surface is observable; the enforce-flip
-    # (claim-derived tenant threaded from terminal->redagraph) is a tracked
-    # follow-on. A foothold inside the authenticated worker can still assert a
-    # tenant here — a strictly smaller surface than the prior anonymous LAN read.
-    logger.info(
-        "graph/exec: authenticated caller, body-identity tenant (R12 legacy path) "
-        "user=%s project=%s op=%s", body.user_id, body.project_id, body.op)
+    logger.info("graph/exec: %s tenant user=%s project=%s op=%s",
+                "run-credential" if cred else "master-key", user_id, project_id, body.op)
 
     op = body.op
     if op == "schema":
@@ -4727,12 +4950,12 @@ async def graph_exec(body: GraphExecRequest):
         final, params = "CALL db.schema.visualization()", {}
     elif op == "types":
         final = _GRAPH_TYPES_CYPHER
-        params = {"tenant_user_id": body.user_id, "tenant_project_id": body.project_id}
+        params = {"tenant_user_id": user_id, "tenant_project_id": project_id}
     elif op == "summary":
         # Two fixed queries, so this op answers alone rather than making the
         # caller issue two and stitch them. It returns early, so it takes the
         # MCP concurrency ceiling here rather than at the shared exit below.
-        params = {"tenant_user_id": body.user_id, "tenant_project_id": body.project_id}
+        params = {"tenant_user_id": user_id, "tenant_project_id": project_id}
         if body.source == "mcp":
             async with _graph_exec_mcp_semaphore():
                 return await asyncio.to_thread(_graph_exec_summary, params)
@@ -4752,10 +4975,10 @@ async def graph_exec(body: GraphExecRequest):
         if not has_labelled_node_pattern(cypher):
             return JSONResponse(status_code=400, content={"error": "query has no labelled node pattern; cannot scope to tenant"})
         try:
-            final = scope_query(cypher, body.user_id, body.project_id)
+            final = scope_query(cypher, user_id, project_id)
         except TenantScopeError as e:
             return JSONResponse(status_code=400, content={"error": str(e)})
-        params = {"tenant_user_id": body.user_id, "tenant_project_id": body.project_id}
+        params = {"tenant_user_id": user_id, "tenant_project_id": project_id}
     else:
         return JSONResponse(status_code=400, content={"error": f"unknown op {op!r}"})
 
@@ -4793,6 +5016,10 @@ def _graph_exec_summary(params: dict) -> JSONResponse:
 
 
 def _graph_exec_respond(final: str, params: dict) -> JSONResponse:
+    from graph_db.display_only import display_only_named, refusal_for
+    named = display_only_named(final)
+    if named:
+        return JSONResponse(status_code=400, content={"error": refusal_for(named)})
     try:
         records, truncated = _graph_exec_run(final, params)
         return JSONResponse(content=_graph_exec_payload(records, truncated))
@@ -4906,6 +5133,111 @@ async def _profile_auth_base(project_id: str, txn: dict) -> dict:
         return {}
 
 
+# The IP-mode target check of a replay or browser send (design §10, decision
+# D-21): the shared capture proxy holds no project and no target list, and kali
+# sends straight out when the proxy is down, so this prepare step is the one
+# place that knows both the origin host and the project's targets.
+_IP_MODE_REFUSALS = {
+    "no_current_resolution": "it resolves to no address now",
+    "never_scannable_address": "it is or resolves to a loopback, link-local, unspecified or multicast address",
+    "resolves_outside_targets": "it is or resolves to an address outside the project's target IPs",
+    "roe_excluded": "the rules of engagement exclude it",
+}
+
+import threading  # noqa: E402
+from collections import OrderedDict  # noqa: E402
+
+# Every send of a proxy_brain run asks for the same target list, and a /16
+# takes about a third of a second to build (recon's target_admission.target_set
+# memoises it for the same reason). Built once per distinct list, off the event
+# loop, never changed after it is built; a few lists cover the live projects.
+_IP_MODE_TARGET_SETS: "OrderedDict[tuple, object]" = OrderedDict()
+_IP_MODE_TARGET_SETS_LOCK = threading.Lock()
+_IP_MODE_TARGET_SETS_MAX = 8
+
+# After a failed project read, the check decides from the last settings load
+# for this long instead of reading again: a hung webapp would otherwise cost
+# every send and every browser action the read's 10 s timeout. Longer than
+# that timeout, short enough that a recovered webapp is read again soon.
+_PROJECT_READ_RETRY_S = 15.0
+_PROJECT_READ_RETRY_AT: dict = {}
+
+
+async def _ip_mode_target_set(entries) -> "TargetSet":
+    """The project's target list as a TargetSet, memoised by the list."""
+    from recon_settings.ip_hostnames import TargetSet
+    key = tuple(str(e) for e in entries or ())
+    with _IP_MODE_TARGET_SETS_LOCK:
+        cached = _IP_MODE_TARGET_SETS.get(key)
+        if cached is not None:
+            _IP_MODE_TARGET_SETS.move_to_end(key)
+            return cached
+    built = await asyncio.to_thread(TargetSet.from_entries, list(key))
+    with _IP_MODE_TARGET_SETS_LOCK:
+        _IP_MODE_TARGET_SETS[key] = built
+        while len(_IP_MODE_TARGET_SETS) > _IP_MODE_TARGET_SETS_MAX:
+            _IP_MODE_TARGET_SETS.popitem(last=False)
+    return built
+
+
+async def _resolve_origin_host(host: str) -> list:
+    """The origin host's live A/AAAA answer, canonical and sorted (the scope id
+    of a link-local answer dropped, so the rule refuses it as link-local)."""
+    import socket
+    from recon_settings.ip_hostnames import canonical_ip
+    infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return sorted({canonical_ip(str(info[4][0]).split("%")[0]) for info in infos})
+
+
+async def _ip_mode_send_refusal(project_id: str, host) -> Optional[str]:
+    """Why a send to `host` is refused in an IP-mode project, or None.
+
+    Every address the host resolves to now must be a target IP that the RoE
+    does not exclude (recon_settings.ip_hostnames.address_verdict, the rule the
+    pipeline selects names with); an IP-literal origin must be one itself. Not
+    an IP-mode project: None, the domain-mode path is unchanged.
+    """
+    import ipaddress
+    from auth_profile import is_roe_excluded
+    from project_settings import seen_project_ip_mode
+    from recon_settings.engagement import derive_roe_enabled
+    from recon_settings.ip_hostnames import address_verdict, canonical_ip
+
+    project = None
+    if time.monotonic() >= _PROJECT_READ_RETRY_AT.get(project_id, 0.0):
+        try:
+            project = await _cached_project(project_id)
+            _PROJECT_READ_RETRY_AT.pop(project_id, None)
+        except Exception:  # noqa: BLE001 - decided below, from the last settings load
+            _PROJECT_READ_RETRY_AT[project_id] = time.monotonic() + _PROJECT_READ_RETRY_S
+    if project is None:
+        # A project this process last loaded in IP mode stays on its targets
+        # (refused: the list is unknown); one never loaded here, or loaded in
+        # domain mode, keeps the domain-mode path.
+        return "the project's target IPs could not be read" if seen_project_ip_mode(project_id) else None
+    if not project.get("ipMode"):
+        return None
+    name = str(host or "").strip().strip("[]").lower().rstrip(".")
+    if not name:
+        return "the origin transaction has no host"
+    roe = (project.get("roeExcludedHosts") or []) if derive_roe_enabled(project) else []
+    try:
+        addresses = [canonical_ip(ipaddress.ip_address(name))]
+    except ValueError:
+        if roe and is_roe_excluded(name, roe):
+            return f"{name}: {_IP_MODE_REFUSALS['roe_excluded']}"
+        try:
+            addresses = await _resolve_origin_host(name)
+        except (OSError, UnicodeError):
+            addresses = []
+    reason = address_verdict(addresses, await _ip_mode_target_set(project.get("targetIps") or []))
+    if reason is None and roe and any(is_roe_excluded(a, roe) for a in addresses):
+        reason = "roe_excluded"
+    if reason is None:
+        return None
+    return f"{name} ({', '.join(addresses) or 'no address'}): {_IP_MODE_REFUSALS[reason]}"
+
+
 def _replay_budget() -> int:
     try:
         return max(1, int(os.environ.get("TRAFFIC_REPLAY_BUDGET", "1000") or "1000"))
@@ -4942,8 +5274,9 @@ def _verify_traffic_ctx(ctx: str) -> Optional[dict]:
     """Verify the signed agent tag and return its claims, or None (fail closed).
 
     The tag is HMAC-signed with INTERNAL_API_KEY, which the kali worker does not
-    hold, so it can present the scoped SCANNER_API_KEY for transport auth yet
-    cannot mint a tag for a tenant it was not issued for."""
+    hold, so it cannot mint a tag for a tenant it was not issued for. Transport
+    auth is the run credential the agent minted beside the tag (`_TRAFFIC_GATE`);
+    `_ctx_mismatch` holds the two to the same user and project."""
     try:
         from redamon_ctx import verify_tag
     except Exception:  # noqa: BLE001
@@ -4957,6 +5290,28 @@ def _verify_traffic_ctx(ctx: str) -> Optional[dict]:
     if not payload or not payload.get("user_id") or not payload.get("project_id"):
         return None
     return payload
+
+
+def _ctx_mismatch(claims: dict, run_cred) -> Optional[JSONResponse]:
+    """403 when the run credential names another user, project or run than the ctx tag.
+
+    Both are minted by this agent for the same proxy_brain call, so a mismatch is
+    a credential or a tag copied from another run (they expire, the tag does not).
+    The run counts when the tag names its session (the credential's `run` is then
+    that session id): the tag carries the run's phase, which a credential of another
+    run must not borrow."""
+    cred = run_credential_claims(run_cred)
+    if cred is None:
+        return None
+    same_tenant = (claims.get("user_id"), claims.get("project_id")) == (cred["ten"], cred["pid"])
+    same_run = not claims.get("session_id") or claims["session_id"] == cred["run"]
+    if same_tenant and same_run:
+        return None
+    logger.warning("[rbac] run credential refused reason=ctx_mismatch aud=traffic")
+    return JSONResponse(status_code=403, content={
+        "error": "the run credential and the traffic ctx name different tenants or runs",
+        "code": "run_credential_ctx_mismatch",
+    })
 
 
 def _apply_traffic_tenant(claims: dict) -> None:
@@ -4974,14 +5329,17 @@ def _apply_traffic_tenant(claims: dict) -> None:
         current_phase.set(claims["phase"])
 
 
-@app.post("/traffic/exec", tags=["Traffic"], dependencies=[Depends(require_internal_auth_only)])
-async def traffic_exec(body: TrafficExecRequest):
+@app.post("/traffic/exec", tags=["Traffic"], dependencies=[Depends(_TRAFFIC_GATE)])
+async def traffic_exec(body: TrafficExecRequest, run_cred: Optional[dict] = Depends(_TRAFFIC_GATE)):
     """Read-only corpus access for the kali `redamon` SDK. Constrained ops only;
     tenant from the verified tag; every underlying query hard-injects the tenant
     filter (traffic_tools). Returns the tool's formatted text under `result`."""
     claims = _verify_traffic_ctx(body.ctx)
     if not claims:
         return JSONResponse(status_code=401, content={"error": "invalid or missing traffic ctx"})
+    refused = _ctx_mismatch(claims, run_cred)
+    if refused:
+        return refused
     _apply_traffic_tenant(claims)
 
     import json as _json
@@ -5016,8 +5374,8 @@ async def traffic_exec(body: TrafficExecRequest):
     return JSONResponse(content={"result": out})
 
 
-@app.post("/traffic/replay", tags=["Traffic"], dependencies=[Depends(require_internal_auth_only)])
-async def traffic_replay(body: TrafficReplayRequest):
+@app.post("/traffic/replay", tags=["Traffic"], dependencies=[Depends(_TRAFFIC_GATE)])
+async def traffic_replay(body: TrafficReplayRequest, run_cred: Optional[dict] = Depends(_TRAFFIC_GATE)):
     """ACTIVE replay PREPARE. Validates tenant + phase, reads the origin
     (tenant-scoped), builds the host-pinned curl and signs the replay lineage
     tag. The worker performs the send through the capture proxy. Per-send gating
@@ -5025,6 +5383,9 @@ async def traffic_replay(body: TrafficReplayRequest):
     claims = _verify_traffic_ctx(body.ctx)
     if not claims:
         return JSONResponse(status_code=401, content={"error": "invalid or missing traffic ctx"})
+    refused = _ctx_mismatch(claims, run_cred)
+    if refused:
+        return refused
 
     # Per-send phase gate (the tag carries the session phase). Active sends are
     # confined to the exploitation phases, mirroring TOOL_PHASE_MAP for the old
@@ -5040,6 +5401,10 @@ async def traffic_replay(body: TrafficReplayRequest):
     txn = await fetch_transaction(str(body.id))
     if not txn:
         return JSONResponse(status_code=404, content={"error": "origin transaction not found (or not in your project)"})
+    not_a_target = await _ip_mode_send_refusal(claims["project_id"], txn.get("host"))
+    if not_a_target:
+        return JSONResponse(status_code=403, content={"error": f"replay refused: {not_a_target}",
+                                                      "code": "not_a_target"})
 
     # Sign the replay lineage tag (source=agent, is_replay, origin_id) so the
     # ingest attributes the re-captured row from the VERIFIED tag, not the body.
@@ -5127,8 +5492,8 @@ class TrafficBrowserRequest(BaseModel):
     anonymous: bool = False    # open only: no session in the browser context
 
 
-@app.post("/traffic/browser", tags=["Traffic"], dependencies=[Depends(require_internal_auth_only)])
-async def traffic_browser(body: TrafficBrowserRequest):
+@app.post("/traffic/browser", tags=["Traffic"], dependencies=[Depends(_TRAFFIC_GATE)])
+async def traffic_browser(body: TrafficBrowserRequest, run_cred: Optional[dict] = Depends(_TRAFFIC_GATE)):
     """Browser PREPARE for the kali `redamon.browser` SDK. Mirrors /traffic/replay:
     validates tenant + phase, re-reads the origin transaction tenant-scoped to pin
     the host, and (for `open`) signs the capture-lineage tag the browser stamps on
@@ -5137,6 +5502,9 @@ async def traffic_browser(body: TrafficBrowserRequest):
     claims = _verify_traffic_ctx(body.ctx)
     if not claims:
         return JSONResponse(status_code=401, content={"error": "invalid or missing traffic ctx"})
+    refused = _ctx_mismatch(claims, run_cred)
+    if refused:
+        return refused
 
     # Browsing emits live traffic; confine it to the exploitation phases exactly
     # like /traffic/replay. Fail closed on anything else.
@@ -5175,6 +5543,12 @@ async def traffic_browser(body: TrafficBrowserRequest):
                           f"{origin_scheme}://{origin_host}:{pin_port})")})
     elif body.action not in ("open", "interact", "eval"):
         return JSONResponse(status_code=400, content={"error": f"unknown browser action {body.action!r}"})
+    # Every action can make the page request its origin again, and the origin
+    # host can resolve elsewhere since the last one, so each is checked.
+    not_a_target = await _ip_mode_send_refusal(claims["project_id"], origin_host)
+    if not_a_target:
+        return JSONResponse(status_code=403, content={"error": f"browser refused: {not_a_target}",
+                                                      "code": "not_a_target"})
 
     # Per-session action budget. EVERY action costs one unit, INCLUDING `open`:
     # each open launches a real chromium, so an unbudgeted open would let a loop
@@ -5231,7 +5605,7 @@ async def traffic_browser(body: TrafficBrowserRequest):
 @app.get(
     "/kali/toolbox",
     tags=["Kali"],
-    dependencies=[Depends(require_internal_auth_only)],
+    dependencies=[Depends(require_configured_master_auth)],
 )
 async def kali_toolbox():
     """The Kali sandbox's installed-tooling catalogue, by category.
@@ -5516,6 +5890,30 @@ async def kali_exec_cancel(job_id: str, project_id: str = Query(...)):
 _KALI_TERMINAL_WS_URL = os.environ.get("KALI_TERMINAL_WS_URL", "ws://kali-sandbox:8016")
 
 
+def _terminal_run_credential(claims: dict) -> tuple:
+    """(credential, run id) redagraph presents from this terminal, or ("", None) when
+    none can be minted (a weak master key): the shell still opens, redagraph says why.
+    The run id goes on the proxied socket, which keeps the credential alive."""
+    import uuid
+
+    from machine_credential import TERMINAL_TTL_SECONDS, CredentialRefused, mint_run_credential
+
+    from ws_ticket import ticket_tenant
+
+    run_id = uuid.uuid4().hex
+    try:
+        # The project's owner (`ten`): redagraph reads the project's graph, which carries
+        # the owner's id whoever opened the terminal (RBAC T15). The person who opened it
+        # (`sub`, and `act` for an admin acting as them) is who a `redagraph ask` spends
+        # the owner's key for (C1).
+        return mint_run_credential("graph", ticket_tenant(claims), str(claims["pid"]),
+                                   run_id, TERMINAL_TTL_SECONDS,
+                                   actor=str(claims["sub"]), real_actor=claims.get("act") or None), run_id
+    except (CredentialRefused, ValueError) as e:
+        logger.warning("[rbac] terminal run credential not minted: %s", getattr(e, "code", type(e).__name__))
+        return "", None
+
+
 @app.websocket("/ws/kali-terminal")
 async def kali_terminal_proxy(websocket: WebSocket):
     """
@@ -5524,10 +5922,15 @@ async def kali_terminal_proxy(websocket: WebSocket):
     Bridges the browser ↔ agent ↔ kali-sandbox terminal for interactive shell access.
 
     STRIDE S3: this proxy is the authentication chokepoint. Before accepting the
-    handshake or dialing the upstream PTY it requires a valid ws-ticket (query
-    param ``ticket``) and a same-origin request. An unset AGENT_WS_TICKET_SECRET
+    handshake or dialing the upstream PTY it requires a valid `kali-terminal`
+    ws-ticket (query param ``ticket``; the webapp mints one only for a holder of
+    the terminal) and a same-origin request. An unset AGENT_WS_TICKET_SECRET
     fails CLOSED (mirrors S2). Identity is taken from the verified claims, never
-    from the browser's self-asserted frame, and forwarded to the upstream.
+    from the browser's self-asserted frame, and forwarded to the upstream, which
+    admits only this proxy: it presents the MCP_AUTH_TOKEN bearer (NF-04). The
+    upgrade also carries a graph run credential bound to that user and project,
+    which the shell's redagraph presents to /graph/exec (HD-19); it is honoured
+    only while this socket stays registered.
     """
     from ws_ticket import authorize_ws
 
@@ -5535,29 +5938,46 @@ async def kali_terminal_proxy(websocket: WebSocket):
     origin = websocket.headers.get("origin")
     host = websocket.headers.get("host")
     ticket = websocket.query_params.get("ticket")
-    ok, claims, reason = authorize_ws(origin, host, ticket, _cors_origins)
+    ok, claims, reason = authorize_ws(origin, host, ticket, _cors_origins, aud="kali-terminal")
     if not ok:
         logger.warning("Rejected /ws/kali-terminal: %s (origin=%r host=%r)", reason, origin, host)
         await websocket.close(code=1008)
         return
 
     # Identity from the VERIFIED ticket, forwarded to the upstream PTY as query
-    # params (never from the browser's self-asserted frame).
+    # params (never from the browser's self-asserted frame). The shell's user is the
+    # project's tenant (`ten`): its REDAMON_USER_ID tags the traffic it captures.
     from urllib.parse import urlencode, urlparse
+    from ws_ticket import ticket_tenant
     _tenant = urlencode({
-        "user_id": str(claims["sub"]),
+        "user_id": ticket_tenant(claims),
         "project_id": str(claims["pid"]),
         "session_id": str(claims["sid"]),
     })
     _sep = "&" if urlparse(_KALI_TERMINAL_WS_URL).query else "?"
     upstream_url = f"{_KALI_TERMINAL_WS_URL}{_sep}{_tenant}"
+    # Unset: no header, and the terminal server refuses the upgrade (it fails closed).
+    # The run credential rides only on an authenticated upgrade, in a header: a query
+    # parameter would land in access logs.
+    _mcp_token = os.environ.get("MCP_AUTH_TOKEN", "")
+    upstream_headers = {}
+    _run_id = None
+    if _mcp_token:
+        upstream_headers["Authorization"] = f"Bearer {_mcp_token}"
+        _run_credential, _run_id = _terminal_run_credential(claims)
+        if _run_credential:
+            upstream_headers["X-Redamon-Run"] = _run_credential
 
     await websocket.accept()
+    # Registered before the upstream dial, so the shell never holds a credential
+    # this socket does not yet keep alive; its `finally` removal ends it.
+    PROXIED_SOCKETS.add(websocket, "kali-terminal", claims, run=_run_id)
 
     close_code, close_reason = 1000, ""
     try:
         async with websockets.connect(
             upstream_url,
+            additional_headers=upstream_headers,
             ping_interval=30,
             ping_timeout=60,
             max_size=2**20,
@@ -5567,6 +5987,8 @@ async def kali_terminal_proxy(websocket: WebSocket):
                 try:
                     while True:
                         data = await websocket.receive()
+                        if data.get("type") == "websocket.disconnect":
+                            break
                         if "text" in data:
                             await kali_ws.send(data["text"])
                         elif "bytes" in data:
@@ -5602,6 +6024,7 @@ async def kali_terminal_proxy(websocket: WebSocket):
         close_code = 1011
         close_reason = f"Kali sandbox terminal unavailable ({type(e).__name__})"
     finally:
+        PROXIED_SOCKETS.remove(websocket)
         try:
             await websocket.close(code=close_code, reason=close_reason)
         except Exception:

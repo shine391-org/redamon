@@ -7,8 +7,11 @@ Includes phase-aware tool management.
 
 import os
 import re
+import json
 import asyncio
+import hashlib
 import logging
+from collections import OrderedDict
 from typing import List, Optional, Dict, Callable, Awaitable, TYPE_CHECKING
 from contextvars import ContextVar
 
@@ -33,6 +36,8 @@ import workspace_fs
 import job_runner
 import output_offload
 from neo4j_read_pool import run_neo4j_read
+from kali_auth import kali_auth_headers, note_kali_refusal
+from sandbox_runs import RunTagInterceptor
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -127,6 +132,25 @@ _CAPTURE_ROUTED_TOOLS = frozenset({
 })
 
 _HTTP_STATUS_RE = re.compile(r"HTTP/\d(?:\.\d)?\s+(\d{3})")
+
+# The sandbox's one msfconsole serves one project at a time (GHSA-w454-6hwp-fm58) and
+# admits a call only when it knows the project: these tools carry `_redamon_owner`.
+_MSF_CONSOLE_TOOLS = frozenset({"metasploit_console", "msf_restart"})
+
+
+def _msf_console_owner() -> str:
+    """The run's project and chat, as the Metasploit server reads them; "" without a project."""
+    from agent_context import current_log_session_id
+    project_id = current_project_id.get()
+    if not project_id:
+        return ""
+    return json.dumps({
+        "project_id": project_id,
+        "user_id": current_user_id.get(),
+        # A plan wave resets current_session_id to "" (set_tenant_context without a
+        # session); the per-turn log session id is the same chat.
+        "chat_session_id": current_session_id.get() or current_log_session_id.get(),
+    })
 
 
 def _first_http_status(text: str) -> str:
@@ -383,6 +407,8 @@ class MCPToolsManager:
         self._generation: int = 0
         # Serialises reconnects across concurrent fireteam tool calls.
         self._reconnect_lock: asyncio.Lock = asyncio.Lock()
+        # Names the chat run on each sandbox call so a stop can kill its processes.
+        self._run_tagger = RunTagInterceptor()
 
     def replace_server_configs(self, server_configs: Dict[str, Dict[str, any]]) -> None:
         """Swap the server config dict. Caller is expected to call get_tools()
@@ -417,7 +443,10 @@ class MCPToolsManager:
         for attempt in range(1, max_retries + 1):
             try:
                 self.client = MultiServerMCPClient(mcp_servers)
+                # Read by get_tools() and baked into each tool it builds.
+                self.client.tool_interceptors = [self._run_tagger]
                 mcp_tools = await self.client.get_tools()
+                self._run_tagger.learn(mcp_tools)
 
                 all_tools = []
                 # Cache tools by name for easy access
@@ -452,7 +481,7 @@ class MCPToolsManager:
         """Snapshot of currently cached MCP tools (empty if disconnected)."""
         return list(self._tools_cache.values())
 
-    async def reconnect(self, seen_generation: int, reason: str = "") -> tuple:
+    async def reconnect(self, seen_generation: int, reason: str = "", force: bool = False) -> tuple:
         """
         Rebuild the MCP client after a dead-session failure.
 
@@ -472,9 +501,12 @@ class MCPToolsManager:
         Returns (current_generation, current_tools). On successful rebuild
         current_generation == seen_generation + 1. On failure current_generation
         is unchanged and the tools list is empty.
+
+        `force` rebuilds even when another caller already did: a manifest reload
+        has just replaced the server configs, and that other rebuild used the old ones.
         """
         async with self._reconnect_lock:
-            if self._generation > seen_generation:
+            if not force and self._generation > seen_generation:
                 logger.info(
                     f"MCP reconnect skipped: already rebuilt to gen {self._generation} "
                     f"(caller saw gen {seen_generation})"
@@ -865,6 +897,13 @@ Cypher Query:"""
                         filtered_cypher = manager._scope_query(cypher, user_id, project_id)
                         logger.info(f"[{user_id}/{project_id}] Filtered Cypher: {filtered_cypher}")
 
+                        # Secrets and full links are kept for the operator's UI:
+                        # never read back into the agent (graph_db/display_only.py).
+                        from graph_db.display_only import display_only_named, refusal_for
+                        _named = display_only_named(filtered_cypher)
+                        if _named:
+                            return f"Error: {refusal_for(_named)}"
+
                         # Step 3: Execute the filtered query
                         # Off the event loop (a slow query must not freeze every
                         # other session served by this process) and off the
@@ -887,8 +926,10 @@ Cypher Query:"""
                             return "No results found"
 
                         # The FILTERED cypher: what actually ran, so an aliased
-                        # incident column cannot hide from the wrapper.
-                        return _wrap_graph_result(result, filtered_cypher)
+                        # incident column cannot hide from the wrapper. A whole
+                        # node returned (`RETURN s`) loses its display-only keys.
+                        from graph_db.display_only import strip_display_only
+                        return _wrap_graph_result(strip_display_only(result), filtered_cypher)
 
                     except CypherGenerationTimeout as e:
                         # Terminal: the remaining attempts would each burn the
@@ -1084,33 +1125,74 @@ Cypher Query:"""
 
 
 # =============================================================================
+# PER-RUN SEARCH KEYS (RBAC T17)
+# =============================================================================
+# The agent's search managers are shared by every run, so a key written onto one
+# was spent by the next run of any owner (F-16). No manager holds a key: each call
+# reads the key pool of the run it serves, and outside a run there is none.
+
+_SEARCH_KEY_FIELDS = {"tavily": "tavilyApiKey", "shodan": "shodanApiKey", "serp": "serpApiKey"}
+_RUN_ROTATORS: "OrderedDict[tuple, object]" = OrderedDict()
+_RUN_ROTATORS_MAX = 256
+
+
+def run_user_settings() -> dict:
+    """This run's USER_SETTINGS, from the settings bound to the run's task only.
+
+    get_settings() falls back to the module-global snapshot of whichever project
+    loaded last, i.e. another owner's keys, so a read outside a run finds none.
+    """
+    import project_settings
+    task_settings = project_settings._settings_ctx.get()
+    return (task_settings or {}).get('USER_SETTINGS') or {}
+
+
+def run_key_rotator(tool_name: str):
+    """The key pool this run spends on `tool_name` (its key plus the rotation extras),
+    or None when the run's owner set no key. Keyed by the pool itself, so a rotation
+    counter is shared only by runs that hold the very same keys."""
+    settings = run_user_settings()
+    main = settings.get(_SEARCH_KEY_FIELDS[tool_name]) or ''
+    if not main:
+        return None
+    from orchestrator_helpers.key_rotation import KeyRotator
+    cfg = (settings.get('rotationConfigs') or {}).get(tool_name) or {}
+    pool = [k for k in [main, *(cfg.get('extraKeys') or [])] if k]
+    every = cfg.get('rotateEveryN', 10)
+    ident = (tool_name, hashlib.sha256("\0".join(pool).encode("utf-8")).hexdigest(), every)
+    rotator = _RUN_ROTATORS.get(ident)
+    if rotator is None:
+        rotator = _RUN_ROTATORS[ident] = KeyRotator(pool, every)
+        while len(_RUN_ROTATORS) > _RUN_ROTATORS_MAX:
+            _RUN_ROTATORS.popitem(last=False)
+    else:
+        _RUN_ROTATORS.move_to_end(ident)
+    return rotator
+
+
+def _call_key(tool_name: str):
+    """(key, rotator) for one call: the run's own pool, or ('', None)."""
+    rotator = run_key_rotator(tool_name)
+    return (rotator.current_key, rotator) if rotator else ('', None)
+
+
+# =============================================================================
 # WEB SEARCH TOOL MANAGER
 # =============================================================================
 
 class WebSearchToolManager:
     """Manages the web_search tool — checks local KB first, falls back to Tavily."""
 
-    def __init__(self, api_key: str = None, max_results: int = 5, knowledge_base=None):
-        self.api_key = api_key or ''
+    def __init__(self, max_results: int = 5, knowledge_base=None):
         self.max_results = max_results
-        self.key_rotator = None  # Optional[KeyRotator]
         self.knowledge_base = knowledge_base  # Optional[PentestKnowledgeBase]
         self.kb_enabled_sources = None  # None = all sources, list = filter
 
     def get_tool(self) -> Optional[callable]:
         """
-        Set up and return the web_search tool.
-
-        Returns:
-            The web_search tool function, or None if neither Tavily nor KB is configured.
+        Set up and return the web_search tool: always, since Tavily's key is the
+        run's own (read per call) and a run without one still has the KB.
         """
-        if not self.api_key and not self.knowledge_base:
-            logger.warning(
-                "Neither Tavily API key nor knowledge base configured — "
-                "web_search tool will not be available."
-            )
-            return None
-
         manager = self
 
         @tool
@@ -1264,7 +1346,7 @@ class WebSearchToolManager:
 
             # 2. Tavily fallback
             tavily_results_str = None
-            if manager.api_key:
+            if _call_key('tavily')[0]:
                 try:
                     tavily_results_str = await _tavily_search(manager, query)
                 except Exception as e:
@@ -1284,12 +1366,9 @@ class WebSearchToolManager:
 
             return "No results found (KB returned no matches and Tavily is not configured)"
 
-        source_info = []
-        if manager.knowledge_base:
-            source_info.append("KB")
-        if manager.api_key:
-            source_info.append("Tavily")
-        logger.info(f"web_search tool configured: {' + '.join(source_info) or 'none'}")
+        source_info = ["KB"] if manager.knowledge_base else []
+        source_info.append("Tavily (each run's key)")
+        logger.info(f"web_search tool configured: {' + '.join(source_info)}")
         return web_search
 
 
@@ -1587,11 +1666,7 @@ async def _tavily_search(manager, query: str) -> str:
     """Run a Tavily search and format the response. Raises on failure."""
     from langchain_tavily import TavilySearch
 
-    api_key = (
-        manager.key_rotator.current_key
-        if manager.key_rotator and manager.key_rotator.has_keys
-        else manager.api_key
-    )
+    api_key, rotator = _call_key('tavily')
     tavily_tool = TavilySearch(
         max_results=manager.max_results,
         topic="general",
@@ -1600,8 +1675,8 @@ async def _tavily_search(manager, query: str) -> str:
     )
 
     results = await tavily_tool.ainvoke({"query": query})
-    if manager.key_rotator:
-        manager.key_rotator.tick()
+    if rotator:
+        rotator.tick()
 
     if isinstance(results, str):
         return _frame_web_results(_sanitize_kb_content(results))
@@ -1630,25 +1705,11 @@ SERPAPI_BASE = "https://serpapi.com/search"
 class GoogleDorkToolManager:
     """Manages Google dork search tool via SerpAPI for OSINT reconnaissance."""
 
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or ''
-        self.key_rotator = None  # Optional[KeyRotator]
-
     def get_tool(self) -> Optional[callable]:
         """
-        Set up and return the Google dork search tool.
-
-        Returns:
-            The google_dork tool function, or None if SerpAPI key is not configured.
+        Set up and return the Google dork search tool: always, since the SerpAPI key
+        is the run's own (read per call); a run without one gets "not configured".
         """
-        if not self.api_key:
-            logger.warning(
-                "SerpAPI key not configured - google_dork tool will not be available. "
-                "Set it in Global Settings (http://localhost:3000/settings)."
-            )
-            return None
-
-        manager = self
 
         @tool
         async def google_dork(query: str) -> str:
@@ -1669,8 +1730,10 @@ class GoogleDorkToolManager:
             Returns:
                 Search results with titles, URLs, and snippets
             """
+            api_key, rotator = _call_key('serp')
+            if not api_key:
+                return "Google dork is not configured: add a SerpAPI key in Global Settings -> API Keys."
             try:
-                api_key = manager.key_rotator.current_key if manager.key_rotator and manager.key_rotator.has_keys else manager.api_key
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     resp = await client.get(
                         SERPAPI_BASE,
@@ -1685,8 +1748,8 @@ class GoogleDorkToolManager:
                     )
                     resp.raise_for_status()
                     data = resp.json()
-                    if manager.key_rotator:
-                        manager.key_rotator.tick()
+                    if rotator:
+                        rotator.tick()
 
                 # Check for API-level errors
                 if "error" in data:
@@ -1745,25 +1808,12 @@ SHODAN_API_BASE = "https://api.shodan.io"
 class ShodanToolManager:
     """Manages unified Shodan OSINT tool for internet-wide reconnaissance."""
 
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or ''
-        self.key_rotator = None  # Optional[KeyRotator]
-
     def get_tool(self) -> Optional[callable]:
         """
-        Set up and return unified Shodan tool with 5 actions.
-
-        Returns:
-            The shodan tool, or None if Shodan API key is not configured.
+        Set up and return unified Shodan tool with 5 actions: always, since the
+        Shodan key is the run's own (read per call); a run without one gets
+        "not configured".
         """
-        if not self.api_key:
-            logger.warning(
-                "Shodan API key not configured - shodan tool will not be available. "
-                "Set it in Global Settings (http://localhost:3000/settings)."
-            )
-            return None
-
-        manager = self
 
         @tool
         async def shodan(action: str, query: str = "", ip: str = "", domain: str = "") -> str:
@@ -1786,7 +1836,9 @@ class ShodanToolManager:
             Returns:
                 Formatted results from the Shodan API
             """
-            api_key = manager.key_rotator.current_key if manager.key_rotator and manager.key_rotator.has_keys else manager.api_key
+            api_key, rotator = _call_key('shodan')
+            if not api_key:
+                return "Shodan is not configured: add a Shodan API key in Global Settings -> API Keys."
             if action == "search":
                 result = await _action_search(api_key, query)
             elif action == "host":
@@ -1802,8 +1854,8 @@ class ShodanToolManager:
                     f"Error: Unknown action '{action}'. "
                     "Valid actions: search, host, dns_reverse, dns_domain, count"
                 )
-            if manager.key_rotator:
-                manager.key_rotator.tick()
+            if rotator:
+                rotator.tick()
             return result
 
         logger.info("Shodan OSINT tool configured (5 actions)")
@@ -2377,24 +2429,12 @@ class PhaseAwareToolExecutor:
                     f"Manifest declared tools that the live MCP servers did not expose: {missing}"
                 )
 
-    def update_web_search_tool(self, tool: callable) -> None:
-        """Replace the web search tool (e.g. when Tavily key changes)."""
-        self.web_search_tool = tool
-        self._all_tools["web_search"] = tool
-
     def update_shodan_tool(self, tool: Optional[callable]) -> None:
         """Replace or remove the Shodan tool (e.g. when API key changes)."""
         if tool:
             self._all_tools["shodan"] = tool
         else:
             self._all_tools.pop("shodan", None)
-
-    def update_google_dork_tool(self, tool: Optional[callable]) -> None:
-        """Replace or remove the Google dork tool (e.g. when SerpAPI key changes)."""
-        if tool:
-            self._all_tools["google_dork"] = tool
-        else:
-            self._all_tools.pop("google_dork", None)
 
     def update_tradecraft_tool(self, tool: Optional[callable]) -> None:
         """Replace or remove the Tradecraft Lookup tool.
@@ -2453,6 +2493,22 @@ class PhaseAwareToolExecutor:
             if not payload["project_id"] or not payload["user_id"]:
                 return ""
             return sign_tag(payload, key)
+        except Exception:
+            return ""
+
+    def _build_run_credential(self, aud: str) -> str:
+        """Mint the run credential proxy_brain's SDK presents to the agent's traffic
+        routes in place of the scanner key (RBAC T15): 15 minutes, bound to the same
+        user and project as the ctx tag. Returns "" when it cannot be minted."""
+        try:
+            import uuid
+
+            from agent_context import current_log_session_id
+            from machine_credential import TRAFFIC_TTL_SECONDS, mint_run_credential
+            # A node-level set_tenant_context can blank the session id mid-run.
+            run_id = current_session_id.get() or current_log_session_id.get() or uuid.uuid4().hex
+            return mint_run_credential(aud, current_user_id.get(), current_project_id.get(), run_id,
+                                       TRAFFIC_TTL_SECONDS)
         except Exception:
             return ""
 
@@ -2695,8 +2751,10 @@ class PhaseAwareToolExecutor:
         # proxy_brain: the signed tenant/session tag is how its kali `redamon` SDK
         # reaches the corpus (/traffic/exec) and the replay path (/traffic/replay),
         # so it is injected UNCONDITIONALLY — independent of the capture-proxy
-        # toggle — and the LLM never sees it. Fail closed if we can't mint it: a
-        # tag-less run would be a request the agent cannot tenant-scope.
+        # toggle — and the LLM never sees it, nor the run credential the SDK
+        # presents for transport auth. Both overwrite whatever the model put in
+        # the args. Fail closed if either cannot be minted: a run without them is
+        # a request the agent cannot tenant-scope or authenticate.
         if tool_name == "proxy_brain":
             _pb_ctx = self._build_redamon_ctx("proxy_brain")
             if not _pb_ctx:
@@ -2704,7 +2762,25 @@ class PhaseAwareToolExecutor:
                     "success": False, "output": None,
                     "error": "proxy_brain: no tenant/session context — cannot mint the traffic tag.",
                 }
-            tool_args = {**tool_args, "_redamon_ctx": _pb_ctx}
+            _pb_run = self._build_run_credential("traffic")
+            if not _pb_run:
+                return {
+                    "success": False, "output": None,
+                    "error": "proxy_brain: cannot mint the run credential (is INTERNAL_API_KEY configured?).",
+                }
+            tool_args = {**tool_args, "_redamon_ctx": _pb_ctx, "_redamon_run": _pb_run}
+
+        # Which project a Metasploit call is for is the server's whole admission rule,
+        # so it is stamped here over whatever the model put in the args, and a call
+        # without a project never leaves the agent.
+        if tool_name in _MSF_CONSOLE_TOOLS:
+            _msf_owner = _msf_console_owner()
+            if not _msf_owner:
+                return {
+                    "success": False, "output": None,
+                    "error": f"{tool_name}: no project in this run's context, so the Metasploit console cannot admit it.",
+                }
+            tool_args = {**tool_args, "_redamon_owner": _msf_owner}
 
         # Dispatch logic pulled into a closure so we can re-invoke with a
         # fresh tool reference after an MCP reconnect.
@@ -2734,17 +2810,20 @@ class PhaseAwareToolExecutor:
                 # Inject WPScan API token if configured and not already in args.
                 # Read from the task-isolated settings at use-time (not a shared
                 # instance field) so concurrent sessions never cross-contaminate.
+                # It travels beside the args: the sandbox hands it to wpscan as
+                # WPSCAN_API_TOKEN, off the command line every process there can read.
                 args = tool_args.get("args", "")
                 wpscan_token = (get_setting('USER_SETTINGS', {}).get('wpscanApiToken', '')
                                 or getattr(self, '_wpscan_api_token', ''))
                 if wpscan_token and '--api-token' not in args:
-                    adjusted = {**tool_args, "args": f"--api-token {wpscan_token} {args}"}
+                    adjusted = {**tool_args, "api_token": wpscan_token}
                 else:
                     adjusted = tool_args
                 output = await active_tool.ainvoke(adjusted)
             elif tool_name == "execute_gau":
-                # Inject URLScan API key if configured (written to ~/.gau.toml by MCP
-                # server). Read at use-time from task-isolated settings (no shared field).
+                # Inject URLScan API key if configured (the MCP server writes it to a
+                # private per-call gau config). Read at use-time from task-isolated
+                # settings (no shared field).
                 urlscan_key = (get_setting('USER_SETTINGS', {}).get('urlscanApiKey', '')
                                or getattr(self, '_gau_urlscan_api_key', ''))
                 if urlscan_key:
@@ -2901,6 +2980,7 @@ class PhaseAwareToolExecutor:
             'MCP_METASPLOIT_PROGRESS_URL',
             'http://host.docker.internal:8013/progress'
         )
+        refusal_logged = False
 
         async with httpx.AsyncClient(timeout=2.0) as client:
             while not execution_task.done():
@@ -2910,7 +2990,9 @@ class PhaseAwareToolExecutor:
                     break
 
                 try:
-                    resp = await client.get(url)
+                    resp = await client.get(url, headers=kali_auth_headers())
+                    if resp.status_code == 401 and not refusal_logged:
+                        refusal_logged = note_kali_refusal(resp.status_code, url)
                     if resp.status_code == 200:
                         progress = resp.json()
 

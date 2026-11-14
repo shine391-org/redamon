@@ -21,6 +21,7 @@ import ipaddress
 import json
 import os
 import shutil
+import ipaddress
 import subprocess
 import threading
 import time
@@ -116,6 +117,7 @@ from recon.helpers.selection_coverage import (
     record_outcome,
     record_execution,
 )
+from recon.helpers.target_admission import admission_context, admit_urls
 
 # Every top-level key run_vuln_scan writes; the security checks nest inside
 # vuln_scan. technology_cves exists only when the CVE lookup ran.
@@ -667,12 +669,9 @@ def _execute_routed_passes(
 
 def _nuclei_kill_container(container_name: str) -> None:
     """`docker kill` a named nuclei container. The daemon owns it, so killing the
-    docker CLI (process.terminate) would leave it running; mirror _run_baddns."""
-    try:
-        subprocess.run(["docker", "kill", container_name],
-                       capture_output=True, text=True, timeout=15, check=False)
-    except Exception as e:  # noqa: BLE001
-        print(f"[!][Nuclei] failed to kill {container_name}: {type(e).__name__}")
+    docker CLI (process.terminate) would leave it running. Never raises."""
+    from recon.helpers.docker_helpers import kill_container
+    kill_container(container_name)
 
 
 def _execute_nuclei_pass(cmd: list, output_file: str, label: str,
@@ -1061,6 +1060,9 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
     # Cleared by the two checks below that leave the Nuclei passes nothing to
     # run; the CVE lookup and the security checks after them still run.
+    early_selection_plan = None
+    early_coverage_passes = []
+    target_urls_after_admission = None
     run_nuclei = NUCLEI_ENABLED and not nuclei_unavailable
     if run_nuclei:
         print(f"[*][Nuclei] Execution Mode: DOCKER ({NUCLEI_DOCKER_IMAGE})")
@@ -1071,7 +1073,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         print(f"[*][Nuclei] Templates Available: ~{template_count}")
 
         # Extract targets
-        ips, hostnames, ip_to_hostnames = extract_targets_from_recon(recon_data)
+        ips, hostnames, ip_to_hostnames = extract_targets_from_recon(recon_data, settings)
 
         if not hostnames and not ips:
             # Not degraded: this run resolved no host at all, which every other
@@ -1091,6 +1093,27 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         target_urls = build_target_urls(
             hostnames, ips, recon_data, scan_all_ips=NUCLEI_SCAN_ALL_IPS,
             admission_report=_target_admission, declared_report=_declared_report)
+        # The crawler's and httpx's URLs (build_target_urls sources 1-2) name
+        # whatever host those tools reached, a redirect or a link included, not
+        # only the gated DNS targets; Nuclei resolves each host itself.
+        target_urls, _ = admit_urls(settings, recon_data, target_urls, module="nuclei")
+        target_urls_after_admission = list(target_urls)
+        if not target_urls:
+            print("[-][Nuclei] No target URL is left after the Rules of Engagement and the "
+                  "target list - skipping Nuclei")
+            run_nuclei = False
+
+    if run_nuclei:
+        # IP mode keeps Nuclei's redirects on the host it was given (B-07).
+        nuclei_ip_mode = bool((recon_data.get("metadata") or {}).get("ip_mode") or settings.get("IP_MODE"))
+        # The target list is admitted, but a target's redirect is not: under
+        # RoE exclusions an admitted host's 302 into an excluded one would be
+        # followed by every template (R-2).
+        nuclei_roe_exclusions = bool(admission_context(settings, recon_data).excluded)
+        if nuclei_roe_exclusions and NUCLEI_FOLLOW_REDIRECTS:
+            print("[*][Nuclei] Redirects followed on the same host only: RoE exclusions are in force")
+        elif nuclei_roe_exclusions:
+            print("[*][Nuclei] Template redirects held (-disable-redirects): RoE exclusions are in force")
 
         # Initialize the per-scan AI context for the false-positive response
         # filter. Consumed by is_false_positive() in _execute_nuclei_pass().
@@ -1174,6 +1197,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 valid_urls = admit_http_urls(discovered_urls, "resource_enum_dast", admission)
                 from urllib.parse import urlparse
                 dast_urls = [url for url in valid_urls if '=' in urlparse(url).query]
+                dast_urls, _ = admit_urls(settings, recon_data, dast_urls, module="nuclei")
                 if dast_urls:
                     print(f"[*][Nuclei] Using {len(dast_urls)} URLs with parameters from resource_enum")
                 else:
@@ -1526,6 +1550,22 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     resource_enum_data=recon_data.get("resource_enum"),
                     http_probe_data=recon_data.get("http_probe"),
                     admitted_targets=target_urls,
+                    rate_limit=NUCLEI_RATE_LIMIT,
+                    bulk_size=NUCLEI_BULK_SIZE,
+                    concurrency=NUCLEI_CONCURRENCY,
+                    timeout=NUCLEI_TIMEOUT,
+                    retries=NUCLEI_RETRIES,
+                    dast_mode=False,
+                    new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
+                    headless=NUCLEI_HEADLESS,
+                    system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
+                    follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
+                    max_redirects=NUCLEI_MAX_REDIRECTS,
+                    interactsh=NUCLEI_INTERACTSH,
+                    auth_headers=_nuclei_auth,
+                    max_host_error=NUCLEI_MAX_HOST_ERROR,
+                    ip_mode=nuclei_ip_mode,
+                    roe_exclusions=nuclei_roe_exclusions,
                 )
                 
                 # Log routing summary
@@ -1634,6 +1674,8 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                         auth_headers=_nuclei_auth,
                         container_name=dast_container_name,
                         max_host_error=NUCLEI_MAX_HOST_ERROR,
+                        ip_mode=nuclei_ip_mode,
+                        roe_exclusions=nuclei_roe_exclusions,
                     )
                     b_findings, b_fps, b_duration, b_rc = _execute_nuclei_pass(
                         dast_cmd, dast_output_file, label="DAST",
@@ -1960,11 +2002,11 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 try:
                     Path(path_str).unlink(missing_ok=True)
                 except PermissionError:
-                    subprocess.run(
+                    from recon.helpers.docker_helpers import run_tool_container
+                    run_tool_container(
                         ["docker", "run", "--rm", "-v", f"{nuclei_temp_dir}:/cleanup",
                          "alpine", "rm", "-f", f"/cleanup/{Path(path_str).name}"],
-                        capture_output=True,
-                    )
+                        tool="nuclei-cleanup", timeout=60)
 
             # The directory is this run's alone, so whatever is left in it can go.
             shutil.rmtree(nuclei_temp_dir, ignore_errors=True)
@@ -1972,14 +2014,36 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
     if NUCLEI_ENABLED and not run_nuclei:
         # Early exits still need a durable outcome, not an absent/planned success.
         early_targets = locals().get("target_urls", _live_web_urls(recon_data))
+        empty_selection = (
+            target_urls_after_admission is not None and not target_urls_after_admission
+        )
+        if empty_selection:
+            # An enabled detector whose admission produced no executable input
+            # re-checked nothing: retain earlier findings and make the prune fail
+            # closed instead of treating this as a clean, complete pass.
+            _keep_nuclei_findings("no selected Nuclei targets")
+            early_coverage_reason = "no selected Nuclei targets"
+            early_coverage_passes = [(early_targets, "failed",
+                                      early_coverage_reason, False)]
+            _record_unrun_nuclei(recon_data, _nuclei_coverage(
+                coverage_at,
+                early_coverage_passes))
         early_reason = nuclei_unavailable or (
             "no Nuclei templates selected" if locals().get("skip_detection_pass") else "no targets")
+        if empty_selection:
+            early_reason = "no selected Nuclei targets"
         early_plan = _selection_plan(
             targets=early_targets, saved_tags=saved_nuclei_tags, effective_tags=NUCLEI_TAGS,
             partial_scope=bool(selection_hint and selection_hint.get("scope") == "partial"))
-        early_passes = [(early_targets, "failed", early_reason, False)] if early_reason != "no targets" else []
+        early_passes = early_coverage_passes or ([(early_targets, "failed", early_reason, False)]
+                                                 if early_reason != "no targets" else [])
         early_plan = record_execution(early_plan, early_passes)
+        if empty_selection:
+            for executed in early_plan.get("execution", {}).get("passes") or []:
+                if executed.get("reason") == "no selected targets":
+                    executed["reason"] = "no selected Nuclei targets"
         early_plan["reason"] = early_reason
+        early_selection_plan = early_plan
         # The plan persists to the canonical artifact under the same lock the
         # main path uses. The in-memory top-level result stays the scanner
         # result contract; a failed launch is reported through the coverage
@@ -2091,14 +2155,19 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     json.dump(recon_data, f, indent=2)
                 fix_file_ownership(output_file)
 
+    if early_selection_plan is not None:
+        recon_data[SELECTION_KEY] = early_selection_plan
+
+    if NUCLEI_ENABLED and not run_nuclei and not SECURITY_CHECK_ENABLED:
+        recon_data["vuln_scan"] = {"scan_metadata": {"coverage": {"at": coverage_at, "hosts": {}}}}
+        recon_data["vuln_scan"]["scan_metadata"]["total_urls_scanned"] = 0
+        recon_data["vuln_scan"]["scan_metadata"]["total_urls_selected"] = 0
+
     return recon_data
 
 
 def enrich_recon_file(recon_file: Path) -> dict:
-    """
-    Load a recon JSON file, enrich it with nuclei data, and save it back.
-
-    Args:
+    """Load a recon JSON file, enrich it with nuclei data, and save it back.
         recon_file: Path to the recon JSON file
 
     Returns:

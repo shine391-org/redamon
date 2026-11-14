@@ -1,13 +1,302 @@
 import { NextRequest, NextResponse } from 'next/server'
+import type { Prisma } from '@prisma/client'
 import { projectTargetLabel } from '@/lib/projectSummary'
 import prisma from '@/lib/prisma'
-import { getSession, isInternalRequest } from '@/lib/session'
+import { actsAsAccount, getSession, isInternalRequest } from '@/lib/session'
 import { internalError } from '@/lib/routeErrors'
-import { purgeProjectWorkspace } from '@/lib/workspacePurge'
+import { readJsonBody } from '@/lib/jsonBody'
+import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
+import { teardownProject } from '@/lib/projectTeardown'
 import { isLoopModel } from '@/lib/agentInTheLoop'
+import { normalizeEmail, emailTakenByAnother } from '@/lib/authz/accountEmail'
+import { requireStepUp } from '@/lib/authz/stepUp'
+import { LAST_ADMIN_REFUSAL, withLastAdminGuard } from '@/lib/authz/adminSet'
+import { userAuditEntry, writeUserAudit, type UserAuditFields } from '@/lib/userAudit'
+import { writeAuditTx } from '@/lib/audit'
+import { auditedTransaction } from '@/lib/auditForward'
+import { invalidatePrincipal } from '@/lib/authz/principal'
+import { rootProtectedAnswer, rootProtectedRefusal } from '@/lib/authz/rootProtection'
+import { rbacFlags } from '@/lib/authz/flags'
+import { lockedInstanceRoot } from '@/lib/authz/root'
+import { manageRefusal, requireRootPower, rootOnlyRefusal, rootStanding } from '@/lib/authz/rootPowers'
+import { canAssignProfile, canManage } from '@/lib/authz/hierarchy'
+import { managedOf, managerOf, profileContents } from '@/lib/authz/permissionAdmin'
+import { emailChangedNotice, withNotice } from '@/lib/authz/accountNotices'
+import { now } from '@/lib/authz/clock'
+import type { RootGuardRefusal } from '@/lib/authz/adminSet'
+import { requireSessionPermission, sessionHolds } from '@/lib/authz/adminPermission'
+import { forbiddenResponse } from '@/lib/authz/guards'
+import { refuseWhileActingAs } from '@/lib/authz/actAsRefusals'
+import { endOpenImpersonationsQuietly } from '@/lib/authz/actAs'
+import { reassignConversationsOfDeletedAuthor } from '@/lib/authz/conversationAccess'
+import { onAccessReduced } from '@/lib/authz/revocation'
+import { deletionWizardOff, endDeletedAccountWork, resolveSharedProjects, unresolvedResponse } from '@/lib/authz/userDeletion'
+import type { Session } from '@/lib/session'
 
 interface RouteParams {
   params: Promise<{ id: string }>
+}
+
+const EMAIL_TAKEN = { error: 'A user with this email already exists', code: 'email_taken' } as const
+const ACCOUNT_CHANGED = {
+  error: 'The account changed while this request ran. Reload it and try again.',
+  code: 'account_changed',
+} as const
+
+/** Thrown inside the write's transaction when the address moved since it was read: all rolls back. */
+class AccountChanged extends Error {
+  constructor() {
+    super('account changed')
+    this.name = 'AccountChanged'
+  }
+}
+
+const USER_SELECT = {
+  id: true,
+  name: true,
+  email: true,
+  role: true,
+  defaultAgentModel: true,
+  defaultAiPipelineModel: true,
+  createdAt: true,
+  updatedAt: true,
+} as const
+
+type AuditedFields = { name?: string | null; email?: string | null; role?: string | null }
+
+/**
+ * `user.update` (name, email) and `user.role_changed`, each only for the fields this
+ * request wrote that really changed. The remembered model defaults are preferences
+ * the project form saves often, not account administration: no row. A role change that
+ * raised the session version (identity switch on) records the new version. With
+ * `emailRow` (identity switch on, step 2.11) a changed email has its own
+ * `user.email_changed` row instead of a field of `user.update`.
+ */
+function userEditRows(
+  id: string,
+  written: Record<string, string>,
+  before: AuditedFields | null,
+  after: AuditedFields & { sessionVersion?: number },
+  { emailRow = false }: { emailRow?: boolean } = {},
+): UserAuditFields[] {
+  const changed = (k: keyof AuditedFields) => k in written && (before?.[k] ?? null) !== (after[k] ?? null)
+  const fields = (emailRow ? ['name'] as const : ['name', 'email'] as const).filter(changed)
+  const rows: UserAuditFields[] = []
+  if (fields.length > 0) {
+    rows.push({
+      action: 'user.update',
+      targetId: id,
+      before: Object.fromEntries(fields.map(k => [k, before?.[k] ?? null])),
+      after: Object.fromEntries(fields.map(k => [k, after[k] ?? null])),
+    })
+  }
+  if (emailRow && changed('email')) {
+    rows.push({ action: 'user.email_changed', targetId: id, before: { email: before?.email ?? null }, after: { email: after.email ?? null } })
+  }
+  if (changed('role')) {
+    rows.push({
+      action: 'user.role_changed',
+      targetId: id,
+      before: { role: before?.role ?? null },
+      after: { role: after.role ?? null, ...(after.sessionVersion !== undefined ? { sessionVersion: after.sessionVersion } : {}) },
+    })
+  }
+  return rows
+}
+
+/**
+ * The stored values `userEditRows` compares a write against, read whenever the write names one:
+ * without the stored role, a role sent as the account already holds it would be recorded as a
+ * change from null.
+ */
+async function auditedBefore(id: string, data: Record<string, string>): Promise<AuditedFields | null> {
+  if (!('name' in data || 'email' in data || 'role' in data)) return null
+  return prisma.user.findUnique({ where: { id }, select: { name: true, email: true, role: true } })
+}
+
+async function auditUserEdit(
+  request: NextRequest,
+  session: Session,
+  id: string,
+  written: Record<string, string>,
+  before: AuditedFields | null,
+  after: AuditedFields,
+): Promise<void> {
+  for (const row of userEditRows(id, written, before, after)) await writeUserAudit(request, session, row)
+}
+
+/**
+ * Identity switch on: the guard's transaction also takes the Root lock and reads the Root
+ * again, so a Root chosen or moved since this request's check is never demoted or deleted;
+ * `needsRoot` when the action is Root's power (step 2.6), which is checked again there too.
+ */
+function rootRecheck(session: { userId: string }, needsRoot = false) {
+  return rbacFlags().identity ? { root: { actorId: session.userId, needsRoot } } : {}
+}
+
+const ROOT_ONLY_EDIT = 'Only Root can make an admin, or change, demote or delete another admin account.'
+const ROOT_ONLY_DELETE = 'Only Root can delete an admin account.'
+
+/** The answer to a write the Root re-check refused inside its transaction. */
+async function rootGuardAnswer(
+  request: NextRequest, session: Session, id: string, refused: RootGuardRefusal, attempted: 'role_change' | 'edit' | 'delete',
+): Promise<NextResponse> {
+  if (refused === 'root_only') return rootOnlyRefusal('none', ROOT_ONLY_EDIT)
+  return rootProtectedAnswer(request, session, id, attempted)
+}
+
+/** What the browser gets: never the session version. */
+function publicUser<T extends { sessionVersion?: number }>(user: T): Omit<T, 'sessionVersion'> {
+  const { sessionVersion: _sessionVersion, ...rest } = user
+  return rest
+}
+
+/**
+ * PUT with the identity switch on (step 2.6, ID-03, PE-08, T5). Promoting a member, and any
+ * change to another admin's account, is the confirmed Root's power with its password; an admin
+ * acts on members and on its own account (its own demotion included, under the last-admin
+ * rule). A role change raises the account's session version in the same transaction as the role
+ * and its audit rows (written fail closed), so the role a cookie was signed for never outlives
+ * it; the transaction holds the Root lock and checks Root again.
+ *
+ * The sign-in email (step 2.11, ID-30, ID-25): changing one's own takes the current password,
+ * an admin changing a member's takes the admin's own (another admin's is Root's, above). Only
+ * then is the address checked against the other accounts, so a cookie without the password
+ * learns nothing about which addresses exist. The change, its `user.email_changed` row and a
+ * notice to the account commit together.
+ */
+async function updateWithIdentity(
+  request: NextRequest, session: Session, id: string, data: Record<string, string>,
+  { stepUpPassword, currentPassword }: { stepUpPassword: unknown; currentPassword: unknown },
+): Promise<NextResponse> {
+  const target = await prisma.user.findUnique({ where: { id }, select: { role: true, email: true } })
+  if (!target) return NextResponse.json({ error: 'User not found' }, { status: 404 })
+  const self = id === session.userId
+  const roleChange = 'role' in data && data.role !== target.role
+  const emailChange = 'email' in data && data.email !== target.email
+  const otherAdmin = !self && target.role === 'admin'
+  const promotes = roleChange && data.role === 'admin'
+  // Another admin's account or a promotion: written under the Root lock, which re-checks Root.
+  const adminWrite = otherAdmin || promotes
+  let needsRoot = adminWrite
+  if (adminWrite) {
+    const managed = await adminsManagePath(request, session, id, 'edit', stepUpPassword, ROOT_ONLY_EDIT, { promotes })
+    if (managed instanceof NextResponse) return managed
+    if (managed === 'allowed') {
+      needsRoot = false
+    } else {
+      const refusal = await requireRootPower(request, session, stepUpPassword, ROOT_ONLY_EDIT)
+      if (refusal) return refusal
+    }
+  } else if (emailChange) {
+    const refusal = await requireStepUp(request, self ? currentPassword : stepUpPassword)
+    if (refusal) return refusal
+  }
+  if (emailChange && await emailTakenByAnother(data.email, id)) {
+    return NextResponse.json(EMAIL_TAKEN, { status: 409 })
+  }
+  const select = { ...USER_SELECT, sessionVersion: true } as const
+  const attempted = roleChange ? 'role_change' : 'edit'
+
+  if (!roleChange && !adminWrite && !emailChange) {
+    const before = await auditedBefore(id, data)
+    const user = await prisma.user.update({ where: { id }, data, select: USER_SELECT })
+    invalidatePrincipal(id)
+    await auditUserEdit(request, session, id, data, before, user)
+    return NextResponse.json(user)
+  }
+
+  const writeEdit = async (tx: Prisma.TransactionClient, before: AuditedFields | null) => {
+    const bump = 'role' in data && data.role !== before?.role
+    const fields = (bump ? { ...data, sessionVersion: { increment: 1 } } : { ...data }) as Prisma.UserUpdateInput
+    let user
+    if (emailChange) {
+      // Conditional on the address read here: another change in between refuses this one.
+      const held = await tx.user.findUnique({ where: { id }, select: { email: true, pendingNotices: true } })
+      if (!held) throw new AccountChanged()
+      const actor = await tx.user.findUnique({ where: { id: session.userId }, select: { name: true, email: true } })
+      const by = { id: session.userId, name: actor?.name ?? '', email: actor?.email ?? '' }
+      const notice = emailChangedNotice({ by, at: now(), from: held.email, to: data.email, self })
+      fields.pendingNotices = withNotice(held.pendingNotices, notice) as unknown as Prisma.InputJsonValue
+      const moved = await tx.user.updateMany({ where: { id, email: held.email }, data: fields as Prisma.UserUpdateManyMutationInput })
+      if (moved.count !== 1) throw new AccountChanged()
+      user = await tx.user.findUnique({ where: { id }, select })
+      if (!user) throw new AccountChanged()
+    } else {
+      user = await tx.user.update({ where: { id }, data: fields, select })
+    }
+    for (const row of userEditRows(id, data, before, bump ? user : publicUser(user), { emailRow: true })) {
+      await writeAuditTx(tx, await userAuditEntry(request, session, row))
+    }
+    return user
+  }
+
+  try {
+    if (roleChange && data.role === 'standard') {
+      const result = await withLastAdminGuard(id, (tx, before) => writeEdit(tx, before), rootRecheck(session, needsRoot))
+      if (!result.ok) {
+        if (result.refused) return rootGuardAnswer(request, session, id, result.refused, attempted)
+        return NextResponse.json(LAST_ADMIN_REFUSAL, { status: 409 })
+      }
+      invalidatePrincipal(id)
+      await onAccessReduced(null, id, 'sessions_revoked')
+      return NextResponse.json(publicUser(result.value))
+    }
+
+    type Outcome = { refused: RootGuardRefusal } | { missing: true } | { user: Awaited<ReturnType<typeof writeEdit>> }
+    const result = await auditedTransaction(prisma, async (tx): Promise<Outcome> => {
+      const root = await lockedInstanceRoot(tx)
+      if (root && root.userId === id && id !== session.userId) return { refused: 'root_protected' }
+      if (needsRoot && !(root && root.userId === session.userId && root.confirmed)) return { refused: 'root_only' }
+      const before = await tx.user.findUnique({ where: { id }, select: { name: true, email: true, role: true } })
+      if (!before) return { missing: true }
+      return { user: await writeEdit(tx, before) }
+    })
+    if ('refused' in result) return rootGuardAnswer(request, session, id, result.refused, attempted)
+    if ('missing' in result) return NextResponse.json({ error: 'User not found' }, { status: 404 })
+    invalidatePrincipal(id)
+    // The raised session version ends the cookies signed for the old role; its open sockets close too (step 5.9).
+    if (roleChange) await onAccessReduced(null, id, 'sessions_revoked')
+    return NextResponse.json(publicUser(result.user))
+  } catch (err) {
+    if (err instanceof AccountChanged) return NextResponse.json(ACCOUNT_CHANGED, { status: 409 })
+    throw err
+  }
+}
+
+/**
+ * Managing another admin, or promoting a member, is the confirmed Root's (step 2.6) unless the
+ * permissions switch is on and the person holds `admins:manage` (hierarchy.ts, D-02): then they edit,
+ * demote or delete an admin whose profile sits strictly inside their own admin side, and promote only
+ * an account whose profile would, each with their own password; the write then re-checks under the
+ * Root lock only that the target is not Root. `null`: this path does not apply (switch off, or the
+ * confirmed Root): Root's rule answers. A refusal answers as 2.6's would (`root_only`), or says why
+ * (`not_a_subset`, the action's permission).
+ */
+async function adminsManagePath(
+  request: NextRequest, session: Session, targetId: string, action: 'edit' | 'delete', password: unknown, error: string,
+  { promotes = false }: { promotes?: boolean } = {},
+): Promise<NextResponse | 'allowed' | null> {
+  if (!rbacFlags().permissions || (await rootStanding(session.userId)) === 'confirmed') return null
+  const target = await managedOf(targetId)
+  if (!target) return NextResponse.json({ error: 'User not found' }, { status: 404 })
+  const { manager } = await managerOf(session)
+  if (target.managed.accountType !== 'member') {
+    const decision = canManage(manager, target.managed, action)
+    if (!decision.allowed) return manageRefusal(session, decision, error)
+  }
+  if (promotes) {
+    const decision = canAssignProfile(manager, await profileContents(prisma, target.principal.adminProfileId))
+    if (!decision.allowed) return manageRefusal(session, decision, error)
+  }
+  return (await requireStepUp(request, password)) ?? 'allowed'
+}
+
+/** Another admin's account changes hands only with the acting admin's own password. */
+async function isAnotherAdmin(sessionUserId: string, targetId: string): Promise<boolean> {
+  if (sessionUserId === targetId) return false
+  const target = await prisma.user.findUnique({ where: { id: targetId }, select: { role: true } })
+  return target?.role === 'admin'
 }
 
 // GET /api/users/[id] - Get user by ID
@@ -15,14 +304,19 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    // Check permissions: admin or internal can view any user, standard can only view self
+    // The internal key and the user directory (users:read) read any account; anyone else their own,
+    // or the one they act as (its own data, §4.7). Through the directory alone another account's
+    // projects show their names and dates: their scope is projects:oversee's (§5.1).
+    let withScope = true
     if (!isInternalRequest(request)) {
       const session = await getSession()
       if (!session) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
       }
-      if (session.role !== 'admin' && session.userId !== id) {
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      if (session.userId !== id) {
+        const directory = await sessionHolds(session, 'users:read')
+        withScope = (directory && (await sessionHolds(session, 'projects:oversee'))) || (await actsAsAccount(session, id))
+        if (!directory && !withScope) return forbiddenResponse('users:read')
       }
     }
 
@@ -65,10 +359,11 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     // A batch has no targetDomain: each project row carries its scope label.
     return NextResponse.json({
       ...user,
-      projects: user.projects.map(({ ipMode, targetIps, subdomainList, domainBatchMode, domainBatchHosts, ...p }) => ({
-        ...p,
-        targetLabel: projectTargetLabel({ ...p, ipMode, targetIps, subdomainList, domainBatchMode, domainBatchHosts }),
-      })),
+      projects: user.projects.map(({ targetDomain, ipMode, targetIps, subdomainList, domainBatchMode, domainBatchHosts, ...p }) => (
+        withScope
+          ? { ...p, targetDomain, targetLabel: projectTargetLabel({ ...p, targetDomain, ipMode, targetIps, subdomainList, domainBatchMode, domainBatchHosts }) }
+          : p
+      )),
     })
   } catch (error) {
     return internalError(error, 'Failed to fetch user')
@@ -79,31 +374,45 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 export async function PUT(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const body = await request.json()
-    const { name, email, role, defaultAgentModel, defaultAiPipelineModel } = body
 
     // Check permissions. S2/E2: internal-key no longer bypasses -- updating a
     // user (esp. role escalation) requires a real session.
-    {
-      const session = await getSession()
-      if (!session) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-      }
-
-      // Standard users can only update their own name/email
-      if (session.role !== 'admin' && session.userId !== id) {
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-      }
-
-      // Only admin can change roles
-      if (role && session.role !== 'admin') {
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-      }
+    const session = await getSession({ fresh: true })
+    if (!session) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    // Same-origin JSON whatever the identity switch (ID-26, step 2.12).
+    if (!sameOrigin(request)) return crossOriginResponse(request)
+    const parsed = await readJsonBody(request)
+    if (parsed instanceof NextResponse) return parsed
+    const body = parsed.body as {
+      name?: string; email?: unknown; role?: unknown; defaultAgentModel?: unknown
+      defaultAiPipelineModel?: unknown; stepUpPassword?: unknown; currentPassword?: unknown
+    }
+    const { name, email, role, defaultAgentModel, defaultAiPipelineModel, stepUpPassword } = body
+
+    // Without users:edit a person changes only their own name, email and preferences, never a role.
+    // Acting as the account the path names saves its preferences (the remembered default models) as
+    // its own; its name and email stay the real person's to change (§4.7).
+    if ((session.userId !== id || role) && !(await sessionHolds(session, 'users:edit', { fresh: true }))
+      && !(!role && !name && !email && (await actsAsAccount(session, id, { fresh: true })))) {
+      return forbiddenResponse('users:edit')
+    }
+    // The sign-in email of the account acted as stays its own (§4.7).
+    if (typeof email === 'string' && email) {
+      const actingAs = await refuseWhileActingAs({ session, targetUserId: id }, 'change_email')
+      if (actingAs) return actingAs
+    }
+
+    // Identity switch on: nobody else edits Root, and Root keeps the admin role.
+    const demotion = role === 'standard'
+    const rootRefusal = await rootProtectedRefusal(request, session, id, demotion ? 'role_change' : 'edit', { self: demotion })
+    if (rootRefusal) return rootRefusal
 
     const data: Record<string, string> = {}
     if (name) data.name = name
-    if (email) data.email = email
+    if (typeof email === 'string' && email) data.email = normalizeEmail(email)
     if (role === 'admin' || role === 'standard') data.role = role
     // Remembered model choices, used to pre-fill the next new project.
     if (isLoopModel(defaultAgentModel) || isLoopModel(defaultAiPipelineModel)) {
@@ -115,28 +424,50 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     if (typeof defaultAgentModel === 'string') data.defaultAgentModel = defaultAgentModel
     if (typeof defaultAiPipelineModel === 'string') data.defaultAiPipelineModel = defaultAiPipelineModel
 
-    const user = await prisma.user.update({
-      where: { id },
-      data,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        defaultAgentModel: true,
-        defaultAiPipelineModel: true,
-        createdAt: true,
-        updatedAt: true,
-      }
-    })
+    // With the identity switch on the address is checked after the password it takes (step 2.11).
+    if (rbacFlags().identity) {
+      return await updateWithIdentity(request, session, id, data, { stepUpPassword, currentPassword: body?.currentPassword })
+    }
 
-    return NextResponse.json(user)
+    // Another account may hold the address in other capitals (stored before
+    // emails were lowercased), which the unique index cannot see.
+    if (data.email && await emailTakenByAnother(data.email, id)) {
+      return NextResponse.json(EMAIL_TAKEN, { status: 409 })
+    }
+
+    if (data.role !== 'standard') {
+      const before = await auditedBefore(id, data)
+      const user = await prisma.user.update({ where: { id }, data, select: USER_SELECT })
+      invalidatePrincipal(id)
+      await auditUserEdit(request, session, id, data, before, user)
+      return NextResponse.json(user)
+    }
+
+    // A demotion, the actor's own included: never of the last admin with a password.
+    if (await isAnotherAdmin(session.userId, id)) {
+      const refusal = await requireStepUp(request, stepUpPassword)
+      if (refusal) return refusal
+    }
+    const result = await withLastAdminGuard(id, async (tx, before) => ({
+      before,
+      user: await tx.user.update({ where: { id }, data, select: USER_SELECT }),
+    }), rootRecheck(session))
+    if (!result.ok) {
+      if (result.refused) return rootGuardAnswer(request, session, id, result.refused, 'role_change')
+      return NextResponse.json(LAST_ADMIN_REFUSAL, { status: 409 })
+    }
+    invalidatePrincipal(id)
+    await auditUserEdit(request, session, id, data, result.value.before, result.value.user)
+    return NextResponse.json(result.value.user)
   } catch (error: unknown) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
         { error: 'User not found' },
         { status: 404 }
       )
+    }
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'P2002') {
+      return NextResponse.json(EMAIL_TAKEN, { status: 409 })
     }
 
     return internalError(error, 'Failed to update user')
@@ -148,57 +479,156 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    {  // S2/E2: deleting a user requires an admin session; no internal bypass.
-      const session = await getSession()
-      if (!session || session.role !== 'admin') {
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-      }
+    // S2/E2: deleting a user requires a session holding users:delete; no internal bypass.
+    const session = await getSession({ fresh: true })
+    if (!session) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+    const denied = await requireSessionPermission(session, 'users:delete', { fresh: true })
+    if (denied) return denied
+    // Whatever the identity switch (ID-26, step 2.12). No JSON check: a member's DELETE has no
+    // body, and a browser form cannot send a DELETE.
+    if (!sameOrigin(request)) return crossOriginResponse(request)
 
-      // Prevent self-deletion
-      if (session.userId === id) {
+    // Prevent self-deletion
+    if (session.userId === id) {
+      return NextResponse.json(
+        { error: 'Cannot delete your own account' },
+        { status: 400 }
+      )
+    }
+    const actingAs = await refuseWhileActingAs({ session, targetUserId: id }, 'delete_account')
+    if (actingAs) return actingAs
+
+    // Self-deletion is refused above, so an admin target is another admin.
+    const target = await prisma.user.findUnique({ where: { id }, select: { email: true, role: true, name: true } })
+    // Before the step-up and the teardown: a refused deletion tears nothing down.
+    const rootRefusal = await rootProtectedRefusal(request, session, id, 'delete')
+    if (rootRefusal) return rootRefusal
+    const targetIsAdmin = target?.role === 'admin'
+    // A member's DELETE has no body unless the deletion plan names projects to delete anyway.
+    const body = await request.json().catch(() => null)
+    // Identity switch on: deleting an admin is the confirmed Root's power (step 2.6), or an
+    // `admins:manage` holder's over a strict subset (permissions switch on).
+    let rootPower = targetIsAdmin && rbacFlags().identity
+    if (targetIsAdmin) {
+      const managed = rootPower
+        ? await adminsManagePath(request, session, id, 'delete', body?.stepUpPassword, ROOT_ONLY_DELETE)
+        : null
+      if (managed instanceof NextResponse) return managed
+      if (managed === 'allowed') {
+        rootPower = false
+      } else {
+        const refusal = rootPower
+          ? await requireRootPower(request, session, body?.stepUpPassword, ROOT_ONLY_DELETE)
+          : await requireStepUp(request, body?.stepUpPassword)
+        if (refusal) return refusal
+      }
+    }
+
+    // The teardown below cannot be undone, so a deletion the last-admin rule
+    // refuses is refused before it; the delete itself checks again under the lock.
+    if (targetIsAdmin) {
+      const allowed = await withLastAdminGuard(id, async () => undefined, rootRecheck(session, rootPower))
+      if (!allowed.ok) {
+        if (allowed.refused) return rootGuardAnswer(request, session, id, allowed.refused, 'delete')
+        return NextResponse.json(LAST_ADMIN_REFUSAL, { status: 409 })
+      }
+    }
+
+    // Write sharing on (step 5.13, SH-17): a shared project is transferred through the deletion plan
+    // or named in `deleteAnyway`; while one is left, nothing is torn down.
+    let deletedAnyway: string[] | null = null
+    if (!deletionWizardOff()) {
+      const shared = await resolveSharedProjects(id, body)
+      if ('unresolved' in shared) return unresolvedResponse(id, shared.unresolved)
+      deletedAnyway = shared.deletedAnyway
+    }
+
+    // Each project goes through the project-delete teardown first (HD-11): the
+    // cascade alone leaves its graph, files, workspace and running work behind, and
+    // a project holding an authorization record refuses it (the key is Restrict).
+    const projects = await prisma.project.findMany({
+      where: { userId: id }, select: { id: true, userId: true }, orderBy: { createdAt: 'asc' },
+    })
+    const auditBefore = { email: target?.email ?? null, role: target?.role ?? null, ownedProjectCount: projects.length }
+    const projectsDeleted: string[] = []
+    for (const project of projects) {
+      const result = await teardownProject(project, { actorUserId: session.userId, archiveReason: 'user_deleted' })
+      if (result.ok) {
+        projectsDeleted.push(project.id)
+        continue
+      }
+      // Its owner deleted it meanwhile, through the project route's own teardown.
+      if (result.code === 'project_not_found') continue
+      console.error(`[rbac] user-delete teardown failed project=${project.id} step=${result.failedStep}`)
+      // Not `user.delete`: the account still exists.
+      await writeUserAudit(request, session, {
+        action: 'user.delete_failed',
+        targetId: id,
+        before: auditBefore,
+        after: { projectsDeleted, failedProjectId: project.id, failedStep: result.failedStep, code: result.code },
+      })
+      if (result.failedStep === 'archive_authorizations') {
         return NextResponse.json(
-          { error: 'Cannot delete your own account' },
-          { status: 400 }
+          {
+            error:
+              'Could not archive the engagement authorization records of one of this user\'s ' +
+              'projects, so the user was not deleted. The record of what authorized an ' +
+              'engagement must outlive the engagement. Retry, or contact an administrator.',
+            code: 'authorization_archive_failed',
+            projectId: project.id,
+          },
+          { status: 500 }
         )
       }
+      throw result.error
     }
 
-    // Collect this user's captured-traffic body refs BEFORE the cascade removes
-    // the rows (user -> projects -> captured rows), so we can GC the now-orphaned
-    // blobs afterward (§6.6). Prisma cascade never touches the filesystem.
-    let capturedBodyRefs: (string | null)[] = []
-    try {
-      const doomed = await prisma.capturedHttpTransaction.findMany({
-        where: { userId: id }, select: { reqBodyRef: true, respBodyRef: true },
+    // The account's own Nuclei templates go to the admin deleting it (DV-33, OQ-50): no
+    // member gains them and no file is lost. Its conversations in other people's projects go to
+    // each project's owner with the former author kept (T24, step 5.8; write switch on), before the
+    // account row whose cascade would delete them. In the delete's transaction, so a deletion
+    // that fails leaves both with their owner.
+    let conversationsReassigned: number | null = null
+    const deleteAccount = async (tx: Prisma.TransactionClient) => {
+      const { count } = await tx.nucleiTemplate.updateMany({
+        where: { ownerUserId: id }, data: { ownerUserId: session.userId },
       })
-      capturedBodyRefs = doomed.flatMap(r => [r.reqBodyRef, r.respBodyRef])
-    } catch (e) {
-      console.warn('Could not enumerate captured body refs before user delete:', e)
+      conversationsReassigned = await reassignConversationsOfDeletedAuthor(tx, id, target?.name?.trim() || target?.email || id)
+      await tx.user.delete({ where: { id } })
+      return count
     }
-
-    // The cascade deletes the user's projects; their workspaces are on disk.
-    let projectIds: string[] = []
-    try {
-      projectIds = (await prisma.project.findMany({ where: { userId: id }, select: { id: true } })).map(p => p.id)
-    } catch (e) {
-      console.warn('Could not list projects before user delete:', e)
-    }
-
-    await prisma.user.delete({
-      where: { id }
-    })
-
-    await Promise.allSettled(projectIds.map(pid => purgeProjectWorkspace(pid)))
-
-    if (capturedBodyRefs.length > 0) {
-      try {
-        const { gcOrphanBodies } = await import('@/lib/captureBodies')
-        const gc = await gcOrphanBodies(capturedBodyRefs)
-        if (gc.deleted > 0) console.log(`[user-delete] GC'd ${gc.deleted} captured body blobs for user ${id}`)
-      } catch (e) {
-        console.warn('Captured body-blob GC failed on user delete:', e)
+    let templatesReassigned: number
+    if (targetIsAdmin) {
+      // The deleter is an admin, but a concurrent demotion of the deleter could
+      // leave nobody: the same locked check as a demotion.
+      const result = await withLastAdminGuard(id, deleteAccount, rootRecheck(session, rootPower))
+      if (!result.ok) {
+        if (result.refused) return rootGuardAnswer(request, session, id, result.refused, 'delete')
+        return NextResponse.json(LAST_ADMIN_REFUSAL, { status: 409 })
       }
+      templatesReassigned = result.value
+    } else {
+      templatesReassigned = await prisma.$transaction(deleteAccount)
     }
+    invalidatePrincipal(id)
+    // A deleted admin never sends its act-as cookie again: the impersonations it held end here,
+    // and what it opened acting closes (permissions switch on, step 3.14).
+    if (targetIsAdmin && rbacFlags().permissions) await endOpenImpersonationsQuietly(id, 'invalidated')
+    // Its shares went with the row; what it still ran on other people's projects stops (step 5.9).
+    await endDeletedAccountWork(id)
+
+    await writeUserAudit(request, session, {
+      action: 'user.delete',
+      targetId: id,
+      before: auditBefore,
+      after: {
+        projectsDeleted, templatesReassigned,
+        ...(conversationsReassigned === null ? {} : { conversationsReassigned }),
+        ...(deletedAnyway === null ? {} : { deletedAnyway }),
+      },
+    })
 
     return NextResponse.json({ success: true })
   } catch (error: unknown) {

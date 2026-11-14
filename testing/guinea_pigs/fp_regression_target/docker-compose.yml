@@ -157,6 +157,120 @@ services:
     environment: { ROLE: plainjs, PORTS: "80" }
     networks: { fp_lab: { ipv4_address: 192.88.94.34 } }
 
+  # An origin behind Cloudflare presents a certificate from Cloudflare's Origin
+  # CA: the issuer names Cloudflare, yet the host is the origin, not an edge (R-40).
+  fp-origincert:
+    <<: *lab
+    container_name: redamon-fp-origincert
+    environment:
+      ROLE: cdncert
+      PORTS: "443"
+      TLS_PORTS: "443"
+      TLS_SUBJECT: "/C=US/O=CloudFlare, Inc./OU=CloudFlare Origin SSL Certificate Authority/L=San Francisco/ST=California"
+    networks: { fp_lab: { ipv4_address: 192.88.94.35 } }
+
+  fp-origincert-ecc:
+    <<: *lab
+    container_name: redamon-fp-origincert-ecc
+    environment:
+      ROLE: cdncert
+      PORTS: "443"
+      TLS_PORTS: "443"
+      TLS_SUBJECT: "/C=US/O=CloudFlare, Inc./OU=CloudFlare Origin SSL ECC Certificate Authority/L=San Francisco/ST=California"
+    networks: { fp_lab: { ipv4_address: 192.88.94.36 } }
+
+  # Nuclei's throttle filter (R-19): "please wait" copy on a served page beside
+  # a server that really throttles.
+  fp-pleasewait:
+    <<: *lab
+    container_name: redamon-fp-pleasewait
+    environment: { ROLE: pleasewait, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.37 } }
+
+  fp-throttled:
+    <<: *lab
+    container_name: redamon-fp-throttled
+    environment: { ROLE: throttled, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.38 } }
+
+  # An unauthenticated Redis whose PING answer can be held past the check
+  # timeout, or refused for want of a password (R-24).
+  fp-redis:
+    <<: *lab
+    container_name: redamon-fp-redis
+    environment: { ROLE: redis, PORTS: "80", REDIS_DELAY: "25" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.39 } }
+
+  # An expired certificate on a non-HTTP TLS port, with a handshake that can be
+  # made to hang (R-21, R-9): tlsx is the only reader of that certificate.
+  fp-tlsmail:
+    <<: *lab
+    container_name: redamon-fp-tlsmail
+    environment: { ROLE: tlsmail, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.40 } }
+
+  # SMTP relay check (L-20): the same server three times, only the RCPT answer differs.
+  fp-smtp-denied:
+    <<: *lab
+    container_name: redamon-fp-smtp-denied
+    environment: { ROLE: smtp, PORTS: "80", SMTP_RCPT: "554 5.7.1 Relay access denied" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.41 } }
+
+  fp-smtp-relay:
+    <<: *lab
+    container_name: redamon-fp-smtp-relay
+    environment: { ROLE: smtp, PORTS: "80", SMTP_RCPT: "250 2.1.5 Ok" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.42 } }
+
+  fp-smtp-grey:
+    <<: *lab
+    container_name: redamon-fp-smtp-grey
+    environment: { ROLE: smtp, PORTS: "80", SMTP_RCPT: "451 4.7.1 Greylisted, try again later" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.43 } }
+
+  # Login forms over HTTP (L-21): a shell that only says "login", a real form, a catch-all.
+  fp-login-shell:
+    <<: *lab
+    container_name: redamon-fp-login-shell
+    environment: { ROLE: login, PORTS: "80", LOGIN_MODE: shell }
+    networks: { fp_lab: { ipv4_address: 192.88.94.44 } }
+
+  fp-login-real:
+    <<: *lab
+    container_name: redamon-fp-login-real
+    environment: { ROLE: login, PORTS: "80", LOGIN_MODE: real }
+    networks: { fp_lab: { ipv4_address: 192.88.94.45 } }
+
+  fp-login-all:
+    <<: *lab
+    container_name: redamon-fp-login-all
+    environment: { ROLE: login, PORTS: "80", LOGIN_MODE: all }
+    networks: { fp_lab: { ipv4_address: 192.88.94.46 } }
+
+  # .23's redirect to the third-party IdP on .21, also over HTTPS, where the
+  # header, cookie, CSP and form checks read a page (L-7).
+  fp-sso-tls:
+    <<: *lab
+    container_name: redamon-fp-sso-tls
+    environment: { ROLE: sso, PORTS: "80,443", TLS_PORTS: "443" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.48 } }
+
+  # S-22: a page on 80 and on 8081. The Shodan stub reports both ports; the
+  # --s22 project's naabu scans 22,80,443 only, so 8081 is known from Shodan
+  # alone until a partial Nmap or Httpx confirms it.
+  fp-passive8081:
+    <<: *lab
+    container_name: redamon-fp-passive8081
+    environment: { ROLE: plainjs, PORTS: "80,8081" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.49 } }
+
+  # A GraphQL server for the rate cap and graphql-cop's gates (R-7, R-42).
+  fp-graphql:
+    <<: *lab
+    container_name: redamon-fp-graphql
+    environment: { ROLE: graphql, PORTS: "80" }
+    networks: { fp_lab: { ipv4_address: 192.88.94.47 } }
+
 networks:
   fp_lab:
     name: redamon_fp_lab

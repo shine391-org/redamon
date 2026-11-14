@@ -49,7 +49,8 @@ How to manage input fields from modal:
 - **Input node types come from `nodeMapping.ts`.** This is the single source of truth for what each tool consumes and produces. The modal reads from this mapping.
 - **Each input type gets its own textarea + validation.** Never mix input types in a single textarea. Each has its own validator, error display, and graph association logic.
 - **Validate on BOTH frontend and backend.** Frontend validates inline (regex, domain ownership, CIDR range) and disables Run on errors. Backend re-validates and skips invalid entries with log messages.
-- **Typed input is scope-checked centrally -- never in your module.** The orchestrator filters `user_inputs` / `user_targets` before it spawns the container, and `_prepare_scope` runs `filter_partial_user_input(config, settings)` again inside it, against the container's own settings: a typed host or URL host must pass the partial rule of the run's scope groups (strictly under an ENUMERATE scan root, or one of an EXACT group's listed hosts; the scan root itself only with Root on), an IP or CIDR may be no wider than /24 (IPv4) or /120 (IPv6), `ip_attach_to` must be an in-scope host and `url_attach_to` is judged by its URL's host. Refused entries are dropped with a log line, and a run that typed targets, kept none and reads no graph targets is refused. Your module reads the surviving `config["user_targets"]`; it must not add a typed URL's host to the writer's scope itself (`_scope_partial_urls` adds it only when the scope admits it).
+- **Typed input is scope-checked centrally -- never in your module.** The orchestrator filters `user_inputs` / `user_targets` before it spawns the container, and `_prepare_scope` runs `filter_partial_user_input(config, settings)` again inside it, against the container's own settings: a typed host or URL host must pass the partial rule of the run's scope groups (strictly under an ENUMERATE scan root, or one of an EXACT group's listed hosts; the scan root itself only with Root on), an IP or CIDR may be no wider than /24 (IPv4) or /120 (IPv6), `ip_attach_to` must be an in-scope host and `url_attach_to` is judged by its URL's host. A host, URL host, address or attach target the Rules of Engagement exclude is dropped too, and a typed CIDR holding an excluded address becomes its other hosts; under RoE IP or CIDR entries a typed name (host, URL host, `ip_attach_to`) is also dropped when any address it resolves to is excluded, and the container drops one with no address (the orchestrator image has no `recon/`, so `recon_orchestrator/batch_scope.py` keeps a copy of the `roe_scope` matcher, pinned by `roe_exclusion_vectors.json`). Refused entries are dropped with a log line, and a run that typed targets, kept none and reads no graph targets is refused. Your module reads the surviving `config["user_targets"]`; it must not add a typed URL's host to the writer's scope itself (`_scope_partial_urls` adds it only when the scope admits it).
+- **Stealth mode refuses a tool it switches off.** Your module forces its tool's switch on, so `main()` in `recon/partial_recon.py` first refuses, before the scope pass, a tool one of whose switches the registry's stealth profile sets to false (`<tool> is off in stealth mode`, exit 1, no container). Add your tool's row to `PARTIAL_TOOL_SWITCHES`: a tool with no row is refused in stealth mode, and `test_partial_stealth_refusal.py` fails a dispatched tool with no row.
 - **An old-model graph refuses the run.** Before `_run_tool`, `_legacy_graph_refusal` asks the graph whether a Domain from an older scope model still holds data (`legacy_domain_nodes`) and refuses the run, failing closed when Neo4j is unreachable; the webapp refuses the same start with a 409 first. A full recon clears it. New tools inherit this; do not bypass it.
 - **User input graph strategy -- choose by type:**
   - **Subdomain** -> attaches to the **org** Domain of the scan root it sits under (`root_for_host(sub, roots)` gives the scan root, `attach_org(root)` its registrable domain; the graph has one Domain per org). Create real Subdomain + IP + RESOLVES_TO nodes directly. No UserInput. The typed subdomain already passed the scope check (see above); `typed_host_ok(host, roots, groups)` is the module-side backstop if you re-check.
@@ -173,20 +174,24 @@ recon_data = _build_http_probe_data_from_graph(
 )
 ```
 
-**Pattern for the graph-off `else` branch** (when `include_graph_targets=False`):
+**Pattern for the graph-off `else` branch** (when `include_graph_targets=False`), for a module whose targets come from `dns` through the D2 gate (`extract_targets_from_recon`, the security checks' host list), as `run_nuclei` and `run_security_checks_partial` in `recon/partial_recon_modules/vulnerability_scanning.py` do:
 ```python
-recon_data = {
+recon_data = ip_mode_recon({
     "domain": roots[0],
     "domains": roots,
+    "subdomains": [],
     "dns": {
         "domain": {"ips": {"ipv4": [], "ipv6": []}, "has_records": False},
         "subdomains": {},
     },
     "http_probe": {"by_url": {}},
-    "metadata": {"include_root_domain": _should_include_root_domain(settings)},
-}
+}, settings)
+# ... inject the typed URLs into http_probe.by_url, then, after the if/else:
+_typed_url_hosts_in_dns(recon_data, user_urls, settings, include_graph, typed_ips=unattached_ips)
 ```
-Always stamp the metadata flag, even when not querying the graph -- downstream consumers of `recon_data` rely on it.
+With graph targets off the run scans what was typed. `_typed_url_hosts_in_dns` stamps `metadata.include_root_domain` False, so the root is no target unless typed, gives each typed URL's host a `dns.subdomains` entry (`has_records` alone; the tool resolves it), and gives a typed address, and each of `typed_ips`, its own entry, where `dns.domain` would make it the root's. Under RoE IP or CIDR entries, graph targets on or off, it resolves once a typed host the dict holds no address for, so the gate judges the host on that answer: an excluded address or no answer refuses it. Do not stamp `_should_include_root_domain(settings)` here: an unstamped or True flag offers the root nobody typed, and under RoE IP entries that address-less root is refused and, with no other `dns` name, nothing is scanned. IP mode is left alone.
+
+A module that takes no targets from `dns` stamps the root's scope flag on this branch instead (`_should_include_root_domain(settings)`, or `include_root_for(root, groups)` with groups). Always stamp the metadata flag, even when not querying the graph -- downstream consumers of `recon_data` rely on it.
 
 **Why the default is `False`:** the safer failure mode. Forgetting to pass `include_root_domain=` means the apex is excluded -- better to under-scan than to silently scan something the user toggled off. This also makes future graph-builder callers fail-safe.
 
@@ -216,7 +221,7 @@ For other tool types, add a `run_<tool_name>(config)` function that:
 1. Calls `get_settings()` for project settings
 2. Reads `config["user_targets"]` for structured user input (keys depend on what the tool accepts)
 3. Builds `recon_data` from the graph via `_build_*_data_from_graph(..., include_root_domain=_should_include_root_domain(settings))` -- **always pass the apex flag** (see Critical Rules and "Include Root Domain scope")
-4. If you have an `else` branch for `include_graph_targets=False`, stamp `recon_data["metadata"]["include_root_domain"]` there too
+4. If you have an `else` branch for `include_graph_targets=False`, stamp `recon_data["metadata"]["include_root_domain"]` there too: False when your targets come from `dns`, through `_typed_url_hosts_in_dns`, which also gives the typed hosts their `dns` entries (see "Pattern for the graph-off `else` branch")
 5. Injects user-provided targets into `recon_data`
 6. Calls the tool's scan function (same one used by the full pipeline)
 7. Normalizes results if needed (e.g. `masscan_scan` -> `port_scan`)
@@ -234,6 +239,8 @@ elif tool_id == "<ToolName>":
 ### 2. Backend: Graph Mixin
 
 Reuse the existing `update_graph_from_<stage>()` methods; a writer attaches every host through `attach_for_host` (scope then org, above), never `MATCH (d:Domain {name: <scan root>})`.
+
+Never hand a full-pipeline writer the dict a builder rebuilt from the graph: every node in it would be rewritten from the graph's own lossy copy. Pass only what your tool measured (`measured_port_data` in `recon/partial_recon_modules/port_scanning.py` cuts port data to it), or write a dedicated Cypher for your tool's own fields. A shared writer never takes `IP.is_cdn` from true to false, sets `Port.passive_only` false only for a port its caller saw (`update_graph_from_port_scan` in `graph_db/mixins/recon/port_mixin.py`), and writes enrichment fields (category, sample values, provenance) with `coalesce` or `ON CREATE SET`.
 
 The graph-input counts and dropdown name lists live in the webapp only: add the tool's case to `webapp/src/app/api/recon/[projectId]/graph-inputs/[toolId]/route.ts`, using its positive scope test (`graphHostInScopeCypher`). The old orchestrator endpoint and `get_graph_inputs_for_tool()` are gone.
 
@@ -272,6 +279,8 @@ For each new tool:
 File: `webapp/src/app/api/recon/[projectId]/partial/route.ts`
 
 Already passes `user_targets: body.user_targets || null`. No changes needed for new tools.
+
+The route asks `recon:partial` on the project (`requirePermission(request, 'recon:partial', { projectId })`) and the graph-input route `recon:read`. A NEW route for a tool (its own start, stop or input list) does the same with the permission of what it does, the `projectId` key written literally, and names that permission in the route manifest (`node scripts/gen-route-manifest.mjs` from `webapp/`; `webapp/src/lib/authz/routePermissions.test.ts` fails when the two differ). Never an inline owner check: `authzStaticGuard.test.ts` fails on one.
 
 ### 7. Backend: Orchestrator
 
@@ -458,6 +467,8 @@ User provides IP (generic):
 | URL generic | User selects "Generic" | `UserInput -[:PRODUCED]-> Endpoint` |
 
 **Safety fallback**: if the selected attachment node doesn't exist at scan time (deleted between modal open and run), the backend detects this via a graph query and automatically falls back to UserInput. No orphan nodes.
+
+**Close the UserInput your module creates.** After its `PRODUCED` edges are written, set its final state with `update_user_input_status(ui_id, "completed" | "error", stats, user_id=user_id, project_id=project_id)` (`graph_db/mixins/recon/user_input_mixin.py`): the tenant arguments are required, the node is matched on `{id, user_id, project_id}`, and a miss is printed rather than raised, leaving the node `running`. The end-of-run orphan cleanup (`_cleanup_orphan_user_inputs` in `recon/partial_recon_modules/user_inputs.py`) deletes an edge-less UserInput only when this process created it or its status is `completed` or `error`: up to twelve partial runs of a project run at once, and another run's `running` node may still be waiting for its results (httpx creates its node before it scans). Once the tool has returned, the cleanup also marks the run's own nodes still `running` as `completed` (`_close_own_user_inputs`), so a node your module never closes reads `completed` with no stats after a run that ended normally, and stays `running` after a crash or a stop: set `error` yourself on a failure path you catch.
 
 ---
 

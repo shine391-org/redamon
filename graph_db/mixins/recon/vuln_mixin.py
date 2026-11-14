@@ -147,6 +147,28 @@ def nuclei_cve_ids(cves) -> list:
     return ids
 
 
+_CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+
+def canonical_cve_id(value) -> str:
+    """`value` as an upper-case CVE id, or "" when it is not exactly one.
+
+    CVE is a global node every tenant shares, and a nuclei template's
+    classification is free text: only a well-formed id may name one.
+    """
+    text = value.strip().upper() if isinstance(value, str) else ""
+    return text if _CVE_ID.match(text) else ""
+
+
+def _cvss_or_none(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 class VulnMixin:
     def _find_cwes_with_capec(self, cwe_node: dict, results: list):
         """
@@ -308,6 +330,97 @@ class VulnMixin:
             )
             stats_mitre["rels"] += 1
 
+    def _link_cve_mitre(self, session, cve_id: str, mitre_attack, user_id: str,
+                        project_id: str, stats_mitre: dict):
+        """CVE -[:HAS_CWE]-> MitreData -[:HAS_CAPEC]-> Capec from one CVE's
+        `mitre_attack` (add_mitre.enrich_cve), for the technology lookup's CVEs
+        and nuclei's alike. The CVE node must already exist."""
+        if not isinstance(mitre_attack, dict) or not mitre_attack.get("enriched"):
+            return
+        hierarchies = [mitre_attack.get("cwe_hierarchy"),
+                       *(mitre_attack.get("additional_cwe_hierarchies") or [])]
+        for hierarchy in hierarchies:
+            if not hierarchy:
+                continue
+            cwes_with_capec = []
+            self._find_cwes_with_capec(hierarchy, cwes_with_capec)
+            for cwe_node in cwes_with_capec:
+                self._process_cwe_with_capec(
+                    session, cwe_node, cve_id, user_id, project_id,
+                    stats_mitre=stats_mitre
+                )
+
+    def _link_nuclei_finding_cves(self, session, vuln_id: str, cves, user_id: str,
+                                  project_id: str) -> list:
+        """Link a nuclei finding to the CVEs it cites; returns the linked ids.
+
+        The finding's INCLUDES_CVE edges become exactly these CVEs, so this
+        runs for a finding that cites none too: a template that dropped its
+        CVEs loses their edges. Only edges go; the CVE nodes are shared.
+
+        Only fields the CVE lacks are filled: the NVD lookup (technology_cves)
+        owns cvss and the rest, and may have written them first.
+        """
+        rows = {}
+        for cve in cves or []:
+            cve_id = canonical_cve_id(cve.get("id") if isinstance(cve, dict) else cve)
+            if cve_id and cve_id not in rows:
+                rows[cve_id] = {
+                    "id": cve_id,
+                    "cvss": _cvss_or_none(cve.get("cvss")) if isinstance(cve, dict) else None,
+                    "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                }
+        session.run(
+            """
+            MATCH (v:Vulnerability {id: $vuln_id, user_id: $user_id, project_id: $project_id})
+            // A template whose classification changed no longer cites that CVE.
+            OPTIONAL MATCH (v)-[stale:INCLUDES_CVE]->(old:CVE)
+            WHERE NOT old.id IN $cve_ids
+            DELETE stale
+            WITH DISTINCT v
+            UNWIND $cves AS row
+            // Global reference node: keyed on its id alone, no tenant stamp.
+            MERGE (c:CVE {id: row.id})
+              ON CREATE SET c.cve_id = row.id, c.name = row.id, c.source = 'nuclei'
+            SET c.cvss = coalesce(c.cvss, row.cvss),
+                c.url = coalesce(c.url, row.url),
+                c.updated_at = datetime()
+            MERGE (v)-[:INCLUDES_CVE]->(c)
+            """,
+            vuln_id=vuln_id, cve_ids=list(rows), cves=list(rows.values()),
+            user_id=user_id, project_id=project_id,
+        )
+        return list(rows)
+
+    def backfill_security_check_domains(self, user_id: str, project_id: str) -> int:
+        """Give older domain-level security_check findings the `domain` they now store.
+
+        SPF, DMARC, DNSSEC and zone-transfer findings name no url, host or
+        IP: their org is their only host field, and the prune deletes one
+        only on an org its check re-checked. One written before the field
+        existed would never match, so it would never be pruned once its
+        record is fixed. The org is the Domain it hangs off, picked the way
+        the writer picks a domain-level finding. Run before the prune. Never
+        writes `updated_at`; idempotent.
+        """
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:HAS_VULNERABILITY]->
+                      (v:Vulnerability {user_id: $uid, project_id: $pid, source: 'security_check'})
+                WHERE v.domain IS NULL AND coalesce(v.url, '') = ''
+                  AND v.matched_ip IS NULL AND v.hostname IS NULL
+                WITH v, min(toLower(d.name)) AS org
+                SET v.domain = org
+                RETURN count(v) AS backfilled
+                """,
+                uid=user_id, pid=project_id,
+            ).single()
+        count = int((record["backfilled"] if record else 0) or 0)
+        if count:
+            print(f"[*][graph-db] Backfilled domain on {count} older DNS security finding(s)")
+        return count
+
     def update_graph_from_vuln_scan(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         """
         Update the Neo4j graph database with vulnerability scan data.
@@ -319,6 +432,9 @@ class VulnMixin:
         - Relationships: BaseURL -[:HAS_ENDPOINT]-> Endpoint -[:HAS_PARAMETER]-> Parameter
         - Relationships: Vulnerability -[:AFFECTS_PARAMETER]-> Parameter, Vulnerability -[:FOUND_AT]-> Endpoint
         - Relationships: BaseURL -[:HAS_VULNERABILITY]-> Vulnerability
+        - Relationships: Vulnerability -[:INCLUDES_CVE]-> CVE for the CVEs a nuclei
+          finding cites, and CVE -[:HAS_CWE]-> MitreData -[:HAS_CAPEC]-> Capec once
+          add_mitre has enriched vuln_scan.all_cves or technology_cves
 
         Args:
             recon_data: The recon JSON data containing vuln_scan results
@@ -371,6 +487,7 @@ class VulnMixin:
             created_endpoints = set()  # (baseurl, path, method)
             created_parameters = set()  # (endpoint_path, param_name, param_position)
             skipped_out_of_scope = 0  # Track skipped URLs
+            nuclei_cves_linked = set()
 
             # Process discovered URLs with parameters (from Katana crawling)
             dast_urls = discovered_urls.get("dast_urls_with_params", [])
@@ -708,14 +825,37 @@ class VulnMixin:
                             )
                             stats["relationships_created"] += 1
 
+                        linked = self._link_nuclei_finding_cves(
+                            session, vuln_id, finding.get("cves"), user_id, project_id)
+                        nuclei_cves_linked.update(linked)
+                        stats["relationships_created"] += len(linked)
+
                     except Exception as e:
                         stats["errors"].append(f"Finding {finding.get('template_id', 'unknown')} processing failed: {e}")
+
+            mitre_stats = {"nodes": 0, "capec": 0, "rels": 0}  # Shared stats for MITRE processing
+
+            # The CWE / CAPEC chain of the CVEs written findings cite, from the
+            # enrichment add_mitre puts on vuln_scan.all_cves. The full pipeline
+            # writes before that enrichment (Group 6 Phase A) and again after it
+            # (Phase B), so the chain lands on the second pass; every write here
+            # is a MERGE, so the repeat duplicates nothing.
+            nuclei_mitre = {}
+            for cve in vuln_scan_data.get("all_cves") or []:
+                cve_id = canonical_cve_id(cve.get("id")) if isinstance(cve, dict) else ""
+                if cve_id in nuclei_cves_linked and cve_id not in nuclei_mitre:
+                    nuclei_mitre[cve_id] = cve.get("mitre_attack")
+            for cve_id, mitre_attack in nuclei_mitre.items():
+                try:
+                    self._link_cve_mitre(session, cve_id, mitre_attack, user_id, project_id,
+                                         mitre_stats)
+                except Exception as e:
+                    stats["errors"].append(f"MITRE data of {cve_id} processing failed: {e}")
 
             # =========================================================================
             # Process technology_cves - CVE, MitreData, and Capec nodes
             # =========================================================================
             cves_created = 0
-            mitre_stats = {"nodes": 0, "capec": 0, "rels": 0}  # Shared stats for MITRE processing
             cve_relationships_created = 0
 
             for tech_name, tech_data in by_technology.items():
@@ -839,34 +979,8 @@ class VulnMixin:
                         if matched > 0:
                             cve_relationships_created += 1
 
-                        # Process MITRE data if available
-                        mitre_attack = cve.get("mitre_attack", {})
-                        if mitre_attack.get("enriched"):
-                            cwe_hierarchy = mitre_attack.get("cwe_hierarchy")
-
-                            if cwe_hierarchy:
-                                # Find all CWEs that have related_capec (traverse hierarchy)
-                                cwes_with_capec = []
-                                self._find_cwes_with_capec(cwe_hierarchy, cwes_with_capec)
-
-                                # Create MitreData and Capec nodes for each CWE with CAPEC
-                                for cwe_node in cwes_with_capec:
-                                    self._process_cwe_with_capec(
-                                        session, cwe_node, cve_id, user_id, project_id,
-                                        stats_mitre=mitre_stats
-                                    )
-
-                            # Process additional CWE hierarchies if present
-                            additional_hierarchies = mitre_attack.get("additional_cwe_hierarchies", [])
-                            for add_hierarchy in additional_hierarchies:
-                                cwes_with_capec = []
-                                self._find_cwes_with_capec(add_hierarchy, cwes_with_capec)
-
-                                for cwe_node in cwes_with_capec:
-                                    self._process_cwe_with_capec(
-                                        session, cwe_node, cve_id, user_id, project_id,
-                                        stats_mitre=mitre_stats
-                                    )
+                        self._link_cve_mitre(session, cve_id, cve.get("mitre_attack"),
+                                             user_id, project_id, mitre_stats)
 
                     except Exception as e:
                         stats["errors"].append(f"CVE {cve.get('id', 'unknown')} processing failed: {e}")
@@ -874,6 +988,8 @@ class VulnMixin:
             if cves_created > 0:
                 print(f"[+][graph-db] Created {cves_created} CVE nodes")
                 print(f"[+][graph-db] Created {cve_relationships_created} Technology-CVE relationships")
+            if nuclei_cves_linked:
+                print(f"[+][graph-db] Linked {len(nuclei_cves_linked)} CVEs to nuclei findings")
             if mitre_stats["nodes"] > 0:
                 print(f"[+][graph-db] Created {mitre_stats['nodes']} MitreData (CWE) nodes")
             if mitre_stats["capec"] > 0:
@@ -1056,8 +1172,9 @@ class VulnMixin:
                     # would hash to one node; a batch keys it on its org. A
                     # single-domain project keeps the id its fix items and mute
                     # exemptions already reference (D-23).
-                    finding_domain = (org_for_scan_root(finding.get("domain") or "", recon_data)
-                                      if domain_batch and not (url or matched_ip or hostname) else "")
+                    org = (org_for_scan_root(finding.get("domain") or "", recon_data)
+                           if not (url or matched_ip or hostname) else "")
+                    finding_domain = org if domain_batch else ""
                     vuln_id = stable_vuln_id(finding_type, url,
                                              ip_port_key or matched_ip or hostname or finding_domain,
                                              user_id, project_id)
@@ -1084,6 +1201,10 @@ class VulnMixin:
                         vuln_props["matched_ip"] = matched_ip
                     if hostname:
                         vuln_props["hostname"] = hostname
+                    if org:
+                        # The org is a domain-level finding's only host: the
+                        # prune keeps or deletes it by org (_KEEP_HOST_FIELDS).
+                        vuln_props["domain"] = org.strip().lower().rstrip(".")
                     if evidence:
                         vuln_props["evidence"] = evidence
                     if status_code:

@@ -2,8 +2,9 @@
 
 Runs one TLS handshake per already-open, non-HTTP port and captures the
 certificate + posture, filling the gap httpx leaves (httpx only grabs certs on
-the 5 HTTPS ports it dials). Runs BEFORE http_probe so SAN-derived hostnames
-become probe targets, and before vhost so it can feed SNI candidates.
+the 5 HTTPS ports it dials). Runs BEFORE http_probe so that, in a domain run,
+the in-scope SAN names the pipeline merges (recon/main.py GROUP 3.6) get ports
+and are probed by httpx, and before vhost so its SAN lists feed SNI candidates.
 
 tlsx is a compiled Go binary run as a sibling container through the broker
 socket, matching every other ProjectDiscovery tool in the pipeline.
@@ -12,6 +13,8 @@ Contract (recon-tool-integration):
   - top-level result key is exactly ``combined_result["tlsx"]``,
   - ``run_tlsx_enrichment_isolated`` is the deep-copy test / fan-out call path,
   - never raises: records ``metadata.phase_errors["tlsx"]`` instead,
+  - a target a failed run (timeout, missing runner, exit, crash) never
+    answered keeps its security_check findings (``_note_unchecked``),
   - every ``print`` is ``[symbol][Tlsx] message``.
 """
 
@@ -56,19 +59,15 @@ def _as_list(value) -> list:
 
 
 def _is_mock_hostname(hostname: str, ip: str) -> bool:
-    """A placeholder run_ip_recon mints for an IP with no PTR record.
+    """``ip``'s IP-mode label (ip_placeholders.is_placeholder), under its old name.
 
-    H8: IP mode creates a Subdomain named after the dashed IP ("192-88-98-10"),
-    and a partial run reads its targets back out of the graph, so tlsx was handed
-    that name as an SNI target. It does not resolve, every handshake failed with
-    `no address found for host`, and the run then stamped tls_probe_failed over
-    the enrichment a full scan had just written correctly.
-
-    The full pipeline never hit it because `by_ip[...]["hostnames"]` is empty
-    there. Mirrors `_is_mock_hostname` in masscan_scan.py, which has guarded the
-    same placeholder all along.
+    H8: a partial run reads the label ("192-88-98-10") back out of the graph as
+    a hostname; handed to tlsx as SNI it never resolves, and the run stamped
+    tls_probe_failed over the enrichment a full scan had written.
     """
-    return bool(hostname) and hostname == ip.replace('.', '-').replace(':', '-')
+    # Lazy, as every recon.helpers import here: the package init is heavy.
+    from recon.helpers.ip_placeholders import is_placeholder
+    return is_placeholder(hostname, ip)
 
 
 def _strip_wildcard(name: str) -> str:
@@ -117,13 +116,16 @@ def _siblings_the_cert_names(submitted: str, cert_names: list, siblings) -> list
                   if name and name != submitted and _host_matches_cert(name, cert_names))
 
 
-def build_tlsx_command(targets_file: str, targets_dir: str, settings: dict) -> list:
+def build_tlsx_command(targets_file: str, targets_dir: str, settings: dict,
+                       container_name: str = None) -> list:
     """Build the ``docker run`` argv for tlsx.
 
     Only the base grab (``-json -silent -duc -tps -se -hash sha256``) is
     unconditional. The loud probes (JARM/JA3, version/cipher enum) are flag
     gated. The output *filters* (-ex/-ss/-mm/-re/-un) are NEVER passed: they
     would silently drop every healthy host from the scan.
+
+    ``container_name``: the name the run timeout kills the container by.
     """
     settings = settings or {}
     image = settings.get("TLSX_DOCKER_IMAGE", "projectdiscovery/tlsx:latest")
@@ -131,8 +133,10 @@ def build_tlsx_command(targets_file: str, targets_dir: str, settings: dict) -> l
     timeout = int(settings.get("TLSX_TIMEOUT", 5))
     retries = int(settings.get("TLSX_RETRIES", 1))
 
-    cmd = [
-        "docker", "run", "--rm", "--net=host",
+    cmd = ["docker", "run", "--rm", "--net=host"]
+    if container_name:
+        cmd += ["--name", container_name]
+    cmd += [
         "-v", f"{targets_dir}:{targets_dir}:ro",
         image,
         "-l", targets_file,
@@ -180,8 +184,9 @@ def _build_tlsx_targets(combined_result: dict, settings: dict):
 
     meta maps ``"submitted:port" -> scanned_ip`` so the parser keys by_target on
     the IP the target line was BUILT from, never the ``ip`` tlsx returns (they
-    differ when a hostname has several A records). Sends a hostname whenever one
-    is known so tlsx presents SNI and grabs the right cert on a vhost frontend.
+    differ when a hostname has several A records). Sends a hostname whenever an
+    admitted one is known so tlsx presents SNI and grabs the right cert on a
+    vhost frontend.
     """
     # Lazy imports: recon.helpers.__init__ pulls heavy deps not needed here.
     from recon.main_recon_modules.ip_filter import is_non_routable_ip
@@ -203,6 +208,28 @@ def _build_tlsx_targets(combined_result: dict, settings: dict):
         return [], {}
 
     by_ip = ((combined_result.get("port_scan") or {}).get("by_ip")) or {}
+    # IP mode: an address is handshaken only when it is a target, and then even
+    # when it is private (D-13: an internal engagement lists private targets).
+    from recon.helpers.target_admission import (admission_context, admit_targets, ip_mode_targets,
+                                                is_target, known_addresses)
+    targets = ip_mode_targets(combined_result)
+    sni_admitted = None
+    # tlsx resolves an SNI name itself and may land on any address the name
+    # has, not the one the line was built from. So a name is sent only when
+    # every address it has may be reached: in IP mode every one a target;
+    # under RoE IP or CIDR entries none excluded (D2). A refused name's
+    # address is handshaken as a bare IP. Asked once for every name, not once
+    # per address.
+    if targets is not None or admission_context(settings, combined_result).ip_rules:
+        known = known_addresses(combined_result)
+        names = {h.strip().lower() for info in by_ip.values() if isinstance(info, dict)
+                 for h in (info.get("hostnames") or []) if isinstance(h, str) and h.strip()}
+        # IP mode reads the target list from the recon dict, and its refusals
+        # are decisions, never coverage gaps; an RoE refusal is noted.
+        sni_admitted = set(admit_targets(None if targets is not None else settings, combined_result,
+                                         names={h: known.get(h, []) for h in names},
+                                         module="tlsx", resolves_names=True,
+                                         record=targets is None).names)
 
     lines = []
     meta = {}
@@ -210,7 +237,10 @@ def _build_tlsx_targets(combined_result: dict, settings: dict):
     for ip, info in sorted(by_ip.items()):
         if not ip or not isinstance(info, dict):
             continue
-        if is_non_routable_ip(ip):
+        if targets is not None:
+            if not is_target(ip, targets):
+                continue
+        elif is_non_routable_ip(ip):
             continue
         if roe_list and _is_roe_excluded(ip, roe_list):
             continue
@@ -222,6 +252,8 @@ def _build_tlsx_targets(combined_result: dict, settings: dict):
         hostnames = sorted({h.strip().lower() for h in (info.get("hostnames") or []) if h})
         hostnames = [h for h in hostnames if not _is_mock_hostname(h, ip)]
         hostnames = [h for h in hostnames if not (roe_list and _is_roe_excluded(h, roe_list))]
+        if sni_admitted is not None:
+            hostnames = [h for h in hostnames if h in sni_admitted]
         submit_names = hostnames[:max_hostnames] if hostnames else [ip]
         for port in sorted(set(ports)):
             for submitted in submit_names:
@@ -372,7 +404,8 @@ def _enrich_port_details(combined_result: dict, by_target: dict) -> None:
             port = _coerce_port(pd.get("port"))
             if port is None:
                 continue
-            cert = by_target.get(f"{ip}:{port}")
+            # A domain run's name on several addresses: the detail names its own.
+            cert = by_target.get(f"{pd.get('ip') or ip}:{port}")
             if not cert or not cert.get("probe_status"):
                 continue
             pd["tls"] = {
@@ -473,12 +506,46 @@ def _wildcard_dropped(combined_result: dict, names: list, settings: dict) -> set
     return set(control.dropped)
 
 
+def _unanswered_targets(meta: dict, by_target: dict) -> list:
+    """The target lines tlsx returned no row for. A row with a failed handshake
+    is an answer: the target was checked and found closed or not TLS."""
+    answered = {(str(e.get("host") or ""), e.get("port")) for e in by_target.values()
+                if isinstance(e, dict)}
+    out = []
+    for key in meta:
+        submitted, _, port = key.rpartition(":")
+        if (submitted, _coerce_port(port)) not in answered:
+            out.append(_target_line(submitted, _coerce_port(port)))
+    return out
+
+
+def _note_unchecked(lines: list, reason: str) -> None:
+    """Keep the security_check findings on the targets tlsx never answered.
+
+    The TLS-hygiene findings are built from tlsx's answer, and for a non-HTTP
+    TLS port it is the only one, so no answer is "not checked", not "no
+    certificate problem". Cut for security_check alone: the other tools
+    re-checked these hosts. With no target list (a crash before it was built),
+    the whole source is kept. Never raises.
+    """
+    try:
+        from recon.helpers import circuit_breaker
+        if lines:
+            circuit_breaker.note_degraded("tlsx", hosts=lines, host_source="security_check",
+                                          source_only_hosts=True, reason=reason)
+        else:
+            circuit_breaker.note_degraded("tlsx", sources=["security_check"], reason=reason)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
     """Grab TLS certificates for open non-HTTP ports. Never raises."""
     settings = settings or {}
     combined_result.setdefault("metadata", {})
     scan_id = uuid.uuid4().hex[:12]
     scan_temp_dir = Path(f"/tmp/redamon/.tlsx_scan_{scan_id}")
+    lines = None
 
     try:
         lines, meta = _build_tlsx_targets(combined_result, settings)
@@ -495,31 +562,52 @@ def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
         targets_file = str(scan_temp_dir / "tlsx_targets.txt")
         Path(targets_file).write_text("\n".join(lines) + "\n")
 
-        cmd = build_tlsx_command(targets_file, str(scan_temp_dir), settings)
+        from recon.helpers.docker_helpers import kill_container, tool_container_name
+        container_name = tool_container_name("tlsx")
+        cmd = build_tlsx_command(targets_file, str(scan_temp_dir), settings,
+                                 container_name=container_name)
         run_timeout = int(settings.get("TLSX_RUN_TIMEOUT", 900))
         _print("*", f"scanning {len(lines)} TLS target(s), timeout {run_timeout}s")
 
         started = datetime.now(timezone.utc)
         stdout = ""
+        failure = ""
+        timed_out = False
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True)
             stdout, stderr = process.communicate(timeout=run_timeout)
-            if process.returncode not in (0, None) and not stdout:
-                _print("!", f"tlsx exited {process.returncode}: {(stderr or '')[:200]}")
+            if process.returncode not in (0, None):
+                failure = f"tlsx exited {process.returncode}"
+                _print("!", f"{failure}: {(stderr or '')[:200]}")
         except subprocess.TimeoutExpired:
             _print("!", f"tlsx timed out after {run_timeout}s -- killing")
+            timed_out = True
+            failure = f"tlsx timed out after {run_timeout}s"
+            # Killing the docker CLI alone leaves the container handshaking.
+            kill_container(container_name)
+            # The rows tlsx printed before the kill are real answers;
+            # communicate() after kill() hands them back.
             try:
                 process.kill()
-                process.wait(timeout=10)
+                stdout, _ = process.communicate(timeout=10)
             except Exception:
                 pass
+            stdout = stdout or ""
         except FileNotFoundError as e:
-            _print("!", f"tlsx runner missing: {e}")
+            failure = "tlsx runner missing"
+            _print("!", f"{failure}: {e}")
         duration = (datetime.now(timezone.utc) - started).total_seconds()
 
         by_target = _parse_tlsx_output(stdout, meta,
                                        ip_hostnames=_hostnames_by_ip(combined_result))
+        unchecked = _unanswered_targets(meta, by_target) if failure else []
+        if unchecked:
+            _print("!", f"{len(unchecked)} of {len(lines)} target(s) not checked; "
+                        f"their earlier security-check findings are kept")
+            _note_unchecked(unchecked, failure)
+        if failure and not by_target:
+            combined_result["metadata"].setdefault("phase_errors", {})["tlsx"] = failure
         _enrich_port_details(combined_result, by_target)
         _attribute_cdn(combined_result, by_target)
 
@@ -545,13 +633,19 @@ def run_tlsx_enrichment(combined_result: dict, settings: dict) -> dict:
                 "command": " ".join(cmd),
             },
         }
+        if failure:
+            combined_result["tlsx"]["scan_metadata"].update(
+                error=failure, unchecked_targets=len(unchecked),
+                **({"timed_out": True} if timed_out else {}))
         _print("+", f"grabbed {with_cert} cert(s) from {len(by_target)} target(s)")
     except Exception as e:  # never raise out of the phase
         _print("!", f"tlsx failed: {e}")
+        _note_unchecked(lines or [], f"tlsx failed: {type(e).__name__}")
         combined_result["metadata"].setdefault("phase_errors", {})["tlsx"] = str(e)
         combined_result.setdefault("tlsx", {"by_target": {}, "discovered_hostnames": [],
                                             "cdn_by_ip": {}, "summary": {},
-                                            "scan_metadata": {"error": str(e)}})
+                                            "scan_metadata": {"error": str(e),
+                                                              "unchecked_targets": len(lines or [])}})
     finally:
         try:
             import shutil

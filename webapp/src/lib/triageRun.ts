@@ -10,9 +10,8 @@
  * `TriageRun` makes the run a row. Three rules follow from that:
  *
  * 1. **The agent authorises before it works.** The run is created through an
- *    internal route that re-checks ownership STRICTLY, ignoring the log-only
- *    `ACCESS_ENFORCE=0` mode, so a ticket minted in observe-mode cannot start a
- *    run on somebody else's project.
+ *    internal route that re-checks ownership STRICTLY, so a ticket cannot start
+ *    a run on somebody else's project.
  * 2. **A stale heartbeat stops blocking.** A crashed agent must not hold a
  *    project forever, so a run that has not checked in for ten minutes no
  *    longer counts as live, and the next create marks it failed.
@@ -22,6 +21,8 @@
  */
 import prisma from '@/lib/prisma'
 import { isActivationInProgress } from '@/lib/activationLock'
+import { meetsLevel, projectAccess } from '@/lib/authz/projectAccess'
+import { PERMISSIONS } from '@/lib/authz/permissions'
 import { MCP_RUN_COOLDOWN_MS, MCP_RUNS_PER_DAY } from '@/lib/triage/limits'
 
 /** Statuses in which a run still intends to write. */
@@ -268,14 +269,21 @@ export interface StartRefusal {
 export async function refuseTriageStart(
   projectId: string,
   actorUserId: string,
+  opts: { actingAs?: boolean } = {},
 ): Promise<StartRefusal | null> {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { id: true, userId: true },
-  })
-  // A project that does not exist and one owned by somebody else are the same
-  // answer, so this cannot be used to enumerate project ids.
-  if (!project || project.userId !== actorUserId) {
+  // A project that does not exist and one the actor cannot see are the same
+  // answer, so this cannot be used to enumerate project ids. The actor is the
+  // person the run is for, who may be a collaborator (step 5.3: the agent sends
+  // the ticket's `sub`, while the run reads the owner's graph): their access must
+  // reach `triage:run`'s level, as the ticket route and the MCP start asked of the
+  // permission itself. Below that level a run never starts. A run started while an
+  // admin acts as the actor reaches through a share no further than read (D-22),
+  // as can() judged the ticket (step 5.6).
+  const access = opts.actingAs === true
+    ? await projectAccess({ userId: actorUserId }, projectId, { actingAs: true })
+    : await projectAccess({ userId: actorUserId }, projectId)
+  const level = PERMISSIONS['triage:run'].level
+  if (!access || level === null || !meetsLevel(access, level)) {
     return { reason: 'Not found' }
   }
 

@@ -9,23 +9,39 @@
  * own actions. Admins included: there is no act-as path to minting.
  *
  * Listing keeps the admin bypass so an admin can audit tokens during an
- * incident. Revoking is a safe privilege; minting is not.
+ * incident, except Root's (identity switch on: `root_protected`). Revoking is a
+ * safe privilege; minting is not.
+ *
+ * With the permissions switch on a scope is grantable only while the account holds the
+ * permissions it maps to (step 3.10): the mint refuses the others, and the list names them so
+ * the screen shows them disabled with the reason.
+ *
+ * With RBAC_SHARING_ENABLED on a token can opt in to the projects shared with its user, optionally
+ * narrowed to an allowlist (step 4.10; SH-42); the mint stores the choice and the list shows it.
+ * With the switch off neither field is read from a body or listed, as before (DV-30).
  */
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { verifyPassword } from '@/lib/auth'
 import { getSession, requireUserAccess } from '@/lib/session'
-import { checkLockout, recordFailure, clearAttempts } from '@/lib/loginThrottle'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { checkStepUp } from '@/lib/authz/stepUp'
 import { writeAudit } from '@/lib/audit'
 import {
   generateToken,
   resolveExpiry,
   sanitizeTokenName,
   validateScopes,
+  validateSharedReach,
 } from '@/lib/mcpAuth'
 import { validateProfile } from '@/lib/mcp/profiles'
 import { internalError, withRouteErrors } from '@/lib/routeErrors'
+import { readJsonBody } from '@/lib/jsonBody'
+import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 import { agentInTheLoopEnabled } from '@/lib/agentInTheLoop'
+import { rootTokensRefusal } from '@/lib/authz/rootProtection'
+import { scopeGrantRefusal, ungrantableScopesOf } from '@/lib/mcp/scopePermissions'
+import { rbacFlags } from '@/lib/authz/flags'
+import { mcpTokenQuotaRefusal, mcpTokenQuotaView } from '@/lib/authz/quotas'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -43,21 +59,37 @@ const LIST_SELECT = {
   createdAt: true,
 } as const
 
+/** The token row as the screen reads it; the shared-project opt-in only with the sharing switch on. */
+function tokenSelect() {
+  return rbacFlags().sharing
+    ? { ...LIST_SELECT, includeSharedProjects: true, projectAllowlist: true }
+    : LIST_SELECT
+}
+
 export const GET = withRouteErrors('Could not load tokens', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
-  const denied = await requireUserAccess(request, id)
+  const denied = await requireUserAccess(request, id, { mode: 'read' }) ?? await rootTokensRefusal(request, id, 'list_mcp_tokens')
   if (denied) return denied
 
   try {
     const tokens = await prisma.mcpAccessToken.findMany({
       where: { userId: id },
-      select: LIST_SELECT,
+      select: tokenSelect(),
       orderBy: { createdAt: 'desc' },
     })
     // Expired and revoked rows stay visible: "why did my agent stop working" is
     // the common support question, and hiding the answer makes it harder.
     // The browser cannot read the deployment's switches; the token UI needs this one.
-    return NextResponse.json({ tokens, features: { agentInTheLoop: agentInTheLoopEnabled() } })
+    // `ungrantableScopes` exists only with the permissions switch on (off: today's answer).
+    const ungrantable = await ungrantableScopesOf(id)
+    // The token quotas (step 6.8), so the screen offers only the expiries they allow; absent when none applies.
+    const tokenQuota = await mcpTokenQuotaView(id)
+    return NextResponse.json({
+      tokens,
+      features: { agentInTheLoop: agentInTheLoopEnabled() },
+      ...(ungrantable ? { ungrantableScopes: ungrantable } : {}),
+      ...(tokenQuota ? { tokenQuota } : {}),
+    })
   } catch (error) {
     return internalError(error, 'Could not load tokens', { log: '[mcp-tokens] list failed' })
   }
@@ -65,24 +97,28 @@ export const GET = withRouteErrors('Could not load tokens', async (request: Next
 
 export const POST = withRouteErrors('Could not create the token', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
-  const session = await getSession()
+  const session = await getSession({ fresh: true })
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  // Self-only, on the REAL identity. Not requireUserAccess: that carries the
-  // admin bypass, which must not extend to minting.
+  // Self-only, on the REAL identity. Not requireUserAccess: even its write rule
+  // admits the internal key and an admin acting as a managed account, and
+  // neither may mint.
   if (session.userId !== id) {
     return NextResponse.json(
       { error: 'A token can only be created by its own user, signed in as themselves.' },
       { status: 403 }
     )
   }
+  // Minting is self:mcp_tokens (§5.3; off with MCP_SERVER_ENABLED off once the permissions switch
+  // is on), on a fresh read like the step-up below. Listing and revoking one's tokens stay open.
+  const refused = await requireSelfPermission(request, id, 'self:mcp_tokens', { fresh: true })
+  if (refused) return refused
 
-  let body: Record<string, unknown>
-  try {
-    body = await request.json()
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
-  }
+  // Same-origin JSON whatever the identity switch (ID-26, step 2.12): a token is a credential.
+  if (!sameOrigin(request)) return crossOriginResponse(request)
+  const parsed = await readJsonBody(request)
+  if (parsed instanceof NextResponse) return parsed
+  const body = parsed.body
 
   const name = sanitizeTokenName(body.name)
   if (!name) return NextResponse.json({ error: 'A token name is required' }, { status: 400 })
@@ -102,33 +138,33 @@ export const POST = withRouteErrors('Could not create the token', async (request
   if ('error' in expiryResult) {
     return NextResponse.json({ error: expiryResult.error }, { status: 400 })
   }
+  // The opt-in to shared projects is part of what the password below confirms.
+  const reach = rbacFlags().sharing ? validateSharedReach(body.includeSharedProjects, body.projectAllowlist) : null
+  if (reach && 'error' in reach) {
+    return NextResponse.json({ error: reach.error }, { status: 400 })
+  }
+  // Before the password: a scope the person cannot hold costs no step-up attempt.
+  const ungrantable = await scopeGrantRefusal(id, scopeResult.scopes)
+  if (ungrantable) return NextResponse.json(ungrantable, { status: 403 })
+  // The token quotas (step 6.8, GV-13), also before the password: the longest lifetime ("never"
+  // included) and the count of tokens that still work.
+  const overQuota = await mcpTokenQuotaRefusal(id, expiryResult.expiresAt, { counting: true })
+  if (overQuota) return overQuota
 
   // Step-up: a stolen 7-day session cookie must not silently become a
-  // credential that outlives logout and password changes.
-  //
-  // THROTTLED with the same limiter the login route uses. This verifies the
-  // same credential with the same slow KDF, so without a throttle it is (a) an
-  // unlimited-rate password oracle for whoever holds a stolen session cookie -
-  // defeating the very step-up it implements - and (b) a cheap CPU-exhaustion
-  // lever for any authenticated user. The key is the token owner's id, so one
-  // account's failures cannot lock out another's.
-  const throttleIp = request.headers?.get('x-forwarded-for')?.split(',')[0]?.trim() ?? null
-  const lock = checkLockout(`mcp-token-mint:${id}`, throttleIp)
-  if (lock.locked) {
+  // credential that outlives logout and password changes. The helper throttles
+  // it with the login limiter, keyed on this (self-only) owner. This route keeps
+  // the answers its clients know: 401 for a missing or wrong password, 429 locked.
+  const proof = await checkStepUp(request, body.password)
+  if (proof.outcome === 'locked') {
     return NextResponse.json(
-      { error: `Too many incorrect passwords. Try again in ${lock.retryAfterSeconds}s.` },
+      { error: `Too many incorrect passwords. Try again in ${proof.retryAfterSeconds}s.` },
       { status: 429 }
     )
   }
-
-  const password = typeof body.password === 'string' ? body.password : ''
-  const user = await prisma.user.findUnique({ where: { id }, select: { password: true } })
-  if (!user) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  if (!password || !(await verifyPassword(password, user.password))) {
-    recordFailure(`mcp-token-mint:${id}`, throttleIp)
+  if (proof.outcome !== 'ok') {
     return NextResponse.json({ error: 'Password is incorrect' }, { status: 401 })
   }
-  clearAttempts(`mcp-token-mint:${id}`, throttleIp)
 
   try {
     const { plaintext, hash, prefix } = generateToken()
@@ -141,8 +177,9 @@ export const POST = withRouteErrors('Could not create the token', async (request
         scopes: scopeResult.scopes,
         profile: profileResult.profile,
         expiresAt: expiryResult.expiresAt,
+        ...(reach ?? {}),
       },
-      select: LIST_SELECT,
+      select: tokenSelect(),
     })
 
     await writeAudit({
@@ -153,6 +190,7 @@ export const POST = withRouteErrors('Could not create the token', async (request
       after: {
         tokenPrefix: prefix, name, scopes: scopeResult.scopes,
         profile: profileResult.profile, expiresAt: expiryResult.expiresAt,
+        ...(reach ?? {}),
       },
       source: 'ui',
     })

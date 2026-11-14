@@ -12,7 +12,7 @@ import { describe, test, expect, beforeEach, vi } from 'vitest'
 
 const prismaMock = vi.hoisted(() => ({
   scanVersion: {
-    update: vi.fn(), create: vi.fn(), findFirst: vi.fn(), findUnique: vi.fn(),
+    update: vi.fn(), updateMany: vi.fn(), create: vi.fn(), findFirst: vi.fn(), findUnique: vi.fn(),
     delete: vi.fn(), findMany: vi.fn(),
   },
   scanJob: { create: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), update: vi.fn() },
@@ -47,6 +47,7 @@ import {
   SnapshotFreezeError,
   persistPlanManifest,
 } from './scanTimeline'
+import { CurrentVersionMovedError } from './projectGraphLock'
 
 const CURRENT = {
   id: 'vCur', seq: 2, label: 'Scan 2 - 2026-07-01 10:00 UTC',
@@ -59,6 +60,7 @@ beforeEach(() => {
   prismaMock.scanVersion.findFirst.mockResolvedValue({ seq: 2 })
   prismaMock.scanVersion.update.mockImplementation(async ({ where, data }: never) =>
     ({ ...CURRENT, ...(data as object), id: (where as { id: string }).id }))
+  prismaMock.scanVersion.updateMany.mockResolvedValue({ count: 1 })
   prismaMock.scanVersion.create.mockResolvedValue({ ...CURRENT, id: 'vNew', seq: 3, label: 'Scan 3' })
   // Run the transaction body against the same mock client.
   prismaMock.$transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => fn(prismaMock))
@@ -87,8 +89,8 @@ describe("prepareVersionsForFullScan — mode 'new'", () => {
     expect(snapshotMock.storeSnapshot).toHaveBeenCalledWith('vCur', expect.objectContaining({ nodeCount: 100 }))
     // Demote then create, inside one transaction.
     expect(prismaMock.$transaction).toHaveBeenCalled()
-    expect(prismaMock.scanVersion.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'vCur' }, data: { isCurrent: false } })
+    expect(prismaMock.scanVersion.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'vCur', isCurrent: true }, data: { isCurrent: false } })
     )
     const created = prismaMock.scanVersion.create.mock.calls[0][0].data
     expect(created).toMatchObject({ projectId: 'p1', seq: 3, isCurrent: true, snapshot: null })
@@ -102,7 +104,7 @@ describe("prepareVersionsForFullScan — mode 'new'", () => {
     await expect(prepareVersionsForFullScan('p1', 'new', 'u1'))
       .rejects.toBeInstanceOf(SnapshotFreezeError)
     expect(snapshotMock.storeSnapshot).not.toHaveBeenCalled()
-    expect(prismaMock.scanVersion.update).not.toHaveBeenCalled()
+    expect(prismaMock.scanVersion.updateMany).not.toHaveBeenCalled()
     expect(prismaMock.scanVersion.create).not.toHaveBeenCalled()
   })
 
@@ -113,7 +115,7 @@ describe("prepareVersionsForFullScan — mode 'new'", () => {
     snapshotMock.storeSnapshot.mockRejectedValue(new Error('snapshot too large'))
     await expect(prepareVersionsForFullScan('p1', 'new', 'u1'))
       .rejects.toThrow(/Could not store the snapshot/)
-    expect(prismaMock.scanVersion.update).not.toHaveBeenCalled()
+    expect(prismaMock.scanVersion.updateMany).not.toHaveBeenCalled()
     expect(prismaMock.scanVersion.create).not.toHaveBeenCalled()
   })
 
@@ -197,9 +199,17 @@ describe('rotateToNextVersion — concurrent writers (double-submit)', () => {
     prismaMock.scanVersion.create.mockResolvedValue({ ...CURRENT, id: 'vNew', seq: 3 })
     await rotateToNextVersion('p1', 'vCur')
     expect(prismaMock.$transaction).toHaveBeenCalled()
-    expect(prismaMock.scanVersion.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'vCur' }, data: { isCurrent: false } })
+    expect(prismaMock.scanVersion.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'vCur', isCurrent: true }, data: { isCurrent: false } })
     )
+  })
+
+  test('a version another writer already demoted is refused, never a second current version (S-4)', async () => {
+    // A writer outside the project graph lock read vCur as current, then lost
+    // the race: the winner demoted vCur and opened its own current version.
+    prismaMock.scanVersion.updateMany.mockResolvedValue({ count: 0 })
+    await expect(rotateToNextVersion('p1', 'vCur')).rejects.toBeInstanceOf(CurrentVersionMovedError)
+    expect(prismaMock.scanVersion.create).not.toHaveBeenCalled()
   })
 })
 
@@ -274,7 +284,19 @@ describe('recordScanStart', () => {
   // History is a side effect of starting a scan; it must never fail the start.
   test('a DB failure never propagates to the caller', async () => {
     prismaMock.scanJob.create.mockRejectedValue(new Error('db down'))
-    await expect(recordScanStart({ projectId: 'p1', kind: 'gvm' })).resolves.toBeUndefined()
+    await expect(recordScanStart({ projectId: 'p1', kind: 'gvm' })).resolves.toBeNull()
+  })
+
+  // The queue links its row to this id, or the jobs list shows the scan twice.
+  test('returns the id of the row it wrote', async () => {
+    prismaMock.scanJob.create.mockResolvedValue({ id: 'j9' })
+    await expect(recordScanStart({ projectId: 'p1', kind: 'gvm' })).resolves.toBe('j9')
+  })
+
+  test('an unattended start with no schedule can say so', async () => {
+    prismaMock.scanJob.create.mockResolvedValue({ id: 'j9' })
+    await recordScanStart({ projectId: 'p1', kind: 'gvm', trigger: 'scheduled' })
+    expect(prismaMock.scanJob.create.mock.calls[0][0].data).toMatchObject({ trigger: 'scheduled', scheduleId: null })
   })
 })
 

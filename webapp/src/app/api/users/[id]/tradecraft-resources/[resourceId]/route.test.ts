@@ -16,6 +16,7 @@ import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
 const mockFindFirst = vi.fn()
 const mockUpdate = vi.fn()
 
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/prisma', () => ({
   default: {
     userTradecraftResource: {
@@ -185,6 +186,30 @@ describe('PUT strips server-managed fields (regression)', () => {
     expect(r.status).toBe(200)
     const args = mockUpdate.mock.calls[0]?.[0] as { data: Record<string, unknown> }
     expect(args.data.githubTokenOverride).toBe('ghp_NEW_TOKEN_HERE')
+  })
+
+  test('a relation input, the owner, lastError and unknown keys never reach prisma.update (review of 1.6)', async () => {
+    const r = await route.PUT(
+      makePut({
+        name: 'Renamed', llmModel: 'gpt-4o',
+        // a nested write Prisma would apply: move the resource to another account
+        user: { connect: { id: 'attacker' } },
+        userId: 'attacker', id: 'res-other', lastError: 'forged', somethingElse: 1,
+      }) as never,
+      PARAMS() as never,
+    )
+    expect(r.status).toBe(200)
+    const args = mockUpdate.mock.calls[0]?.[0] as { where: unknown; data: Record<string, unknown> }
+    expect(args.where).toEqual({ id: 'res-1' })
+    expect(args.data).toEqual({ name: 'Renamed', llmModel: 'gpt-4o' })
+  })
+
+  test('every field the resource form sends still reaches the update', async () => {
+    const form = { name: 'N', url: 'https://book.hacktricks.wiki', enabled: false, cacheTtlSec: 60, llmModel: 'gpt-4o', githubTokenOverride: 'ghp_typed' }
+    const r = await route.PUT(makePut(form) as never, PARAMS() as never)
+    expect(r.status).toBe(200)
+    const args = mockUpdate.mock.calls[0]?.[0] as { data: Record<string, unknown> }
+    expect(args.data).toEqual(form)
   })
 
   test('returns 404 when resource not owned by user', async () => {

@@ -1,9 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { hashPassword, verifyPassword } from '@/lib/auth'
+import { hashPassword } from '@/lib/auth'
 import { getSession } from '@/lib/session'
 import { writeAudit } from '@/lib/audit'
 import { internalError } from '@/lib/routeErrors'
+import { readJsonBody } from '@/lib/jsonBody'
+import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
+import { validateNewPassword } from '@/lib/authz/passwordPolicy'
+import { passwordPolicyInForce } from '@/lib/authz/passwordPolicyInForce'
+import { checkStepUp, requireStepUp } from '@/lib/authz/stepUp'
+import { writeUserAudit } from '@/lib/userAudit'
+import { invalidatePrincipal } from '@/lib/authz/principal'
+import { rootProtectedRefusal } from '@/lib/authz/rootProtection'
+import { requireRootPower } from '@/lib/authz/rootPowers'
+import { rbacFlags } from '@/lib/authz/flags'
+import { sessionHolds } from '@/lib/authz/adminPermission'
+import { forbiddenResponse } from '@/lib/authz/guards'
+import { refuseWhileActingAs } from '@/lib/authz/actAsRefusals'
+import { setLoginCookie } from '@/lib/loginCookie'
+import { issueLoginToken } from '@/lib/authz/sessionLifetime'
+import { sessionDeviceId } from '@/lib/authz/deviceSessions'
+import { getClientMeta } from '@/lib/requestMeta'
+import { parseReason, reasonRequired, resetCredentials, resetStatusRefusal } from '@/lib/authz/resetCredentials'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -13,57 +31,123 @@ interface RouteParams {
 export async function PUT(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const session = await getSession()
+    const session = await getSession({ fresh: true })
 
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const { newPassword, currentPassword } = await request.json()
+    // Same-origin JSON whatever the identity switch (ID-26, step 2.12).
+    if (!sameOrigin(request)) return crossOriginResponse(request)
+    const parsed = await readJsonBody(request)
+    if (parsed instanceof NextResponse) return parsed
+    const { newPassword: rawNewPassword, currentPassword, stepUpPassword, requirePasswordChange, reason: rawReason } = parsed.body
+    // Anything but a string is the empty password, which the floor refuses.
+    const newPassword = typeof rawNewPassword === 'string' ? rawNewPassword : ''
 
-    if (!newPassword || newPassword.length < 4) {
+    const check = validateNewPassword(newPassword)
+    if (!check.ok) {
+      return NextResponse.json({ error: check.message, code: check.code }, { status: 400 })
+    }
+    const identity = rbacFlags().identity
+    if (identity && requirePasswordChange !== undefined && typeof requirePasswordChange !== 'boolean') {
       return NextResponse.json(
-        { error: 'Password must be at least 4 characters' },
-        { status: 400 }
+        { error: 'requirePasswordChange must be true or false', code: 'invalid_field', field: 'requirePasswordChange' },
+        { status: 400 },
       )
     }
 
-    const isAdmin = session.role === 'admin'
     const isSelf = session.userId === id
 
-    // Standard users can only change their own password
-    if (!isAdmin && !isSelf) {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    // Setting another account's password is resetting its credentials.
+    if (!isSelf && !(await sessionHolds(session, 'users:reset_credentials', { fresh: true }))) {
+      return forbiddenResponse('users:reset_credentials')
+    }
+    // The password of the account acted as stays its own (§4.7), whoever may reset it otherwise.
+    if (!isSelf) {
+      const actingAs = await refuseWhileActingAs({ session, targetUserId: id }, 'change_password')
+      if (actingAs) return actingAs
     }
 
-    // Standard users must provide current password
-    if (!isAdmin && isSelf) {
-      if (!currentPassword) {
+    // Identity switch on (step 2.10): a password set for someone else is a credentials reset.
+    const reset = identity && !isSelf
+    const reason = reset ? parseReason(rawReason) : null
+    if (reason instanceof NextResponse) return reason
+
+    let adminTarget = false
+    if (isSelf) {
+      // Everyone, admins included, proves the current password, through the shared
+      // step-up limiter. The answers keep the statuses this form always had.
+      const proof = await checkStepUp(request, currentPassword)
+      if (proof.outcome === 'missing') {
+        return NextResponse.json({ error: 'Current password is required', code: 'step_up_required' }, { status: 400 })
+      }
+      if (proof.outcome === 'wrong') {
+        return NextResponse.json({ error: 'Current password is incorrect', code: 'step_up_failed' }, { status: 401 })
+      }
+      if (proof.outcome === 'locked') {
         return NextResponse.json(
-          { error: 'Current password is required' },
-          { status: 400 }
+          { error: `Too many incorrect passwords. Try again in ${proof.retryAfterSeconds}s.`, code: 'step_up_locked' },
+          { status: 429, headers: { 'Retry-After': String(proof.retryAfterSeconds) } },
         )
       }
+    } else {
+      const rootRefusal = await rootProtectedRefusal(request, session, id, 'reset_password')
+      if (rootRefusal) return rootRefusal
+      // An admin resetting another admin takes over that account: the acting
+      // admin's own password first, and with the identity switch on only the
+      // confirmed Root may (step 2.6). A member's reset needs none.
+      const target = await prisma.user.findUnique({ where: { id }, select: { role: true } })
+      adminTarget = target?.role === 'admin'
+      if (adminTarget) {
+        const refusal = rbacFlags().identity
+          ? await requireRootPower(request, session, stepUpPassword, 'Only Root can reset another admin\'s password.')
+          : await requireStepUp(request, stepUpPassword)
+        if (refusal) return refusal
+      }
+    }
 
-      const user = await prisma.user.findUnique({
+    // Identity switch on: the policy in force (the instance minimum, the deny list and the two
+    // rules), judged against the address of the account the password is for.
+    const account = identity
+      ? await prisma.user.findUnique({
         where: { id },
-        select: { password: true },
+        select: { email: true, status: true, lastLoginAt: true, mustChangePassword: true, sessionVersion: true },
       })
-
-      if (!user || !user.password) {
-        return NextResponse.json({ error: 'User not found' }, { status: 404 })
+      : null
+    if (identity) {
+      const full = validateNewPassword(newPassword, await passwordPolicyInForce(), { email: account?.email })
+      if (!full.ok) {
+        return NextResponse.json({ error: full.message, code: full.code }, { status: 400 })
       }
+    }
 
-      const valid = await verifyPassword(currentPassword, user.password)
-      if (!valid) {
-        return NextResponse.json(
-          { error: 'Current password is incorrect' },
-          { status: 401 }
-        )
-      }
+    // The takeover a reset allows is made visible (ID-18, ID-19): the version rises and the
+    // tokens end whether or not a change is required, the open links are cancelled, the person
+    // gets a notice, and an account that has signed in before needs a reason; the change and its
+    // row commit together. Same path as "Reset credentials" in temporary mode.
+    if (reset) {
+      if (!account) return NextResponse.json({ error: 'User not found', code: 'user_not_found' }, { status: 404 })
+      const refused = resetStatusRefusal(account.status, 'temporary')
+      if (refused) return refused
+      if (account.lastLoginAt && !reason) return reasonRequired()
+      const done = await resetCredentials(request, session, id, {
+        mode: 'temporary',
+        passwordHash: await hashPassword(newPassword),
+        requireChange: requirePasswordChange !== false,
+        reason,
+        adminTarget,
+        judgedEmail: account.email,
+        attempted: 'reset_password',
+      })
+      if (done instanceof NextResponse) return done
+      return NextResponse.json({ success: true, revokedMcpTokens: done.tokensRevoked })
     }
 
     const hashed = await hashPassword(newPassword)
+    // Identity switch on: the account's own change clears the must-change flag (ID-17). Off:
+    // Phase 1's write of the password alone.
+    const data = identity ? { password: hashed, mustChangePassword: false } : { password: hashed }
 
     // Any password change revokes every MCP personal access token. An admin can
     // reset another user's password without knowing the current one (above), so
@@ -71,15 +155,13 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     // transaction as the password write: a half-applied reset would be worse
     // than either outcome.
     const [, revoked] = await prisma.$transaction([
-      prisma.user.update({
-        where: { id },
-        data: { password: hashed },
-      }),
+      prisma.user.update({ where: { id }, data }),
       prisma.mcpAccessToken.updateMany({
         where: { userId: id, revokedAt: null },
         data: { revokedAt: new Date() },
       }),
     ])
+    invalidatePrincipal(id)
 
     if (revoked.count > 0) {
       await writeAudit({
@@ -87,12 +169,31 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         action: 'mcp-token.revoke-all',
         targetType: 'user',
         targetId: id,
-        after: { reason: 'password changed', revokedCount: revoked.count, byAdmin: isAdmin && !isSelf },
+        after: { reason: 'password changed', revokedCount: revoked.count, byAdmin: !isSelf },
         source: 'api',
       })
     }
 
-    return NextResponse.json({ success: true, revokedMcpTokens: revoked.count })
+    // The host scripts write the same two actions with source `system`.
+    await writeUserAudit(request, session, {
+      action: isSelf ? 'user.password_changed' : 'user.credentials_reset',
+      targetId: id,
+      after: { revokedMcpTokens: revoked.count },
+    })
+
+    const response = NextResponse.json({ success: true, revokedMcpTokens: revoked.count })
+    // A forced change done: this browser's cookie drops the must-change claim (same version),
+    // so the person goes on without signing in again; any other cookie with the claim now
+    // disagrees with the account and signs in again (session.ts). The browser keeps its device
+    // session (governance on, step 6.10).
+    if (isSelf && account?.mustChangePassword) {
+      const { token, maxAge } = await issueLoginToken(
+        { id, role: session.role, sessionVersion: account.sessionVersion },
+        { device: { meta: getClientMeta(request), keep: sessionDeviceId(session) } },
+      )
+      setLoginCookie(response, request, token, maxAge)
+    }
+    return response
   } catch (error) {
     return internalError(error, 'Failed to change password')
   }

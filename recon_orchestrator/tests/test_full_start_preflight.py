@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 import api
 from models import ReconStartRequest, ReconState, ReconStatus
+from tests.job_credentials import job_credential, use_keys
 
 
 class _SpyManager:
@@ -39,7 +40,9 @@ def _start(webapp_api_url, monkeypatch, project):
         return project
 
     monkeypatch.setattr(api, "_fetch_project_for_preflight", _fetch)
-    req = ReconStartRequest(project_id="p1", user_id="u1", webapp_api_url=webapp_api_url)
+    use_keys(monkeypatch)
+    req = ReconStartRequest(project_id="p1", user_id="u1", webapp_api_url=webapp_api_url,
+                            job_credential=job_credential("p1", "u1"))
     return fetched, (lambda: asyncio.run(api.start_recon("p1", req)))
 
 
@@ -77,3 +80,64 @@ def test_a_scope_the_webapp_could_not_derive_refuses_the_start(monkeypatch, spy)
         run()
     assert ei.value.status_code == 400
     assert spy.calls == []
+
+
+# --- IP mode: the hostname include entries (design §9 "Hard guardrail") ---------
+
+IP_PROJECT = {"ipMode": True, "targetDomain": "", "targetIps": ["203.0.113.10"]}
+
+
+@pytest.mark.parametrize("include,expected", [
+    ([], []),
+    (["*.example.com", "app.example.org"], ["example.com", "app.example.org"]),
+    (["*example.com", " *.EXAMPLE.com. ", "example.com"], ["example.com"]),
+    (["", None, 7], ["7"]),
+])
+def test_ip_mode_guardrails_the_include_bases(include, expected):
+    from batch_scope import guardrail_targets
+    assert guardrail_targets({**IP_PROJECT, "ipHostnameInclude": include}) == expected
+
+
+def test_ip_mode_without_an_include_list_has_nothing_to_guardrail():
+    from batch_scope import guardrail_targets
+    assert guardrail_targets(IP_PROJECT) == []
+    assert guardrail_targets({**IP_PROJECT, "ipHostnameInclude": "*.agency.gov.uk"}) == []
+
+
+def test_the_addresses_are_never_guardrail_names():
+    from batch_scope import guardrail_targets
+    names = guardrail_targets({**IP_PROJECT, "ipHostnameInclude": ["*.example.com"]})
+    assert "203.0.113.10" not in names
+
+
+@pytest.mark.parametrize("mode", ["record_filter", "record_only", "ip_only"])
+def test_an_ip_project_with_a_blocked_include_entry_is_refused(mode, monkeypatch, spy):
+    """Checked whatever the mode: a rescope to record_filter would scan under it
+    without the list being written (and checked by the webapp) again."""
+    project = {**IP_PROJECT, "ipHostnameMode": mode,
+               "ipHostnameInclude": ["*.example.com", "*.agency.gov.uk"]}
+    _, run = _start("", monkeypatch, project)
+    with pytest.raises(HTTPException) as ei:
+        run()
+    assert ei.value.status_code == 403
+    assert spy.calls == []
+
+
+def test_an_ip_project_with_a_clean_include_list_starts(monkeypatch, spy):
+    project = {**IP_PROJECT, "ipHostnameMode": "record_filter", "ipHostnameInclude": ["*.example.com"]}
+    _, run = _start("", monkeypatch, project)
+    run()
+    assert len(spy.calls) == 1
+
+
+def test_an_ip_project_never_guardrails_its_addresses(monkeypatch, spy):
+    seen = []
+
+    def _blocked(name):
+        seen.append(name)
+        return False, ""
+
+    monkeypatch.setattr("hard_guardrail.is_hard_blocked", _blocked)
+    _, run = _start("", monkeypatch, {**IP_PROJECT, "ipHostnameInclude": ["*.example.com"]})
+    run()
+    assert seen == ["example.com"]

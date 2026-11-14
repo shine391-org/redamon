@@ -272,7 +272,7 @@ flowchart TB
 | MCP Nmap | http://127.0.0.1:8004/sse | Loopback + token | Nmap network scanner |
 | Metasploit Progress | http://127.0.0.1:8013 | Loopback | Live progress streaming for long-running exploits |
 | Tunnel Manager | http://127.0.0.1:8015 | Loopback | ngrok/chisel tunnel configuration API |
-| RedAmon Terminal | ws://127.0.0.1:8016 | Loopback | Kali sandbox PTY shell access (xterm.js; browser reaches it via the agent proxy) |
+| RedAmon Terminal | ws://kali-sandbox:8016 | Docker network + token (not published on the host) | Kali sandbox PTY shell access (xterm.js; browser reaches it via the agent proxy, the only caller holding the token) |
 | Metasploit Listener | 0.0.0.0:4444 | LAN (by design) | Reverse shell listener — a target connects back here in direct/no-tunnel mode |
 
 The plugin services (`plugin-runner`, `plugin-gateway`) publish no host port; see
@@ -480,7 +480,7 @@ flowchart TB
     subgraph Core["Core services (redamon / orchestrator-net)"]
         Webapp[Next.js Webapp :3000<br/>Plugin Manager · UI host<br/>Gateway routes]
         Agent["AI Agent :8090<br/>skill-part seam<br/>/plugins/* master-key API"]
-        Postgres[(PostgreSQL<br/>plugin_installs · plugin_data<br/>plugin_overrides · plugin_platform_state)]
+        Postgres[(PostgreSQL<br/>plugin_installs · plugin_data<br/>plugin_overrides · plugin_platform_state<br/>plugin_access_rules)]
         ReconOrch[Recon Orchestrator<br/>reconcile tick]
     end
 
@@ -516,7 +516,7 @@ flowchart TB
 | `plugin-gateway` | A small standard-library proxy built from the same image. It is the only door between `plugins-net` and the rest of the stack: `:7071` passes only the webapp's `/api/plugin-gateway/v1/*` (plugin code) and `/api/plugin-runner/v1/*` (the supervisor's run list), and `:7072` passes only the webapp's calls to the supervisor's `/runner/v1/*`. It joins `plugins-edge` and `plugins-net`, never `redamon`. |
 | `plugins-net`, `plugins-edge` | Two `internal` bridge networks (no route out) with `gateway_mode_ipv4: isolated`, which removes the bridge's own address on the host. The overlay adds the webapp to `plugins-edge`. |
 | `plugins` volume | The installed plugin versions. Only the webapp's Plugin Manager writes it (mounted at `/data/plugins` through the overlay); only `./redamon.sh purge` removes it. |
-| Postgres tables | `plugin_installs`, `plugin_data`, `plugin_overrides`, `plugin_platform_state`. |
+| Postgres tables | `plugin_installs`, `plugin_data`, `plugin_overrides`, `plugin_platform_state`, `plugin_access_rules` (the per-plugin allowlist). |
 
 Nothing in the platform publishes a host port.
 

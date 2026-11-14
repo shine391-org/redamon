@@ -16,7 +16,9 @@ from recon.partial_recon_modules.helpers import (
     _should_include_root_domain,
     host_in_roots,
     include_root_for,
+    ip_mode_recon,
     partial_settings,
+    run_is_ip_mode,
     scope_roots,
 )
 from recon.partial_recon_modules.graph_builders import (
@@ -30,6 +32,7 @@ from recon.partial_recon_modules.graph_builders import (
 )
 from recon.partial_recon_modules.user_inputs import _create_user_subdomains_in_graph
 from recon.helpers import build_target_urls, extract_targets_from_recon
+from recon.helpers.archive_leaks import report_archive_leaks
 from recon.helpers.auth_profile import merge_auth_headers
 from recon.helpers.auth_profile import profile_from_settings as _profile_of
 from recon.helpers import discovery_inventory as _di, discovery_adapters as _da
@@ -107,14 +110,14 @@ def run_katana(config: dict) -> None:
         )
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "subdomains": [],
             "http_probe": {
                 "by_url": {},
             },
-        }
+        }, settings)
 
     # Inject user-provided URLs into the target list
     if user_urls:
@@ -130,7 +133,7 @@ def run_katana(config: dict) -> None:
     #   - Custom URLs already merged into http_probe.by_url upstream
     # Replaces the old "BaseURLs only" logic where freshly-discovered subdomains
     # were silently dropped until httpx ran again.
-    ips, hostnames, _ = extract_targets_from_recon(recon_data)
+    ips, hostnames, _ = extract_targets_from_recon(recon_data, settings)
     target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=False)
 
     # target_domains is the unique-host set Katana needs for in-scope filtering.
@@ -193,11 +196,13 @@ def run_katana(config: dict) -> None:
         KATANA_EXCLUDE_PATTERNS,
         KATANA_PARALLELISM,
         KATANA_CONCURRENCY,
+        settings=settings,
+        recon_data=recon_data,
     )
     print(f"[+][Partial Recon] Katana found {len(katana_urls)} URLs")
 
     # Organize discovered URLs into by_base_url structure
-    organized_data = organize_endpoints(katana_urls, settings=settings)
+    organized_data = organize_endpoints(katana_urls, settings=settings, recon_data=recon_data)
 
     # Mark all endpoints with sources=['katana']
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -292,7 +297,7 @@ def run_katana(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 
@@ -375,14 +380,14 @@ def run_hakrawler(config: dict) -> None:
         )
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "subdomains": [],
             "http_probe": {
                 "by_url": {},
             },
-        }
+        }, settings)
 
     # Inject user-provided URLs into the target list
     if user_urls:
@@ -394,7 +399,7 @@ def run_hakrawler(config: dict) -> None:
 
     # Union target-builder (see Katana for full rationale): BaseURLs ∪ uncovered
     # Subdomains ∪ user URLs, deduplicated. Uncovered subs get both schemes.
-    ips, hostnames, _ = extract_targets_from_recon(recon_data)
+    ips, hostnames, _ = extract_targets_from_recon(recon_data, settings)
     target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=False)
 
     target_domains = set()
@@ -427,6 +432,14 @@ def run_hakrawler(config: dict) -> None:
     HAKRAWLER_TIMEOUT = settings.get('HAKRAWLER_TIMEOUT', 30)
     HAKRAWLER_MAX_URLS = settings.get('HAKRAWLER_MAX_URLS', 500)
     HAKRAWLER_INCLUDE_SUBS = settings.get('HAKRAWLER_INCLUDE_SUBS', False)
+    # The full pipeline's rule: an EXACT group scans its listed hosts, and -subs
+    # follows links into any subdomain of a seed (every sibling when the root is
+    # a seed). One flag serves every seed, so one EXACT group in the run is enough.
+    from recon.partial_recon_modules.helpers import allowed_hosts_for
+    if HAKRAWLER_INCLUDE_SUBS and any(
+            allowed_hosts_for(r, config.get("domain_groups")) is not None for r in roots):
+        HAKRAWLER_INCLUDE_SUBS = False
+        print("[*][Hakrawler] Listed hosts only (exact scope): subdomain crawling off")
     HAKRAWLER_INSECURE = settings.get('HAKRAWLER_INSECURE', True)
     HAKRAWLER_CUSTOM_HEADERS = merge_auth_headers(settings.get('HAKRAWLER_CUSTOM_HEADERS', []), settings, sorted(target_domains))
     from recon.helpers.auth_profile import append_engagement_identity as _append_identity
@@ -459,11 +472,13 @@ def run_hakrawler(config: dict) -> None:
         # The full pipeline filters Hakrawler with the shared crawl excludes too.
         settings.get('KATANA_EXCLUDE_PATTERNS', []),
         settings.get('HAKRAWLER_PARALLELISM', 4),
+        settings=settings,
+        recon_data=recon_data,
     )
     print(f"[+][Partial Recon] Hakrawler found {len(hakrawler_urls)} URLs")
 
     # Organize discovered URLs into by_base_url structure
-    organized_data = organize_endpoints(hakrawler_urls, settings=settings)
+    organized_data = organize_endpoints(hakrawler_urls, settings=settings, recon_data=recon_data)
 
     # Mark all endpoints with sources=['hakrawler']
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -558,7 +573,7 @@ def run_hakrawler(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 
@@ -673,7 +688,7 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
         recon_data["http_probe"]["by_url"] = filtered_by_url
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "subdomains": [],
@@ -681,7 +696,7 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
                 "by_url": {},
             },
             "metadata": {"include_root_domain": bool(roots) and roots[0] in included_roots},
-        }
+        }, settings)
 
     # Inject user-provided URLs into the target list
     if user_urls:
@@ -691,7 +706,7 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
                 from recon.helpers.target_helpers import add_supplied_http_targets
                 add_supplied_http_targets(recon_data, [url])
 
-    ips, hostnames, _ = extract_targets_from_recon(recon_data)
+    ips, hostnames, _ = extract_targets_from_recon(recon_data, settings)
     target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=False)
 
     target_domains = set()
@@ -904,7 +919,7 @@ def run_zap_ajax_spider_partial(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 
@@ -989,14 +1004,14 @@ def run_ffuf(config: dict) -> None:
         )
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "subdomains": [],
             "http_probe": {
                 "by_url": {},
             },
-        }
+        }, settings)
 
     # Inject user-provided URLs into the target list
     if user_urls:
@@ -1009,7 +1024,7 @@ def run_ffuf(config: dict) -> None:
     # Union target-builder: BaseURLs ∪ uncovered Subdomains ∪ user URLs (see
     # Katana for full rationale). New subs get both schemes; httpx-covered hosts
     # keep only the verified scheme.
-    ips, hostnames, _ = extract_targets_from_recon(recon_data)
+    ips, hostnames, _ = extract_targets_from_recon(recon_data, settings)
     target_urls = build_target_urls(hostnames, ips, recon_data, scan_all_ips=False)
 
     target_domains = set()
@@ -1193,6 +1208,8 @@ def run_ffuf(config: dict) -> None:
         target_domains,
         discovered_base_paths,
         FFUF_PARALLELISM,
+        settings=settings,
+        recon_data=recon_data,
         # F11: ownership execution path, shadows nothing when disabled.
         origin_plan=(ownership_plan.origin_base_paths() if (ownership_plan is not None and ownership_plan.execute) else None),
         extensions_by_origin=(extensions_by_origin if ownership_plan is not None and ownership_plan.execute else None),
@@ -1319,7 +1336,7 @@ def run_ffuf(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 
@@ -1399,6 +1416,11 @@ def run_gau(config: dict) -> None:
         target_domains.add(sub)
 
     print(f"[+][Partial Recon] Total target domains for GAU: {len(target_domains)}")
+    if not target_domains and run_is_ip_mode():
+        # No name whose every address is a target: the archives index names,
+        # and the run's root is the project id (S-6).
+        print("[-][Gau] IP mode: no hostname resolving only to target IPs, nothing to look up")
+        return
 
     # Also get subdomains list for scope filtering later
     all_subdomains = list(target_domains)
@@ -1432,6 +1454,7 @@ def run_gau(config: dict) -> None:
 
     # Run GAU discovery
     print(f"[*][Partial Recon] Running GAU on {len(target_domains)} domains...")
+    archive_quarantined: list = []
     gau_urls, gau_urls_by_domain = run_gau_discovery(
         target_domains,
         GAU_DOCKER_IMAGE,
@@ -1444,6 +1467,7 @@ def run_gau(config: dict) -> None:
         GAU_VERBOSE,
         URLSCAN_API_KEY,
         settings.get('GAU_WORKERS', 10),
+        quarantined_out=archive_quarantined,
     )
     print(f"[+][Partial Recon] GAU discovered {len(gau_urls)} total URLs")
 
@@ -1522,7 +1546,7 @@ def run_gau(config: dict) -> None:
         print(f"[+][Partial Recon]   Dead filtered: {gau_stats.get('gau_skipped_dead', 0)}")
 
     # Build resource_enum result structure (same shape as full pipeline)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": domain,
         "domains": roots,
         "subdomains": all_subdomains,
@@ -1530,6 +1554,7 @@ def run_gau(config: dict) -> None:
             "by_base_url": by_base_url,
             "forms": [],
             "jsluice_secrets": [],
+            "archive_leaks": report_archive_leaks(archive_quarantined, settings, domain),
             "scan_metadata": {
                 "gau_urls_found_total": len(gau_urls),
                 "gau_urls_in_scope": len(in_scope_gau_urls),
@@ -1544,7 +1569,7 @@ def run_gau(config: dict) -> None:
             },
             "external_domains": gau_external_domains,
         },
-    }
+    }, settings)
 
     # Update the graph database
     print(f"[*][Partial Recon] Updating graph database...")
@@ -1794,11 +1819,11 @@ def run_jsluice(config: dict) -> None:
         print(f"[+][Partial Recon] Organized {jsluice_stats['jsluice_new']} new endpoints across {len(by_base_url)} base URLs")
 
     # Build recon_data for graph update (needs domain + subdomains for scope)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "subdomains": [],
-    }
+    }, settings)
 
     # Get subdomains for scope filtering
     if include_graph:
@@ -1907,7 +1932,7 @@ def run_jsluice(config: dict) -> None:
                                     host=parsed.netloc.split(":")[0],
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Created UserInput + linked user URLs via PRODUCED")
 

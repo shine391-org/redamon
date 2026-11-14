@@ -8,16 +8,19 @@
  *
  * Strategy (unchanged from import):
  *   - group nodes by primary label,
- *   - MERGE on the label's uniqueness constraint keys when it has any (avoids
- *     IndexEntryConflictException), CREATE otherwise,
+ *   - MERGE on the label's uniqueness constraint keys plus the target tenant
+ *     (see Tenancy) when it has any (avoids IndexEntryConflictException), CREATE
+ *     otherwise,
  *   - batch with UNWIND,
  *   - recreate relationships by the temporary `_exportId`, then strip it.
  *
  * Tenancy: `project_id` is ALWAYS stamped from the caller's argument (never taken
  * from the payload), so a restore can only ever write into the target project.
+ * Every MERGE also matches on it, and the agent-session nodes get fresh ids
+ * (`freshSessionIds`), so a restore never matches a node of another project.
  */
-import { createHash } from 'crypto'
-import type { Session } from 'neo4j-driver'
+import { createHash, randomUUID } from 'crypto'
+import { DateTime, type Session } from 'neo4j-driver'
 import { functionalLabel } from '@/lib/scanSnapshot'
 import { carriedReferenceEdgesToLinks, isReferenceNode, restoreReferenceLinks } from '@/lib/graphReferenceLinks'
 
@@ -62,6 +65,11 @@ export interface RestoreOptions {
   relBatchSize?: number
   /** Link records to the global reference catalogue (graphReferenceLinks.ts); untrusted input. */
   referenceLinks?: readonly unknown[]
+  /**
+   * The chain id to give each exported one. A chain id is its conversation's session
+   * id, which the import renames; without an entry a chain gets a fresh id.
+   */
+  renamedChainIds?: ReadonlyMap<string, string>
 }
 
 export interface RestoreResult {
@@ -133,6 +141,56 @@ export async function clearProjectGraph(
   if (opts.sweep !== false) await sweepOrphanReferenceNodes(session)
 }
 
+/**
+ * The id each agent-session label (scanSnapshot SESSION_LABELS) is unique on, ALONE:
+ * graph_db/schema_keys.py keys them without the tenant, and the agent refuses to write
+ * a chain id another project holds (`_chain_held_elsewhere`). Checked against that file
+ * by graphRestore.globalIds.test.ts.
+ */
+export const SESSION_ID_KEYS: Readonly<Record<string, string>> = {
+  AttackChain: 'chain_id',
+  ChainStep: 'step_id',
+  ChainFinding: 'finding_id',
+  ChainDecision: 'decision_id',
+  ChainFailure: 'failure_id',
+}
+
+/**
+ * Give every agent-session node its own new id, in place on `nodes` (copies the
+ * caller made). Restored under the exported ids, an import into the database that
+ * still holds the source project MERGEd onto the source's chain nodes, re-stamped
+ * them into the import, and the import's delete removed them (R-15); without a
+ * constraint it left one chain id in two projects, and the agent then refused every
+ * write to the source's chain. Each old id maps to one new id, so the `chain_id` a
+ * step, finding, decision or failure carries follows its chain. Edges are wired by
+ * `_exportId`, which this leaves alone.
+ */
+function freshSessionIds(
+  nodes: ReadonlyArray<{ labels: string[]; properties: Record<string, unknown> }>,
+  renamedChainIds: ReadonlyMap<string, string> = new Map()
+): void {
+  const fresh = new Map<string, string>()
+  const remap = (key: string, old: unknown): string => {
+    if (typeof old !== 'string' || old === '') return randomUUID()
+    const slot = `${key}\u0000${old}`
+    let id = fresh.get(slot)
+    if (!id) {
+      id = (key === 'chain_id' ? renamedChainIds.get(old) : undefined) ?? randomUUID()
+      fresh.set(slot, id)
+    }
+    return id
+  }
+  for (const node of nodes) {
+    const label = node.labels.find(l => l in SESSION_ID_KEYS)
+    if (!label) continue
+    const key = SESSION_ID_KEYS[label]
+    node.properties[key] = remap(key, node.properties[key])
+    if (key !== 'chain_id' && typeof node.properties.chain_id === 'string' && node.properties.chain_id) {
+      node.properties.chain_id = remap('chain_id', node.properties.chain_id)
+    }
+  }
+}
+
 /** Uniqueness-constraint keys per label, used to choose MERGE vs CREATE. */
 async function loadUniqueKeys(session: Session): Promise<Map<string, string[]>> {
   const result = await session.run(
@@ -174,6 +232,42 @@ export function retiredPropertiesFor(labels: readonly string[], properties: Reco
 }
 
 /**
+ * Node properties every RedAmon writer stores as a Neo4j DateTime, which the
+ * export flattens to `YYYY-MM-DDTHH:MM:SSZ` (graphSerialize.ts). Written back
+ * as strings, the recon prune never matched them (R-38): a restored finding was
+ * never pruned nor stamped stale. An allowlist, not every `*_at`: `matched_at`
+ * is a URL, and js_recon stores `discovered_at` as a string in exactly the
+ * exported shape, which a reader may compare as text.
+ */
+const RESTORED_DATETIME_PROPERTIES: ReadonlySet<string> = new Set([
+  'updated_at', 'created_at', 'stale_since', 'muted_at',
+  'triaged_at', 'triage_rescored_at', 'triage_ai_at', 'triage_verdict_at',
+  'recon_coverage_at', 'js_recon_at', 'nuclei_at', 'http_probed_at', 'anon_status_at',
+  'first_seen_at', 'last_seen_at',
+  // The hostname selection's (graph_db ip_hostnames_mixin, the webapp's
+  // narrowing marker): readers order by it.
+  'ip_hostname_evaluated_at',
+])
+
+const EXPORTED_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/
+
+/** A temporal property as the DateTime it was exported from; anything else unchanged. */
+export function restoredTemporal(key: string, value: unknown): unknown {
+  if (typeof value !== 'string' || !RESTORED_DATETIME_PROPERTIES.has(key)) return value
+  const match = EXPORTED_DATETIME.exec(value)
+  if (!match) return value
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number)
+  // The driver checks each field's range but not the day against its month.
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute, second))
+  if (parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day
+      || parsed.getUTCHours() !== hour || parsed.getUTCMinutes() !== minute
+      || parsed.getUTCSeconds() !== second) {
+    return value
+  }
+  return new DateTime(year, month, day, hour, minute, second, 0, 0)
+}
+
+/**
  * Recreate `nodes` + `relationships` for `projectId`. The caller owns clearing
  * (so it can choose what to preserve) and owns the session lifecycle.
  */
@@ -203,6 +297,7 @@ export async function restoreGraph(
       _exportId: node._exportId,
     }
     for (const retired of retiredPropertiesFor(node.labels, properties)) delete properties[retired]
+    for (const [key, value] of Object.entries(properties)) properties[key] = restoredTemporal(key, value)
     // Pre-re-key snapshots have no cert_key; the uniqueness constraint now
     // requires it. Derive it before MERGE so old certificates do not collapse.
     if (node.labels.includes('Certificate') && !properties.cert_key) {
@@ -210,6 +305,15 @@ export async function restoreGraph(
     }
     return { labels: node.labels, properties }
   })
+  freshSessionIds(prepared, opts.renamedChainIds)
+
+  // The project end of every MERGE: a constraint without the tenant (the session
+  // labels, an older database's id-only key) would otherwise match another
+  // project's node and re-stamp it into this one. With it, the restore makes its
+  // own node, or the constraint refuses the write; it never moves one. user_id
+  // only when the restore stamps it: activation keeps each node's own, which an
+  // old node may lack, and a null key fails the MERGE.
+  const tenantKeys = opts.userId ? ['user_id', 'project_id'] : ['project_id']
 
   // Bucket by the node's FUNCTIONAL label, not labels[0]. A suppressed finding
   // is dual-labelled (`:Vulnerability:Muted`) and Neo4j does not order labels,
@@ -229,7 +333,7 @@ export async function restoreGraph(
     for (let i = 0; i < labelNodes.length; i += nodeBatchSize) {
       const batch = labelNodes.slice(i, i + nodeBatchSize)
       if (uniqueKeys && uniqueKeys.length > 0) {
-        const identExpr = uniqueKeys
+        const identExpr = [...new Set([...uniqueKeys, ...tenantKeys])]
           .map(k => `\`${k}\`: node.properties.\`${k}\``)
           .join(', ')
         await session.run(

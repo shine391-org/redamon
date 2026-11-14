@@ -53,7 +53,7 @@ from urllib.parse import urlparse
 
 #: Bump on ANY change to a table, a threshold or a rule below. Stored with each
 #: run so two runs are only comparable when this matches.
-SCORE_MODEL_VERSION = "v3.10.0"
+SCORE_MODEL_VERSION = "v3.12.0"
 
 
 # ===========================================================================
@@ -785,9 +785,13 @@ class ProjectFacts:
     #: IP addresses no current DNS name of the target points at (never an
     #: IP-mode target, which the operator listed by address)
     no_dns_name_hosts: set = field(default_factory=set)
-    #: hosts the run skipped (a tripped breaker), lower-case names and
-    #: addresses: not re-checked, so their reachability is unknown
+    #: hosts the run skipped whole (a tripped breaker's bare-host key),
+    #: lower-case names and addresses: not re-checked, so the reachability of
+    #: every finding on them is unknown
     skipped_hosts: set = field(default_factory=set)
+    #: (host, port number) the run skipped (a `host:port` key): unknown for the
+    #: findings on that port only
+    skipped_ports: set = field(default_factory=set)
     #: DNS name -> the attribution tags of the IPs it currently resolves to,
     #: '' for an IP no run has attributed yet
     name_ownership: dict = field(default_factory=dict)
@@ -924,7 +928,23 @@ def _passive_unconfirmed(finding: dict) -> bool:
     """A passive CVE no port scan of this run confirmed open."""
     verdict = finding.get("port_confirmed")
     return (_lower(finding.get("source")) in PASSIVE_CVE_SOURCES
-            and not (verdict is True or _lower(verdict) == "true"))
+            and (_ip_left_the_run(finding)
+                 or not (verdict is True or _lower(verdict) == "true")))
+
+
+def _ip_left_the_run(finding: dict) -> bool:
+    """A passive CVE whose IP has no node in the project's graph any more.
+
+    A full run rebuilds the IP nodes from its own targets, and the
+    positive-coverage prune keeps a passive CVE on an IP it did not re-check,
+    so the CVE outlives its IP: nothing of this run says whether it is
+    reachable, and its `port_confirmed` is the last run's that had the IP. A
+    row without `target_ip_in_graph` (no `target_ip`, an older reader) is not
+    one.
+    """
+    present = finding.get("target_ip_in_graph")
+    return (_lower(finding.get("source")) in PASSIVE_CVE_SOURCES
+            and (present is False or _lower(present) == "false"))
 
 
 def _validator_rejected_it(finding: dict) -> bool:
@@ -1495,12 +1515,19 @@ def _host_address(host: str) -> str:
 
 
 def reach(finding: dict, facts: ProjectFacts, cvss: Cvss) -> Factor:
-    """R, capped when the IP attribution tag says the address may not be the target's.
+    """R, capped when the IP attribution tag says the address may not be the
+    target's, or when a passive CVE's IP is no longer in the graph.
 
     The cap reads the IP itself (or a URL on it), never a hostname: a site
     served through a CDN is still the target's application.
     """
     factor = _reach(finding, facts, cvss)
+    if _ip_left_the_run(finding):
+        # Said even when R is already lower: R's evidence is what the reviewer
+        # reads about reach, and this run has no fact about the address at all.
+        return Factor(min(factor.value, LEFT_TARGET_MAX_REACH),
+                      f"the IP is no longer among this run's targets, so reach unknown "
+                      f"({factor.evidence})")
     address = _host_address(finding.get("triage_host") or finding.get("host") or "")
     if address in facts.shared_edge_hosts and factor.value > SHARED_EDGE_MAX_REACH:
         return Factor(SHARED_EDGE_MAX_REACH,
@@ -1595,8 +1622,7 @@ _ATTRIBUTED_TAGS = frozenset({"dedicated", "unknown"})
 
 def _gate_name(host: str) -> str:
     """The host's name or address, lower-case, with no scheme, port or IPv6
-    brackets: how the coverage record spells a skipped host
-    (circuit_breaker.hostname_of) and how the IP and DNS facts are keyed."""
+    brackets: how the skipped-host facts and the IP and DNS facts are keyed."""
     text = str(host or "").strip()
     if "://" in text:
         try:
@@ -1610,6 +1636,41 @@ def _gate_name(host: str) -> str:
     return text.lower()
 
 
+#: circuit_breaker._DEFAULT_PORTS (recon image, not importable here): the port
+#: a skipped key gives a URL that names none.
+_SCHEME_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
+
+
+def _gate_port(finding: dict, host: str) -> int:
+    """The port a finding sits on, as circuit_breaker.host_key keys it: the
+    row's target_port, else the port its host spelling names, a URL's scheme
+    default included. 0 for a finding on the host itself."""
+    port = as_int(finding.get("target_port"), 0)
+    if port > 0:
+        return port
+    text = str(host or "").strip()
+    if "://" in text:
+        try:
+            parts = urlparse(text)
+            return parts.port or _SCHEME_PORTS.get(parts.scheme.lower(), 0)
+        except ValueError:
+            return 0
+    if text.startswith("["):
+        rest = text.partition("]")[2]
+        return max(0, as_int(rest[1:], 0)) if rest.startswith(":") else 0
+    if text.count(":") == 1:
+        return max(0, as_int(text.partition(":")[2], 0))
+    return 0
+
+
+def _skipped(facts: ProjectFacts, name: str, port: int) -> bool:
+    """Did the run skip what this finding sits on? A bare-host key covers the
+    whole host, a `host:port` key only that port: one dead port must not turn
+    every finding on its address unknown."""
+    return bool(name) and (name in facts.skipped_hosts
+                           or (port > 0 and (name, port) in facts.skipped_ports))
+
+
 def _behind_a_login(facts: ProjectFacts, host: str) -> bool:
     """The matched URL answered, with 401/403: `_reach`'s login rule."""
     return bool(host) and host in facts.live_hosts and host in facts.auth_required_hosts
@@ -1619,16 +1680,20 @@ def _reachable_now(finding: dict, facts: ProjectFacts, cvss: Cvss, host: str,
                    name: str) -> Optional[bool]:
     if host and host in facts.gone_hosts:
         return False
-    if name and name in facts.skipped_hosts:
+    if _skipped(facts, name, _gate_port(finding, host)):
         return None
     if _lower(finding.get("source")) in PASSIVE_CVE_SOURCES:
         # A banner is as current as the port scan that found its port again,
         # whatever else on the host answers.
         verdict = finding.get("port_confirmed")
-        if verdict is True or _lower(verdict) == "true":
-            return True
         if verdict is False or _lower(verdict) == "false":
             return False
+        # Only an "open" is discounted: a stale "closed" keeps the finding
+        # resolved (finding_state), and this gate agrees with it.
+        if _ip_left_the_run(finding):
+            return None
+        if verdict is True or _lower(verdict) == "true":
+            return True
         return None
     if _behind_a_login(facts, host):
         # It answered: the login is the impact gate's business.

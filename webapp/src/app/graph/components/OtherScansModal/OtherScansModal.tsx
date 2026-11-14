@@ -11,6 +11,8 @@ import { projectSettingsHref, type ProjectSectionAnchor } from '@/lib/projectSet
 import { Modal, WikiInfoButton } from '@/components/ui'
 import type { GithubHuntStatus, TrufflehogStatus, SupplyChainStatus } from '@/lib/recon-types'
 import { ScanStatusWarning } from '@/components/scans/ScanStatusWarning'
+import { useRefusal } from '@/hooks/useRefusal'
+import { RefusalNotice } from '@/components/auth/ForbiddenNotice'
 import { useSupplyChainConfig } from './useSupplyChainConfig'
 import { SupplyChainOrgBatchButton } from './SupplyChainOrgBatchButton'
 import styles from './OtherScansModal.module.css'
@@ -199,6 +201,15 @@ export function OtherScansModal({
   // Read-only past version (or an in-flight swap): no scan may start/resume, and the
   // JSON download is disabled because it would return the latest scan, not this view.
   const scanBlocked = viewingPastVersion || isActivatingVersion
+  // What each card's start and resume routes ask (route manifest); a refused card says why (UI-12).
+  // Every start, resume, pause and stop of a card asks its permission (route manifest); refused, the
+  // control says why in the refusal's words (a read share's level, or the missing permission).
+  const secretsRefusal = useRefusal('scan:secrets', projectId)
+  const supplyChainRefusal = useRefusal('scan:supply_chain', projectId)
+  const secretsRefused = secretsRefusal !== null
+  const supplyChainRefused = supplyChainRefusal !== null
+  const secretsText = secretsRefusal?.text ?? ''
+  const supplyChainText = supplyChainRefusal?.text ?? ''
   const blockedTitle = viewingPastVersion
     ? 'Viewing a saved version - switch back to the active version to run scans'
     : 'A version activation is in progress'
@@ -251,6 +262,7 @@ export function OtherScansModal({
           <p className={styles.cardDescription}>
             Search GitHub repositories for exposed secrets, API keys, and credentials related to your target domain.
           </p>
+          {secretsRefusal && <RefusalNotice refusal={secretsRefusal} />}
           {!githubTokenSet && (
             <CredentialShortcut settingsKey="githubAccessToken" keys={credentialKeys} compact />
           )}
@@ -259,8 +271,8 @@ export function OtherScansModal({
               <button
                 className={styles.resumeButton}
                 onClick={onResumeGithubHunt}
-                disabled={!githubTokenSet || scanBlocked}
-                title={scanBlocked ? blockedTitle : !githubTokenSet ? 'GitHub token required' : 'Resume GitHub Hunt'}
+                disabled={secretsRefused || !githubTokenSet || scanBlocked}
+                title={secretsRefused ? secretsText : scanBlocked ? blockedTitle : !githubTokenSet ? 'GitHub token required' : 'Resume GitHub Hunt'}
               >
                 <Play size={12} />
                 <span>Resume</span>
@@ -269,8 +281,8 @@ export function OtherScansModal({
               <button
                 className={styles.startButton}
                 onClick={onStartGithubHunt}
-                disabled={!githubTokenSet || isGHRunning || (!hasReconData && !isGHPaused) || scanBlocked}
-                title={scanBlocked ? blockedTitle : !githubTokenSet ? 'GitHub token required' : !hasReconData ? 'Run recon first' : isGHRunning ? 'In progress...' : 'Start GitHub Hunt'}
+                disabled={secretsRefused || !githubTokenSet || isGHRunning || (!hasReconData && !isGHPaused) || scanBlocked}
+                title={secretsRefused ? secretsText : scanBlocked ? blockedTitle : !githubTokenSet ? 'GitHub token required' : !hasReconData ? 'Run recon first' : isGHRunning ? 'In progress...' : 'Start GitHub Hunt'}
               >
                 {isGHRunning ? (
                   <Loader2 size={12} className={styles.spinner} />
@@ -285,8 +297,8 @@ export function OtherScansModal({
               <button
                 className={styles.pauseButton}
                 onClick={onPauseGithubHunt}
-                disabled={isGHPausing}
-                title="Pause"
+                disabled={secretsRefused || isGHPausing}
+                title={secretsRefused ? secretsText : 'Pause'}
               >
                 {isGHPausing ? <Loader2 size={12} className={styles.spinner} /> : <Pause size={12} />}
                 <span>Pause</span>
@@ -297,8 +309,8 @@ export function OtherScansModal({
               <button
                 className={styles.stopButton}
                 onClick={onStopGithubHunt}
-                disabled={isGHStopping}
-                title="Stop"
+                disabled={secretsRefused || isGHStopping}
+                title={secretsRefused ? secretsText : 'Stop'}
               >
                 <Square size={12} />
                 <span>Stop</span>
@@ -352,6 +364,7 @@ export function OtherScansModal({
             Deep secret scanning with 700+ detectors across git hosts, container registries,
             Hugging Face, object storage and CI systems. Sources run independently and in parallel.
           </p>
+          {secretsRefusal && <RefusalNotice refusal={secretsRefusal} />}
 
           {/* Scrolls on its own: any number of sources can be added, and the
               card must not push the modal past the viewport. */}
@@ -387,8 +400,12 @@ export function OtherScansModal({
               const invalid = (profile.validationErrors ?? []).length > 0
               // Fails closed in the UI too, and the start route re-checks: a key
               // cleared after this rendered must not produce an opaque failure.
-              const blockedReason = missing.length
-                ? `Set ${missing.map(m => m.label).join(', ')} in Global Settings > API Keys`
+              // On a project the person does not own the source runs on the owner's keys (step 5.7).
+              const blockedReason = secretsRefused ? secretsText
+                : missing.length
+                ? (credentialKeys.readOnly
+                  ? `The project owner has not set ${missing.map(m => m.label).join(', ')}`
+                  : `Set ${missing.map(m => m.label).join(', ')} in Global Settings > API Keys`)
                 : invalid ? 'This source is not fully configured'
                 : scanBlocked ? blockedTitle : ''
 
@@ -421,8 +438,8 @@ export function OtherScansModal({
                     <button
                       className={styles.stopButton}
                       onClick={() => onStopTrufflehog?.(profile.source)}
-                      disabled={stopping}
-                      title="Stop this source"
+                      disabled={secretsRefused || stopping}
+                      title={secretsRefused ? secretsText : 'Stop this source'}
                     >
                       <Square size={12} />
                       <span>Stop</span>
@@ -443,9 +460,13 @@ export function OtherScansModal({
                 {missing.length > 0 && (
                   <span className={styles.missingKeyNote}>
                     <AlertTriangle size={12} />
-                    <Link href={`${SETTINGS_KEYS_HREF}#trufflehog-keys`} style={{ color: 'inherit' }}>
-                      {missing.map(m => m.label).join(', ')} required
-                    </Link>
+                    {credentialKeys.readOnly ? (
+                      <span>{missing.map(m => m.label).join(', ')} required</span>
+                    ) : (
+                      <Link href={`${SETTINGS_KEYS_HREF}#trufflehog-keys`} style={{ color: 'inherit' }}>
+                        {missing.map(m => m.label).join(', ')} required
+                      </Link>
+                    )}
                   </span>
                 )}
 
@@ -510,6 +531,7 @@ export function OtherScansModal({
             Audit an SBOM / lockfile, or a GitHub repository, against the offline OSV database for
             known-malicious (MAL) and known-vulnerable packages. The OSV verdict is fully offline.
           </p>
+          {supplyChainRefusal && <RefusalNotice refusal={supplyChainRefusal} />}
 
           {supplyChain.ready ? (
             <p className={styles.targetLine}>
@@ -527,8 +549,8 @@ export function OtherScansModal({
 
           <div className={styles.cardActions}>
             {isSCPaused ? (
-              <button className={styles.resumeButton} onClick={onResumeSupplyChain} disabled={scanBlocked}
-                title={scanBlocked ? blockedTitle : 'Resume Supply-Chain scan'}>
+              <button className={styles.resumeButton} onClick={onResumeSupplyChain} disabled={supplyChainRefused || scanBlocked}
+                title={supplyChainRefused ? supplyChainText : scanBlocked ? blockedTitle : 'Resume Supply-Chain scan'}>
                 <Play size={12} /><span>Resume</span>
               </button>
             ) : supplyChain.source === 'org' && projectId ? (
@@ -538,24 +560,26 @@ export function OtherScansModal({
               <SupplyChainOrgBatchButton
                 projectId={projectId}
                 org={supplyChain.org}
-                disabled={isSCActive || scanBlocked}
-                blockedReason={scanBlocked ? blockedTitle : ''}
+                disabled={supplyChainRefused || isSCActive || scanBlocked}
+                blockedReason={supplyChainRefused ? supplyChainText : scanBlocked ? blockedTitle : ''}
               />
             ) : (
               <button className={styles.startButton} onClick={onStartSupplyChain}
-                disabled={!supplyChain.ready || isSCRunning || scanBlocked}
-                title={scanBlocked ? blockedTitle : !supplyChain.ready ? 'Configure the scan input in project settings first' : isSCRunning ? 'In progress...' : 'Start Supply-Chain scan'}>
+                disabled={supplyChainRefused || !supplyChain.ready || isSCRunning || scanBlocked}
+                title={supplyChainRefused ? supplyChainText : scanBlocked ? blockedTitle : !supplyChain.ready ? 'Configure the scan input in project settings first' : isSCRunning ? 'In progress...' : 'Start Supply-Chain scan'}>
                 {isSCRunning ? <Loader2 size={12} className={styles.spinner} /> : <Play size={12} />}
                 <span>{isSCPausing ? 'Pausing...' : isSCBusy ? 'Running...' : isSCStopping ? 'Stopping...' : 'Start'}</span>
               </button>
             )}
             {isSCBusy && (
-              <button className={styles.pauseButton} onClick={onPauseSupplyChain} disabled={isSCPausing} title="Pause">
+              <button className={styles.pauseButton} onClick={onPauseSupplyChain} disabled={supplyChainRefused || isSCPausing}
+                title={supplyChainRefused ? supplyChainText : 'Pause'}>
                 {isSCPausing ? <Loader2 size={12} className={styles.spinner} /> : <Pause size={12} />}<span>Pause</span>
               </button>
             )}
             {isSCActive && (
-              <button className={styles.stopButton} onClick={onStopSupplyChain} disabled={isSCStopping} title="Stop">
+              <button className={styles.stopButton} onClick={onStopSupplyChain} disabled={supplyChainRefused || isSCStopping}
+                title={supplyChainRefused ? supplyChainText : 'Stop'}>
                 <Square size={12} /><span>Stop</span>
               </button>
             )}

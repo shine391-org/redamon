@@ -725,13 +725,37 @@ and a page under `webapp/src/app/plugins/`.
   exist on every install. Until an admin installs a plugin, the product behaves exactly as
   without one; a runner that is down is a state the page shows, not a reason to hide it.
 - **Who can do what.** Installing, updating, enabling, disabling and uninstalling are
-  **instance-wide, admin-only** actions, because they put code on the host. The lifecycle
-  routes read the admin role from the database on every request
-  ([lifecycleRoutes.ts](../../webapp/src/lib/plugins/lifecycleRoutes.ts)), because the role
-  inside a login token outlives a demotion by up to seven days. An admin acting as another
-  user keeps these rights and is recorded as the actor.
-  Every signed-in user sees the contributions of enabled plugins; only admins see the
-  management controls.
+  **instance-wide** actions of whoever holds `platform:plugins`, because they put code on the
+  host: every admin while `RBAC_PERMISSIONS_ENABLED` is off; with it on, an admin whose profile
+  holds it or a member given it as an override. The lifecycle routes ask it of the account read
+  from the database on every request
+  ([lifecycleRoutes.ts](../../webapp/src/lib/plugins/lifecycleRoutes.ts)), because a login token
+  outlives a demotion by up to seven days. An admin acting as another user keeps these rights
+  and is recorded as the actor.
+  Every signed-in user sees the contributions of enabled plugins; only those who hold
+  `platform:plugins` see the management controls (`GET /api/plugins` and
+  `GET /api/plugins/[pluginId]` answer `managesPlugins`, read fresh). A refusal answers 403
+  `{code: 'admin_required', permission: 'platform:plugins'}`. With the permissions switch on,
+  the member-side routes ask their own permissions too: using plugins (the page, contributions,
+  actions, jobs, the skill picker, the override views) `plugins:use`, approving, rejecting,
+  resetting or deleting a proposed skill version `plugins:approve_overrides`; both are in
+  *Default member*, so nothing changes until an account is given a narrower set.
+- **Who may use one plugin (per-plugin allowlists).** With `RBAC_GOVERNANCE_ENABLED` on, whoever
+  holds `platform:plugins` can limit a plugin to chosen member permission sets, on the plugin's
+  details drawer ("Who may use it";
+  [`/api/plugins/[pluginId]/access-rules`](../../webapp/src/app/api/plugins/[pluginId]/access-rules/route.ts),
+  audited `plugin.access_rules_changed`). A plugin with no rule stays available to everyone holding
+  `plugins:use`; with rules, only to the holders of a listed set, and always to whoever holds
+  `platform:plugins`. [accessRules.ts](../../webapp/src/lib/plugins/accessRules.ts) decides for the
+  account the plugin works for (the effective user; the call token's user at the Gateway) at every
+  enforcement point: the Plugins page and a plugin's entry hide it (the plugin admins still see
+  every plugin), its icon, nav page and jobs answer 404, the contributions and the Models-by-feature
+  tiles leave it out, an action start and the skill picker answer 403 `plugin_not_allowed`, and so
+  does every Gateway call, so an action already running stops at its next call. A rule names a set
+  by id, with no foreign key; deleting a set a rule names is refused (409 `set_in_plugin_rules`).
+  Rules survive an uninstall, purge included, for a reinstall. With the switch off the rules are
+  neither read nor managed, and every plugin is available as before; this is not an off switch for
+  the platform.
 - **Audit.** Every lifecycle operation, every override proposal, approval and reset, and
   every permission grant is recorded with the existing
   [`writeAudit`](../../webapp/src/lib/audit.ts#L17) into the `AuditLog` table.
@@ -830,17 +854,35 @@ A plugin reaches the outside world only through the SDK, which has two halves:
   reach any other webapp route. The single-host deploy also denies these prefixes at nginx.
 
 Each action invocation carries a short-lived **call token**, minted by the webapp and bound
-to `(plugin, version, acting user, project, session)`. The session is set only when the action
+to `(plugin, version, acting user, project, session)`, plus the project's owner as its **tenant**
+(`ten`; the acting user outside a project). The session is set only when the action
 was started from a session, so `sdk.session.read` can read that one session and nothing else.
 A token lives no longer than its action (`403 action_ended`) or job (`403 job_ended`) and makes
 at most `PLUGIN_GATEWAY_CALLS_PER_TOKEN` calls. The Gateway authorizes every call again: the
 token, the plugin still serving (enabled, `ready`, not revoked, at the token's version), the
-permission granted and declared, and the tenancy of the project and session.
+permission granted and declared, the tenancy of the project and session, and, with
+`RBAC_GOVERNANCE_ENABLED` on, the plugin still available to the token's user (§7.1, per-plugin
+allowlists; `403 plugin_not_allowed`).
+
+**On a project shared with the user** (RBAC sharing, step 5.10) the tenancy check asks
+`projectAccess()` for the token's user at the levels the plugin's permissions need, on every call:
+Read + Write for any permission (a run writes the project's plugin data and may propose), and also
+Use AI agent for `llm:invoke` (which counts only while the owner consents to collaborators
+spending the project's credentials). A plugin that declares no permission stays the owner's. The
+project's owner must still be the token's tenant, so a token minted before a transfer reaches it
+no more. A Read share, oversight and break-glass never run a plugin; an admin acting as a
+collaborator reaches the share at Read and runs none. A refusal at the Gateway is the same `404
+not_found` as a deleted project (a share revoked or narrowed mid-action ends the plugin's reach at
+its next call; a job then ends `context_gone`); at the action start a collaborator below a level is
+told which one (`403 forbidden`, `level`). A session is its author's, or another person's that its
+author shared with the project (RBAC step 5.8, with write sharing in force): project access alone
+(a co-owner, the owner's "managers see all", break-glass) never hands a plugin another person's
+conversation.
 
 | SDK call | Permission | What the Gateway does |
 |---|---|---|
 | `sdk.session.read()` | `session:read` | returns the transcript of the token's session, masked and capped (see below) |
-| `sdk.llm.invoke(messages, *, max_tokens, temperature)` | `llm:invoke` | forwards to the agent, which runs the model the user chose for this plugin |
+| `sdk.llm.invoke(messages, *, max_tokens, temperature)` | `llm:invoke` | forwards to the agent, which runs the model the user chose for this plugin; on a shared project the owner's choice with the owner's keys, each call recorded as `credits.used` for the user first (`503 spend_not_recorded` when it cannot be) |
 | `sdk.data.get / put / delete / query / count` | always granted | reads and writes rows of the plugin's own data, within its quotas; `query` takes `prefix`, `where` (top-level JSON equality), `order`, `limit` and `cursor`, and answers `{items, next}` (§7.4) |
 | `sdk.override.get(point, target_group)` | `override:<point>` | returns the factory parts of the target with their checksums, the version that applies, if any, and the limits |
 | `sdk.override.propose(point, target_group, parts, *, note, meta, scope)` | `override:<point>` | has the agent validate the snapshot and stores it as **Proposed** (§7.6) |
@@ -863,7 +905,8 @@ Three rules shape these calls:
   ([`redact_secret_shapes`](../../agentic/cypherfix_triage/evidence.py#L147)). Target
   hostnames, IPs and findings stay readable, because a transcript without them is useless and
   regex anonymisation of free text is not reliable. A value is masked together with its key,
-  and a key that is itself secret-shaped is masked too. The session is read in pages of 500 rows
+  and a key that is itself secret-shaped is masked too. Who answered the agent's requests (a row's
+  `actor`: the account and, under act-as, the admin) is left out. The session is read in pages of 500 rows
   and capped at `PLUGIN_TRANSCRIPT_MAX_BYTES` (2 MiB; never below 64 KiB): long strings keep
   their head and tail, an event above 64 KB becomes a preview, and three tiers (what people
   wrote, the agent's priority events, the rest) each keep a head and a sliding tail, so the middle
@@ -1117,7 +1160,8 @@ agent follows. It is defined precisely:
   leaves that skill on factory text; it does not fall back to a user version nobody chose for
   the project.
 - **Approval (principle 5).** A valid proposal is stored as **Proposed** and changes nothing.
-  The scope's owner, or an admin, sees it in the **core** review window, opened from the chat
+  The scope's owner, or an admin acting as them, or for a project scope a co-owner whose share
+  holds Manage, sees it in the **core** review window, opened from the chat
   right after the plugin's action or from "N pending" in project settings, as a before/after
   comparison of every part against the version it would replace, with the plugin's note, and
   approves or rejects it.
@@ -1307,15 +1351,18 @@ plugin UI, and where the skill-version decisions live:
   texts and the whole-skill size with the agent, then stores the next number.
 - **Versions** (`SkillVersionsModal`, `GET /api/plugins/overrides/versions`, `POST
   /api/plugins/overrides/reset`) list the factory row and every version of a skill for the
-  viewer's user scope and a project they own. A version number is never reused, so the list
+  viewer's user scope and a project whose proposals they decide (owned, or shared with Manage). A version number is never reused, so the list
   can skip numbers after a deletion. Reset works whatever state the plugin is in. A project
   reset makes the project follow the owner's user-scope version, or the factory text.
 - **Project settings** show, per built-in skill of a saved project, a chip naming the version
   that governs it, Versions, Reset and "N pending" (`GET /api/plugins/overrides/summary`), plus
   `project.skills.row` contributions. Reset is its own API call, never part of the project
   save.
-- Who decides: the scope owner, or an admin acting as them (the audit names the admin). A
-  user-scope decision carries the owner id, which must equal the effective user.
+- Who decides: the scope owner, or an admin acting as them (the audit names the admin); on a
+  project scope also a co-owner whose share holds Manage (step 5.10, `changeSetAccess.ts`). A
+  collaborator below Manage, who may still run a plugin that proposes, is answered `403` naming
+  level `M` on approve, reject, delete and reset and sees no review window for the project's
+  proposals. A user-scope decision carries the owner id, which must equal the effective user.
 - Project export and import leave plugin rows out: the export manifest says
   `excluded: ["plugin_overrides", "plugin_data"]`, and the import never reads a plugin file.
 
@@ -2192,7 +2239,8 @@ plugin's feature code.
 The schema changes only with a RedAmon release. At every start, the webapp's entrypoint applies
 the `prisma/schema.prisma` baked into its image with `prisma db push`, then the platform's
 constraint script ([Dockerfile:123](../../webapp/Dockerfile#L123)). The four plugin tables were
-added this way, once. A plugin archive has no route to the schema: its files land on the
+added this way, once, and the allowlist's `plugin_access_rules` later the same way (empty until an
+admin limits a plugin). A plugin archive has no route to the schema: its files land on the
 plugins volume, the webapp only reads JSON from them, and its migrations transform the rows
 the platform hands them, with no Gateway access (§9.5).
 

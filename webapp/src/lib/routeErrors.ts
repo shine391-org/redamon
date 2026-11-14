@@ -42,6 +42,19 @@ export function safeErrorCode(err: unknown): string {
   return 'internal_error'
 }
 
+// eslint-disable-next-line no-control-regex
+const LOG_UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g
+
+/**
+ * A value a caller chose (a session id, an id in a body) as a log line may carry it: control
+ * characters and line separators become `?`, so a CR/LF cannot start a forged `[rbac]` line, and it
+ * is cut at `max` characters.
+ */
+export function logValue(value: string, max = 200): string {
+  const clean = value.replace(LOG_UNSAFE, '?')
+  return clean.length > max ? `${clean.slice(0, max)}...` : clean
+}
+
 export interface InternalErrorOptions {
   status?: number
   /** The log line's prefix; defaults to the message. */
@@ -50,10 +63,19 @@ export interface InternalErrorOptions {
   extra?: Record<string, unknown>
 }
 
+/**
+ * Prisma's validation error renders the whole call, the values written included: a provider key, a
+ * token or a password being saved. Only its class reaches the log.
+ */
+function loggable(err: unknown): unknown {
+  const name = err && typeof err === 'object' ? (err as { name?: unknown }).name : undefined
+  return name === 'PrismaClientValidationError' ? `${name} (its rendering of the call is not logged: it holds the values written)` : err
+}
+
 /** A 500 (or `status`) whose body is `{error: message, code}`; the full error goes to the log. */
 export function internalError(err: unknown, message: string, opts: InternalErrorOptions = {}): NextResponse {
   const code = safeErrorCode(err)
-  console.error(`${opts.log ?? message}:`, err)
+  console.error(`${opts.log ?? message}:`, loggable(err))
   return NextResponse.json({ error: message, code, ...opts.extra }, { status: opts.status ?? 500 })
 }
 

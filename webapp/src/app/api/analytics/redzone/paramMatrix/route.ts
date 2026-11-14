@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { rowCap } from '../rowCap'
-import { guardProject } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
 import { reportCountable } from '@/lib/triage/reportable'
@@ -13,8 +13,8 @@ function toNum(val: unknown): number {
 
 export async function GET(request: NextRequest) {
   const projectId = request.nextUrl.searchParams.get('projectId')
-  const __denied = await guardProject(projectId || '')
-  if (__denied) return __denied
+  const auth = await requirePermission(request, 'graph:read', { projectId })
+  if (auth instanceof NextResponse) return auth
   if (!projectId) {
     return NextResponse.json({ error: 'projectId is required' }, { status: 400 })
   }
@@ -43,7 +43,7 @@ export async function GET(request: NextRequest) {
               p.type                                  AS paramType,
               p.category                              AS paramCategory,
               ep.method                               AS endpointMethod,
-              ep.full_url                             AS endpointFullUrl,
+              coalesce(ep.unmasked_url, ep.full_url)  AS endpointFullUrl,
               ep.category                             AS endpointCategory,
               bu.url                                  AS baseUrl,
               sd.name                                 AS subdomain,
@@ -56,7 +56,7 @@ export async function GET(request: NextRequest) {
               v.extractor_name                        AS extractorName,
               v.fuzzing_method                        AS fuzzingMethod,
               v.fuzzing_position                      AS fuzzingPosition,
-              coalesce(v.matched_at, v.url)           AS matchedAt,
+              coalesce(v.unmasked_url, v.matched_at, v.url) AS matchedAt,
               v.cvss_score                            AS cvssScore,
               coalesce(v.updated_at, p.updated_at)    AS updatedAt
        ORDER BY

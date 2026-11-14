@@ -20,6 +20,7 @@ from recon.partial_recon_modules.graph_builders import (
 )
 from recon.partial_recon_modules.helpers import (
     _scope_partial_urls,
+    ip_mode_recon,
     partial_settings,
     root_orgs,
     scope_roots,
@@ -28,7 +29,7 @@ from recon.partial_recon_modules.helpers import (
 
 
 def _empty_recon_data(roots: list, settings: dict) -> dict:
-    return {
+    return ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "subdomains": [],
@@ -36,13 +37,15 @@ def _empty_recon_data(roots: list, settings: dict) -> dict:
         "resource_enum": {"by_base_url": {}},
         "metadata": {
             "include_root_domain": bool(settings.get("INCLUDE_ROOT_DOMAIN", False)),
-            "expanded_ips": list(settings.get("TARGET_IPS") or []) if settings.get("IP_MODE") else [],
+            # ip_mode_recon fills it in IP mode, with the expanded targets,
+            # never the raw CIDRs (B-23).
+            "expanded_ips": [],
             "roe": {
                 "ROE_ENABLED": settings.get("ROE_ENABLED", False),
                 "ROE_EXCLUDED_HOSTS": settings.get("ROE_EXCLUDED_HOSTS", []) or [],
             },
         },
-    }
+    }, settings)
 
 
 def _graph_subdomains(roots, user_id, project_id, domain_groups) -> list:
@@ -169,7 +172,7 @@ def _link_user_urls(graph_client, user_urls, url_attach_to, roots, user_id, proj
             root_orgs=root_orgs(roots),
         )
         linked = graph_client.link_route_exposure_user_input(user_input_id, produced, user_id, project_id)
-        graph_client.update_user_input_status(user_input_id, "completed", {"findings": linked})
+        graph_client.update_user_input_status(user_input_id, "completed", {"findings": linked}, user_id=user_id, project_id=project_id)
         print(f"[*][Partial Recon][RouteExposure] Created UserInput node for {len(user_urls)} URL(s), "
               f"PRODUCED {linked} finding(s)")
     except Exception as e:  # noqa: BLE001

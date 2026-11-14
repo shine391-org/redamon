@@ -35,8 +35,13 @@ import prisma from '@/lib/prisma'
 import { writeAudit } from '@/lib/audit'
 import { describeInvalid, validateDomainBatch, MAX_BATCH_HOSTS } from '@/lib/domainBatch'
 import {
-  guardrailNames, resolveScopeGroups, scopeGuardrailNames, softGuardrailNames,
+  type ScopeFields, guardrailNames, ipHostnameIncludeBases, ipHostnamePolicySummary, ipHostnameStartProblem,
+  resolveScopeGroups, scopeGuardrailNames, softGuardrailNames,
 } from '@/lib/scopeGroups'
+import { validateCrossFieldRules } from '@/lib/reconSettings/crossField'
+import { ipHostnameOverrides } from '@/lib/ipHostnameOverrides'
+import { lastRunCounts } from '@/lib/ipHostnamePreview'
+import { getGraphSession } from '@/app/api/graph/neo4j'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import {
   currentAuthorization,
@@ -54,7 +59,8 @@ import {
 } from '@/lib/engagement'
 import { describeScanWriters } from '@/lib/graphWriters'
 import { firstHardBlocked } from '@/lib/hard-guardrail'
-import { assertMcpProjectAccess, requireScope } from '@/lib/mcpAuth'
+import { assertMcpProjectAccess, mcpProjectAccess, requireScope } from '@/lib/mcpAuth'
+import { ownsRow } from '@/lib/authz/rowOwner'
 import { McpToolError } from '@/lib/mcp/errors'
 import { enforceRate, type McpContext } from '@/lib/mcp/tools'
 import { settingsFingerprint } from '@/lib/jobQueue'
@@ -64,6 +70,8 @@ import { checkIdentityHeader, isInsideProjectFileRoot } from '@/lib/reconSetting
 import { validateJevEngineChange } from '@/lib/reconSettings/jevEngine'
 import { JEV_PROVIDER_TYPES } from '@/lib/llmProviderKinds'
 import { normalizeUserSkillToggles, UserSkillError } from '@/lib/userSkills'
+import { ownershipTokenForCreate } from '@/lib/ownershipToken'
+import { projectQuotaReached, quotaRefusalMessage } from '@/lib/authz/quotas'
 
 // --- create_project -----------------------------------------------------------------
 
@@ -215,7 +223,7 @@ async function findByIdempotencyKey(ctx: McpContext, key: string) {
     select: { projectId: true, project: { select: { userId: true, name: true } } },
   })
   if (!existing) return null
-  if (existing.project.userId !== ctx.token.userId) {
+  if (!ownsRow({ userId: ctx.token.userId }, existing.project.userId)) {
     throw new McpToolError(
       'That idempotency key belongs to another account\'s project.',
       'access_denied'
@@ -306,6 +314,17 @@ export async function createProject(ctx: McpContext, args: CreateProjectArgs) {
     if (seen) return seen
   }
 
+  // The token user's maxProjects quota (step 6.8), as the HTTP create and import obey it: after the
+  // replay above (which creates nothing), before anything is judged or written.
+  const overQuota = await projectQuotaReached(ctx.token.userId)
+  if (overQuota) {
+    throw new McpToolError(
+      quotaRefusalMessage('maxProjects', overQuota.limit, ctx.token.userId, overQuota.used),
+      'quota_exceeded',
+      { quota: 'maxProjects', limit: overQuota.limit },
+    )
+  }
+
   const data: Record<string, unknown> = {
     name,
     description: (args.description ?? '').trim(),
@@ -371,6 +390,7 @@ export async function createProject(ctx: McpContext, args: CreateProjectArgs) {
   }
 
   if (args.settings) Object.assign(data, filterSettingsAtCreate(args.settings))
+  data.ownershipToken = ownershipTokenForCreate(data.ownershipToken)
 
   // The user-skill toggles may name only the creator's own skills, at most 20 of them on.
   if ('attackSkillConfig' in data) {
@@ -386,6 +406,18 @@ export async function createProject(ctx: McpContext, args: CreateProjectArgs) {
   // settings is a switch-on and needs a Jev provider of the creating account selected.
   const jevError = await validateJevEngineChange(null, data, ctx.token.userId)
   if (jevError) throw new McpToolError(jevError, 'setting_rejected')
+
+  // An IP project's hostname include entries are scanned names, so they get the
+  // hard guardrail a batch host gets, with the same refusal.
+  if (data.ipMode === true) refuseHardBlocked(ipHostnameIncludeBases(data.ipHostnameInclude as string[] | undefined))
+  // The rules over several fields every create path runs (B-25), on the whole
+  // new row: scan_all needs its confirmation and is refused on a third_party
+  // engagement, record_filter needs an include entry, the policy applies only in
+  // IP mode. The toggles were normalized above, so they are not judged twice.
+  const crossFieldError = await validateCrossFieldRules(
+    data, Object.keys(data).filter(k => k !== 'attackSkillConfig'), ctx.token.userId,
+    { ownerUserId: ctx.token.userId })
+  if (crossFieldError) throw new McpToolError(crossFieldError, 'setting_rejected')
 
   // The rule third_party projects live under, checked BEFORE the row exists so
   // a refused creation leaves nothing behind.
@@ -509,7 +541,8 @@ export async function attachEngagementAuthorization(
   auth: AuthorizationArgs
 ) {
   requireScope(ctx.token, 'engagement:authorize')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  // The owner's alone (OQ-23), whatever level later opens the other write tools to a collaborator.
+  await assertMcpProjectAccess(ctx.token, projectId, 'O')
   enforceRate(ctx, 'write')
 
   const record = normaliseAuthorization(auth)
@@ -577,7 +610,9 @@ interface ResolvedRate {
  * because this runs in the webapp and that runs in a scan container. The two are
  * kept honest by the golden master on the Python side and by this tool's own
  * tests, and the rule is three lines: a value above the ceiling comes down to
- * it, and a 0 that means unlimited comes down to it too.
+ * it, and any value at or below 0 is raised to it, whatever its zero_means: a
+ * reader runs a 0 with no limit (graphql waits nothing, nuclei and httpx get
+ * no rate flag), so the scan treats every one as unlimited.
  */
 function resolveRates(row: Record<string, unknown>, ceiling: number | null): ResolvedRate[] {
   const out: ResolvedRate[] = []
@@ -588,10 +623,10 @@ function resolveRates(row: Record<string, unknown>, ceiling: number | null): Res
     let capped = false
     let wasUnlimited = false
     if (ceiling !== null) {
-      if (written === 0 && f.zero_means === 'unlimited') {
+      if (written <= 0) {
         resolved = ceiling
         capped = true
-        wasUnlimited = true
+        wasUnlimited = written === 0 && f.zero_means === 'unlimited'
       } else if (written > ceiling) {
         resolved = ceiling
         capped = true
@@ -734,7 +769,8 @@ function noOpReason(
  */
 export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
   requireScope(ctx.token, 'recon:read')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  const { project: reached, access: { level } } = await mcpProjectAccess(ctx.token, projectId, 'R')
+  const owner = reached.userId
   // The 'query' bucket rather than 'read': this resolves the whole settings
   // tree, the cap list and the authorization record, which is not the cost of
   // an ordinary read.
@@ -778,6 +814,10 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
       })
     }
   }
+  // The toggles an IP project's hostname mode forces off (decision D-20).
+  for (const o of ipHostnameOverrides(row)) {
+    if (row[o.key] !== o.value) rewritten.push({ field: o.key, written: row[o.key], willRun: o.value, why: o.reason })
+  }
 
   // The provenance of the LAST run, so the chain from a graph node back to the
   // document that permitted looking at it can be walked from one call. Without
@@ -808,7 +848,9 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
 
   const exceeds = rates.filter(r => ceiling !== null && r.resolved > ceiling)
 
-  const aiHooks = await resolveAiHooks(row, ctx.token.userId)
+  // The owner's providers: a scan of the project runs the owner's keys (T9),
+  // whoever asks.
+  const aiHooks = await resolveAiHooks(row, owner)
 
   // The scope the next scan runs, derived from the stored target fields exactly
   // as the scan derives it, and the entries the current rules refuse.
@@ -818,13 +860,22 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
     targetDomain: typeof row.targetDomain === 'string' ? row.targetDomain : '',
     subdomainList: Array.isArray(row.subdomainList) ? row.subdomainList as string[] : [],
   })
+  // An IP project's hostname policy: refused at scan start by the same rule the
+  // start paths and recon apply (an unconfirmed scan_all, a record_filter with no
+  // include entry, scan_all on a third-party engagement).
+  const hostnameProblem = row.ipMode === true ? ipHostnameStartProblem(row as ScopeFields) : null
   const scopeUnusable = resolvedScope.invalid.length > 0
     || (row.ipMode !== true && resolvedScope.groups.length === 0)
+    || hostnameProblem !== null
 
   return {
     projectId,
     engagement,
-    authorization,
+    // The authorization record is the owner's to read (the app's list asks
+    // engagement:authorize, a manage level); a reader of a shared project sees
+    // only whether one exists, in engagement.hasAuthorization.
+    authorization: level === 'owner' ? authorization : null,
+    ...(level === 'owner' ? {} : { authorizationWithheld: true }),
     scope: {
       targetDomain: row.targetDomain ?? '',
       targetIps: row.targetIps ?? [],
@@ -856,6 +907,16 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
       // scan root and org.
       guardrailNames: guardrailNames(resolvedScope.groups),
       ipMode: row.ipMode ?? false,
+      // Hostnames on target IPs: what the next run does with the names it sees on
+      // the target IPs. The two LastRun counts come from the last run's recorded
+      // hostnames and are null until a run has recorded any.
+      hostnamePolicy: row.ipMode === true
+        ? {
+            ...ipHostnamePolicySummary(row as ScopeFields),
+            ...(await lastRunCounts(getGraphSession, { ...(row as ScopeFields), id: projectId, userId: owner })),
+            problem: hostnameProblem,
+          }
+        : null,
       targetGuardrailEnabled: row.targetGuardrailEnabled ?? false,
       excludedHosts: row.roeExcludedHosts ?? [],
       maxBatchHosts: MAX_BATCH_HOSTS,
@@ -937,6 +998,11 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
         'DIFFERENT configuration than the one above. That is the chain an incident review ' +
         'walks: a graph node, the scan job that wrote it, the settings hash it ran with, and ' +
         'the authorization that permitted looking.',
+      'scope.hostnamePolicy (IP projects only): ip_only looks no hostname up; record_only ' +
+        'records the names seen on the target IPs and scans only the IPs; record_filter also ' +
+        'scans the names matching include minus exclude; scan_all scans every name except on ' +
+        'shared CDN edges. A name is scanned only when every address it resolves to is a target. ' +
+        'It is changed with update_project_scope; a problem there makes the project unstartable.',
     ],
   }
 }
@@ -944,7 +1010,8 @@ export async function preflightScopeCheck(ctx: McpContext, projectId: string) {
 /** Every authorization ever recorded for a project, newest first. */
 export async function listEngagementAuthorizations(ctx: McpContext, projectId: string) {
   requireScope(ctx.token, 'recon:read')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  // The app's list of authorizations asks Manage (M): a co-owner reads them, a reader does not.
+  await assertMcpProjectAccess(ctx.token, projectId, 'M')
   enforceRate(ctx, 'read')
 
   const rows = await prisma.engagementAuthorization.findMany({

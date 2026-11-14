@@ -26,6 +26,7 @@ vi.mock('@/lib/prisma', () => ({
     apiKeyRotationConfig: { findMany: (...a: unknown[]) => h.rotationFindMany(...a) },
   },
 }))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/session', () => ({
   requireUserAccess: (...a: unknown[]) => h.requireUserAccess(...a),
   isInternalRequest: () => false,
@@ -37,7 +38,7 @@ vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: vi.fn() }))
 import { PUT } from './route'
 
 const put = (body: unknown) =>
-  new NextRequest('http://x', { method: 'PUT', body: JSON.stringify(body) })
+  new NextRequest('http://x', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
 const params = (id: string) => ({ params: Promise.resolve({ id }) })
 
 beforeEach(() => {

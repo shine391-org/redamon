@@ -15,8 +15,9 @@ import httpx
 
 from state import AgentState
 from orchestrator_helpers import roe_gate
-from orchestrator_helpers.config import get_identifiers
+from orchestrator_helpers.config import get_identifiers, get_tenant_id
 from tools import set_tenant_context, set_phase_context, set_graph_view_context
+from kali_auth import kali_auth_headers, note_kali_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,8 @@ async def _execute_single_step(
         step["error_message"] = "No tool name provided"
         return False
 
-    refusal = roe_gate.check_tool_call(tool_name, tool_args, phase, iteration)
+    refusal = (roe_gate.check_tool_call(tool_name, tool_args, phase, iteration)
+               or await roe_gate.check_unasked_call(tool_name, tool_args))
     if refusal:
         logger.warning(f"[{user_id}/{project_id}/{session_id}] refused '{tool_name}' at iter {iteration}: {refusal.error}")
         step["tool_output"] = refusal.message
@@ -258,10 +260,12 @@ async def _execute_single_step(
             msf_session_id = int(match.group(1))
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(
+                    resp = await client.post(
                         f"{session_manager_base}/session-chat-map",
-                        json={"msf_session_id": msf_session_id, "chat_session_id": session_id}
+                        json={"msf_session_id": msf_session_id, "chat_session_id": session_id},
+                        headers=kali_auth_headers(),
                     )
+                    note_kali_refusal(resp.status_code, "/session-chat-map")
             except Exception:
                 pass
 
@@ -271,11 +275,13 @@ async def _execute_single_step(
         if re.search(r'(nc|ncat)\s+.*-l', cmd) or 'socat' in cmd:
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.post(
+                    resp = await client.post(
                         f"{session_manager_base}/non-msf-sessions",
                         json={"type": "listener", "tool": "netcat", "command": cmd,
-                              "chat_session_id": session_id}
+                              "chat_session_id": session_id},
+                        headers=kali_auth_headers(),
                     )
+                    note_kali_refusal(resp.status_code, "/non-msf-sessions")
             except Exception:
                 pass
 
@@ -312,8 +318,9 @@ async def execute_plan_node(
     logger.info(f"Tools: {[s.get('tool_name') for s in steps]}")
     logger.info(f"{'='*60}")
 
-    # Set context (ContextVar — inherited by child tasks in asyncio)
-    set_tenant_context(user_id, project_id)
+    # Set context (ContextVar — inherited by child tasks in asyncio); the tenant is the
+    # project's owner, whose graph and traffic the tools use.
+    set_tenant_context(get_tenant_id(state, config), project_id)
     set_phase_context(phase)
     if graph_view_cyphers:
         set_graph_view_context(graph_view_cyphers.get(session_id))

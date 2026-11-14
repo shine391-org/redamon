@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
-import subprocess
+import subprocess  # noqa: F401 - the tool tests fake docker through misconfig.subprocess
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -63,7 +63,8 @@ TITLE_TO_KEY: Dict[str, str] = {
     'Field Duplication':                                'field_duplication',
 }
 
-# Tests that generate noisy/DoS-class traffic. Auto-excluded in stealth mode.
+# Tests that generate noisy/DoS-class traffic. Excluding any one of them keeps
+# graphql-cop from running at all (see run_graphql_cop); stealth turns it off.
 HEAVY_TRAFFIC_TESTS = frozenset({
     'alias_overloading',
     'batch_query',
@@ -101,9 +102,27 @@ def run_graphql_cop(
 
     Returns:
         - dict with both arrays on success (possibly both empty)
-        - None on execution error (logged, not raised -- does not kill parent scan)
+        - None when graphql-cop did not run: switched off (the master toggle, or
+          an excluded denial-of-service test), or an execution error or a
+          timeout (logged, not raised -- does not kill parent scan). An error
+          or timeout keeps the host's earlier graphql-cop findings, and a
+          timed-out container is stopped.
     """
     if not settings.get('GRAPHQL_COP_ENABLED', False):
+        return None
+
+    # The pinned image (dolevf/graphql-cop:1.14) has no `-e` flag: it runs all
+    # its tests and the per-test toggles only filter the report afterwards. An
+    # excluded DoS test would still hit the target, so excluding any of them
+    # keeps graphql-cop from running at all. A configuration choice, not a
+    # failure: nothing is noted degraded, and its earlier findings are pruned
+    # like any switched-off source's.
+    excluded_set = set(_build_excluded_tests(settings))
+    dos_excluded = sorted(HEAVY_TRAFFIC_TESTS & excluded_set)
+    if dos_excluded:
+        print(f"[-][GraphQL-Cop] Skipping {endpoint}: denial-of-service test(s) excluded "
+              f"({', '.join(dos_excluded)}) and the graphql-cop image cannot leave a "
+              f"single test out. Re-enable all four to run graphql-cop.")
         return None
 
     # Skip a host already known unreachable this run: graphql-cop is a full
@@ -119,8 +138,6 @@ def run_graphql_cop(
 
     timeout = timeout or settings.get('GRAPHQL_COP_TIMEOUT', 120)
     image = settings.get('GRAPHQL_COP_DOCKER_IMAGE', DEFAULT_IMAGE) or DEFAULT_IMAGE
-    excluded = _build_excluded_tests(settings)
-    excluded_set = set(excluded)
 
     # --net=host is ALWAYS passed so GraphQL-Cop can reach loopback / local-lab
     # GraphQL endpoints. See recon/helpers/resource_enum/katana_helpers.py for
@@ -130,14 +147,10 @@ def run_graphql_cop(
     cmd = ['docker', 'run', '--rm', '--net=host', image,
            '-t', endpoint, '-o', 'json']
 
-    # NOTE: the dolevf/graphql-cop:1.14 Docker image does NOT support the `-e`
-    # exclusion flag (added in git main v1.15 but unreleased on DockerHub as of
-    # 2026-04-20). We post-filter findings Python-side instead. A side-effect:
-    # DoS probes still hit the target even when "excluded" by per-test toggles.
-    # For true stealth, disable the GRAPHQL_COP_ENABLED master toggle.
-    if excluded_set and len(excluded_set) == len(GRAPHQL_COP_TEST_TO_VULN_TYPE):
-        print(f"[-][GraphQL-Cop] All tests excluded by per-test toggles -- skipping {endpoint}")
-        return {'findings': [], 'raw': []}
+    # The `-e` exclusion flag landed in graphql-cop's git main (v1.15), not in
+    # the 1.14 image on DockerHub (checked 2026-04-20), so the remaining
+    # exclusions -- none of them a DoS test, see above -- are post-filtered
+    # Python-side. Those tests still run against the target.
 
     if settings.get('GRAPHQL_COP_FORCE_SCAN', False):
         cmd.append('-f')
@@ -153,30 +166,32 @@ def run_graphql_cop(
     print(f"[*][GraphQL-Cop] {endpoint}  image={image}  tests={active_test_count}/12  timeout={timeout}s"
           + (f"  (filtering {len(excluded_set)} excluded tests post-execution)" if excluded_set else ""))
 
+    from recon.helpers.docker_helpers import run_tool_container
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"[!][GraphQL-Cop] Timeout after {timeout}s against {endpoint}")
-        return None
+        result = run_tool_container(cmd, tool="graphql-cop", timeout=timeout)
     except FileNotFoundError:
         print(f"[!][GraphQL-Cop] 'docker' binary not found -- is the Docker socket mounted?")
+        _note_unchecked(endpoint, "graphql-cop could not start (no docker binary)")
         return None
     except Exception as e:
         print(f"[!][GraphQL-Cop] Subprocess failed: {e}")
+        _note_unchecked(endpoint, f"graphql-cop could not start ({type(e).__name__})")
         return None
 
-    if result.returncode != 0:
+    if result.timed_out:
+        print(f"[!][GraphQL-Cop] Timeout after {timeout}s against {endpoint} -- stopped it")
+    elif result.returncode != 0:
         print(f"[!][GraphQL-Cop] Non-zero exit ({result.returncode}): {result.stderr[:500].strip()}")
 
+    # graphql-cop prints its JSON array once, after its last test, so an array
+    # read from a cut-short run is the whole report.
     findings_raw = _extract_json_array(result.stdout)
     if findings_raw is None:
-        print(f"[!][GraphQL-Cop] No parseable JSON in output. First 300 chars: {result.stdout[:300]!r}")
+        if result.timed_out:
+            _note_unchecked(endpoint, f"graphql-cop timed out after {timeout}s")
+        else:
+            print(f"[!][GraphQL-Cop] No parseable JSON in output. First 300 chars: {result.stdout[:300]!r}")
+            _note_unchecked(endpoint, "graphql-cop returned no report")
         return None
 
     if not findings_raw:
@@ -191,6 +206,26 @@ def run_graphql_cop(
         'findings': _normalize_findings(endpoint, filtered_raw),
         'raw': filtered_raw,
     }
+
+
+def _note_unchecked(endpoint: str, reason: str) -> None:
+    """Keep graphql-cop's earlier findings on a host it ran against but did not finish.
+
+    By host and for graphql-cop alone (README "Degrade by host before degrading
+    by source"): the native GraphQL checks did reach the host. Never raises.
+    """
+    try:
+        from recon.helpers import circuit_breaker as _cb
+        host = _cb.host_key(endpoint)
+        if host:
+            _cb.note_degraded("graphql_scan", hosts=[host], host_source="graphql_cop",
+                              source_only_hosts=True, reason=reason)
+        else:
+            _cb.note_degraded("graphql_scan", sources=["graphql_cop"], reason=reason)
+        print(f"[!][GraphQL-Cop] {_cb.safe_text(host or endpoint)}: earlier graphql-cop "
+              f"findings are kept ({reason})")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _filter_excluded(raw_findings: List[dict], excluded_keys: set) -> List[dict]:

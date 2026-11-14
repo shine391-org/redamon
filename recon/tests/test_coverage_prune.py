@@ -68,7 +68,7 @@ class FakeGraph:
         return 0
 
     def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
-                              keep_unproven=False):
+                              keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
         self.prunes.append({"sources": list(sources), "since": since,
                             "keep_hosts": tuple(keep_hosts),
                             "keep_unproven": bool(keep_unproven)})

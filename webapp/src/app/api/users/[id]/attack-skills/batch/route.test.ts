@@ -13,8 +13,19 @@ const h = vi.hoisted(() => ({
   session: { userId: 'alice', role: 'standard' } as { userId: string; role: string } | null,
   batch: vi.fn(),
 }))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/prisma', () => ({ default: {} }))
-vi.mock('@/lib/session', () => ({ getSession: async () => h.session }))
+vi.mock('@/lib/session', async () => {
+  const { NextResponse } = await import('next/server')
+  return {
+    getSession: async () => h.session,
+    // session.ts requireAccountWrite (the write rule), over the account the test lets this
+    // request write, h.eff: a response is that refusal, another account than the path's is 403.
+    requireAccountWrite: async (id: string) => h.eff instanceof NextResponse ? h.eff
+      : (h.eff as { userId: string }).userId === id ? null
+        : NextResponse.json({ error: 'Forbidden', code: 'own_account_only' }, { status: 403 }),
+  }
+})
 vi.mock('@/lib/access', async (orig) => ({
   ...(await orig<typeof import('@/lib/access')>()),
   requireEffectiveUser: async () => h.eff,
@@ -97,7 +108,7 @@ describe('POST /attack-skills/batch', () => {
     expect(h.batch).not.toHaveBeenCalled()
   })
 
-  test('an admin simulating the owner is audited on behalf of the owner', async () => {
+  test('an admin acting as a passwordless managed owner is audited on behalf of the owner (HD-23: the only admin who writes)', async () => {
     h.session = { userId: 'root', role: 'admin' }
     await post({ items: ITEMS })
     expect(h.batch.mock.calls[0][1]).toEqual({ actorId: 'root', onBehalfOf: 'alice', source: 'ui' })

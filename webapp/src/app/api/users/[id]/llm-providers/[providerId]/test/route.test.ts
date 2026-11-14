@@ -10,6 +10,7 @@ import { NextRequest } from 'next/server'
 const mockFindFirst = vi.fn()
 const mockRequireUserAccess = vi.fn()
 
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/prisma', () => ({
   default: { userLlmProvider: { findFirst: (...a: unknown[]) => mockFindFirst(...a) } },
 }))
@@ -167,14 +168,66 @@ describe('POST llm-providers/[providerId]/test — agent reachable', () => {
   })
 
   test('a saved provider keeps its stored secret when the form sends the mask', async () => {
-    mockFindFirst.mockResolvedValue({ id: 'p1', userId: 'u1', apiKey: 'sk-REAL', baseUrl: 'http://old/v1' })
+    // Same type and base URL as stored: the masked key is the stored one (HD-24 only
+    // stops it following an edited endpoint, below).
+    mockFindFirst.mockResolvedValue({ id: 'p1', userId: 'u1', providerType: CONFIG.providerType, apiKey: 'sk-REAL', baseUrl: CONFIG.baseUrl })
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ success: true }), { status: 200 }))
 
-    await POST(post({ ...CONFIG, apiKey: '••••1234' }), params('u1', 'p1'))
+    await POST(post({ ...CONFIG, apiKey: '••••1234', temperature: 0.3 }), params('u1', 'p1'))
 
     const sent = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(sent.apiKey).toBe('sk-REAL')
     expect(sent.baseUrl).toBe(CONFIG.baseUrl)
+    expect(sent.temperature).toBe(0.3)
+  })
+
+  // HD-24: this case used to send the stored key to the edited base URL.
+  test('a masked key with an edited base URL is refused: the stored key never reaches the new endpoint', async () => {
+    mockFindFirst.mockResolvedValue({ id: 'p1', userId: 'u1', providerType: CONFIG.providerType, apiKey: 'sk-REAL', baseUrl: 'http://old/v1' })
+
+    const res = await POST(post({ ...CONFIG, apiKey: '••••1234' }), params('u1', 'p1'))
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body).toMatchObject({ success: false, code: 'secret_reentry_required', field: 'apiKey', endpoint: 'baseUrl' })
+    expect(JSON.stringify(body)).not.toContain('sk-REAL')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('an edited base URL with the key typed again tests that key', async () => {
+    mockFindFirst.mockResolvedValue({ id: 'p1', userId: 'u1', providerType: CONFIG.providerType, apiKey: 'sk-REAL', baseUrl: 'http://old/v1' })
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ success: true }), { status: 200 }))
+
+    await POST(post({ ...CONFIG, apiKey: 'sk-typed-again' }), params('u1', 'p1'))
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ apiKey: 'sk-typed-again', baseUrl: CONFIG.baseUrl })
+  })
+
+  test('a masked Extra Headers value is tested with the stored one, on the stored endpoint (review of 1.6)', async () => {
+    mockFindFirst.mockResolvedValue({ id: 'p1', userId: 'u1', providerType: CONFIG.providerType, apiKey: '', baseUrl: CONFIG.baseUrl, defaultHeaders: { Authorization: 'Bearer hdr-REAL' } })
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ success: true }), { status: 200 }))
+
+    await POST(post({ ...CONFIG, defaultHeaders: { Authorization: '••••••••REAL', 'X-New': 'typed' } }), params('u1', 'p1'))
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).defaultHeaders).toEqual({ Authorization: 'Bearer hdr-REAL', 'X-New': 'typed' })
+  })
+
+  test('a masked Extra Headers value with an edited base URL is refused (review of 1.6)', async () => {
+    mockFindFirst.mockResolvedValue({ id: 'p1', userId: 'u1', providerType: CONFIG.providerType, apiKey: '', baseUrl: 'http://old/v1', defaultHeaders: { Authorization: 'Bearer hdr-REAL' } })
+
+    const res = await POST(post({ ...CONFIG, defaultHeaders: { Authorization: '••••••••REAL' } }), params('u1', 'p1'))
+
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(JSON.parse(text)).toMatchObject({ success: false, code: 'secret_reentry_required', field: 'defaultHeaders.Authorization' })
+    expect(text).not.toContain('hdr-REAL')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('the test spends the account\'s key, so it asks for the write rule (HD-23)', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ success: true }), { status: 200 }))
+    await POST(post(CONFIG), params('u1', 'unsaved'))
+    expect(mockRequireUserAccess).toHaveBeenCalledWith(expect.anything(), 'u1', { mode: 'write' })
   })
 })
 

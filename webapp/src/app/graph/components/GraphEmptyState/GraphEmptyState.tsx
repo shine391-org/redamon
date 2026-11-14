@@ -1,6 +1,8 @@
 'use client'
 
 import { Loader2, Play } from 'lucide-react'
+import { useRefusal } from '@/hooks/useRefusal'
+import { RefusalNotice } from '@/components/auth/ForbiddenNotice'
 import type { EmptyGraphState } from '../../utils/emptyGraph'
 import styles from './GraphEmptyState.module.css'
 
@@ -49,6 +51,10 @@ const GHOSTS: { x: number; y: number; r: number; color: string; from?: number }[
 
 export function GraphEmptyState({ state, onStartRecon, onResumeRecon }: GraphEmptyStateProps) {
   const { title, description } = COPY[state]
+  // Start and resume both ask recon:scan (route manifest).
+  const refusal = useRefusal('recon:scan')
+  const refused = refusal !== null
+  const refusedTitle = refusal?.text
 
   return (
     <div className={styles.wrapper}>
@@ -87,16 +93,19 @@ export function GraphEmptyState({ state, onStartRecon, onResumeRecon }: GraphEmp
         <p className={styles.description}>{description}</p>
 
         {state === 'start' && (
-          <button type="button" className={styles.startButton} onClick={onStartRecon}>
+          <button type="button" className={styles.startButton} onClick={onStartRecon} disabled={refused} title={refusedTitle}>
             <Play size={15} />
             <span>Start Recon Pipeline</span>
           </button>
         )}
         {state === 'paused' && (
-          <button type="button" className={styles.startButton} onClick={onResumeRecon}>
+          <button type="button" className={styles.startButton} onClick={onResumeRecon} disabled={refused} title={refusedTitle}>
             <Play size={15} />
             <span>Resume Recon</span>
           </button>
+        )}
+        {refusal && (state === 'start' || state === 'paused') && (
+          <RefusalNotice refusal={refusal} className={styles.notice} />
         )}
         {state === 'running' && (
           <div className={styles.running} role="status">

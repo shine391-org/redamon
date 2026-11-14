@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { getEffectiveUser, EffectiveUser } from './session'
+import { projectAccess } from './authz/projectAccess'
+import { ownsRow, rowOwnerFilter, type RowOwnerFilter } from './authz/rowOwner'
 
 /**
  * Per-user authorization guards (BOLA remediation).
@@ -10,34 +12,47 @@ import { getEffectiveUser, EffectiveUser } from './session'
  * id unless they are simulating another user. These helpers turn "which user is
  * this?" (identity) into "may this user touch this resource?" (authorization).
  *
- * Rollout: ownership is ENFORCED by default (fail closed). An operator who wants
- * to observe first can set ACCESS_ENFORCE=0 (or false) to run a log-only phase -
- * violations are then logged with a `[BOLA]` marker and allowed. Genuinely missing
- * resources (404) and unauthenticated callers (401) are always hard.
+ * Ownership is always enforced: ACCESS_ENFORCE, which once allowed a log-only rollout,
+ * is ignored with one warning per process.
  *
  * Anti-enumeration: a cross-user resource is reported as 404 (not 403) so the
  * distinction "exists but not yours" vs "does not exist" cannot be used to
  * enumerate other users' project/conversation ids (repo convention).
  *
- * Secret-exposure routes (A2) use requireUserAccess, which enforces immediately.
+ * Secret-exposure routes (A2) use requireUserAccess, which answers 403 instead.
+ *
+ * The helpers ask one policy instead of comparing owners themselves: a project through
+ * `projectAccess()`, a per-user row (a preset) through `ownsRow()`, a conversation through both
+ * (its author, on a project the author can still see).
  */
 
-export function accessEnforced(): boolean {
-  const v = process.env.ACCESS_ENFORCE
-  // Enforce by default; only an explicit opt-out disables it.
-  return !(v === '0' || v === 'false')
-}
+let ignoredWarned = false
 
 /**
- * Cross-user ownership-violation response. Returns a 404 (anti-enumeration) when
- * enforcing; otherwise logs `[BOLA]` and returns null (allow, opt-in log-only).
+ * Always true. ACCESS_ENFORCE once turned ownership into a log-only check; it is read only to
+ * tell an operator who still sets it that it is ignored.
  */
-function ownershipDenied(reason: string, detail: Record<string, unknown>): NextResponse | null {
-  if (accessEnforced()) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+export function accessEnforced(): boolean {
+  if (!ignoredWarned && (process.env.ACCESS_ENFORCE ?? '').trim() !== '') {
+    ignoredWarned = true
+    console.warn('[rbac] access_enforce_ignored: ACCESS_ENFORCE is set but ignored; ownership is always enforced')
   }
-  console.warn(`[BOLA] would-block: ${reason}`, JSON.stringify(detail))
-  return null
+  return true
+}
+
+/** Tests only. */
+export function resetAccessEnforceWarningForTests(): void {
+  ignoredWarned = false
+}
+
+// Checked as the guards load, so an operator who still sets the variable reads the warning with
+// the first request, not only when a cross-user request is refused (which may never happen).
+accessEnforced()
+
+/** The answer to a resource of another user: 404, as for one that does not exist (anti-enumeration). */
+function ownershipDenied(): NextResponse {
+  accessEnforced()
+  return NextResponse.json({ error: 'Not found' }, { status: 404 })
 }
 
 /** Resolve the effective user, or a 401 NextResponse the caller must return. */
@@ -47,31 +62,27 @@ export async function requireEffectiveUser(): Promise<EffectiveUser | NextRespon
   return eff
 }
 
-/**
- * Immediate (non-log-only) owner check. Use where a violation must always block -
- * notably the secret-exposure routes (A2). Returns 403 unless eff owns ownerId.
- */
+/** Owner check answering 403 (not the anti-enumeration 404) unless eff owns ownerId. */
 export function assertOwnerStrict(eff: EffectiveUser, ownerId: string): NextResponse | null {
-  if (eff.userId === ownerId) return null
+  if (ownsRow(eff, ownerId)) return null
   return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 }
 
-/** Log-only-aware owner check for the bulk BOLA rollout. */
+/** Owner check for a per-user row: null when eff owns it, else 404. */
 export function assertOwner(eff: EffectiveUser, ownerId: string): NextResponse | null {
-  if (eff.userId === ownerId) return null
-  return ownershipDenied('owner mismatch', { ownerId, eff: eff.userId })
+  if (ownsRow(eff, ownerId)) return null
+  return ownershipDenied()
 }
 
-/** Prisma where-fragment scoping a list query to the effective user. */
-export function ownerScope(eff: EffectiveUser): { userId: string } {
-  return { userId: eff.userId }
+/** Prisma where-fragment scoping a list query to the effective user (matches no row without an id). */
+export function ownerScope(eff: EffectiveUser): RowOwnerFilter {
+  return rowOwnerFilter(eff)
 }
 
 /**
- * One-call guard for project-scoped routes: resolve the effective user and verify
- * they own `projectId`. Returns a 401/404 NextResponse to return, or null when
- * access is allowed. Convenience wrapper over requireEffectiveUser +
- * requireProjectAccess for the many scan/analytics `[projectId]` routes.
+ * One-call guard for project-scoped routes: resolve the effective user and verify they can see
+ * `projectId` (requireProjectAccess). Returns a 401/404 NextResponse to return, or null when access
+ * is allowed. It asks no level, so a read share passes it as the owner does.
  */
 export async function guardProject(projectId: string): Promise<NextResponse | null> {
   const eff = await requireEffectiveUser()
@@ -82,9 +93,13 @@ export async function guardProject(projectId: string): Promise<NextResponse | nu
 }
 
 /**
- * Load a Project and verify the effective user owns it. 404 when the project does
- * not exist (always hard); ownership violation is log-only-aware. On success (or
- * during the log-only phase) returns the project's id + owner.
+ * Verify the effective user can see a Project at any level (`projectAccess()`): the owner and,
+ * with sharing in force, a read share, oversight or break-glass. 404 when the project does not
+ * exist or the user cannot see it. On success returns the project's id + owner.
+ *
+ * It asks no level, nor do guardProject and requireProjectScopedResource built on it: a route
+ * that writes must also ask a permission at a write level (`requirePermission` /
+ * `withPermission`), or a read collaborator writes (levelLessHelpers.test.ts).
  */
 export async function requireProjectAccess(
   eff: EffectiveUser,
@@ -93,28 +108,16 @@ export async function requireProjectAccess(
   if (!projectId) {
     return NextResponse.json({ error: 'projectId is required' }, { status: 400 })
   }
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { id: true, userId: true },
-  })
-  if (!project) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-  if (project.userId !== eff.userId) {
-    const denied = ownershipDenied('project owner mismatch', {
-      projectId,
-      owner: project.userId,
-      eff: eff.userId,
-    })
-    if (denied) return denied
-  }
-  return { project }
+  const access = await projectAccess(eff, projectId)
+  if (!access) return ownershipDenied()
+  return { project: { id: access.project.id, userId: access.project.userId } }
 }
 
 /**
  * Guard a resource that is owned via its parent Project (Report, Remediation,
  * GraphView, ...). `loadProjectId` returns the resource's projectId (or null when
- * the resource does not exist). Verifies the effective user owns that project.
+ * the resource does not exist). Verifies the effective user can see that project, at any level
+ * (requireProjectAccess).
  */
 export async function requireProjectScopedResource(
   eff: EffectiveUser,
@@ -129,54 +132,48 @@ export async function requireProjectScopedResource(
   return { ok: true }
 }
 
+type ConversationRow = { id: string; userId: string; projectId: string }
+
 /**
- * Load a Conversation (which carries a direct userId) and verify ownership.
- * 404 when absent; ownership is log-only-aware.
+ * A conversation is its author's, and only while the author can still see its project: after a
+ * transfer or a lost membership the project's conversations close with it. The project alone
+ * never opens another author's conversation. Every refusal is the same 404.
  */
+async function conversationAccess(
+  eff: EffectiveUser,
+  conversation: ConversationRow | null,
+): Promise<{ conversation: ConversationRow } | NextResponse> {
+  if (!conversation) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
+  if (!ownsRow(eff, conversation.userId)) return ownershipDenied()
+  if (!(await projectAccess(eff, conversation.projectId))) return ownershipDenied()
+  return { conversation }
+}
+
+/** Load a Conversation and verify the effective user may use it (`conversationAccess`): 404 otherwise. */
 export async function requireConversationAccess(
   eff: EffectiveUser,
   conversationId: string
-): Promise<{ conversation: { id: string; userId: string; projectId: string } } | NextResponse> {
+): Promise<{ conversation: ConversationRow } | NextResponse> {
   const conversation = await prisma.conversation.findUnique({
     where: { id: conversationId },
     select: { id: true, userId: true, projectId: true },
   })
-  if (!conversation) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-  if (conversation.userId !== eff.userId) {
-    const denied = ownershipDenied('conversation owner mismatch', {
-      conversationId,
-      owner: conversation.userId,
-      eff: eff.userId,
-    })
-    if (denied) return denied
-  }
-  return { conversation }
+  return conversationAccess(eff, conversation)
 }
 
 /**
- * Load a Conversation by its (unique) sessionId and verify ownership. Used by the
- * by-session/* routes. 404 when absent; ownership is log-only-aware.
+ * Load a Conversation by its (unique) sessionId and verify the effective user may use it
+ * (`conversationAccess`): 404 otherwise. Used by the by-session/* routes.
  */
 export async function requireConversationAccessBySession(
   eff: EffectiveUser,
   sessionId: string
-): Promise<{ conversation: { id: string; userId: string; projectId: string } } | NextResponse> {
+): Promise<{ conversation: ConversationRow } | NextResponse> {
   const conversation = await prisma.conversation.findUnique({
     where: { sessionId },
     select: { id: true, userId: true, projectId: true },
   })
-  if (!conversation) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-  if (conversation.userId !== eff.userId) {
-    const denied = ownershipDenied('conversation owner mismatch', {
-      sessionId,
-      owner: conversation.userId,
-      eff: eff.userId,
-    })
-    if (denied) return denied
-  }
-  return { conversation }
+  return conversationAccess(eff, conversation)
 }

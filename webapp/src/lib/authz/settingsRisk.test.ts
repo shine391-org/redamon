@@ -1,0 +1,538 @@
+/**
+ * SH-08, SH-28, OQ-23: project settings classed by risk. An editor (Write) may change ordinary
+ * settings and tighten a safety gate; loosening a gate needs Manage, and Exploitation & shells
+ * for the agent's approval, tunnel and Kali switches; narrowing scope needs Manage, widening it
+ * the owner; the owner's secrets are the owner's. The owner passes every change.
+ *
+ * @vitest-environment node
+ */
+import { describe, test, expect } from 'vitest'
+import { fieldKeys, fieldsWhere, loadRegistry } from '@/lib/reconSettings/registry'
+import { directionOf, wideningReason } from '@/lib/roe/roeWidening'
+import { RECON_PRESETS } from '@/lib/recon-presets'
+import { effectiveToggles, type ProjectAccess } from './projectAccess'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
+import {
+  DANGEROUS_AGENT_TOOLS, EXPLOIT_GATES, NEED_LEVELS, OWN_DIRECTIONS, RISK_CONTEXT_KEYS, classifyChange, classifyField, riskSelect, settingsRefusal,
+} from './settingsRisk'
+
+// The level decision is the real meetsLevel table (write rows from step 5.2a): write reaches R, R*
+// and W; W+S, W+A and W+X also need their toggle; M needs manage; O stays the owner's. These
+// accesses carry the toggles a write share could hold once step 5.6 turns the run toggles on.
+
+type Toggles = Partial<Record<'rawData' | 'runScans' | 'useAgent' | 'exploit' | 'manage', boolean>>
+
+function access(level: string, toggles: Toggles = {}, via = 'share'): ProjectAccess {
+  return { project: { id: 'P', userId: 'owner-1' }, level, toggles: { rawData: level !== 'read', ...toggles }, via } as unknown as ProjectAccess
+}
+
+const OWNER = access('owner', {}, 'owner')
+const READ = access('read')
+const EDITOR = access('write')
+const CO_OWNER = access('write', { manage: true })
+const RED_TEAM_CO_OWNER = access('write', { manage: true, exploit: true })
+const RED_TEAMER = access('write', { exploit: true, runScans: true, useAgent: true })
+
+/** A fresh project: every column at its registry default. */
+function defaultsRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const row: Record<string, unknown> = {}
+  for (const [key, f] of Object.entries(loadRegistry().fields)) row[key] = f.default ?? null
+  return { ...row, ...overrides }
+}
+
+function verdictOf(before: Record<string, unknown>, after: Record<string, unknown>, who: ProjectAccess | null) {
+  return classifyChange(defaultsRow(before), after, who)
+}
+
+describe('classifyChange: one case per class and direction', () => {
+  test('ordinary: Write', () => {
+    const change = { naabuRateLimit: 50 }
+    expect(verdictOf({ naabuRateLimit: 100 }, change, EDITOR).ok).toBe(true)
+    const refused = verdictOf({ naabuRateLimit: 100 }, change, READ)
+    expect(refused.ok).toBe(false)
+    expect(refused.refused).toEqual([expect.objectContaining({ key: 'naabuRateLimit', share: 'ordinary', needs: 'write' })])
+  })
+
+  test('a gate tightened: Write', () => {
+    const v = verdictOf({ agentRequireToolConfirmation: false }, { agentRequireToolConfirmation: true }, EDITOR)
+    expect(v.ok).toBe(true)
+    expect(v.changes).toEqual([expect.objectContaining({ key: 'agentRequireToolConfirmation', share: 'gate', needs: 'write', reason: null })])
+  })
+
+  test('a gate loosened: Manage', () => {
+    const before = { jsReconValidateKeys: false }
+    const after = { jsReconValidateKeys: true }
+    expect(verdictOf(before, after, EDITOR).refused).toEqual([
+      expect.objectContaining({ key: 'jsReconValidateKeys', share: 'gate', needs: 'manage', reason: expect.stringMatching(/safety/) }),
+    ])
+    expect(verdictOf(before, after, CO_OWNER).ok).toBe(true)
+  })
+
+  test('scope narrowed: Manage', () => {
+    const before = { subdomainList: ['a.example.test', 'b.example.test'] }
+    const after = { subdomainList: ['a.example.test'] }
+    expect(verdictOf(before, after, EDITOR).refused).toEqual([
+      expect.objectContaining({ key: 'subdomainList', share: 'scope', needs: 'manage', reason: null }),
+    ])
+    expect(verdictOf(before, after, CO_OWNER).ok).toBe(true)
+  })
+
+  test('scope widened: the owner', () => {
+    const before = { subdomainList: ['a.example.test'] }
+    const after = { subdomainList: ['a.example.test', 'c.example.test'] }
+    const v = verdictOf(before, after, RED_TEAM_CO_OWNER)
+    expect(v.refused).toEqual([
+      expect.objectContaining({ key: 'subdomainList', share: 'scope', needs: 'owner', reason: expect.stringContaining('c.example.test') }),
+    ])
+    expect(verdictOf(before, after, OWNER).ok).toBe(true)
+  })
+
+  test("the owner's secret: the owner", () => {
+    const after = { cypherfixGithubToken: 'rbac-fake-share-secret-0001' }
+    expect(verdictOf({}, after, RED_TEAM_CO_OWNER).refused).toEqual([
+      expect.objectContaining({ key: 'cypherfixGithubToken', share: 'secret', needs: 'owner' }),
+    ])
+    expect(verdictOf({}, after, OWNER).ok).toBe(true)
+  })
+
+  test('a key the registry does not know needs the owner', () => {
+    const v = verdictOf({}, { notAColumn: 1 }, RED_TEAM_CO_OWNER)
+    expect(v.refused).toEqual([expect.objectContaining({ key: 'notAColumn', share: 'unknown', needs: 'owner' })])
+  })
+})
+
+describe('the spec cases', () => {
+  test('owner unchanged: every column changed at once passes', () => {
+    const before = defaultsRow()
+    const after = Object.fromEntries(fieldKeys().map(k => [k, `changed-${k}`]))
+    const v = classifyChange(before, after, OWNER)
+    expect(v.ok).toBe(true)
+    expect(v.refused).toEqual([])
+    expect(v.changes.map(c => c.key)).toEqual(fieldKeys())
+  })
+
+  test('an editor cannot loosen the dangerous-tool confirmation', () => {
+    const v = verdictOf({ agentRequireToolConfirmation: true }, { agentRequireToolConfirmation: false }, EDITOR)
+    expect(v.ok).toBe(false)
+    expect(v.refused).toEqual([expect.objectContaining({ key: 'agentRequireToolConfirmation', needs: 'manage+exploit' })])
+    // Exploitation & shells alone is not enough either: loosening a gate is a co-owner's call.
+    expect(verdictOf({ agentRequireToolConfirmation: true }, { agentRequireToolConfirmation: false }, RED_TEAMER).ok).toBe(false)
+  })
+
+  test('a co-owner loosening an approval gate needs Exploitation', () => {
+    for (const key of ['agentRequireApprovalForExploitation', 'agentRequireApprovalForPostExploitation', 'agentRequireToolConfirmation']) {
+      const before = { [key]: true }
+      const after = { [key]: false }
+      expect(verdictOf(before, after, CO_OWNER).refused, key).toEqual([expect.objectContaining({ key, needs: 'manage+exploit' })])
+      expect(verdictOf(before, after, RED_TEAM_CO_OWNER).ok, key).toBe(true)
+    }
+    // Opening the post-exploitation phase is the same call.
+    expect(verdictOf({ agentActivatePostExplPhase: false }, { agentActivatePostExplPhase: true }, CO_OWNER).ok).toBe(false)
+    expect(verdictOf({ agentActivatePostExplPhase: false }, { agentActivatePostExplPhase: true }, RED_TEAM_CO_OWNER).ok).toBe(true)
+  })
+
+  test('a co-owner as projectAccess answers today (Exploitation reads off until step 5.6) cannot loosen an approval gate', () => {
+    const today = access('write', effectiveToggles({ manage: true, exploit: true, runScans: true, useAgent: true }))
+    expect(verdictOf({ agentRequireToolConfirmation: true }, { agentRequireToolConfirmation: false }, today).refused)
+      .toEqual([expect.objectContaining({ key: 'agentRequireToolConfirmation', needs: 'manage+exploit' })])
+    expect(verdictOf({ agentGuardrailEnabled: true }, { agentGuardrailEnabled: false }, today).ok).toBe(true)
+  })
+
+  test('widening scope needs the owner', () => {
+    const cases: Array<[string, unknown, unknown]> = [
+      ['targetDomain', 'example.test', 'other.test'],
+      ['targetIps', ['10.0.0.1'], ['10.0.0.1', '10.0.0.2']],
+      ['domainBatchHosts', ['a.example.test'], ['*.example.test']],
+      ['ipHostnameExclude', ['a.example.test'], []],
+      ['ipHostnameMaxScanned', 100, 200],
+      ['ipMode', false, true],
+      ['githubTargetRepos', 'one', ''],
+      ['supplyChainRepoUrl', 'https://git.example.test/a', 'https://git.example.test/b'],
+      ['roeExcludedHosts', ['prod.example.test'], []],
+      ['roeGlobalMaxRps', 10, 0],
+      ['roeAllowDos', false, true],
+      ['roeEngagementEndDate', '2026-12-01', '2027-01-01'],
+    ]
+    for (const [key, before, after] of cases) {
+      const v = verdictOf({ [key]: before }, { [key]: after }, RED_TEAM_CO_OWNER)
+      expect(v.refused, key).toEqual([expect.objectContaining({ key, share: 'scope', needs: 'owner' })])
+      expect(verdictOf({ [key]: before }, { [key]: after }, OWNER).ok, key).toBe(true)
+    }
+  })
+
+  test('the same fields narrowed are a co-owner call', () => {
+    const cases: Array<[string, unknown, unknown]> = [
+      ['targetIps', ['10.0.0.1', '10.0.0.2'], ['10.0.0.1']],
+      ['ipHostnameExclude', [], ['a.example.test']],
+      ['ipHostnameMaxScanned', 200, 100],
+      ['githubTargetRepos', '', 'one'],
+      ['roeExcludedHosts', [], ['prod.example.test']],
+      ['roeGlobalMaxRps', 10, 5],
+      ['roeAllowDos', true, false],
+      ['roeEngagementEndDate', '2027-01-01', '2026-12-01'],
+    ]
+    for (const [key, before, after] of cases) {
+      expect(verdictOf({ [key]: before }, { [key]: after }, CO_OWNER).ok, key).toBe(true)
+      expect(verdictOf({ [key]: before }, { [key]: after }, EDITOR).refused, key).toEqual([
+        expect.objectContaining({ key, needs: 'manage' }),
+      ])
+    }
+  })
+
+  test('a preset that loosens a gate is refused at W', () => {
+    // Secret Hunter validates the keys it finds against their providers: a gate an owner who
+    // turned it off has closed. The rest of the preset is an editor's to apply.
+    const preset = RECON_PRESETS.find(p => p.id === 'secret-hunter')!
+    expect(preset.parameters.jsReconValidateKeys).toBe(true)
+    const v = verdictOf({ jsReconValidateKeys: false }, preset.parameters as Record<string, unknown>, EDITOR)
+    expect(v.refused).toEqual([expect.objectContaining({ key: 'jsReconValidateKeys', share: 'gate', needs: 'manage' })])
+    expect(verdictOf({ jsReconValidateKeys: false }, preset.parameters as Record<string, unknown>, CO_OWNER).ok).toBe(true)
+  })
+
+  test('every shipped preset is ordinary or a gate: no preset reaches scope or a secret', () => {
+    for (const preset of RECON_PRESETS) {
+      const v = classifyChange(defaultsRow(), preset.parameters as Record<string, unknown>, OWNER)
+      const beyond = v.changes.filter(c => c.share !== 'ordinary' && c.share !== 'gate').map(c => c.key)
+      expect(beyond, preset.id).toEqual([])
+    }
+  })
+})
+
+describe('the directions the generic rules get wrong or do not cover', () => {
+  test('turning the target guardrail or the ownership proof off widens; on narrows', () => {
+    for (const key of ['targetGuardrailEnabled', 'verifyDomainOwnership']) {
+      expect(classifyField(key, true, false).needs, key).toBe('owner')
+      expect(classifyField(key, false, true).needs, key).toBe('manage')
+    }
+  })
+
+  test('the derived roeEnabled widens when it goes off, not on', () => {
+    expect(classifyField('roeEnabled', true, false).needs).toBe('owner')
+    expect(classifyField('roeEnabled', false, true).needs).toBe('manage')
+  })
+
+  test('the Kali allowlist: a first entry tightens, an added entry or an emptied list loosens', () => {
+    expect(classifyField('agentKaliInstallAllowedPackages', '', 'nmap').needs).toBe('write')
+    expect(classifyField('agentKaliInstallAllowedPackages', 'nmap, hydra', 'nmap').needs).toBe('write')
+    expect(classifyField('agentKaliInstallAllowedPackages', 'nmap', 'nmap,hydra').needs).toBe('manage+exploit')
+    expect(classifyField('agentKaliInstallAllowedPackages', 'nmap', '').needs).toBe('manage+exploit')
+  })
+
+  test('the Kali denylist: an entry removed loosens, one added tightens', () => {
+    expect(classifyField('agentKaliInstallForbiddenPackages', 'hydra', 'hydra,john').needs).toBe('write')
+    expect(classifyField('agentKaliInstallForbiddenPackages', 'hydra,john', 'john').needs).toBe('manage+exploit')
+  })
+
+  test('MCP Kali exec: on loosens (Manage + Exploitation), off tightens', () => {
+    expect(classifyField('mcpKaliExecEnabled', false, true).needs).toBe('manage+exploit')
+    expect(classifyField('mcpKaliExecEnabled', true, false).needs).toBe('write')
+  })
+
+  test('a window part edited while the window is off widens nothing', () => {
+    const row = { roeTimeWindowEnabled: false, roeTimeWindowStartTime: '09:00' }
+    expect(classifyField('roeTimeWindowStartTime', '09:00', '01:00', row, { ...row, roeTimeWindowStartTime: '01:00' }).needs).toBe('manage')
+    const on = { roeTimeWindowEnabled: true, roeTimeWindowStartTime: '09:00' }
+    expect(classifyField('roeTimeWindowStartTime', '09:00', '01:00', on, { ...on, roeTimeWindowStartTime: '01:00' }).needs).toBe('owner')
+  })
+
+  test('the subdomain list is judged by what it scans: emptying it reaches every subdomain', () => {
+    // Single-domain mode (scopeGroups.ts): no prefix enumerates `*.target`, '.' adds the domain itself.
+    const judge = (before: string[], after: string[], targetDomain = 'example.test') =>
+      classifyField('subdomainList', before, after, { targetDomain, subdomainList: before }, { targetDomain, subdomainList: after })
+    expect(judge(['www'], [])).toMatchObject({ needs: 'owner', reason: expect.stringMatching(/every subdomain/) })
+    expect(judge(['www'], ['.']).needs).toBe('owner')
+    expect(judge(['www', 'api'], ['www'])).toMatchObject({ needs: 'manage', reason: null })
+    expect(judge([], ['www']).needs).toBe('manage')
+    expect(judge(['.'], []).needs).toBe('manage')
+    expect(judge([], ['.'])).toMatchObject({ needs: 'owner', reason: expect.stringMatching(/domain itself/) })
+    expect(judge(['www'], ['www', '.']).needs).toBe('owner')
+    expect(judge(['www'], ['www', 'api'])).toMatchObject({ needs: 'owner', reason: expect.stringMatching(/adds api/) })
+    // An entry the rule drops leaves no prefix, which enumerates every subdomain.
+    expect(judge(['www'], ['www.example.test']).needs).toBe('owner')
+    // No target yet: the prefixes mean the same under any domain.
+    expect(judge(['www'], [], '').needs).toBe('owner')
+    expect(judge(['www', 'api'], ['api'], '').needs).toBe('manage')
+  })
+
+  test('the daily window is judged whole: an end before the start crosses midnight, as every reader reads it', () => {
+    const on = { roeTimeWindowEnabled: true, roeTimeWindowStartTime: '09:00', roeTimeWindowEndTime: '18:00' }
+    const judge = (start: string, end: string, before: Record<string, unknown> = on) =>
+      classifyChange(before, { roeTimeWindowStartTime: start, roeTimeWindowEndTime: end }, CO_OWNER)
+    // 09:00-08:00 is 23 hours a day, not an earlier close.
+    expect(judge('09:00', '08:00').refused).toEqual([
+      expect.objectContaining({ key: 'roeTimeWindowEndTime', needs: 'owner', reason: expect.stringMatching(/09:00-18:00 .*09:00-08:00/) }),
+    ])
+    // A later start and an earlier end, each "narrower" alone, make 17:00-10:00 overnight.
+    expect(judge('17:00', '10:00').refused.map(c => c.key)).toEqual(['roeTimeWindowEndTime', 'roeTimeWindowStartTime'])
+    expect(judge('10:00', '17:00').ok).toBe(true)
+    const overnight = { ...on, roeTimeWindowStartTime: '22:00', roeTimeWindowEndTime: '06:00' }
+    expect(judge('23:00', '05:00', overnight).ok).toBe(true)
+    expect(judge('21:00', '06:00', overnight).refused.map(c => c.key)).toEqual(['roeTimeWindowStartTime'])
+    expect(judge('22:00', '07:00', overnight).refused.map(c => c.key)).toEqual(['roeTimeWindowEndTime'])
+    // An overnight window cut to a daytime one that lies inside it narrows.
+    expect(judge('00:00', '05:00', overnight).ok).toBe(true)
+  })
+
+  test('a window edit reads the other end as stored: an end alone can make the window overnight', () => {
+    const stored = { roeTimeWindowEnabled: true, roeTimeWindowStartTime: '07:00', roeTimeWindowEndTime: '08:00' }
+    expect(classifyChange(stored, { roeTimeWindowEndTime: '06:00' }, CO_OWNER).refused).toEqual([
+      expect.objectContaining({ key: 'roeTimeWindowEndTime', needs: 'owner' }),
+    ])
+    expect(RISK_CONTEXT_KEYS).toEqual(expect.arrayContaining(['roeTimeWindowStartTime', 'roeTimeWindowEndTime']))
+  })
+
+  test('a value outside the field\'s set or format widens before any order is read', () => {
+    // The agent reads an unknown phase as post_exploitation (roe_gate.py): no cap at all.
+    expect(classifyField('roeMaxSeverityPhase', 'exploitation', 'none')).toMatchObject({ needs: 'owner', reason: expect.stringMatching(/must be one of/) })
+    expect(classifyField('roeMaxSeverityPhase', 'exploitation', 'informational').needs).toBe('manage')
+    // A date the agent's strptime cannot read is no end date at all.
+    for (const bad of ['1', '2026-02-30', '2026-1-5', '30/12/2026']) {
+      expect(classifyField('roeEngagementEndDate', '2026-12-01', bad), bad).toMatchObject({ needs: 'owner', reason: expect.stringMatching(/YYYY-MM-DD/) })
+      expect(classifyField('roeEngagementStartDate', '2026-11-01', bad).needs, bad).toBe('owner')
+    }
+    expect(classifyField('roeEngagementEndDate', '2026-12-01', '2026-11-30').needs).toBe('manage')
+    // The readers compare HH:MM text: '9:00' sorts after '18:00'. Refused whether or not the window is on.
+    for (const bad of ['9:00', '25:00', '18:00:00', '6pm']) {
+      expect(classifyField('roeTimeWindowEndTime', '18:00', bad).needs, bad).toBe('owner')
+    }
+    // Below the field's bound, or not a number: no ordering applies.
+    expect(classifyField('roeGlobalMaxRps', 10, -1).needs).toBe('owner')
+    expect(classifyField('ipHostnameMaxScanned', 100, 'lots').needs).toBe('owner')
+    expect(classifyField('ipHostnameMode', 'record_only', 'everything').needs).toBe('owner')
+    // A gate given a value of the wrong type loosens.
+    expect(classifyField('agentGuardrailEnabled', true, 'yes').needs).toBe('manage')
+    expect(classifyField('agentGuardrailEnabled', false, true).needs).toBe('write')
+  })
+
+  test('the RoE review reads the same: an unknown phase or an unreadable date widens, an unreadable stored date was none', () => {
+    expect(wideningReason('roeMaxSeverityPhase', 'post_exploitation', 'none')).toBeTruthy()
+    expect(wideningReason('roeMaxSeverityPhase', 'informational', 'nonsense')).toBeTruthy()
+    expect(wideningReason('roeEngagementEndDate', '2026-12-01', '1')).toMatch(/YYYY-MM-DD/)
+    expect(wideningReason('roeEngagementStartDate', '2026-11-01', 'next week')).toMatch(/YYYY-MM-DD/)
+    expect(wideningReason('roeEngagementEndDate', 'garbage', '2026-12-01')).toBeNull()
+    const on = { roeTimeWindowEnabled: true, roeTimeWindowStartTime: '09:00', roeTimeWindowEndTime: '18:00' }
+    expect(wideningReason('roeTimeWindowEndTime', '18:00', '9:00', on, { ...on, roeTimeWindowEndTime: '9:00' })).toMatch(/HH:MM/)
+  })
+
+  test('the CypherFix push approval is a gate: off loosens (Manage), on tightens (Write)', () => {
+    expect(classifyField('cypherfixRequireApproval', true, false)).toMatchObject({ share: 'gate', needs: 'manage' })
+    expect(classifyField('cypherfixRequireApproval', false, true)).toMatchObject({ share: 'gate', needs: 'write' })
+  })
+
+  test('the tool phase map: a dangerous tool opened in an earlier phase loosens the approval gates', () => {
+    const map = (over: Record<string, unknown> = {}) => ({
+      kali_shell: ['exploitation', 'post_exploitation'], execute_nuclei: ['informational', 'exploitation'],
+      metasploit_console: ['post_exploitation'], tradecraft_lookup: ['exploitation', 'post_exploitation'], ...over,
+    })
+    const judge = (over: Record<string, unknown>, before = map()) => classifyField('agentToolPhaseMap', before, map(over))
+    // A shell before the exploitation approval: Manage and Exploitation & shells.
+    expect(judge({ kali_shell: ['informational', 'exploitation', 'post_exploitation'] }))
+      .toMatchObject({ share: 'gate', needs: 'manage+exploit', reason: expect.stringMatching(/kali_shell in informational/) })
+    expect(judge({ metasploit_console: ['exploitation', 'post_exploitation'] }).needs).toBe('manage+exploit')
+    // A dangerous tool the map had off, opened at all.
+    const { kali_shell: _off, ...withoutShell } = map()
+    expect(classifyField('agentToolPhaseMap', withoutShell, map()).needs).toBe('manage+exploit')
+    // The agent reads `phase in entry`: a text entry matches by substring, so 'post_exploitation' admits exploitation.
+    expect(judge({ metasploit_console: 'post_exploitation' }).needs).toBe('manage+exploit')
+    // Tightening, a later phase, or a tool with no confirmation gate stays an editor's.
+    expect(judge({ kali_shell: ['post_exploitation'] }).needs).toBe('write')
+    expect(judge({ execute_nuclei: ['informational', 'exploitation', 'post_exploitation'] }).needs).toBe('write')
+    expect(judge({ tradecraft_lookup: ['informational', 'exploitation', 'post_exploitation'] }).needs).toBe('write')
+    expect(judge({ kali_shell: [] }).needs).toBe('write')
+  })
+
+  // The agent's source is outside webapp/: a webapp-only checkout skips this pin.
+  const agentSettings = path.resolve(__dirname, '../../../../agentic/project_settings.py')
+  test.skipIf(!existsSync(agentSettings))('the tool phase map knows the agent\'s dangerous tools', () => {
+    const block = readFileSync(agentSettings, 'utf8').match(/^DANGEROUS_TOOLS = frozenset\(\{([\s\S]*?)\}\)/m)
+    expect(block).not.toBeNull()
+    const python = [...block![1].replace(/#.*$/gm, '').matchAll(/'([a-z_]+)'/g)].map(m => m[1]).sort()
+    expect([...DANGEROUS_AGENT_TOOLS].sort()).toEqual(python)
+  })
+
+  test('the sensitive-data rule is scope: a looser rule needs the owner, a stricter one Manage', () => {
+    expect(classifyField('roeSensitiveDataHandling', 'no_access', 'full_access')).toMatchObject({ share: 'scope', needs: 'owner' })
+    expect(classifyField('roeSensitiveDataHandling', 'prove_access_only', 'limited_collection').needs).toBe('owner')
+    expect(classifyField('roeSensitiveDataHandling', 'full_access', 'no_access').needs).toBe('manage')
+    expect(classifyField('roeSensitiveDataHandling', 'no_access', 'anything').needs).toBe('owner')
+  })
+
+  test('the engagement identity header is scope: clearing or replacing it needs the owner, setting a first one Manage', () => {
+    const set = 'X-Bug-Bounty: rbac-fake-handle'
+    expect(classifyField('engagementIdentityHeader', set, '')).toMatchObject({ share: 'scope', needs: 'owner', reason: expect.stringMatching(/clears/) })
+    expect(classifyField('engagementIdentityHeader', set, 'X-Bug-Bounty: rbac-other-handle').needs).toBe('owner')
+    expect(classifyField('engagementIdentityHeader', '', set).needs).toBe('manage')
+    expect(verdictOf({ engagementIdentityHeader: '' }, { engagementIdentityHeader: set }, EDITOR).refused)
+      .toEqual([expect.objectContaining({ key: 'engagementIdentityHeader', needs: 'manage' })])
+  })
+
+  test('the derived batch groups never decide on their own', () => {
+    expect(classifyField('domainBatchGroups', [], [{ rootDomain: 'x.test', prefixes: ['*'], hosts: [], wildcard: true }]).needs).toBe('manage')
+  })
+
+  test('a partial save judges the window against the row as it will be', () => {
+    // Auto-save sends one field: the window turned on in the same row decides.
+    const before = defaultsRow({ roeTimeWindowEnabled: true, roeTimeWindowStartTime: '09:00' })
+    expect(classifyChange(before, { roeTimeWindowStartTime: '01:00' }, CO_OWNER).refused).toEqual([
+      expect.objectContaining({ key: 'roeTimeWindowStartTime', needs: 'owner' }),
+    ])
+  })
+})
+
+describe('what is classified', () => {
+  test('an unchanged value is not a change: a full-form save at W passes over gates and scope', () => {
+    const row = defaultsRow({ targetDomain: 'example.test', agentRequireToolConfirmation: false })
+    const v = classifyChange(row, { ...row, naabuRateLimit: 7 }, EDITOR)
+    expect(v.ok).toBe(true)
+    expect(v.changes.map(c => c.key)).toEqual(['naabuRateLimit'])
+  })
+
+  test('no access, or a read access, changes nothing', () => {
+    for (const who of [null, undefined, READ]) {
+      const v = classifyChange(defaultsRow({ agentRequireToolConfirmation: false }), { naabuRateLimit: 7, agentRequireToolConfirmation: true }, who)
+      expect(v.ok).toBe(false)
+      expect(v.refused.map(c => c.key)).toEqual(['agentRequireToolConfirmation', 'naabuRateLimit'])
+    }
+  })
+
+  test('a kind of access meetsLevel has no row for is refused', () => {
+    expect(classifyChange(defaultsRow(), { naabuRateLimit: 7 }, access('auditor')).ok).toBe(false)
+  })
+
+  test('several changes: every refusal is listed, in key order, beside the allowed ones', () => {
+    const v = verdictOf(
+      { subdomainList: ['a.example.test'], agentRequireToolConfirmation: true },
+      { subdomainList: ['a.example.test', 'b.example.test'], agentRequireToolConfirmation: false, naabuRateLimit: 3 },
+      CO_OWNER,
+    )
+    expect(v.changes.map(c => [c.key, c.ok])).toEqual([
+      ['agentRequireToolConfirmation', false], ['naabuRateLimit', true], ['subdomainList', false],
+    ])
+    expect(v.refused.map(c => c.needs)).toEqual(['manage+exploit', 'owner'])
+  })
+})
+
+describe('the tables cover the registry', () => {
+  test('every gate and scope field has a judgment, so none slips through unjudged', () => {
+    const unjudged = fieldsWhere(f => f.share === 'gate' || f.share === 'scope')
+      .filter(f => !(f.key in OWN_DIRECTIONS) && f.roe_parse !== 'tighten_only' && directionOf(f.key) === undefined)
+      .map(f => f.key)
+    expect(unjudged).toEqual([])
+  })
+
+  test('every own direction and every exploit gate names a gate or scope field', () => {
+    const classed = new Set(fieldsWhere(f => f.share === 'gate' || f.share === 'scope').map(f => f.key))
+    expect(Object.keys(OWN_DIRECTIONS).filter(k => !classed.has(k))).toEqual([])
+    const gates = new Set(fieldsWhere(f => f.share === 'gate').map(f => f.key))
+    expect([...EXPLOIT_GATES].filter(k => !gates.has(k))).toEqual([])
+  })
+
+  test('the exploit gates are the agent approval, phase, tool-phase, tunnel and Kali switches', () => {
+    expect([...EXPLOIT_GATES].sort()).toEqual([
+      'agentActivatePostExplPhase', 'agentChiselTunnelEnabled', 'agentKaliInstallAllowedPackages',
+      'agentKaliInstallEnabled', 'agentKaliInstallForbiddenPackages', 'agentNgrokTunnelEnabled',
+      'agentRequireApprovalForExploitation', 'agentRequireApprovalForPostExploitation',
+      'agentRequireToolConfirmation', 'agentToolPhaseMap', 'mcpKaliExecEnabled',
+    ])
+  })
+
+  test('classifying never throws on a value of the wrong shape', () => {
+    for (const key of fieldKeys()) {
+      for (const [b, a] of [[null, 'x'], [{ a: 1 }, 7], [['x'], true]] as Array<[unknown, unknown]>) {
+        expect(() => classifyField(key, b, a), key).not.toThrow()
+      }
+    }
+  })
+})
+
+// Step 5.1b: what the writers answer with, and the columns they read beside the change.
+describe('the refusal every writer answers (step 5.1b)', () => {
+  test('nothing refused: no refusal', () => {
+    expect(settingsRefusal(verdictOf({ naabuRateLimit: 100 }, { naabuRateLimit: 50 }, EDITOR), 'project:settings')).toBeNull()
+  })
+
+  test('names each refused key with the level it needs, in the §9.8 body', () => {
+    const v = verdictOf(
+      { subdomainList: ['a.example.test'], agentRequireToolConfirmation: true },
+      { subdomainList: ['a.example.test', 'b.example.test'], agentRequireToolConfirmation: false, naabuRateLimit: 3 },
+      CO_OWNER,
+    )
+    const r = settingsRefusal(v, 'project:settings')!
+    expect(r).toMatchObject({ code: 'forbidden', permission: 'project:settings', level: 'O', needs: 'owner' })
+    expect(r.refused).toEqual([
+      { key: 'agentRequireToolConfirmation', needs: 'manage+exploit', levels: ['M', 'W+X'], reason: expect.stringMatching(/safety gate/) },
+      { key: 'subdomainList', needs: 'owner', levels: ['O'], reason: expect.stringContaining('b.example.test') },
+    ])
+    expect(r.error).toMatch(/agentRequireToolConfirmation needs Manage and Exploitation & shells/)
+    expect(r.error).toMatch(/subdomainList needs the project's owner/)
+    expect(r.error).toMatch(/\(project:settings\)/)
+    expect(r.error).toMatch(/Nothing was saved\.$/)
+    // The allowed change is not named.
+    expect(r.error).not.toMatch(/naabuRateLimit/)
+  })
+
+  test('the strictest need decides the level: Manage alone answers M, Write alone W', () => {
+    expect(settingsRefusal(verdictOf({ jsReconValidateKeys: false }, { jsReconValidateKeys: true }, EDITOR), 'preset:apply'))
+      .toMatchObject({ level: 'M', needs: 'manage', permission: 'preset:apply' })
+    expect(settingsRefusal(verdictOf({ naabuRateLimit: 1 }, { naabuRateLimit: 2 }, READ), 'project:settings'))
+      .toMatchObject({ level: 'W', needs: 'write' })
+    for (const need of Object.keys(NEED_LEVELS) as Array<keyof typeof NEED_LEVELS>) expect(NEED_LEVELS[need].length).toBeGreaterThan(0)
+  })
+
+  test('a long reason (a whole added target list) is cut, never the key', () => {
+    const hosts = Array.from({ length: 200 }, (_, i) => `h${i}.example.test`)
+    const r = settingsRefusal(verdictOf({ subdomainList: ['seed.example.test'] }, { subdomainList: hosts }, CO_OWNER), 'project:settings')!
+    expect(r.refused[0].key).toBe('subdomainList')
+    expect(r.refused[0].reason!.length).toBeLessThanOrEqual(160)
+    expect(r.error.length).toBeLessThan(400)
+  })
+})
+
+describe('ordinary columns that stay the owner\'s (step 5.1b)', () => {
+  test('who owns and wrote the row, and who the target belongs to, need the owner', () => {
+    for (const key of ['userId', 'createdById', 'updatedById', 'engagementKind']) {
+      const v = verdictOf({ [key]: 'internal' }, { [key]: 'third_party' }, RED_TEAM_CO_OWNER)
+      expect(v.refused, key).toEqual([expect.objectContaining({ key, share: 'ordinary', needs: 'owner' })])
+      expect(verdictOf({ [key]: 'internal' }, { [key]: 'third_party' }, OWNER).ok, key).toBe(true)
+    }
+  })
+
+  test('every identity column is one of them; the internal ones a preset writes stay Write', () => {
+    for (const f of fieldsWhere(x => x.deny_reason === 'identity')) expect(classifyField(f.key, 'a', 'b').needs, f.key).toBe('owner')
+    for (const key of ['loadedPreset', 'reconPresetId', 'name']) expect(classifyField(key, 'a', 'b').needs, key).toBe('write')
+  })
+})
+
+describe('the stored columns a writer reads (step 5.1b)', () => {
+  test('riskSelect: the changed keys and the context keys', () => {
+    const context = Object.fromEntries(RISK_CONTEXT_KEYS.map(k => [k, true]))
+    expect(riskSelect(['naabuRateLimit', 'roeTimeWindowDays'])).toEqual({ naabuRateLimit: true, roeTimeWindowDays: true, ...context })
+    expect(riskSelect([])).toEqual(context)
+    expect(RISK_CONTEXT_KEYS).toContain('roeTimeWindowEnabled')
+  })
+
+  test('a window edit judged without the switch reads as narrowing: the switch must be read', () => {
+    const on = { roeTimeWindowEnabled: true, roeTimeWindowDays: ['mon'] }
+    expect(classifyChange({ roeTimeWindowDays: ['mon'] }, { roeTimeWindowDays: ['mon', 'sun'] }, CO_OWNER).ok).toBe(true)
+    expect(classifyChange(on, { roeTimeWindowDays: ['mon', 'sun'] }, CO_OWNER).refused).toEqual([
+      expect.objectContaining({ key: 'roeTimeWindowDays', needs: 'owner' }),
+    ])
+  })
+
+  test('the context keys are every row field a rule reads', () => {
+    // The rules read other columns only through beforeRow / afterRow; each such column is a context key.
+    // Each is read by a named constant (`beforeRow[WINDOW_SWITCH]`), whose value is the column.
+    const read = new Set<string>()
+    for (const file of ['../roe/roeWidening.ts', './settingsRisk.ts']) {
+      const src = readFileSync(path.join(__dirname, file), 'utf8')
+      for (const m of src.matchAll(/(?:beforeRow|afterRow)\[([A-Za-z_]+)\]/g)) {
+        const value = src.match(new RegExp(`const ${m[1]} = '([A-Za-z]+)'`))
+        expect(value, `${file}: ${m[1]} is not a constant naming a column`).not.toBeNull()
+        read.add(value![1])
+      }
+    }
+    expect([...read].sort()).toEqual([...RISK_CONTEXT_KEYS].sort())
+    expect(read.has('roeTimeWindowEnabled') && read.has('targetDomain')).toBe(true)
+  })
+})

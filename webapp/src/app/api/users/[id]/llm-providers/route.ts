@@ -1,28 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { getSession, isInternalRequest } from '@/lib/session'
+import { actsAsAccount, getSession, isInternalRequest, requireAccountWrite } from '@/lib/session'
 import { isReasoningEffort } from '@/lib/llmReasoning'
 import { requireUserExists, isForeignKeyViolation } from '@/lib/userScopedWrite'
 import { isJevProvider, jevPinnedConfig } from '@/lib/llmProviderKinds'
 import { internalError } from '@/lib/routeErrors'
+import { maskProvider } from '@/lib/llmProviderMask'
+import { sessionHolds } from '@/lib/authz/adminPermission'
+import { forbiddenResponse } from '@/lib/authz/guards'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { refuseWhileActingAsOn } from '@/lib/authz/actAsRefusals'
+import { agentProviderList } from '@/lib/instanceProviders/entitlement'
 
 interface RouteParams {
   params: Promise<{ id: string }>
-}
-
-function maskSecret(value: string): string {
-  if (!value || value.length <= 4) return value ? '••••' : ''
-  return '••••••••' + value.slice(-4)
-}
-
-function maskProvider(provider: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...provider,
-    apiKey: maskSecret(provider.apiKey as string),
-    awsAccessKeyId: maskSecret(provider.awsAccessKeyId as string),
-    awsSecretKey: maskSecret(provider.awsSecretKey as string),
-    awsBearerToken: maskSecret(provider.awsBearerToken as string),
-  }
 }
 
 // GET /api/users/[id]/llm-providers
@@ -31,7 +22,7 @@ function maskProvider(provider: Record<string, unknown>): Record<string, unknown
 // are returned ONLY to trusted internal callers that present a valid
 // `X-Internal-Key` header (the agent) - never on the strength of the plaintext
 // `?internal=true` query param alone. Browser/JWT callers always receive masked
-// rows, and only for their OWN user id (or if admin), closing the cross-tenant
+// rows, and only for their OWN user id (or with users:read), closing the cross-tenant
 // IDOR where any logged-in user could read another user's cleartext keys.
 export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
@@ -39,15 +30,20 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const internalReq = isInternalRequest(request)
     const wantUnmasked = request.nextUrl.searchParams.get('internal') === 'true'
 
-    // Browser/JWT callers must own the account (or be admin); they never get
-    // unmasked secrets even if they pass ?internal=true.
+    // The person's own list is self:llm_providers (§5.3); another account's is the read rule's alone.
+    const refused = await requireSelfPermission(request, id, 'self:llm_providers')
+    if (refused) return refused
+
+    // The read rule (requireUserAccess `read`): browser/JWT callers must own the
+    // account, act as it, or hold the user directory (users:read), and they never get
+    // unmasked secrets, even with ?internal=true.
     if (!internalReq) {
       const session = await getSession()
       if (!session) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
       }
-      if (session.userId !== id && session.role !== 'admin') {
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      if (session.userId !== id && !(await sessionHolds(session, 'users:read')) && !(await actsAsAccount(session, id))) {
+        return forbiddenResponse('users:read')
       }
     }
 
@@ -56,9 +52,11 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       orderBy: { createdAt: 'asc' },
     })
 
-    // Unmasked only for internal-key callers that explicitly request it.
+    // Unmasked only for internal-key callers that explicitly request it. The agent's list also
+    // carries the instance providers the account may use, as marked rows (step 6.11): every agent
+    // path reads its keys here, and the account is the project's owner on a project run (C1).
     if (internalReq && wantUnmasked) {
-      return NextResponse.json(providers)
+      return NextResponse.json(await agentProviderList(id, providers))
     }
 
     return NextResponse.json(providers.map(p => maskProvider(p as unknown as Record<string, unknown>)))
@@ -72,22 +70,21 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    // Ownership: only the account owner (or admin) may create providers for
-    // this user id. S2/E2: the internal-key bypass is removed -- no production
-    // internal caller creates providers, and a leaked key must not be able to
-    // add a provider (and thus a harvestable secret) to an arbitrary account.
-    {
-      const session = await getSession()
-      if (!session) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-      }
-      if (session.userId !== id && session.role !== 'admin') {
-        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-      }
-    }
+    // The account's write rule (HD-23): its own session, or an admin acting as a
+    // passwordless managed account; an admin cannot add a provider to another
+    // account. S2/E2: no internal-key bypass either -- no production internal
+    // caller creates providers, and a leaked key must not be able to add a
+    // provider (and thus a harvestable secret) to an arbitrary account.
+    const denied = await requireAccountWrite(id)
+    if (denied) return denied
+    const refused = await requireSelfPermission(request, id, 'self:llm_providers')
+    if (refused) return refused
+    // A new provider decides where the account's keys and prompts go: never while acting as it (§4.7).
+    const actingAs = await refuseWhileActingAsOn(id, 'change_llm_endpoint')
+    if (actingAs) return actingAs
 
-    // The admin bypass above lets a caller name any user id; a ghost id must
-    // fail as a readable 404, not as a foreign-key 500 (issue #173).
+    // An account deleted after the session check must fail as a readable 404,
+    // not as a foreign-key 500 (issue #173).
     const missing = await requireUserExists(id)
     if (missing) return missing
 

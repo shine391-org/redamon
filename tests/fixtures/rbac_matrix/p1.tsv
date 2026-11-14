@@ -1,0 +1,228 @@
+# Live RBAC route matrix: Phase 1 (hardening). Each step adds the rows of the behaviour it
+# changes; a baseline row whose answer a step changes is tagged superseded-by:p1 there.
+# Columns: id, since, actor, method, path, body, expect, tags (see tests/rbac_matrix_live.sh).
+#
+# id	since	actor	method	path	body	expect	tags
+#
+# ---- step 1.1: role and existence come from the database, not the 7-day login JWT ----
+# rbac-admin-b signs in (and acts as member_a) while an admin and keeps those cookies; the
+# runner demotes it to standard by SQL just before each *_demoted row and restores it right
+# after. Each control sends the same request as the admin. POST /api/users gets a body it
+# refuses after its admin check (400), so no account is ever created.
+p1-demoted-admin-users-create-control	1.1	admin_b	POST	/api/users	{}	400	req:HD-10
+p1-demoted-admin-users-create	1.1	admin_b_demoted	POST	/api/users	{}	403	req:HD-10
+p1-demoted-admin-users-list	1.1	admin_b_demoted	GET	/api/users	-	200;has=rbac-admin-b@e2e.local;lacks=rbac-member-a@e2e.local	req:HD-10
+p1-demoted-admin-settings-control	1.1	admin_b	GET	/api/users/${MEMBER_A_ID}/settings	-	200;has=••••••••0001;lacks=${A_TAVILY_SECRET}	req:HD-10
+p1-demoted-admin-settings	1.1	admin_b_demoted	GET	/api/users/${MEMBER_A_ID}/settings	-	403	req:HD-10
+p1-demoted-admin-actas-start	1.1	admin_b_demoted	POST	/api/auth/act-as	{"targetUserId":"${MEMBER_A_ID}"}	403	req:HD-10
+# the act-as cookie minted while an admin stops counting once the account is demoted
+p1-demoted-admin-actas-control	1.1	admin_b_as_member_a	GET	/api/projects/${PA_ID}	-	200;has=rbac-PA	req:HD-10
+p1-demoted-admin-actas-ignored	1.1	admin_b_as_member_a_demoted	GET	/api/projects/${PA_ID}	-	404	req:HD-10
+# rbac-deleted signs in, is deleted by SQL, and its still-valid cookie is replayed: three
+# former login-only routes, the current-account route, then a sign-in proving it is gone.
+p1-deleted-user-agent-health	1.1	deleted	GET	/api/agent/health	-	401	req:HD-10
+p1-deleted-user-skills	1.1	deleted	GET	/api/skills	-	401	req:HD-10
+p1-deleted-user-system-stats	1.1	deleted	GET	/api/system/stats	-	401	req:HD-10
+p1-deleted-user-me	1.1	deleted	GET	/api/auth/me	-	401	req:HD-10
+p1-deleted-user-login	1.1	anon	POST	/api/auth/login	{"email":"${DELETED_EMAIL}","password":"${RBAC_PASSWORD}"}	401	req:HD-10
+#
+# ---- step 1.2: one password floor, email case ----
+# A new password under 12 characters is refused with its code, so nothing is created or
+# changed ("elevenchars" is 11).
+p1-password-floor-create	1.2	admin_a	POST	/api/users	{"name":"RBAC Floor","email":"rbac-floor@e2e.local","password":"elevenchars"}	400;has=password_too_short	req:HD-12
+p1-password-floor-change	1.2	member_b	PUT	/api/users/${MEMBER_B_ID}/password	{"newPassword":"elevenchars","currentPassword":"${RBAC_PASSWORD}"}	400;has=password_too_short	req:HD-12
+# Emails are stored lowercase: an edit to an address another account holds in other
+# capitals is refused, and sign-in finds the account whatever the case typed. With the
+# identity switch on an admin changing a member's email needs its own password first
+# (step 2.11): the collision's twin with it is p2-email-admin-taken in p2.tsv.
+p1-email-edit-collision	1.2	admin_a	PUT	/api/users/${MEMBER_B_ID}	{"email":"RBAC-Member-A@e2e.local"}	409;has=email_taken	req:NF-09 identity:off
+p1-login-email-case	1.2	anon	POST	/api/auth/login	{"email":"RBAC-MEMBER-A@E2E.LOCAL","password":"${RBAC_PASSWORD}"}	200;has=rbac-member-a@e2e.local	req:NF-09
+#
+# ---- step 1.4: admin-on-admin actions need the acting admin's own password ----
+# Every refused row lacks that password (or sends a wrong one), so nothing changes. The one
+# wrong password counts one attempt against rbac-admin-a's step-up budget; the act-as row
+# after it gives the right one and clears it (rows never keep a Set-Cookie, so the actor
+# stays rbac-admin-a). The last-admin guard cannot answer 409 on a stack whose real admins
+# remain: its race is proved on the locked transaction itself (route.concurrentDemote.test.ts).
+# With RBAC_IDENTITY_ENABLED on these six are Root's (step 2.6): rbac-admin-a gets 403 root_only
+# before any password (p2.tsv p2-rootonly-*), so they run only with the switch off.
+p1-stepup-demote-admin	1.4	admin_a	PUT	/api/users/${ADMIN_B_ID}	{"role":"standard"}	403;has=step_up_required	req:HD-09 req:ID-25 identity:off
+p1-stepup-delete-admin	1.4	admin_a	DELETE	/api/users/${ADMIN_B_ID}	-	403;has=step_up_required	req:HD-09 req:ID-25 identity:off
+p1-stepup-delete-admin-wrong	1.4	admin_a	DELETE	/api/users/${ADMIN_B_ID}	{"stepUpPassword":"not-the-rbac-password"}	403;has=step_up_failed	req:HD-09 req:ID-25 identity:off
+p1-stepup-reset-admin	1.4	admin_a	PUT	/api/users/${ADMIN_B_ID}/password	{"newPassword":"rbac-never-applied-passphrase"}	403;has=step_up_required	req:HD-09 req:ID-25 identity:off
+p1-stepup-actas-admin	1.4	admin_a	POST	/api/auth/act-as	{"targetUserId":"${ADMIN_B_ID}"}	403;has=step_up_required	req:HD-09 req:ID-25 identity:off
+p1-stepup-actas-admin-ok	1.4	admin_a	POST	/api/auth/act-as	{"targetUserId":"${ADMIN_B_ID}","stepUpPassword":"${RBAC_PASSWORD}"}	200;has=${ADMIN_B_ID}	req:HD-09 req:ID-25 identity:off
+p1-own-password-admin-current	1.4	admin_a	PUT	/api/users/${ADMIN_A_ID}/password	{"newPassword":"rbac-never-applied-passphrase"}	400;has=step_up_required	req:HD-09 req:ID-25
+# a member target needs no step-up; a demotion runs in the locked transaction even when the
+# account is already standard, so this proves the advisory lock on the deployed build
+p1-demote-member-no-stepup	1.4	admin_a	PUT	/api/users/${MEMBER_A_ID}	{"role":"standard"}	200;has=${MEMBER_A_ID}	req:HD-09
+#
+# ---- step 1.6: the admin bypass is a masked read; a re-pointed endpoint needs its secret again ----
+# Every refused row is refused at the gate, before anything is written or sent. The managed and
+# owner controls send a body their handler refuses after the gate (chat-skills POST {} -> 400
+# "name is required"), so nothing is created there either.
+p1-admin-writes-other-settings	1.6	admin_a	PUT	/api/users/${MEMBER_A_ID}/settings	{"tavilyApiKey":"rbac-never-applied"}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-admin-settings	1.6	admin_a	PUT	/api/users/${ADMIN_B_ID}/settings	{"tavilyApiKey":"rbac-never-applied"}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-provider	1.6	admin_a	POST	/api/users/${MEMBER_A_ID}/llm-providers	{"providerType":"openai","name":"rbac-never","apiKey":"rbac-never"}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-mcp-server	1.6	admin_a	POST	/api/users/${MEMBER_A_ID}/mcp	{}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-attack-skill	1.6	admin_a	POST	/api/users/${MEMBER_A_ID}/attack-skills	{}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-chat-skill	1.6	admin_a	POST	/api/users/${MEMBER_A_ID}/chat-skills	{}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-tradecraft	1.6	admin_a	POST	/api/users/${MEMBER_A_ID}/tradecraft-resources	{}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-skill-batch	1.6	admin_a	POST	/api/users/${MEMBER_A_ID}/attack-skills/batch	{}	403;has=own_account_only	req:HD-23
+p1-admin-writes-other-mcp-test	1.6	admin_a	POST	/api/mcp/test	{"userId":"${MEMBER_A_ID}","server":{"id":"rbac-fake-server","transport":"streamable_http","url":"http://127.0.0.1:9/mcp","auth":{"type":"bearer","token":"••••••••0001"}}}	403;has=own_account_only	req:HD-23
+# act-as a member who can sign in grants no write either
+p1-admin-acting-writes-member	1.6	admin_a_as_member_a	PUT	/api/users/${MEMBER_A_ID}/settings	{"tavilyApiKey":"rbac-never-applied"}	403;has=own_account_only	req:HD-23
+p1-admin-acting-writes-member-skill-batch	1.6	admin_a_as_member_a	POST	/api/users/${MEMBER_A_ID}/attack-skills/batch	{}	403;has=own_account_only	req:HD-23
+# the read stays, masked: the seeded fake bearer never comes back
+p1-admin-reads-other-masked	1.6	admin_a	GET	/api/users/${MEMBER_A_ID}/mcp	-	200;has=rbac-fake-server;has=••••••••0001;lacks=${A_MCP_BEARER}	req:HD-23
+# revoking another account's token stays an admin action: the gate admits it (no such token: 404)
+p1-admin-revokes-other-token-gate	1.6	admin_a	DELETE	/api/users/${MEMBER_A_ID}/mcp-tokens/rbac-no-such-token	-	404	req:HD-23
+# a passwordless managed account is written through act-as, and only through it; with the
+# permissions switch on its chat skills stay with it even then (3.14's never-list, IM-08)
+p1-admin-acting-managed-writes	1.6	admin_a_as_managed	POST	/api/users/${MANAGED_ID}/chat-skills	{}	400;has=name is required	req:HD-23 permissions:off
+p1-admin-acting-managed-writes-on	3.14	admin_a_as_managed	POST	/api/users/${MANAGED_ID}/chat-skills	{}	403;has="code":"not_while_acting_as";has="action":"write_chat_skills"	req:HD-23 req:IM-08 permissions:on
+p1-admin-not-acting-writes-managed	1.6	admin_a	POST	/api/users/${MANAGED_ID}/chat-skills	{}	403;has=own_account_only	req:HD-23
+p1-owner-writes-own-control	1.6	member_a	POST	/api/users/${MEMBER_A_ID}/chat-skills	{}	400;has=name is required	req:HD-23
+# the owner re-pointing a saved MCP server (save or test) with the masked token is refused
+p1-secret-reentry-mcp-server	1.6	member_a	PUT	/api/users/${MEMBER_A_ID}/mcp/rbac-fake-server	{"id":"rbac-fake-server","name":"rbac fake server","transport":"streamable_http","url":"http://127.0.0.2:9/mcp","auth":{"type":"bearer","token":"••••••••0001"}}	400;has=secret_reentry_required;has=auth.token;lacks=${A_MCP_BEARER}	req:HD-24
+p1-secret-reentry-mcp-test	1.6	member_a	POST	/api/mcp/test	{"userId":"${MEMBER_A_ID}","server":{"id":"rbac-fake-server","name":"rbac fake server","transport":"streamable_http","url":"http://127.0.0.2:9/mcp","auth":{"type":"bearer","token":"••••••••0001"}}}	400;has=secret_reentry_required;lacks=${A_MCP_BEARER}	req:HD-24
+#
+# ---- step 1.14: a ticket names its socket; the Kali terminal needs the terminal grant ----
+# A member seeded after the upgrade holds no legacy grant (the backfill's cutoff came first), so
+# its terminal ticket is refused and its chat and CypherFix tickets are not. An admin opens the
+# terminal through its own role, also while acting as the member. An allowed mint writes nothing
+# but, for the terminal, an agent.terminal_opened row the cleanup removes. The legacy holder and
+# the sockets themselves: tests/rbac_kali_terminal_live.sh.
+p1-ws-ticket-terminal-new-member	1.14	member_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws","socket":"kali-terminal"}	403;has="code":"forbidden";has=platform:kali_terminal;lacks="ticket"	req:HD-04
+p1-ws-ticket-agent-member	1.14	member_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws","socket":"agent"}	200;has="ticket":"	req:HD-25
+p1-ws-ticket-cypherfix-member	1.14	member_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws","socket":"cypherfix-triage"}	200;has="ticket":"	req:HD-25
+p1-ws-ticket-no-socket-member	1.14	member_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws"}	200;has="ticket":"	req:HD-25
+p1-ws-ticket-unknown-socket	1.14	member_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws","socket":"shell"}	400;has=unknown_socket;lacks="ticket"	req:HD-25
+p1-ws-ticket-terminal-other-project	1.14	member_a	POST	/api/agent/ws-ticket	{"projectId":"${PB_ID}","sessionId":"rbac-ws","socket":"kali-terminal"}	404;lacks="ticket"	req:HD-04
+p1-ws-ticket-terminal-admin	1.14	admin_a	POST	/api/agent/ws-ticket	{"projectId":"${PADM_ID}","sessionId":"rbac-ws","socket":"kali-terminal"}	200;has="ticket":"	req:HD-04
+p1-ws-ticket-terminal-admin-acting	1.14	admin_a_as_member_a	POST	/api/agent/ws-ticket	{"projectId":"${PA_ID}","sessionId":"rbac-ws","socket":"kali-terminal"}	200;has="ticket":"	req:HD-04
+#
+# ---- step 1.10: tunnels ----
+# The unmasked tunnel credentials answer only the internal key (HD-05): every session, an
+# admin's included, gets 404 (anonymous keeps the middleware's 401, baseline). Changing the
+# tunnel takes an admin, the member holding the `tunnels` legacy grant or a pre-upgrade account
+# under the escape hatch (HD-06); the seeded members hold no grant (the legacy holder:
+# tests/test_e2e_security_live.sh and testing/e2e/tests/rbacTunnels.spec.ts). Rows that pass
+# the tunnel check send a GitHub Enterprise host the route refuses after it (400), so nothing
+# is written or pushed to the sandbox; refused rows stop at the tunnel check. The settings GET
+# tells the page whether to offer the controls. With the identity switch on these settings are
+# instance settings (step 2.4): the rows tagged identity:off have identity:on twins in p2.tsv.
+p1-tunnel-config-member	1.10	member_c	GET	/api/global/tunnel-config	-	404	req:HD-05
+p1-tunnel-config-admin	1.10	admin_a	GET	/api/global/tunnel-config	-	404	req:HD-05
+p1-tunnel-config-internal	1.10	internal	GET	/api/global/tunnel-config	-	200;has=chiselServerUrl	req:HD-05
+p1-tunnel-change-member	1.10	member_b	PUT	/api/users/${MEMBER_B_ID}/settings	{"chiselServerUrl":"http://127.0.0.1:9","githubEnterpriseHost":"127.0.0.1"}	403;has=tunnels_admin_only;has=chiselServerUrl	req:HD-06 identity:off
+p1-tunnel-enable-member	1.10	member_b	PUT	/api/users/${MEMBER_B_ID}/settings	{"tunnelsEnabled":true,"githubEnterpriseHost":"127.0.0.1"}	403;has=tunnels_admin_only	req:HD-06 identity:off
+p1-tunnel-member-full-save	1.10	member_b	PUT	/api/users/${MEMBER_B_ID}/settings	{"tunnelsEnabled":false,"ngrokAuthtoken":"","chiselServerUrl":"","chiselAuth":"","githubEnterpriseHost":"127.0.0.1"}	400;has=GitHub Enterprise Host	req:HD-06
+p1-tunnel-change-admin	1.10	admin_a	PUT	/api/users/${ADMIN_A_ID}/settings	{"chiselServerUrl":"http://127.0.0.1:9","githubEnterpriseHost":"127.0.0.1"}	400;has=GitHub Enterprise Host	req:HD-06 identity:off
+p1-tunnel-hint-member	1.10	member_b	GET	/api/users/${MEMBER_B_ID}/settings	-	200;has="canManageTunnels":false	req:HD-06 req:UI-03
+p1-tunnel-hint-admin	1.10	admin_a	GET	/api/users/${ADMIN_A_ID}/settings	-	200;has="canManageTunnels":true	req:HD-06 req:UI-03 identity:off
+#
+# ---- step 1.6 review fixes ----
+# The settings row also carries the MCP servers JSON: the admin's masked read of /settings
+# returns the seeded server with its bearer masked (the /mcp read is p1-admin-reads-other-masked).
+p1-admin-reads-other-settings-masked	1.6	admin_a	GET	/api/users/${MEMBER_A_ID}/settings	-	200;has=rbac-fake-server;has=••••••••0001;lacks=${A_MCP_BEARER};lacks=${A_TAVILY_SECRET}	req:HD-23
+# Re-pointing a saved MCP server with a NEW token typed passes the re-entry rule but asks for the
+# signed-in user's password (ID-25): refused before anything is written, the stored bearer never
+# answered. (A wrong password would count toward member_a's step-up lockout, so no row sends one.)
+p1-stepup-repoint-mcp-server	1.6	member_a	PUT	/api/users/${MEMBER_A_ID}/mcp/rbac-fake-server	{"id":"rbac-fake-server","name":"rbac fake server","transport":"streamable_http","url":"http://127.0.0.2:9/mcp","auth":{"type":"bearer","token":"rbac-typed-never-stored"}}	403;has=step_up_required;lacks=${A_MCP_BEARER}	req:ID-25
+#
+# ---- step 1.12: Nuclei templates have owners ----
+# Refusals only, so nothing is written: the allowed selection row is refused afterwards by
+# the numeric bounds (nucleiRateLimit 0), which run after the template check. The uploads,
+# the overwrite, the promotion, a scan's filtered read and the user-delete handover need
+# multipart bodies and SQL: tests/rbac_nuclei_templates_live.sh. aem-json-exposure.yaml
+# ships in mcp/nuclei-templates, so it is an instance template (the upgrade backfill).
+p1-nuclei-list-member	1.12	member_c	GET	/api/nuclei-templates	-	200;has="canManageAll":false;has="ownership":"instance"	req:HD-08
+p1-nuclei-list-admin	1.12	admin_a	GET	/api/nuclei-templates	-	200;has="canManageAll":true	req:HD-08
+p1-nuclei-delete-instance-member	1.12	member_c	DELETE	/api/nuclei-templates?path=aem-json-exposure.yaml	-	403;has="permission":"platform:nuclei_templates"	req:HD-08
+p1-nuclei-promote-member	1.12	member_a	PATCH	/api/nuclei-templates	{"path":"rbac-e2e-none.yaml","promote":true}	403;has="permission":"platform:nuclei_templates"	req:HD-08
+p1-nuclei-promote-admin-missing	1.12	admin_a	PATCH	/api/nuclei-templates	{"path":"rbac-e2e-none.yaml","promote":true}	404;has=template_not_found	req:HD-08
+p1-nuclei-select-mount-refused	1.12	member_a	PUT	/api/projects/${PA_ID}	{"nucleiTemplates":["/custom-templates/"]}	400;has=template_not_selectable	req:HD-08
+p1-nuclei-select-root-refused	1.12	member_a	PUT	/api/projects/${PA_ID}	{"nucleiCustomTemplates":["."]}	400;has=template_not_selectable	req:HD-08
+p1-nuclei-select-glob-refused	1.12	member_a	PUT	/api/projects/${PA_ID}	{"nucleiSelectedCustomTemplates":["*"]}	400;has=template_not_selectable	req:HD-08
+p1-nuclei-select-instance-allowed	1.12	member_a	PUT	/api/projects/${PA_ID}	{"nucleiSelectedCustomTemplates":["aem-json-exposure.yaml"],"nucleiRateLimit":0}	400;has=setting_rejected;lacks=template_not_selectable	req:HD-08
+#
+# ---- step 1.11: emergency stop ----
+# GET tells the toolbar whose agent runs a press stops (HD-07): every user's for an admin
+# (also while acting as a member), the member's own otherwise. A member's POST stops only
+# that member's runs: member_c has none, so it stops nothing and no one else's. No row POSTs
+# as an admin, the instance-wide stop, which would end other people's runs on a shared stack;
+# the stop itself is checked live with two members' stub-model runs, one stopped, one not.
+p1-estop-scope-member	1.11	member_c	GET	/api/agent/emergency-stop-all	-	200;has="scope":"own"	req:HD-07
+p1-estop-scope-admin	1.11	admin_a	GET	/api/agent/emergency-stop-all	-	200;has="scope":"all"	req:HD-07
+p1-estop-scope-admin-acting	1.11	admin_a_as_member_a	GET	/api/agent/emergency-stop-all	-	200;has="scope":"all"	req:HD-07
+p1-estop-member-own	1.11	member_c	POST	/api/agent/emergency-stop-all	-	200;has="scope":"own";has="stopped":0	req:HD-07
+p1-estop-deleted	1.11	deleted	POST	/api/agent/emergency-stop-all	-	401	req:HD-07
+#
+# ---- step 1.9: the agent's webapp-only routes, MCP reload / manifest / test, stdio servers ----
+# A member's stdio server or draft is refused before anything is written or spawned (NF-14,
+# audited), and so is a server naming an agent variable as its bearer (OQ-R1). The admin's
+# stdio save is refused AFTER the stdio check by the schema (no name), so nothing is written.
+# No row reloads the shared agent as an admin (it would reconnect every user's MCP tools).
+# includeSkillContent answers the master key only (NF-15): the owner's browser and an admin
+# acting as the owner get the project without the raw servers.
+p1-mcp-reload-member	1.9	member_c	POST	/api/mcp/reload	{}	403	req:HD-03
+p1-mcp-manifest-own	1.9	member_a	GET	/api/mcp/manifest	-	200;has=rbac-fake-server;has=••••••••0001;lacks=${A_MCP_BEARER}	req:HD-15
+p1-mcp-manifest-other	1.9	member_b	GET	/api/mcp/manifest	-	200;lacks=rbac-fake-server;lacks=${A_MCP_BEARER}	req:HD-15
+p1-mcp-test-member-stdio	1.9	member_c	POST	/api/mcp/test	{"server":{"id":"rbac-probe","name":"rbac probe","enabled":true,"transport":"stdio","command":"id"}}	403;has=stdio_admin_only	req:NF-14
+p1-mcp-test-member-http	1.9	member_c	POST	/api/mcp/test	{"server":{"id":"rbac-probe","name":"rbac probe","enabled":true,"transport":"streamable_http","url":"http://127.0.0.1:9/"}}	200;has="ok":false	req:NF-14
+p1-mcp-test-other-account	1.9	member_c	POST	/api/mcp/test	{"userId":"${MEMBER_A_ID}","server":{"id":"rbac-probe","name":"rbac probe","enabled":true,"transport":"streamable_http","url":"http://127.0.0.1:9/"}}	403	req:NF-14
+p1-mcp-test-token-env-var	1.9	member_c	POST	/api/mcp/test	{"server":{"id":"rbac-probe","name":"rbac probe","enabled":true,"transport":"streamable_http","url":"http://127.0.0.1:9/","auth":{"type":"bearer","token_env_var":"INTERNAL_API_KEY"}}}	422;has=token_env_var_refused	req:NF-17
+p1-mcp-save-member-stdio	1.9	member_c	POST	/api/users/${MEMBER_C_ID}/mcp	{"id":"rbac-stdio","name":"rbac stdio","transport":"stdio","command":"id"}	403;has=stdio_admin_only	req:NF-14
+p1-mcp-save-admin-stdio-gate	1.9	admin_a	POST	/api/users/${ADMIN_A_ID}/mcp	{"id":"rbac-stdio","transport":"stdio","command":"id"}	400;lacks=stdio_admin_only	req:NF-14
+p1-mcp-save-token-env-var	1.9	member_c	POST	/api/users/${MEMBER_C_ID}/mcp	{"id":"rbac-envvar","name":"rbac envvar","transport":"streamable_http","url":"http://127.0.0.1:9/","auth":{"type":"bearer","token_env_var":"INTERNAL_API_KEY"}}	422;has=token_env_var_refused	req:NF-17
+p1-skillcontent-owner	1.9	member_a	GET	/api/projects/${PA_ID}?includeSkillContent=true	-	200;lacks=userMcpServers;lacks=${A_MCP_BEARER}	req:NF-15
+p1-skillcontent-actas	1.9	admin_a_as_member_a	GET	/api/projects/${PA_ID}?includeSkillContent=true	-	200;lacks=userMcpServers;lacks=${A_MCP_BEARER}	req:NF-15
+#
+# ---- step 1.13: shell sessions per project ----
+# The live stack holds no Metasploit session to show (a real one is manual checkpoint M4;
+# run_artifacts/step113/drive.mjs proves the per-project view with a tagged listener), so
+# these rows prove the gate on ids outside the caller's view: such an id is 404 before any
+# command reaches the console (the baseline's 422 was the agent refusing a non-numeric id).
+# member_c owns nothing and holds no grant, so its list never carries a job. A 502
+# session_manager_unauthorized means the agent's MCP_AUTH_TOKEN differs from kali-sandbox's.
+p1-sessions-list-member	1.13	member_c	GET	/api/agent/sessions	-	200;has="jobs":[];lacks=session_manager_unauthorized	req:HD-01
+p1-sessions-list-admin	1.13	admin_a	GET	/api/agent/sessions	-	200;has="sessions":	req:HD-02
+p1-session-interact-hidden	1.13	member_c	POST	/api/agent/sessions/rbac-not-a-session/interact	{"command":"id"}	404	req:HD-01
+p1-session-interact-hidden-numeric	1.13	member_c	POST	/api/agent/sessions/999999/interact	{"command":"id"}	404	req:HD-01
+p1-session-kill-hidden	1.13	member_c	POST	/api/agent/sessions/rbac-not-a-session/kill	-	404	req:HD-01
+p1-job-kill-hidden	1.13	member_c	POST	/api/agent/jobs/rbac-not-a-job/kill	-	404	req:HD-02
+p1-session-kill-unknown-admin	1.13	admin_a	POST	/api/agent/sessions/999999/kill	-	404	req:HD-02
+#
+# ---- step 1.16: job credentials for scan containers ----
+# The bare scanner key reads and writes nothing (HD-20): each scanner route wants the scan's job
+# credential beside it, which the matrix cannot send (tests/rbac_job_credential_live.sh mints
+# one inside the agent container and proves the reads it opens). The master key is unchanged.
+p1-scanner-settings-bare	1.16	scanner	GET	/api/users/${MEMBER_A_ID}/settings?internal=true	-	403;has=job_credential_required;lacks=${A_TAVILY_SECRET}	req:HD-20
+p1-scanner-project-bare	1.16	scanner	GET	/api/projects/${PA_ID}	-	403;has=job_credential_required;lacks=rbac-PA	req:HD-20
+p1-scanner-traffic-ingest-bare	1.16	scanner	POST	/api/traffic/${PA_ID}/ingest	{"source":"recon","transactions":[]}	403;has=job_credential_required	req:HD-20
+p1-internal-settings-unmasked	1.16	internal	GET	/api/users/${MEMBER_A_ID}/settings?internal=true	-	200;has=${A_TAVILY_SECRET}	req:HD-20
+#
+# ---- step 1.18: the legacy access review, the update notes and the admins' rbac block ----
+# Reads and refusals only: no row decides a grant, since that would decide this stack's real
+# members' grants; tests/rbac_legacy_review_live.sh makes fixture-only decisions.
+p1-legacy-grants-anon	1.18	anon	GET	/api/admin/legacy-grants	-	401	req:HD-29
+p1-legacy-grants-member	1.18	member_c	GET	/api/admin/legacy-grants	-	403;has="code":"forbidden"	req:HD-29
+p1-legacy-grants-member-decide	1.18	member_c	POST	/api/admin/legacy-grants	{"action":"remove_all"}	403;has="code":"forbidden"	req:HD-29
+p1-legacy-grants-admin	1.18	admin_a	GET	/api/admin/legacy-grants	-	200;has="holders"	req:HD-29
+p1-legacy-grants-admin-acting	1.18	admin_a_as_member_a	GET	/api/admin/legacy-grants	-	200;has="holders"	req:HD-29
+p1-legacy-grants-no-add	1.18	admin_a	POST	/api/admin/legacy-grants	{"action":"add","userId":"${MEMBER_A_ID}","grant":"kali_terminal"}	400;has=invalid_action	req:HD-29
+p1-legacy-grants-keep-not-held	1.18	admin_a	POST	/api/admin/legacy-grants	{"action":"keep","userId":"${MEMBER_A_ID}","grant":"kali_terminal"}	409;has=not_held	req:HD-29
+p1-whats-new-member	1.18	member_c	GET	/api/admin/whats-new	-	403;has="code":"forbidden"	req:HD-32
+p1-whats-new-admin	1.18	admin_a	GET	/api/admin/whats-new	-	200;has="dismissed"	req:HD-32
+p1-auth-me-member-no-rbac	1.18	member_c	GET	/api/auth/me	-	200;lacks="rbac"	req:HD-30
+p1-auth-me-admin-rbac	1.18	admin_a	GET	/api/auth/me	-	200;has="rbac":{"compat":	req:HD-30
+#
+# ---- step 1.20: the last baseline hole rows ----
+# A member may upload and delete its own templates (F-07), so the baseline's two invalid-body
+# probes still reach the body checks and keep their 400; the owner rules are the p1-nuclei-*
+# rows above and tests/rbac_nuclei_templates_live.sh. The member's session list keeps its 200
+# with its own projects' sessions only (p1-sessions-list-member), its template list its 200
+# with its own and the instance templates (p1-nuclei-list-member).
+p1-nuclei-upload-invalid-body-member	1.20	member_c	POST	/api/nuclei-templates	{}	400;has=invalid_multipart	req:HD-08
+p1-nuclei-delete-no-path-member	1.20	member_c	DELETE	/api/nuclei-templates	-	400;has=Missing path parameter	req:HD-08

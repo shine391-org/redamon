@@ -396,7 +396,7 @@ class _Graph:
         return 0
 
     def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
-                              keep_unproven=False):
+                              keep_unproven=False, **kw):
         self.prunes.append((list(sources), tuple(keep_hosts)))
 
 

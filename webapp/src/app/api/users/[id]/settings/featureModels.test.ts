@@ -40,6 +40,7 @@ vi.mock('@/lib/prisma', () => ({
     $executeRawUnsafe: (...a: unknown[]) => mockExecuteRawUnsafe(...a),
   },
 }))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/session', () => ({
   requireUserAccess: (...a: unknown[]) => mockRequireUserAccess(...a),
   isInternalRequest: (...a: unknown[]) => mockIsInternal(...a),
@@ -69,7 +70,7 @@ function baseRow(featureModels: Record<string, string> = {}): Row {
 
 function put(body: unknown, id = USER) {
   return PUT(
-    new NextRequest(`http://x/api/users/${id}/settings`, { method: 'PUT', body: JSON.stringify(body) }),
+    new NextRequest(`http://x/api/users/${id}/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
     { params: Promise.resolve({ id }) },
   )
 }

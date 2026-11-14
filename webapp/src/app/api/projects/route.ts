@@ -1,14 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
+import { requirePermission } from '@/lib/authz/guards'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { isBlankModelField } from '@/components/projects/ProjectForm/projectLlmGate.logic'
-import { requireEffectiveUser, ownerScope } from '@/lib/access'
+import { requireEffectiveUser } from '@/lib/access'
+import { myShareSelect, visibleProjects, withMyAccess } from '@/lib/authz/visibleProjects'
+import { getAuthzIdentity } from '@/lib/session'
 import { validateJevEngineChange } from '@/lib/reconSettings/jevEngine'
+import { numericBoundsRefusal } from '@/lib/reconSettings/numericBounds'
 import { normalizeUserSkillToggles, UserSkillError } from '@/lib/userSkills'
 import { describeInvalid, normalizeHost, splitWildcard, validateDomainBatch } from '@/lib/domainBatch'
-import { resolveScopeGroups, scopeGuardrailNames, softGuardrailNames } from '@/lib/scopeGroups'
+import { IP_HOSTNAME_FIELDS, resolveScopeGroups, scopeGuardrailNames, softGuardrailNames } from '@/lib/scopeGroups'
+import { validateCrossFieldRules } from '@/lib/reconSettings/crossField'
 import { seedDomainNames, seedProjectDomains } from '@/lib/graphSeedDomains'
 import { firstHardBlocked } from '@/lib/hard-guardrail'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
@@ -21,6 +26,8 @@ import { internalError } from '@/lib/routeErrors'
 import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
 import { projectModelProblem } from '@/lib/agentInTheLoop'
 import { checkIdentityHeader } from '@/lib/reconSettings/validators'
+import { ownershipTokenForCreate } from '@/lib/ownershipToken'
+import { projectQuotaRefusal } from '@/lib/authz/quotas'
 
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8080'
 const SOFT_GUARDRAIL_TIMEOUT_MS = 10_000
@@ -28,13 +35,19 @@ const SOFT_GUARDRAIL_TIMEOUT_MS = 10_000
 // GET /api/projects - List the effective user's projects.
 // The client-supplied ?userId is ignored as an auth input: the list is always
 // scoped to the caller's effective user (admin -> own, unless simulating X).
+// With sharing in force it also holds the projects shared with that user
+// (step 4.5); with RBAC_SHARING_ENABLED on every row carries `myAccess`, the
+// person's own access as the project GET answers it (owner, or read with its
+// Raw data toggle, or with write sharing in force Read + Write with its toggles),
+// beside `user`, the owner.
 export async function GET() {
   try {
     const eff = await requireEffectiveUser()
     if (eff instanceof NextResponse) return eff
 
+    const visible = await visibleProjects(eff)
     const projects = await prisma.project.findMany({
-      where: ownerScope(eff),
+      where: visible.where,
       orderBy: { createdAt: 'desc' },
       select: {
         id: true,
@@ -58,11 +71,15 @@ export async function GET() {
             name: true,
             email: true
           }
-        }
+        },
+        ...myShareSelect(eff, visible),
       }
     })
 
-    return NextResponse.json(projects)
+    // Only a list that can show a write share asks whether an admin acts as the person: then
+    // every share lists as read, as the project GET answers it (D-22).
+    const actingAs = visible.writeShares === true && !!(await getAuthzIdentity())?.actingAs
+    return NextResponse.json(await withMyAccess(eff, projects, { actingAs }))
   } catch (error) {
     return internalError(error, 'Failed to fetch projects')
   }
@@ -74,8 +91,9 @@ export async function POST(request: NextRequest) {
   try {
     // The new project is owned by the caller's effective user; the body-supplied
     // userId is ignored so a caller cannot create a project under another user.
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
+    const auth = await requirePermission(request, 'project:create')
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
 
     let body: Record<string, unknown>
     let roeFile: { name: string; kind: RoeFileKind; bytes: Buffer } | null = null
@@ -220,12 +238,21 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // The owner's maxProjects quota (step 6.8), before the guardrail spends an agent call.
+    const overQuota = await projectQuotaRefusal(userId)
+    if (overQuota) return overQuota
+
     const rawSubdomains = optionalParams.subdomainList
+    const rawInclude = optionalParams.ipHostnameInclude
     const scopeFields = {
       ipMode, domainBatchMode, domainBatchHosts: batchHosts, targetDomain,
       subdomainList: Array.isArray(rawSubdomains)
         ? rawSubdomains.filter((s): s is string => typeof s === 'string')
         : typeof rawSubdomains === 'string' ? rawSubdomains.split(',') : [],
+      // An IP project's hard-guardrail names are its hostname include entries.
+      ipHostnameInclude: Array.isArray(rawInclude)
+        ? rawInclude.filter((s): s is string => typeof s === 'string')
+        : typeof rawInclude === 'string' ? rawInclude.split(',') : [],
     }
     // The single-domain target and prefixes get the same rules as a batch entry
     // (no public suffix, no IP, prefixes of any depth): a direct POST bypasses
@@ -297,6 +324,7 @@ export async function POST(request: NextRequest) {
       'roeExcludedHosts', 'roeExcludedHostReasons', 'roeTimeWindowDays',
       'roeForbiddenTools', 'roeForbiddenCategories',
       'roeThirdPartyProviders', 'roeComplianceFrameworks',
+      'ipHostnameInclude', 'ipHostnameExclude',
     ]
     for (const key of STRING_ARRAY_FIELDS) {
       if (key in optionalParams && typeof optionalParams[key] === 'string') {
@@ -380,6 +408,13 @@ export async function POST(request: NextRequest) {
       sanitizedParams.targetIps = (sanitizedParams.targetIps as string[]).map(s => s.trim()).filter(Boolean)
     }
 
+    // Judged after the coercion above, so a number an LLM-parsed body sent as
+    // text gets the same verdict create_project gives it.
+    const outOfBounds = numericBoundsRefusal(sanitizedParams)
+    if (outOfBounds) {
+      return NextResponse.json({ ...outOfBounds, code: 'setting_rejected' }, { status: 400 })
+    }
+
     // The user-skill toggles may name only the creator's own skills, at most 20 of them on.
     if ('attackSkillConfig' in sanitizedParams) {
       try {
@@ -388,6 +423,21 @@ export async function POST(request: NextRequest) {
         if (e instanceof UserSkillError) return NextResponse.json({ error: e.message, code: e.code }, { status: 400 })
         throw e
       }
+    }
+
+    // The rules over several fields that a save runs, on the whole new row (B-25):
+    // a create that skipped them was a way around them. The toggles were just
+    // normalized above, so they are not judged twice.
+    const createRow: Record<string, unknown> = {
+      ...sanitizedParams, ipMode: ipMode === true, domainBatchMode: domainBatchMode === true,
+    }
+    const crossFieldError = await validateCrossFieldRules(
+      createRow, Object.keys(createRow).filter(k => k !== 'attackSkillConfig'), userId, { ownerUserId: userId })
+    if (crossFieldError) {
+      return NextResponse.json({ error: crossFieldError }, { status: 400 })
+    }
+    for (const key of IP_HOSTNAME_FIELDS) {
+      if (key in createRow) sanitizedParams[key] = createRow[key]
     }
 
     // The document's artefacts come from the server, never from the body: the
@@ -413,6 +463,8 @@ export async function POST(request: NextRequest) {
     if (jevError) {
       return NextResponse.json({ error: jevError }, { status: 400 })
     }
+
+    sanitizedParams.ownershipToken = ownershipTokenForCreate(sanitizedParams.ownershipToken)
 
     // Create project with required fields and valid optional params.
     // If the frontend provided a pre-generated ID (for uploads during creation), use it.

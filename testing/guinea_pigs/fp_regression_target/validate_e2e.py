@@ -37,6 +37,22 @@ project, `--ip-ownership-stealth <recon.log>` on its stealth twin (the log
 e2e_fp.py --log wrote), `--ip-ownership-nwlab` on the domain-mode project over
 the nested-wildcard lab (e2e_fp.py --ip-ownership-nwlab).
 
+Audit cases (e2e_fp.py prints RUN_START=<UTC time> for the access-log checks):
+`--roe <runStart>` (R-3) on the --roe project, then `--roe-window` (R-32: a
+window that excludes now refuses the start; it restores the one containing
+now); `--r29 <runStart>`; `--r43 <runStart> <recon.log>`; `--nuclei-throttle
+<recon.log | nuclei.jsonl>` (R-19: the recon log e2e_fp.py --log wrote echoes
+every line of the run's nuclei_detection.jsonl); `--redis
+open|delay|auth` after each run of the --redis project (R-24). `--roe` and
+`--roe-window` also write project settings over MCP; every other check reads.
+
+Round 3 (README.md step 15): `--passive-fd1 kept|orphan|cdn` on a second
+--passive-cves project (F-D1, D1-ORPHAN), `--fd5 snapshot|after` around each
+partial port writer (F-D5 / R-26), `--ceiling free|capped` on the --ceiling
+project (R-8; CEILING_NMAP names the --watch-nmap file, CEILING_ARGV the
+--watch-argv file, CEILING_FP where `free` stores the favicon/JARM hashes `capped`
+compares).
+
 Every check is read-only Cypher through query_graph (tenant-scoped by the
 server) and prints PASS / FAIL with what the graph actually holds. Exit 0 only
 when every assertion holds. Case ids match README.md.
@@ -49,13 +65,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import mcp_client as mcp  # noqa: E402
 
-USAGE = ("usage: validate_e2e.py <projectId> [--js-count | --js-count-equals <n> | --http-layer"
+USAGE = ("usage: validate_e2e.py <projectId> [--s22 full|nmap|httpx | --js-count | --js-count-equals <n> | --http-layer"
          " | --passive-cves baseline|partial|unscanned|off | --js-coverage first | --js-coverage capped <n>"
          " | --vhost-origin | --coverage stamps|clean|lost | --coverage import <originalProjectId>"
          " | --disposition before|decided | --disposition-stored before|decided|http-layer"
          " | --ip-ownership | --ip-ownership-stealth <recon.log>"
-         " | --ip-ownership-nwlab]")
-if len(sys.argv) not in (2, 3, 4, 5):
+         " | --ip-ownership-nwlab | --roe <runStart> | --roe-window | --r29 <runStart>"
+         " | --r43 <runStart> <recon.log> | --nuclei-throttle <recon.log> | --redis open|delay|auth"
+         " | --probefail baseline|stall|httpx|healthy <runStart> [recon.log] | --secchk <runStart>"
+         " | --redis-nohttp open <runStart> | --redis-nohttp rerun <findingId> | --redis-nohttp auth"
+         " | --fanout <recon.log> | --r14 <runStart> [recon.log] | --r14js <runStart> <recon.log>"
+         " | --graphql-rate <runStart> | --graphql-cop stealth|ran|dos-off <runStart> [recon.log]"
+         " | --vhost-drop <runStart> <recon.log> | --cache stall|open <runStart> [recon.log]"
+         " | --epai snapshot <file> | --epai compare <file> <excludedHost> | --userinput <toolId>"
+         " | --upload-sink <fileName> | --passive-fd1 kept <runStart> <recon.log> | --passive-fd1 orphan"
+         " | --passive-fd1 cdn <runStart> | --ceiling free|capped <runStart> <recon.log> (CEILING_NMAP=<nmap.jsonl>)"
+         " | --fd5 snapshot <file> | --fd5 after <file> <tool> [partial.log]]")
+if len(sys.argv) not in (2, 3, 4, 5, 6, 7):
     sys.exit(USAGE)
 P = sys.argv[1]
 NET = "192.88.94"
@@ -101,15 +127,29 @@ def http_layer_checks():
                       e.status_code AS last, e.redirect_chain_codes AS chain,
                       e.redirected_off_host AS off, e.final_url AS final, collect(t.name) AS techs""")
     r = ep[0] if ep else None
-    check("R-01", r and not r["title"] and not r["server"] and not [t for t in r["techs"] if "SAP" in (t or "")],
-          f".23's root Endpoint keeps nothing from the third-party IdP page: {r}")
-    check("R-02", r and r["first"] == 302 and r["off"] is True and (r["chain"] or [None])[0] == 302
-          and (r["final"] or "").endswith("/saml/login"), f".23's redirect chain: {r}")
     ext = q(f"""MATCH (d:ExternalDomain) WHERE d.domain = '{NET}.21'
                 RETURN d.sources AS src, d.redirect_from_urls AS frm, d.titles_seen AS titles""")
-    r = ext[0] if ext else None
-    check("R-03", r and "http_probe_redirect" in (r["src"] or [])
-          and any(f"{NET}.23" in u for u in (r["frm"] or [])), f"the IdP host is an external domain: {r}")
+    x = ext[0] if ext else None
+    ip_mode = any(d.get("ip") for d in q("MATCH (d:Domain) RETURN d.ip_mode AS ip"))
+    if ip_mode:
+        # IP mode follows same-host redirects only (httpx -fhr, I-1): .23's own
+        # 302 is the answer, .21 is never requested, so nothing of its page and
+        # no redirect record of it reach the graph.
+        check("R-01", r and not r["title"] and "SAP" not in str(r["server"] or "")
+              and not [t for t in r["techs"] if "SAP" in (t or "")],
+              f".23's root Endpoint keeps nothing from the third-party IdP page: {r}")
+        check("R-02", r and r["first"] == 302 and r["last"] == 302 and (r["chain"] or [None]) == [302]
+              and not r["off"] and not (r["final"] or "").endswith("/saml/login"),
+              f".23's off-host redirect is not followed in IP mode: {r}")
+        check("R-03", not (x and "http_probe_redirect" in (x["src"] or [])),
+              f"no redirect record of the IdP host, which httpx never asked: {x}")
+    else:
+        check("R-01", r and not r["title"] and not r["server"] and not [t for t in r["techs"] if "SAP" in (t or "")],
+              f".23's root Endpoint keeps nothing from the third-party IdP page: {r}")
+        check("R-02", r and r["first"] == 302 and r["off"] is True and (r["chain"] or [None])[0] == 302
+              and (r["final"] or "").endswith("/saml/login"), f".23's redirect chain: {r}")
+        check("R-03", x and "http_probe_redirect" in (x["src"] or [])
+              and any(f"{NET}.23" in u for u in (x["frm"] or [])), f"the IdP host is an external domain: {x}")
 
     js = q(f"""MATCH (e:Endpoint) WHERE (e.source = 'js_recon' OR e.js_recon_source = true)
                AND e.baseurl IN ['http://{NET}.20', 'http://{NET}.22']
@@ -185,6 +225,105 @@ def passive_cves(stage):
               f"and stale: {json.dumps(muted)[:400]}")
     else:
         sys.exit(USAGE)
+
+
+def passive_fd1(stage, since=None, log_path=None):
+    """F-D1 for passive CVEs (W6-FD1-PASSIVE) and the orphan reach (W6-D1-ORPHAN), on a
+    second --passive-cves project: `kept` after a rerun without .10 in the target
+    IPs, `orphan` after the Priority Board on it, `cdn` after a rerun where the stub
+    tags .13 a CDN edge."""
+    rows = q(f"""MATCH (v:Vulnerability) WHERE v.source IN {PASSIVE}
+                 RETURN v.id AS id, v.target_ip AS ip, v.name AS cve, v.stale_since AS stale,
+                        toString(v.updated_at) AS seen, v.triage_factors AS f, v.triage_tier AS tier,
+                        v.triage_model_version AS ver, v.triage_tier_rule AS rule""")
+    gone = [r for r in rows if r["ip"] == f"{NET}.10"]
+    ten_ip = q(f"MATCH (i:IP) WHERE i.address = '{NET}.10' RETURN count(i) AS n")[0]["n"]
+    others = {r["ip"]: r for r in rows if r["ip"] in (f"{NET}.13", f"{NET}.14")}
+    if stage == "kept":
+        check("FD1-01", len(gone) == 2 and all(r["stale"] is None for r in gone),
+              f".10 left the target IPs: its Shodan CVEs are kept, not stale: "
+              f"{[(r['cve'], r['stale'], r['seen'][:19]) for r in gone]}")
+        check("FD1-02", ten_ip == 0, f"no IP node for .10 after the asset clear: {ten_ip}")
+        check("FD1-03", set(others) == {f"{NET}.13", f"{NET}.14"} and all(r["seen"] >= since for r in others.values()),
+              f".13/.14 CVEs re-checked this run: {[(r['ip'], r['seen'][:19]) for r in others.values()]}")
+        check("FD1-04", "source(s) prune only the hosts they re-checked" in _log_text(log_path),
+              "log: ... source(s) prune only the hosts they re-checked")
+    elif stage == "orphan":
+        def reach(r):
+            try:
+                f = json.loads(r["f"]) if isinstance(r["f"], str) else (r["f"] or {})
+            except ValueError:
+                return None, ""
+            fr = f.get("R") or f.get("reach") or {}
+            return fr.get("value"), str(fr.get("evidence") or "")
+        got = [(r["cve"], *reach(r), r["tier"], r["ver"]) for r in gone]
+        check("D1O-01", gone and all(v == 0.5 and "no longer among this run's targets" in ev
+                                     and t not in ("T1", "T2") and ver == "v3.11.0"
+                                     for _, v, ev, t, ver in got),
+              f".10's kept CVEs on the board (cve, R, evidence, tier, model): {got}")
+        live = [(r["cve"], *reach(r)) for r in others.values()]
+        check("D1O-02", live and all(v != 0.5 or "no longer among" not in ev for _, v, ev in live),
+              f"CVEs on IPs still in the run are not read as left: {live}")
+    elif stage == "cdn":
+        check("FD1-05", f"{NET}.13" not in others, f".13 tagged cdn by the stub: its CVE is pruned: {others.get(f'{NET}.13')}")
+        check("FD1-06", f"{NET}.14" in others and others[f"{NET}.14"]["seen"] >= since,
+              f".14 (no tag) keeps a refreshed CVE: {others.get(f'{NET}.14')}")
+        check("FD1-07", len(gone) == 2, f".10 still out of the run: its CVEs still kept: {[r['cve'] for r in gone]}")
+    else:
+        sys.exit(USAGE)
+
+
+FD5_PORTS = """MATCH (i:IP) OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)
+               RETURN i.address AS ip, i.is_cdn AS cdn, i.cdn_name AS cdn_name,
+                      collect(CASE WHEN p IS NULL THEN NULL
+                              ELSE [p.number, p.passive_only, p.ip_address] END) AS ports"""
+
+
+def _fd5_state():
+    return {r["ip"]: {"cdn": r["cdn"], "cdn_name": r["cdn_name"],
+                      "ports": {str(n): {"passive": pa, "ip": pip} for n, pa, pip in r["ports"]}}
+            for r in q(FD5_PORTS)}
+
+
+def fd5_checks(stage, path, tool=None, log_path=None):
+    """F-D5 / R-26 (W4-FD5): a partial port-touching run (Nmap or Masscan on custom
+    ports with the graph targets, httpx on a typed IP:port that never answers, tlsx
+    on a custom port) writes back only the ports it measured. `snapshot` after the
+    full run, `after` after each partial: Shodan-only ports keep passive_only, every
+    port stays under its own IP, every CDN IP keeps is_cdn and its name, and no
+    port appears that the lab does not serve. A custom port on an IP nmap gave up
+    on (the partial's log names it unreachable) is the documented exception: the
+    typed port is written as given, so it is listed, not failed."""
+    if stage == "snapshot":
+        state = _fd5_state()
+        json.dump(state, open(path, "w"), indent=1, sort_keys=True)
+        print(f"FD5_SNAPSHOT={path}: " + json.dumps(state, sort_keys=True)[:900])
+        return
+    if stage != "after":
+        sys.exit(USAGE)
+    before, now = json.load(open(path)), _fd5_state()
+    tag = f"[{tool}]" if tool else ""
+    passive = {(ip, n): v["passive"] for ip, s in before.items() for n, v in s["ports"].items()}
+    changed = {k: (v, ((now.get(k[0]) or {}).get("ports") or {}).get(k[1], {}).get("passive", "gone"))
+               for k, v in passive.items()
+               if ((now.get(k[0]) or {}).get("ports") or {}).get(k[1], {}).get("passive", "gone") != v}
+    check(f"FD5-01{tag}", not changed,
+          f"Shodan-only ports keep passive_only, measured ports stay measured "
+          f"(passive before: {sorted(k for k, v in passive.items() if v)}); changed: {changed}")
+    moved = q("MATCH (i:IP)-[:HAS_PORT]->(p:Port) WHERE p.ip_address <> i.address "
+              "RETURN i.address AS ip, p.number AS port, p.ip_address AS pip")
+    check(f"FD5-02{tag}", not moved, f"Ports filed under another IP's address: {moved}")
+    cdn = {ip: s["cdn_name"] for ip, s in before.items() if s["cdn"]}
+    lost = {ip: (now.get(ip) or {}).get("cdn_name") for ip in cdn
+            if not (now.get(ip) or {}).get("cdn") or (now.get(ip) or {}).get("cdn_name") != cdn[ip]}
+    check(f"FD5-03{tag}", not lost, f"CDN IPs before {cdn}: is_cdn or its name lowered on {lost}")
+    import re
+    gave_up = {ip for m in re.finditer(r"\[DEGRADED\]\[Nmap\] \d+ unreachable host\(s\) skipped: ([^\n]+)",
+                                       _log_text(log_path)) for ip in re.findall(r"[\d.]+\d", m.group(1))}
+    new = sorted((ip, n) for ip, s in now.items() for n in s["ports"] if n not in (before.get(ip) or {}).get("ports", {}))
+    check(f"FD5-04{tag}", not [x for x in new if x[0] not in gave_up],
+          f"ports that appeared (the lab serves none beyond the full run's): {new}; on IPs nmap gave up on "
+          f"(typed ports written as given): {[x for x in new if x[0] in gave_up]}")
 
 
 SPA = f"http://{NET}.20"
@@ -299,6 +438,14 @@ def vhost_origin_checks():
     plain = ips.get(f"{NET}.31") or {}
     check("T-02", plain and not plain.get("cdn") and plain.get("src") is None,
           f".31 with the lab's own certificate: {plain} (expect no CDN tag)")
+    origin = _ownership([f"{NET}.35", f"{NET}.36"])
+    for case, n in (("T-03", 35), ("T-04", 36)):
+        r = origin.get(f"{NET}.{n}") or {}
+        check(case, r and r.get("is_cdn") is not True and r.get("cdn") is None and r.get("src") is None
+              and r.get("own") != "shared_edge",
+              f".{n} behind a Cloudflare Origin CA certificate ({'ECC' if n == 36 else 'RSA'} issuer): "
+              f"is_cdn {r.get('is_cdn')}, cdn_name {r.get('cdn')}, cdn_source {r.get('src')}, ownership "
+              f"{r.get('own')} (expect an origin: no CDN tag, never shared_edge)")
 
 
 CVE_SNAPSHOT = os.environ.get("COVERAGE_CVE_SNAPSHOT", "coverage_cve_snapshot.json")
@@ -669,9 +816,959 @@ def ip_ownership_nwlab_checks():
           f"most; never the PTR name)")
 
 
+# --------------------------------------------------------------------------- audit cases
+def _lab_log(container, since):
+    """A lab host's request lines since `since` (its log names method, path, host
+    and whether an Authorization header came, never a value)."""
+    import subprocess
+    out = subprocess.run(["docker", "logs", "--since", since, container], capture_output=True, text=True)
+    return [ln for ln in (out.stdout + out.stderr).splitlines() if ln.startswith("[") and "listening on" not in ln]
+
+
+ASSET_LABELS = ("IP", "Port", "Service", "BaseURL", "Endpoint", "Technology", "Vulnerability", "Certificate",
+                "Subdomain", "Header")
+
+
+def _nodes_naming(needles):
+    """Asset nodes with any property naming one of `needles` (read whole, matched here)."""
+    hits = []
+    for label in ASSET_LABELS:
+        for r in q(f"MATCH (n:{label}) RETURN properties(n) AS p"):
+            text = json.dumps(r["p"], default=str)
+            if any(x in text for x in needles):
+                p = r["p"]
+                hits.append((label, p.get("address") or p.get("url") or p.get("name") or p.get("id")))
+    return hits
+
+
+def roe_checks(since):
+    """R-3: .11 excluded by `192.88.94.11/admin`, .12 by `192.88.94.12/`."""
+    hits = _nodes_naming([f"{NET}.11", f"{NET}.12", "192-88-94-11", "192-88-94-12"])
+    check("RoE-01", not hits, f"asset nodes naming an excluded host: {hits} (expect none)")
+    ports = q(f"""MATCH (i:IP {{address: '{NET}.10'}})-[]->(p:Port) RETURN p.number AS n""")
+    bases = q(f"""MATCH (b:BaseURL) WHERE b.url STARTS WITH 'http://{NET}.10' RETURN b.url AS u""")
+    check("RoE-02", ports and bases, f".10 still scanned: ports {[r['n'] for r in ports]}, "
+                                     f"BaseURLs {[r['u'] for r in bases]}")
+    touched = {c: _lab_log(c, since) for c in ("redamon-fp-cloudflare", "redamon-fp-redirect")}
+    check("RoE-03", not any(touched.values()),
+          f"requests on the excluded hosts since {since}: { {c: v[:3] for c, v in touched.items()} } (expect none)")
+    fastly = [ln for ln in _lab_log("redamon-fp-fastly", since) if "] GET " in ln]
+    check("RoE-04", fastly, f"requests on .10 since {since}: {len(fastly)} GET lines (expect some)")
+    refused = {}
+    for entry in ("0.5", f"{NET}.11/33"):
+        out, err = mcp.call("update_recon_settings", {"projectId": P, "settings": {"roeExcludedHosts": [entry]}})
+        refused[entry] = bool(err) and "would exclude nothing" in json.dumps(out)
+    out, err = mcp.call("update_recon_settings",
+                        {"projectId": P, "settings": {"roeExcludedHosts": [f"{NET}.11/admin", f"{NET}.12/"]}})
+    check("RoE-05", all(refused.values()) and not err,
+          f"MCP validator: refused {refused} (expect both 'would exclude nothing'); the path-form list "
+          f"accepted: {not err} {json.dumps(out)[:160] if err else ''}")
+
+
+def roe_window_checks():
+    """R-32: a window that excludes now refuses the start; the overnight one that
+    contains now (e2e_fp.py set it, the run completed) is restored after."""
+    import e2e_fp
+    out, err = mcp.call("update_recon_settings", {"projectId": P, "settings": e2e_fp.roe_window(False)})
+    if err:
+        check("RoE-06", False, f"could not set the excluding window: {json.dumps(out)[:300]}")
+        return
+    out, err = mcp.call("start_recon", {"projectId": P, "mode": "new"})
+    text = json.dumps(out)
+    check("RoE-06", err and ("window" in text.lower() or "403" in text),
+          f"start outside the window: refused={bool(err)} {text[:300]}")
+    mcp.call("update_recon_settings", {"projectId": P, "settings": e2e_fp.roe_window(True)})
+
+
+def r29_checks(since):
+    """R-29: one relative path on two origins is two Endpoints; .21 gets none."""
+    rows = q("""MATCH (b:BaseURL)-[:HAS_ENDPOINT]->(e:Endpoint {path: '/api/v1', method: 'GET'})
+                RETURN b.url AS base, e.source AS source ORDER BY base""")
+    bases = [r["base"] for r in rows]
+    check("R29-01", bases == [f"http://{NET}.20", f"http://{NET}.22"],
+          f"/api/v1 Endpoints by BaseURL: {rows} (expect one on .20 and one on .22, none on .21)")
+    rows = q("""MATCH (f:JsReconFinding {finding_type: 'js_file'})-[:HAS_ENDPOINT]->(e:Endpoint {path: '/api/v1'})
+                RETURN f.source_url AS js, e.baseurl AS base""")
+    got = sorted((r["js"], r["base"]) for r in rows)
+    own = (f"http://{NET}.20/static/js/r29.relative.js", f"http://{NET}.20")
+    check("R29-02", own in got and not [g for g in got if g[0] == own[0] and g[1] != own[1]],
+          f"js_file -> /api/v1: {got} (expect r29.relative.js's relative call on .20, after .21's absolute one)")
+    client = [g for g in got if g[0] == f"http://{NET}.22/js/client.js"]
+    if client:
+        check("R29-02b", client == [(f"http://{NET}.22/js/client.js", f"http://{NET}.22")],
+              f".22's client.js resolves its relative call against .22: {client}")
+    else:
+        # The crawl scopes each seed to its own host, so .20's cross-host script
+        # tag for .22's client.js is not collected (like J-09's loader on .21).
+        check("R29-02b (not crawled)", True, ".22/js/client.js was not collected by the crawl; nothing to judge")
+    spa = [ln for ln in _lab_log("redamon-fp-spa", since) if "GET /static/js/r29.relative.js" in ln]
+    vendor = [ln for ln in _lab_log("redamon-fp-vendor", since) if "/api/v1" in ln]
+    check("R29-03", spa and not vendor,
+          f"r29.relative.js served {len(spa)}x; .21 asked for /api/v1 {len(vendor)}x (expect 0)")
+
+
+R43_REFUSED = ("[!][GraphQL] Refused 1 user-specified endpoint(s) outside the project scope; "
+               f"no request and no credential sent to: {NET}.21")
+
+
+def r43_checks(since, log_path):
+    """R-43: the typed endpoint on .21 (outside the project) gets no request and no token."""
+    text = open(log_path, errors="replace").read()
+    check("R43-01", text.count(R43_REFUSED) == 1, f"refusal line in the recon log: {text.count(R43_REFUSED)}x (expect 1)")
+    vendor = [ln for ln in _lab_log("redamon-fp-vendor", since) if "/graphql" in ln or "auth=yes" in ln]
+    check("R43-02", not vendor, f".21 requests for /graphql or with a credential: {vendor[:3]} (expect none)")
+    spa = [ln for ln in _lab_log("redamon-fp-spa", since) if f"POST /graphql host={NET}.20" in ln]
+    check("R43-03", spa and all(" auth=yes" in ln for ln in spa),
+          f".20 got POST /graphql {len(spa)}x, with a credential each: {spa[:2]}")
+    gaps = q("""MATCH (d:Domain) WHERE d.name STARTS WITH 'ip-targets.' RETURN d.recon_coverage_gaps AS g""")
+    listed = [g for r in gaps for g in json.loads(r["g"] or "[]")
+              if g.get("source") == "roe_excluded" and g.get("module") == "graphql_scan"]
+    check("R43-04", listed and any(g.get("skipped") == 1 or g.get("hosts") == 1 for g in listed),
+          f"roe_excluded gap for graphql_scan: {listed}")
+
+
+def nuclei_throttle_checks(jsonl_path):
+    """R-19: "please wait" copy on a served page no longer hides a finding; a
+    non-timing template's match on a throttled (429) host is kept."""
+    rows = q("""MATCH (v:Vulnerability) WHERE v.source = 'nuclei'
+                RETURN v.template_id AS t, coalesce(v.matched_at, v.url, v.host) AS at""")
+    on = lambda ip, tid: [r for r in rows if r["t"] == tid and f"{NET}.{ip}" in (r["at"] or "")]
+    check("N19-01", on(37, "git-config"), f"git-config on the please-wait host .37: {on(37, 'git-config')}")
+    check("N19-02", on(38, "http-missing-security-headers"),
+          f"a non-timing template on the throttled host .38 is kept: {on(38, 'http-missing-security-headers')[:2]}")
+    check("N19-03", not on(38, "git-config"), f"no git-config on the 429 host: {on(38, 'git-config')}")
+    recon = os.path.join(HERE, "..", "..", "..", "recon", "output", f"recon_{P}.json")
+    fps = ((json.load(open(recon)).get("vuln_scan") or {}).get("false_positives") or []) if os.path.exists(recon) else None
+    named = [f for f in (fps or []) if "git-config" in json.dumps(f)]
+    check("N19-04", fps is not None and not named,
+          f"vuln_scan.false_positives: {len(fps) if fps is not None else 'no recon file'} entries, "
+          f"git-config among them: {len(named)} (expect 0)")
+    heads = []
+    if jsonl_path and os.path.exists(jsonl_path):
+        # A nuclei_detection.jsonl, or the recon log, which echoes each of its
+        # lines as "[*][Nuclei][DETECTION] {...}".
+        for ln in open(jsonl_path, errors="replace"):
+            if "{" not in ln or ("[Nuclei][" in ln and "{" not in ln.split("]", 3)[-1]):
+                continue
+            try:
+                line = json.loads(ln[ln.index("{"):])
+            except ValueError:
+                continue
+            if isinstance(line, dict) and line.get("template-id"):   # not a progress/stats line
+                heads.append((line.get("response") or "")[:12])
+    raw = [h for h in heads if h.startswith("HTTP/1.1 ")]
+    check("N19-05", heads and len(raw) == len(heads),
+          f"Nuclei JSONL lines: {len(heads)}, with a raw 'HTTP/1.1 ...' response head: {len(raw)} "
+          f"(the throttle rule parses it; none means the rule is dead code)")
+
+
+def redis_checks(stage):
+    """R-24: open -> redis_no_auth; delay -> kept + a coverage gap; auth -> pruned."""
+    rows = q(f"""MATCH (v:Vulnerability) WHERE v.source = 'security_check' AND v.type = 'redis_no_auth'
+                 RETURN v.id AS id, v.matched_ip AS ip, v.stale_since AS stale, toString(v.updated_at) AS seen""")
+    gaps = q("""MATCH (d:Domain) WHERE d.recon_coverage_gaps IS NOT NULL RETURN d.recon_coverage_gaps AS g""")
+    listed = [g for r in gaps for g in json.loads(r["g"] or "[]")
+              if g.get("source") == "security_check" and "redis_no_auth" in json.dumps(g)]
+    if stage == "open":
+        check("RD-01", len(rows) == 1 and rows[0]["ip"] == f"{NET}.39", f"redis_no_auth on .39: {rows}")
+        check("RD-02", not listed, f"no security_check gap for redis_no_auth: {listed}")
+    elif stage == "delay":
+        check("RD-03", len(rows) == 1, f"PING answered past the timeout: the finding is kept: {rows}")
+        check("RD-04", listed, f"security_check coverage gap naming redis_no_auth: {listed}")
+    elif stage == "auth":
+        check("RD-05", not rows, f"NOAUTH is a verdict: the finding is pruned: {rows}")
+        check("RD-06", not listed, f"no gap once Redis answered: {listed}")
+    else:
+        sys.exit(USAGE)
+
+
+# --------------------------------------------------------------------------- recon-audit cases, round 2
+def _all_gaps():
+    rows = q("""MATCH (d:Domain) WHERE d.recon_coverage_gaps IS NOT NULL
+                RETURN d.recon_coverage_gaps AS g, d.recon_skipped_hosts AS sk""")
+    return ([g for r in rows for g in json.loads(r["g"] or "[]")],
+            sorted({h for r in rows for h in (r.get("sk") or [])}))
+
+
+def _gaps(source=None, module=None, reason=None):
+    return [g for g in _all_gaps()[0] if (source is None or g.get("source") == source)
+            and (module is None or g.get("module") == module)
+            and (reason is None or reason in str(g.get("reason") or ""))]
+
+
+def _recon_json():
+    path = os.path.join(HERE, "..", "..", "..", "recon", "output", f"recon_{P}.json")
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return None
+
+
+def _log_text(path):
+    return open(path, errors="replace").read() if path and os.path.exists(path) else ""
+
+
+def _http_lines(container, since):
+    return [ln for ln in _lab_log(container, since) if any(f"] {m} " in ln for m in ("GET", "POST", "HEAD"))]
+
+
+def _tool_lifetimes(prefix, since):
+    """(name, seconds from start to die) of each container named `prefix`* that
+    started since `since`, from the Docker event log. The daemon keeps only its
+    last events, so run this right after the run."""
+    import subprocess
+    import datetime as dt
+    out = subprocess.run(["docker", "events", "--since", since, "--until", "0s", "--filter", "type=container",
+                          "--format", "{{json .}}"], capture_output=True, text=True).stdout
+    starts, ends = {}, {}
+    for ln in out.splitlines():
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        name = (ev.get("Actor") or {}).get("Attributes", {}).get("name", "")
+        if not name.startswith(prefix):
+            continue
+        t = ev.get("timeNano", 0) / 1e9
+        if ev.get("Action") == "start":
+            starts[name] = t
+        elif ev.get("Action") in ("die", "kill") and name not in ends:
+            ends[name] = t
+    return [(n, round(ends[n] - starts[n], 1) if n in ends else None) for n in sorted(starts)]
+
+
+def _updated(rows):
+    return [str(r.get("seen") or "") for r in rows]
+
+
+def probefail_checks(stage, since, log_path=None):
+    """R-21 (and R-9's tlsx kill): .40's expired certificate on 993, Nuclei and
+    the header checks on 80, through a stalled handshake and a failed httpx."""
+    tls = q(f"""MATCH (v:Vulnerability) WHERE v.source = 'security_check' AND v.type = 'tls_expired'
+                AND v.matched_ip = '{NET}.40' RETURN v.id AS id, v.url AS url, toString(v.updated_at) AS seen""")
+    # The header checks read HTTPS only: on .40's port 80 the web findings are
+    # Nuclei's missing-headers template and the direct-IP-over-HTTP check.
+    web = q(f"""MATCH (v:Vulnerability) WHERE (v.source = 'nuclei' OR (v.source = 'security_check'
+                AND v.type = 'direct_ip_http')) AND coalesce(v.matched_at, v.url, '') CONTAINS '{NET}.40'
+                RETURN v.id AS id, v.source AS src, v.type AS t, toString(v.updated_at) AS seen""")
+    log = _log_text(log_path)
+    on993 = [r for r in tls if ":993" in (r["url"] or "")]
+    if stage == "baseline":
+        check("PF-01", len(on993) == 1, f"tls_expired on .40:993 (only tlsx reads it): {tls}")
+        check("PF-02", any(r["src"] == "nuclei" for r in web) and any(r["src"] == "security_check" for r in web),
+              f"Nuclei and security-check findings on .40:80: {sorted({(r['src'], str(r['t'])) for r in web})}")
+    elif stage == "stall":
+        check("PF-03", len(on993) == 1 and all(s < since for s in _updated(on993)),
+              f"tls_expired kept, not re-written, through a tlsx run cut at its timeout: {on993}")
+        gaps = _gaps("security_check", "tlsx", "tlsx timed out after 20s")
+        check("PF-04", gaps, f"security_check gap from tlsx naming its timeout: {gaps or _all_gaps()[0]}")
+        check("PF-05", "tlsx timed out after 20s" in log or not log_path,
+              "recon log says tlsx timed out after 20s")
+        kept = _tool_lifetimes("tlsx-", since)
+        check("PF-06 (R-9)", kept and all(t is not None and t <= 30 for _, t in kept),
+              f"tlsx containers (start -> die, s; the run timeout is 20 s): {kept} (expect each gone by 30 s)")
+    elif stage == "httpx":
+        rj = _recon_json() or {}
+        meta = rj.get("metadata") or {}
+        check("PF-07", "SKIPPING ACTIVE SCANS: http_probe failed (" in log,
+              "recon log: SKIPPING ACTIVE SCANS: http_probe failed (...)")
+        check("PF-08", (meta.get("phase_errors") or {}).get("http_probe")
+              and "http_probe" not in (meta.get("modules_executed") or []),
+              f"phase_errors.http_probe={str((meta.get('phase_errors') or {}).get('http_probe'))[:80]!r}, "
+              f"modules_executed={meta.get('modules_executed')}")
+        check("PF-09", web and all(s < since for s in _updated(web)),
+              f"run-1 Nuclei and header findings kept untouched: {sorted({(r['src'], str(r['t']), r['seen'][:19]) for r in web})}")
+        why = "http_probe failed, no host probed"
+        named = {g.get("source") for g in _all_gaps()[0]
+                 if why in str(g.get("reason") or "") or g.get("source") == "http_probe"}
+        check("PF-10", {"http_probe", "nuclei", "security_check"} <= named,
+              f"sources with a gap ({why!r} or httpx's own): {sorted(named)}")
+        hits = _http_lines("redamon-fp-tlsmail", since)
+        check("PF-11", not hits, f"HTTP requests on .40 while httpx had failed: {hits[:3]} (expect none: no Nuclei)")
+    elif stage == "healthy":
+        check("PF-12", not on993, f"a renewed certificate prunes tls_expired: {on993}")
+        check("PF-13", web and all(s >= since for s in _updated(web)),
+              f"Nuclei and header findings re-checked: {sorted({(r['src'], str(r['t']), r['seen'][:19]) for r in web})}")
+        left = [g for g in _all_gaps()[0] if g.get("module") == "tlsx" or g.get("source") == "http_probe"]
+        check("PF-14", not left, f"no tlsx or httpx gap on a healthy run: {left}")
+    else:
+        sys.exit(USAGE)
+
+
+def secchk_checks(since):
+    """L-20 SMTP relay, L-21 login form over HTTP, L-7 no header check off the host."""
+    relay = q("""MATCH (v:Vulnerability) WHERE v.source = 'security_check' AND v.type = 'smtp_open_relay'
+                 RETURN coalesce(v.matched_ip, v.ip, v.matched_at, v.url) AS at""")
+    at = sorted(str(r["at"]) for r in relay)
+    check("SC-01 (L-20)", len(at) == 1 and f"{NET}.42" in at[0],
+          f"smtp_open_relay: {at} (expect .42 only: .41 refuses with 554 after a split greeting, .43 greylists)")
+    grey = [g for g in _gaps("security_check") if "smtp_open_relay" in json.dumps(g)]
+    check("SC-02 (L-20)", grey and "451" in json.dumps(grey),
+          f"security_check gap for the greylisted server: {grey}")
+    login = q("""MATCH (v:Vulnerability) WHERE v.source = 'security_check' AND v.type = 'login_no_https'
+                 RETURN v.url AS url, v.control_check AS cc, v.evidence AS ev""")
+    check("SC-03 (L-21)", len(login) == 1 and f"{NET}.45/login" in (login[0]["url"] or "")
+          and login[0]["cc"] == "passed"
+          and login[0]["ev"] == "Login form with password field found on HTTP; control_check: passed",
+          f"login_no_https: {login} (expect .45/login only; not .44's shell without a password field, "
+          f"not .46's catch-all)")
+    import re as _re
+    ctl = [ln for ln in _lab_log("redamon-fp-login-real", since) if _re.search(r"GET /\S*rdm-[0-9a-f]{12}", ln)]
+    check("SC-04 (L-21)", len(ctl) >= 1, f".45 control requests (/…rdm-<hex>): {len(ctl)} {ctl[:2]}")
+    page = lambda t: t.startswith(("missing_", "session_no_")) or t in (
+        "cache_control_missing", "csp_unsafe_inline", "insecure_form_action")
+    sso = [r["t"] for r in q(f"""MATCH (v:Vulnerability) WHERE v.source = 'security_check'
+                                  AND v.url CONTAINS '{NET}.48' RETURN v.type AS t""") if page(r["t"])]
+    own = [r["t"] for r in q(f"""MATCH (v:Vulnerability) WHERE v.source = 'security_check'
+                                  AND v.url CONTAINS '{NET}.24' RETURN v.type AS t""") if page(r["t"])]
+    check("SC-05 (L-7)", not sso and own,
+          f"page findings on .48 (HTTPS 302 to .21): {sso} (expect none); on .24 (HTTPS 302 to its own "
+          f"/login): {sorted(own)} (expect some)")
+    # The direct-IP redirect analysis (_analyze_redirect_chain, outside L-7)
+    # still follows .48's 302 once per scheme; the five page checks, which
+    # followed it too before L-7, would add one request each.
+    vendor = _http_lines("redamon-fp-vendor", since)
+    check("SC-06 (L-7)", len(vendor) <= 2 and all("GET /saml/login" in ln for ln in vendor),
+          f"requests on .21 (outside the project) since {since}: {len(vendor)} {vendor[:3]} (expect at most "
+          f"the redirect analysis's one per scheme, none from the page checks)")
+
+
+def redis_nohttp_checks(stage, extra=None):
+    """R-22: with no live URL the port checks still run and keep their verdicts."""
+    rows = q("""MATCH (v:Vulnerability) WHERE v.source = 'security_check' AND v.type = 'redis_no_auth'
+                RETURN v.id AS id, v.matched_ip AS ip""")
+    meta = (_recon_json() or {}).get("metadata") or {}
+    if stage in ("open", "rerun"):
+        check("RN-01", meta.get("active_scans_skipped") is True,
+              f"active_scans_skipped={meta.get('active_scans_skipped')} ({meta.get('active_scans_skip_reason')})")
+        check("RN-02", len(rows) == 1 and rows[0]["ip"] == f"{NET}.39", f"redis_no_auth with no live URL: {rows}")
+        not_run = sorted({g.get("source") for g in _gaps(reason="not run: no live HTTP URL")})
+        redis_gap = [g for g in _gaps("security_check") if "redis_no_auth" in json.dumps(g)]
+        check("RN-03", "nuclei" in not_run and not redis_gap,
+              f"sources noted 'not run: no live HTTP URL': {not_run}; redis_no_auth gap: {redis_gap}")
+        if stage == "open":
+            pings = [ln for ln in _lab_log("redamon-fp-redis", extra) if "PING mode=open" in ln] if extra else []
+            # The stand-in on 6379 logs "mode=", the toggle on 80 "host= ... auth=".
+            web = [ln for ln in _http_lines("redamon-fp-redis", extra) if "auth=" in ln] if extra else []
+            check("RN-04", pings and not web, f"PINGs on 6379: {len(pings)}; HTTP requests on :80 (Nuclei, "
+                                             f"crawlers): {web[:3]} (expect none)")
+            print(f"REDIS_FINDING_ID={rows[0]['id'] if rows else ''}")
+        else:
+            check("RN-05", rows and rows[0]["id"] == extra, f"same finding id on a rerun: {rows} vs {extra}")
+    elif stage == "auth":
+        check("RN-06", not rows, f"NOAUTH is a verdict with no live URL too: pruned: {rows}")
+    else:
+        sys.exit(USAGE)
+
+
+PHASE_A = ("vuln_scan", "vhost_sni", "cache_scan", "origin_discovery", "graphql_scan", "port_scan")
+
+
+def fanout_checks(log_path):
+    """R-31: every Phase A tool ran, and no shared-snapshot race."""
+    meta = (_recon_json() or {}).get("metadata") or {}
+    ran = meta.get("modules_executed") or []
+    check("FO-01", all(m in ran for m in PHASE_A), f"modules_executed: {ran} (expect {list(PHASE_A)})")
+    errs = json.dumps(meta.get("phase_errors") or {})
+    check("FO-02", "changed size" not in errs, f"phase_errors: {errs[:300]}")
+    log = _log_text(log_path)
+    bad = [w for w in ("changed size", "vuln_scan failed", "Enrichment failed") if w in log]
+    check("FO-03", log and not bad, f"recon log lines naming a race or a failed tool: {bad}")
+
+
+def _map_rows():
+    return q("""MATCH (f:JsReconFinding) WHERE f.finding_type IN ['source_map_exposure', 'source_map_reference']
+                RETURN f.source_url AS js, f.finding_type AS t, f.severity AS sev, f.map_url AS map,
+                       f.fetch_result AS fr, f.first_party_files AS fp""")
+
+
+def r14_checks(since, log_path=None):
+    """R-14: a source map (or a map URL's redirect) off the run's hosts is never fetched."""
+    m = {r["js"].rsplit("/", 1)[-1]: r for r in _map_rows()}
+    vendor = _http_lines("redamon-fp-vendor", since)
+    check("R14-01", not [ln for ln in vendor if ".map" in ln], f".map requests on .21: {vendor[:3]} (expect none)")
+    r = m.get("r14.offhost.4d1e.js")
+    check("R14-02", r and r["t"] == "source_map_reference" and r["fr"] == "out_of_scope"
+          and f"{NET}.21" in (r["map"] or ""), f"map named on .21: {r}")
+    check("R14-03", "r14.bounce.5e2f.js" not in m, f"map URL redirecting to .21: {m.get('r14.bounce.5e2f.js')}")
+    r = m.get("r14.moved.6f3a.js")
+    check("R14-04", r and r["t"] == "source_map_exposure", f"map URL redirecting to another .20 path: {r}")
+    r = m.get("main.4f2a9c.js")
+    check("R14-05 (M-01)", r and r["t"] == "source_map_exposure" and r["sev"] == "low" and r["fp"] == 2,
+          f"the first-party map is unchanged: {r}")
+    if log_path:
+        import re as _re
+        hit = _re.search(r"Source-map requests not sent \(hop guard\): out_of_scope (\d+)", _log_text(log_path))
+        check("R14-06", hit and int(hit.group(1)) >= 1, f"hop-guard summary line: {hit.group(0) if hit else None}")
+
+
+def _timed_http_lines(container, since):
+    """(epoch seconds, line) of a lab host's request lines since `since`."""
+    import subprocess
+    import datetime as dt
+    out = subprocess.run(["docker", "logs", "--timestamps", "--since", since, container],
+                         capture_output=True, text=True)
+    rows = []
+    for ln in (out.stdout + out.stderr).splitlines():
+        stamp, _, rest = ln.partition(" ")
+        if not any(f"] {m} " in rest for m in ("GET", "POST", "HEAD")):
+            continue
+        t = dt.datetime.fromisoformat(stamp[:26].rstrip("Z") + "+00:00").timestamp()
+        rows.append((t, rest))
+    return rows
+
+
+def r14js_checks(since, log_path):
+    """R-14 (downloads): a .20 bundle redirecting to the RoE-excluded .21 is not
+    followed by JS Recon; one moving to another .20 path is analysed. The crawl
+    (GROUP 5) fetches the bundle before JS Recon (GROUP 5b) does, so a .21
+    request right after .20's LAST answer for the bundle would be JS Recon's
+    (R14J-01); any .21 request at all breaks the RoE (R14J-05)."""
+    bundle = "GET /static/js/r14js.offhost.7a8b.js"
+    asked = [t for t, ln in _timed_http_lines("redamon-fp-spa", since) if bundle in ln]
+    vendor = [(t, ln) for t, ln in _timed_http_lines("redamon-fp-vendor", since) if "GET /loader.js" in ln]
+    last = max(asked) if asked else None
+    js_recon = [ln for t, ln in vendor if last is not None and last <= t <= last + 2]
+    check("R14J-01", asked and not js_recon,
+          f".20 served the redirecting bundle {len(asked)}x; .21 requests right after the last (JS Recon's): "
+          f"{js_recon} (expect none)")
+    check("R14J-05", not vendor, f"requests on .21 (RoE-excluded) during the run: {[ln for _, ln in vendor][:3]} "
+                                 f"(expect none: an excluded host gets no request)")
+    log = _log_text(log_path)
+    # JS Recon refuses .21 either at its admission gate (the URL itself) or on a
+    # redirect hop of a bundle it fetched; since Katana stopped following
+    # redirects under RoE exclusions (B-KATANA) the first is the usual one.
+    roe_line = [ln for ln in log.splitlines() if ln.startswith("[-][RoE] js_recon: not sent to") and f"{NET}.21" in ln]
+    check("R14J-02", roe_line or "blocked (RoE exclusion)" in log,
+          "recon log: '[-][RoE] js_recon: not sent to ... .21' or a download hop 'blocked (RoE exclusion)'")
+    moved = q("""MATCH (f:JsReconFinding) WHERE f.source_url CONTAINS 'r14js.'
+                 RETURN f.finding_type AS t, f.source_url AS u""")
+    eps = q(f"""MATCH (e:Endpoint) WHERE e.path = '/api/r14js/moved' RETURN e.baseurl AS b""")
+    check("R14J-03", moved or eps, f"the moved bundle was analysed: findings {moved[:4]}, endpoints {eps}")
+    off = [r for r in moved if "offhost" in (r["u"] or "")]
+    check("R14J-04", not [r for r in off if r["t"] != "js_file"], f"nothing analysed from the .21 redirect: {off}")
+
+
+def graphql_rate_checks(since):
+    """R-7: graphqlRateLimit 0 under a 2 rps ceiling runs at 2 requests a second at most."""
+    import subprocess
+    out, err = mcp.call("preflight_scope_check", {"projectId": P})
+    rates = (out or {}).get("resolvedRates") or [] if isinstance(out, dict) else []
+    entry = next((x for x in rates if x.get("field") == "graphqlRateLimit"), None)
+    check("GQ-01", not err and entry and entry.get("written") == 0,
+          f"preflight lists graphqlRateLimit as written: {entry}")
+    check("GQ-02", entry and entry.get("resolved") == 2 and entry.get("capped") is True,
+          f"graphqlRateLimit 0 (unlimited) under a 2 rps ceiling resolves to 2, capped: {entry}")
+    logs = subprocess.run(["docker", "logs", "--timestamps", "--since", since, "redamon-fp-graphql"],
+                          capture_output=True, text=True)
+    per_s = {}
+    for ln in (logs.stdout + logs.stderr).splitlines():
+        if "] POST /graphql" in ln:
+            per_s[ln[:19]] = per_s.get(ln[:19], 0) + 1
+    worst = max(per_s.values()) if per_s else 0
+    check("GQ-03", sum(per_s.values()) >= 3 and worst <= 2, f"POST /graphql: {sum(per_s.values())} in {len(per_s)} s, "
+                                         f"busiest second {worst} (expect <= 2)")
+
+
+def graphql_cop_checks(stage, since, log_path=None):
+    """R-42: graphql-cop never runs in stealth or with a DoS test excluded."""
+    started = _tool_lifetimes("graphql-cop-", since)
+    import subprocess
+    ev = subprocess.run(["docker", "events", "--since", since, "--until", "0s", "--filter", "type=container",
+                         "--filter", "image=dolevf/graphql-cop:1.14", "--filter", "event=start",
+                         "--format", "{{.Actor.Attributes.name}}"], capture_output=True, text=True).stdout.split()
+    # The writer stamps graphql_cop_scanned_at for a run that executed
+    # (graphql_cop_ran stays in the recon JSON); Endpoints are rebuilt per run.
+    ran = q("""MATCH (e:Endpoint) WHERE e.graphql_cop_ran = true OR e.graphql_cop_scanned_at IS NOT NULL
+               RETURN e.baseurl AS b, e.path AS p""")
+    if stage in ("stealth", "dos-off"):
+        check(f"GC-{stage}", not ev and not ran, f"graphql-cop containers: {ev or started}; "
+                                                  f"Endpoints graphql-cop scanned: {ran} (expect none)")
+        if stage == "dos-off":
+            check("GC-dos-off log", "denial-of-service test(s) excluded" in _log_text(log_path),
+                  "recon log: Skipping ... denial-of-service test(s) excluded")
+    elif stage == "ran":
+        check("GC-ran", ev and ran, f"graphql-cop containers: {len(ev)}; Endpoints graphql-cop scanned: {ran}")
+    else:
+        sys.exit(USAGE)
+
+
+def vhost_drop_checks(since, log_path):
+    """R-46 run 2: .10's baseline fails, so its vhost findings are kept, not re-written."""
+    rows = q(f"""MATCH (v:Vulnerability) WHERE v.source = 'vhost_sni_enum' AND v.ip = '{NET}.10'
+                 RETURN v.hostname AS h, v.id AS id, toString(v.updated_at) AS seen ORDER BY h""")
+    names = sorted(r["h"] for r in rows)
+    want = sorted(f"{w}.{APEX}" for w in ("admin", "dev-api", "dev.api", "wiki"))
+    check("VD-01", names == want and all(s < since for s in _updated(rows)),
+          f".10 findings kept from run 1: {[(r['h'], r['seen'][:19]) for r in rows]}")
+    gaps = _gaps("vhost_sni_enum")
+    skipped = _all_gaps()[1]
+    log = _log_text(log_path)
+    line = f"[!][VhostSni] IP {NET}.10:80 (http) baseline failed -- skipping port"
+    check("VD-02", gaps and (f"{NET}.10:80" in skipped or line in log),
+          f"vhost_sni_enum gap: {gaps}; recon_skipped_hosts: {skipped}; log line: {line in log}")
+    others = q(f"""MATCH (v:Vulnerability) WHERE v.source = 'vhost_sni_enum' AND v.ip IN ['{NET}.11', '{NET}.14']
+                   RETURN v.ip AS ip, toString(v.updated_at) AS seen""")
+    check("VD-03", others and all(s >= since for s in _updated(others)), f".11/.14 refreshed: {others}")
+
+
+def cache_checks(stage, since, log_path=None):
+    """R-23 / R-9: a stalled cache scan keeps C-01 and says why; WCVS is stopped."""
+    rows = q("""MATCH (v:Vulnerability) WHERE v.source = 'cache_poisoning'
+                AND coalesce(v.endpoint_url, v.url, v.matched_at, '') CONTAINS '/home'
+                RETURN v.id AS id, toString(v.updated_at) AS seen""")
+    gaps = _gaps("cache_poisoning", "cache_scan")
+    if stage == "stall":
+        check("CS-01", rows and all(s < since for s in _updated(rows)), f"C-01 kept, not re-written: {rows}")
+        check("CS-02", any("no answer" in str(g.get("reason")) for g in gaps), f"cache_scan gaps: {gaps}")
+        check("CS-03 (R-9)", any("WCVS timed out after 60s" in str(g.get("reason")) for g in gaps),
+              f"WCVS timeout gap: {gaps}")
+        log = _log_text(log_path)
+        check("CS-04", "not fully tested (no answer)" in log and "WCVS timed out after 60s" in log,
+              "recon log: '... not fully tested (no answer)' and 'WCVS timed out after 60s'")
+        stalled = [ln for ln in _lab_log("redamon-fp-cache", since) if "stalled GET /home ua=RedAmon-CachePoison" in ln]
+        check("CS-05", stalled, f".15 stalled the cache scanner's /home: {len(stalled)}x")
+        wcvs = _tool_lifetimes("wcvs-", since)
+        check("CS-06 (R-9)", wcvs and all(t is not None and t <= 70 for _, t in wcvs),
+              f"wcvs containers (start -> die, s; timeout 60 s): {wcvs} (expect each gone by 70 s)")
+    elif stage == "open":
+        check("CS-07", rows and all(s >= since for s in _updated(rows)), f"C-01 re-checked: {rows}")
+        # .11's TLS edge refuses the scanner on every run (a gap of its own);
+        # the stalled host and WCVS must be clean.
+        targets = ((_recon_json() or {}).get("cache_scan") or {}).get("by_target") or {}
+        cut15 = {u: t.get("unchecked") for u, t in targets.items()
+                 if f"{NET}.15" in u and isinstance(t, dict) and t.get("unchecked")}
+        check("CS-08", not [g for g in gaps if "WCVS" in str(g.get("reason"))] and not cut15,
+              f"no WCVS gap and no .15 URL left unchecked: gaps {gaps}, .15 unchecked {cut15}")
+    else:
+        sys.exit(USAGE)
+
+
+EPAI_Q1 = """MATCH (e:Endpoint) RETURN e.baseurl AS b, e.path AS path, e.method AS m, e.category AS cat,
+             e.urls_found AS n, e.source AS src, e.sources AS srcs, e.ai_interface_type AS ai ORDER BY b, path, m"""
+EPAI_Q2 = """MATCH (e:Endpoint)-[:HAS_PARAMETER]->(p:Parameter) RETURN DISTINCT p.baseurl AS b,
+             p.endpoint_path AS path, p.name AS name, p.position AS pos, p.category AS cat,
+             p.sample_values AS sv, p.is_ai_prompt_injectable AS inj ORDER BY b, path, name"""
+
+
+# --------------------------------------------------------------------------- R-8 RoE ceiling
+CEILING_HOSTS = [f"{NET}.{n}" for n in (10, 15, 20, 39, 40, 42, 45, 47)]
+# Lines a lab host prints that are not one request, connection or command.
+NOT_A_REQUEST = ("listening on", "] stalled ", "/_lab/")
+# Docker stamps a line when the server prints it, not when the packet came:
+# two requests paced 0.5 s apart may print a few tens of ms closer than that.
+CEILING_SKEW_S = 0.1
+
+
+def _lab_containers(addresses):
+    """{container name: address} of the running FP lab hosts serving `addresses`."""
+    import subprocess
+    names = subprocess.run(["docker", "ps", "--filter", "name=redamon-fp-", "--format", "{{.Names}}"],
+                           capture_output=True, text=True).stdout.split()
+    out = {}
+    for name in names:
+        ip = subprocess.run(["docker", "inspect", "-f",
+                             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name],
+                            capture_output=True, text=True).stdout.strip()
+        if ip in addresses:
+            out[name] = ip
+    return out
+
+
+def _lab_events(since, addresses):
+    """(epoch, address, line) of every request, TLS handshake, Redis or SMTP command
+    the lab hosts serving `addresses` logged since `since`, in time order."""
+    import subprocess
+    import datetime as dt
+    events = []
+    for name, ip in _lab_containers(addresses).items():
+        out = subprocess.run(["docker", "logs", "--timestamps", "--since", since, name],
+                             capture_output=True, text=True)
+        for ln in (out.stdout + out.stderr).splitlines():
+            stamp, _, rest = ln.partition(" ")
+            if not rest.startswith("[") or any(x in rest for x in NOT_A_REQUEST):
+                continue
+            t = dt.datetime.fromisoformat(stamp[:26].rstrip("Z") + "+00:00").timestamp()
+            # A lab image older than server.py's log_error override logs an error
+            # response twice, microseconds apart (log_error, then log_request).
+            if events and events[-1][1] == ip and events[-1][2] == rest and t - events[-1][0] < 0.005:
+                continue
+            events.append((t, ip, rest))
+    return sorted(events)
+
+
+def _busiest(events, width):
+    """The most events inside any window [t, t + width), and that window's events."""
+    best, at, j = 0, (0, 0), 0
+    for i in range(len(events)):
+        while events[i][0] - events[j][0] >= width:
+            j += 1
+        if i - j + 1 > best:
+            best, at = i - j + 1, (j, i + 1)
+    return best, events[at[0]:at[1]]
+
+
+def _nmap_runs(path):
+    rows = [json.loads(ln) for ln in open(path)] if path and os.path.exists(path) else []
+    overlap = 0
+    for r in rows:
+        overlap = max(overlap, sum(1 for o in rows if o["first"] <= r["first"] <= o["last"]))
+    return rows, overlap
+
+
+def _run_duration():
+    out, err = mcp.call("get_recon_status", {"projectId": P})
+    last = (out or {}).get("lastRun") or {} if isinstance(out, dict) else {}
+    import datetime as dt
+    try:
+        a = dt.datetime.fromisoformat(last["startedAt"].replace("Z", "+00:00"))
+        b = dt.datetime.fromisoformat(last["finishedAt"].replace("Z", "+00:00"))
+        return round((b - a).total_seconds()), last.get("status")
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None, last.get("status")
+
+
+def _argv_runs(path):
+    """httpx and WCVS processes of the run (e2e_fp.py --watch-argv): (tool, cmd)."""
+    rows = [json.loads(ln) for ln in open(path)] if path and os.path.exists(path) else []
+    return [("wcvs" if r["cmd"].startswith("/wcvs") else "httpx", r["cmd"]) for r in rows]
+
+
+def _fingerprints():
+    """The stored favicon hashes (on Endpoints) and JARM hashes (on Certificates)."""
+    fav = q("""MATCH (e:Endpoint) WHERE e.favicon_hash IS NOT NULL
+               RETURN coalesce(e.baseurl, '') + coalesce(e.path, '') AS k, toString(e.favicon_hash) AS v""")
+    jarm = q("""MATCH (c:Certificate) WHERE c.jarm IS NOT NULL RETURN c.cert_key AS k, c.jarm AS v""")
+    return {"favicon": {r["k"]: r["v"] for r in fav}, "jarm": {r["k"]: r["v"] for r in jarm}}
+
+
+def _sender(line):
+    """Who sent a lab event: the User-Agent of an HTTP request, else the kind of
+    connection (a TLS handshake, a Redis or SMTP command) on that host's role."""
+    import re
+    m = re.search(r" ua=(\S+)", line)
+    if m and m.group(1) != "-":
+        return "ua:" + m.group(1)
+    role = line.split("]", 1)[0].lstrip("[")
+    if "TLS handshake" in line:
+        return f"tls:{role}"
+    return f"conn:{role}"
+
+
+def _per_sender_seconds(events):
+    """{sender: (most events in one calendar second, that second)}."""
+    counts = {}
+    for t, _, ln in events:
+        key = (_sender(ln), int(t))
+        counts[key] = counts.get(key, 0) + 1
+    worst = {}
+    for (sender, sec), n in counts.items():
+        if n > worst.get(sender, (0, 0))[0]:
+            worst[sender] = (n, sec)
+    return worst
+
+
+def ceiling_checks(stage, since, log_path, nmap_path=None, rps=2.0):
+    """R-8 (B-R8a, B-R8b1, B-R8b2a, B-R8b2b, B-FD2-3): the --ceiling project with no
+    ceiling (`free`), then under roeGlobalMaxRps 2 (`capped`)."""
+    log = _log_text(log_path)
+    events = _lab_events(since, set(CEILING_HOSTS))
+    duration, status = _run_duration()
+    print(f"DURATION_S={duration} (lastRun {status}); lab events since {since}: {len(events)}")
+    nmaps, overlap = _nmap_runs(nmap_path)
+    rl = q("""MATCH (v:Vulnerability) WHERE v.source = 'security_check' AND v.type = 'no_rate_limiting'
+              RETURN v.id AS id, toString(v.updated_at) AS seen, coalesce(v.url, v.matched_at) AS url""")
+    # The burst goes only to a login URL the run discovered; with none, there is
+    # nothing to seed and nothing to keep, which is the lab's gap, not the check's.
+    logins = q("""MATCH (e:Endpoint) WHERE toLower(coalesce(e.path, '')) =~ '.*(login|signin|sign-in|auth).*'
+                  RETURN count(e) AS n""")[0]["n"]
+    if stage == "free":
+        check("CF-01", "GROUP 6 Phase A: Active Vulnerability Scanning (fan-out:" in log
+              and "In-process requests paced" not in log,
+              "no ceiling: Phase A fans out, no pacing line")
+        check("CF-02", "[*][Nmap] Parallelism: 5 concurrent IPs" in log and nmaps
+              and not any("--max-rate" in r["cmd"] for r in nmaps),
+              f"nmap at parallelism 5 with no --max-rate: {len(nmaps)} nmap process(es), at most {overlap} at once")
+        if logins:
+            check("CF-03", rl, f"no_rate_limiting finding(s) seeded by the login burst: {rl}")
+        else:
+            print(f"INFO  CF-03 not checked: the run discovered no login URL to burst (no_rate_limiting: {rl})")
+        check("CF-04", "[-][Kiterunner] Not run" not in log, "Kiterunner not refused with no ceiling")
+        if rl:
+            print("RATE_FINDING_IDS=" + ",".join(sorted(r["id"] for r in rl)))
+        argv = _argv_runs(os.environ.get("CEILING_ARGV"))
+        if os.environ.get("CEILING_ARGV"):
+            hx = [c for t, c in argv if t == "httpx" and " -l " in f" {c} "]
+            wc = [c for t, c in argv if t == "wcvs"]
+            import re
+
+            def threads(cmd):
+                m = re.search(r" -t (\d+)( |$)", f" {cmd}")
+                return int(m.group(1)) if m else 0
+            # The memory governor may lower the thread counts (httpx's 50, WCVS's
+            # 10) on a busy host; with no ceiling they stay above the paced 1.
+            check("CF-05", hx and all(all(f" {a} " in f" {c} " for a in ("-retries 2", "-rl 50", "-favicon", "-jarm"))
+                                      and threads(c) > 1 for c in hx)
+                  and (not wc or all(threads(c) > 1 for c in wc)),
+                  f"no ceiling: httpx argv -t >1 -retries 2 -rl 50 -favicon -jarm "
+                  f"({len(hx)} run(s): {[c[:160] for c in hx][:2]}); WCVS -t >1 ({[c[:120] for c in wc][:2]})")
+        check("CF-06", not any(x in log for x in ("rps RoE ceiling: one URL at a time",
+                                                   "not collected while the", "WCVS paced to the")),
+              "no ceiling: none of the B-R8c pacing lines")
+        if os.environ.get("CEILING_FP"):
+            json.dump(_fingerprints(), open(os.environ["CEILING_FP"], "w"), indent=1)
+            print(f"[*] stored favicon/JARM hashes written to {os.environ['CEILING_FP']}")
+        return
+    if stage != "capped":
+        sys.exit(USAGE)
+    width = 1.0 - CEILING_SKEW_S
+    # nmap holds --max-rate on its port and discovery probes only; its -sV and
+    # NSE traffic is outside the ceiling by design (nmap_scan.py), so CE-01
+    # counts every other request: not nmap's user agent, and not on the IP an
+    # nmap process was scanning at that moment (an -sV probe sends no agent).
+    import re
+    scanning = {}
+    for r in nmaps:
+        for ip in set(re.findall(r"\b\d+\.\d+\.\d+\.\d+\b", r["cmd"])):
+            scanning.setdefault(ip, []).append((r["first"] - 0.5, r["last"] + 0.5))
+
+    def by_nmap(event):
+        t, ip, ln = event
+        return "nmap" in ln.lower() or any(a <= t <= b for a, b in scanning.get(ip, []))
+    paced = [e for e in events if not by_nmap(e)]
+    worst, window = _busiest(paced, width)
+    strict, _ = _busiest(paced, 1.0)
+    per_s = {}
+    for t, _, _ in paced:
+        per_s[int(t)] = per_s.get(int(t), 0) + 1
+    detail = "; ".join(f"{ip} {ln[:90]}" for _, ip, ln in window)
+    check("CE-01", len(paced) >= 50 and worst <= rps,
+          f"{len(paced)} requests/handshakes/commands on {len(CEILING_HOSTS)} hosts (nmap's own "
+          f"{len(events) - len(paced)} left out): busiest {width:.1f}-s window {worst} (expect <= {rps:g}); "
+          f"strict 1-s window {strict}; busiest calendar second {max(per_s.values()) if per_s else 0}; "
+          f"worst window: {detail[:600]}")
+    raw, raw_window = _busiest(events, width)
+    print(f"INFO  nmap -sV/NSE included: busiest {width:.1f}-s window {raw}: "
+          f"{'; '.join(f'{ip} {ln[:80]}' for _, ip, ln in raw_window)[:400]}")
+    check("CE-02", f"[*][RoE] In-process requests paced to the {rps:g} rps ceiling" in log,
+          "log: In-process requests paced to the ceiling")
+    check("CE-03", "GROUP 6 Phase A: Active Vulnerability Scanning (one at a time under the RoE ceiling:" in log,
+          "log: GROUP 6 Phase A ... one at a time")
+    check("CE-04", "[*][Nmap] Parallelism: 1 IP at a time under the RoE ceiling" in log,
+          "log: [*][Nmap] Parallelism: 1 IP at a time under the RoE ceiling")
+    check("CE-05", nmaps and all(f"--max-rate {rps:g}" in r["cmd"] for r in nmaps) and overlap <= 1,
+          f"{len(nmaps)} nmap process(es), each with --max-rate {rps:g}: "
+          f"{all(f'--max-rate {rps:g}' in r['cmd'] for r in nmaps) if nmaps else None}; at most {overlap} at once")
+    check("CE-06", "[-][SecurityCheck] Rate Limiting check skipped" in log, "log: Rate Limiting check skipped")
+    check("CE-07", "[-][Kiterunner] Not run" in log, "log: [-][Kiterunner] Not run")
+    rate_gap = _gaps("security_check", reason="no_rate_limiting not checked")
+    kr_gap = _gaps("kiterunner")
+    check("CE-08", rate_gap and kr_gap, f"coverage gaps: security_check {rate_gap}; kiterunner {kr_gap}")
+    kr = q("MATCH (e:Endpoint) WHERE 'kiterunner' IN coalesce(e.sources, []) OR e.source = 'kiterunner' "
+           "RETURN count(e) AS n")
+    check("CE-09", kr and kr[0]["n"] == 0, f"Endpoints from Kiterunner: {kr}")
+    if rl or logins:
+        check("CE-10", rl and all(r["seen"] < since for r in rl),
+              f"the no_rate_limiting finding(s) of the free run kept, not re-checked: {rl}")
+    else:
+        print("INFO  CE-10 not checked: no no_rate_limiting finding to keep (no login URL discovered)")
+    # B-R8c: each sender on its own stays within the ceiling per calendar second;
+    # one more is allowed where a redirect hop lands on a second boundary.
+    worst = _per_sender_seconds(paced)
+    over = {k: v for k, v in worst.items() if v[0] > rps}
+    check("CE-11", paced and all(n <= rps + 1 for n, _ in worst.values()),
+          f"per-sender busiest calendar second: {dict(sorted(worst.items(), key=lambda kv: -kv[1][0])[:8])} "
+          f"(expect <= {rps:g}, +1 for a redirect hop at a second boundary; above {rps:g}: {over})")
+    check("CE-12", f"[*][httpx] Paced to the {rps:g} rps RoE ceiling: one URL at a time, -rl 1, -delay 1000ms, "
+                   f"no retries" in log
+          and f"[-][httpx] JARM and favicon not collected while the {rps:g} rps RoE ceiling is in force" in log,
+          "log: [*][httpx] Paced to the ceiling ... ; [-][httpx] JARM and favicon not collected ...")
+    wcvs_ran = "[CachePoison]" in log and "WCVS" in log
+    check("CE-13", not wcvs_ran or f"[*][CachePoison] WCVS paced to the {rps:g} rps RoE ceiling: one thread, -rr 1"
+          in log, "log: [*][CachePoison] WCVS paced to the ceiling: one thread, -rr 1")
+    if os.environ.get("CEILING_ARGV"):
+        import re
+        argv = _argv_runs(os.environ.get("CEILING_ARGV"))
+        hx = [c for t, c in argv if t == "httpx" and " -l " in f" {c} "]
+        wc = [c for t, c in argv if t == "wcvs"]
+        check("CE-14", hx and all(all(f" {a} " in f" {c} " for a in ("-t 1", "-retries 0", "-rl 1", "-delay 1000ms"))
+                                  and " -favicon" not in c and " -jarm" not in c for c in hx)
+              and (not wc or all(" -t 1 " in f" {c} " and re.search(r" -rr 1(\.0+)?( |$)", c) for c in wc)),
+              f"httpx argv -t 1 -retries 0 -rl 1 -delay 1000ms, no -favicon/-jarm "
+              f"({len(hx)} run(s): {[c[:200] for c in hx][:2]}); WCVS -t 1 -rr 1 ({[c[:160] for c in wc][:2]})")
+    fp_gaps = {g.get("source") for g in _gaps(module="http_probe")}
+    check("CE-15", {"httpx_jarm", "httpx_favicon"} <= fp_gaps,
+          f"coverage gaps of module http_probe: {sorted(s for s in fp_gaps if s)} (expect httpx_jarm, httpx_favicon)")
+    if os.environ.get("CEILING_FP") and os.path.exists(os.environ["CEILING_FP"]):
+        before, after = json.load(open(os.environ["CEILING_FP"])), _fingerprints()
+        if not before["favicon"] and not before["jarm"]:
+            print("INFO  CE-16 not checked: the free run stored no favicon or JARM hash to keep "
+                  "(no HTTPS web host with a favicon among the ceiling hosts)")
+            return
+        lost = {kind: sorted(k for k in before[kind] if before[kind][k] != after[kind].get(k))
+                for kind in ("favicon", "jarm")}
+        check("CE-16", not lost["favicon"] and not lost["jarm"],
+              f"stored hashes the capped run changed or dropped: {lost} "
+              f"(before: {len(before['favicon'])} favicon, {len(before['jarm'])} JARM)")
+
+
+def epai_checks(stage, path, host=None):
+    """R-27: a partial EndpointAiClassifier writes only AI fields, only on its run's hosts."""
+    snap = {"q1": q(EPAI_Q1), "q2": q(EPAI_Q2),
+            "counts": q("MATCH (e:Endpoint) RETURN count(e) AS e") + q("MATCH (p:Parameter) RETURN count(p) AS p")}
+    if stage == "snapshot":
+        json.dump(snap, open(path, "w"), default=str)
+        hosts = sorted({r["b"] for r in snap["q2"] if r.get("sv")})
+        print(f"EPAI_SNAPSHOT={path} endpoints={len(snap['q1'])} params={len(snap['q2'])} hosts_with_samples={hosts}")
+        return
+    before = json.load(open(path))
+    key = lambda r: (r["b"], r["path"], r.get("m") or r.get("name"))
+    b1 = {key(r): r for r in before["q1"]}
+    a1 = {key(r): r for r in json.loads(json.dumps(snap["q1"], default=str))}
+    check("EP-01", json.dumps(before["counts"]) == json.dumps(snap["counts"], default=str),
+          f"node counts: {before['counts']} -> {snap['counts']}")
+    fixed = ("cat", "n", "src", "srcs")
+    changed = [(k, f, b1[k].get(f), a1[k].get(f)) for k in b1 if k in a1 for f in fixed
+               if b1[k].get(f) != a1[k].get(f)]
+    check("EP-02", not changed, f"cat/urls_found/source/sources changed: {changed[:4]}")
+    on_h = [(k, b1[k].get("ai"), a1[k].get("ai")) for k in b1 if k in a1 and host and host in k[0]
+            and b1[k].get("ai") != a1[k].get("ai")]
+    check("EP-03", not on_h, f"the RoE-excluded host's endpoints untouched (ai): {on_h[:4]}")
+    tagged = [k for k in b1 if k in a1 and not (host and host in k[0]) and b1[k].get("ai") is None
+              and a1[k].get("ai") is not None]
+    if tagged:
+        check("EP-04", True, f"other hosts' endpoints newly typed by the classifier: {len(tagged)} {tagged[:3]}")
+    else:
+        # The rules-only classifier types AI-interface paths and prompt
+        # parameters; the main project has none, so it annotates nothing.
+        check("EP-04 (not exercised)", True, "the classifier typed no endpoint (no AI-interface path in the lab)")
+    b2 = {key(r): r for r in before["q2"]}
+    a2 = {key(r): r for r in json.loads(json.dumps(snap["q2"], default=str))}
+    p_changed = [(k, f) for k in b2 if k in a2 for f in ("pos", "sv", "cat")
+                 if b2[k].get(f) != a2[k].get(f)]
+    p_host = [k for k in b2 if k in a2 and host and host in k[0] and b2[k] != a2[k]]
+    check("EP-05", not p_changed and not p_host and set(b2) == set(a2),
+          f"Parameter position/sample_values/category changed: {p_changed[:4]}; on the excluded host: {p_host[:3]}")
+
+
+def userinput_checks(tool):
+    """L-11: a partial run marks its own UserInput nodes completed, with their PRODUCED edges."""
+    rows = q(f"""MATCH (ui:UserInput {{tool_id: '{tool}'}})
+                 RETURN ui.id AS id, ui.status AS status, toString(ui.completed_at) AS done,
+                        size([(ui)-[:PRODUCED]->(x) | x]) AS produced""")
+    print(f"USERINPUT={json.dumps(rows)}")
+    check("UI-01", rows and all(r["status"] == "completed" and r["done"] and r["produced"] >= 1 for r in rows),
+          f"UserInput nodes of {tool}: {rows}")
+
+
+def upload_sink_checks(name):
+    """L-1: a partial JS Recon run on an upload alone writes its DOM sink."""
+    rows = q(f"""MATCH (f:JsReconFinding {{finding_type: 'js_file'}}) WHERE f.source_url CONTAINS '{name}'
+                 OPTIONAL MATCH (f)-[]->(s:JsReconFinding {{finding_type: 'dom_sink'}})
+                 RETURN f.source_url AS u, collect(s.title) AS sinks""")
+    check("UP-01", rows and any(r["sinks"] for r in rows), f"uploaded bundle's js_file node and its sinks: {rows}")
+
+
+def s22_checks(stage):
+    """S-22: a port the Shodan stub alone reports (.49:8081, naabu on 22,80,443) is
+    passive_only after the full run; a partial Nmap or Httpx that gets an answer on
+    it turns that false. .14's Shodan-only 22 is closed and stays passive (FD5-01)."""
+    rows = q(f"""MATCH (i:IP)-[:HAS_PORT]->(p:Port) WHERE i.address IN ['{NET}.49', '{NET}.14']
+                 RETURN i.address + ':' + toString(p.number) AS k, p.passive_only AS po,
+                        p.nmap_scanned AS ns, p.product AS product, p.source AS src""")
+    port = {r["k"]: r for r in rows}
+    p8081, p22 = port.get(f"{NET}.49:8081"), port.get(f"{NET}.14:22")
+    print(f"PORTS={json.dumps(rows)}")
+    if stage == "full":
+        check("S22-01", p8081 and p8081["po"] is True,
+              f".49:8081 known from Shodan only, passive_only true: {p8081}")
+        check("S22-02", port.get(f"{NET}.49:80") and port[f"{NET}.49:80"]["po"] is not True,
+              f".49:80 scanned open, not passive: {port.get(f'{NET}.49:80')}")
+    elif stage == "nmap":
+        # nmap -sV may name no product for the lab server (an empty string): the
+        # confirmation is nmap_scanned on an open port, which clears passive_only.
+        check("S22-03", p8081 and p8081["po"] is False and p8081["ns"] is True and p8081["product"] is not None,
+              f"partial Nmap answered on .49:8081: passive_only false, nmap_scanned, product recorded: {p8081}")
+    elif stage == "httpx":
+        check("S22-04", p8081 and p8081["po"] is False,
+              f"partial Httpx answered on .49:8081: passive_only false: {p8081}")
+    else:
+        sys.exit(USAGE)
+    check("S22-05", p22 and p22["po"] is True, f".14:22 is closed and stays passive_only (FD5-01): {p22}")
+
 if len(sys.argv) > 2:
+    if sys.argv[2] == "--probefail" and len(sys.argv) in (5, 6):
+        probefail_checks(sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) == 6 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--secchk" and len(sys.argv) == 4:
+        secchk_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--redis-nohttp" and len(sys.argv) in (4, 5):
+        redis_nohttp_checks(sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--fanout" and len(sys.argv) == 4:
+        fanout_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--r14" and len(sys.argv) in (4, 5):
+        r14_checks(sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--r14js" and len(sys.argv) == 5:
+        r14js_checks(sys.argv[3], sys.argv[4])
+        sys.exit(report())
+    if sys.argv[2] == "--graphql-rate" and len(sys.argv) == 4:
+        graphql_rate_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--graphql-cop" and len(sys.argv) in (5, 6):
+        graphql_cop_checks(sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) == 6 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--vhost-drop" and len(sys.argv) == 5:
+        vhost_drop_checks(sys.argv[3], sys.argv[4])
+        sys.exit(report())
+    if sys.argv[2] == "--cache" and len(sys.argv) in (5, 6):
+        cache_checks(sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) == 6 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--passive-fd1" and len(sys.argv) in (4, 5, 6):
+        passive_fd1(sys.argv[3], sys.argv[4] if len(sys.argv) >= 5 else None, sys.argv[5] if len(sys.argv) == 6 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--fd5" and len(sys.argv) in (5, 6, 7):
+        fd5_checks(sys.argv[3], sys.argv[4], *sys.argv[5:7])
+        sys.exit(0 if sys.argv[3] == "snapshot" else report())
+    if sys.argv[2] == "--ceiling" and len(sys.argv) in (5, 6):
+        ceiling_checks(sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) >= 6 else None,
+                       os.environ.get("CEILING_NMAP"))
+        sys.exit(report())
+    if sys.argv[2] == "--s22" and len(sys.argv) == 4:
+        s22_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--epai" and len(sys.argv) in (5, 6):
+        epai_checks(sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) == 6 else None)
+        sys.exit(0 if sys.argv[3] == "snapshot" else report())
+    if sys.argv[2] == "--userinput" and len(sys.argv) == 4:
+        userinput_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--upload-sink" and len(sys.argv) == 4:
+        upload_sink_checks(sys.argv[3])
+        sys.exit(report())
     if sys.argv[2] == "--ip-ownership" and len(sys.argv) == 3:
         ip_ownership_checks()
+        sys.exit(report())
+    if sys.argv[2] == "--roe" and len(sys.argv) == 4:
+        roe_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--roe-window" and len(sys.argv) == 3:
+        roe_window_checks()
+        sys.exit(report())
+    if sys.argv[2] == "--r29" and len(sys.argv) == 4:
+        r29_checks(sys.argv[3])
+        sys.exit(report())
+    if sys.argv[2] == "--r43" and len(sys.argv) == 5:
+        r43_checks(sys.argv[3], sys.argv[4])
+        sys.exit(report())
+    if sys.argv[2] == "--nuclei-throttle" and len(sys.argv) in (3, 4):
+        nuclei_throttle_checks(sys.argv[3] if len(sys.argv) == 4 else None)
+        sys.exit(report())
+    if sys.argv[2] == "--redis" and len(sys.argv) == 4:
+        redis_checks(sys.argv[3])
         sys.exit(report())
     if sys.argv[2] == "--ip-ownership-stealth" and len(sys.argv) == 4:
         ip_ownership_stealth_checks(sys.argv[3])
@@ -723,8 +1820,16 @@ def vhosts(ip):
 
 
 got, _ = vhosts(f"{NET}.10")
-check("V-01/V-02/V-03", got == [(f"admin.{APEX}", "L7"), (f"wiki.{APEX}", "L7")],
-      f"Fastly-like edge: {got} (expect admin + wiki, L7, nothing from the 19 catch-all names)")
+check("V-01/V-02/V-03", got == [(f"admin.{APEX}", "L7"), (f"dev-api.{APEX}", "L7"), (f"dev.api.{APEX}", "L7"),
+                                 (f"wiki.{APEX}", "L7")],
+      f"Fastly-like edge: {got} (expect admin, dev-api, dev.api and wiki, L7, nothing from the 19 catch-all names)")
+ids = q(f"""MATCH (v:Vulnerability) WHERE v.source = 'vhost_sni_enum' AND v.ip = '{NET}.10'
+            AND v.hostname IN ['dev-api.{APEX}', 'dev.api.{APEX}'] RETURN v.hostname AS h, v.id AS id""")
+import re as _re  # noqa: E402
+check("V-16 (R-46)", len(ids) == 2 and len({r["id"] for r in ids}) == 2
+      and all(_re.fullmatch(r"vhost_sni_[0-9a-f]{20}", r["id"] or "") for r in ids),
+      f"dev-api and dev.api, two apps one character apart: {[(r['h'], r['id']) for r in ids]} "
+      f"(expect two distinct vhost_sni_<20 hex> ids)")
 got, _ = vhosts(f"{NET}.11")
 check("V-04/V-05", got == [(f"admin.{APEX}", "L4")], f"Cloudflare-like edge: {got} (expect the SNI-routed admin only)")
 got, _ = vhosts(f"{NET}.12")
@@ -801,7 +1906,9 @@ check("M-04", r and r["t"] == "source_map_reference" and r["sev"] == "info" and 
 check("M-07", "s3miss.0c1d.js" not in m, f"an S3 AccessDenied 403 for a missing map: {m.get('s3miss.0c1d.js')}")
 check("M-08", "cfmiss.2e3f.js" not in m, f"a 403 the made-up sibling also gets: {m.get('cfmiss.2e3f.js')}")
 r = m.get("buildref.7a8b.js")
-check("M-05", r and r["t"] == "source_map_reference" and r["fr"] in ("unreachable", "unsafe")
+# R-14: .99 is not one of the run's hosts, so the hop guard refuses it before
+# any request (out_of_scope); before R-14 the fetch was tried and failed.
+check("M-05", r and r["t"] == "source_map_reference" and r["fr"] in ("unreachable", "unsafe", "out_of_scope")
       and f"{NET}.99" in (r["map"] or ""), f"map on another unreachable host: {r}")
 r = m.get("inline.5e6f.js")
 check("M-06", r and r["t"] == "source_map_exposure" and (r["map"] or "").startswith("data:application/json;base64,…")

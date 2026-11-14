@@ -103,6 +103,8 @@ All parameters are set in the webapp project settings (stored in PostgreSQL) and
 
 At scan start the engagement ceiling caps `HTTPX_RATE_LIMIT`, the memory governor can lower `HTTPX_THREADS` and `BANNER_GRAB_THREADS`, and stealth mode sets `HTTPX_RATE_LIMIT = 2` and `HTTPX_THREADS = 1` and turns off `HTTPX_PROBE_FAVICON`, `HTTPX_PROBE_JARM` and `BANNER_GRAB_ENABLED`.
 
+**Under an RoE rate ceiling C** (`ROE_GLOBAL_MAX_RPS`) the cap alone does not hold httpx: its limiter counts only each URL's main request, in fixed one-second windows. So `httpx_ceiling_pacing()` builds the command with `-t 1`, `-retries 0`, `-rl max(1, floor(C/2))` (never above `HTTPX_RATE_LIMIT`) and `-delay ceil(2000/C)ms`, without `-favicon` and `-jarm`, and `httpx_budget()` adds the delay to the run's time budget. The run logs `[*][httpx] Paced to the 2 rps RoE ceiling: one URL at a time, -rl 1, -delay 1000ms, no retries` (plus `; its redirect hops take no token of httpx's limiter and can exceed it` with `HTTPX_FOLLOW_REDIRECTS` on) and `[-][httpx] JARM and favicon not collected while the 2 rps RoE ceiling is in force: httpx's limiter does not count their requests`, and records coverage gaps `httpx_jarm` and `httpx_favicon` (module `http_probe`) for the probes the project had on. The graph writers skip absent values, so a hash an earlier run stored is kept. The banner grab connects in-process, so each of its connections takes a slot of recon's request clock (`request_pacer`). With no ceiling the command is unchanged and the banner grab never touches the clock.
+
 ---
 
 ### 1. Core Configuration
@@ -114,7 +116,7 @@ At scan start the engagement ceiling caps `HTTPX_RATE_LIMIT`, the memory governo
 | `HTTPX_THREADS` | `int` | `50` | `-t` | Number of concurrent HTTP requests. Higher = faster but uses more CPU/memory. |
 | `HTTPX_TIMEOUT` | `int` | `10` | `-timeout` | Seconds to wait for each HTTP response before giving up. |
 | `HTTPX_RETRIES` | `int` | `2` | `-retries` | Number of retry attempts for failed/timeout requests. |
-| `HTTPX_RATE_LIMIT` | `int` | `50` | `-rl` | Maximum requests per second. Lower = more stealthy. |
+| `HTTPX_RATE_LIMIT` | `int` | `50` | `-rl` | Maximum requests per second, held in fixed one-second windows (a window's requests can all leave at its start) and counting only each URL's main request: retries, redirect hops, the favicon fetch and JARM's handshakes take no token. Lower = more stealthy. |
 
 **Thread Tuning Guide:**
 
@@ -141,7 +143,7 @@ finding prune for that run.
 
 | Parameter | Type | Default | httpx Flag | Description |
 |-----------|------|---------|------------|-------------|
-| `HTTPX_FOLLOW_REDIRECTS` | `bool` | `True` | `-fr` | Follow HTTP 301/302/307/308 redirects. Essential for modern web apps. With session headers attached, `-fhr` (same host only) is used instead, so the session never follows a redirect to another host. |
+| `HTTPX_FOLLOW_REDIRECTS` | `bool` | `True` | `-fr` | Follow HTTP 301/302/307/308 redirects. Essential for modern web apps. With session headers attached, `-fhr` (same host only) is used instead, so the session never follows a redirect to another host. An IP-mode run always uses `-fhr`, so a redirect never takes httpx off the target IPs. A run with RoE exclusions in force uses it too (`[*][httpx] Redirects followed on the same host only: RoE exclusions are in force`): an admitted host's redirect into an excluded one is not followed, and the URL keeps its own answer (its 3xx, `final_url` the URL itself), not the excluded host's page. |
 | `HTTPX_MAX_REDIRECTS` | `int` | `10` | `-maxr` | Maximum redirect chain length. Prevents infinite redirect loops. |
 
 **Why Follow Redirects?**
@@ -171,14 +173,30 @@ counts, headers, body or TLS certificate (Go reports the final connection's).
 JARM, the IP, CNAME, ASN and CDN are measured on the requested host and stay.
 The foreign host becomes an external-domain entry (`source:
 "http_probe_redirect"`, `redirect_from_url` = the in-scope URL), which
-`run_http_probe` returns as `http_probe.external_domains` and the pipeline writes
-as an `ExternalDomain`. When neither host is in scope the entry is dropped and
-counted in `summary.filtered_out_of_scope`. `HTTPX_FOLLOW_REDIRECTS` stays on by
-default: with the chain stored, nothing needs the pre-redirect page itself.
+`run_http_probe` returns as `http_probe.external_domains`. The pipeline writes it
+as an `ExternalDomain` only when it is under none of the project's scan roots; a
+host under a scan root that the run did not admit (an EXACT group's unlisted
+name, say) becomes neither an `ExternalDomain` nor a Subdomain: it only links to
+a Subdomain the graph already holds. When neither host is in scope the entry is
+dropped and counted in `summary.filtered_out_of_scope`. `HTTPX_FOLLOW_REDIRECTS`
+stays on by default: with the chain stored, nothing needs the pre-redirect page
+itself.
 
 **What "in scope" means** (`is_host_in_scope()`): a subdomain of a scan root
 (the root itself only when it is a target); for an EXACT scope group or a
-filtered run, exactly the listed hosts; any IP otherwise.
+filtered run, exactly the listed hosts. An IP literal is in scope only as one
+of the run's own addresses (`_run_addresses`): one it resolved, port-scanned or
+asked httpx to probe, less those the RoE excludes, compared in canonical form
+so any IPv6 spelling matches. An in-scope host that redirects to someone
+else's address (`http://203.0.113.50/sso`) is therefore an off-scope redirect,
+and that page's title, technologies and certificate are not credited to the
+target.
+
+**IPv6 literals.** `url_port` and `extract_host_from_url` parse with
+`urllib.parse`: `https://[2001:db8::10]:8443` keeps port 8443 and its host
+comes back bare (`2001:db8::10`, the form the graph keys an IP by), and
+userinfo (`user@host`) is never read as the host. A port that is not a number
+reads as `-1`.
 
 ---
 
@@ -260,14 +278,15 @@ These options extract basic HTTP response information with **minimal performance
 
 | Parameter | Type | Default | httpx Flag | What It Does | Speed Impact |
 |-----------|------|---------|------------|--------------|--------------|
-| `HTTPX_PROBE_TLS_INFO` | `bool` | `True` | `-tls-probe` | Basic TLS info: version, cipher suite | ⚡ **Medium** |
+| `HTTPX_PROBE_TLS_INFO` | `bool` | `True` | `-tls-probe` | Also probes the names the TLS certificate of each probed host lists (its SANs), each as one more target. Not passed in IP mode or while RoE exclusions are in force, where it would request the names the certificate lists, an excluded one included (`[-][httpx] TLS probing: off in IP mode` / `off while RoE exclusions are in force`); `-tls-grab` (its own setting) still reads the certificate, and in a domain run its names still join as late names, each admitted on its own | ⚡ **Medium** |
 | `HTTPX_PROBE_TLS_GRAB` | `bool` | `True` | `-tls-grab` | Full certificate extraction | ⚠️ **SLOW** |
 
-**TLS_INFO extracts:**
-- TLS version (TLS 1.0, 1.1, 1.2, 1.3)
-- Cipher suite in use
+**TLS_INFO probes** the hostnames the certificate lists, so a probe can reach a
+host nobody handed httpx; that is why it is off in IP mode and under RoE
+exclusions. The TLS fields stored on a URL come from TLS_GRAB.
 
-**TLS_GRAB extracts (additional):**
+**TLS_GRAB extracts:**
+- TLS version (TLS 1.0, 1.1, 1.2, 1.3) and the cipher suite in use
 - Certificate subject (CN, DN, organisation) and issuer (DN, CN, organisation)
 - Validity period (not_before, not_after)
 - Subject Alternative Names (all domains on cert)
@@ -312,8 +331,8 @@ The certificate fields feed the TLS-hygiene security checks (see [README.VULN_SC
 
 | Parameter | Type | Default | httpx Flag | What It Does | Speed Impact |
 |-----------|------|---------|------------|--------------|--------------|
-| `HTTPX_PROBE_FAVICON` | `bool` | `True` | `-favicon` | Calculates MMH3 hash of favicon.ico | ⚡ **Medium** (extra HTTP request) |
-| `HTTPX_PROBE_JARM` | `bool` | `True` | `-jarm` | JARM TLS fingerprint | ⚠️ **VERY SLOW** |
+| `HTTPX_PROBE_FAVICON` | `bool` | `True` | `-favicon` | Calculates MMH3 hash of favicon.ico. Not sent under an RoE ceiling (coverage gap `httpx_favicon`; a stored hash is kept) | ⚡ **Medium** (extra HTTP request) |
+| `HTTPX_PROBE_JARM` | `bool` | `True` | `-jarm` | JARM TLS fingerprint. Not sent under an RoE ceiling (coverage gap `httpx_jarm`; a stored hash is kept) | ⚠️ **VERY SLOW** |
 | `HTTPX_PROBE_HASH` | `str` | `"sha256"` | `-hash` | Hash of response body | ⚡ **Medium** |
 
 #### Favicon Hashing
@@ -544,8 +563,14 @@ BANNER_GRAB_MAX_LENGTH = 1000
 For every open port in `port_scan.by_host` that is not in
 `BANNER_GRAB_SKIP_PORTS` (every port in `HTTP_PORTS` and `HTTPS_PORTS`, plus
 9090 and 8800, which httpx already probes), `grab_banner_for_target()` connects
-to the host's IP, reads what the service sends first, sends the port's probe if
-nothing came, and retries over TLS on 993, 995, 465, 636 and 990.
+to the address the port detail names, else the host's IP
+(`socket.create_connection`, so an IPv6 address is reached too): a domain
+run's name on two addresses is reached on each port at the address it was
+found on, and each detail takes only its own address's banner. It reads what
+the service sends first, sends the port's probe if nothing came, and retries
+over TLS on 993, 995, 465, 636 and 990. Targets the RoE
+excludes are never connected to (see
+[RoE admission of the target list](#roe-admission-of-the-target-list)).
 `identify_service()` matches the banner against `SERVICE_PATTERNS`.
 
 FTP and SMTP both greet with `220`, so their patterns are anchored at the start
@@ -576,13 +601,14 @@ banner-grabbed.
 
 ### Skipped Ports (Handled by httpx)
 
-Ports in `HTTP_PORTS` are skipped:
+Ports in `BANNER_GRAB_SKIP_PORTS` (`http_probe.py`) are skipped, because httpx
+already probes them:
 
 ```
-80, 8080, 8000, 8888, 8008, 3000, 5000, 9000
+80, 8080, 8000, 8888, 8008, 3000, 5000, 9000   HTTP_PORTS
+443, 8443, 4443, 9443, 8843                    HTTPS_PORTS
+9090, 8800
 ```
-
-`http_probe.py` assigns `HTTP_PORTS` twice; the second assignment, shared with the URL builders, is the one in effect, so 443 and 8443 are banner-grabbed as well.
 
 ### Output Structure
 
@@ -842,7 +868,7 @@ Wappalyzer-detected technologies are automatically included in CVE lookup, becau
 
 ## Architecture & Flow
 
-> **Pipeline context:** HTTP probing runs in **GROUP 4** of the recon pipeline (`recon/main.py`), after GROUP 3 (Shodan + port scan), GROUP 3.5 (Nmap) and GROUP 3.6 (tlsx), when `http_probe` is in the scan modules and `HTTPX_ENABLED` is on. It depends on the merged `port_scan` to build probe targets. The module runs sequentially in the pipeline; httpx uses parallel threads internally. After it, `update_graph_from_http_probe` writes the graph in the background, certificate SANs are offered back as hostnames, and when no live URL was found the active scans (resource enumeration, vulnerability scanning) are skipped.
+> **Pipeline context:** HTTP probing runs in **GROUP 4** of the recon pipeline (`recon/main.py`), after GROUP 3 (Shodan + port scan), GROUP 3.5 (Nmap) and GROUP 3.6 (tlsx), when `http_probe` is in the scan modules and `HTTPX_ENABLED` is on. It depends on the merged `port_scan` to build probe targets. The module runs sequentially in the pipeline; httpx uses parallel threads internally. After it, `update_graph_from_http_probe` writes the graph in the background, certificate SANs are offered back as hostnames, and when no live URL was found the active scans that need one (resource enumeration, Nuclei and the web checks, the URL-reading Phase A tools) are skipped. Subdomain Takeover, the port and service checks, the org DNS checks and certificate hygiene still run, and each skipped source that was switched on keeps its earlier findings on the group's hosts (`_note_gate_skipped`).
 
 ### Execution Flow (`run_http_probe`)
 
@@ -857,6 +883,8 @@ Wappalyzer-detected technologies are automatically included in CVE lookup, becau
    └── no port_scan → build_targets_from_dns()
    └── apply_custom_port_scope(): with NAABU_CUSTOM_PORTS set, drop every
        URL on another port
+   └── admit_urls(): drop a URL whose host the RoE excludes, by name or, under
+       IP/CIDR entries, by any address the run resolved it to (below)
 
 3. PROBE EXECUTION
    └── targets.txt in a per-run dir /tmp/redamon/.httpx_temp_<id>
@@ -898,7 +926,25 @@ HTTP_PORTS  = {80, 8080, 8000, 8888, 8008, 3000, 5000, 9000}  # -> http://host:p
 # Any other port -> try both http:// and https://
 ```
 
-`build_targets_from_dns()` (the fallback) probes each resolved host (the root only when it is a target): with `NAABU_CUSTOM_PORTS` set, exactly those ports; otherwise ports 80 and 443 plus 8080, 8000, 8888, 3000, 5000, 9000 over HTTP and 8443, 4443, 9443 over HTTPS. In IP mode a mock hostname is replaced by its IP.
+`build_targets_from_dns()` (the fallback) probes each resolved host (the root only when it is a target): with `NAABU_CUSTOM_PORTS` set, exactly those ports; otherwise ports 80 and 443 plus 8080, 8000, 8888, 3000, 5000, 9000 over HTTP and 8443, 4443, 9443 over HTTPS. In IP mode a placeholder name (`10-0-0-1`) is replaced by its IP, and no reverse-DNS name is ever a target here: the hostnames an IP-mode run scans are probed later, by the hostnames step (README.RECON.md, "IP / CIDR: hostnames on target IPs"), on their target IPs only.
+
+### RoE admission of the target list
+
+httpx resolves each name itself, so the URL list passes the Rules of Engagement
+admission gate (`admit_urls` in `recon/helpers/target_admission.py`) after the
+custom-port guard. A URL survives when its host is an admitted IP literal, or a
+name the RoE host entries do not exclude whose every known address is outside
+the RoE IP and CIDR entries. While such an entry is set, a name with no known
+address is refused too and recorded as not checked, so its earlier findings
+are kept. Each refusal is logged once (`[-][RoE] httpx: not sent to ...`) and
+noted under the coverage source `roe_excluded`. With no exclusion the list,
+and so the httpx command, is unchanged.
+
+The banner grab connects to addresses itself, and `by_host` can hold one a
+passive source or a partial run's graph rows added, so its targets pass the
+same gate (module `banner_grab`): an excluded address, an address reached only
+through an excluded name, and, under IP or CIDR entries, a name with no known
+address are not connected to.
 
 ### Docker Command Structure
 
@@ -919,7 +965,7 @@ docker run --rm --net=host \
   -timeout 10 \
   -retries 2 \
   -rl 50 \                   # Rate limit
-  -fr \                      # Follow redirects (-fhr with session headers)
+  -fr \                      # Follow redirects (-fhr with session headers, in IP mode, under RoE exclusions)
   -maxr 10 \                 # Max redirects
   -sc \                      # Status code
   -cl \                      # Content length
@@ -932,7 +978,7 @@ docker run --rm --net=host \
   -td \                      # Tech detect
   -ip \                      # IP address
   -cname \                   # CNAME records
-  -tls-probe \               # TLS info
+  -tls-probe \               # probe the certificate's names (not in IP mode, not under RoE exclusions)
   -tls-grab \                # TLS certificate
   -favicon \                 # Favicon hash
   -jarm \                    # JARM fingerprint
@@ -1072,7 +1118,7 @@ docker run --rm --net=host \
 - A URL counts as live when it answered with a status below 500.
 - `summary.total_urls_probed` counts the parsed results; `scan_metadata.total_urls_probed` the URLs sent.
 - `body` is not stored (see [Response Content Inclusion](#8-response-content-inclusion)).
-- `update_graph_from_http_probe` (`graph_db/mixins/recon/http_mixin.py`) writes the result to the graph.
+- `update_graph_from_http_probe` (`graph_db/mixins/recon/http_mixin.py`) writes the result to the graph. httpx does not always name the address it connected to on a name with several addresses, so in a domain run an answer goes (Port, Service, `SERVES_URL`) to the name's address whose port scan has that port open, not always to the `ip` httpx names; IP mode keeps httpx's address.
 
 ---
 
@@ -1170,11 +1216,15 @@ HTTPX_TIMEOUT = 20
 HTTPX_RETRIES = 3
 ```
 
-With no live URL, the pipeline skips resource enumeration and vulnerability scanning (`metadata.active_scans_skipped`).
+With no live URL, the pipeline skips resource enumeration, Nuclei and the web checks, and the Phase A tools that read URLs (`metadata.active_scans_skipped`). Subdomain Takeover (Subjack and BadDNS read names, not URLs), the port and service checks (admin and database ports, Redis, SMTP relay, Kubernetes API), the org DNS checks and certificate hygiene still run. A skipped source that was switched on is noted degraded ("not run: no live HTTP URL") by host on the group's hosts, so its earlier findings are kept there and it shows as a coverage gap; one switched off prunes as usual.
+
+#### "[!][httpx] ... - nothing was probed; earlier findings are kept"
+
+httpx could not run: Docker missing or down, the image unavailable, an exit or its runtime budget with nothing written, or an exception. A failed probe is not "no live URL". It records `metadata.phase_errors.http_probe`, keeps the `http_probe` source, and is not listed in `modules_executed`. The pipeline takes the same skip as above (`SKIPPING ACTIVE SCANS: http_probe failed (...)`), with the coverage reason "http_probe failed, no host probed", and keeps more: `security_check` on every host, the port- and DNS-check ones included, since the web checks were not re-checked anywhere, and the findings of JS Recon and AI Surface Recon, which still run without httpx's pages.
 
 #### "Probe hit its ...s budget"
 
-The probe outlived `httpx_budget()` and was stopped; downstream phases run on what it found. Raise `HTTPX_THREADS`, or lower `HTTPX_RETRIES`, or probe fewer URLs.
+The probe outlived `httpx_budget()` and was stopped; downstream phases run on what it found. If it had written nothing by then, the probe counts as failed (see above). Raise `HTTPX_THREADS`, or lower `HTTPX_RETRIES`, or probe fewer URLs.
 
 #### Scan too slow
 

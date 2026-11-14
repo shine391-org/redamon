@@ -201,7 +201,7 @@ class TestPlanPersistedBeforeLaunch:
                 mock.patch.object(vs, "pull_nuclei_docker_image", lambda image: True), \
                 mock.patch.object(vs, "ensure_templates_volume", lambda image, auto: True), \
                 mock.patch.object(vs, "extract_targets_from_recon",
-                                  lambda rd: ([], ["app.example.com"], {})), \
+                                  lambda rd, settings=None: ([], ["app.example.com"], {})), \
                 mock.patch.object(vs, "build_target_urls",
                                   lambda h, i, rd, scan_all_ips=False,
                                      admission_report=None,
@@ -371,7 +371,7 @@ class _FakeGraph:
         return 0
 
     def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
-                              keep_unproven=False):
+                              keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
         self.prunes.append({"sources": list(sources), "since": since,
                             "keep_hosts": tuple(keep_hosts),
                             "keep_unproven": bool(keep_unproven)})
@@ -510,7 +510,7 @@ class _UnprovenClient:
     def __init__(self):
         self.driver = _FakeDriver()
     def prune_unseen_findings(self, user_id, project_id, sources, run_started_at,
-                              keep_hosts=(), keep_unproven=False):
+                              keep_hosts=(), keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
         from graph_db.mixins.base_mixin import BaseMixin, keep_host_patterns
         BaseMixin.prune_unseen_findings(
             self, user_id, project_id, sources, run_started_at,

@@ -546,14 +546,35 @@ MITRE CWE/CAPEC enrichment is **automatically included** in the `vuln_scan` modu
 | `technology_cves` | `by_technology.<tech>.cves[]` | `mitre_attack.cwe_hierarchy` with full metadata |
 | `gvm_scan` | `unique_cves_enriched` | `mitre_attack.cwe_hierarchy` with full metadata |
 
+In the graph, a nuclei finding links each CVE its template cites, and that CVE its
+CWE and CAPEC chain:
+`(v:Vulnerability)-[:INCLUDES_CVE]->(c:CVE)-[:HAS_CWE]->(m:MitreData)-[:HAS_CAPEC]->(cap:Capec)`.
+Only an `ALLOWED` CWE gets CAPEC patterns, and the graph writes only the CWEs that
+have some, so a CVE whose hierarchy holds no `ALLOWED` CWE with CAPEC patterns (only
+DISCOURAGED or ALLOWED-WITH-REVIEW ones) has no `HAS_CWE` edge at all. Technology
+CVEs get their chain the same way.
+
+A finding's `INCLUDES_CVE` edges are exactly the CVEs its template cites on the
+latest write: a CVE the template no longer cites loses its edge, even when the
+template cites none any more. The CVE, MitreData and Capec nodes are shared
+reference nodes, so they and their `HAS_CWE` / `HAS_CAPEC` chain stay. The graph
+screen shows a finding's chain like a Technology's, Vulnerability → CVE → CWE →
+CAPEC, through `INCLUDES_CVE` (nuclei and the passive CVE sources) or `HAS_CVE`
+(nmap NSE); a muted finding's chain is hidden with it.
+
 ### Pipeline Order (Parallelized)
 
 MITRE enrichment runs automatically after Nuclei scanning as part of **GROUP 6** in the parallelized recon pipeline. Graph DB updates happen in a background thread so the main pipeline is not blocked.
 
+Phase A writes the nuclei findings and their `INCLUDES_CVE` edges. Phase B runs the
+enrichment and then the vuln write again (`update_graph_from_vuln_scan`), which adds
+the `HAS_CWE` / `HAS_CAPEC` chain from the enriched `vuln_scan.all_cves`. Every write
+is a MERGE, so the second pass creates no duplicate edge.
+
 ```python
 # Parallelized pipeline groups:
 # GROUP 1: domain_discovery + WHOIS + URLScan (parallel fan-out)
-#   └── 5 discovery tools run concurrently, DNS with 20 parallel workers
+#   └── 5 discovery tools run concurrently, DNS with DNS_MAX_WORKERS workers (default 80)
 # GROUP 3: port_scan + Shodan enrichment (parallel fan-out)
 # GROUP 4: http_probe (sequential, internally parallel)
 # GROUP 5: resource_enum (Katana ∥ GAU ∥ Kiterunner — internally parallel)

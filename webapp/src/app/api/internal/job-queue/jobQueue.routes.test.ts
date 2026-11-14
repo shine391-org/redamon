@@ -22,14 +22,17 @@ const h = vi.hoisted(() => ({
   jqFindMany: vi.fn(),
   jqCount: vi.fn(),
   sjFindMany: vi.fn(),
-  // Set in beforeEach: routes a row set to one of the two sweeps.
-  sweep: (() => {}) as (rows: unknown[], runKeyed?: boolean) => void,
+  // Set in beforeEach: answers each sweep query with the rows its filter selects.
+  sweep: (() => {}) as (rows: unknown[]) => void,
   sjUpdateMany: vi.fn(),
   projectFindUnique: vi.fn(),
   agentState: vi.fn(),
   dispatchStart: vi.fn(),
   stopScan: vi.fn(),
   orchFetch: vi.fn(),
+  userFindMany: vi.fn(),
+  audit: vi.fn(),
+  actorRefusal: vi.fn(),
 }))
 
 vi.mock('@/lib/session', () => ({ isInternalRequest: (...a: unknown[]) => h.isInternal(...a) }))
@@ -48,7 +51,16 @@ vi.mock('@/lib/prisma', () => ({
       updateMany: (...a: unknown[]) => h.sjUpdateMany(...a),
     },
     project: { findUnique: (...a: unknown[]) => h.projectFindUnique(...a) },
+    user: { findMany: (...a: unknown[]) => h.userFindMany(...a) },
   },
+}))
+vi.mock('@/lib/audit', () => ({ writeAudit: (...a: unknown[]) => h.audit(...a) }))
+// The actor's project access (step 5.5) runs the real can(); its own tests are
+// scanActor.access.test.ts and internal/deferredActor.shares.test.ts. Here it answers "allowed"
+// unless a test says otherwise.
+vi.mock('@/lib/authz/scanActor', async (orig) => ({
+  ...(await orig<typeof import('@/lib/authz/scanActor')>()),
+  actorScanRefusal: (...a: unknown[]) => h.actorRefusal(...a),
 }))
 vi.mock('@/lib/startScan', () => ({
   dispatchStart: (...a: unknown[]) => h.dispatchStart(...a),
@@ -77,6 +89,22 @@ function baseRow(over: Record<string, unknown> = {}) {
   }
 }
 
+interface SweepRow { id: string; projectId: string; kind: string; runId?: string; startedAt?: Date | null }
+interface SweepWhere {
+  kind: { in: string[] }
+  projectId?: { in?: string[]; notIn?: string[] }
+  OR?: { startedAt: null | { lte: Date } }[]
+}
+
+function sweepSelects(where: SweepWhere, row: SweepRow): boolean {
+  if (!where.kind.in.includes(row.kind)) return false
+  if (where.projectId?.notIn?.includes(row.projectId)) return false
+  if (where.projectId?.in && !where.projectId.in.includes(row.projectId)) return false
+  const lte = where.OR?.map(c => c.startedAt).find((s): s is { lte: Date } => !!s && 'lte' in s)?.lte
+  if (lte && row.startedAt && row.startedAt > lte) return false
+  return true
+}
+
 const post = (url: string, body: unknown = {}) => new NextRequest(url, {
   method: 'POST', headers: { 'x-internal-key': 'k' }, body: JSON.stringify(body),
 })
@@ -93,18 +121,20 @@ beforeEach(() => {
   h.jqFindMany.mockResolvedValue([])
   h.jqCount.mockResolvedValue(0)
   h.sjFindMany.mockResolvedValue([])
-  // Two sweeps now run per tick (one-per-project kinds, then run-keyed kinds).
-  // A helper that answers only the sweep a test cares about keeps rows from
-  // being returned to BOTH and double-counted.
-  h.sweep = (rows: unknown[], runKeyed = false) =>
-    h.sjFindMany.mockImplementation((args: { where: { kind: { in: string[] } } }) =>
-      Promise.resolve(args.where.kind.in.includes('trufflehog') === runKeyed ? rows : []))
+  // Several sweep queries run per tick (one-per-project kinds; run-keyed kinds
+  // of idle projects; run-keyed kinds of active projects). Each is answered with
+  // the rows its where clause selects, as the database would, so no row reaches
+  // two sweeps and a query's own filter is what keeps a row out of it.
+  h.sweep = (rows: unknown[]) =>
+    h.sjFindMany.mockImplementation((args: { where: SweepWhere }) =>
+      Promise.resolve((rows as SweepRow[]).filter(r => sweepSelects(args.where, r))))
   h.sjUpdateMany.mockResolvedValue({ count: 1 })
   h.orchFetch.mockResolvedValue({ ok: true, json: async () => ({ status: 'idle' }) })
   h.projectFindUnique.mockResolvedValue(PROJECT)
   h.agentState.mockResolvedValue('idle')
   h.dispatchStart.mockResolvedValue({ ok: true, runId: 'r1', scanJobId: 'sj1' })
   h.stopScan.mockResolvedValue(undefined)
+  h.actorRefusal.mockResolvedValue(null)
 })
 
 describe('dispatch route auth', () => {
@@ -558,9 +588,10 @@ describe('reconcile route - stuck ScanJob rows (phantom "running")', () => {
     expect(h.sjUpdateMany).not.toHaveBeenCalled()
   })
 
-  // Only kinds that WRITE a ScanJob per project are swept. partial_recon / ai_attack
-  // are run-keyed (own reconcile); supply_chain_repo is queue-dispatched and writes
-  // no ScanJob (its history is the JobQueue row, closed by the queue reconcile).
+  // Only kinds that WRITE a ScanJob per project are swept. partial_recon,
+  // trufflehog and ai_attack are run-keyed (the run-granular sweep below);
+  // supply_chain_repo is queue-dispatched and writes no ScanJob (its history is
+  // the JobQueue row, closed by the queue reconcile).
   test('sweeps only the one-ScanJob-per-project kinds', async () => {
     await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
     const where = h.sjFindMany.mock.calls[0][0].where
@@ -579,7 +610,7 @@ describe('reconcile route - stuck ScanJob rows (phantom "running")', () => {
     h.sweep([
       { id: 'r-docker', projectId: 'p1', kind: 'trufflehog', runId: 'docker' },
       { id: 'r-hf', projectId: 'p1', kind: 'trufflehog', runId: 'huggingface' },
-    ], true)
+    ])
     h.orchFetch.mockResolvedValue({
       ok: true,
       json: async () => ({ runs: [
@@ -595,7 +626,7 @@ describe('reconcile route - stuck ScanJob rows (phantom "running")', () => {
   })
 
   test('a trufflehog row whose run vanished from /all is canceled, not left running', async () => {
-    h.sweep([{ id: 'r1', projectId: 'p1', kind: 'trufflehog', runId: 'docker' }], true)
+    h.sweep([{ id: 'r1', projectId: 'p1', kind: 'trufflehog', runId: 'docker' }])
     h.orchFetch.mockResolvedValue({ ok: true, json: async () => ({ runs: [] }) })
     await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
     expect(h.sjUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -608,7 +639,7 @@ describe('reconcile route - stuck ScanJob rows (phantom "running")', () => {
       { id: 'a', projectId: 'p1', kind: 'trufflehog', runId: 'docker' },
       { id: 'b', projectId: 'p1', kind: 'trufflehog', runId: 's3' },
       { id: 'c', projectId: 'p1', kind: 'trufflehog', runId: 'gcs' },
-    ], true)
+    ])
     h.orchFetch.mockResolvedValue({ ok: true, json: async () => ({ runs: [] }) })
     await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
     expect(h.orchFetch).toHaveBeenCalledTimes(1)
@@ -625,5 +656,265 @@ describe('reconcile route - stuck ScanJob rows (phantom "running")', () => {
   test('with no active projects the ScanJob query carries no project filter', async () => {
     await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
     expect(h.sjFindMany.mock.calls[0][0].where.projectId).toBeUndefined()
+  })
+})
+
+// L-13: a partial recon that ended with nobody watching, or was stopped, left its
+// ScanJob `running` for ever: only the browser's list poll closed one, and only
+// on a listed terminal status, while the orchestrator drops a finished run from
+// its listing about a minute later and a stopped one at once.
+describe('reconcile route - partial recon runs', () => {
+  const old = () => new Date(Date.now() - 5 * 60_000)
+  const listing = (runs: { run_id: string; status: string }[]) =>
+    h.orchFetch.mockResolvedValue({ ok: true, json: async () => ({ project_id: 'p1', runs }) })
+  const outcomes = () => Object.fromEntries(h.sjUpdateMany.mock.calls.map(c => [c[0].where.id, c[0].data.status]))
+
+  test('each row is closed from its own run in /recon/<project>/partial/all', async () => {
+    h.sweep([
+      { id: 'done', projectId: 'p1', kind: 'partial_recon', runId: 'r1', startedAt: old() },
+      { id: 'broke', projectId: 'p1', kind: 'partial_recon', runId: 'r2', startedAt: old() },
+      { id: 'gone', projectId: 'p1', kind: 'partial_recon', runId: 'r3', startedAt: old() },
+    ])
+    listing([{ run_id: 'r1', status: 'completed' }, { run_id: 'r2', status: 'error' }])
+    const res = await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
+    expect(outcomes()).toEqual({ done: 'completed', broke: 'failed', gone: 'canceled' })
+    expect((await res.json()).scansClosed).toBe(3)
+    expect(h.orchFetch).toHaveBeenCalledTimes(1)
+    expect(String(h.orchFetch.mock.calls[0][0])).toMatch(/\/recon\/p1\/partial\/all$/)
+    expect(h.sjUpdateMany.mock.calls[0][0].where).toMatchObject({ status: 'running' })
+  })
+
+  // A short run is dropped from the listing a minute after it ends, which can be
+  // before its row is past the grace: its listed outcome is taken while it is there.
+  test('a short run that already ended is closed from the listing inside the grace', async () => {
+    h.sweep([{ id: 'quick', projectId: 'p1', kind: 'partial_recon', runId: 'r1', startedAt: new Date() }])
+    listing([{ run_id: 'r1', status: 'completed' }])
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
+    expect(outcomes()).toEqual({ quick: 'completed' })
+  })
+
+  test('a young row whose run is not listed yet waits for the grace', async () => {
+    h.sweep([{ id: 'fresh', projectId: 'p1', kind: 'partial_recon', runId: 'r1', startedAt: new Date() }])
+    listing([])
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
+    expect(h.sjUpdateMany).not.toHaveBeenCalled()
+  })
+
+  // Partial runs go in parallel: one long run keeps the project active, which
+  // must not keep its finished siblings `running` until it ends.
+  test('a project with a live run still has its finished and vanished runs closed', async () => {
+    h.sweep([
+      { id: 'live', projectId: 'p1', kind: 'partial_recon', runId: 'r-live', startedAt: old() },
+      { id: 'stopping', projectId: 'p1', kind: 'partial_recon', runId: 'r-stop', startedAt: old() },
+      { id: 'done', projectId: 'p1', kind: 'partial_recon', runId: 'r-done', startedAt: old() },
+      { id: 'gone', projectId: 'p1', kind: 'partial_recon', runId: 'r-gone', startedAt: old() },
+    ])
+    listing([
+      { run_id: 'r-live', status: 'running' },
+      { run_id: 'r-stop', status: 'stopping' },
+      { run_id: 'r-done', status: 'completed' },
+    ])
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: ['p1'] }))
+    expect(outcomes()).toEqual({ done: 'completed', gone: 'canceled' })
+  })
+
+  test('an unreadable listing never closes a row of a project that is still active', async () => {
+    h.sweep([{ id: 'x', projectId: 'p1', kind: 'partial_recon', runId: 'r1', startedAt: old() }])
+    h.orchFetch.mockRejectedValue(new Error('connect ECONNREFUSED'))
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: ['p1'] }))
+    expect(h.sjUpdateMany).not.toHaveBeenCalled()
+  })
+
+  test('a listing without a run list is unreadable, not empty', async () => {
+    h.sweep([{ id: 'x', projectId: 'p1', kind: 'partial_recon', runId: 'r1', startedAt: old() }])
+    h.orchFetch.mockResolvedValue({ ok: true, json: async () => ({ detail: 'nope' }) })
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: ['p1'] }))
+    expect(h.sjUpdateMany).not.toHaveBeenCalled()
+  })
+
+  // The project is known idle, so the run is over; only its outcome is unknown.
+  test('an unreadable listing for an idle project records the old row canceled', async () => {
+    h.sweep([{ id: 'x', projectId: 'p1', kind: 'partial_recon', runId: 'r1', startedAt: old() }])
+    h.orchFetch.mockResolvedValue({ ok: false, json: async () => ({}) })
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: [] }))
+    expect(outcomes()).toEqual({ x: 'canceled' })
+  })
+
+  // AI attack used to be left to the browser's list poll, which never sees a
+  // stopped run end and is gone once the tab closes.
+  test('the run-keyed sweep covers partial recon, trufflehog and AI attack', async () => {
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: ['p1'] }))
+    const runKeyed = h.sjFindMany.mock.calls.map(c => c[0].where).filter(w => w.kind.in.includes('partial_recon'))
+    expect(runKeyed.length).toBeGreaterThan(0)
+    for (const w of runKeyed) {
+      expect(w.kind.in).toEqual(expect.arrayContaining(['partial_recon', 'trufflehog', 'ai_attack']))
+    }
+  })
+
+  test('AI attack rows are closed from their own run in /ai-attack-surface/<project>/all', async () => {
+    h.sweep([
+      { id: 'done', projectId: 'p1', kind: 'ai_attack', runId: 'a1', startedAt: old() },
+      { id: 'live', projectId: 'p1', kind: 'ai_attack', runId: 'a2', startedAt: old() },
+      { id: 'gone', projectId: 'p1', kind: 'ai_attack', runId: 'a3', startedAt: old() },
+    ])
+    listing([{ run_id: 'a1', status: 'completed' }, { run_id: 'a2', status: 'running' }])
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: ['p1'] }))
+    expect(outcomes()).toEqual({ done: 'completed', gone: 'canceled' })
+    expect(h.orchFetch).toHaveBeenCalledTimes(1)
+    expect(String(h.orchFetch.mock.calls[0][0])).toMatch(/\/ai-attack-surface\/p1\/all$/)
+  })
+
+  // A project's live runs stay out of the idle projects' budget, so they never
+  // starve the stuck rows of projects that have nothing running.
+  test('the idle projects are swept in a query that excludes the active ones', async () => {
+    await reconcile(post('http://x/api/internal/job-queue/reconcile', { activeProjects: ['p1'] }))
+    const runKeyed = h.sjFindMany.mock.calls.map(c => c[0].where).filter(w => w.kind.in.includes('partial_recon'))
+    expect(runKeyed.some(w => w.projectId?.notIn?.includes('p1'))).toBe(true)
+  })
+})
+
+describe('dispatch: a job of an account that is not active (step 2.3, DV-39)', () => {
+  const users = (statuses: Record<string, string>) =>
+    h.userFindMany.mockImplementation(async ({ where }: { where: { id: { in: string[] } } }) =>
+      where.id.in.filter((id) => id in statuses).map((id) => ({ id, status: statuses[id] })))
+  const go = () => dispatch(post('http://x/api/internal/job-queue/j1/dispatch'), sp('j1'))
+
+  beforeEach(async () => {
+    const { setFlagsForTests } = await import('@/lib/authz/flags')
+    setFlagsForTests({ identity: true })
+    h.jqFindUnique.mockResolvedValue(baseRow({ userId: 'admin-acting' }))
+    users({ 'admin-acting': 'active', u1: 'active' })
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(async () => {
+    const { setFlagsForTests } = await import('@/lib/authz/flags')
+    setFlagsForTests(null)
+    vi.restoreAllMocks()
+  })
+
+  test('a queued job of a disabled actor is cancelled, audited, and nothing starts', async () => {
+    users({ 'admin-acting': 'disabled', u1: 'active' })
+    const body = await (await go()).json()
+    expect(body).toEqual({ ok: false, canceled: true, blocked: 'actor_inactive', error: 'the account that queued it is disabled' })
+    expect(h.dispatchStart).not.toHaveBeenCalled()
+    const cancel = h.jqUpdateMany.mock.calls.find((c) => c[0].data.status === 'canceled')
+    expect(cancel?.[0]).toEqual({
+      where: { id: 'j1', status: 'dispatching' },
+      data: {
+        status: 'canceled', blockedCode: 'actor_inactive', blockedReason: 'the account that queued it is disabled',
+        finishedAt: expect.any(Date),
+      },
+    })
+    expect(h.audit).toHaveBeenCalledWith({
+      actorId: null, action: 'job_queue.cancelled', targetType: 'jobQueue', targetId: 'j1',
+      after: {
+        reason: 'actor_inactive', projectId: 'p1', kind: 'full_recon',
+        userId: 'admin-acting', account: 'actor', status: 'disabled',
+      },
+      source: 'system',
+    })
+  })
+
+  test("a disabled project owner cancels the job too, judged on the project already read", async () => {
+    users({ 'admin-acting': 'active', u1: 'disabled' })
+    const body = await (await go()).json()
+    expect(body).toMatchObject({ canceled: true, error: "the project owner's account is disabled" })
+    expect(h.dispatchStart).not.toHaveBeenCalled()
+    expect(h.projectFindUnique).toHaveBeenCalledTimes(1)
+    expect(h.userFindMany.mock.calls[0][0]).toEqual({ where: { id: { in: ['admin-acting', 'u1'] } }, select: { id: true, status: true } })
+  })
+
+  test('active accounts: the job starts as before, for the account that queued it', async () => {
+    expect((await (await go()).json()).ok).toBe(true)
+    expect(h.dispatchStart).toHaveBeenCalledWith('full_recon', 'p1', { actorUserId: 'admin-acting', payload: {} })
+    expect(h.audit).not.toHaveBeenCalled()
+  })
+
+  test('a deleted project still fails as before, without reading accounts', async () => {
+    h.projectFindUnique.mockResolvedValue(null)
+    expect((await (await go()).json()).error).toBe('project no longer exists')
+    expect(h.userFindMany).not.toHaveBeenCalled()
+  })
+
+  test("switch off → today's behaviour: no account read, the job starts", async () => {
+    const { setFlagsForTests } = await import('@/lib/authz/flags')
+    setFlagsForTests({ identity: false })
+    users({ 'admin-acting': 'disabled', u1: 'disabled' })
+    expect((await (await go()).json()).ok).toBe(true)
+    expect(h.dispatchStart).toHaveBeenCalled()
+    expect(h.userFindMany).not.toHaveBeenCalled()
+  })
+})
+
+describe('dispatch: a job whose actor lost access to the project (step 5.5, DV-38)', () => {
+  const go = () => dispatch(post('http://x/api/internal/job-queue/j1/dispatch'), sp('j1'))
+  const LOST = { userId: 'collab-1', permission: 'scan:gvm', reason: 'project_not_visible' }
+
+  beforeEach(() => {
+    h.jqFindUnique.mockResolvedValue(baseRow({ userId: 'collab-1', kind: 'gvm' }))
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(() => vi.restoreAllMocks())
+
+  test('dispatch cancels a job whose actor lost access: audited, logged, nothing starts', async () => {
+    h.actorRefusal.mockResolvedValue(LOST)
+    const body = await (await go()).json()
+    expect(body).toEqual({
+      ok: false, canceled: true, blocked: 'actor_no_access',
+      error: 'the account that queued it no longer has access to this project',
+    })
+    expect(h.dispatchStart).not.toHaveBeenCalled()
+    expect(h.actorRefusal).toHaveBeenCalledWith('collab-1', 'p1', ['scan:gvm'])
+    const cancel = h.jqUpdateMany.mock.calls.find((c) => c[0].data.status === 'canceled')
+    expect(cancel?.[0]).toEqual({
+      where: { id: 'j1', status: 'dispatching' },
+      data: {
+        status: 'canceled', blockedCode: 'actor_no_access',
+        blockedReason: 'the account that queued it no longer has access to this project', finishedAt: expect.any(Date),
+      },
+    })
+    expect(h.audit).toHaveBeenCalledWith({
+      actorId: null, projectId: 'p1', action: 'job_queue.cancelled', targetType: 'jobQueue', targetId: 'j1',
+      after: {
+        reason: 'actor_no_access', projectId: 'p1', kind: 'gvm',
+        userId: 'collab-1', permission: 'scan:gvm', refusal: 'project_not_visible',
+      },
+      source: 'system',
+    })
+    expect(console.warn).toHaveBeenCalledWith('[rbac] job j1 cancelled: actor collab-1 lost scan:gvm on project p1 (project_not_visible)')
+  })
+
+  test('the check asks the permissions of the job, overwrite included', async () => {
+    h.jqFindUnique.mockResolvedValue(baseRow({ userId: 'collab-1', kind: 'full_recon', payload: { mode: 'overwrite' } }))
+    await go()
+    expect(h.actorRefusal).toHaveBeenCalledWith('collab-1', 'p1', ['recon:scan', 'recon:overwrite'])
+    h.jqFindUnique.mockResolvedValue(baseRow({ userId: 'collab-1', kind: 'partial_recon', payload: {} }))
+    h.actorRefusal.mockClear()
+    await go()
+    expect(h.actorRefusal).toHaveBeenCalledWith('collab-1', 'p1', ['recon:partial'])
+  })
+
+  test("an owner's job passes and starts as before (owner unchanged)", async () => {
+    h.jqFindUnique.mockResolvedValue(baseRow())
+    expect((await (await go()).json()).ok).toBe(true)
+    expect(h.actorRefusal).toHaveBeenCalledWith('u1', 'p1', ['recon:scan'])
+    expect(h.dispatchStart).toHaveBeenCalledWith('full_recon', 'p1', { actorUserId: 'u1', payload: {} })
+    expect(h.audit).not.toHaveBeenCalled()
+  })
+
+  test('an access check that cannot be read starts nothing and spends an attempt (never)', async () => {
+    h.actorRefusal.mockRejectedValue(Object.assign(new Error('db down'), { code: 'P1001' }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await go()
+    expect(res.status).toBe(500)
+    expect(h.dispatchStart).not.toHaveBeenCalled()
+    const retry = h.jqUpdateMany.mock.calls.find((c) => c[0].data.status === 'queued')
+    expect(retry?.[0].data).toMatchObject({ status: 'queued', attempts: 1, blockedCode: 'transient' })
+  })
+
+  test('a deleted project fails before any access check', async () => {
+    h.projectFindUnique.mockResolvedValue(null)
+    expect((await (await go()).json()).error).toBe('project no longer exists')
+    expect(h.actorRefusal).not.toHaveBeenCalled()
   })
 })

@@ -96,6 +96,13 @@ to `kali_shell cat /tmp/...`, wastes a tool call, and prevents `fs_grep`
 from scanning the file. Workspace paths also persist across the
 engagement; `/tmp` is wiped when the kali sandbox restarts.
 
+FILES FOR THE USER TO DOWNLOAD (payloads, generated documents, exports) -
+not output capture: the file IS the result. Write it under
+`__WORKSPACE_ROOT__/notes/` with its full path, e.g.
+`msfvenom ... -o __WORKSPACE_ROOT__/notes/payload.exe`. The chat shows a
+download card only for a file of this project's workspace; a file under
+`/tmp` (or anywhere else) cannot be downloaded from the chat.
+
 JOB SPAWN POLICY - decide per call, not by default:
 
 SPAWN with job_spawn when ALL hold:
@@ -1849,14 +1856,16 @@ __GRAPH_SCHEMA__
 ## Common Query Patterns
 
 ### ALL Vulnerabilities (BOTH Vulnerability and CVE nodes!)
-When user asks "what vulnerabilities exist?" - query BOTH node types with UNION:
+When user asks "what vulnerabilities exist?" - query BOTH node types with UNION.
+A CVE is a shared reference node: reach it through this project's Technology
+that links to it (a bare `MATCH (c:CVE)` is rejected):
 ```cypher
-// Get ALL security issues - both scanner findings AND known CVEs
+// Get ALL security issues - both scanner findings AND the known CVEs of this project's technologies
 MATCH (v:Vulnerability)
 RETURN 'Vulnerability' as type, v.id as id, v.name as name, v.severity as severity, v.source as source
 UNION ALL
-MATCH (c:CVE)
-RETURN 'CVE' as type, c.id as id, c.id as name, c.severity as severity, c.source as source
+MATCH (t:Technology)-[:HAS_KNOWN_CVE]->(c:CVE)
+RETURN DISTINCT 'CVE' as type, c.id as id, c.id as name, c.severity as severity, c.source as source
 LIMIT 500
 ```
 
@@ -1881,16 +1890,24 @@ RETURN i.address, v.name, v.cvss_score
 ```
 
 ### Finding CVEs (Known vulnerabilities from NVD)
+Reach a CVE through this project's node that links to it: a Technology
+(HAS_KNOWN_CVE) or a scanner finding (INCLUDES_CVE). A query that matches only
+CVE nodes is rejected.
 ```cypher
-// All CVEs in the system
-MATCH (c:CVE)
-RETURN c.id, c.severity, c.cvss, c.description
+// The CVEs known for this project's technologies
+MATCH (t:Technology)-[:HAS_KNOWN_CVE]->(c:CVE)
+RETURN DISTINCT c.id, c.severity, c.cvss, c.description
 LIMIT 500
 
-// High severity CVEs
-MATCH (c:CVE)
+// High severity CVEs among them
+MATCH (t:Technology)-[:HAS_KNOWN_CVE]->(c:CVE)
 WHERE c.severity IN ["HIGH", "CRITICAL"] OR c.cvss >= 7.0
-RETURN c.id, c.severity, c.cvss
+RETURN DISTINCT c.id, c.severity, c.cvss
+LIMIT 500
+
+// CVEs this project's scanner findings cite
+MATCH (v:Vulnerability)-[:INCLUDES_CVE]->(c:CVE)
+RETURN DISTINCT v.name, c.id, c.severity, c.cvss
 LIMIT 500
 
 // CVEs linked to detected technologies
@@ -2214,7 +2231,8 @@ LIMIT 500
    what vulnerabilities EXIST, or to list/count them in general:
    - Vulnerability nodes = scanner findings (nuclei, gvm, security_check)
    - CVE nodes = known CVEs linked to detected technologies
-   - Use UNION ALL to combine results from both node types
+   - Use UNION ALL to combine results from both node types, reaching each CVE
+     through the project's node that links to it (see the examples above)
    - **But NOT when the question filters on something only Vulnerability has.**
      `severity`, `source`, `template_id`, `matcher_name` and the other scanner
      fields do not exist on CVE, and CVE carries `cvss` with UPPERCASE severity
@@ -2242,7 +2260,7 @@ LIMIT 500
 6. **Use property filters** in WHERE clauses, not relationship traversals for filtering
 7. **Check vulnerability source** when querying Vulnerability nodes:
    - source="nuclei" -> web/DAST vulnerabilities (FOUND_AT, AFFECTS_PARAMETER)
-   - source="nmap_nse" -> Nmap NSE script findings (AFFECTS Port, FOUND_ON Technology, HAS_CVE CVE)
+   - source="nmap_nse" -> Nmap NSE script findings (AFFECTS Port, FOUND_ON Technology, HAS_CVE CVE); a host-script finding (host_level=true, port_number 0, e.g. smb-vuln-ms17-010) has no Port or Technology: HAS_VULNERABILITY from IP
    - source="gvm" -> network vulnerabilities (HAS_VULNERABILITY from IP/Subdomain)
    - source="security_check" -> DNS/email security checks (SPF, DMARC)
    - source="netlas" -> passive CVE detection via NVD (HAS_VULNERABILITY from Service)

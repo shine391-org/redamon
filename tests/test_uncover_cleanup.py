@@ -36,6 +36,7 @@ def test_unique_name_and_stdout_survive_normal_cleanup(tmp_path):
     names = [cmd[cmd.index('--name')+1] for cmd in runs]
     assert len(set(names)) == 2
     assert all(name.startswith('redamon-uncover-') for name in names)
+    assert all(cmd.count('--name') == 1 for cmd in runs)
     removals = [cmd for cmd, _ in calls if cmd[1] == 'rm']
     assert removals == [['docker', 'rm', '-f', name] for name in names]
     assert all('--rm' in cmd for cmd in runs)
@@ -52,9 +53,13 @@ def test_timeout_cleans_exact_child_and_keeps_only_complete_output(tmp_path):
     with mock.patch.object(u.subprocess, 'run', side_effect=run):
         assert invoke(tmp_path) == [ROW]
     name = calls[0][0][calls[0][0].index('--name')+1]
-    assert calls[1][0] == ['docker', 'rm', '-f', name]
+    # Upstream kills the timed-out child; our finally also confirms removal.
+    # Both must refer to the exact UUID assigned to this invocation.
+    assert calls[1][0] == ['docker', 'kill', name]
+    assert calls[2][0] == ['docker', 'rm', '-f', name]
     assert calls[0][1]['timeout'] == u.UNCOVER_TIMEOUT
-    assert calls[1][1]['timeout'] == 10
+    assert calls[1][1]['timeout'] == 15
+    assert calls[2][1]['timeout'] == 10
 
 
 @pytest.mark.parametrize('error', [RuntimeError('fixture error'), OSError('fixture OS error')])

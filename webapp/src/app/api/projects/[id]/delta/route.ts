@@ -10,9 +10,15 @@
  * carry, which would show up as a wall of phantom "removed" rows.)
  *
  * Read-only: nothing is written, and no snapshot content is logged.
+ *
+ * A reader below Raw data & files (`recon:read` is R) compares both sides as the graph read view
+ * gives them (`stripStepContent`, the helper of every graph output): no chain-step content, nor what
+ * OQ-R7 makes raw data, reaches the added, removed or changed nodes, a changed node's previous
+ * properties or the overlay, and a change in such a property alone is no change.
  */
 import { NextRequest, NextResponse } from 'next/server'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
+import { stripStepContent } from '@/lib/authz/stepContent'
 import { internalError, withRouteErrors } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
 import { SCOPE_SELECT, currentScanRoots } from '@/lib/scanCoverage'
@@ -36,10 +42,8 @@ interface SideDescriptor {
 export const GET = withRouteErrors('Failed to compute the delta', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
 
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'recon:read', { projectId: id })
+  if (auth instanceof NextResponse) return auth
 
   const sp = request.nextUrl.searchParams
   // Anti-IDOR: a version id in `from`/`to` must belong to THIS project.
@@ -96,10 +100,13 @@ export const GET = withRouteErrors('Failed to compute the delta', async (request
       }
     }
 
+    const asRead = (data: FormattedGraphData): FormattedGraphData => ({ ...data, nodes: stripStepContent(data.nodes, auth.access) })
     const fromLoaded = await load(fromSel)
     if (fromLoaded instanceof NextResponse) return fromLoaded
+    fromLoaded.data = asRead(fromLoaded.data)
     const toLoaded = await load(toSel)
     if (toLoaded instanceof NextResponse) return toLoaded
+    toLoaded.data = asRead(toLoaded.data)
 
     // Coverage of a scan root removed since the run is not this scope's gap.
     const scope = await prisma.project.findUnique({ where: { id }, select: SCOPE_SELECT })

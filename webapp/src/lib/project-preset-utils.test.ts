@@ -42,7 +42,7 @@ const UNCLASSIFIED = ['name', 'description', 'vhostSniCustomWordlist', 'supplyCh
  * so these are the columns a preset used to lose.
  */
 const ABSENT_FROM_BACKEND_DEFAULTS = [
-  'katanaScope', 'sqliLevel', 'sqliRisk', 'sqliTamperScripts', 'ssrfCloudProviders',
+  'sqliLevel', 'sqliRisk', 'sqliTamperScripts', 'ssrfCloudProviders',
   'rceAggressivePayloads', 'pathTraversalRequestTimeout', 'trufflehogEnabled',
   'trufflehogConcurrency', 'cypherfixDefaultBranch', 'cypherfixRequireApproval',
   'supplyChainEcosystems', 'supplyChainOrgMaxRepos', 'triageReviewBudget',
@@ -218,7 +218,6 @@ describe('extractPresetSettings', () => {
     // The create form only holds what /defaults returned.
     const result = extractPresetSettings({ naabuEnabled: false })
     expect(result.naabuEnabled).toBe(false)
-    expect(result.katanaScope).toBe('dn')
     expect(result.sqliLevel).toBe(1)
     expect(result.triageReviewBudget).toBe(150)
     expect(result.agentLport).toBeNull()
@@ -800,7 +799,8 @@ describe('ProjectForm: both preset kinds go through loadPreset', () => {
 
   test('it saves only the preset fields, not the whole form, as a compare-and-swap', () => {
     expect(loadPreset).toMatch(/pickPresetFields\(next/)
-    expect(loadPreset).toMatch(/const versioned = savedVersionRef\.current \? \{ \.\.\.saved, updatedAt: savedVersionRef\.current \} : saved/)
+    // withoutOwnerSecrets (step 5.2): a collaborator's save leaves the owner's secret columns out.
+    expect(loadPreset).toMatch(/const versioned = withoutOwnerSecrets\(savedVersionRef\.current \? \{ \.\.\.saved, updatedAt: savedVersionRef\.current \} : saved\)/)
     expect(loadPreset).toMatch(/mutateAsync\(\{ projectId, data: versioned/)
   })
 

@@ -22,7 +22,7 @@ Seven workloads (each independently toggled in settings):
   6. Latency p50 baseline     -> ai_latency_p50_ms (piggybacks on #1)
   7. Cross-reference / glue    -> merged interface type, summary counters
 
-All heavy third-party deps (mcp, yara, prance, jq) are imported lazily inside
+All heavy third-party deps (mcp, yara, jq) are imported lazily inside
 functions so a not-yet-rebuilt image degrades this module instead of crashing
 the whole recon job.
 """
@@ -34,7 +34,7 @@ import time
 import hashlib
 import asyncio
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -48,6 +48,7 @@ except Exception:
     pass
 
 from recon.helpers import ai_signal_catalog as cat
+from recon.helpers import request_pacer
 
 # Vendored data (Apache-2.0): Cisco MCP YARA rules + Julius probe packs.
 # Lives beside the module (the sibling `data/` dir is a root-owned runtime cache).
@@ -71,6 +72,17 @@ _MCP_THREAT_MAP = {
 # --------------------------------------------------------------------------- #
 def _log(msg: str, sym: str = "*") -> None:
     print(f"[{sym}][AISurfaceRecon] {msg}", flush=True)
+
+
+def _paced(send, url: str, **kwargs):
+    """One probe through ``send`` (a session's get or post) after a slot of
+    the process-wide RoE pacer, so the host workers share the ceiling with
+    every other in-process requester. Every probe here is sent with
+    allow_redirects=False: one call is one request."""
+    request_pacer.acquire()
+    response = send(url, **kwargs)
+    request_pacer.back_off_on_429(response)
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +171,8 @@ def _probe_chat(base_url: str, cand: dict, session: requests.Session,
     latencies = []
     for path in paths[:24]:
         url = base_url.rstrip("/") + path
+        # The wait for a slot is the ceiling's, not the endpoint's latency.
+        request_pacer.acquire()
         t0 = time.monotonic()
         try:
             r = session.post(url, data=body,
@@ -167,6 +181,7 @@ def _probe_chat(base_url: str, cand: dict, session: requests.Session,
         except requests.RequestException:
             continue
         latencies.append((time.monotonic() - t0) * 1000.0)
+        request_pacer.back_off_on_429(r)
         ctype = r.headers.get("Content-Type", "")
         is_sse = "text/event-stream" in ctype.lower()
         iface = None
@@ -207,9 +222,9 @@ def _mcp_detect(base_url: str, session: requests.Session, timeout: float) -> dic
     for path in cat.AI_MCP_PROBE_PATHS:
         url = base_url.rstrip("/") + path
         try:
-            r = session.post(url, json=init,
-                             headers={"Accept": "application/json, text/event-stream"},
-                             timeout=timeout, allow_redirects=False, verify=False)
+            r = _paced(session.post, url, json=init,
+                       headers={"Accept": "application/json, text/event-stream"},
+                       timeout=timeout, allow_redirects=False, verify=False)
         except requests.RequestException:
             continue
         if r.status_code == 401 and r.headers.get("WWW-Authenticate"):
@@ -243,67 +258,105 @@ def _first_sse_json(text: str) -> dict | None:
     return None
 
 
+def _mcp_paced_hooks(budget: asyncio.Timeout) -> dict:
+    """httpx event hooks: every request the MCP SDK sends (the handshake, each
+    listing, the event stream, the closing DELETE, each redirect hop) takes a
+    slot of the process-wide RoE pacer, and a 429 backs off every requester.
+
+    The wait sleeps on the loop's thread: this loop runs this one listing, and
+    the listing's deadline cannot fire during the sleep, so it is moved by the
+    wait before anything else runs. The queue is the ceiling's, not a slow
+    server's.
+    """
+    async def before(request):
+        waited = request_pacer.acquire()
+        when = budget.when()
+        if waited and when is not None:
+            budget.reschedule(when + waited)
+
+    async def after(response):
+        request_pacer.back_off_on_429(response)
+
+    return {"request": [before], "response": [after]}
+
+
 def _mcp_enumerate(url: str, timeout: float, extra_headers: dict | None = None) -> dict | None:
     """Use the MCP SDK to list tools/resources/prompts. Async -> own loop."""
-    async def _go():
+    async def _list(conn):
         from mcp import ClientSession
-        # The transport export was renamed (streamablehttp_client ->
-        # streamable_http_client) and its yielded tuple dropped the session-id
-        # callback (3-tuple -> 2-tuple) in a later SDK. Support both.
-        try:
-            from mcp.client.streamable_http import streamable_http_client as _client
-        except ImportError:
-            from mcp.client.streamable_http import streamablehttp_client as _client
-        from contextlib import AsyncExitStack
-        import inspect
-        import mcp.client.streamable_http as transport
-        async with AsyncExitStack() as stack:
-            kwargs = {}
-            if extra_headers:
-                parameters = inspect.signature(_client).parameters
-                if 'http_client' in parameters:
-                    # Use the HTTP implementation bundled with this SDK version.
-                    http_module = getattr(transport, 'httpx2', None)
-                    if http_module is None:
-                        import httpx as http_module
-                    client = await stack.enter_async_context(http_module.AsyncClient(
-                        headers=extra_headers, timeout=timeout, follow_redirects=False))
-                    kwargs['http_client'] = client
-                elif 'headers' in parameters:
-                    kwargs['headers'] = extra_headers
-                else:
-                    raise RuntimeError('MCP transport cannot preserve request headers')
-            conn = await stack.enter_async_context(_client(url, **kwargs))
-            read, write = conn[0], conn[1]  # tolerate 2- or 3-tuple
-            async with ClientSession(read, write) as s:
-                init = await s.initialize()
-                tools = await s.list_tools()
-                try:
-                    resources = await s.list_resources()
-                    res = [r.model_dump(by_alias=True) for r in resources.resources]
-                except Exception:
-                    res = []
-                try:
-                    prompts = await s.list_prompts()
-                    prm = [p.model_dump(by_alias=True) for p in prompts.prompts]
-                except Exception:
-                    prm = []
-                # Attribute names migrated camelCase -> snake_case across SDK
-                # versions; read both. model_dump(by_alias=True) yields camelCase
-                # wire keys (inputSchema) on every version.
-                si = getattr(init, "serverInfo", None) or getattr(init, "server_info", None)
-                return {
-                    "server_name": getattr(si, "name", None) if si else None,
-                    "server_version": getattr(si, "version", None) if si else None,
-                    "protocol_version": (getattr(init, "protocolVersion", None)
-                                         or getattr(init, "protocol_version", None)),
-                    "instructions": getattr(init, "instructions", None),
-                    "tools": [t.model_dump(by_alias=True) for t in tools.tools],
-                    "resources": res,
-                    "prompts": prm,
-                }
+        read, write = conn[0], conn[1]  # tolerate 2- or 3-tuple
+        async with ClientSession(read, write) as s:
+            init = await s.initialize()
+            tools = await s.list_tools()
+            try:
+                resources = await s.list_resources()
+                res = [r.model_dump(by_alias=True) for r in resources.resources]
+            except Exception:
+                res = []
+            try:
+                prompts = await s.list_prompts()
+                prm = [p.model_dump(by_alias=True) for p in prompts.prompts]
+            except Exception:
+                prm = []
+            # Attribute names migrated camelCase -> snake_case across SDK
+            # versions; read both. model_dump(by_alias=True) yields camelCase
+            # wire keys (inputSchema) on every version.
+            si = getattr(init, "serverInfo", None) or getattr(init, "server_info", None)
+            return {
+                "server_name": getattr(si, "name", None) if si else None,
+                "server_version": getattr(si, "version", None) if si else None,
+                "protocol_version": (getattr(init, "protocolVersion", None)
+                                     or getattr(init, "protocol_version", None)),
+                "instructions": getattr(init, "instructions", None),
+                "tools": [t.model_dump(by_alias=True) for t in tools.tools],
+                "resources": res,
+                "prompts": prm,
+            }
+
+    async def _go():
+        from mcp.shared._httpx_utils import create_mcp_http_client
+        async with asyncio.timeout(timeout * 4) as budget:
+            hooks = _mcp_paced_hooks(budget)
+
+            def paced_client(**kwargs):
+                if extra_headers:
+                    from recon.helpers.auth_profile import merge_identity_headers
+                    kwargs["headers"] = merge_identity_headers(kwargs.get("headers") or {}, extra_headers)
+                client = create_mcp_http_client(**kwargs)
+                client.follow_redirects = False
+                own = client.event_hooks
+                client.event_hooks = {kind: [*own.get(kind, ()), *added]
+                                      for kind, added in hooks.items()}
+                return client
+
+            # Preserve identification on both SDK transport APIs, without
+            # silently dropping the per-request pacing hook on a capped run.
+            import inspect
+            try:
+                from mcp.client.streamable_http import streamable_http_client as transport_client
+            except ImportError:
+                from mcp.client.streamable_http import streamablehttp_client as transport_client
+            parameters = inspect.signature(transport_client).parameters
+            if 'http_client' in parameters:
+                async with paced_client() as http:
+                    async with transport_client(url, http_client=http) as conn:
+                        return await _list(conn)
+            elif 'httpx_client_factory' in parameters:
+                async with transport_client(url, httpx_client_factory=paced_client) as conn:
+                    return await _list(conn)
+            elif 'headers' in parameters:
+                if request_pacer.ceiling():
+                    raise RuntimeError('MCP transport cannot preserve per-request RoE pacing')
+                async with transport_client(url, headers=extra_headers or {}) as conn:
+                    return await _list(conn)
+            else:
+                if extra_headers or request_pacer.ceiling():
+                    raise RuntimeError('MCP transport cannot preserve required headers or RoE pacing')
+                async with transport_client(url) as conn:
+                    return await _list(conn)
+
     try:
-        return asyncio.run(asyncio.wait_for(_go(), timeout * 4))
+        return asyncio.run(_go())
     except Exception:
         return None
 
@@ -414,7 +467,8 @@ def _probe_mcp(base_url: str, session: requests.Session, timeout: float,
                                 f"MCP tool '{t.get('name')}': {y['rule']}",
                                 base_url, det["path"], t.get("name"),
                                 owasp, atlas,
-                                json.dumps({"matched": y.get("matched"), "offset": y.get("offset")})))
+                                json.dumps({"matched": y.get("matched"), "offset": y.get("offset")}),
+                                rule=y["rule"]))
                 tools_out.append(entry)
             # server-instructions YARA
             if yara_on and mcp.get("instructions"):
@@ -422,7 +476,8 @@ def _probe_mcp(base_url: str, session: requests.Session, timeout: float,
                     findings.append(_mk_finding("mcp_prompt_injection", y["severity"],
                                     f"MCP server instructions: {y['rule']}",
                                     base_url, det["path"], None, "LLM01", "AML.T0051",
-                                    json.dumps({"matched": y.get("matched")})))
+                                    json.dumps({"matched": y.get("matched")}),
+                                    rule=y["rule"]))
             mcp["tools"] = tools_out
             mcp["tool_count"] = len(tools_out)
             mcp["tools_hash"] = hashlib.sha256(
@@ -433,9 +488,15 @@ def _probe_mcp(base_url: str, session: requests.Session, timeout: float,
     return {"mcp": mcp, "findings": findings}
 
 
-def _mk_finding(ftype, severity, desc, base_url, path, tool, owasp, atlas, evidence):
-    fid = "aisr_" + hashlib.sha256(
-        f"{ftype}|{base_url}|{path}|{tool}".encode()).hexdigest()[:16]
+def _mk_finding(ftype, severity, desc, base_url, path, tool, owasp, atlas, evidence,
+                rule=None):
+    # The YARA rule is part of a finding's identity: every rule that fires on a
+    # server's instructions is an mcp_prompt_injection with no tool, and a pack
+    # can hold several rules of one threat type for a tool. The rule name comes
+    # from the vendored pack, never from the target. A finding with no rule keeps
+    # the key it always had; tooling/scripts/aisr_finding_rekey.py moves the rest.
+    key = f"{ftype}|{base_url}|{path}|{tool}" + (f"|{rule}" if rule else "")
+    fid = "aisr_" + hashlib.sha256(key.encode()).hexdigest()[:16]
     return {"id": fid, "type": ftype, "severity": severity, "name": desc,
             "baseurl": base_url, "path": path, "tool_name": tool,
             "owasp_llm_id": owasp, "atlas_technique": atlas, "evidence": evidence}
@@ -451,7 +512,7 @@ def _probe_openapi(base_url: str, session: requests.Session, timeout: float,
     for path in cat.AI_OPENAPI_DISCOVERY_PATHS:
         url = base_url.rstrip("/") + path
         try:
-            r = session.get(url, timeout=timeout, allow_redirects=False, verify=False)
+            r = _paced(session.get, url, timeout=timeout, allow_redirects=False, verify=False)
         except requests.RequestException:
             continue
         if r.status_code != 200:
@@ -512,24 +573,95 @@ def _extract_model_ids(resp) -> list:
     return [x for x in ids if isinstance(x, str)]
 
 
+_SPEC_REF_MAX_DEPTH = 128
+_SPEC_REF_MAX_NODES = 100_000
+_SPEC_REF_MAX_CHARS = 16 * 1024 * 1024
+
+
+class _SpecLimit(Exception):
+    pass
+
+
+def _resolve_local_refs(doc):
+    """Inline the ``#/...`` JSON-pointer ``$ref``s of a target's spec, with no I/O.
+
+    The document is target-controlled: following a remote or ``file:`` ``$ref``
+    would make the recon container fetch any URL from its network position
+    (no RoE, no rate ceiling, no SSRF guard) and copy its own files into the
+    cached spec. Any ``$ref`` that is not a pointer into this document, or that
+    points nowhere, stays as data; so does a cyclic one. The node and character
+    budgets bound alias fan-out (one large subtree referenced many times): over
+    a budget the document is returned unresolved.
+    """
+    nodes = [_SPEC_REF_MAX_NODES]
+    chars = [_SPEC_REF_MAX_CHARS]
+
+    def spend(n_chars):
+        nodes[0] -= 1
+        chars[0] -= n_chars
+        if nodes[0] < 0 or chars[0] < 0:
+            raise _SpecLimit()
+
+    def pointer_tokens(ref):
+        # RFC 6901 section 6: a URI fragment is percent-decoded, then read as a pointer.
+        return tuple(t.replace("~1", "/").replace("~0", "~")
+                     for t in unquote(ref[1:]).split("/")[1:])
+
+    def target_of(tokens):
+        target = doc
+        for token in tokens:
+            if isinstance(target, list):
+                if not token.isdigit():
+                    raise KeyError(token)
+                target = target[int(token)]
+            else:
+                target = target[token]
+        return target
+
+    def expand(value, stack, depth):
+        if depth > _SPEC_REF_MAX_DEPTH:
+            raise _SpecLimit()
+        spend(len(value) if isinstance(value, str) else 0)
+        if isinstance(value, list):
+            return [expand(v, stack, depth + 1) for v in value]
+        if not isinstance(value, dict):
+            return value
+        ref = value.get("$ref")
+        if isinstance(ref, str) and (ref == "#" or ref.startswith("#/")):
+            tokens = pointer_tokens(ref)
+            if tokens not in stack:
+                try:
+                    target = target_of(tokens)
+                except (KeyError, IndexError, TypeError, ValueError):
+                    pass
+                else:
+                    return expand(target, stack | {tokens}, depth + 1)
+        out = {}
+        for key, child in value.items():
+            spend(len(key))
+            out[key] = expand(child, stack, depth + 1)
+        return out
+
+    try:
+        return expand(doc, frozenset(), 0)
+    except (_SpecLimit, RecursionError):
+        return doc
+
+
 def _parse_spec(text: str) -> dict | None:
     try:
         doc = json.loads(text)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         return None
     # ai-plugin.json manifest
     if isinstance(doc, dict) and doc.get("schema_version") and doc.get("api"):
         return {"supports_tools": True, "_spec": doc,
                 "manifest_name": doc.get("name_for_model")}
-    # OpenAPI: resolve with prance if available
-    spec = doc
-    try:
-        from prance import ResolvingParser
-        spec = ResolvingParser(spec_string=text, backend="openapi-spec-validator").specification
-    except Exception:
-        spec = doc
+    spec = _resolve_local_refs(doc)
     info = {"_spec": spec}
-    blob = json.dumps(spec).lower()
+    # The flags read what the target served: inlining local refs only copies
+    # subtrees of it, and the served text is the smaller of the two to scan.
+    blob = json.dumps(doc).lower()
     if '"tools"' in blob or '"function"' in blob or '"input_schema"' in blob:
         info["supports_tools"] = True
     if '"image_url"' in blob or '"image"' in blob:
@@ -582,6 +714,17 @@ def _probe_julius(base_url: str, timeout: float, ua: str,
 # --------------------------------------------------------------------------- #
 # Workload 5 — vector-DB confirmation reads
 # --------------------------------------------------------------------------- #
+def _url_authority(host: str) -> str:
+    """``host`` as a URL's authority needs it: an IPv6 literal in brackets (B-12)."""
+    import ipaddress
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            return f"[{host}]"
+    except ValueError:
+        pass
+    return host
+
+
 def _confirm_vector_dbs(combined_result: dict, session: requests.Session,
                         timeout: float) -> list:
     """Confirm vector DBs via a benign unauthenticated read.
@@ -600,11 +743,36 @@ def _confirm_vector_dbs(combined_result: dict, session: requests.Session,
     # (tech, host, port) -> {"ip": str|None, "schemes": tuple}
     candidates: dict = {}
 
+    def _address(value, host):
+        """The IP a candidate runs on: the one recorded for it, else the host
+        when it is an address. The writer anchors the Technology on that IP's
+        Port, and a candidate with none can only be matched by host and port."""
+        import ipaddress
+        for v in (value, host):
+            try:
+                return str(ipaddress.ip_address(str(v).strip("[]")))
+            except ValueError:
+                continue
+        return None
+
+    # IP mode: the read goes to the target address itself (B-11). A by_host key
+    # can be an IP-mode label or a name, and only the address is a target.
+    from recon.helpers.target_admission import ip_mode_targets, is_target
+    targets = ip_mode_targets(combined_result)
+
+    def _ip_mode_host(host, ip):
+        """The host to read in IP mode (the address), or None to skip it."""
+        return ip if ip is not None and is_target(ip, targets) else None
+
     ps = combined_result.get("port_scan", {}).get("by_host", {}) or {}
     for host, rec in ps.items():
         if not isinstance(rec, dict):
             continue
-        ip = rec.get("ip")
+        ip = _address(rec.get("ip"), host)
+        if targets is not None:
+            host = _ip_mode_host(host, ip)
+            if host is None:
+                continue
         for p in rec.get("ports", []) or []:
             try:
                 port = int(p)
@@ -635,8 +803,15 @@ def _confirm_vector_dbs(combined_result: dict, session: requests.Session,
         except ValueError:
             continue
         other = "https" if parsed.scheme == "http" else "http"
-        candidates.setdefault((tech, host, int(port)),
-                              {"ip": None, "schemes": (parsed.scheme or "http", other)})
+        ip = _address(info.get("ip"), host)
+        if targets is not None:
+            host = _ip_mode_host(host, ip)
+            if host is None:
+                continue
+        cand = candidates.setdefault((tech, host, int(port)),
+                                     {"ip": ip, "schemes": (parsed.scheme or "http", other)})
+        if not cand["ip"]:
+            cand["ip"] = ip
 
     for (tech, host, port), info in candidates.items():
         reads = cat.AI_VECTOR_DB_READS.get(tech) or []
@@ -645,10 +820,10 @@ def _confirm_vector_dbs(combined_result: dict, session: requests.Session,
             if confirmed:
                 break
             for path, expect in reads:
-                url = f"{scheme}://{host}:{port}{path}"
+                url = f"{scheme}://{_url_authority(host)}:{port}{path}"
                 try:
-                    r = session.get(url, timeout=timeout, verify=False,
-                                    allow_redirects=False)
+                    r = _paced(session.get, url, timeout=timeout, verify=False,
+                               allow_redirects=False)
                 except requests.RequestException:
                     continue
                 if r.status_code == 200 and (not expect or expect in (r.text or "")):

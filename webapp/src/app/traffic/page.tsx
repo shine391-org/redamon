@@ -4,8 +4,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Network, PanelRightOpen, Copy, Settings } from 'lucide-react'
 import { useProject } from '@/providers/ProjectProvider'
-import { useAuth } from '@/providers/AuthProvider'
+import { useCan, useRbacFlags } from '@/hooks/useCan'
+import { useRefusal } from '@/hooks/useRefusal'
 import { Drawer, useToast, useAlertModal, WikiInfoButton } from '@/components/ui'
+import { GuardedLink } from '@/components/GuardedLink'
 import { TrafficCaptureStatus } from '@/components/traffic/TrafficCaptureStatus'
 import { TrafficMindSettingsModal } from '@/components/traffic/TrafficMindSettingsModal'
 import { isHttpUrl } from '@/lib/url-utils'
@@ -24,6 +26,9 @@ import {
   type TrafficDetail,
 } from './hooks/useTrafficData'
 import styles from './page.module.css'
+
+// The Instance page's TrafficMind panel (app/admin/instance: each panel's id is its anchor).
+const INSTANCE_PAGE_TRAFFIC = '/admin/instance#traffic'
 
 const SORT_COLUMNS = new Set(['startedAt', 'statusCode', 'host', 'tool', 'method', 'respBodySize', 'responseTimeMs', 'source'])
 
@@ -64,7 +69,12 @@ function toCurl(d: TrafficDetail): string {
 
 export default function TrafficPage() {
   const { projectId, userId, currentProject, isLoading: projectLoading } = useProject()
-  const { isAdmin } = useAuth()
+  const canManageCapture = useCan('platform:traffic_capture')
+  // With the admin console on, platform:traffic_capture opens its Instance section and the TrafficMind
+  // panel there (consoleSections.ts, instanceView.ts), so the settings are edited on that page.
+  const settingsOnInstancePage = useRbacFlags()?.governance === true && canManageCapture
+  // A read share with Raw data & files reads and exports the owner's traffic and deletes none (4.11).
+  const deleteRefusal = useRefusal('traffic:delete', projectId)?.text ?? null
   const router = useRouter()
   const toast = useToast()
 
@@ -189,19 +199,29 @@ export default function TrafficPage() {
         <a className={styles.pageBtn} href={exportUrl('csv')}>Export CSV</a>
         <a className={styles.pageBtn} href={exportUrl('json')}>Export JSON</a>
         {selected.size > 0 && (
-          <button className={styles.clearBtn} onClick={handleDeleteSelected}>Delete selected ({selected.size})</button>
+          <button className={styles.clearBtn} onClick={handleDeleteSelected} disabled={!!deleteRefusal}
+            title={deleteRefusal ?? undefined}>Delete selected ({selected.size})</button>
         )}
         {total > 0 && (
-          <button className={styles.clearBtn} onClick={handleDeleteAllMatching}>Delete all matching</button>
+          <button className={styles.clearBtn} onClick={handleDeleteAllMatching} disabled={!!deleteRefusal}
+            title={deleteRefusal ?? undefined}>Delete all matching</button>
         )}
-        {isAdmin && (
-          <button className={styles.settingsBtn} onClick={() => setSettingsOpen(true)} title="TrafficMind global settings (admin)">
+        {settingsOnInstancePage ? (
+          <GuardedLink className={styles.settingsBtn} href={INSTANCE_PAGE_TRAFFIC}
+            title="TrafficMind global settings, on the IAM console's Instance page">
+            <Settings size={15} /> Settings
+          </GuardedLink>
+        ) : canManageCapture && (
+          <button className={styles.settingsBtn} onClick={() => setSettingsOpen(true)} title="TrafficMind global settings">
             <Settings size={15} /> Settings
           </button>
         )}
       </div>
 
-      <TrafficMindSettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} userId={userId} />
+      {/* Mounted only for platform:traffic_capture: it reads the global capture settings on open. */}
+      {canManageCapture && !settingsOnInstancePage && (
+        <TrafficMindSettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} userId={userId} />
+      )}
 
       {/* Filters */}
       <div className={styles.filters}>

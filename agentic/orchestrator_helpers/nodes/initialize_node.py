@@ -17,7 +17,7 @@ from state import (
     utc_now,
 )
 import orchestrator_helpers.chain_graph_writer as chain_graph
-from orchestrator_helpers.config import get_config_values
+from orchestrator_helpers.config import get_config_values, get_tenant_id
 from orchestrator_helpers.phase import classify_attack_path, determine_phase_for_new_objective
 from neo4j_read_pool import run_neo4j_read
 from project_settings import get_setting
@@ -96,6 +96,33 @@ def _build_guardrail_loop_failure(user_id, project_id, session_id, target_desc, 
     }
 
 
+LLM_BUDGET_GUARDRAIL_REFUSED = "Scope Guardrail: daily model-call budget used up"
+
+
+def _build_guardrail_budget_refusal(user_id, project_id, session_id, target_desc, exc) -> dict:
+    """A daily budget on instance LLM providers refused the guardrail's model call: still blocked.
+
+    The exception's own text names the limit and whose budget it is (never an
+    account id), as every other surface that meets the budget says it.
+    """
+    return {
+        "messages": [AIMessage(content=(
+            f"**{LLM_BUDGET_GUARDRAIL_REFUSED}**\n\n"
+            f"The scope check for `{target_desc}` needs a model call, and it was refused: {exc}\n\n"
+            f"Send your message again once the budget starts again, or ask an administrator "
+            f"to raise it.\n\n"
+            f"The agent uses a fail-closed policy: it will not proceed until the guardrail "
+            f"can verify the target."
+        ))],
+        "task_complete": True,
+        "completion_reason": LLM_BUDGET_GUARDRAIL_REFUSED,
+        "_guardrail_blocked": True,
+        "user_id": user_id,
+        "project_id": project_id,
+        "session_id": session_id,
+    }
+
+
 async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | None:
     """Run LLM-based guardrail check on the project's target scope.
 
@@ -106,14 +133,15 @@ async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | N
     Returns a state update dict if blocked, or None if allowed.
     """
     from orchestrator_helpers.guardrail import check_target_allowed
-    from project_settings import soft_guardrail_names
+    from project_settings import ip_soft_guardrail_names, soft_guardrail_names
 
     ip_mode = get_setting('IP_MODE', False)
     target_ips = get_setting('TARGET_IPS', [])
     # The orgs and scan roots, whatever the target mode. A Domain-batch project
     # has no TARGET_DOMAIN, so reading that field alone used to skip this check
-    # on the projects with the MOST targets.
-    scope_domains = soft_guardrail_names()
+    # on the projects with the MOST targets. In IP mode: the include entries a
+    # record_filter run scans under, judged in a call of their own after the IPs.
+    scope_domains = ip_soft_guardrail_names() if ip_mode else soft_guardrail_names()
 
     # A batch project with no derivable scope is misconfigured, not unconstrained:
     # fail closed rather than fall through to "nothing to check".
@@ -128,7 +156,7 @@ async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | N
     if not scope_domains and not target_ips:
         return None
 
-    target_desc = ", ".join(scope_domains[:5]) if not ip_mode else ", ".join(target_ips[:5])
+    target_desc = ", ".join(scope_domains[:5]) if not ip_mode else ", ".join([*target_ips[:5], *scope_domains[:5]])
 
     try:
         result = await check_target_allowed(
@@ -136,8 +164,10 @@ async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | N
             # A LIST, never a joined string: the singular prompt would ask for one
             # verdict on "a.com, b.com, c.com" and could allow the set despite one
             # blocked member. check_target_allowed routes a list to the
-            # block-if-any prompt.
-            target_domains=[] if ip_mode else scope_domains,
+            # block-if-any prompt. IPs and names together are two model calls,
+            # both inside this try: a loop failure in the second ends the
+            # session like one in the first.
+            target_domains=scope_domains,
             target_ips=target_ips if ip_mode else [],
         )
 
@@ -151,12 +181,23 @@ async def _run_scope_guardrail(llm, user_id, project_id, session_id) -> dict | N
             return _build_guardrail_block(user_id, project_id, session_id, target_desc, reason)
 
     except Exception as e:
-        if getattr(e, "no_retry", False):
+        # By class, not by `no_retry`: the budget refusal carries that marker too
+        # and is no loop step, so it must not read as the external agent's silence.
+        from agent_in_the_loop.errors import LoopError
+        from llm_budget import LlmBudgetExhausted
+
+        if isinstance(e, LoopError):
             logger.error(
                 f"[{user_id}/{project_id}/{session_id}] Scope guardrail step not answered "
                 f"(fail closed): {type(e).__name__}"
             )
             return _build_guardrail_loop_failure(user_id, project_id, session_id, target_desc, e)
+        if isinstance(e, LlmBudgetExhausted):
+            logger.warning(
+                f"[{user_id}/{project_id}/{session_id}] Scope guardrail refused by the daily "
+                f"model-call budget (fail closed): {e.code}"
+            )
+            return _build_guardrail_budget_refusal(user_id, project_id, session_id, target_desc, e)
         # FAIL CLOSED — agent must not proceed if it cannot verify the target
         logger.error(
             f"[{user_id}/{project_id}/{session_id}] Scope guardrail error (fail closed): {e}"
@@ -214,16 +255,81 @@ async def _run_scope_checks(llm, user_id, project_id, session_id) -> dict | None
             target_domain, reason = hit
             logger.warning(f"[{user_id}/{project_id}/{session_id}] HARD GUARDRAIL BLOCKED: {reason}")
             return _build_guardrail_block(user_id, project_id, session_id, target_domain, reason)
+    else:
+        # IP mode: an address is never hard-blocked, but the hostname include
+        # entries name the hosts a record_filter run scans under (I-2), and the
+        # webapp's write-time check does not cover a row edited or imported
+        # around it. A blocked scanned name is not a refusal: recon's selection
+        # refuses those, and the reader drops one a newer list would block.
+        hit = first_hard_blocked(guardrail_names())
+        if hit:
+            name, reason = hit
+            logger.warning(f"[{user_id}/{project_id}/{session_id}] HARD GUARDRAIL BLOCKED (IP mode): {reason}")
+            return _build_guardrail_block(user_id, project_id, session_id, name, reason)
 
     if get_setting('AGENT_GUARDRAIL_ENABLED', True):
         return await _run_scope_guardrail(llm, user_id, project_id, session_id)
     return None
 
 
-async def _scope_gate(state, llm, user_id, project_id, session_id) -> tuple[dict | None, dict]:
+#: The selection's own names (recon's ip_hostnames writer), on the tenant key,
+#: and only those a run left scanned: an out_of_policy name (a narrowing) is
+#: not one, and a recorded name is an ExternalDomain, never read here.
+SCANNED_HOSTNAMES_CYPHER = """
+MATCH (s:Subdomain {user_id: $uid, project_id: $pid, source: 'ip_hostname_selection'})
+WHERE s.ip_hostname_reason = 'scanned'
+RETURN s.name AS name
+"""
+
+# Seconds a turn waits for the scanned hostnames. Past it the turn runs on the
+# target IPs alone, a narrower scope, rather than waiting on a slow Neo4j.
+SCANNED_HOSTNAMES_WAIT_S = 10.0
+
+
+def _query_scanned_hostnames(neo4j_uri, neo4j_user, neo4j_password, user_id, project_id) -> list[str]:
+    """The scanned hostnames as the graph holds them (raw; the caller applies
+    the current policy). Raises when the graph cannot answer: an empty list
+    would read as "no name scanned"."""
+    if not neo4j_uri or not neo4j_password:
+        raise RuntimeError("Neo4j is not configured")
+    driver = chain_graph._get_driver(neo4j_uri, neo4j_user, neo4j_password)
+    with driver.session() as session:
+        rows = session.run(SCANNED_HOSTNAMES_CYPHER, uid=user_id, pid=project_id)
+        return [r["name"] for r in rows if r["name"]]
+
+
+async def read_scanned_hostnames(user_id, project_id, neo4j_creds=None) -> list[str]:
+    """_query_scanned_hostnames on the read pool, bounded by SCANNED_HOSTNAMES_WAIT_S.
+    Without `neo4j_creds` the agent's own (NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD)."""
+    import os
+    creds = neo4j_creds or (os.getenv("NEO4J_URI", "bolt://neo4j:7687"), os.getenv("NEO4J_USER", "neo4j"),
+                            os.getenv("NEO4J_PASSWORD"))
+    return await asyncio.wait_for(run_neo4j_read(_query_scanned_hostnames, *creds, user_id, project_id),
+                                  timeout=SCANNED_HOSTNAMES_WAIT_S)
+
+
+async def _bind_scanned_hostnames(neo4j_creds, user_id, project_id, session_id) -> None:
+    """Bind this turn's scanned hostnames for the scope signature and the prompt
+    (IP mode, record_filter / scan_all only; the other modes scan no name)."""
+    from project_settings import bind_ip_hostnames_scanned, scans_ip_hostnames
+
+    if not scans_ip_hostnames():
+        return
+    try:
+        names = await read_scanned_hostnames(user_id, project_id, neo4j_creds)
+    except Exception as exc:  # noqa: BLE001 - fewer names is a narrower scope, never a wider one
+        logger.warning(f"[{user_id}/{project_id}/{session_id}] Scanned hostnames unreadable, "
+                       f"the turn runs on the target IPs only: {type(exc).__name__}")
+        names = []
+    bind_ip_hostnames_scanned(names)
+
+
+async def _scope_gate(state, llm, user_id, project_id, session_id, neo4j_creds=None,
+                      tenant_id=None) -> tuple[dict | None, dict]:
     """(refusal, updates). The scope checks run at session start and again on any
     later turn whose scope differs from the one last checked: a mid-session
-    rescope must not inherit the old scope's approval."""
+    rescope must not inherit the old scope's approval. The scanned names are read
+    from the graph of `tenant_id`, the project's owner (`user_id` when None)."""
     from project_settings import SETTINGS_SOURCE_KEY, scope_signature
 
     previous = state.get("_scope_signature")
@@ -245,6 +351,7 @@ async def _scope_gate(state, llm, user_id, project_id, session_id) -> tuple[dict
         refusal["_scope_signature"] = _SETTINGS_UNAVAILABLE
         return refusal, {}
 
+    await _bind_scanned_hostnames(neo4j_creds, tenant_id or user_id, project_id, session_id)
     signature = scope_signature()
     if state.get("execution_trace") and not retry and previous == signature:
         return None, {"_scope_signature": signature}
@@ -331,7 +438,8 @@ def _roe_warning_update(user_id, project_id, session_id) -> dict:
 async def initialize_node(state: AgentState, config, *, llm, neo4j_creds) -> dict:
     """Initialize state, after the scope gate (_scope_gate) lets the turn run."""
     user_id, project_id, session_id = get_config_values(config)
-    refusal, updates = await _scope_gate(state, llm, user_id, project_id, session_id)
+    refusal, updates = await _scope_gate(state, llm, user_id, project_id, session_id, neo4j_creds=neo4j_creds,
+                                         tenant_id=get_tenant_id(state, config))
     if refusal is not None:
         return refusal
     if updates.get("_guardrail_blocked") is False:
@@ -354,6 +462,9 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
         neo4j_creds: Tuple of (neo4j_uri, neo4j_user, neo4j_password).
     """
     user_id, project_id, session_id = get_config_values(config)
+    # The project's owner: the chain is written, and prior chains read, under their id;
+    # kept in the state for the Fireteam members (user_id stays the person).
+    tenant_id = get_tenant_id(state, config)
     neo4j_uri, neo4j_user, neo4j_password = neo4j_creds
 
     logger.info(f"[{user_id}/{project_id}/{session_id}] Initializing state...")
@@ -367,6 +478,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with approval response: {state.get('user_approval_response')}")
         return {
             "user_id": user_id,
+            "tenant_user_id": tenant_id,
             "project_id": project_id,
             "session_id": session_id,
         }
@@ -375,6 +487,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with question answer")
         return {
             "user_id": user_id,
+            "tenant_user_id": tenant_id,
             "project_id": project_id,
             "session_id": session_id,
         }
@@ -462,7 +575,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
             chain_graph.fire_create_attack_chain(
                 neo4j_uri, neo4j_user, neo4j_password,
                 chain_id=session_id,
-                user_id=user_id,
+                user_id=tenant_id,
                 project_id=project_id,
                 title=latest_message[:200] if latest_message else "Untitled",
                 objective=latest_message[:500],
@@ -487,6 +600,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
                 "todo_list": [],  # Clear TODO list for new objective
                 "phase_history": state.get("phase_history", []),
                 "user_id": user_id,
+                "tenant_user_id": tenant_id,
                 "project_id": project_id,
                 "session_id": session_id,
                 "awaiting_user_approval": False,
@@ -512,7 +626,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
     chain_graph.fire_create_attack_chain(
         neo4j_uri, neo4j_user, neo4j_password,
         chain_id=session_id,
-        user_id=user_id,
+        user_id=tenant_id,
         project_id=project_id,
         title=latest_message[:200] if latest_message else "Untitled",
         objective=current_objective_content[:500],
@@ -536,6 +650,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
         "original_objective": state.get("original_objective", latest_message),  # Backward compat
         "target_info": state.get("target_info", TargetInfo().model_dump()),
         "user_id": user_id,
+        "tenant_user_id": tenant_id,
         "project_id": project_id,
         "session_id": session_id,
         "awaiting_user_approval": False,
@@ -560,7 +675,7 @@ async def _initialize(state: AgentState, config, *, llm, neo4j_creds) -> dict:
                 run_neo4j_read(
                     chain_graph.query_prior_chains,
                     neo4j_uri, neo4j_user, neo4j_password,
-                    user_id, project_id, session_id,
+                    tenant_id, project_id, session_id,
                 ),
                 timeout=PRIOR_CHAINS_WAIT_S,
             )

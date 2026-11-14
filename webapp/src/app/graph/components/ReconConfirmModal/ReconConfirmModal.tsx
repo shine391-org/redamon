@@ -4,8 +4,19 @@ import { useState, useEffect } from 'react'
 import { AlertTriangle, ShieldAlert, Play, Loader2, History, Trash2 } from 'lucide-react'
 import { Modal } from '@/components/ui'
 import type { ScanMode } from '@/hooks/useReconStatus'
-import { type ScopeGroup, groupLabel } from '@/lib/scopeGroups'
+import { type ScopeGroup, groupLabel, ipHostnameModeOf } from '@/lib/scopeGroups'
+import { IP_HOSTNAME_SECTION_LABEL, ipHostnameModeLabel } from '@/lib/ipHostnameModeLabels'
+import { useOptionalProject } from '@/providers/ProjectProvider'
+import { useRefusal } from '@/hooks/useRefusal'
+import { RefusalNotice } from '@/components/auth/ForbiddenNotice'
 import styles from './ReconConfirmModal.module.css'
+
+/** What the dialog says about an IP project's hostname policy. */
+export interface ConfirmHostnamePolicy {
+  ipHostnameMode?: string | null
+  ipHostnameInclude?: readonly string[] | null
+  ipHostnameExclude?: readonly string[] | null
+}
 
 interface GraphStats {
   totalNodes: number
@@ -26,6 +37,8 @@ interface ReconConfirmModalProps {
   isLoading: boolean
   /** Label of the version the current graph would be saved as (Scan Timeline). */
   currentVersionLabel?: string | null
+  /** IP mode: the saved hostname policy; read from the current project when not passed. */
+  hostnamePolicy?: ConfirmHostnamePolicy
 }
 
 export function ReconConfirmModal({
@@ -40,7 +53,16 @@ export function ReconConfirmModal({
   stats,
   isLoading,
   currentVersionLabel,
+  hostnamePolicy,
 }: ReconConfirmModalProps) {
+  // The graph page opens this dialog for its current project, whose summary
+  // carries the saved policy; absent (an older read) says nothing rather than
+  // guessing "IP only".
+  const contextProject = useOptionalProject()?.currentProject
+  const policy = hostnamePolicy ?? contextProject ?? undefined
+  const hostnameMode = ipMode && typeof policy?.ipHostnameMode === 'string'
+    ? ipHostnameModeOf(policy.ipHostnameMode)
+    : null
   // This dialog guards a destructive action, so it must never show a blank
   // target. A Domain-batch project has no targetDomain: name its groups instead.
   // An enumerated group discovers hosts this list never names, so the group
@@ -65,6 +87,12 @@ export function ReconConfirmModal({
   useEffect(() => {
     if (isOpen) setScanMode('new')
   }, [isOpen])
+  // The start route asks recon:overwrite on top of recon:scan for this mode (route manifest).
+  const overwriteRefusal = useRefusal('recon:overwrite')
+  const overwriteRefused = overwriteRefusal !== null
+  useEffect(() => {
+    if (overwriteRefused) setScanMode('new')
+  }, [overwriteRefused])
 
   return (
     <Modal
@@ -81,7 +109,28 @@ export function ReconConfirmModal({
           <p className={styles.projectInfo}>
             <strong>Target:</strong> {targetDisplay}
           </p>
+          {hostnameMode && (
+            <p className={styles.projectInfo} data-testid="recon-confirm-hostname-mode">
+              <strong>{IP_HOSTNAME_SECTION_LABEL}:</strong> {ipHostnameModeLabel(hostnameMode)}
+              {hostnameMode === 'record_filter' && (
+                ` (include ${(policy?.ipHostnameInclude ?? []).length}, exclude ${(policy?.ipHostnameExclude ?? []).length})`
+              )}
+            </p>
+          )}
         </div>
+
+        {hostnameMode === 'scan_all' && (
+          <div className={styles.disclaimer} role="note" data-testid="recon-confirm-scan-all">
+            <ShieldAlert size={18} className={styles.disclaimerIcon} />
+            <div className={styles.disclaimerContent}>
+              <p className={styles.disclaimerTitle}>Every hostname found on these IPs will be scanned</p>
+              <p className={styles.disclaimerText}>
+                Including sites you may not own (shared hosting). CDN edge addresses are always
+                skipped. Use this only for servers that are entirely yours.
+              </p>
+            </div>
+          </div>
+        )}
 
         <div className={styles.disclaimer}>
           <ShieldAlert size={18} className={styles.disclaimerIcon} />
@@ -143,14 +192,15 @@ export function ReconConfirmModal({
 
               <label
                 className={`${styles.modeOption} ${scanMode === 'overwrite' ? styles.modeOptionActive : ''}`}
+                title={overwriteRefusal?.text}
               >
                 <input
                   type="radio"
                   name="scanMode"
                   value="overwrite"
                   checked={scanMode === 'overwrite'}
-                  onChange={() => setScanMode('overwrite')}
-                  disabled={isLoading}
+                  onChange={() => { if (!overwriteRefused) setScanMode('overwrite') }}
+                  disabled={isLoading || overwriteRefused}
                 />
                 <Trash2 size={16} className={styles.modeIconDanger} />
                 <span className={styles.modeText}>
@@ -161,6 +211,7 @@ export function ReconConfirmModal({
                 </span>
               </label>
             </div>
+            {overwriteRefusal && <RefusalNotice refusal={overwriteRefusal} />}
           </>
         ) : (
           <div className={styles.ready}>

@@ -80,8 +80,10 @@ def get_ai_extensions(
     print(f"[*][{_TAG}] Planning extensions for {clean_url}")
 
     try:
+        # The first answer's headers are the target's own; a redirect could
+        # name a host the RoE exclude, unchecked (R-2).
         from recon.helpers.auth_profile import identity_header_dict, merge_identity_headers
-        head_resp = requests.head(clean_url, allow_redirects=True, timeout=HEAD_TIMEOUT,
+        head_resp = requests.head(clean_url, allow_redirects=False, timeout=HEAD_TIMEOUT,
                                   headers=merge_identity_headers({}, identity_header_dict(settings)) or None)
         headers = dict(head_resp.headers)
     except Exception as e:

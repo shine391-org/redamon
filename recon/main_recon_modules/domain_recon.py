@@ -365,8 +365,12 @@ def query_crtsh(domain: str, settings: dict = None) -> dict:
         if resp.status_code == 200:
             for entry in resp.json():
                 for sub in entry['name_value'].lower().split('\n'):
-                    if not sub.startswith('*.'):
-                        crtsh_subs.add(sub.strip())
+                    sub = sub.strip()
+                    # name_value lists every SAN, email ones too: an address
+                    # under the root would otherwise pass the "ends with
+                    # .<root>" scope test and become a Subdomain.
+                    if sub and not sub.startswith('*.') and '@' not in sub:
+                        crtsh_subs.add(sub)
             max_results = settings.get('CRTSH_MAX_RESULTS', 5000)
             if len(crtsh_subs) > max_results:
                 crtsh_subs = set(sorted(crtsh_subs)[:max_results])
@@ -814,16 +818,18 @@ def run_subfinder(domain: str, settings: dict = None) -> set:
     if _source_skipped("subfinder", "Subfinder"):
         return set()
 
+    from recon.helpers.docker_helpers import run_tool_container
     subdomains = set()
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=720)
+        result = run_tool_container(command, tool="subfinder", timeout=720)
 
-        if result.returncode != 0:
+        if not result.timed_out and result.returncode != 0:
             tail = (result.stderr or "").strip().splitlines()[-1:] or ["no stderr"]
             print(f"[!][Subfinder] Failed (exit {result.returncode}): {tail[0][:200]}")
             _source_record("subfinder", _outcome("TRANSIENT"), detail=f"exit {result.returncode}")
             return set()
 
+        # A cut-short run's last line may be a half-written object: it does not parse.
         for line in result.stdout.strip().split('\n'):
             line = line.strip()
             if not line:
@@ -840,15 +846,18 @@ def run_subfinder(domain: str, settings: dict = None) -> set:
             subdomains = set(sorted(subdomains)[:max_results])
             print(f"[*][Subfinder] Capped at {max_results} results")
 
+        if result.timed_out:
+            print(f"[!][Subfinder] Timed out: stopped it, keeping the {len(subdomains)} "
+                  f"subdomain(s) it printed")
+            _source_record("subfinder", _outcome("TRANSIENT"), detail="timeout")
+            return subdomains
+
         _source_record("subfinder", _outcome("OK"))
         if subdomains:
             print(f"[+][Subfinder] Found {len(subdomains)} subdomains")
         else:
             print(f"[*][Subfinder] Found 0 subdomains")
 
-    except subprocess.TimeoutExpired:
-        print("[!][Subfinder] Timed out")
-        _source_record("subfinder", _outcome("TRANSIENT"), detail="timeout")
     except FileNotFoundError:
         print("[!][Subfinder] Docker not found — cannot run")
     except Exception as e:
@@ -984,21 +993,21 @@ def run_amass(domain: str, settings: dict = None) -> set:
         shutil.rmtree(amass_temp, ignore_errors=True)
         return set()
 
+    from recon.helpers.docker_helpers import run_tool_container
     subdomains = set()
     try:
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            timeout=(timeout_min * 60) + 120
-        )
+        result = run_tool_container(command, tool="amass", timeout=(timeout_min * 60) + 120)
 
-        if result.returncode != 0:
+        if not result.timed_out and result.returncode != 0:
             tail = (result.stderr or "").strip().splitlines()[-1:] or ["no stderr"]
             print(f"[!][Amass] Failed (exit {result.returncode}): {tail[0][:200]}")
             _source_record("amass", _outcome("TRANSIENT"), detail=f"exit {result.returncode}")
             return set()
 
         # Output format: "name (FQDN) --> record_type --> target (FQDN)"
-        # Capture ALL FQDNs per line (both source and target can be subdomains)
+        # Capture ALL FQDNs per line (both source and target can be subdomains).
+        # A name counts only once its "(FQDN)" follows it, so a name the
+        # timeout's kill cut short is never taken.
         fqdn_pattern = re.compile(r'([\w.\-]+)\s+\(FQDN\)')
         for line in result.stdout.strip().split('\n'):
             line = line.strip()
@@ -1013,15 +1022,18 @@ def run_amass(domain: str, settings: dict = None) -> set:
             subdomains = set(sorted(subdomains)[:max_results])
             print(f"[*][Amass] Capped at {max_results} results")
 
+        if result.timed_out:
+            print(f"[!][Amass] Timed out: stopped it, keeping the {len(subdomains)} "
+                  f"subdomain(s) it printed")
+            _source_record("amass", _outcome("TRANSIENT"), detail="timeout")
+            return subdomains
+
         _source_record("amass", _outcome("OK"))
         if subdomains:
             print(f"[+][Amass] Found {len(subdomains)} subdomains")
         else:
             print(f"[*][Amass] Found 0 subdomains")
 
-    except subprocess.TimeoutExpired:
-        print("[!][Amass] Timed out")
-        _source_record("amass", _outcome("TRANSIENT"), detail="timeout")
     except FileNotFoundError:
         print("[!][Amass] Docker not found — cannot run")
     except Exception as e:
@@ -1411,8 +1423,16 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
     if skip_validation:
         command.append('--skip-validation')
 
+    from recon.helpers.docker_helpers import run_tool_container
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        result = run_tool_container(command, tool="puredns", timeout=600)
+
+        if result.timed_out:
+            # puredns writes its list as it goes: a cut-short list would drop
+            # every name it had not reached yet.
+            print("[!][Puredns] Timed out (600s): stopped it, returning the unfiltered list")
+            _source_record("puredns", _outcome("TRANSIENT"), detail="timeout")
+            return _puredns_skipped(subdomains, "timeout")
 
         if output_file.exists():
             with open(output_file, 'r') as f:
@@ -1429,10 +1449,6 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
                            detail=f"no output (exit {result.returncode})")
             return _puredns_skipped(subdomains, "no_output")
 
-    except subprocess.TimeoutExpired:
-        print("[!][Puredns] Timed out (600s) — returning unfiltered list")
-        _source_record("puredns", _outcome("TRANSIENT"), detail="timeout")
-        return _puredns_skipped(subdomains, "timeout")
     except FileNotFoundError:
         print("[!][Puredns] Docker not found — cannot run")
         return _puredns_skipped(subdomains, "docker_missing")
@@ -1449,11 +1465,10 @@ def run_puredns_resolve(subdomains: list, domain: str, settings: dict = None) ->
                 # The cleanup container itself must be bounded: without a timeout
                 # a hung `docker run` here would stall the whole scan at the end.
                 try:
-                    subprocess.run(
+                    run_tool_container(
                         ["docker", "run", "--rm", "-v", f"{data_dir}:/cleanup",
                          "alpine", "rm", "-f", f"/cleanup/{tmp.name}"],
-                        capture_output=True, timeout=60
-                    )
+                        tool="puredns-cleanup", timeout=60)
                 except Exception:  # noqa: BLE001 - best-effort cleanup
                     pass
 
@@ -1567,9 +1582,11 @@ def discover_subdomains(domain: str, bruteforce: bool = False,
     filtered_subs = []
     external_domain_entries = []
     for s, sources in sourced_subs.items():
+        if not s or '@' in s:  # an email address (a certificate SAN) is no hostname
+            continue
         if s == domain or s.endswith("." + domain):
             filtered_subs.append(s)
-        elif s and '@' not in s:  # non-empty, out-of-scope (skip email addresses from crt.sh)
+        else:
             for source in sources:
                 external_domain_entries.append({"domain": s, "source": source})
     all_subs = sorted(filtered_subs)
@@ -1653,18 +1670,22 @@ def discover_subdomains(domain: str, bruteforce: bool = False,
 
 
 def reverse_dns_lookup(ip_address: str, max_retries: int = 3):
-    """
-    Perform reverse DNS (PTR) lookup for an IP address.
+    """The first PTR name of an address, or None. Kept for callers that want
+    one name; an IP-mode run asks reverse_dns_lookup_all."""
+    names = reverse_dns_lookup_all(ip_address, max_retries)
+    return names[0] if names else None
 
-    Args:
-        ip_address: IPv4 or IPv6 address string
-        max_retries: Number of retry attempts
 
-    Returns:
-        Hostname string if PTR record found, None otherwise
+def reverse_dns_lookup_all(ip_address: str, max_retries: int = 3) -> list:
+    """Every PTR name of an address, in answer order, without the root dot or
+    duplicates; [] when there is none or no answer could be had.
+
+    A shared host carries one PTR record per site, and the resolver may rotate
+    their order, so keeping only the first lost the others and made the one
+    kept depend on the resolver.
     """
     if resolver_breaker.is_open():
-        return None
+        return []
 
     # Per-/24 (reverse-zone) breaker: a zone whose PTR authority stops answering
     # is skipped for its remaining IPs, instead of timing out on each one. A
@@ -1672,7 +1693,7 @@ def reverse_dns_lookup(ip_address: str, max_retries: int = 3):
     # count against it.
     zone_breaker = _rdns_zone_breaker(ip_address)
     if zone_breaker is not None and _breaker_is_open(zone_breaker):
-        return None
+        return []
 
     definitive = _dns_definitive_errors()
     for attempt in range(max_retries):
@@ -1680,24 +1701,27 @@ def reverse_dns_lookup(ip_address: str, max_retries: int = 3):
             rev_name = dns.reversename.from_address(ip_address)
             answers = dns.resolver.resolve(rev_name, 'PTR')
             _rdns_record_ok(zone_breaker)
-            # Return first PTR record, strip trailing dot
-            hostname = str(answers[0]).rstrip('.')
-            return hostname
+            names = []
+            for answer in answers:
+                name = str(answer).rstrip('.')
+                if name and name not in names:
+                    names.append(name)
+            return names
         except definitive:
             _rdns_record_ok(zone_breaker)  # a definitive answer = zone is alive
-            return None
+            return []
         except (dns.resolver.LifetimeTimeout, dns.resolver.Timeout,
                 dns.resolver.NoNameservers):
             if resolver_breaker.note_transient():
-                return None
+                return []
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
             _rdns_record_timeout(zone_breaker)
-            return None
+            return []
         except Exception:
-            return None
-    return None
+            return []
+    return []
 
 
 def _rdns_zone_breaker(ip_address: str):

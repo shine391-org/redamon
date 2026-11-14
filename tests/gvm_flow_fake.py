@@ -85,7 +85,7 @@ class FakeGraph:
                 "cves_deleted": 0, "technologies_cleaned": 0}
 
     def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
-                              keep_unproven=False):
+                              keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
         self.log.append(("prune", list(sources), since, sorted(keep_hosts)))
         return {"pruned": 0, "stale": 0, "revived": 0}
 
@@ -122,7 +122,7 @@ class GvmFlowTestCase(unittest.TestCase):
             mock.patch.object(gvm_main, "load_recon_file",
                               return_value={"metadata": {"root_domain": "example.com"}}),
             mock.patch.object(gvm_main, "extract_targets_from_recon",
-                              side_effect=lambda _r: (list(self.IPS), list(self.HOSTS))),
+                              side_effect=lambda _r, settings=None: (list(self.IPS), list(self.HOSTS))),
             mock.patch.object(gvm_main, "save_vuln_results",
                               side_effect=lambda r, p: self.log.append(("save", len(r["scans"])))),
             mock.patch.object(gvm_main, "update_graph_from_gvm_results", side_effect=write),

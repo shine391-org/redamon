@@ -122,7 +122,7 @@ The projects table holds the configuration parameters, each described in `recon_
 
 ### Plugin Platform Tables
 
-Four tables hold the plugin platform's state ([README.PLUGINS.md](README.PLUGINS.md) §11.5). Plugin code never touches them directly: the webapp's Plugin Manager and Gateway are their only writers.
+Five tables hold the plugin platform's state ([README.PLUGINS.md](README.PLUGINS.md) §11.5). Plugin code never touches them directly: the webapp's Plugin Manager and Gateway are their only writers.
 
 | Table (model) | One row per | What it holds |
 |---|---|---|
@@ -130,10 +130,41 @@ Four tables hold the plugin platform's state ([README.PLUGINS.md](README.PLUGINS
 | `plugin_data` (`PluginData`) | value a plugin stored | JSON keyed by plugin, namespace (`live`, or a migration copy), owner, collection and key, with its size and an optional expiry. Action jobs live here too, under the reserved `__jobs` collection. Rows cascade with their user or project; quotas are enforced by the Gateway |
 | `plugin_overrides` (`PluginOverride`) | part of a proposed skill version | The proposed text for one part of a built-in skill, its scope (user or project) and the SHA-256 of the factory text it was built on. Rows that share a `change_set_id` are decided together; an approved change set gets the next `revision` for its scope. `status` is `proposed`, `active`, `rejected`, `withdrawn`, `superseded`, `stale` or `cleared`, with who decided and when |
 | `plugin_platform_state` (`PluginPlatformState`) | instance fact | The highest catalog `serial` accepted (a lower one is a replayed catalog and is refused), the never-lowered version counters, the reconcile lease |
+| `plugin_access_rules` (`PluginAccessRule`) | plugin and permission set | The per-plugin allowlist: with any row, the plugin is available only to the holders of a listed member set (and to `platform:plugins`); with none, to everyone holding `plugins:use`. Read only with `RBAC_GOVERNANCE_ENABLED` on. `plugin_id` and `set_id` have no foreign key: rules survive an uninstall, and a set a rule names cannot be deleted |
 
 `installed_by`, `created_by` and `decided_by` deliberately have no foreign key: deleting the admin who installed a plugin or decided a version must not uninstall it for everyone or remove a version from its owner's scope. Uninstalling asks whether to keep the plugin's data: **keep** sets the install back to `available` and leaves its rows dormant for a reinstall; **purge** deletes its `plugin_data`, `plugin_overrides` and `plugin_installs` rows for every user and project (an admin can export them first).
 
 For the complete schema, see [webapp/prisma/schema.prisma](../../webapp/prisma/schema.prisma).
+
+### Device Session Table
+
+`user_sessions` (`UserSession`), one row per browser sign-in, written and read only with `RBAC_GOVERNANCE_ENABLED` on (login and invite accept write it; its id is the token's `sid` claim): `session_version` (the account's at sign-in; a row below the account's current version reads as ended), `created_at`, `last_seen_at` (updated at most every 5 minutes), `expires_at`, `ip` with `ip_trusted`, `user_agent`, `revoked_at`, `revoked_by_id` (no foreign key) and `ended_by` (`sign_out`, `self` or `admin`). The rows go with their account; the expiry sweep deletes a row 30 days after it was revoked or expired.
+
+The governance settings live on the one `instance_settings` row: `quotas` (JSON, `{}` = every quota unlimited), `audit_retention_days` (null = keep forever) and `audit_retention_pending` (Root's retention change while it waits its 7 days, null when none).
+
+### Instance LLM Provider Tables
+
+Three tables back the LLM providers Root adds for the whole instance (Instance page, Root only), read only with `RBAC_GOVERNANCE_ENABLED` on.
+
+| Table (model) | One row per | What it holds |
+|---|---|---|
+| `instance_llm_providers` (`InstanceLlmProvider`) | instance provider | The columns of `user_llm_providers` without the account: kind, name, key fields (stored as in `user_llm_providers` and masked on every browser read), endpoint, model and options. Never sent to a browser or a scan container: the agent receives it, with its key, only in the provider list of an account that may use it |
+| `permission_set_providers` (`PermissionSetProvider`) | provider and permission set | Who may use a provider: the holders of a listed set (built-in or custom; an admin profile counts). `set_id` has no foreign key (built-in sets have no row), so a set a row names cannot be deleted; the rows go with their provider |
+| `quota_usage` (`QuotaUsage`) | account, UTC day and kind | Calls counted against a daily budget (`llm_instance_calls` first); the rows go with their account |
+
+`instance_settings.byo_llm_forbidden` (default false): when true, the agent no longer uses the providers an account added itself if that account lacks the permission to add them.
+
+### Project Access Policy Table
+
+`project_access_policies` (`ProjectAccessPolicy`), one row per project at most, read only while Read + Write sharing is in force (`RBAC_SHARING_WRITE_ENABLED` and the instance sharing policy). `owner_credential_consent_at` records that the project's owner lets collaborators spend the project's credentials (its LLM providers and keys: agent runs, scans, the LLM features); while it is null, or the project has no row, a collaborator's Run scans, Use AI agent and Exploitation & shells count for nothing. `owner_credential_consent_by_id` names the owner who consented, without a foreign key. `managers_see_all_conversations` (default false) is the co-owners' view of conversations. The row goes with its project. Every collaborator spend of the owner's credentials writes a `credits.used` row to `audit_log`.
+
+### Conversation Sharing
+
+A conversation (`conversations`) is private to its author (`user_id`). `conversation_shares` (`ConversationShare`) holds at most one row per conversation: its author shared it, read-only, with every collaborator of the project (`shared_by_id` is a plain id). The row goes with the conversation and is read only while Read + Write sharing is in force. When a collaborator's account is deleted, their conversations in other people's projects are reassigned to the project's owner instead of being deleted with the account: `user_id` becomes the owner, `former_author_id` keeps the deleted account's id (no foreign key) and `former_author_label` its name or email as it was then. Such a conversation opens read-only, since its agent checkpoints belong to the former author. Existing conversations have no share row and no former author.
+
+### Project Ownership Transfers
+
+`project_transfers` (`ProjectTransfer`) records each offer to give a project to one of its collaborators and what came of it, read only while Read + Write sharing is in force. `from_user_id` and `to_user_id` are plain ids (no foreign key), so the record outlives either account; the row goes with its project. `old_owner_role` is `co-owner` (the old owner keeps a Manage share) or `leave`. `status` is `pending` (waiting for the recipient, 7 days at most), `in_progress` (the project's activation state reads `transferring` meanwhile, so new scans, agent tickets and settings saves wait; from the start of the graph move it reads `transfer_split`, which no timeout ends: the project stays held until the transfer completes or its graph is moved back), `completed`, `declined`, `cancelled`, `expired` or `failed` (`error` holds the code; the recipient may accept again, and a failed transfer that still holds the project never expires: a decline or cancel moves its graph back first). On completion `projects.user_id` is the recipient in the same transaction as the status, and `cleared_settings` lists the settings that named the old owner's own LLM providers, Nuclei templates or GitHub token and were cleared, which the new owner sees until `cleared_seen_at`.
 
 ## Docker Configuration
 

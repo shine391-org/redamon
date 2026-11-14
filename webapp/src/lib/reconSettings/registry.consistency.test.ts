@@ -235,13 +235,33 @@ describe('T32 the unit agrees with the name', () => {
     [/(Depth|DepthLimit|RecursionDepth|CrawlDepth)$/, ['depth', 'count'], 'depth'],
   ]
 
+  // Fields whose name ends like one of the rules above but measures something
+  // else, each with the unit it really has. Keep this list short: an entry
+  // here is a name a reader will misread, so it must say why it is right.
+  const EXCEPTIONS: Record<string, string> = {
+    // hydra's -W: the seconds each task waits between its connections, not a
+    // count of connections. The connection count is hydraThreads (-t).
+    hydraWaitBetweenConnections: 'seconds',
+  }
+
   test.each(RULES)('a name matching %s carries %s', (pattern, allowed, label) => {
     const problems = offenders((f, key) => {
-      if (!pattern.test(key)) return null
+      if (!pattern.test(key) || key in EXCEPTIONS) return null
       // A boolean named `...Timeout`-ish is a toggle, not a measurement.
       if (f.type === 'boolean' || f.type === 'string' || f.type === 'string-list') return null
       return allowed.includes(f.unit) ? null : `unit '${f.unit}' but the name expects ${label}`
     })
+    expect(problems).toEqual([])
+  })
+
+  test('every exception names a field that exists and carries the unit it states', () => {
+    const problems = Object.entries(EXCEPTIONS).flatMap(([key, unit]) =>
+      !fields[key]
+        ? [`${key}: an exception for a field the registry does not have`]
+        : fields[key].unit !== unit
+          ? [`${key}: unit '${fields[key].unit}' but the exception says '${unit}'`]
+          : []
+    )
     expect(problems).toEqual([])
   })
 
@@ -401,6 +421,13 @@ describe('T16 exactly the documented columns are closed', () => {
     // DERIVED from whether any engagement limit is set. As a writable boolean it
     // was a master bypass shipped as a checkbox.
     roeEnabled: 'derived',
+    // Retired (L-17): nothing reads them, and the column stays only so an
+    // upgrade or a rollback drops no data. Settable, they were controls that
+    // changed nothing.
+    katanaScope: 'internal',
+    jsReconStandaloneCrawlDepth: 'internal',
+    jsReconStandaloneCrawlScope: 'internal',
+    aiSurfaceReconCacheEnabled: 'internal',
   }
 
   test('the never set is exactly this list, plus the engagement record', () => {
@@ -430,6 +457,68 @@ describe('T16 exactly the documented columns are closed', () => {
       .map(f => f.key)
       .filter(k => CREDENTIAL.test(k))
     expect(settable).toEqual(['ownershipToken'])
+  })
+})
+
+// --- HD-27: the owner's secrets are named -------------------------------------------------
+
+describe("HD-27 the columns that stay the owner's when a project is shared", () => {
+  const CUSTOM_HEADER_LISTS = [
+    'arjunCustomHeaders', 'ffufCustomHeaders', 'hakrawlerCustomHeaders', 'httpxCustomHeaders',
+    'jsReconEndpointCustomHeaders', 'katanaCustomHeaders', 'kiterunnerHeaders',
+    'zapAjaxSpiderCustomHeaders',
+  ]
+
+  test('share is ordinary, gate, scope or secret, and absent means ordinary', () => {
+    const problems = offenders(f =>
+      f.share !== undefined && !['ordinary', 'gate', 'scope', 'secret'].includes(f.share) ? `share '${f.share}'` : null
+    )
+    expect(problems).toEqual([])
+  })
+
+  test('every readable:false column except userId is secret', () => {
+    const problems = fieldsWhere(f => f.readable === false)
+      .filter(f => f.key !== 'userId' && f.share !== 'secret')
+      .map(f => `${f.key}: withheld from MCP reads but shared with collaborators`)
+    expect(problems).toEqual([])
+    expect(fields.userId.share).not.toBe('secret')
+  })
+
+  test('the secret set is exactly the withheld columns and the custom header lists', () => {
+    const withheld = fieldsWhere(f => f.readable === false).map(f => f.key).filter(k => k !== 'userId')
+    const secret = fieldsWhere(f => f.share === 'secret').map(f => f.key)
+    expect(secret).toEqual([...withheld, ...CUSTOM_HEADER_LISTS].sort())
+  })
+})
+
+// --- SH-08, SH-28: the writes a collaborator needs more than Write for ---------------------
+
+describe('SH-08 safety gates and scope are classed, not ordinary', () => {
+  test('every tighten_only switch is a gate, beside the Kali package lists, MCP Kali exec, the tool phase map and the CypherFix approval', () => {
+    const tighten = fieldsWhere(f => f.roe_parse === 'tighten_only').map(f => f.key)
+    const gates = fieldsWhere(f => f.share === 'gate').map(f => f.key)
+    expect(gates).toEqual(
+      [...tighten, 'agentKaliInstallAllowedPackages', 'agentKaliInstallForbiddenPackages', 'mcpKaliExecEnabled',
+        'agentToolPhaseMap', 'cypherfixRequireApproval'].sort()
+    )
+  })
+
+  test('the engagement terms outside the target groups that the agent or the traffic enforce are scope', () => {
+    for (const key of ['roeSensitiveDataHandling', 'engagementIdentityHeader']) expect([key, fields[key]?.share]).toEqual([key, 'scope'])
+  })
+
+  test('every field of the scope and engagement_limits groups is scope, the ownership token secret', () => {
+    const problems = fieldsWhere(f => f.group === 'scope' || f.group === 'engagement_limits')
+      .filter(f => f.share !== 'scope' && !(f.key === 'ownershipToken' && f.share === 'secret'))
+      .map(f => `${f.key}: decides targets or engagement terms but share '${f.share ?? 'ordinary'}'`)
+    expect(problems).toEqual([])
+  })
+
+  test('the other targets are scope, but the threat-intel correlation switch', () => {
+    const problems = fieldsWhere(f => f.group === 'othertarget')
+      .filter(f => (f.share === 'scope') === (f.key === 'scaIntelCorrelationEnabled'))
+      .map(f => f.key)
+    expect(problems).toEqual([])
   })
 })
 

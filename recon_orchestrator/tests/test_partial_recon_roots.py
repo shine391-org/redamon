@@ -30,6 +30,7 @@ from batch_scope import (
     validate_partial_overrides,
 )
 from models import PartialReconStartRequest, PartialReconState, PartialReconStatus, ReconStatus
+from tests.job_credentials import job_credential, use_keys
 
 BATCH = {
     "domainBatchMode": True,
@@ -181,7 +182,7 @@ class _SpyManager:
 
 def _request(**kw):
     base = dict(project_id="p1", user_id="u1", webapp_api_url="http://localhost:3000",
-                tool_id="Tlsx", graph_inputs={})
+                tool_id="Tlsx", graph_inputs={}, job_credential=job_credential("p1", "u1"))
     base.update(kw)
     return PartialReconStartRequest(**base)
 
@@ -190,6 +191,7 @@ def _request(**kw):
 def spy(monkeypatch):
     s = _SpyManager()
     monkeypatch.setattr(api, "container_manager", s)
+    use_keys(monkeypatch)
     return s
 
 
@@ -320,6 +322,30 @@ class TestEndpoint:
                             lambda d: pytest.fail("IP mode root was hard-guardrailed"))
         _start(_request())
         assert spy.calls[0]["config"]["domains"] == ["ip-targets.p1"]
+
+    def test_ip_mode_guardrails_the_hostname_include_bases(self, monkeypatch, spy):
+        """Design §9: the include entries' base names, never the synthetic root."""
+        _project(monkeypatch, {**IP_MODE, "ipHostnameMode": "record_filter",
+                               "ipHostnameInclude": ["*.alpha.test"]})
+        seen = []
+
+        def _blocked(name):
+            seen.append(name)
+            return False, ""
+
+        monkeypatch.setattr("hard_guardrail.is_hard_blocked", _blocked)
+        _start(_request())
+        assert seen == ["alpha.test"]
+        assert spy.calls[0]["config"]["domains"] == ["ip-targets.p1"]
+
+    def test_ip_mode_with_a_blocked_include_entry_refuses_the_run(self, monkeypatch, spy):
+        _project(monkeypatch, {**IP_MODE, "ipHostnameMode": "record_filter",
+                               "ipHostnameInclude": ["*.alpha.test", "whitehouse.gov"]})
+        with pytest.raises(HTTPException) as ei:
+            _start(_request())
+        assert ei.value.status_code == 403
+        assert "whitehouse.gov" in ei.value.detail
+        assert spy.calls == []
 
     def test_the_roe_window_is_still_enforced(self, monkeypatch, spy):
         _project(monkeypatch, {**SINGLE, "roeTimeWindowEnabled": True,

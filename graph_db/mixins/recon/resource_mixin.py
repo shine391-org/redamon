@@ -11,6 +11,29 @@ from graph_db.cpe_resolver import _is_ip_address
 from graph_db.mixins.recon.scope import build_host_scope, host_in_scope, org_for_scan_root
 from graph_db.endpoint_paths import normalize_endpoint_path
 
+def _jsluice_secret_values(data) -> tuple:
+    """(the key, the pair's other half) out of a jsluice secret's `data`: AWS
+    gives {key, secret}, the other kinds {key} or a config object."""
+    if isinstance(data, dict):
+        for name in ("key", "value", "match", "token"):
+            if isinstance(data.get(name), str) and data[name]:
+                secret = data.get("secret")
+                return data[name], secret if isinstance(secret, str) and name != "secret" else ""
+        if isinstance(data.get("secret"), str) and data["secret"]:
+            return data["secret"], ""
+        return (json.dumps(data, sort_keys=True) if data else ""), ""
+    return (str(data) if data else ""), ""
+
+
+def _redact_sample(text: str) -> str:
+    """The stored `sample`: its first and last characters, as JS Recon's."""
+    if len(text) > 12:
+        return text[:6] + '...' + text[-4:]
+    if len(text) > 4:
+        return text[:3] + '...'
+    return '***' if text else ''
+
+
 def _openapi_params(endpoint_info: dict, method: str) -> dict:
     """Cypher parameters for an endpoint's OpenAPI fields; None keeps what is stored.
 
@@ -177,7 +200,7 @@ class ResourceMixin:
                     try:
                         methods = endpoint_info.get("methods") or [endpoint_info.get("method") or "GET"]
                         category = endpoint_info.get("category", "other")
-                        param_count = endpoint_info.get("parameter_count", {})
+                        param_count = endpoint_info.get("parameter_count") or {}
 
                         for method in methods:
                             if endpoint_info.get('arjun_evidence'):
@@ -238,11 +261,20 @@ class ResourceMixin:
                             # without the flag) counts as declared-only, so a
                             # declared node this run creates on an observed path
                             # stores false rather than leaving the flag unset.
+                            # source is first-writer provenance (an Endpoint's and a
+                            # Parameter's), and urls_found, the parameter counts, a
+                            # Parameter's category, sample_values, input_type and
+                            # required keep what is stored when this caller did not
+                            # measure them (D5): a partial run hands this writer
+                            # only what its tool saw.
+                            # A full run clears assets first, so a node this writer
+                            # creates gets the same values as before.
                             session.run(
                                 """
                                 MERGE (e:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
                                 ON CREATE SET e.openapi_declared_only = CASE WHEN $oa_declared_only THEN true
-                                                                              WHEN $oa_declared THEN false ELSE null END
+                                                                              WHEN $oa_declared THEN false ELSE null END,
+                                              e.source = 'resource_enum'
                                 ON MATCH SET e.openapi_declared_only = CASE
                                     WHEN $oa_declared_only IS NULL THEN e.openapi_declared_only
                                     WHEN NOT $oa_declared_only THEN
@@ -261,13 +293,19 @@ class ResourceMixin:
                                                            AND e.category <> 'other'
                                                       THEN e.category ELSE $category END,
                                     e.ffuf_category = coalesce($ffuf_category, e.ffuf_category),
-                                    e.has_parameters = $has_params,
-                                    e.query_param_count = $query_count,
-                                    e.body_param_count = $body_count,
-                                    e.path_param_count = $path_count,
-                                    e.urls_found = $urls_found,
+                                    // A tool that counted no parameter (FFuf, Kiterunner, a
+                                    // partial that only names a path) did not look; this
+                                    // writer never removes a Parameter node, so neither
+                                    // does a zero count.
+                                    e.has_parameters = $has_params OR coalesce(e.has_parameters, false),
+                                    e.query_param_count = CASE WHEN $query_count > 0 THEN $query_count
+                                                               ELSE coalesce(e.query_param_count, 0) END,
+                                    e.body_param_count = CASE WHEN $body_count > 0 THEN $body_count
+                                                              ELSE coalesce(e.body_param_count, 0) END,
+                                    e.path_param_count = CASE WHEN $path_count > 0 THEN $path_count
+                                                              ELSE coalesce(e.path_param_count, 0) END,
+                                    e.urls_found = coalesce($urls_found, e.urls_found, 1),
                                     e.request_fidelity_json = $request_fidelity_json,
-                                    e.source = 'resource_enum',
                                     e.sources = CASE
                                         WHEN e.sources IS NULL THEN $sources
                                         ELSE e.sources + [s IN $sources WHERE NOT s IN e.sources]
@@ -299,7 +337,7 @@ class ResourceMixin:
                                 query_count=param_count.get('query', 0),
                                 body_count=param_count.get('body', 0),
                                 path_count=param_count.get('path', 0),
-                                urls_found=endpoint_info.get('urls_found', 1),
+                                urls_found=endpoint_info.get('urls_found'),
                                 request_fidelity_json=_request_fidelity_json(endpoint_info, method),
                                 sources=ep_sources,
                                 ffuf_status=ffuf_status,
@@ -357,11 +395,14 @@ class ResourceMixin:
                                     p.type = CASE WHEN $param_type = 'string' AND p.type IS NOT NULL
                                                        AND p.type <> 'string'
                                                   THEN p.type ELSE $param_type END,
-                                    p.category = $category,
-                                    p.sample_values = $sample_values,
+                                    p.category = CASE WHEN coalesce($category, 'other') = 'other' AND p.category IS NOT NULL
+                                                           AND p.category <> 'other'
+                                                      THEN p.category ELSE $category END,
+                                    p.sample_values = CASE WHEN size($sample_values) > 0 THEN $sample_values
+                                                           ELSE coalesce(p.sample_values, $sample_values) END,
                                     p.sample_values_encoding = $sample_values_encoding,
                                     p.is_injectable = coalesce(p.is_injectable, false),
-                                    p.source = 'resource_enum',
+                                    p.source = coalesce(p.source, 'resource_enum'),
                                     p.arjun_methods = COALESCE($arjun_methods, p.arjun_methods),
                                     p.arjun_modes = COALESCE($arjun_modes, p.arjun_modes),
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
@@ -417,12 +458,15 @@ class ResourceMixin:
                                     p.type = CASE WHEN $param_type = 'string' AND p.type IS NOT NULL
                                                        AND p.type <> 'string'
                                                   THEN p.type ELSE $param_type END,
-                                    p.category = $category,
-                                    p.sample_values = $sample_values,
+                                    p.category = CASE WHEN coalesce($category, 'other') = 'other' AND p.category IS NOT NULL
+                                                           AND p.category <> 'other'
+                                                      THEN p.category ELSE $category END,
+                                    p.sample_values = CASE WHEN size($sample_values) > 0 THEN $sample_values
+                                                           ELSE coalesce(p.sample_values, $sample_values) END,
                                     p.sample_values_encoding = $sample_values_encoding,
-                                    p.required = $required,
+                                    p.required = coalesce($required, p.required, true),
                                     p.is_injectable = coalesce(p.is_injectable, false),
-                                    p.source = 'resource_enum',
+                                    p.source = coalesce(p.source, 'resource_enum'),
                                     p.arjun_methods = COALESCE($arjun_methods, p.arjun_methods),
                                     p.arjun_modes = COALESCE($arjun_modes, p.arjun_modes),
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
@@ -436,7 +480,7 @@ class ResourceMixin:
                                 category=param.get("category", "other"),
                                 sample_values=(param.get("sample_values") or [])[:5],
                                 sample_values_encoding=param.get("sample_values_encoding"),
-                                required=param.get("required", True),
+                                required=param.get("required"),
                                 is_ai_prompt_injectable=param.get("is_ai_prompt_injectable"),
                                 ai_tool_arg_path=param.get("ai_tool_arg_path"),
                             )
@@ -480,11 +524,16 @@ class ResourceMixin:
                                     p.type = CASE WHEN $param_type = 'string' AND p.type IS NOT NULL
                                                        AND p.type <> 'string'
                                                   THEN p.type ELSE $param_type END,
-                                    p.category = $category,
-                                    p.input_type = $input_type,
-                                    p.required = $required,
+                                    p.category = CASE WHEN coalesce($category, 'other') = 'other' AND p.category IS NOT NULL
+                                                           AND p.category <> 'other'
+                                                      THEN p.category ELSE $category END,
+                                    // input_type comes from a form, required from a form or
+                                    // an API specification; a tool that only names the
+                                    // field (Arjun) says neither.
+                                    p.input_type = coalesce($input_type, p.input_type, 'text'),
+                                    p.required = coalesce($required, p.required, false),
                                     p.is_injectable = coalesce(p.is_injectable, false),
-                                    p.source = 'resource_enum',
+                                    p.source = coalesce(p.source, 'resource_enum'),
                                     p.arjun_methods = COALESCE($arjun_methods, p.arjun_methods),
                                     p.arjun_modes = COALESCE($arjun_modes, p.arjun_modes),
                                     p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
@@ -496,8 +545,8 @@ class ResourceMixin:
                                 user_id=user_id, project_id=project_id,
                                 param_type=param.get("type", "string"),
                                 category=param.get("category", "other"),
-                                input_type=param.get("input_type", "text"),
-                                required=param.get("required", False),
+                                input_type=param.get("input_type"),
+                                required=param.get("required"),
                                 is_ai_prompt_injectable=is_ai_prompt_injectable,
                                 ai_tool_arg_path=ai_tool_arg_path,
                             )
@@ -622,9 +671,11 @@ class ResourceMixin:
                     if node_id in created_secrets:
                         continue
 
-                    # Redacted sample: first 6 chars + ...
-                    matched = data_field.get("match", "") if isinstance(data_field, dict) else str(data_field)
-                    sample = (matched[:6] + "...") if len(matched) > 6 else matched
+                    secret_value, paired_secret = _jsluice_secret_values(data_field)
+                    sample = _redact_sample(secret_value)
+                    context = secret.get("context")
+                    raw_context = (json.dumps(context, sort_keys=True) if isinstance(context, (dict, list))
+                                   else str(context or ""))[:400] or None
 
                     scan_ts = resource_enum_data.get("scan_metadata", {}).get("scan_timestamp", "")
 
@@ -640,6 +691,9 @@ class ResourceMixin:
                             s.source_url = $source_url,
                             s.base_url = $base_url,
                             s.sample = $sample,
+                            s.secret_value = $secret_value,
+                            s.paired_secret = $paired_secret,
+                            s.raw_context = $raw_context,
                             s.discovered_at = $discovered_at,
                             s.updated_at = datetime()
                         WITH s
@@ -649,7 +703,9 @@ class ResourceMixin:
                         id=node_id, user_id=user_id, project_id=project_id,
                         secret_type=secret_type, severity=severity,
                         source_url=source_url, base_url=base_url,
-                        sample=sample, discovered_at=scan_ts
+                        sample=sample, discovered_at=scan_ts,
+                        secret_value=secret_value or None, paired_secret=paired_secret or None,
+                        raw_context=raw_context,
                     )
                     created_secrets.add(node_id)
                     stats["secrets_created"] += 1
@@ -771,6 +827,90 @@ class ResourceMixin:
             if stats["errors"]:
                 print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
 
+        if (resource_enum_data.get("archive_leaks") or {}) and hasattr(self, "update_graph_from_archive_leaks"):
+            try:
+                leaks = self.update_graph_from_archive_leaks(recon_data, user_id, project_id)
+                stats["archive_findings_written"] = leaks.get("findings_written", 0)
+                stats["secrets_created"] += leaks.get("secrets_written", 0)
+                # The pipeline reads only the errors this writer returns: a
+                # url_archive finding that failed here must not read as gone.
+                stats["errors"].extend(f"Archive leaks: {e}" for e in leaks.get("errors") or [])
+            except Exception as e:
+                stats["errors"].append(f"Archive leaks failed: {e}")
+
+        return stats
+
+    def update_graph_from_endpoint_ai_classifier(self, by_base_url: dict, user_id: str,
+                                                 project_id: str) -> dict:
+        """Write the partial Endpoint AI Classifier's annotations and nothing else (D5).
+
+        ``by_base_url`` is the resource_enum shape the classifier stamped. Only
+        what it stamps is read: ai_interface_type and is_ai_rag_ingest per
+        endpoint, is_ai_prompt_injectable per parameter. The classifier matches
+        stored paths and parameter names, so the crawl's fields (category,
+        urls_found, source, sample_values, counts) and updated_at stay as the
+        last crawl left them. Nodes are matched on their full key and never
+        created. A value the classifier did not produce keeps the stored one,
+        and its "non-llm" (no path pattern matched) never replaces a type
+        another source found, such as AI Surface Recon's live probe.
+        """
+        stats = {"endpoints_annotated": 0, "parameters_annotated": 0, "errors": []}
+        endpoints, parameters = [], []
+        for base_url, base_data in (by_base_url or {}).items():
+            if not base_url or not isinstance(base_data, dict):
+                continue
+            for path, info in (base_data.get("endpoints") or {}).items():
+                if not path or not isinstance(info, dict):
+                    continue
+                iface, rag = info.get("ai_interface_type"), info.get("is_ai_rag_ingest")
+                if iface is not None or rag is not None:
+                    endpoints.extend({"baseurl": base_url, "path": path, "method": method,
+                                      "ai_interface_type": iface, "is_ai_rag_ingest": rag}
+                                     for method in info.get("methods") or ["GET"])
+                params = info.get("parameters")
+                for position, plist in (params.items() if isinstance(params, dict) else ()):
+                    for param in plist or []:
+                        if (isinstance(param, dict) and param.get("name")
+                                and param.get("is_ai_prompt_injectable") is not None):
+                            parameters.append({"baseurl": base_url, "path": path, "name": param["name"],
+                                               "position": position,
+                                               "is_ai_prompt_injectable": param["is_ai_prompt_injectable"]})
+        if not endpoints and not parameters:
+            return stats
+
+        def work(tx):
+            annotated = tx.run(
+                """
+                UNWIND $rows AS row
+                MATCH (e:Endpoint {path: row.path, method: row.method, baseurl: row.baseurl,
+                                   user_id: $user_id, project_id: $project_id})
+                SET e.ai_interface_type = CASE
+                        WHEN row.ai_interface_type IS NULL THEN e.ai_interface_type
+                        WHEN row.ai_interface_type = 'non-llm'
+                             AND coalesce(e.ai_interface_type, 'non-llm') <> 'non-llm' THEN e.ai_interface_type
+                        ELSE row.ai_interface_type END,
+                    e.is_ai_rag_ingest = coalesce(row.is_ai_rag_ingest, e.is_ai_rag_ingest)
+                RETURN count(e) AS n
+                """,
+                rows=endpoints, user_id=user_id, project_id=project_id,
+            ).single()
+            flagged = tx.run(
+                """
+                UNWIND $rows AS row
+                MATCH (p:Parameter {name: row.name, position: row.position, endpoint_path: row.path,
+                                    baseurl: row.baseurl, user_id: $user_id, project_id: $project_id})
+                SET p.is_ai_prompt_injectable = coalesce(row.is_ai_prompt_injectable, p.is_ai_prompt_injectable)
+                RETURN count(p) AS n
+                """,
+                rows=parameters, user_id=user_id, project_id=project_id,
+            ).single()
+            return (annotated["n"] if annotated else 0), (flagged["n"] if flagged else 0)
+
+        try:
+            with self.driver.session() as session:
+                stats["endpoints_annotated"], stats["parameters_annotated"] = session.execute_write(work)
+        except Exception as e:
+            stats["errors"].append(f"Endpoint AI annotations failed: {e}")
         return stats
 
     def prune_withdrawn_openapi_declarations(self, user_id: str, project_id: str, reread_spec_urls,

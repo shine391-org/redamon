@@ -15,12 +15,22 @@ const h = vi.hoisted(() => ({
   orchestratorFetch: vi.fn(),
   recordScanStart: vi.fn(),
   legacy: vi.fn(),
+  countAuthorizations: vi.fn(),
 }))
 
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProject()))
 vi.mock('@/lib/access', () => ({ guardProject: (...a: unknown[]) => h.guard(...a) }))
 vi.mock('@/lib/session', () => ({ getEffectiveUser: async () => ({ userId: 'u1' }) }))
 vi.mock('@/lib/scanTimeline', () => ({ recordScanStart: (...a: unknown[]) => h.recordScanStart(...a) }))
-vi.mock('@/lib/prisma', () => ({ default: { project: { findUnique: (...a: unknown[]) => h.findUnique(...a) } } }))
+vi.mock('@/lib/prisma', () => ({
+  default: {
+    project: { findUnique: (...a: unknown[]) => h.findUnique(...a) },
+    engagementAuthorization: {
+      count: (...a: unknown[]) => h.countAuthorizations(...a),
+      findFirst: async () => null,
+    },
+  },
+}))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
 vi.mock('@/lib/activationLock', () => ({ assertGraphNotActivating: async () => null }))
 vi.mock('@/lib/nodeFilterRun', () => ({ describeNodeFilterWriter: async () => null }))
@@ -42,6 +52,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.guard.mockResolvedValue(null)
   h.findUnique.mockResolvedValue({ id: 'p1', userId: 'u1', targetDomain: '' })
+  h.countAuthorizations.mockResolvedValue(0)
   h.legacy.mockResolvedValue([])
   h.orchestratorFetch.mockResolvedValue({
     ok: true,
@@ -79,6 +90,44 @@ describe('partial recon start', () => {
     const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['evil.test'] } })
     expect(res.status).toBe(400)
     expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+})
+
+describe('a third-party engagement (R-11)', () => {
+  // The full start refuses these with 422; a partial Nuclei or port scan
+  // reaches the same estate, so it must be refused the same way.
+  const thirdParty = (over: Record<string, unknown> = {}) => ({
+    id: 'p1', userId: 'u1', targetDomain: 'alpha.test',
+    engagementKind: 'third_party', roeGlobalMaxRps: 3, ...over,
+  })
+
+  test('with no rate ceiling is refused with 422 before the orchestrator', async () => {
+    h.findUnique.mockResolvedValue(thirdParty({ roeGlobalMaxRps: 0 }))
+    h.countAuthorizations.mockResolvedValue(1)
+    const res = await post({ tool_id: 'Nuclei', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(422)
+    const { error } = await res.json()
+    expect(error).toMatch(/^This is a third-party engagement and it is not startable: /)
+    expect(error).toContain('roeGlobalMaxRps is 0')
+    expect(error).toMatch(/Use preflight_scope_check to see the whole picture\.$/)
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test('with no authorization record is refused too', async () => {
+    h.findUnique.mockResolvedValue(thirdParty())
+    const res = await post({ tool_id: 'Naabu', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(422)
+    expect((await res.json()).error).toContain('No authorization record')
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  test('with a ceiling and an authorization record it starts', async () => {
+    h.findUnique.mockResolvedValue(thirdParty())
+    h.countAuthorizations.mockResolvedValue(1)
+    const res = await post({ tool_id: 'Nuclei', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(200)
+    expect(h.orchestratorFetch).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -152,5 +201,64 @@ describe('a partial start that got no answer says whether it may have started', 
     const res = await post({ tool_id: 'Tlsx' })
     expect(res.status).toBe(500)
     expect(await res.json()).toEqual({ error: 'Failed to start partial recon', code: 'P1001' })
+  })
+})
+
+describe('the job credential (step 1.16)', () => {
+  test('the orchestrator call carries a job credential for the project owner', async () => {
+    const { verifyJobCredential } = await import('@/lib/authz/machineCredential')
+    const saved = process.env.INTERNAL_API_KEY
+    process.env.INTERNAL_API_KEY = 'start-path-test-master'
+    try {
+      const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+      expect(res.status).toBe(200)
+      const sent = JSON.parse(h.orchestratorFetch.mock.calls[0][1].body)
+      expect(verifyJobCredential(sent.job_credential)).toMatchObject({ aud: 'scan', ten: 'u1', pid: 'p1' })
+      expect(sent.user_id).toBe('u1')
+    } finally {
+      if (saved === undefined) delete process.env.INTERNAL_API_KEY
+      else process.env.INTERNAL_API_KEY = saved
+    }
+  })
+})
+
+describe('the start body (step 1.16 review)', () => {
+  test('a body without tool_id or graph_inputs is refused 400 before the orchestrator', async () => {
+    for (const body of [
+      { graph_inputs: { domains: ['alpha.test'] } },
+      { tool_id: 'Tlsx' },
+      { tool_id: '', graph_inputs: { domains: ['alpha.test'] } },
+      { tool_id: 'Tlsx', graph_inputs: ['alpha.test'] },
+      { tool_id: 7, graph_inputs: {} },
+    ]) {
+      const res = await post(body)
+      expect(res.status, JSON.stringify(body)).toBe(400)
+      expect(await res.json()).toMatchObject({ code: 'invalid_request' })
+    }
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test('an orchestrator 422 never echoes the request, its job credential included, to the browser', async () => {
+    const saved = process.env.INTERNAL_API_KEY
+    process.env.INTERNAL_API_KEY = 'start-path-test-master'
+    try {
+      h.orchestratorFetch.mockImplementation(async (_url: string, init: { body: string }) => {
+        const sent = JSON.parse(init.body)
+        expect(sent.job_credential).toBeTruthy()
+        return {
+          ok: false, status: 422,
+          json: async () => ({ detail: [{ type: 'missing', loc: ['body', 'x'], msg: 'Field required', input: sent }] }),
+        }
+      })
+      const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+      expect(res.status).toBe(422)
+      const text = await res.text()
+      expect(text).not.toContain('job_credential')
+      expect(JSON.parse(text)).toEqual({ error: 'Failed to start partial recon', upstreamStatus: 422 })
+    } finally {
+      if (saved === undefined) delete process.env.INTERNAL_API_KEY
+      else process.env.INTERNAL_API_KEY = saved
+    }
   })
 })

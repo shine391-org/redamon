@@ -9,7 +9,7 @@
  *
  * @vitest-environment node
  */
-import { describe, test, expect, beforeEach, vi } from 'vitest'
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
 const h = vi.hoisted(() => ({
@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
   projectFindMany: vi.fn(),
   findSchedule: vi.fn(),
   updateSchedule: vi.fn(),
+  updateManySchedule: vi.fn(),
   countJobs: vi.fn(),
   start: vi.fn(),
   createJob: vi.fn(),
@@ -25,6 +26,10 @@ const h = vi.hoisted(() => ({
   audit: vi.fn(),
   agent: vi.fn(),
   jqFindFirst: vi.fn(),
+  projectFindUnique: vi.fn(),
+  userFindMany: vi.fn(),
+  actorRefusal: vi.fn(),
+  notice: vi.fn(),
 }))
 
 vi.mock('@/lib/session', () => ({ isInternalRequest: (...a: unknown[]) => h.isInternal(...a) }))
@@ -34,9 +39,14 @@ vi.mock('@/lib/prisma', () => ({
       findMany: (...a: unknown[]) => h.findScheduleMany(...a),
       findUnique: (...a: unknown[]) => h.findSchedule(...a),
       update: (...a: unknown[]) => h.updateSchedule(...a),
+      updateMany: (...a: unknown[]) => h.updateManySchedule(...a),
     },
     scanJob: { count: (...a: unknown[]) => h.countJobs(...a) },
-    project: { findMany: (...a: unknown[]) => h.projectFindMany(...a) },
+    project: {
+      findMany: (...a: unknown[]) => h.projectFindMany(...a),
+      findUnique: (...a: unknown[]) => h.projectFindUnique(...a),
+    },
+    user: { findMany: (...a: unknown[]) => h.userFindMany(...a) },
     jobQueue: { findFirst: (...a: unknown[]) => h.jqFindFirst(...a) },
   },
 }))
@@ -47,6 +57,14 @@ vi.mock('@/lib/agentSessions', async importOriginal => ({
 vi.mock('@/lib/startFullScan', () => ({ startFullScan: (...a: unknown[]) => h.start(...a) }))
 vi.mock('@/lib/enqueueJob', () => ({ enqueueJob: (...a: unknown[]) => h.enqueue(...a) }))
 vi.mock('@/lib/audit', () => ({ writeAudit: (...a: unknown[]) => h.audit(...a) }))
+// The actor's project access (step 5.5) runs the real can(); its own tests are
+// scanActor.access.test.ts and internal/deferredActor.shares.test.ts. Here it answers "allowed"
+// unless a test says otherwise.
+vi.mock('@/lib/authz/scanActor', async (orig) => ({
+  ...(await orig<typeof import('@/lib/authz/scanActor')>()),
+  actorScanRefusal: (...a: unknown[]) => h.actorRefusal(...a),
+  noticeSchedulePaused: (...a: unknown[]) => h.notice(...a),
+}))
 vi.mock('@/lib/scanTimeline', async orig => ({
   ...(await orig<typeof import('@/lib/scanTimeline')>()),
   createScanJob: (...a: unknown[]) => h.createJob(...a),
@@ -72,6 +90,7 @@ beforeEach(() => {
   h.findScheduleMany.mockResolvedValue([])
   h.findSchedule.mockResolvedValue(SCHEDULE)
   h.updateSchedule.mockResolvedValue({})
+  h.updateManySchedule.mockResolvedValue({ count: 1 })
   h.countJobs.mockResolvedValue(0)
   h.projectFindMany.mockResolvedValue([])
   h.start.mockResolvedValue({ ok: true, versionId: 'v3', versionSeq: 3, scanJobId: 'job1', frozenVersionId: 'v2' })
@@ -79,6 +98,8 @@ beforeEach(() => {
   h.enqueue.mockResolvedValue({ ok: true, status: 201, id: 'jq1' })
   h.agent.mockResolvedValue('idle')
   h.jqFindFirst.mockResolvedValue(null)
+  h.actorRefusal.mockResolvedValue(null)
+  h.notice.mockResolvedValue(true)
 })
 
 describe('authentication', () => {
@@ -357,3 +378,186 @@ describe('POST /run', () => {
   })
 })
 
+
+describe('a schedule of an account that is not active (step 2.3, DV-39)', () => {
+  const users = (statuses: Record<string, string>) =>
+    h.userFindMany.mockImplementation(async ({ where }: { where: { id: { in: string[] } } }) =>
+      where.id.in.filter((id) => id in statuses).map((id) => ({ id, status: statuses[id] })))
+  const runIt = async () => (await run(req('http://x/api/internal/scan-schedules/s1/run', {}), sp('s1')))
+
+  beforeEach(async () => {
+    const { setFlagsForTests } = await import('@/lib/authz/flags')
+    setFlagsForTests({ identity: true })
+    h.projectFindUnique.mockResolvedValue({ userId: 'owner-1' })
+    users({ u1: 'active', 'owner-1': 'active' })
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(async () => {
+    const { setFlagsForTests } = await import('@/lib/authz/flags')
+    setFlagsForTests(null)
+    vi.restoreAllMocks()
+  })
+
+  test("a disabled actor's schedule is skipped and audited; the occurrence advances", async () => {
+    users({ u1: 'disabled', 'owner-1': 'active' })
+    const res = await runIt()
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({ ok: false, skipped: 'actor_inactive', error: 'skipped: the account that scheduled it is disabled' })
+    expect(body.nextRunAt).toBeTruthy()
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.agent).not.toHaveBeenCalled()
+    expect(h.enqueue).not.toHaveBeenCalled()
+    expect(h.updateSchedule).toHaveBeenCalledTimes(1)
+    expect(h.updateSchedule.mock.calls[0][0].data.nextRunAt).toBeInstanceOf(Date)
+    expect(h.audit).toHaveBeenCalledWith({
+      actorId: null, action: 'scan_schedule.skipped', targetType: 'scanSchedule', targetId: 's1',
+      after: { reason: 'actor_inactive', projectId: 'p1', userId: 'u1', account: 'actor', status: 'disabled' },
+      source: 'system',
+    })
+  })
+
+  test("a disabled owner's schedule is skipped", async () => {
+    users({ u1: 'active', 'owner-1': 'disabled' })
+    const body = await (await runIt()).json()
+    expect(body).toMatchObject({ skipped: 'actor_inactive', error: "skipped: the project owner's account is disabled" })
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.audit.mock.calls[0][0].after).toMatchObject({ userId: 'owner-1', account: 'owner' })
+    expect(h.projectFindUnique).toHaveBeenCalledWith({ where: { id: 'p1' }, select: { userId: true } })
+  })
+
+  test('an account that no longer exists counts as not active', async () => {
+    users({ 'owner-1': 'active' })
+    expect((await (await runIt()).json()).skipped).toBe('actor_inactive')
+    expect(h.audit.mock.calls[0][0].after).toMatchObject({ userId: 'u1', status: 'deleted' })
+  })
+
+  test('the actor and the owner are read in one query', async () => {
+    await runIt()
+    expect(h.userFindMany).toHaveBeenCalledTimes(1)
+    expect(h.userFindMany.mock.calls[0][0]).toEqual({ where: { id: { in: ['u1', 'owner-1'] } }, select: { id: true, status: true } })
+  })
+
+  test('enabled again → the next occurrence fires', async () => {
+    users({ u1: 'disabled', 'owner-1': 'active' })
+    expect((await (await runIt()).json()).skipped).toBe('actor_inactive')
+    users({ u1: 'active', 'owner-1': 'active' })
+    const body = await (await runIt()).json()
+    expect(body.ok).toBe(true)
+    expect(h.start).toHaveBeenCalledTimes(1)
+    expect(h.start.mock.calls[0][0]).toMatchObject({ actorUserId: 'u1', trigger: 'scheduled' })
+  })
+
+  test('a schedule paused by a person is still refused first, without advancing', async () => {
+    users({ u1: 'disabled', 'owner-1': 'active' })
+    h.findSchedule.mockResolvedValue({ ...SCHEDULE, enabled: false })
+    expect((await runIt()).status).toBe(409)
+    expect(h.updateSchedule).not.toHaveBeenCalled()
+    expect(h.audit).not.toHaveBeenCalled()
+  })
+
+  test('switch off → today\'s behaviour: no account read, the scan starts', async () => {
+    const { setFlagsForTests } = await import('@/lib/authz/flags')
+    setFlagsForTests({ identity: false })
+    users({ u1: 'disabled', 'owner-1': 'disabled' })
+    expect((await (await runIt()).json()).ok).toBe(true)
+    expect(h.start).toHaveBeenCalled()
+    expect(h.userFindMany).not.toHaveBeenCalled()
+    expect(h.projectFindUnique).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /run: a schedule whose actor lost access to the project (step 5.5, DV-38, D-13)', () => {
+  const runIt = async () => (await run(req('http://x/api/internal/scan-schedules/s1/run', {}), sp('s1')))
+  const LOST = { userId: 'collab-1', permission: 'recon:scan', reason: 'project_level' }
+
+  beforeEach(() => {
+    h.findSchedule.mockResolvedValue({ ...SCHEDULE, userId: 'collab-1', label: 'nightly' })
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterEach(() => vi.restoreAllMocks())
+
+  test('schedule paused with a reason: audited, logged, nothing starts, never re-attributed', async () => {
+    h.actorRefusal.mockResolvedValue(LOST)
+    const res = await runIt()
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      ok: false, paused: true, code: 'actor_no_access',
+      error: 'paused: the account that scheduled it no longer has the access to this project that recon:scan needs',
+    })
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.enqueue).not.toHaveBeenCalled()
+    expect(h.actorRefusal).toHaveBeenCalledWith('collab-1', 'p1', ['recon:scan'])
+    expect(h.updateSchedule).not.toHaveBeenCalled()
+    expect(h.updateManySchedule).toHaveBeenCalledTimes(1)
+    const update = h.updateManySchedule.mock.calls[0][0]
+    expect(update.where).toEqual({ id: 's1', userId: 'collab-1' })
+    expect(update.data).toMatchObject({
+      enabled: false, pausedReason: 'actor_no_access', lastRunAt: expect.any(Date), nextRunAt: expect.any(Date),
+    })
+    // D-13: the schedule keeps its actor until a person confirms it.
+    expect(update.data).not.toHaveProperty('userId')
+    expect(h.audit).toHaveBeenCalledWith({
+      actorId: null, projectId: 'p1', action: 'scan_schedule.paused', targetType: 'scanSchedule', targetId: 's1',
+      after: { reason: 'actor_no_access', projectId: 'p1', userId: 'collab-1', permission: 'recon:scan', refusal: 'project_level' },
+      source: 'system',
+    })
+    expect(console.warn).toHaveBeenCalledWith(
+      '[rbac] schedule s1 paused: actor collab-1 lost recon:scan on project p1 (project_level)')
+    // The owner is told (the notice helper reads the owner and writes the notice itself).
+    expect(h.notice).toHaveBeenCalledWith({ projectId: 'p1', scheduleId: 's1', label: 'nightly', actorUserId: 'collab-1' })
+  })
+
+  test('a notice that cannot be written leaves the pause standing', async () => {
+    h.actorRefusal.mockResolvedValue(LOST)
+    h.notice.mockResolvedValue(false)
+    const body = await (await runIt()).json()
+    expect(body).toMatchObject({ paused: true, code: 'actor_no_access' })
+    expect(h.updateManySchedule).toHaveBeenCalledTimes(1)
+  })
+
+  test('a confirmation that landed while it fired is not undone (two at once)', async () => {
+    h.actorRefusal.mockResolvedValue(LOST)
+    h.updateManySchedule.mockResolvedValue({ count: 0 })
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    const res = await runIt()
+    expect(res.status).toBe(409)
+    expect(await res.json()).toEqual({ ok: false, skipped: 'actor_changed' })
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.audit).not.toHaveBeenCalled()
+    expect(h.notice).not.toHaveBeenCalled()
+  })
+
+  test('an overwrite schedule needs recon:overwrite of its actor too', async () => {
+    h.findSchedule.mockResolvedValue({ ...SCHEDULE, userId: 'collab-1', scanMode: 'overwrite' })
+    await runIt()
+    expect(h.actorRefusal).toHaveBeenCalledWith('collab-1', 'p1', ['recon:scan', 'recon:overwrite'])
+  })
+
+  test('owner schedules unchanged: the check passes and the scan starts as its actor', async () => {
+    h.findSchedule.mockResolvedValue(SCHEDULE)
+    const body = await (await runIt()).json()
+    expect(body.ok).toBe(true)
+    expect(h.actorRefusal).toHaveBeenCalledWith('u1', 'p1', ['recon:scan'])
+    expect(h.start.mock.calls[0][0]).toMatchObject({ actorUserId: 'u1', scheduleId: 's1', trigger: 'scheduled' })
+    expect(h.audit).not.toHaveBeenCalled()
+    expect(h.notice).not.toHaveBeenCalled()
+  })
+
+  test('an access check that cannot be read starts nothing and keeps the occurrence due (never)', async () => {
+    h.actorRefusal.mockRejectedValue(Object.assign(new Error('db down'), { code: 'P1001' }))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await runIt()
+    expect(res.status).toBe(500)
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.updateSchedule).not.toHaveBeenCalled()
+    expect(h.updateManySchedule).not.toHaveBeenCalled()
+  })
+
+  test('a schedule a person already turned off is refused before any access check', async () => {
+    h.findSchedule.mockResolvedValue({ ...SCHEDULE, userId: 'collab-1', enabled: false })
+    expect((await runIt()).status).toBe(409)
+    expect(h.actorRefusal).not.toHaveBeenCalled()
+  })
+})

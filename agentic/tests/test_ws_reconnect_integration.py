@@ -47,7 +47,7 @@ def _ticket(user="u", project="p", session="s") -> str:
     def b64(raw: bytes) -> str:
         return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
     head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    body = b64(json.dumps({"sub": user, "pid": project, "sid": session,
+    body = b64(json.dumps({"sub": user, "pid": project, "sid": session, "aud": "agent",
                            "iat": int(time.time()), "exp": int(time.time()) + 300}).encode())
     sig = hmac.new(SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
     return f"{head}.{body}.{b64(sig)}"
@@ -64,7 +64,7 @@ class _ScriptedRun:
 
     async def invoke_with_streaming(self, *, question, user_id, project_id, session_id,
                                     streaming_callback, guidance_queue=None,
-                                    graph_view_cypher=None):
+                                    graph_view_cypher=None, tenant_user_id=None):
         cb = streaming_callback
         await cb.on_tool_start("execute_code", {"code": "print(1)"}, step_id="step0001")
         self.started.set()

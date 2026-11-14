@@ -182,6 +182,11 @@ CSP_CONNECT="${WS_SCHEME}://${PUBLIC_HOST}"
 WEBAPP_NODE_ENV="production"
 NEED_CERTBOT=false; [[ "${TLS_MODE}" == "letsencrypt" ]] && NEED_CERTBOT=true
 
+# The webapp's password floor and bcrypt's byte bound (webapp/scripts/lib/password-policy.json),
+# also redamon.sh's; passwordPolicy.drift.test.ts keeps the copies equal.
+MIN_ADMIN_PASSWORD_LEN=12
+MAX_ADMIN_PASSWORD_BYTES=72
+
 # ------------------------------------------------------------------ local preflight validation
 preflight_validate() {
   hr "Local preflight"
@@ -249,7 +254,13 @@ preflight_validate() {
   if [[ "${MODE}" == "init" ]]; then
     [[ -n "${ADMIN_NAME}" && -n "${ADMIN_EMAIL}" && -n "${ADMIN_PASSWORD}" ]] \
       || die "init requires ADMIN_NAME, ADMIN_EMAIL and ADMIN_PASSWORD in .env (the first admin is created automatically)"
-    [[ ${#ADMIN_PASSWORD} -ge 8 ]] || warn "ADMIN_PASSWORD is short; there is no app-layer login lockout (nginx limit_req is the only brake)"
+    # Refused, not warned: the admin is created from this value, and the webapp
+    # refuses the same password when it is set through the UI.
+    [[ ${#ADMIN_PASSWORD} -ge ${MIN_ADMIN_PASSWORD_LEN} ]] \
+      || die "ADMIN_PASSWORD must be at least ${MIN_ADMIN_PASSWORD_LEN} characters (the webapp's password floor)"
+    # create-admin.mjs refuses a longer one too, but only after the whole build.
+    [[ $(printf '%s' "${ADMIN_PASSWORD}" | LC_ALL=C wc -c) -le ${MAX_ADMIN_PASSWORD_BYTES} ]] \
+      || die "ADMIN_PASSWORD must be at most ${MAX_ADMIN_PASSWORD_BYTES} bytes (bcrypt reads no further, so the webapp refuses a longer one)"
   fi
   ok "Preflight passed (ACCESS_MODE=${ACCESS_MODE}, TLS_MODE=${TLS_MODE}, host=${HOST_IP}, user=${REMOTE_USER})"
 }
@@ -668,8 +679,10 @@ secrets_gate "\$APP_PATH/.env"
 EOF
 }
 
-# idempotent guarantee: upsert the admin from .env (create-admin.mjs). No-op if the
-# pty-driven install already made it. Needs the webapp container running (post-install).
+# idempotent guarantee: create the admin from .env (create-admin.mjs). No-op if the
+# pty-driven install already made it with this password; a changed ADMIN_PASSWORD resets
+# it (and revokes its MCP tokens). A member with that email is refused (exit 3) rather
+# than promoted, since promotion takes FORCE_PROMOTE=1. Needs the webapp container running.
 bootstrap_admin() {
   hr "Admin bootstrap (idempotent guarantee)"
   remote <<EOF
@@ -681,8 +694,10 @@ cd "\$APP_PATH"
 export ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD
 if sg docker -c "cd \$APP_PATH && docker compose exec -T -e ADMIN_NAME -e ADMIN_EMAIL -e ADMIN_PASSWORD webapp node scripts/create-admin.mjs"; then
   success "Admin ensured: \${ADMIN_EMAIL}"
+elif [[ \$? -eq 3 ]]; then
+  warn "create-admin.mjs refused \${ADMIN_EMAIL}: a member already has that email (promoting it takes FORCE_PROMOTE=1)"
 else
-  warn "create-admin.mjs returned non-zero (admin may already exist)"
+  warn "create-admin.mjs failed, so the admin was not ensured: see its output above"
 fi
 EOF
 }

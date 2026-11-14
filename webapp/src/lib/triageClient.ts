@@ -3,23 +3,21 @@
  *
  * Two things every one of these routes must get right, so they live here once:
  *
- * 1. **Authorisation is hard-enforced.** `guardProject` honours the
- *    `ACCESS_ENFORCE=0` log-only escape hatch, which exists so an ownership fix
- *    can be rolled out in observe-mode first. Mute is not eligible for that:
- *    muting changes what the AGENT can see, project-wide, so a mis-scoped mute
- *    is a correctness failure and not just an information leak. These routes
- *    therefore re-check ownership themselves and 404 on a mismatch whatever the
- *    flag says.
+ * 1. **Authorisation is hard-enforced.** Muting changes what the AGENT can see,
+ *    project-wide, so a mis-scoped mute is a correctness failure and not just an
+ *    information leak. Each route asks its permission on the project
+ *    (`requirePermission`): a mute or a verdict needs a write level, which a share
+ *    at Read never reaches, and a project the caller cannot see answers 404.
  *
  * 2. **The tenant is never taken from the request body.** The caller sends a
- *    `projectId` and a `nodeId`; the user id is resolved server-side from the
- *    session, and the node is scoped by that pair inside the graph mixin. A
- *    guessed nodeId from another project matches nothing.
+ *    `projectId` and a `nodeId`; the user id is the project's owner, resolved
+ *    server-side (`triageCaller`), and the node is scoped by that pair inside the
+ *    graph mixin. A guessed nodeId from another project matches nothing.
  */
 import { NextResponse } from 'next/server'
-import prisma from '@/lib/prisma'
 import { requireEffectiveUser } from '@/lib/access'
-import { getSession } from '@/lib/session'
+import { projectAccess } from '@/lib/authz/projectAccess'
+import { signedInActor } from '@/lib/auditActor'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import { safeErrorCode, upstreamFailure } from '@/lib/routeErrors'
@@ -30,11 +28,13 @@ export interface TriageCaller {
 }
 
 /**
- * Resolve the caller and prove they own the project, ignoring the log-only flag.
+ * Resolve the caller and prove they can see the project (`projectAccess()`). It asks no level, so
+ * a share, oversight or break-glass at Read passes as the owner does: no route calls it (a write
+ * needs its route permission's level); the route tests' guard double does.
  *
- * Returns the resolved tenant, or the NextResponse to send back. A project that
- * does not exist and a project owned by somebody else both return 404, so this
- * cannot be used to enumerate project ids.
+ * Returns the resolved tenant (the project's owner, whose graph holds its nodes), or the
+ * NextResponse to send back. A project that does not exist and one the caller cannot see both
+ * return 404, so this cannot be used to enumerate project ids.
  */
 export async function requireProjectOwner(
   projectId: string | null | undefined,
@@ -46,22 +46,13 @@ export async function requireProjectOwner(
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
 
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { id: true, userId: true },
-  })
-  if (!project) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  // There is no separate admin bypass to reproduce -- an admin acts on another
+  // user's project by simulating them, and getEffectiveUser has already resolved
+  // that, so the effective user is the one the policy asks about.
+  const access = await projectAccess(eff, projectId)
+  if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-  // Deliberately NOT ownershipDenied(): that helper honours ACCESS_ENFORCE=0
-  // and would let a mismatch through in log-only mode. There is no separate
-  // admin bypass to reproduce -- an admin acts on another user's project by
-  // simulating them, and getEffectiveUser has already resolved that, so the
-  // strict comparison is the same rule requireProjectAccess applies.
-  if (project.userId !== eff.userId) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-
-  return { userId: project.userId, projectId: project.id }
+  return { userId: access.project.userId, projectId: access.project.id }
 }
 
 /**
@@ -71,8 +62,7 @@ export async function requireProjectOwner(
  */
 export async function realActorUserId(): Promise<string | null> {
   try {
-    const session = await getSession()
-    return session?.userId ?? null
+    return (await signedInActor())?.id ?? null
   } catch {
     // No request scope (a unit test, a background caller): the audit row then
     // records the effective user alone, as every route did before.

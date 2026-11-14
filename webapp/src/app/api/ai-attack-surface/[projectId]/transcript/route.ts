@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { guardProject } from '@/lib/access'
+import { requireLevel, requirePermission } from '@/lib/authz/guards'
 import { promises as fs } from 'fs'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
@@ -21,8 +21,11 @@ const MAX_BYTES = 8 * 1024 * 1024
 //      caller can't read another project's transcripts or arbitrary files).
 export async function GET(request: NextRequest, { params }: RouteParams) {
   const { projectId } = await params
-  const __denied = await guardProject(projectId)
-  if (__denied) return __denied
+  const auth = await requirePermission(request, 'recon:read', { projectId })
+  if (auth instanceof NextResponse) return auth
+  // A raw output (the probe prompts and the target's answers): a read share needs Raw data & files (step 4.7).
+  const raw = requireLevel(auth, 'R*')
+  if (raw) return raw
   const ref = request.nextUrl.searchParams.get('ref') || ''
 
   const filePath = resolveTranscriptPath(ref)

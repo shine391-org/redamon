@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requireEffectiveUser } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
+import { ownerCredentialRefusal, recordFeatureSpend } from '@/lib/authz/ownerSpend'
 import { writeAudit } from '@/lib/audit'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
 import { callFeatureAgent } from '@/lib/featureAgentCall'
@@ -13,7 +15,6 @@ import { readRoeUpload } from '@/lib/roe/upload'
 import { MAX_MODEL_CHARS } from '@/lib/roe/limits'
 import { buildReplaceReview, ReviewUnavailable } from '@/lib/roe/review'
 import { internalError } from '@/lib/routeErrors'
-import type { EffectiveUser } from '@/lib/session'
 
 // Under undici's 300 s default, and over the agent's own 270 s cap on the model
 // call, so a slow model reaches the person as a coded timeout.
@@ -51,7 +52,7 @@ function reviewError(err: unknown): NextResponse | null {
  * stale confirm (the project moved while the person was reviewing) and to
  * review a Remove, which is a replace with an empty document.
  */
-async function rediff(request: NextRequest, eff: EffectiveUser): Promise<NextResponse> {
+async function rediff(request: NextRequest): Promise<NextResponse> {
   const body = await request.json().catch(() => null)
   if (!isObject(body) || typeof body.projectId !== 'string') {
     return NextResponse.json({ error: 'projectId is required.', code: 'bad_request' }, { status: 400 })
@@ -60,8 +61,8 @@ async function rediff(request: NextRequest, eff: EffectiveUser): Promise<NextRes
   if (!remove && !isObject(body.parsedFields)) {
     return NextResponse.json({ error: 'parsedFields is required.', code: 'bad_request' }, { status: 400 })
   }
-  const access = await requireProjectAccess(eff, body.projectId)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'roe:manage', { projectId: body.projectId })
+  if (auth instanceof NextResponse) return auth
   try {
     const review = await buildReplaceReview({
       projectId: body.projectId,
@@ -91,15 +92,12 @@ export async function POST(request: NextRequest) {
   try {
     if (!sameOrigin(request)) return crossOriginResponse()
 
-    // The caller's own "RoE parsing" model on their own keys. Checked before the
-    // upload is read: without a user there is nobody whose keys may be spent.
+    // Without a user there is nobody whose keys may be spent.
     const eff = await requireEffectiveUser()
     if (eff instanceof NextResponse) return eff
     if ((request.headers.get('content-type') || '').toLowerCase().startsWith('application/json')) {
-      return await rediff(request, eff)
+      return await rediff(request)
     }
-    const model = await readFeatureModel(eff.userId, 'roe_parse')
-    if (!model) return featureModelErrorResponse('model_required', 'roe_parse')
 
     const upload = await readRoeUpload(request)
     if (upload instanceof NextResponse) return upload
@@ -109,10 +107,22 @@ export async function POST(request: NextRequest) {
     // row; without one (a project being created) it is a diff against the form.
     const rawProjectId = formData.get('projectId')
     const projectId = typeof rawProjectId === 'string' && rawProjectId ? rawProjectId : null
+    const auth = projectId
+      ? await requirePermission(request, 'roe:manage', { projectId })
+      // A document read for a project the person is creating.
+      : await requirePermission(request, 'project:create')
+    if (auth instanceof NextResponse) return auth
+    // An existing project's parse spends its owner's "RoE parsing" model and keys (step 5.6, C1): a
+    // collaborator needs Use AI agent, which counts only with the owner's consent. A project being
+    // created is the caller's own.
     if (projectId) {
-      const access = await requireProjectAccess(eff, projectId)
-      if (access instanceof NextResponse) return access
+      const spendRefused = ownerCredentialRefusal(auth)
+      if (spendRefused) return spendRefused
     }
+    // The account whose model and keys the parse spends.
+    const userId = projectId ? auth.access!.project.userId : eff.userId
+    const model = await readFeatureModel(userId, 'roe_parse')
+    if (!model) return featureModelErrorResponse('model_required', 'roe_parse')
 
     let doc
     try {
@@ -148,13 +158,17 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    // The model is the one saved in the user's settings, never a form field: a
-    // client cannot pick a model the user never chose.
+    // The model is the one saved in the spender's settings, never a form field: a
+    // client cannot pick a model the owner never chose.
+    if (projectId) {
+      const unrecorded = await recordFeatureSpend(auth, 'roe_parse')
+      if (unrecorded) return unrecorded
+    }
     const agent = await callFeatureAgent({
       featureId: 'roe_parse',
       path: '/roe/parse',
       model,
-      body: { text: doc.text, model, user_id: eff.userId },
+      body: { text: doc.text, model, user_id: userId },
       timeoutMs: AGENT_TIMEOUT_MS,
     })
     if (!agent.ok) {

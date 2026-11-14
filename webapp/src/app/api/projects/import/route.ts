@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
+import { forbiddenResponse, requirePermission } from '@/lib/authz/guards'
+import { projectQuotaRefusal } from '@/lib/authz/quotas'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { clearProjectGraph, restoreGraph } from '@/lib/graphRestore'
 import { REFERENCE_LINKS_BUNDLE_PATH } from '@/lib/graphReferenceLinks'
-import { requireEffectiveUser } from '@/lib/access'
 import JSZip from 'jszip'
 import { randomUUID } from 'crypto'
 import { writeFileSync, mkdirSync, existsSync } from 'fs'
@@ -29,6 +30,8 @@ import { sanitizeImportedRoeParsedJson } from '@/lib/roe/createRoe'
 import { sanitizeImportedOpenApiSettings } from '@/lib/validation/openapiSettings'
 import { importRevision, MAX_IMPORTED_REVISIONS, REVISIONS_BUNDLE_PATH } from '@/lib/roe/revisionBundle'
 import { jevImportWarnings } from '@/lib/reconSettings/jevEngine'
+import { numericBoundsRefusal } from '@/lib/reconSettings/numericBounds'
+import { validateCrossFieldRules } from '@/lib/reconSettings/crossField'
 import { PROJECT_EXPORT_EXCLUDED, isPluginArchivePath } from '@/lib/projectExport/pluginExclusion'
 import { validateSerializedScanChange } from '@/lib/reconSettings/serializedScanGate'
 import { skillToggleWarnings, trimImportedSkillToggles } from '@/lib/userSkills'
@@ -37,6 +40,7 @@ import { internalError } from '@/lib/routeErrors'
 import { checkIdentityHeader } from '@/lib/reconSettings/validators'
 import { DEFAULT_IMPORT_MAX_UPLOAD_BYTES } from './limits'
 import { SCHEMA_DEFAULT_AGENT_MODEL, isLoopModel } from '@/lib/agentInTheLoop'
+import { ownershipTokenForCreate } from '@/lib/ownershipToken'
 
 const MUTEABLE_LABELS = new Set<string>(MUTEABLE_FINDING_LABELS)
 
@@ -155,9 +159,14 @@ export async function POST(request: NextRequest) {
     // The imported project is created under the caller's EFFECTIVE user; the
     // client-supplied ?userId is ignored so a caller cannot import a project into
     // another user's account.
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
+    const auth = await requirePermission(request, 'project:import')
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
     const userId = eff.userId
+
+    // The importer's maxProjects quota (step 6.8): an import creates a project they own.
+    const overQuota = await projectQuotaRefusal(userId)
+    if (overQuota) return overQuota
 
     // D10: zip-bomb defense. Cap the upload size, the total DECLARED uncompressed
     // size, and the entry count BEFORE decompressing any entry, so a small crafted
@@ -298,6 +307,10 @@ export async function POST(request: NextRequest) {
     }
     // Provider ids are account-scoped, even when the importing account owns one.
     delete projectFields.jevProviderId
+    // A bundle exported before tokens were generated per project carries the
+    // placeholder every install shipped; a record published with it would
+    // verify this project too.
+    projectFields.ownershipToken = ownershipTokenForCreate(projectFields.ownershipToken)
 
     // The scope columns get the create routes' rules: groups re-derived from the
     // hosts, one targeting mode, and the hard guardrail in every mode.
@@ -324,6 +337,21 @@ export async function POST(request: NextRequest) {
     // number clamped, so an older or edited bundle still imports.
     sanitizeImportedOpenApiSettings(projectFields)
 
+    // Every other number gets the registry bound create_project applies, refused
+    // as create_project refuses it: a `nucleiRateLimit: 0` imported here ran
+    // nuclei at its built-in rate.
+    const outOfBounds = numericBoundsRefusal(projectFields)
+    if (outOfBounds) {
+      return NextResponse.json(
+        {
+          ...outOfBounds,
+          error: `${outOfBounds.error} The bundle was not imported.`,
+          code: 'setting_rejected',
+        },
+        { status: 400 }
+      )
+    }
+
     // Import is a SECOND creation path, and it has to apply the same rule
     // create_project does or it is the way around it. A bundle that claims a
     // third-party engagement without a rate ceiling and an authorization record
@@ -333,6 +361,11 @@ export async function POST(request: NextRequest) {
     const importedAuthorizations: Record<string, unknown>[] = authorizationsFile
       ? JSON.parse(await authorizationsFile.async('text'))
       : []
+    // Recording them is engagement:authorize. The project does not exist yet and the importer
+    // will own it, so the capability is the whole decision (no project level to check).
+    if (importedAuthorizations.length > 0 && !auth.capabilities.has('engagement:authorize')) {
+      return forbiddenResponse('engagement:authorize')
+    }
 
     if (projectFields.engagementKind === 'third_party') {
       // The ceiling is the number alone now. There is no second switch that
@@ -363,6 +396,16 @@ export async function POST(request: NextRequest) {
       if (trimmed.value) projectFields.attackSkillConfig = trimmed.value
       else delete projectFields.attackSkillConfig
       skillToggleNotes.push(...skillToggleWarnings(trimmed, 'project'))
+    }
+
+    // The rules over several fields every create path runs (B-25), on the row as
+    // it will be created: a bundle is untrusted, and the import is a second
+    // create_project. The toggles were trimmed just above, so they are not judged twice.
+    const crossFieldError = await validateCrossFieldRules(
+      projectFields, Object.keys(projectFields).filter(k => k !== 'attackSkillConfig'), userId,
+      { ownerUserId: userId })
+    if (crossFieldError) {
+      return NextResponse.json({ error: `${crossFieldError} The bundle was not imported.` }, { status: 400 })
     }
 
     // A person picks the brain: an imported project never arrives on Agent in
@@ -441,16 +484,21 @@ export async function POST(request: NextRequest) {
 
     // Import conversations
     const conversationIdMap = new Map<string, string>()
+    // A chain id is its conversation's session id: the graph restore gives each
+    // imported chain the renamed one, so it follows its imported conversation.
+    const renamedChainIds = new Map<string, string>()
     const conversationsFile = zip.file('conversations/conversations.json')
     if (conversationsFile) {
       const conversations: ExportedConversation[] = JSON.parse(await conversationsFile.async('text'))
 
       for (const conv of conversations) {
+        const sessionId = `${conv.sessionId}_imported_${randomUUID().substring(0, 8)}`
+        if (typeof conv.sessionId === 'string' && conv.sessionId) renamedChainIds.set(conv.sessionId, sessionId)
         const newConv = await prisma.conversation.create({
           data: {
             projectId: newProject.id,
             userId,
-            sessionId: `${conv.sessionId}_imported_${randomUUID().substring(0, 8)}`,
+            sessionId,
             title: conv.title,
             status: 'completed',
             agentRunning: false,
@@ -857,10 +905,12 @@ export async function POST(request: NextRequest) {
 
           // Shared with Scan Timeline version activation (lib/graphRestore.ts):
           // same MERGE-vs-CREATE-by-constraint, batching and _exportId wiring.
-          // Nodes are re-owned under the importing user and the new project.
+          // Nodes are re-owned under the importing user and the new project; the
+          // agent-session nodes get new ids, so the source's chain stays its own (R-15).
           const restored = await restoreGraph(session, nodes, relationships, {
             projectId: newProject.id,
             userId,
+            renamedChainIds,
             ...(Array.isArray(referenceLinks) ? { referenceLinks } : {}),
           })
           stats.neo4jNodes = restored.nodes

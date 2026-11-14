@@ -25,12 +25,18 @@ vi.mock('@/lib/activationLock', () => ({
   // which asks the boolean form.
   isActivationInProgress: async () => h.isActivating(),
 }))
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overEffectiveUser()))
 vi.mock('@/lib/access', () => ({
   guardProject: async () => null,
   requireProjectAccess: async () => ({ project: { id: 'p1', userId: 'owner' } }),
   requireEffectiveUser: async () => ({ userId: 'owner' }),
 }))
-vi.mock('@/lib/session', () => ({ getEffectiveUser: async () => ({ userId: 'owner' }) }))
+vi.mock('@/lib/session', () => ({
+  getEffectiveUser: async () => ({ userId: 'owner' }),
+  getAuthzIdentity: async () => ({ session: { userId: 'owner', role: 'standard' }, principal: { id: 'owner', role: 'standard' }, actingAs: null }),
+}))
+// The agent ticket's approval permissions (step 3.9b) are agentCap.test.ts's; here only the lock matters.
+vi.mock('@/lib/authz/agentCap', () => ({ agentTicketCap: async () => [] }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
 // "is something already scanning?" is covered in graphWriters.test.ts and
 // startFullScan.test.ts; here the graph is free so only the LOCK can refuse.
@@ -38,6 +44,8 @@ vi.mock('@/lib/graphWriters', () => ({ describeScanWriters: async () => null }))
 vi.mock('@/lib/nodeFilterRun', () => ({ describeNodeFilterWriter: (...a: unknown[]) => h.nodeFilterWriter(...a) }))
 vi.mock('@/lib/prisma', () => ({
   default: {
+    // A ticket's session that no conversation holds yet (5.3 review: sessionTicketRefusal).
+    conversation: { findUnique: async () => null },
     project: {
       findUnique: async () => ({ id: 'p1', userId: 'owner', targetDomain: 'x.tld', ipMode: false, targetIps: [] }),
     },
@@ -98,7 +106,7 @@ function scanReq() {
 }
 function partialReq() {
   return new NextRequest('http://x/api/recon/p1/partial', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"tool_id":"katana"}',
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"tool_id":"katana","graph_inputs":{"domains":["alpha.test"]}}',
   })
 }
 function ticketReq() {

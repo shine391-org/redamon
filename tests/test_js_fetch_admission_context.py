@@ -72,24 +72,10 @@ fa = _load_path("recon.helpers.js_recon.fetch_admission",
 # where the code path under test touches them; MagicMock stubs elsewhere.
 helpers.catchall = _module("recon.helpers.catchall")
 
-_roe = _module("recon.helpers.roe_scope")
-
-
-def _is_roe_excluded(host, excluded):  # noqa: ARG001 - stubbed guard
-    return False
-
-
-def _normalize_host(host):  # noqa: ARG001 - stubbed guard
-    return str(host or "").strip().lower().rstrip(".")
-
-
-def _normalize_scope_entry(entry):  # noqa: ARG001 - stubbed guard
-    return entry
-
-
-_roe._is_roe_excluded = _is_roe_excluded
-_roe._normalize_host = _normalize_host
-_roe._normalize_scope_entry = _normalize_scope_entry
+# The 7.8 hop guard uses target_admission, which needs the complete scope
+# normalizer API. roe_scope is stdlib-only; use its real policy rather than an
+# incomplete permissive stub so newly added guards still execute in this suite.
+_roe = _load_path("recon.helpers.roe_scope", "recon/helpers/roe_scope.py")
 helpers.roe_scope = _roe
 
 for _name, _attr in (
@@ -435,7 +421,7 @@ class DownloadSeamTests(unittest.TestCase):
         js_recon._download_allowed = lambda url: True
 
         def fake_get(url, *, timeout, headers, max_redirects=5, extra_headers=None,
-                     session=None):
+                     session=None, settings=None):
             self.assertIsNotNone(session)
             self.assertFalse(session.trust_env)
             self.calls += 1

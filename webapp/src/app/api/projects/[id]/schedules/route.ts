@@ -5,8 +5,8 @@
  * POST /api/projects/[id]/schedules   create a schedule (validated + RAM-checked)
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { requireAlso, requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { writeAudit } from '@/lib/audit'
 import {
   validateSchedule,
@@ -14,7 +14,7 @@ import {
   ScheduleValidationError,
 } from '@/lib/scanSchedule'
 import { fetchScanEnvelope } from '@/lib/scanEnvelope'
-import { scopeStartProblem } from '@/lib/scopeGroups'
+import { IP_HOSTNAME_SELECT, scopeStartProblem } from '@/lib/scopeGroups'
 import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
@@ -26,12 +26,20 @@ interface RouteParams {
 // finished queue jobs) is capped, then merged and re-capped newest-first.
 const JOB_HISTORY_LIMIT = 1000
 
-export const GET = withRouteErrors('Failed to list schedules', async (_request: NextRequest, { params }: RouteParams) => {
+/** A person a schedule or run names, as the timeline shows them. */
+interface Person { name: string | null; email: string }
+
+async function peopleByIds(ids: Array<string | null>): Promise<Map<string, Person>> {
+  const wanted = [...new Set(ids.filter((id): id is string => typeof id === 'string' && id !== ''))]
+  if (wanted.length === 0) return new Map()
+  const rows = await prisma.user.findMany({ where: { id: { in: wanted } }, select: { id: true, name: true, email: true } })
+  return new Map(rows.map(r => [r.id, { name: r.name, email: r.email }]))
+}
+
+export const GET = withRouteErrors('Failed to list schedules', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'recon:read', { projectId: id })
+  if (auth instanceof NextResponse) return auth
 
   try {
     const [schedules, jobs, queueHistory] = await Promise.all([
@@ -61,9 +69,17 @@ export const GET = withRouteErrors('Failed to list schedules', async (_request: 
         take: JOB_HISTORY_LIMIT,
         select: {
           id: true, kind: true, status: true, error: true, blockedReason: true,
-          enqueuedAt: true, startedAt: true, finishedAt: true, scheduleId: true,
+          enqueuedAt: true, startedAt: true, finishedAt: true, scheduleId: true, userId: true,
         },
       }),
+    ])
+
+    // Who created each schedule and who started each run, where the row records it: on a shared
+    // project that is not always the reader (SH-24). Names only, read once for every row.
+    const people = await peopleByIds([
+      ...schedules.map(s => s.userId),
+      ...jobs.map(j => j.initiatedByUserId),
+      ...queueHistory.map(q => q.userId),
     ])
 
     // ScanJob status vocabulary, so one column reads consistently.
@@ -84,6 +100,7 @@ export const GET = withRouteErrors('Failed to list schedules', async (_request: 
       degradedSources: null,
       scheduleId: q.scheduleId,
       version: null,
+      startedBy: people.get(q.userId) ?? null,
     }))
 
     return NextResponse.json(
@@ -94,6 +111,7 @@ export const GET = withRouteErrors('Failed to list schedules', async (_request: 
           estimatedEnvelopeBytes: s.estimatedEnvelopeBytes === null
             ? null
             : Number(s.estimatedEnvelopeBytes),
+          createdBy: people.get(s.userId) ?? null,
         })),
         jobs: [
           ...jobs.map(j => ({
@@ -110,6 +128,7 @@ export const GET = withRouteErrors('Failed to list schedules', async (_request: 
             degradedSources: j.degradedSources,
             scheduleId: j.scheduleId,
             version: j.version ? { seq: j.version.seq, label: j.version.label } : null,
+            startedBy: j.initiatedByUserId ? people.get(j.initiatedByUserId) ?? null : null,
           })),
           ...queueRuns,
         ]
@@ -125,12 +144,15 @@ export const GET = withRouteErrors('Failed to list schedules', async (_request: 
 
 export const POST = withRouteErrors('Failed to create the schedule', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'recon:schedule', { projectId: id })
+  if (auth instanceof NextResponse) return auth
+  const eff = auth.effective
 
   const body = await request.json().catch(() => null)
+  // A schedule starts a full recon later, as its author: the author must be able to start one.
+  const refused = requireAlso(auth, 'recon:scan')
+    ?? ((body as { scanMode?: unknown } | null)?.scanMode === 'overwrite' ? requireAlso(auth, 'recon:overwrite') : null)
+  if (refused) return refused
 
   let validated
   try {
@@ -148,7 +170,10 @@ export const POST = withRouteErrors('Failed to create the schedule', async (requ
   if (validated.enabled) {
     const project = await prisma.project.findUnique({
       where: { id },
-      select: { ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true },
+      select: {
+        ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true,
+        engagementKind: true, ...IP_HOSTNAME_SELECT,
+      },
     })
     const problem = project ? scopeStartProblem(project) : null
     if (problem) {

@@ -20,16 +20,24 @@ const h = vi.hoisted(() => ({
   recordScanStart: vi.fn(),
   guard: vi.fn(),
   legacy: vi.fn(),
+  countAuthorizations: vi.fn(),
 }))
 
 vi.mock('@/lib/prisma', () => ({
-  default: { project: { findUnique: (...a: unknown[]) => h.findProject(...a) } },
+  default: {
+    project: { findUnique: (...a: unknown[]) => h.findProject(...a) },
+    engagementAuthorization: {
+      count: (...a: unknown[]) => h.countAuthorizations(...a),
+      findFirst: async () => null,
+    },
+  },
 }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
 vi.mock('fs', async orig => ({
   ...(await orig<typeof import('fs')>()),
   existsSync: (...a: unknown[]) => h.existsSync(...a),
 }))
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProject()))
 vi.mock('@/lib/access', () => ({
   guardProject: (...a: unknown[]) => h.guard(...a),
   requireEffectiveUser: vi.fn().mockResolvedValue({ userId: 'u1' }),
@@ -64,7 +72,41 @@ beforeEach(() => {
   h.recordScanStart.mockResolvedValue(null)
   h.orchestratorFetch.mockResolvedValue({ ok: true, json: async () => ({ status: 'starting' }) })
   h.findProject.mockResolvedValue(BATCH)
+  h.countAuthorizations.mockResolvedValue(0)
   h.legacy.mockResolvedValue([])
+})
+
+describe('a third-party engagement (R-11)', () => {
+  // GVM sweeps ports on somebody else's estate: a manual start is held to the
+  // same engagement rule as the full start and the queued start.
+  test('with no rate ceiling is refused with 422 before the orchestrator', async () => {
+    h.findProject.mockResolvedValue({ ...BATCH, engagementKind: 'third_party', roeGlobalMaxRps: 0 })
+    h.countAuthorizations.mockResolvedValue(1)
+    const res = await call()
+    expect(res.status).toBe(422)
+    const { error } = await res.json()
+    expect(error).toMatch(/^This is a third-party engagement and it is not startable: /)
+    expect(error).toContain('roeGlobalMaxRps is 0')
+    expect(error).toMatch(/Use preflight_scope_check to see the whole picture\.$/)
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test('with no authorization record is refused too', async () => {
+    h.findProject.mockResolvedValue({ ...BATCH, engagementKind: 'third_party', roeGlobalMaxRps: 3 })
+    const res = await call()
+    expect(res.status).toBe(422)
+    expect((await res.json()).error).toContain('No authorization record')
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  test('with a ceiling and an authorization record it starts', async () => {
+    h.findProject.mockResolvedValue({ ...BATCH, engagementKind: 'third_party', roeGlobalMaxRps: 3 })
+    h.countAuthorizations.mockResolvedValue(1)
+    const res = await call()
+    expect(res.status).toBe(200)
+    expect(h.orchestratorFetch).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('domain batch precondition', () => {
@@ -204,5 +246,25 @@ describe('a start the orchestrator or the DB refuses', () => {
     const body = await res.json()
     expect(body).toEqual({ error: 'Failed to start GVM scan', code: 'P1001' })
     expect(JSON.stringify(body)).not.toContain('example.com')
+  })
+})
+
+describe('the job credential (step 1.16)', () => {
+  test('the orchestrator call carries a job credential for the project owner', async () => {
+    const { verifyJobCredential } = await import('@/lib/authz/machineCredential')
+    const saved = process.env.INTERNAL_API_KEY
+    process.env.INTERNAL_API_KEY = 'start-path-test-master'
+    try {
+      h.findProject.mockResolvedValue({ ...BATCH, engagementKind: 'third_party', roeGlobalMaxRps: 3 })
+      h.countAuthorizations.mockResolvedValue(1)
+      const res = await call()
+      expect(res.status).toBe(200)
+      const sent = JSON.parse(h.orchestratorFetch.mock.calls[0][1].body)
+      expect(verifyJobCredential(sent.job_credential)).toMatchObject({ aud: 'scan', ten: 'u1', pid: 'p1' })
+      expect(sent.user_id).toBe('u1')
+    } finally {
+      if (saved === undefined) delete process.env.INTERNAL_API_KEY
+      else process.env.INTERNAL_API_KEY = saved
+    }
   })
 })

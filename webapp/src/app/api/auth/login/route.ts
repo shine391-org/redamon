@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
-import prisma from '@/lib/prisma'
-import { verifyPassword, createToken, AUTH_COOKIE_NAME } from '@/lib/auth'
+import { verifyPassword, UNMATCHABLE_PASSWORD_HASH } from '@/lib/auth'
+import { findSignInAccount, recordSignIn } from '@/lib/authz/accountEmail'
+import { invalidatePrincipal } from '@/lib/authz/principal'
+import { rbacFlags } from '@/lib/authz/flags'
 import { writeAudit } from '@/lib/audit'
 import { getClientMeta } from '@/lib/requestMeta'
 import { checkLockout, recordFailure, clearAttempts } from '@/lib/loginThrottle'
-import { isSecureRequest } from '@/lib/cookieSecurity'
+import { setLoginCookie } from '@/lib/loginCookie'
+import { issueLoginToken } from '@/lib/authz/sessionLifetime'
+import { flagShortPasswordAtSignIn } from '@/lib/authz/mustChange'
+import { afterResetEntry, firstSignInAfterReset, handOverNotices, type NoticeView } from '@/lib/authz/accountNotices'
 import { internalError } from '@/lib/routeErrors'
 
 export async function POST(request: NextRequest) {
@@ -12,7 +17,7 @@ export async function POST(request: NextRequest) {
     const { email, password } = await request.json()
     const meta = getClientMeta(request)
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return NextResponse.json(
         { error: 'Email and password are required' },
         { status: 400 }
@@ -26,11 +31,11 @@ export async function POST(request: NextRequest) {
     // would let one client lock out others and let an attacker rotate XFF to
     // evade. Per-account lockout still protects every account either way.
     const lockIp = meta.ipTrusted ? meta.ip : null
-    const lock = checkLockout(String(email), lockIp)
+    const lock = checkLockout(email, lockIp)
     if (lock.locked) {
       await writeAudit({
         action: 'auth.login.lockout', targetType: 'user',
-        after: { email: String(email), ip: meta.ip, ipTrusted: meta.ipTrusted, retryAfter: lock.retryAfterSeconds },
+        after: { email, ip: meta.ip, ipTrusted: meta.ipTrusted, retryAfter: lock.retryAfterSeconds },
       })
       return NextResponse.json(
         { error: 'Too many failed attempts. Try again later.' },
@@ -38,31 +43,26 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email },
-      select: { id: true, name: true, email: true, password: true, role: true },
-    })
+    const user = await findSignInAccount(email)
 
-    if (!user || !user.password) {
+    // One bcrypt compare on every path: with no account, or one without a
+    // password, the compare runs against a hash nothing matches, so the answer
+    // takes as long as a wrong password and its latency names no account.
+    const valid = await verifyPassword(password, user?.password || UNMATCHABLE_PASSWORD_HASH)
+    // With the identity switch on only an active account signs in. A disabled one has an
+    // empty password anyway, which the passwordless check refuses on any release; the status
+    // check also refuses one whose password was set while it was disabled. Same answer as a
+    // wrong password, so the status of an account is never disclosed.
+    const identity = rbacFlags().identity
+    const disabled = identity && user?.status === 'disabled'
+    if (!user || !user.password || !valid || (identity && user.status !== 'active')) {
       // R5: log the failure. Record ONLY the attempted email + source IP; never
       // the password or hash. S11: increment the lockout counter.
-      recordFailure(String(email), lockIp)
+      recordFailure(email, lockIp)
       await writeAudit({
-        action: 'auth.login.failure', targetType: 'user',
-        after: { email: String(email), ip: meta.ip, ipTrusted: meta.ipTrusted, userAgent: meta.userAgent },
-      })
-      return NextResponse.json(
-        { error: 'Invalid email or password' },
-        { status: 401 }
-      )
-    }
-
-    const valid = await verifyPassword(password, user.password)
-    if (!valid) {
-      recordFailure(String(email), lockIp)
-      await writeAudit({
-        action: 'auth.login.failure', targetType: 'user', targetId: user.id,
-        after: { email: String(email), ip: meta.ip, ipTrusted: meta.ipTrusted, userAgent: meta.userAgent },
+        action: disabled ? 'auth.login.disabled' : 'auth.login.failure', targetType: 'user',
+        ...(user?.password || disabled ? { targetId: user!.id } : {}),
+        after: { email, ip: meta.ip, ipTrusted: meta.ipTrusted, userAgent: meta.userAgent },
       })
       return NextResponse.json(
         { error: 'Invalid email or password' },
@@ -71,28 +71,56 @@ export async function POST(request: NextRequest) {
     }
 
     // S11: successful login clears the failure counters for this email + IP.
-    clearAttempts(String(email), lockIp)
+    clearAttempts(email, lockIp)
     await writeAudit({
       actorId: user.id, action: 'auth.login.success', targetType: 'user', targetId: user.id,
       after: { ip: meta.ip, ipTrusted: meta.ipTrusted, userAgent: meta.userAgent },
     })
 
-    const token = await createToken(user.id, user.role)
+    // Identity switch on (step 2.10): a credentials reset is made visible to the person. The
+    // first sign-in after it records its address and browser (only that one, DV-11), and the
+    // pending notices are answered once, for the sign-in page to show.
+    let notices: NoticeView[] = []
+    if (identity) {
+      if (firstSignInAfterReset(user.lastLoginAt, user.pendingNotices)) {
+        await writeAudit(afterResetEntry(user.id, meta, user.pendingNotices))
+      }
+      notices = await handOverNotices(user.id, user.pendingNotices)
+    }
+
+    await recordSignIn(user.id)
+
+    // Identity switch on: an account whose password must change signs in into the change page
+    // only (the `pwc` claim, read by the middleware). The flag comes from the sign-in row, or is
+    // set now by Root's short-password prompt, which also raises the version.
+    let sessionVersion = user.sessionVersion
+    let mustChange = identity && user.mustChangePassword
+    if (identity && !mustChange) {
+      const raised = await flagShortPasswordAtSignIn(user.id, password)
+      if (raised !== null) {
+        sessionVersion = raised
+        mustChange = true
+      }
+    }
+    invalidatePrincipal(user.id)
+
+    // The token carries the version the account holds now: raising it later signs this
+    // browser out, together with every other one. With the identity switch on it lives as long
+    // as the instance gives this kind of account (step 2.11), and so does its cookie; with the
+    // governance switch on it names this browser's new device session (step 6.10).
+    const { token, maxAge } = await issueLoginToken(
+      { id: user.id, role: user.role, sessionVersion }, { pwc: mustChange, device: { meta } },
+    )
 
     const response = NextResponse.json({
       id: user.id,
       name: user.name,
       email: user.email,
       role: user.role,
+      ...(mustChange ? { mustChangePassword: true } : {}),
+      ...(notices.length ? { notices } : {}),
     })
-
-    response.cookies.set(AUTH_COOKIE_NAME, token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: isSecureRequest(request), // S12: Secure over HTTPS, else plain HTTP works
-      path: '/',
-      maxAge: 7 * 24 * 60 * 60, // 7 days
-    })
+    setLoginCookie(response, request, token, maxAge)
 
     return response
   } catch (error) {

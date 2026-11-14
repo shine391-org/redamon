@@ -7,7 +7,8 @@ looked at and not found is closed, and anything the scan did not look at is
 unknown, never closed.
 
 What a scan looked at comes from what it recorded (`scan_metadata`): the
-custom port list it ran, or "top-N". naabu's and masscan's top-100/1000 lists
+custom port list it ran, or "top-N", and for a naabu run cut by its timeout
+the targets it never reached. naabu's and masscan's top-100/1000 lists
 are their own and are not shipped here, so a top-N scan can confirm an open
 port but never call one closed; "top-full" is every port. naabu's passive
 mode reads InternetDB rather than scanning, so it confirms nothing.
@@ -89,10 +90,15 @@ def _scans(combined_result: dict, settings: dict) -> list[_Scan]:
     masscan_only = meta.get("scanner") == "masscan"
 
     if port_scan and not masscan_only and not meta.get("passive_mode"):
-        ips = set(extract_targets_from_recon(combined_result)[0])
+        ips = set(extract_targets_from_recon(combined_result, settings)[0])
         if meta.get("cdn_exclusion"):
             # naabu -exclude-cdn probes a CDN IP on 80 and 443 only.
             ips -= collect_cdn_ips(combined_result)
+        if meta.get("timed_out"):
+            # A naabu run cut by its timeout (R-9) did not reach the targets it
+            # lists as unchecked; without that list, none counts as looked at.
+            unchecked = meta.get("unchecked_targets")
+            ips = ips - set(unchecked) if isinstance(unchecked, list) else set()
         scans.append(_Scan(frozenset(ips), ports_from_config(meta.get("ports_config")),
                            _open_by_ip(port_scan)))
 
@@ -102,7 +108,7 @@ def _scans(combined_result: dict, settings: dict) -> list[_Scan]:
         # An exclusion list leaves IPs unprobed that this cannot tell apart.
         ports = (None if (settings or {}).get("MASSCAN_EXCLUDE_TARGETS")
                  else ports_from_config(mmeta.get("ports_config")))
-        scans.append(_Scan(frozenset(resolve_targets_to_ips(combined_result)[0]), ports,
+        scans.append(_Scan(frozenset(resolve_targets_to_ips(combined_result, settings)[0]), ports,
                            _open_by_ip(masscan)))
     return scans
 

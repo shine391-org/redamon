@@ -6,12 +6,16 @@
  * back as `warnings`.
  */
 import { NextRequest, NextResponse } from 'next/server'
-import { requireUserAccess } from '@/lib/session'
+import { isInternalRequest, requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
 import { mcpServerSchema, validateMcpServers, type MCPServer } from '@/lib/mcp/schema'
-import { maskMcpServersForApi, restoreMaskedToken } from '../route'
+import { maskMcpServersForApi, refuseUserServer, restoreMaskedToken } from '../route'
 import { internalError } from '@/lib/routeErrors'
+import { mcpServerEndpointChange, mcpServerSecretReentry, secretReentryResponse } from '@/lib/authz/secretEndpointRebind'
+import { requireStepUp } from '@/lib/authz/stepUp'
 import { reloadAgentMcp } from '../reload'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { refuseWhileActingAsOn } from '@/lib/authz/actAsRefusals'
 
 interface RouteParams {
   params: Promise<{ id: string; serverId: string }>
@@ -20,9 +24,15 @@ interface RouteParams {
 export async function PUT(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, serverId } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'write' })
     if (__denied) return __denied
-    const body = await request.json()
+    const selfRefused = await requireSelfPermission(request, id, 'self:mcp_servers')
+    if (selfRefused) return selfRefused
+    // The step-up password rides with the save and is never part of the server.
+    const { stepUpPassword, ...body } = await request.json()
+
+    const refused = await refuseUserServer(request, id, body)
+    if (refused) return refused
 
     // Look up the existing record first so we can restore the literal auth
     // token if the user submitted a masked placeholder. This must happen
@@ -34,6 +44,23 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     })
     const current = (Array.isArray(existing?.mcpServers) ? existing!.mcpServers : []) as MCPServer[]
     const existingServer = current.find(s => s.id === serverId)
+
+    // A new URL must come with the token and header values typed again (HD-24):
+    // the masked ones restored below would otherwise follow the server there.
+    if (existingServer && mcpServerEndpointChange(existingServer, body)) {
+      const actingAs = await refuseWhileActingAsOn(id, 'change_mcp_endpoint')
+      if (actingAs) return actingAs
+    }
+    if (existingServer) {
+      const reentry = mcpServerSecretReentry(existingServer, body)
+      if (reentry) return secretReentryResponse(reentry)
+      // Re-pointing also takes the signed-in person's password (ID-25): a new token typed
+      // for a new address passes the re-entry rule, yet the agent's tool calls follow it.
+      if (!isInternalRequest(request) && mcpServerEndpointChange(existingServer, body)) {
+        const refused = await requireStepUp(request, stepUpPassword)
+        if (refused) return refused
+      }
+    }
 
     // Restore masked token (••••...) from the existing DB record.
     const restored = existingServer
@@ -71,7 +98,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       data: { mcpServers: next as unknown as object },
     })
 
-    const warnings = await reloadAgentMcp(next)
+    const warnings = await reloadAgentMcp(id, next)
     const [returned] = maskMcpServersForApi([updated])
     return NextResponse.json({
       server: returned, servers: maskMcpServersForApi(next),
@@ -85,8 +112,10 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, serverId } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'write' })
     if (__denied) return __denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:mcp_servers')
+    if (selfRefused) return selfRefused
 
     const existing = await prisma.userSettings.findUnique({
       where: { userId: id },
@@ -104,7 +133,7 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       data: { mcpServers: next as unknown as object },
     })
 
-    const warnings = await reloadAgentMcp(next)
+    const warnings = await reloadAgentMcp(id, next)
     // Masked like every other answer here: the remaining servers hold literal tokens.
     return NextResponse.json({ servers: maskMcpServersForApi(next), ...(warnings.length ? { warnings } : {}) })
   } catch (error) {

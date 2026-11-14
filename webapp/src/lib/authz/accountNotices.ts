@@ -1,0 +1,373 @@
+/**
+ * One-time notices to an account (step 2.10, ID-19; feature document §7.1): a credentials reset
+ * is takeover-equivalent, whoever issued it can use it first, so the person is told. The reset
+ * writes a notice into the account's `pendingNotices`; the next sign-in hands the pending ones
+ * to the person once and marks them shown. The account keeps them, the newest NOTICE_LIMIT, for
+ * its activity list (step 2.11). A change of the sign-in email is told the same way (step 2.11,
+ * ID-30): whoever changes it can then reset the password through it. An admin acting as the
+ * account is told too (step 3.14, IM-10), unless Root turned it off. Root opening break-glass
+ * access to a project tells its owner (step 4.14, SH-18): who, when, why, for how long, which project.
+ * A scan schedule that paused itself because the person it runs as lost access to the project tells
+ * the project's owner (step 5.5, D-13): which schedule, which project, whose access ended.
+ * An ownership transfer tells both people (step 5.12, SH-15): which project, who gave or took it,
+ * whether the old owner stayed as a co-owner, and how many settings the new owner has to re-pick.
+ *
+ * The first sign-in after a reset is the one whose account last signed in before the latest
+ * reset notice; only that sign-in records its address and browser (DV-11).
+ */
+import { randomUUID } from 'node:crypto'
+import prisma from '@/lib/prisma'
+import { safeErrorCode } from '@/lib/routeErrors'
+import { now } from './clock'
+
+export const NOTICE_LIMIT = 20
+
+export type ResetMode = 'link' | 'temporary'
+
+export interface CredentialsResetNotice {
+  id: string
+  type: 'credentials_reset'
+  /** When the reset happened (ISO). */
+  at: string
+  /** The person who reset it (the real signed-in admin, never an account it acted as). */
+  by: { id: string; name: string; email: string }
+  reason: string | null
+  mode: ResetMode
+  /** When a sign-in handed it to the person; absent while pending. */
+  shownAt?: string
+}
+
+export interface EmailChangedNotice {
+  id: string
+  type: 'email_changed'
+  at: string
+  /** Who changed it: the account itself (`self`), or the real signed-in admin. */
+  by: { id: string; name: string; email: string }
+  from: string
+  to: string
+  self: boolean
+  shownAt?: string
+}
+
+export interface ActedAsNotice {
+  id: string
+  type: 'acted_as'
+  /** When the impersonation started (ISO). */
+  at: string
+  /** The real signed-in admin. */
+  by: { id: string; name: string; email: string }
+  reason: string | null
+  /** The time limit chosen (the impersonation may have ended earlier: My activity has the end). */
+  durationMinutes: number
+  shownAt?: string
+}
+
+export interface BreakGlassNotice {
+  id: string
+  type: 'break_glass'
+  /** When Root opened it (ISO). */
+  at: string
+  /** Root, the person signed in. */
+  by: { id: string; name: string; email: string }
+  reason: string
+  durationMinutes: number
+  project: { id: string; name: string }
+  shownAt?: string
+}
+
+export interface SchedulePausedNotice {
+  id: string
+  type: 'schedule_paused'
+  /** When the schedule paused itself (ISO). */
+  at: string
+  /**
+   * The person the schedule ran as, whose access to the project ended (the schedule paused itself;
+   * nobody paused it). Name and email are empty for an account that no longer exists.
+   */
+  by: { id: string; name: string; email: string }
+  project: { id: string; name: string }
+  schedule: { id: string; label: string }
+  shownAt?: string
+}
+
+export interface ProjectTransferNotice {
+  id: string
+  type: 'project_transfer'
+  /** When the transfer completed (ISO). */
+  at: string
+  /** The other person: who took the project (`given`) or who gave it (`received`). */
+  by: { id: string; name: string; email: string }
+  project: { id: string; name: string }
+  direction: 'given' | 'received'
+  oldOwnerRole: 'co-owner' | 'leave'
+  /** Settings cleared for the new owner to re-pick (0 for the old owner). */
+  cleared: number
+  shownAt?: string
+}
+
+export type AccountNotice =
+  | CredentialsResetNotice | EmailChangedNotice | ActedAsNotice | BreakGlassNotice | SchedulePausedNotice | ProjectTransferNotice
+
+/** What the person is shown: the notice without the admin's account id. */
+export type NoticeView =
+  | {
+    id: string
+    type: 'credentials_reset'
+    at: string
+    by: { name: string; email: string }
+    reason: string | null
+    mode: ResetMode
+  }
+  | {
+    id: string
+    type: 'email_changed'
+    at: string
+    by: { name: string; email: string }
+    from: string
+    to: string
+    self: boolean
+  }
+  | {
+    id: string
+    type: 'acted_as'
+    at: string
+    by: { name: string; email: string }
+    reason: string | null
+    durationMinutes: number
+  }
+  | {
+    id: string
+    type: 'break_glass'
+    at: string
+    by: { name: string; email: string }
+    reason: string
+    durationMinutes: number
+    project: { id: string; name: string }
+  }
+  | {
+    id: string
+    type: 'schedule_paused'
+    at: string
+    by: { name: string; email: string }
+    project: { id: string; name: string }
+    schedule: { id: string; label: string }
+  }
+  | {
+    id: string
+    type: 'project_transfer'
+    at: string
+    by: { name: string; email: string }
+    project: { id: string; name: string }
+    direction: 'given' | 'received'
+    oldOwnerRole: 'co-owner' | 'leave'
+    cleared: number
+  }
+
+const text = (v: unknown): v is string => typeof v === 'string'
+
+function isNotice(v: unknown): v is AccountNotice {
+  if (!v || typeof v !== 'object') return false
+  const n = v as Record<string, unknown>
+  const by = n.by as Record<string, unknown> | null | undefined
+  const common = text(n.id) && text(n.at) && !Number.isNaN(Date.parse(n.at))
+    && !!by && typeof by === 'object' && text(by.id) && text(by.name) && text(by.email)
+    && (n.shownAt === undefined || text(n.shownAt))
+  if (!common) return false
+  if (n.type === 'credentials_reset') {
+    return (n.mode === 'link' || n.mode === 'temporary') && (n.reason === null || text(n.reason))
+  }
+  if (n.type === 'acted_as') {
+    return (n.reason === null || text(n.reason)) && Number.isSafeInteger(n.durationMinutes) && (n.durationMinutes as number) >= 1
+  }
+  if (n.type === 'break_glass') {
+    const project = n.project as Record<string, unknown> | null | undefined
+    return text(n.reason) && Number.isSafeInteger(n.durationMinutes) && (n.durationMinutes as number) >= 1
+      && !!project && typeof project === 'object' && text(project.id) && text(project.name)
+  }
+  if (n.type === 'schedule_paused') {
+    const project = n.project as Record<string, unknown> | null | undefined
+    const schedule = n.schedule as Record<string, unknown> | null | undefined
+    return !!project && typeof project === 'object' && text(project.id) && text(project.name)
+      && !!schedule && typeof schedule === 'object' && text(schedule.id) && text(schedule.label)
+  }
+  if (n.type === 'project_transfer') {
+    const project = n.project as Record<string, unknown> | null | undefined
+    return !!project && typeof project === 'object' && text(project.id) && text(project.name)
+      && (n.direction === 'given' || n.direction === 'received') && (n.oldOwnerRole === 'co-owner' || n.oldOwnerRole === 'leave')
+      && Number.isSafeInteger(n.cleared) && (n.cleared as number) >= 0
+  }
+  return n.type === 'email_changed' && text(n.from) && text(n.to) && typeof n.self === 'boolean'
+}
+
+/** The notices a stored value holds; anything else (a row from before this step, a bad entry) is none. */
+export function readNotices(value: unknown): AccountNotice[] {
+  return Array.isArray(value) ? value.filter(isNotice) : []
+}
+
+export function credentialsResetNotice(
+  { by, at, reason, mode }: { by: CredentialsResetNotice['by']; at: Date; reason: string | null; mode: ResetMode },
+): CredentialsResetNotice {
+  return { id: randomUUID(), type: 'credentials_reset', at: at.toISOString(), by, reason, mode }
+}
+
+export function emailChangedNotice(
+  { by, at, from, to, self }: { by: EmailChangedNotice['by']; at: Date; from: string; to: string; self: boolean },
+): EmailChangedNotice {
+  return { id: randomUUID(), type: 'email_changed', at: at.toISOString(), by, from, to, self }
+}
+
+export function actedAsNotice(
+  { by, at, reason, durationMinutes }: { by: ActedAsNotice['by']; at: Date; reason: string | null; durationMinutes: number },
+): ActedAsNotice {
+  return { id: randomUUID(), type: 'acted_as', at: at.toISOString(), by, reason, durationMinutes }
+}
+
+export function breakGlassNotice(
+  { by, at, reason, durationMinutes, project }: {
+    by: BreakGlassNotice['by']; at: Date; reason: string; durationMinutes: number; project: BreakGlassNotice['project']
+  },
+): BreakGlassNotice {
+  return {
+    id: randomUUID(), type: 'break_glass', at: at.toISOString(), by, reason, durationMinutes,
+    project: { id: project.id, name: project.name },
+  }
+}
+
+export function schedulePausedNotice(
+  { by, at, project, schedule }: {
+    by: SchedulePausedNotice['by']; at: Date; project: SchedulePausedNotice['project']; schedule: SchedulePausedNotice['schedule']
+  },
+): SchedulePausedNotice {
+  return {
+    id: randomUUID(), type: 'schedule_paused', at: at.toISOString(), by,
+    project: { id: project.id, name: project.name }, schedule: { id: schedule.id, label: schedule.label },
+  }
+}
+
+export function projectTransferNotice(
+  { by, at, project, direction, oldOwnerRole, cleared }: {
+    by: ProjectTransferNotice['by']; at: Date; project: ProjectTransferNotice['project']
+    direction: ProjectTransferNotice['direction']; oldOwnerRole: ProjectTransferNotice['oldOwnerRole']; cleared: number
+  },
+): ProjectTransferNotice {
+  return {
+    id: randomUUID(), type: 'project_transfer', at: at.toISOString(), by,
+    project: { id: project.id, name: project.name }, direction, oldOwnerRole, cleared,
+  }
+}
+
+/** `stored` with `notice` appended, keeping the newest NOTICE_LIMIT. */
+export function withNotice(stored: unknown, notice: AccountNotice): AccountNotice[] {
+  return [...readNotices(stored), notice].slice(-NOTICE_LIMIT)
+}
+
+export function pendingNotices(stored: unknown): AccountNotice[] {
+  return readNotices(stored).filter((n) => !n.shownAt)
+}
+
+/** The latest credentials reset the account was told about, or null. */
+export function latestReset(stored: unknown): CredentialsResetNotice | null {
+  let latest: CredentialsResetNotice | null = null
+  for (const n of readNotices(stored)) {
+    if (n.type === 'credentials_reset' && (!latest || Date.parse(n.at) > Date.parse(latest.at))) latest = n
+  }
+  return latest
+}
+
+/** Whether a sign-in by an account that last signed in at `lastLoginAt` is its first since a reset. */
+export function firstSignInAfterReset(lastLoginAt: Date | null, stored: unknown): boolean {
+  const reset = latestReset(stored)
+  if (!reset) return false
+  return !lastLoginAt || lastLoginAt.getTime() < Date.parse(reset.at)
+}
+
+/**
+ * `auth.login.after_reset`'s payload: the address and browser of the first sign-in after a
+ * reset, the only sign-in whose address and browser this feature records (DV-11).
+ */
+export function afterResetEntry(
+  userId: string,
+  meta: { ip: string | null; ipTrusted: boolean; userAgent: string | null },
+  stored: unknown,
+) {
+  const reset = latestReset(stored)
+  return {
+    actorId: userId,
+    action: 'auth.login.after_reset',
+    targetType: 'user',
+    targetId: userId,
+    after: {
+      ip: meta.ip,
+      ipTrusted: meta.ipTrusted,
+      userAgent: meta.userAgent,
+      ...(reset ? { resetAt: reset.at, resetMode: reset.mode } : {}),
+    },
+  }
+}
+
+export function noticeView(n: AccountNotice): NoticeView {
+  const by = { name: n.by.name, email: n.by.email }
+  if (n.type === 'email_changed') return { id: n.id, type: n.type, at: n.at, by, from: n.from, to: n.to, self: n.self }
+  if (n.type === 'acted_as') return { id: n.id, type: n.type, at: n.at, by, reason: n.reason, durationMinutes: n.durationMinutes }
+  if (n.type === 'break_glass') {
+    return { id: n.id, type: n.type, at: n.at, by, reason: n.reason, durationMinutes: n.durationMinutes, project: { id: n.project.id, name: n.project.name } }
+  }
+  if (n.type === 'schedule_paused') {
+    return {
+      id: n.id, type: n.type, at: n.at, by,
+      project: { id: n.project.id, name: n.project.name }, schedule: { id: n.schedule.id, label: n.schedule.label },
+    }
+  }
+  if (n.type === 'project_transfer') {
+    return {
+      id: n.id, type: n.type, at: n.at, by, project: { id: n.project.id, name: n.project.name },
+      direction: n.direction, oldOwnerRole: n.oldOwnerRole, cleared: n.cleared,
+    }
+  }
+  return { id: n.id, type: n.type, at: n.at, by, reason: n.reason, mode: n.mode }
+}
+
+/** `stored` with every pending notice marked shown now. */
+export function markShown(stored: unknown): AccountNotice[] {
+  const at = now().toISOString()
+  return readNotices(stored).map((n) => (n.shownAt ? n : { ...n, shownAt: at }))
+}
+
+// A notice written meanwhile makes the conditional write miss: read again, at most this often.
+const APPEND_ATTEMPTS = 3
+
+/**
+ * Adds a notice to the account outside any other change (an impersonation's start). Raw and
+ * conditional on the list it read, like handOverNotices, so `updated_at` does not move and a notice
+ * written at the same moment is never lost. Throws when the account is gone or the list kept
+ * changing; the caller decides whether that fails its action.
+ */
+export async function appendNotice(userId: string, notice: AccountNotice): Promise<void> {
+  for (let attempt = 0; attempt < APPEND_ATTEMPTS; attempt += 1) {
+    const row = await prisma.user.findUnique({ where: { id: userId }, select: { pendingNotices: true } })
+    if (!row) throw new Error('accountNotices: no such account')
+    const stored = row.pendingNotices
+    const written = await prisma.$executeRaw`
+      UPDATE users SET pending_notices = ${JSON.stringify(withNotice(stored, notice))}::jsonb WHERE id = ${userId} AND pending_notices = ${JSON.stringify(stored)}::jsonb`
+    if (written === 1) return
+  }
+  throw new Error('accountNotices: the notices kept changing')
+}
+
+/**
+ * At a sign-in: the pending notices, for the person to see once, and the stored list marked
+ * shown. Raw, so the account's `updated_at` does not move, and conditional on the list read at
+ * the sign-in, so a notice that arrived meanwhile is never overwritten (it stays pending). Never
+ * fails the sign-in: a failed write is logged with its code and the notices are shown anyway.
+ */
+export async function handOverNotices(userId: string, stored: unknown): Promise<NoticeView[]> {
+  const pending = pendingNotices(stored)
+  if (pending.length === 0) return []
+  try {
+    await prisma.$executeRaw`
+      UPDATE users SET pending_notices = ${JSON.stringify(markShown(stored))}::jsonb WHERE id = ${userId} AND pending_notices = ${JSON.stringify(stored)}::jsonb`
+  } catch (err) {
+    console.error(`[rbac] notice write failed user=${userId} code=${safeErrorCode(err)}`)
+  }
+  return pending.map(noticeView)
+}

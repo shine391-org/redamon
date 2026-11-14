@@ -46,8 +46,217 @@ model User {
   // going forward only; no default, no backfill, MUST stay nullable.
   createdById   String?           @map("created_by_id")
   updatedById   String?           @map("updated_by_id")
+  // The instance-wide tools a member could use before the RBAC hardening and keeps
+  // (kali_terminal, shell_sessions, tunnels). Written once by
+  // scripts/backfill-rbac-legacy-grants.mjs for accounts that existed at the upgrade;
+  // admins review them. Read by src/lib/authz/sharedTools.ts.
+  legacyGrants  String[]          @default([]) @map("legacy_grants")
+
+  // Account state (RBAC identity). The defaults are what an account was before these
+  // columns existed, so existing rows and an old copy during a deploy behave as before.
+  status             String    @default("active")   // active | invited | disabled
+  // A login token carries the version it was issued with (`sv`); raising this signs
+  // the account out of every browser on its next request.
+  sessionVersion     Int       @default(0) @map("session_version")
+  mustChangePassword Boolean   @default(false) @map("must_change_password")
+  lastLoginAt        DateTime? @map("last_login_at")
+  // The admin profile narrowing what this admin may do; null = a full admin.
+  adminProfileId     String?   @map("admin_profile_id")
+  // A disabled account's bcrypt hash, put back on enable. `password` is '' while
+  // disabled, so the previous release, which never reads `status`, refuses it too.
+  passwordOnHold     String    @default("") @map("password_on_hold")
+  // One-time notices shown to the account at its next sign-in.
+  pendingNotices     Json      @default("[]") @map("pending_notices")
+  invites            UserInvite[]
+  permissionSets      UserPermissionSet[]
+  permissionOverrides UserPermissionOverride[]
+  // The projects shared with this account, and its break-glass accesses: both go with it.
+  collaborations      ProjectCollaborator[]
+  breakGlass          ProjectBreakGlass[]
+  deviceSessions      UserSession[]
+  // Daily use counted against a budget (step 6.11): goes with the account.
+  quotaUsage          QuotaUsage[]
 
   @@map("users")
+}
+
+/// Instance-wide settings: one row, id "instance". Until a backfill creates it from
+/// the values in force, it does not exist and the user rows stay in force. The moved
+/// tunnel and capture values are also kept mirrored in the user rows, so a downgrade
+/// still finds the current values. Accounts are named by plain id, never a foreign
+/// key: deleting one never cascades into, or is blocked by, this row.
+model InstanceSettings {
+  id                          String    @id @default("instance")
+  rootUserId                  String?   @map("root_user_id")
+  rootConfirmedAt             DateTime? @map("root_confirmed_at")
+  rootAssignedBy              String?   @map("root_assigned_by")      // automatic | host | transfer | install
+  pendingRootTransferTo       String?   @map("pending_root_transfer_to")
+  pendingRootTransferExpires  DateTime? @map("pending_root_transfer_expires")
+  passwordMinLength           Int       @default(12) @map("password_min_length")
+  passwordAskChangeIfShort    Boolean   @default(false) @map("password_ask_change_if_short")
+  // Session and link lifetimes: placeholders until the owner answers OQ-38.
+  memberSessionTtlHours       Int       @default(168) @map("member_session_ttl_hours")
+  adminSessionTtlHours        Int       @default(12) @map("admin_session_ttl_hours")
+  adminIdleMinutes            Int       @default(60) @map("admin_idle_minutes")
+  inviteTtlHours              Int       @default(168) @map("invite_ttl_hours")
+  resetTtlHours               Int       @default(4) @map("reset_ttl_hours")
+  publicBaseUrl               String?   @map("public_base_url")
+  // Placeholder until the owner answers OQ-32.
+  impersonationMaxMinutes     Int       @default(720) @map("impersonation_max_minutes")
+  impersonationReasonRequired Boolean   @default(false) @map("impersonation_reason_required")
+  impersonationNotifyTarget   Boolean   @default(true) @map("impersonation_notify_target")
+  defaultMemberSetId          String?   @map("default_member_set_id")
+  sharingPolicy               Json      @default("{}") @map("sharing_policy")
+  directoryVisible            Boolean   @default(false) @map("directory_visible")
+  quotas                      Json      @default("{}")
+  // Null keeps every audit row; placeholder until the owner answers OQ-40.
+  auditRetentionDays          Int?      @map("audit_retention_days")
+  // Root's next retention, waiting out its delay (step 6.6, AU-04): {days, requestedAt, effectiveAt,
+  // requestedById}, or null. Once effectiveAt has passed it is the retention in force, read lazily;
+  // the expiry sweep then moves it into auditRetentionDays (lib/authz/auditRetention.ts).
+  auditRetentionPending       Json?     @map("audit_retention_pending")
+  // On: the agent stops using the LLM providers an account added itself when the account lacks
+  // self:llm_providers (step 6.11). Off keeps every account's own providers, as before.
+  byoLlmForbidden             Boolean   @default(false) @map("byo_llm_forbidden")
+
+  // Moved from UserSettings: same columns, types and defaults as there, so the
+  // backfill copies each value unchanged. The *SourceUserId fields name the user row
+  // each group was copied from.
+  tunnelsEnabled  Boolean  @default(false) @map("tunnels_enabled")
+  ngrokAuthtoken  String   @default("") @map("ngrok_authtoken")
+  chiselServerUrl String   @default("") @map("chisel_server_url")
+  chiselAuth      String   @default("") @map("chisel_auth")
+  tunnelSourceUserId String? @map("tunnel_source_user_id")
+
+  captureProxyEnabled       Boolean @default(true)  @map("capture_proxy_enabled")
+  captureProxyPort          Int     @default(8888)  @map("capture_proxy_port")
+  captureProxyScope         String  @default("both") @map("capture_proxy_scope")   // recon | agent | both
+  captureProxyStoreBodies   Boolean @default(true)  @map("capture_proxy_store_bodies")
+  captureProxyMaxBodyKb     Int     @default(64)    @map("capture_proxy_max_body_kb")
+  captureProxyRetentionDays Int     @default(14)    @map("capture_proxy_retention_days")
+  captureProxyRedactSecrets Boolean @default(true)  @map("capture_proxy_redact_secrets")
+  captureProxyPassiveDetect Boolean @default(true)  @map("capture_proxy_passive_detect")
+  captureProxyStoreReqBodies  Boolean @default(true) @map("capture_proxy_store_req_bodies")
+  captureProxyStoreRespBodies Boolean @default(true) @map("capture_proxy_store_resp_bodies")
+  captureProxyMaxStoreMb      Int     @default(5)    @map("capture_proxy_max_store_mb")
+  captureProxyBodyRules       Json    @default("{}") @map("capture_proxy_body_rules")
+  captureEgressBlockEmptyHost     Boolean @default(true) @map("capture_egress_block_empty_host")
+  captureEgressBlockHardGuardrail Boolean @default(true) @map("capture_egress_block_hard_guardrail")
+  captureEgressFailClosed         Boolean @default(true) @map("capture_egress_fail_closed")
+  captureEgressBlockUnresolvable  Boolean @default(true) @map("capture_egress_block_unresolvable")
+  captureEgressBlockPrivate       Boolean @default(true) @map("capture_egress_block_private")
+  captureEgressBlockLoopback      Boolean @default(true) @map("capture_egress_block_loopback")
+  captureEgressBlockLinkLocal     Boolean @default(true) @map("capture_egress_block_link_local")
+  captureEgressBlockCgnat         Boolean @default(true) @map("capture_egress_block_cgnat")
+  captureEgressBlockReserved      Boolean @default(true) @map("capture_egress_block_reserved")
+  captureEgressBlockMulticast     Boolean @default(true) @map("capture_egress_block_multicast")
+  captureEgressBlockUnspecified   Boolean @default(true) @map("capture_egress_block_unspecified")
+  scaIntelIgnoreSuffixes String @default("oastify.com,oast.fun,mburpcollab.com,canarytokens.com,pipedream.net") @map("sca_intel_ignore_suffixes")
+  captureSourceUserId String? @map("capture_source_user_id")
+
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  updatedById String?  @map("updated_by_id")
+
+  @@map("instance_settings")
+}
+
+/// A one-time invite or password-reset link. Only the sha256 of the token is stored
+/// (the token is high-entropy random, as McpAccessToken's). A link is spent when
+/// usedAt or cancelledAt is set, or once expiresAt has passed.
+model UserInvite {
+  id          String    @id @default(cuid())
+  userId      String    @map("user_id")
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind        String                                    // invite | reset
+  tokenHash   String    @unique @map("token_hash")
+  expiresAt   DateTime  @map("expires_at")
+  usedAt      DateTime? @map("used_at")
+  cancelledAt DateTime? @map("cancelled_at")
+  createdById String    @map("created_by_id")
+  reason      String?
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, kind])
+  @@map("user_invites")
+}
+
+/// One browser's sign-in (GV-17, step 6.10), written at each sign-in while RBAC_GOVERNANCE_ENABLED is
+/// on; its id rides in the login token as `sid`. Revoking the row ends that browser's session at its
+/// next request, within RBAC_AUTHZ_CACHE_MS; the account's other browsers keep theirs. A row whose
+/// `sessionVersion` is below the account's was ended by a version bump (sign out everywhere, a disable,
+/// a reset), so no bump site writes here. The address and browser live as long as the row: the expiry
+/// sweep deletes it 30 days after it was revoked or expired, and it goes with its account.
+model UserSession {
+  id             String    @id @default(cuid())
+  userId         String    @map("user_id")
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionVersion Int       @map("session_version")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  lastSeenAt     DateTime  @default(now()) @map("last_seen_at")
+  expiresAt      DateTime  @map("expires_at")
+  ip             String?
+  ipTrusted      Boolean   @default(false) @map("ip_trusted")
+  userAgent      String?   @map("user_agent")
+  revokedAt      DateTime? @map("revoked_at")
+  // No foreign key: deleting the admin who revoked it keeps the row.
+  revokedById    String?   @map("revoked_by_id")
+  endedBy        String?   @map("ended_by")                // sign_out | self | admin
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@map("user_sessions")
+}
+
+/// A custom permission set (kind member) or admin profile (kind admin). The built-in
+/// ones are code (src/lib/authz/builtinSets.ts), never rows: their ids are
+/// 'builtin:<slug>'. Accounts are named by plain id, so a set outlives its author.
+model PermissionSet {
+  id          String   @id @default(cuid())
+  kind        String                                    // member | admin
+  name        String   @unique
+  description String?
+  // Registry ids (src/lib/authz/permissions.ts), validated on write.
+  permissions String[]
+  clonedFrom  String?  @map("cloned_from")
+  createdById String   @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("permission_sets")
+}
+
+/// A member's permission sets. No row = never assigned: the instance default set,
+/// else Default member. setId is a PermissionSet id or 'builtin:<slug>' with no
+/// foreign key, so deleting a set leaves its rows behind and an account whose every
+/// set is gone resolves to No access instead of widening to the default.
+model UserPermissionSet {
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  setId     String   @map("set_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([userId, setId])
+  @@map("user_permission_sets")
+}
+
+/// A per-account grant or deny of one permission on top of the sets; a deny wins. An
+/// override past expiresAt counts for nothing. It names a member permission or, on a member,
+/// a platform:* tool (a kept legacy grant is one); never any other administration
+/// permission, nothing of an admin's admin side (its one profile, User.adminProfileId) and
+/// nothing on Root. The writers check it (authz/hierarchy.ts overrideAllowed).
+model UserPermissionOverride {
+  userId      String    @map("user_id")
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission  String
+  effect      String                                    // grant | deny
+  expiresAt   DateTime? @map("expires_at")
+  reason      String?
+  grantedById String    @map("granted_by_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@id([userId, permission])
+  @@map("user_permission_overrides")
 }
 
 /// A personal access token for the INBOUND MCP server (/api/mcp-server), which
@@ -84,6 +293,11 @@ model McpAccessToken {
   expiresAt   DateTime? @map("expires_at")
   revokedAt   DateTime? @map("revoked_at")
   createdAt   DateTime  @default(now()) @map("created_at")
+  /// Opt-in to the projects shared with the token's user (step 4.10 reads it). Off, a token
+  /// reaches only its user's own projects, as every token minted before sharing did.
+  includeSharedProjects Boolean  @default(false) @map("include_shared_projects")
+  /// Empty = no narrowing. Project ids by plain id: deleting a project leaves the token as is.
+  projectAllowlist      String[] @default([]) @map("project_allowlist")
 
   @@index([userId])
   @@map("mcp_access_tokens")
@@ -132,6 +346,68 @@ model UserLlmProvider {
 
   @@index([userId])
   @@map("user_llm_providers")
+}
+
+/// An LLM provider the confirmed Root adds for the whole instance (step 6.11, GV-15). The same shape
+/// and storage as UserLlmProvider (plaintext key columns, masked on every browser read, OQ-52); chat
+/// kinds only. Offered to whoever holds a permission set it is assigned to (PermissionSetProvider),
+/// and reaches the agent only as a marked row of that account's provider list.
+model InstanceLlmProvider {
+  id               String   @id @default(cuid())
+  providerType     String   @map("provider_type")
+  name             String
+  apiKey           String   @default("") @map("api_key")
+  baseUrl          String   @default("") @map("base_url")
+  modelIdentifier  String   @default("") @map("model_identifier")
+  defaultHeaders   Json     @default("{}") @map("default_headers")
+  timeout          Int      @default(120)
+  temperature      Float    @default(0)
+  maxTokens        Int      @default(16384) @map("max_tokens")
+  sslVerify        Boolean  @default(true) @map("ssl_verify")
+  reasoningEnabled Boolean  @default(false) @map("reasoning_enabled")
+  reasoningEffort  String   @default("high") @map("reasoning_effort")
+  awsRegion        String   @default("us-east-1") @map("aws_region")
+  awsAccessKeyId   String   @default("") @map("aws_access_key_id")
+  awsSecretKey     String   @default("") @map("aws_secret_key")
+  awsBearerToken   String   @default("") @map("aws_bearer_token")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  createdById      String?  @map("created_by_id")
+  updatedById      String?  @map("updated_by_id")
+  sets             PermissionSetProvider[]
+
+  @@map("instance_llm_providers")
+}
+
+/// One assignment: the instance provider is offered to the holders of the set. `setId` names a
+/// stored permission set or a built-in one (`builtin:<slug>`), so it has no foreign key; deleteSet
+/// refuses a set a row still names. The row goes with its provider.
+model PermissionSetProvider {
+  setId       String              @map("set_id")
+  providerId  String              @map("provider_id")
+  provider    InstanceLlmProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  createdById String?             @map("created_by_id")
+  createdAt   DateTime            @default(now()) @map("created_at")
+
+  @@id([setId, providerId])
+  @@index([providerId])
+  @@map("permission_set_providers")
+}
+
+/// Calls counted per person and UTC day against a daily budget (step 6.11, GV-12): the agent reports
+/// its in-process counts to POST /api/internal/llm-usage; `kind` names the budget
+/// (`llm_instance_calls` first). Goes with the account.
+model QuotaUsage {
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  day       DateTime @db.Date
+  kind      String
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@id([userId, day, kind])
+  @@index([day])
+  @@map("quota_usage")
 }
 
 /// One configured TruffleHog source for a project. Runs are keyed by source, so
@@ -441,6 +717,19 @@ model Project {
   subdomainList               String[] @default([]) @map("subdomain_list")
   ipMode                      Boolean  @default(false) @map("ip_mode")
   targetIps                   String[] @default([]) @map("target_ips")
+  /// Hostnames on target IPs (IP mode only): what a run does with the names it
+  /// sees on the target addresses. ip_only looks none up; record_only records
+  /// them; record_filter also scans the ones matching include minus exclude;
+  /// scan_all scans every one, needs ipHostnameScanAllConfirmed and is refused on
+  /// a third_party engagement. Validated by reconSettings/crossField.ts on every
+  /// write path and re-validated by recon at load; rescopable over MCP.
+  ipHostnameMode              String   @default("ip_only") @map("ip_hostname_mode")
+  ipHostnameInclude           String[] @default([]) @map("ip_hostname_include")
+  ipHostnameExclude           String[] @default([]) @map("ip_hostname_exclude")
+  ipHostnamePassiveExpand     Boolean  @default(true) @map("ip_hostname_passive_expand")
+  ipHostnameScanAllConfirmed  Boolean  @default(false) @map("ip_hostname_scan_all_confirmed")
+  ipHostnameMaxScanned        Int      @default(100) @map("ip_hostname_max_scanned")
+  ipHostnamePassiveMaxNames   Int      @default(500) @map("ip_hostname_passive_max_names")
   /// Domain batch: the third targeting mode. Mutually exclusive with ipMode.
   /// One full recon walks the derived groups in order, appending to one graph.
   domainBatchMode             Boolean  @default(false) @map("domain_batch_mode")
@@ -455,7 +744,7 @@ model Project {
   /// domainBatchGroups grep test allows.
   domainBatchGroups           Json?    @map("domain_batch_groups")
   verifyDomainOwnership       Boolean  @default(false) @map("verify_domain_ownership")
-  ownershipToken              String   @default("your-secret-token-here") @map("ownership_token")
+  ownershipToken              String   @default(uuid()) @map("ownership_token")
   ownershipTxtPrefix          String   @default("_redamon-verify") @map("ownership_txt_prefix")
   stealthMode                 Boolean  @default(false) @map("stealth_mode")
   targetGuardrailEnabled      Boolean  @default(true) @map("target_guardrail_enabled")
@@ -590,6 +879,7 @@ model Project {
   naabuThreads                Int      @default(25) @map("naabu_threads")
   naabuTimeout                Int      @default(10000) @map("naabu_timeout")
   naabuRetries                Int      @default(1) @map("naabu_retries")
+  naabuRunTimeout             Int      @default(1800) @map("naabu_run_timeout")
   naabuScanType               String   @default("s") @map("naabu_scan_type")
   naabuExcludeCdn             Boolean  @default(false) @map("naabu_exclude_cdn")
   naabuDisplayCdn             Boolean  @default(true) @map("naabu_display_cdn")
@@ -850,6 +1140,7 @@ model Project {
   aiSurfaceReconVectorDbReadEnabled       Boolean @default(true) @map("ai_surface_recon_vector_db_read_enabled")
   aiSurfaceReconJuliusProbePackEnabled    Boolean @default(true) @map("ai_surface_recon_julius_probe_pack_enabled")
   aiSurfaceReconLatencyBaselineEnabled    Boolean @default(true) @map("ai_surface_recon_latency_baseline_enabled")
+  // Retired: nothing reads it. Kept so an upgrade or a rollback never drops data; drop in a later release.
   aiSurfaceReconCacheEnabled              Boolean @default(true) @map("ai_surface_recon_cache_enabled")
   aiSurfaceReconProbePackVersion          String  @default("latest") @map("ai_surface_recon_probe_pack_version")
 
@@ -862,6 +1153,7 @@ model Project {
   katanaJsCrawl               Boolean  @default(true) @map("katana_js_crawl")
   katanaParamsOnly            Boolean  @default(false) @map("katana_params_only")
   katanaExcludePatterns       String[] @default(["/_next/image", "/_next/static", "/_next/data", "/__nextjs", "/_nuxt/", "/__nuxt", "/runtime.", "/polyfills.", "/vendor.", "/webpack", "/chunk.", ".chunk.js", ".bundle.js", "hot-update", "/static/", "/public/", "/dist/", "/build/", "/lib/", "/vendor/", "/node_modules/", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif", ".bmp", ".tiff", ".tif", ".heic", ".heif", ".raw", "/images/", "/img/", "/image/", "/pics/", "/pictures/", "/thumbnails/", "/thumb/", "/thumbs/", ".css", ".scss", ".sass", ".less", ".styl", ".css.map", "/css/", "/styles/", "/style/", "/stylesheet/", ".js.map", ".min.js", "/js/lib/", "/js/vendor/", "/js/plugins/", "jquery", "bootstrap.js", "popper.js", ".woff", ".woff2", ".ttf", ".eot", ".otf", "/fonts/", "/font/", "/webfonts/", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf", ".odt", ".ods", ".odp", ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".mp3", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".mkv", ".wav", ".ogg", ".aac", ".m4a", ".flac", "/video/", "/videos/", "/audio/", "/music/", "/sounds/", "/wp-content/uploads/", "/wp-content/themes/", "/wp-includes/", "/sites/default/files/", "/core/assets/", "/pub/static/", "/pub/media/", "/storage/", "/staticfiles/", "/packs/", "cdn.", "cdnjs.", "cloudflare.", "akamai.", "fastly.", "googleapis.com", "gstatic.com", "cloudfront.net", "unpkg.com", "jsdelivr.net", "bootstrapcdn.com", "google-analytics", "googletagmanager", "gtag/", "facebook.com/tr", "facebook.net", "analytics.", "tracking.", "pixel.", "hotjar.", "mouseflow.", "clarity.", "googlesyndication", "doubleclick", "adservice", "platform.twitter", "connect.facebook", "platform.linkedin", "maps.google", "maps.googleapis", "openstreetmap", "mapbox", "recaptcha", "hcaptcha", "captcha", "manifest.json", "sw.js", "service-worker", "browserconfig.xml", "robots.txt", "sitemap.xml", ".well-known/", "favicon", "apple-touch-icon", "android-chrome", "/icons/", "/icon/"]) @map("katana_exclude_patterns")
+  // Retired: nothing reads it. Kept so an upgrade or a rollback never drops data; drop in a later release.
   katanaScope                 String   @default("dn") @map("katana_scope")
   katanaCustomHeaders         String[] @default(["User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", "Accept-Language: en-US,en;q=0.9"]) @map("katana_custom_headers")
   katanaParallelism           Int      @default(8) @map("katana_parallelism")
@@ -947,6 +1239,7 @@ model Project {
   jsReconIncludeFrameworkJs   Boolean  @default(true)  @map("js_recon_include_framework_js")
   jsReconIncludeArchivedJs    Boolean  @default(true)  @map("js_recon_include_archived_js")
   jsReconMinConfidence        String   @default("low") @map("js_recon_min_confidence")
+  // Retired: nothing reads these two. Kept so an upgrade or a rollback never drops data; drop in a later release.
   jsReconStandaloneCrawlDepth Int      @default(3)     @map("js_recon_standalone_crawl_depth")
   jsReconStandaloneCrawlScope String   @default("subdomain") @map("js_recon_standalone_crawl_scope")
   jsReconUploadedFiles        String[] @default([])    @map("js_recon_uploaded_files")
@@ -1545,9 +1838,104 @@ model Project {
   // Superseded Rules of Engagement documents. A relation rather than columns,
   // because a replace must not destroy the contract earlier scans ran under.
   roeDocumentRevisions              RoeDocumentRevision[]
+  // Sharing (RBAC Phase 4): relations, never Project columns, so the settings registry and the
+  // settings form's whole-row PUT never see them.
+  collaborators                     ProjectCollaborator[]
+  breakGlass                        ProjectBreakGlass[]
+  // The owner's consent that collaborators may spend the project's credentials (RBAC Phase 5).
+  accessPolicy                      ProjectAccessPolicy?
+  // Offers to give the project to one of its collaborators, and what came of them (RBAC Phase 5).
+  transfers                         ProjectTransfer[]
 
   @@index([jevProviderId])
   @@map("projects")
+}
+
+/// A project shared with one account (RBAC Phase 4). The owner stays Project.userId, the only
+/// owner; this row only lets another account in, at `access` with the toggles below. Read only
+/// with RBAC_SHARING_ENABLED on and the instance sharing policy enabled; an expired row counts
+/// for nothing (checked at access time, deleted by the sweep). It goes with the project and with
+/// the account; the person who granted it is a plain id, so the share outlives them.
+model ProjectCollaborator {
+  projectId   String    @map("project_id")
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId      String    @map("user_id")
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  access      String                                    // read | write (write is read until Phase 5's switch)
+  runScans    Boolean   @default(false) @map("run_scans")
+  useAgent    Boolean   @default(false) @map("use_agent")
+  exploit     Boolean   @default(false)
+  rawData     Boolean   @default(false) @map("raw_data")
+  manage      Boolean   @default(false)
+  expiresAt   DateTime? @map("expires_at")
+  note        String?
+  grantedById String    @map("granted_by_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@id([projectId, userId])
+  @@index([userId])
+  @@map("project_collaborators")
+}
+
+/// Root's time-boxed emergency read of a project it cannot otherwise see (RBAC Phase 4), with
+/// the reason it gave; the owner is told. Goes with the project and with the account.
+model ProjectBreakGlass {
+  id        String   @id @default(cuid())
+  projectId String   @map("project_id")
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reason    String
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([projectId, userId])
+  @@map("project_break_glass")
+}
+
+/// A project's access policy (RBAC Phase 5): whether its owner lets collaborators spend the
+/// project's credentials (its providers and keys: runs, scans, the LLM features), and whether
+/// co-owners see every conversation. No row reads as no consent and the default below, so every
+/// project created before it keeps its collaborators off the owner's keys. Read only with write
+/// sharing in force (lib/authz/ownerConsent.ts); it goes with the project; the person who consented
+/// is a plain id.
+model ProjectAccessPolicy {
+  projectId                   String    @id @map("project_id")
+  project                     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  ownerCredentialConsentAt    DateTime? @map("owner_credential_consent_at")
+  ownerCredentialConsentById  String?   @map("owner_credential_consent_by_id")
+  managersSeeAllConversations Boolean   @default(false) @map("managers_see_all_conversations")
+  updatedAt                   DateTime  @updatedAt @map("updated_at")
+
+  @@map("project_access_policies")
+}
+
+/// An offer to give a project to one of its collaborators, and what came of it (RBAC Phase 5, SH-15).
+/// The recipient accepts with their own password, or declines; the owner may cancel; an offer lapses
+/// after 7 days. Accepting re-tenants the project's graph, then moves the project in Postgres in one
+/// transaction with the status (lib/authz/ownershipTransfer.ts). Read only with write sharing in force.
+/// It goes with the project; both people are plain ids, so the record outlives either account.
+model ProjectTransfer {
+  id            String    @id @default(cuid())
+  projectId     String    @map("project_id")
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fromUserId    String    @map("from_user_id")
+  toUserId      String    @map("to_user_id")
+  oldOwnerRole  String    @map("old_owner_role")            // co-owner | leave
+  status        String                                      // pending | in_progress | completed | declined | cancelled | expired | failed
+  forced        Boolean   @default(false)                   // by projects:administer, without acceptance (step 5.13)
+  error         String?                                     // a failed attempt's code; the offer can be accepted again
+  // The settings the move cleared because they named the old owner's own providers, templates or
+  // token, shown to the new owner to re-pick until they dismiss it (clearedSeenAt).
+  clearedSettings Json?   @map("cleared_settings")
+  clearedSeenAt DateTime? @map("cleared_seen_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  decidedAt     DateTime? @map("decided_at")
+
+  @@index([projectId, status])
+  @@index([toUserId, status])
+  @@map("project_transfers")
 }
 
 /// A Rules of Engagement document that a replace or a remove superseded.
@@ -1960,6 +2348,10 @@ model ScanSchedule {
   // "new" | "overwrite"
   scanMode               String   @default("new") @map("scan_mode")
   enabled                Boolean  @default(true)
+  // Why the schedule stopped itself, null when it did not (step 5.5, D-13): "actor_no_access" when
+  // the person it runs as lost access to the project. Such a schedule is turned back on only by a
+  // confirmation, which makes the confirmer its actor; a plain re-enable is refused.
+  pausedReason           String?  @map("paused_reason")
   nextRunAt              DateTime? @map("next_run_at")
   lastRunAt              DateTime? @map("last_run_at")
   estimatedEnvelopeBytes BigInt?  @map("estimated_envelope_bytes")
@@ -1991,11 +2383,33 @@ model Conversation {
   // R1: nullable actor columns (populated going forward only; MUST stay nullable).
   createdById    String?       @map("created_by_id")
   updatedById    String?       @map("updated_by_id")
+  // T24: once the author's account is deleted, a conversation in someone else's project is the
+  // project owner's (userId) and keeps who wrote it: their id (a plain id, the account is gone)
+  // and their name or email as it was then. Its checkpoint thread is the former author's, so it
+  // opens read-only. userId stays non-null (DV-23).
+  formerAuthorId    String?    @map("former_author_id")
+  formerAuthorLabel String?    @map("former_author_label")
   messages       ChatMessage[]
   fireteams      Fireteam[]
+  share          ConversationShare?
 
   @@index([projectId, userId])
   @@map("conversations")
+}
+
+/// The author's read-only share of one conversation with every collaborator of its project (RBAC
+/// Phase 5, SH-22). No row is private: every conversation from before the table stays its author's
+/// alone. Read only with write sharing in force (lib/authz/conversationAccess.ts); it goes with the
+/// conversation; the person who shared it is a plain id.
+model ConversationShare {
+  id             String       @id @default(cuid())
+  conversationId String       @map("conversation_id")
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sharedById     String       @map("shared_by_id")
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  @@unique([conversationId])
+  @@map("conversation_shares")
 }
 
 // ========== Captured HTTP Traffic (mitmproxy integration, Phase 0+) ==========
@@ -2172,9 +2586,18 @@ model AuditLog {
   after      Json?
   source     String   @default("api")                  // "api" | "ui" | "admin" | "system"
   createdAt  DateTime @default(now()) @map("created_at")
+  // actorId is always the real signed-in person; under act-as the account acted as
+  // goes here.
+  onBehalfOfUserId String? @map("on_behalf_of_user_id")
+  projectId        String? @map("project_id")
+  permission       String?                             // the permission the action used, when one applies
+  // The actor's email when the row was written, so the row still names a person after
+  // the account is deleted; audit retention removes it (OQ-31).
+  actorEmail       String? @map("actor_email")
 
   @@index([targetType, targetId, createdAt])
   @@index([actorId, createdAt])
+  @@index([projectId, createdAt])
   @@map("audit_log")
 }
 
@@ -2187,10 +2610,34 @@ model ActAsAudit {
   event        String                                  // "start" | "end"
   source       String   @default("api")                // "api" | "self-clear"
   createdAt    DateTime @default(now()) @map("created_at")
+  reason          String?
+  durationMinutes Int?    @map("duration_minutes")
+  endedBy         String? @map("ended_by")             // who or what ended the session, on an end row
 
   @@index([adminId, createdAt])
   @@index([targetUserId, createdAt])
   @@map("act_as_audit")
+}
+
+/// Who owns each custom Nuclei template file (HD-08). The files live in the shared
+/// templates folder (NUCLEI_TEMPLATES_PATH); this table is the owner record. A null
+/// owner is an instance template: every member may select it, only admins change it.
+/// A file with no row (added on the host) is an instance template too. The owner and
+/// promoter ids carry no foreign key on purpose: a row whose owner was deleted by a path
+/// other than DELETE /api/users/[id] (which hands the rows to the deleting admin) keeps
+/// that id, so no member can select the file until an admin promotes it.
+model NucleiTemplate {
+  id           String   @id @default(cuid())
+  path         String   @unique                       // relative to the templates folder, posix
+  ownerUserId  String?  @map("owner_user_id")
+  sha256       String?
+  sizeBytes    Int?     @map("size_bytes")
+  promotedById String?  @map("promoted_by_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([ownerUserId])
+  @@map("nuclei_templates")
 }
 
 model FireteamMember {
@@ -2700,4 +3147,22 @@ model PluginPlatformState {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("plugin_platform_state")
+}
+
+/// Per-plugin allowlist (GV-16): a plugin with any row is available only to the holders of one of
+/// its listed member permission sets, and to whoever holds platform:plugins; a plugin with none, to
+/// everyone holding plugins:use. Neither column is a foreign key: pluginId is the catalog id, so a
+/// plugin uninstalled keeps its rules for a reinstall, and setId is a PermissionSet id or a built-in
+/// 'builtin:<slug>' (code, no row), so deleting a set is refused while a rule names it
+/// (permissionSetAdmin.ts deleteSet), else the plugin would silently become admin-only.
+model PluginAccessRule {
+  pluginId    String   @map("plugin_id")
+  setId       String   @map("set_id")
+  // No foreign key, as for PluginInstall.installedBy: deleting the admin keeps the rule.
+  createdById String   @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@id([pluginId, setId])
+  @@index([setId])
+  @@map("plugin_access_rules")
 }

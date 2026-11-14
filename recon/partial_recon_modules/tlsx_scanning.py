@@ -16,11 +16,16 @@ import uuid
 from recon.partial_recon_modules.helpers import (
     root_orgs,
     _is_ip_or_cidr,
+    _resolve_hostname,
     _should_include_root_domain,
+    ip_mode_recon,
     partial_settings,
+    run_is_ip_mode,
     scope_roots,
+    typed_ip_attach_to,
 )
 from recon.partial_recon_modules.graph_builders import _build_port_scan_data_from_graph
+from recon.partial_recon_modules.port_scanning import measured_port_data
 
 
 def run_tlsx(config: dict) -> None:
@@ -57,7 +62,7 @@ def run_tlsx(config: dict) -> None:
                     user_ports.append(port)
             except (ValueError, TypeError):
                 print(f"[!][Partial Recon] Skipping invalid port: {entry}")
-        ip_attach_to = user_targets.get("ip_attach_to")
+        ip_attach_to = typed_ip_attach_to(user_targets)
     elif config.get("user_inputs"):
         for entry in config["user_inputs"]:
             entry = (entry or "").strip()
@@ -73,14 +78,39 @@ def run_tlsx(config: dict) -> None:
             domain_groups=config.get("domain_groups"),
         )
     else:
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "port_scan": {"by_ip": {}, "by_host": {}, "ip_to_hostnames": {},
                           "all_ports": [], "scan_metadata": {}, "summary": {}},
             "dns": {"domain": {"ips": {"ipv4": [], "ipv6": []}, "has_records": False},
                     "subdomains": {}},
-        }
+        }, settings)
+
+    # A row's name is what _build_tlsx_targets sends, for SNI, and tlsx
+    # resolves it itself and handshakes whatever it gets; SNI for one target
+    # only is no tlsx option (-sni is one value for the whole run). So the
+    # attach name rides on a typed IP only where tlsx resolving it lands there:
+    # the name's one address. Every other typed IP is handshaken bare. In IP
+    # mode the attach is a target's own label, which is never sent.
+    attach_lands_on = None
+    if ip_attach_to and user_ips and not run_is_ip_mode():
+        import ipaddress as _ip
+        try:
+            found = _resolve_hostname(ip_attach_to)
+            answers = {str(_ip.ip_address(a)) for a in found["ipv4"] + found["ipv6"]}
+        except (OSError, UnicodeError, ValueError):
+            answers = set()
+        if len(answers) == 1:
+            attach_lands_on = answers.pop()
+
+    def attach_names(addr: str) -> list:
+        if not ip_attach_to:
+            return []
+        if run_is_ip_mode():
+            return [ip_attach_to]
+        import ipaddress as _ip
+        return [ip_attach_to] if str(_ip.ip_address(addr)) == attach_lands_on else []
 
     # Inject user IPs.
     user_ip_addrs = []
@@ -101,9 +131,12 @@ def run_tlsx(config: dict) -> None:
         for addr in addrs:
             user_ip_addrs.append(addr)
             recon_data["port_scan"]["by_ip"].setdefault(addr, {
-                "ip": addr, "hostnames": [ip_attach_to] if ip_attach_to else [],
+                "ip": addr, "hostnames": attach_names(addr),
                 "ports": [], "port_details": [],
             })
+    if ip_attach_to and user_ip_addrs and not any(attach_names(a) for a in user_ip_addrs):
+        print(f"[*][Partial Recon] Typed IPs are handshaken by address, without SNI: "
+              f"{ip_attach_to} does not resolve to exactly one of them")
 
     # Inject user ports across every IP (tlsx builds targets from by_ip.ports).
     if user_ports:
@@ -134,12 +167,14 @@ def run_tlsx(config: dict) -> None:
             if not graph_client.verify_connection():
                 print("[!][Partial Recon] Neo4j not reachable -- graph not updated")
                 return
-            # Custom ports: create Port/Service/IP nodes first so the tlsx MATCH
-            # on Service lands (update_graph_from_tlsx uses MATCH, not MERGE, for
-            # Service enrichment).
+            # Custom ports: write the IP nodes first, so the tlsx writer's MATCH
+            # on a typed address lands. The custom ports ride in by_ip only, and
+            # by_host is the graph's own ports, which tlsx did not measure: none
+            # of them is written back (D5).
             if user_ports:
                 graph_client.update_graph_from_port_scan(
-                    recon_data=port_data, user_id=user_id, project_id=project_id)
+                    recon_data=measured_port_data(port_data, {}),
+                    user_id=user_id, project_id=project_id)
             stats = graph_client.update_graph_from_tlsx(
                 recon_data=result, user_id=user_id, project_id=project_id)
             print(f"[+][Partial Recon] tlsx graph update: {json.dumps(stats, default=str)}")

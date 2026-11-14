@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { guardProject } from '@/lib/access'
+import { requireLevel, requirePermission } from '@/lib/authz/guards'
 import { createHash } from 'crypto'
 
 // Reuse the graph API's Neo4j driver
@@ -15,6 +15,11 @@ function toNum(value: unknown): number | null {
   if (value === null || value === undefined) return null
   if (typeof value === 'object' && 'low' in (value as object)) return (value as { low: number }).low
   return typeof value === 'number' ? value : null
+}
+
+/** `@acme` for `@acme/ui`; null for an unscoped name. */
+function npmScopeOf(packageName: unknown): string | null {
+  return typeof packageName === 'string' && /^@[^/]+\//.test(packageName) ? packageName.split('/')[0] : null
 }
 
 // Simple in-memory cache (same pattern as graph route)
@@ -49,8 +54,15 @@ interface JsReconResponse {
   }
 }
 
+/**
+ * Bump when the answer gains or changes fields. The browser revalidates its
+ * cached body by tag alone, so without it a body cached before the change gets
+ * a 304 and stays in use until the graph itself next changes.
+ */
+const RESPONSE_SHAPE = 3
+
 function generateEtag(data: JsReconResponse): string {
-  const raw = `${data.secrets.length}:${data.endpoints.length}:${data.dependencies.length}:${data.dom_sinks.length}:${data.frameworks.length}:${data.source_maps.length}:${data.dev_comments.length}:${data.emails.length}:${data.ip_addresses.length}:${data.dev_references.length}:${data.object_references.length}:${data.cloud_assets.length}:${data.external_domains.length}`
+  const raw = `shape${RESPONSE_SHAPE}:${data.secrets.length}:${data.endpoints.length}:${data.dependencies.length}:${data.dom_sinks.length}:${data.frameworks.length}:${data.source_maps.length}:${data.dev_comments.length}:${data.emails.length}:${data.ip_addresses.length}:${data.dev_references.length}:${data.object_references.length}:${data.cloud_assets.length}:${data.external_domains.length}`
   const hash = createHash('md5').update(raw)
   // A rescan recreates the nodes, usually with the same counts but new ids. A
   // count-only tag would 304 and leave the Node ID column pointing at deleted
@@ -73,8 +85,11 @@ interface RouteParams {
 
 export async function GET(request: NextRequest, { params }: RouteParams) {
   const { projectId } = await params
-  const __denied = await guardProject(projectId)
-  if (__denied) return __denied
+  const auth = await requirePermission(request, 'recon:read', { projectId })
+  if (auth instanceof NextResponse) return auth
+  // A raw output (the JS recon output): a read share needs Raw data & files (step 4.7).
+  const raw = requireLevel(auth, 'R*')
+  if (raw) return raw
   if (!PROJECT_ID_RE.test(projectId)) {
     return new NextResponse(null, { status: 400 })
   }
@@ -129,6 +144,11 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
              jf.line AS line,
              jf.user_source AS userSource,
              jf.vendor AS vendor,
+             jf.package_name AS packageName,
+             jf.package_scope AS packageScope,
+             jf.npm_exists AS npmExists,
+             jf.recommendation AS recommendation,
+             coalesce(jf.source_urls, [jf.source_url]) AS sourceUrls,
              jf.updated_at AS updatedAt
       `,
       { pid: projectId }
@@ -145,6 +165,10 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
              s.severity AS severity,
              s.sample AS redacted_value,
              s.matched_text AS matched_text,
+             coalesce(s.secret_value, s.matched_text) AS secret_value,
+             s.paired_secret AS paired_secret,
+             s.context AS context,
+             s.raw_context AS raw_context,
              s.key_type AS category,
              s.source_url AS source_url,
              s.line_number AS line_number,
@@ -214,12 +238,24 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
         case 'js_file':
           jsFilesCount++
           break
-        case 'dependency_confusion':
+        case 'dependency_confusion': {
+          // A node written before source_urls carries only source_url, often
+          // empty; one written before package_name is named by its title.
+          // One written before package_scope / npm_exists gets its scope from
+          // the package name and npm_exists null: unknown, never "not on npm".
+          const urls = record.get('sourceUrls')
+          const packageName = record.get('packageName')
+          const npmExists = record.get('npmExists')
           dependencies.push({
             ...base,
-            package_name: base.title,
+            package_name: packageName ?? base.title,
+            scope: record.get('packageScope') ?? npmScopeOf(packageName),
+            npm_exists: typeof npmExists === 'boolean' ? npmExists : null,
+            recommendation: record.get('recommendation') ?? null,
+            source_urls: Array.isArray(urls) ? urls.filter((u: unknown) => typeof u === 'string' && u !== '') : [],
           })
           break
+        }
         case 'source_map_exposure':
         case 'source_map_reference':
           source_maps.push({
@@ -406,10 +442,12 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
   }
 }
 
-export async function HEAD(_request: NextRequest, { params }: RouteParams) {
+export async function HEAD(request: NextRequest, { params }: RouteParams) {
   const { projectId } = await params
-  const __denied = await guardProject(projectId)
-  if (__denied) return __denied
+  const auth = await requirePermission(request, 'recon:read', { projectId })
+  if (auth instanceof NextResponse) return auth
+  const raw = requireLevel(auth, 'R*')
+  if (raw) return raw
   if (!PROJECT_ID_RE.test(projectId)) {
     return new NextResponse(null, { status: 400 })
   }

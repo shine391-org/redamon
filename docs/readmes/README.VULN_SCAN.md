@@ -90,7 +90,7 @@ When `NUCLEI_DAST_MODE = True`, a second Nuclei pass fuzzes the parameterized UR
 | **DAST Mode** | Active fuzzing for XSS, SQLi, SSTI, Command Injection |
 | **Auto-Update Templates** | Template update (`-ut`) before each scan, into a persistent Docker volume |
 | **Custom Templates** | Per-project selection of uploaded templates |
-| **False-Positive Filter** | Drops findings whose response is a rate-limit or WAF block page (optionally AI-assisted) |
+| **False-Positive Filter** | Drops a time-based or blind finding whose response the server throttled, and an injection finding whose response is a WAF block page (optionally AI-assisted) |
 | **AI Tag Selection** | Optionally lets an LLM prune `NUCLEI_TAGS` to the detected tech stack |
 | **Category Classification** | Auto-categorizes findings (XSS, SQLi, RCE, etc.) |
 | **Authenticated Scanning** | The project's authenticated-session headers, when every scanned host is in scope |
@@ -238,7 +238,7 @@ For a host whose responses name nginx 1.19.0 and PHP 5.6.40:
 }
 ```
 
-The graph writer (`update_graph_from_vuln_scan`) and MITRE enrichment (`recon/main_recon_modules/add_mitre.py`) read `technology_cves.by_technology`. In the domain pipeline's GROUP 6 fan-out, `run_vuln_scan_isolated()` returns only the `vuln_scan` key, so a `technology_cves` computed there stays on the wrapper's copy.
+The graph writer (`update_graph_from_vuln_scan`) and MITRE enrichment (`recon/main_recon_modules/add_mitre.py`) read `technology_cves.by_technology`. The writer also reads `vuln_scan.all_cves`, which MITRE enrichment fills with CWE and CAPEC, to link each nuclei finding to the CVEs its template cites: `(v:Vulnerability)-[:INCLUDES_CVE]->(c:CVE)-[:HAS_CWE]->(m:MitreData)-[:HAS_CAPEC]->(cap:Capec)`. A finding's `INCLUDES_CVE` edges are exactly the CVEs it cites on the latest write: a CVE its template dropped loses the edge, even when none is left, while the shared CVE node and its chain stay. In the domain pipeline's GROUP 6 fan-out, `run_vuln_scan_isolated()` returns a `TopLevelKeys` holding `vuln_scan` and, when the CVE lookup ran, `technology_cves`, and the fan-out merges both.
 
 ### Nuclei Template CVEs vs Technology CVE Lookup
 
@@ -346,7 +346,7 @@ Custom nuclei templates (`mcp/nuclei-templates/`) can be uploaded, viewed, and d
 - **Select** templates per project via checkboxes — only selected templates run during scans
 - **View** all uploaded templates with severity badges and metadata
 - **Delete** individual templates
-- API: `GET/POST/DELETE /api/nuclei-templates`
+- API: `GET/POST/DELETE /api/nuclei-templates`; uploading or deleting asks `scan:custom_templates`, and replacing or deleting another account's template, or making one an instance template (`PATCH`), `platform:nuclei_templates` (an admin; with `RBAC_PERMISSIONS_ENABLED` on, an admin profile that holds it or a member's override)
 
 **How it works:**
 - The orchestrator passes the templates' host path as `HOST_CUSTOM_TEMPLATES_PATH`; it is mounted read-only at `/custom-templates`, and each selected template is passed as `-t /custom-templates/{path}`
@@ -438,7 +438,7 @@ The AI-in-pipeline switch (`AI_IN_PIPELINE`) turns `NUCLEI_AI_TAGS`, `NUCLEI_AI_
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `NUCLEI_SYSTEM_RESOLVERS` | `bool` | `True` | Use system DNS resolvers |
-| `NUCLEI_FOLLOW_REDIRECTS` | `bool` | `True` | Follow HTTP redirects (same-host only when session headers are attached) |
+| `NUCLEI_FOLLOW_REDIRECTS` | `bool` | `True` | Follow HTTP redirects (`-follow-redirects`). Same host only (`-follow-host-redirects`) when session headers are attached, and in IP mode or while RoE exclusions are in force, in both passes and the takeover templates (`[*][Nuclei] Redirects followed on the same host only: RoE exclusions are in force`); that flag also holds a template's own `redirects: true` to the same host. Off, no flag is passed, so a template with `redirects: true` follows its redirects to any host, except in those same three cases (a session, IP mode, RoE exclusions): there `-disable-redirects` holds it (`[*][Nuclei] Template redirects held (-disable-redirects): RoE exclusions are in force`) |
 | `NUCLEI_MAX_REDIRECTS` | `int` | `10` | Maximum redirects to follow |
 | `NUCLEI_SCAN_ALL_IPS` | `bool` | `False` | Also scan `http(s)://<ip>` for every resolved IP no other target URL covers |
 | `NUCLEI_INTERACTSH` | `bool` | `True` | Enable OOB testing (blind vulns); always off when session headers are attached, since callbacks go to a third-party collector |
@@ -475,7 +475,7 @@ docker run --rm --net=host \
 
 ## Architecture & Flow
 
-> **Pipeline context:** Vulnerability scanning runs in **GROUP 6 Phase A** of the recon pipeline (`recon/main.py`). In domain mode, `run_vuln_scan_isolated()` runs in one `ThreadPoolExecutor` with the other active scanners the project enabled (the GraphQL scanner `recon/graphql_scan/`, subdomain takeover, VHost/SNI, web cache poisoning, origin discovery); each `_isolated` wrapper deep-copies `combined_result` so there is no shared-dict race, and only its own key is merged back. In IP mode `run_vuln_scan()` runs first on its own, then the others fan out. Phase B (MITRE CWE/CAPEC enrichment) runs after Phase A — it depends on Nuclei's CVEs. Both phases depend on resource enumeration (GROUP 5) output, and the whole group is skipped when http_probe found no live URL (then only the certificate-hygiene checks run, from stored certificate data). Graph DB updates happen in a background thread.
+> **Pipeline context:** Vulnerability scanning runs in **GROUP 6 Phase A** of the recon pipeline (`recon/main.py`). In domain mode, `run_vuln_scan_isolated()` runs in one `ThreadPoolExecutor` with the other active scanners the project enabled (the GraphQL scanner `recon/graphql_scan/`, subdomain takeover, VHost/SNI, web cache poisoning, origin discovery, route exposure); every worker is handed one `_fan_out_snapshot` (a deep copy of `combined_result` taken before the first submit), its `_isolated` wrapper deep-copies that again, and only its own key is merged back into the live dict, so no worker copies a dict mid-merge. In IP mode `run_vuln_scan()` runs first on its own, then the others fan out. Phase B (MITRE CWE/CAPEC enrichment) runs after Phase A — it depends on Nuclei's CVEs. Both phases depend on resource enumeration (GROUP 5) output, and the whole group is skipped when http_probe found no live URL: then the certificate-hygiene checks run from stored certificate data, the port and service checks and the org DNS checks run on their own (`_maybe_run_port_checks`, `_maybe_run_dns_checks` in `recon/main.py`), Subdomain Takeover still runs, and the skipped sources keep their findings on the group's hosts. Graph DB updates happen in a background thread.
 
 ### Execution Flow (`run_vuln_scan`)
 
@@ -652,7 +652,7 @@ The module's own functions live in `recon/main_recon_modules/vuln_scan.py`; the 
 
 ---
 
-### `build_nuclei_command(targets_file, output_file, docker_image, ..., force_dast_pass=False, auth_headers=None, container_name=None, max_host_error=0) -> List[str]`
+### `build_nuclei_command(targets_file, output_file, docker_image, ..., force_dast_pass=False, auth_headers=None, container_name=None, max_host_error=0, ip_mode=False, roe_exclusions=False) -> List[str]`
 
 **Purpose:** Constructs the nuclei Docker CLI command for one pass. The keyword arguments mirror the settings above.
 
@@ -687,6 +687,8 @@ docker run --rm --net=host --name redamon-nuclei-detection-<id> \
 
 - `force_dast_pass=True` adds `-dast` and drops every tag and template filter, which would otherwise empty-intersect with the DAST template set.
 - `auth_headers` become `-H` flags; with them, redirects use `-follow-host-redirects` and `-no-interactsh` is forced.
+- `ip_mode=True` or `roe_exclusions=True` also switches redirects to `-follow-host-redirects`. The target list is admitted, but a target's redirect is not, and nuclei follows it inside its client before any scope check. `run_vuln_scan` passes `roe_exclusions` from `admission_context(settings, recon_data).excluded`, so a partial run reads the exclusions from `metadata.roe`; `_run_nuclei_takeover` reads them from its settings.
+- With `follow_redirects=False`, any of the three (`auth_headers`, `ip_mode`, `roe_exclusions`) adds `-disable-redirects`. Without it, a template that sets its own `redirects: true` follows a redirect to any host: an excluded one, an address off the IP target list, or a third party that would receive the `-H` session. With none of the three, follow-off passes no redirect flag.
 - When HTTP traffic capture is on and reachable, `-proxy <capture proxy>` and an `X-Redamon-Ctx` header are added.
 
 ---
@@ -696,7 +698,7 @@ docker run --rm --net=host --name redamon-nuclei-detection-<id> \
 **Purpose:** Decides whether a raw nuclei finding is a false positive.
 
 **Rules:**
-1. A response with a rate-limit marker (`429`, "Too Many Requests", "try again later", ...) is a false positive, whatever the template
+1. For time-based and blind templates only (a `time-based`, `blind` or `time-based-sqli` tag, or `time` / `blind` as a whole word of the template id), a response the server throttled is a false positive: the delay the template measured is the throttle's. Throttled means the raw response's status line reads `429`, or it reads `503` or carries a `Retry-After` header and the response holds throttle wording ("too many requests", "rate limit", "please wait", "try again later", ...). Nuclei's JSONL has no status field, so the status and headers are parsed from the raw `response`. Any other template keeps its match, and the same wording on a page the server did not throttle ("Loading, please wait...") is ordinary copy
 2. For injection templates (`sqli`, `xss`, `rce`, `lfi`, `ssti`, `injection` tags), a `403` response with a WAF marker ("Access Denied", "ModSecurity", "Cloudflare", ...) is a false positive
 3. With `NUCLEI_AI_RESPONSE_FILTER` on, an injection finding the keyword lists missed, whose response's first 50 characters hold a suspicious status (403, 406, 418, 429, 503, 451), is classified by the LLM; a "blocked" verdict with confidence of at least 70 is a false positive
 
@@ -722,7 +724,7 @@ map fails the whole write. That list is what CVE enrichment, reports and the
 Mute Rules CVE fields (`has_cve`, `cve_year`, `cve_ids`) read. Regression tests:
 `recon/tests/test_nuclei_cve_findings_reach_graph.py`.
 
-**Category Classification:** the first tag that contains one of these keys (checked in this order) decides; no match is `general`.
+**Category Classification:** the first tag that names one of these keys (keys checked in this order) decides; no match is `general`. A key matches whole words of a tag, split on anything that is not a letter or digit, never a substring: `time-based-sqli` is sqli and `open-redirect` is open_redirect, while `ecommerce`, `salesforce` and `source` are not rce and `sqlite` is not sqli. The Priority Board ranks on this category.
 
 | Tag Containing | Category |
 |----------------|----------|
@@ -736,7 +738,7 @@ Mute Rules CVE fields (`has_cve`, `cve_year`, `cve_ids`) read. Regression tests:
 | `ssti` | ssti |
 | `cve` | cve |
 | `exposure` | exposure |
-| `misconfig` | misconfiguration |
+| `misconfig`, `misconfiguration` | misconfiguration |
 | `default-login`, `auth-bypass` | authentication |
 | `panel` | exposed_panel |
 | `tech` | technology |
@@ -992,6 +994,7 @@ The flags `build_nuclei_command()` can pass:
 | `-system-resolvers` | Use system DNS |
 | `-follow-redirects` | Follow HTTP redirects |
 | `-follow-host-redirects` | Follow redirects on the same host only |
+| `-disable-redirects` | Follow no redirect, a template's own `redirects: true` included |
 | `-max-redirects <n>` | Max redirect depth |
 | `-proxy <url>` | Send traffic through the capture proxy |
 
@@ -1213,6 +1216,13 @@ The module runs when the project's scan modules include `vuln_scan` (they do by 
 
 `recon/partial_recon_modules/vulnerability_scanning.py` re-runs `run_vuln_scan()` on demand (`run_nuclei`) against the graph's BaseURLs and endpoints and any URLs the user typed in, and `run_security_checks_partial` runs the security checks alone.
 
+Both read their hosts from `dns` (`extract_targets_from_recon`, the security checks' host list) through the D2 gate, while a typed URL lands in `http_probe`. `_typed_url_hosts_in_dns` closes that gap, in domain mode:
+
+- **Include Graph Targets off:** the run scans only the typed inputs. `metadata.include_root_domain` is stamped False, so the project root is no target unless typed. Each typed URL's host joins `dns.subdomains` with `has_records` alone (the tool resolves it), and a typed URL on an address gets its own entry. In the security checks a typed IP not attached to a subdomain gets its own entry too, not the root's `dns.domain`.
+- **RoE IP or CIDR entries, graph targets on or off:** a typed URL's host the dict holds no address for is resolved once (`[+][Partial Recon] Resolved <host> -> [...]`) and the gate judges it on that answer: any excluded address refuses it, and a host that does not resolve stays refused as not checked.
+
+With graph targets on and no IP or CIDR entry the dict is unchanged; IP mode is unchanged.
+
 ### Standalone Enrichment
 
 ```python
@@ -1431,14 +1441,116 @@ In addition to Nuclei templates, RedAmon includes custom Python-based security c
 | **Rate Limiting** | No | Brute-force protection detection |
 | **Service Exposure** | Partial | Redis no-auth, K8s API, SMTP relay |
 
+The header, cookie, CSP and form checks (and `no_rate_limiting`) follow a redirect only while it stays on the probed host (`_get_on_host`; http to https on the same name is followed). A page another host serves after a redirect is not judged as this host's, and that host gets no request, so an apex that only redirects to `www` gets no header findings of its own.
+
+### Which hosts the checks probe
+
+A domain run hands the checks its whole DNS block and port scan. Three gates in
+`recon/helpers/security_checks.py` decide which of those hosts get a request.
+IP mode keeps its own rules (a target's live ports, redirect hops onto targets).
+
+**Only a web port the run found live.** A host is probed on `:80` or `:443`
+only when this run has evidence that the port is live there
+(`_domain_live_ports`): the port scan lists it open on the address, or found it
+by name (live on the name and its address), or httpx reached a URL on it (by the
+URL's host and the address httpx used). A name has every port that is live on
+an address it resolves to (the run's DNS and the port scan's name maps), since
+it is the same TCP endpoint. So an HTTP-only host gets its `:80` checks and no
+`:443` connection, the WAF bypass pairs a name with an address only when both
+are live on `:443`, and the bare-origin comparison skips a name that is not live
+on the port. The log says `[*][SecurityCheck] A host is probed only on a web
+port this run found live (:80 on N, :443 on M of T host(s))`.
+
+A host left unprobed is never marked unreachable (`_keep_unproven_domain_hosts`):
+
+- A host with no live port at all in that data is not probed. The port scan and
+  httpx do not reach every name the checks read (a name found after them, a name
+  naabu never got), so their silence is no verdict.
+- When an evidence source was cut (naabu, masscan or httpx stopped early or
+  failed) and no finished port scan says a port is closed, a host with an
+  unproven web port is kept the same way.
+
+Both keep their `security_check` findings, for that source alone, through a
+`security_checks` coverage gap ("no live web port in this run's port or URL
+data"), and the log says `[!][SecurityCheck] N host(s) without live-port
+evidence for a web check: not probed there, earlier findings kept`. A run whose
+port and URL data show nothing live at all probes every host on both ports, as
+before the gate.
+
+A deliberate refusal is no cut (`_REFUSAL_GAP_SOURCES` in
+`recon/helpers/security_checks.py`): the gap naabu or masscan records when the
+RoE gate keeps a target from it (`{"source": "roe_excluded", "module": "naabu"}`;
+the scanner still scanned every target it was allowed), and the `httpx_jarm` /
+`httpx_favicon` gaps the RoE ceiling leaves when it turns those fingerprints off
+(httpx still probed every URL). So under an RoE exclusion a finished port scan
+stays a verdict: an HTTP-only or HTTPS-only host is no longer kept as unproven,
+and its stale `security_check` findings are pruned. Any other gap under an evidence
+source, an unknown or new one included, still counts as a cut. IP mode
+(`_keep_unproven_targets`) and `vhost_sni_enum` read the same cuts.
+
+**The Rules of Engagement.** The three target lists (the direct-IP checks'
+addresses, the WAF bypass's name-address pairs, the hostname checks' names) pass
+`target_admission.admit_host_targets` (`_domain_roe_hosts`):
+
+- an excluded address is never probed;
+- a name with any excluded address is neither probed by name (the HTTP stack
+  would resolve it onto any of its addresses) nor paired with an address, while
+  its allowed addresses are still checked as bare IPs;
+- a name an entry excludes by name takes the addresses only it holds with it.
+
+The port and service checks drop an excluded address and an address held only
+by excluded names, as nmap does (`admit_ip_map`, `_domain_roe_port_ips`). The
+RoE list comes from the caller, else from a partial builder's `metadata.roe`.
+Each refusal is logged once per run (`[-][RoE] security_checks: not sent to N
+target(s) the Rules of Engagement exclude: <address> (<name>), ...`) and noted
+under `roe_excluded`, and each refused host is kept as not checked for
+`security_check` alone (`[-][SecurityCheck] N host(s) the Rules of Engagement
+refuse: not checked, earlier findings kept`). With no exclusion the gate
+changes nothing.
+
+**Redirect chains.** `check_direct_ip_http` and `check_direct_ip_https` follow
+an address's redirects hop by hop (`_follow_admitted_redirects` with
+`_domain_redirect_admission`), not through requests' own following. A hop is
+sent only to one of the run's own hosts that the RoE admit: a name the run
+resolved (its DNS and the port scan's name maps) or an address they hold.
+`hop_guard.hop_refusal` asks the RoE again for each hop, on the name's current
+addresses. A third party, an address the run never resolved (cloud metadata, an
+internal service the target points at) and an excluded host get no request; no
+SSRF guard is added on top, so an internal project's own private addresses
+still pass. A refused hop counts no host failure: the chain ends there and is
+reported as where the target pointed (`final_url` is the refused `Location`).
+Each hop takes its own slot of the RoE rate ceiling.
+
+**Partial runs.** `run_security_checks_partial` reads the graph through
+`_build_vuln_scan_data_from_graph`, so its evidence is the graph's open `Port`
+nodes and `BaseURL`s, and a graph host follows the rule above. A subdomain or IP
+typed into the modal that the graph has no live row for is probed on both web
+ports, as before the gate: the run stamps the typed hosts and a typed name's
+resolved addresses in `metadata.typed_hosts` (not in IP mode). A typed host the
+graph has evidence for follows it, a name that only shares a typed address gains
+nothing, and the RoE gate still refuses an excluded typed host and a typed name
+with any excluded address. A typed URL's host gets its `dns` entry as partial
+Nuclei's does (see [Partial Recon](#partial-recon)): with graph targets off the
+root is no target unless typed and a typed IP attached to no subdomain is checked
+as its own host, and under RoE IP or CIDR entries a typed URL's host with no
+known address is resolved once and refused on an excluded address or no answer.
+
+The builder keeps a graph name's RoE-excluded address in the `dns` block, which
+every reader's gate reads, and out of `port_scan.by_ip`, a `BaseURL`'s resolved
+address and the nmap services the CVE lookup reads. While the run has
+exclusions (outside IP mode) it stamps the run's RoE in `metadata.roe`. So the
+partial security checks, Nuclei and Subdomain Takeover refuse a graph name with
+one excluded and one allowed address by name, and a name whose only address is
+excluded as excluded, not as unresolved.
+
 ### Check Categories
 
 #### Authentication Security
 | Check | Severity | Description |
 |-------|----------|-------------|
-| `login_no_https` | High | Login form served over HTTP |
+| `login_no_https` | High | Login form served over HTTP: only a page with a password input, and only when a made-up path next to it answers differently (the catch-all control, recorded as `control_check`) |
 | `session_no_secure` | Medium | Session cookie missing Secure flag |
-| `session_no_httponly` | Medium | Session cookie missing HttpOnly flag |
+| `session_no_httponly` | Medium | Session cookie missing HttpOnly flag (never on an anti-CSRF cookie such as `csrftoken` or `XSRF-TOKEN`, which the page's JavaScript must read) |
 | `basic_auth_no_tls` | High | Basic Auth over unencrypted HTTP |
 
 #### TLS / Certificates
@@ -1488,7 +1600,7 @@ The hygiene checks (all but `tls_expiring_soon`) read stored certificate data an
 #### Rate Limiting
 | Check | Severity | Description |
 |-------|----------|-------------|
-| `no_rate_limiting` | Medium | No rate limit on login endpoints |
+| `no_rate_limiting` | Medium | No rate limit on login endpoints: one GET, then 10 login POSTs all processed (2xx, 3xx or 401) with no throttling status, header or text; redirects followed only on the same host |
 
 #### Direct IP Access
 | Check | Severity | Description |

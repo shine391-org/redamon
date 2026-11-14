@@ -36,10 +36,24 @@ vi.mock('@/lib/prisma', () => ({
   },
 }))
 
-vi.mock('@/lib/session', () => ({
-  getSession: (...args: unknown[]) => mockGetSession(...args),
-  isInternalRequest: (...args: unknown[]) => mockIsInternal(...args),
-}))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
+vi.mock('@/lib/session', async () => {
+  const { NextResponse } = await import('next/server')
+  return {
+    getSession: (...args: unknown[]) => mockGetSession(...args),
+    isInternalRequest: (...args: unknown[]) => mockIsInternal(...args),
+    // No act-as in this file: actAs.ownAccount.test.ts proves the account acted as.
+    actsAsAccount: async () => false,
+    // session.ts requireAccountWrite over the session the test sets (no act-as here: the
+    // managed-account exception is proved in session.userAccess.test.ts).
+    requireAccountWrite: async (id: string) => {
+      const s = await mockGetSession()
+      if (!s) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      if (s.userId === id) return null
+      return NextResponse.json(s.role === 'admin' ? { error: 'own account only', code: 'own_account_only' } : { error: 'Forbidden' }, { status: 403 })
+    },
+  }
+})
 
 import { GET, POST } from './route'
 
@@ -212,17 +226,37 @@ describe('POST /api/users/[id]/llm-providers — I1 ownership', () => {
 // providers against a user id that no longer existed. The admin bypass let the
 // request through, prisma raised P2003 on user_llm_providers_user_id_fkey and the
 // catch-all turned it into an opaque 500 ("Failed to save provider" in the UI).
+// HD-23 removed the admin write bypass, so that stale write is now refused at the
+// gate (it answered 404 while the bypass existed); a 404 remains for an account
+// deleted between the gate and the insert.
 describe('POST /api/users/[id]/llm-providers — ghost user id (#173)', () => {
-  test('admin writes to a user id that does not exist → 404, no write, no 500', async () => {
+  test('admin writes to a user id that does not exist → 403 own_account_only, no write, no 500 (HD-23; was 404)', async () => {
     mockIsInternal.mockReturnValue(false)
     mockGetSession.mockResolvedValue({ userId: 'admin1', role: 'admin' })
     mockUserFindUnique.mockResolvedValue(null)
 
     const res = await POST(postReq('ghost', NEW_PROVIDER), params('ghost'))
 
-    expect(res.status).toBe(404)
+    expect(res.status).toBe(403)
     expect(mockCreate).not.toHaveBeenCalled()
-    expect((await res.json()).error).toContain('User not found')
+    expect((await res.json()).code).toBe('own_account_only')
+  })
+
+  test('HD-23: an admin cannot add a provider to another existing account', async () => {
+    mockIsInternal.mockReturnValue(false)
+    mockGetSession.mockResolvedValue({ userId: 'admin1', role: 'admin' })
+    const res = await POST(postReq('victim', NEW_PROVIDER), params('victim'))
+    expect(res.status).toBe(403)
+    expect(mockCreate).not.toHaveBeenCalled()
+    expect(mockUserFindUnique).not.toHaveBeenCalled()
+  })
+
+  test('an admin adds a provider to their own account', async () => {
+    mockIsInternal.mockReturnValue(false)
+    mockGetSession.mockResolvedValue({ userId: 'admin1', role: 'admin' })
+    mockUserFindUnique.mockResolvedValue({ id: 'admin1' })
+    const res = await POST(postReq('admin1', NEW_PROVIDER), params('admin1'))
+    expect(res.status).toBe(201)
   })
 
   test('user deleted between the check and the insert (P2003) → 404, not 500', async () => {
@@ -322,5 +356,27 @@ describe('GET /api/users/[id]/llm-providers — failure', () => {
     const res = await GET(req('http://x/api/users/victim/llm-providers'), params('victim'))
     expect(res.status).toBe(500)
     expect(await res.json()).toEqual({ error: 'Failed to fetch LLM providers', code: 'P1001' })
+  })
+})
+
+describe('GET /api/users/[id]/llm-providers - Extra Headers values are masked too (review of 1.6)', () => {
+  const HEADER = 'Bearer hdr-SECRET-77770001'
+  beforeEach(() => mockFindMany.mockResolvedValue([{ ...PROVIDER, defaultHeaders: { Authorization: HEADER, 'X-Org': 'acme-org' } }]))
+
+  test('an admin reading another account gets every header value masked', async () => {
+    mockIsInternal.mockReturnValue(false)
+    mockGetSession.mockResolvedValue({ userId: 'admin1', role: 'admin' })
+    const res = await GET(req('http://x/api/users/victim/llm-providers'), params('victim'))
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).not.toContain(HEADER)
+    expect(text).not.toContain('acme-org')
+    expect(JSON.parse(text)[0].defaultHeaders).toEqual({ Authorization: '••••••••0001', 'X-Org': '••••••••-org' })
+  })
+
+  test('the internal key with ?internal=true still reads them (the agent sends them)', async () => {
+    mockIsInternal.mockReturnValue(true)
+    const res = await GET(req('http://x/api/users/victim/llm-providers?internal=true'), params('victim'))
+    expect(await res.text()).toContain(HEADER)
   })
 })

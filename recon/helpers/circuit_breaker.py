@@ -869,7 +869,11 @@ def run_cache(name: str) -> RunCache:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
-_HOST_CHARS = re.compile(r"^[a-z0-9.\-]+$|^[0-9a-f:]+$")
+# A hostname the prune may build a keep regex or lookup from: the graph's
+# _KEEP_HOST_CHARS (graph_db/mixins/base_mixin.py). Underscores are legal in
+# DNS names (`_dmarc.`, `dev_api.`), and a host dropped here loses its notes:
+# the prune would delete findings the run never re-checked.
+_HOST_CHARS = re.compile(r"^[a-z0-9._\-]+$|^[0-9a-f:]+$")
 
 
 def host_key(target: Any) -> str:
@@ -928,6 +932,75 @@ _CONNECT = "connect"
 _READ_TIMEOUT = "read_timeout"
 _ALIVE = "alive"
 
+# OpenSSL's reason for every refused certificate: self-signed, expired,
+# unknown CA, hostname or IP mismatch.
+_CERT_VERIFY_REASON = "CERTIFICATE_VERIFY_FAILED"
+# requests nests the ssl error three deep, urllib one: a chain that needs more
+# exceptions than this to reach it is not theirs.
+_MAX_CHAIN_NODES = 16
+
+
+def _cert_error_types() -> tuple:
+    types: list = []
+    try:
+        import ssl  # noqa: PLC0415
+        types.append(ssl.SSLCertVerificationError)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # urllib3's own hostname matcher (assert_hostname, or an IP address
+        # the ssl module did not check) raises this instead.
+        from urllib3.util.ssl_match_hostname import CertificateError  # noqa: PLC0415
+        types.append(CertificateError)
+    except Exception:  # noqa: BLE001
+        pass
+    return tuple(types)
+
+
+def _is_cert_verification_failure(exc: BaseException) -> bool:
+    """True when ``exc`` is, or wraps, a certificate this client refused.
+
+    The host completed enough of the handshake to present a certificate, so
+    it is up: a self-signed one on a live internal host must not take it away
+    from every other module. A handshake reset or EOF is not this and still
+    counts. Only the ssl error's own OpenSSL text is read, never a wrapper's
+    message, which carries the target-controlled URL.
+    """
+    try:
+        import ssl  # noqa: PLC0415
+        ssl_error: Any = ssl.SSLError
+    except Exception:  # noqa: BLE001
+        ssl_error = ()
+    cert_types = _cert_error_types()
+    seen: set[int] = set()
+    stack: list = [exc]
+    while stack and len(seen) < _MAX_CHAIN_NODES:
+        node = stack.pop()
+        if not isinstance(node, BaseException) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if cert_types and isinstance(node, cert_types):
+            return True
+        if ssl_error and isinstance(node, ssl_error) and (
+                getattr(node, "reason", None) == _CERT_VERIFY_REASON
+                or f"[SSL: {_CERT_VERIFY_REASON}]" in str(node)):
+            return True
+        stack.extend(a for a in getattr(node, "args", ()) if isinstance(a, BaseException))
+        stack.extend((getattr(node, "reason", None), node.__cause__, node.__context__))
+    return False
+
+
+def is_certificate_refused(exc: BaseException) -> bool:
+    """True when this client refused the host's certificate. Never raises.
+
+    The host is up, but a module that verifies certificates checked nothing
+    on it: it must keep its earlier findings there (see ``note_degraded``).
+    """
+    try:
+        return _is_cert_verification_failure(exc)
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def _failure_kind(exc: BaseException) -> Optional[str]:
     rex = _requests_exceptions()
@@ -935,6 +1008,8 @@ def _failure_kind(exc: BaseException) -> Optional[str]:
         # ProxyError subclasses ConnectionError: a dead capture proxy must not
         # make every host look down.
         if isinstance(exc, rex.ProxyError):
+            return None
+        if isinstance(exc, rex.SSLError) and _is_cert_verification_failure(exc):
             return None
         if isinstance(exc, (rex.ConnectTimeout, rex.SSLError, rex.ConnectionError)):
             return _CONNECT
@@ -961,7 +1036,7 @@ def _failure_kind(exc: BaseException) -> Optional[str]:
     try:
         import ssl  # noqa: PLC0415
         if isinstance(exc, ssl.SSLError):
-            return _CONNECT
+            return None if _is_cert_verification_failure(exc) else _CONNECT
     except Exception:  # noqa: BLE001
         pass
     if isinstance(exc, OSError) and getattr(exc, "errno", None) in _NETWORK_ERRNOS:
@@ -1340,11 +1415,43 @@ class CoverageReport:
     # The plan ids of every selection cut, so a caller can prove the plan was
     # persisted before trusting the cut.
     selection_plan_ids: tuple = ()
+    # ((source, ((check, (host, ...)), ...)), ...): what note_checked recorded;
+    # check "*" is every finding type of the source. Not a cut: no gap.
+    checked: tuple = ()
 
     @property
     def degraded(self) -> bool:
         return bool(self.degraded_sources or self.skipped_hosts or self.nuclei_truncated
                     or self.gaps)
+
+    @property
+    def positive_sources(self) -> frozenset:
+        """The sources that recorded what they re-checked (``note_checked``).
+        The prune deletes their stale findings only on those hosts; every
+        other source keeps the rule "not reported and not cut means gone".
+        A degraded one is listed too: the prune leaves it out first."""
+        return frozenset(source for source, _ in self.checked)
+
+    def checked_types(self, source: str) -> tuple:
+        """The checks ``source`` recorded: ``"*"`` (every finding type) first
+        when some note covered the whole source, then each finding ``type``
+        recorded on its own."""
+        checks = [check for check, _ in dict(self.checked).get(source, ())]
+        return tuple(sorted(checks, key=lambda c: (c != "*", c)))
+
+    def checked_hostnames(self, source: str, check: str = "*") -> tuple:
+        """The hostnames whose ``source`` findings (of type ``check``, or of
+        every type for ``"*"``) the prune may delete: those the source
+        re-checked, minus every host the run cut for it. Degraded always
+        wins: a source cut as a whole has none."""
+        if source in self.degraded_sources:
+            return ()
+        per_check = dict(dict(self.checked).get(source, ()))
+        hosts = set(per_check.get("*", ()))
+        if check != "*":
+            hosts.update(per_check.get(check, ()))
+        kept = set(self.keep_hostnames(source))
+        return tuple(h for h in _prune_hostnames(hosts) if h not in kept)
 
     def skipped_hostnames(self) -> tuple:
         """Hostnames (port stripped, lower-cased) safe to build a prune regex from."""
@@ -1408,7 +1515,7 @@ def _norm_host(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text or len(text) > 300:
         return ""
-    return text if re.fullmatch(r"[a-z0-9.:\-\[\]]+", text) else ""
+    return text if re.fullmatch(r"[a-z0-9._:\-\[\]]+", text) else ""
 
 
 def note_degraded(module: str, *, sources: Iterable[str] = (), hosts: Iterable[str] = (),
@@ -1486,7 +1593,48 @@ def note_selection_cut(module: str, *, sources: Iterable[str], hosts: Iterable[s
                           reason=reason or "selected targets/templates")
     except Exception:  # noqa: BLE001
         _mark_accumulator_broken()
+def note_checked(source: str, *, hosts: Iterable[str] = (), checks: Iterable[str] = (),
+                 module: str = "") -> None:
+    """Record, for the run, the hosts ``source`` positively re-checked. Never raises.
 
+    The positive-coverage prune (design decision D1). Once a finding source
+    calls this in a run, the end-of-run prune deletes its stale findings only
+    on these hosts and keeps every other one, so a host the module never
+    reached (a crash, a cap, a host discovery stopped finding) keeps its
+    findings without the module having to say so. A source that never calls
+    it keeps the older rule: whatever is not noted degraded is pruned. A
+    source switched off by configuration must not call it, so its old
+    findings are pruned (README "Degraded vs. switched off").
+
+    ``hosts``: ``host`` or ``host:port`` keys, as ``note_degraded`` takes them
+    (``host_key`` turns a URL into one). The prune matches findings by
+    hostname through ``_KEEP_HOST_FIELDS``, so a host counts as checked when
+    any of its ports was. Called with none, the source re-checked nothing and
+    prunes nothing. Findings with no host field are never pruned under this
+    rule, so a source whose findings carry none should not adopt it.
+    ``checks``: finding ``type`` values this record covers alone, for a
+    source made of independent checks (``security_check``); empty means every
+    type of the source.
+    Degraded always wins: a source noted degraded, or a host cut for it or for
+    every source, is kept even when also recorded here. Recording a check is
+    not a coverage gap: it changes no gap, keep set or degraded flag.
+    A fault here marks the accumulator broken, which makes the prune fail closed.
+    """
+    try:
+        token = _token(source)
+        if not token:
+            return
+        note = {
+            "kind": "checked",
+            "module": _token(module) or token,
+            "source": token,
+            "hosts": sorted({h for h in (_norm_host(x) for x in hosts) if h}),
+            "checks": sorted({_token(c) for c in checks if _token(c)}),
+        }
+        with _notes_lock:
+            _notes.append(note)
+    except Exception:  # noqa: BLE001
+        _mark_accumulator_broken()
 
 
 def _aggregate(notes: list[dict]) -> CoverageReport:
@@ -1494,6 +1642,7 @@ def _aggregate(notes: list[dict]) -> CoverageReport:
     skipped_hosts: set[str] = set()
     every_source_hosts: set[str] = set()
     per_source_hosts: dict[str, set[str]] = {}
+    checked: dict[str, dict[str, set[str]]] = {}
     truncated = False
     selection_unknown = False
     selection_plan_ids: list[str] = []
@@ -1511,6 +1660,11 @@ def _aggregate(notes: list[dict]) -> CoverageReport:
             slot["reason"] = f"{slot['reason']}; {reason}" if slot["reason"] else reason
 
     for note in notes:
+        if note.get("kind") == "checked":
+            per_check = checked.setdefault(note["source"], {})
+            for check in note["checks"] or ("*",):
+                per_check.setdefault(check, set()).update(note["hosts"])
+            continue
         module = note["module"]
         aliases = note.get("aliases") or []
         truncated = truncated or note["nuclei_truncated"]
@@ -1547,9 +1701,12 @@ def _aggregate(notes: list[dict]) -> CoverageReport:
     source_hosts = tuple(sorted(
         (source, tuple(sorted(hosts - every_source_hosts)))
         for source, hosts in per_source_hosts.items() if hosts - every_source_hosts))
+    checked_record = tuple(sorted(
+        (source, tuple(sorted((check, tuple(sorted(hosts))) for check, hosts in per_check.items())))
+        for source, per_check in checked.items()))
     return CoverageReport(frozenset(degraded_sources), tuple(sorted(skipped_hosts)),
                           truncated, gaps, source_hosts, selection_unknown,
-                          tuple(selection_plan_ids))
+                          tuple(selection_plan_ids), checked_record)
 
 
 def coverage_report() -> CoverageReport:

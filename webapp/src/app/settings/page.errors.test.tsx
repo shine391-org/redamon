@@ -21,7 +21,6 @@ vi.mock('next/navigation', () => ({
   usePathname: () => '/settings',
 }))
 vi.mock('@/providers/ProjectProvider', () => ({ useProject: () => ({ userId: 'user-1' }) }))
-vi.mock('@/providers/AuthProvider', () => ({ useAuth: () => ({ isAdmin: false }) }))
 
 const alertSpies = vi.hoisted(() => ({
   alert: vi.fn(async () => {}),
@@ -269,5 +268,56 @@ describe('Tradecraft (U-13, U-61, U-62)', () => {
     const row = (await screen.findByText('HackTricks')).closest('div')!.parentElement!
     fireEvent.click(within(row.parentElement ?? row).getByTitle('Delete'))
     expect(await screen.findByText('Delete failed: Failed to delete tradecraft resource (P2024 · HTTP 500)')).toBeInTheDocument()
+  })
+})
+
+describe('HD-24: a new chisel URL with the masked auth asks for it again', () => {
+  test('the refusal is shown with its code and the chisel auth field takes the focus', async () => {
+    routes[`GET ${BASE}/settings`] = {
+      status: 200,
+      body: { chiselServerUrl: 'http://vps.example:9090', chiselAuth: '••••••••pass', rotationConfigs: {} },
+    }
+    routes[`PUT ${BASE}/settings`] = {
+      status: 400,
+      body: {
+        error: 'The chisel server URL changed: type the chisel auth again, or clear it. A stored secret is never sent to a new address unless it is entered again.',
+        code: 'secret_reentry_required', field: 'chiselAuth', fields: ['chiselAuth'], endpoint: 'chiselServerUrl',
+      },
+    }
+    renderPage()
+    fireEvent.change(await screen.findByPlaceholderText('e.g. http://your-vps.com:9090'), { target: { value: 'http://elsewhere.example:9090' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Save Settings' }))
+
+    expect(await screen.findByText(/type the chisel auth again, or clear it\..*\(secret_reentry_required · HTTP 400\)/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByPlaceholderText('Enter chisel auth')).toHaveFocus())
+  })
+})
+
+describe('ID-25: re-pointing the chisel server asks for the password (review of 1.6)', () => {
+  test('the refused save opens the password dialog; the password goes with the same save', async () => {
+    routes[`GET ${BASE}/settings`] = {
+      status: 200,
+      body: { chiselServerUrl: 'http://vps.example:9090', chiselAuth: '••••••••pass', rotationConfigs: {} },
+    }
+    let n = 0
+    routes[`PUT ${BASE}/settings`] = () => (n++ === 0
+      ? { status: 403, body: { error: 'Enter your password to confirm this action.', code: 'step_up_required' } }
+      : { status: 200, body: { chiselServerUrl: 'http://elsewhere.example:9090', chiselAuth: '••••••••ped!', rotationConfigs: {} } })
+    renderPage()
+    fireEvent.change(await screen.findByPlaceholderText('e.g. http://your-vps.com:9090'), { target: { value: 'http://elsewhere.example:9090' } })
+    fireEvent.change(screen.getByPlaceholderText('Enter chisel auth'), { target: { value: 'user:typed!' } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Save Settings' }))
+
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveTextContent('new address')
+    fireEvent.change(within(dialog).getByLabelText('Your password'), { target: { value: 'my-password' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Settings saved')).toBeInTheDocument()
+    const bodies = puts().map(c => JSON.parse(String((c[1] as RequestInit).body)))
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0].stepUpPassword).toBeUndefined()
+    expect(bodies[1]).toMatchObject({ chiselServerUrl: 'http://elsewhere.example:9090', chiselAuth: 'user:typed!', stepUpPassword: 'my-password' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
   })
 })

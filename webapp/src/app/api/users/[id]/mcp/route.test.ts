@@ -18,7 +18,31 @@ const mockUpsert = vi.fn()
 const mockUpdate = vi.fn()
 const fetchMock = vi.fn()
 
-vi.mock('@/lib/session', () => ({ requireUserAccess: vi.fn().mockResolvedValue(null) }))
+const mockIsInternal = vi.hoisted(() => vi.fn(() => false))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
+vi.mock('@/lib/session', () => ({
+  requireUserAccess: vi.fn().mockResolvedValue(null),
+  isInternalRequest: mockIsInternal,
+  getSession: vi.fn(async () => ({ userId: 'u1', role: 'standard' })),
+}))
+// The account the path names owns the servers. An administrator by default, so a
+// stdio server is theirs to save (NF-14, OQ-48); the member cases set 'standard'.
+const mockOwnerRole = vi.hoisted(() => ({ role: 'admin' as string | null }))
+vi.mock('@/lib/authz/principal', () => ({
+  loadPrincipal: vi.fn(async (id: string) => (mockOwnerRole.role ? { id, role: mockOwnerRole.role } : null)),
+}))
+const mockWriteAudit = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/audit', () => ({ writeAudit: mockWriteAudit }))
+// The step-up's own outcomes are proved in stepUp.test.ts; here the double answers as
+// requireStepUp does: no password 403 step_up_required, a wrong one 403 step_up_failed.
+const mockStepUp = vi.hoisted(() => vi.fn(async (_req: unknown, password: unknown) => {
+  const { NextResponse } = await import('next/server')
+  if (password === 'right-password') return null
+  return password
+    ? NextResponse.json({ error: 'Password is incorrect', code: 'step_up_failed' }, { status: 403 })
+    : NextResponse.json({ error: 'Enter your password to confirm this action.', code: 'step_up_required' }, { status: 403 })
+}))
+vi.mock('@/lib/authz/stepUp', () => ({ requireStepUp: mockStepUp }))
 vi.mock('@/lib/prisma', () => ({
   default: {
     userSettings: {
@@ -53,6 +77,7 @@ function refused(code: string): TypeError {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mockOwnerRole.role = 'admin'
   vi.stubGlobal('fetch', fetchMock)
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -178,5 +203,227 @@ describe('DELETE never returns a stored token', () => {
     expect(body.servers[0].auth.token.startsWith('••••')).toBe(true)
     // The database keeps the literal: only the answer is masked.
     expect(JSON.stringify(mockUpdate.mock.calls[0][0])).toContain(TOKEN)
+  })
+})
+
+describe('PUT /api/users/[id]/mcp/[serverId]: a new URL needs its secrets typed again (HD-24)', () => {
+  const TOKEN = 'mcp-STORED-bearer-1234'
+  const STORED = {
+    id: 'probe', name: 'Probe', transport: 'streamable_http', url: 'https://mcp.example.com/mcp',
+    enabled: true, tools: [], auth: { type: 'bearer', token: TOKEN }, headers: { 'X-Api-Key': 'hdr-STORED-9999' },
+  }
+  const put = (body: unknown) => PUT(json('PUT', 'http://x/api/users/u1/mcp/probe', body), oneParams)
+
+  beforeEach(() => mockFindUnique.mockResolvedValue({ mcpServers: [STORED] }))
+
+  test('a new URL with the masked token is 400 naming auth.token; nothing is written or reloaded', async () => {
+    const res = await put({ ...STORED, url: 'https://elsewhere.example.net/mcp', auth: { type: 'bearer', token: '••••••••1234' }, headers: {} })
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(JSON.parse(text)).toMatchObject({ code: 'secret_reentry_required', field: 'auth.token', endpoint: 'url' })
+    expect(text).not.toContain(TOKEN)
+    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('a masked header value counts as a stored secret', async () => {
+    const res = await put({ ...STORED, url: 'https://elsewhere.example.net/mcp', auth: { type: 'bearer', token: 'typed-again' }, headers: { 'X-Api-Key': '••••••••9999' } })
+    expect(res.status).toBe(400)
+    expect((await res.json()).field).toBe('headers.X-Api-Key')
+    expect(mockUpdate).not.toHaveBeenCalled()
+  })
+
+  test('a new URL with the token and header typed again is saved as typed', async () => {
+    // ID-25: re-pointing also takes the signed-in user's password (review of 1.6)
+    const res = await put({ ...STORED, url: 'https://elsewhere.example.net/mcp', auth: { type: 'bearer', token: 'typed-again' }, headers: { 'X-Api-Key': 'hdr-new' }, stepUpPassword: 'right-password' })
+    expect(res.status).toBe(200)
+    const saved = mockUpdate.mock.calls[0][0].data.mcpServers[0]
+    expect(saved).toMatchObject({ url: 'https://elsewhere.example.net/mcp', auth: { token: 'typed-again' }, headers: { 'X-Api-Key': 'hdr-new' } })
+  })
+
+  test('the same URL keeps the masked token and header (every save from the form)', async () => {
+    const res = await put({ ...STORED, enabled: false, auth: { type: 'bearer', token: '••••••••1234' }, headers: { 'X-Api-Key': '••••••••9999' } })
+    expect(res.status).toBe(200)
+    const saved = mockUpdate.mock.calls[0][0].data.mcpServers[0]
+    expect(saved.auth.token).toBe(TOKEN)
+    expect(saved.headers['X-Api-Key']).toBe('hdr-STORED-9999')
+  })
+})
+
+describe('PUT /api/users/[id]/mcp/[serverId]: a new stdio command needs its env values typed again (review of 1.6)', () => {
+  const ENV = 'env-STORED-5555'
+  const STORED = {
+    id: 'probe', name: 'Probe', transport: 'stdio', command: 'npx', args: ['shodan-mcp'],
+    env: { SHODAN_API_KEY: ENV }, enabled: true, tools: [],
+  }
+  const put = (body: unknown) => PUT(json('PUT', 'http://x/api/users/u1/mcp/probe', body), oneParams)
+
+  beforeEach(() => mockFindUnique.mockResolvedValue({ mcpServers: [STORED] }))
+
+  test('a new command with the masked env value is 400 naming it; nothing is written or reloaded', async () => {
+    const res = await put({ ...STORED, command: 'sh', args: ['-c', 'env'], env: { SHODAN_API_KEY: '••••••••5555' } })
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(JSON.parse(text)).toMatchObject({ code: 'secret_reentry_required', field: 'env.SHODAN_API_KEY', endpoint: 'command' })
+    expect(text).not.toContain(ENV)
+    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('the same command keeps the masked env value (every save from the form)', async () => {
+    const res = await put({ ...STORED, enabled: false, env: { SHODAN_API_KEY: '••••••••5555' } })
+    expect(res.status).toBe(200)
+    expect(mockUpdate.mock.calls[0][0].data.mcpServers[0].env.SHODAN_API_KEY).toBe(ENV)
+  })
+})
+
+describe('PUT /api/users/[id]/mcp/[serverId]: re-pointing a saved server takes the password too (ID-25, review of 1.6)', () => {
+  const STORED = {
+    id: 'probe', name: 'Probe', transport: 'streamable_http', url: 'https://mcp.example.com/mcp',
+    enabled: true, tools: [], auth: { type: 'bearer', token: 'mcp-STORED-bearer-1234' }, headers: {},
+  }
+  const put = (body: unknown) => PUT(json('PUT', 'http://x/api/users/u1/mcp/probe', body), oneParams)
+
+  beforeEach(() => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [STORED] })
+    mockIsInternal.mockReturnValue(false)
+    mockStepUp.mockClear()
+  })
+
+  test('a new URL with a new token and no password: 403 step_up_required, nothing written or reloaded', async () => {
+    const res = await put({ ...STORED, url: 'https://collector.example.net/mcp', auth: { type: 'bearer', token: 'junk' } })
+    expect(res.status).toBe(403)
+    expect((await res.json()).code).toBe('step_up_required')
+    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('a new stdio command with the right password is saved; the password is never stored', async () => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [{ ...STORED, transport: 'stdio', command: 'npx', url: '' }] })
+    expect((await put({ ...STORED, transport: 'stdio', command: 'uvx', url: '' })).status).toBe(403)
+    const res = await put({ ...STORED, transport: 'stdio', command: 'uvx', url: '', stepUpPassword: 'right-password' })
+    expect(res.status).toBe(200)
+    const saved = mockUpdate.mock.calls[0][0].data.mcpServers[0]
+    expect(saved.command).toBe('uvx')
+    expect('stepUpPassword' in saved).toBe(false)
+  })
+
+  test('a save that keeps the endpoint asks for no password', async () => {
+    const res = await put({ ...STORED, enabled: false, auth: { type: 'bearer', token: '••••••••1234' } })
+    expect(res.status).toBe(200)
+    expect(mockStepUp).not.toHaveBeenCalled()
+  })
+
+  test('the internal key re-points without one', async () => {
+    mockIsInternal.mockReturnValue(true)
+    const res = await put({ ...STORED, url: 'https://mcp2.example.com/mcp', auth: { type: 'bearer', token: 'new' } })
+    expect(res.status).toBe(200)
+    expect(mockStepUp).not.toHaveBeenCalled()
+  })
+})
+
+describe('stdio servers are an administrator\'s (NF-14, OQ-48)', () => {
+  const HTTP = { id: 'web', name: 'Web', transport: 'streamable_http', url: 'https://mcp.example.com/mcp' }
+  const STORED_STDIO = { ...SERVER, enabled: true, tools: [] }
+  const reloadBody = () => JSON.parse(fetchMock.mock.calls[0][1].body)
+
+  beforeEach(() => {
+    mockOwnerRole.role = 'standard'
+    mockIsInternal.mockReturnValue(false)
+  })
+
+  test('member cannot save a stdio server: 403 stdio_admin_only, audited, nothing written or reloaded', async () => {
+    const res = await POST(json('POST', 'http://x/api/users/u1/mcp', SERVER), listParams)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toMatchObject({
+      code: 'stdio_admin_only', field: 'transport',
+      error: "stdio servers run inside the agent with every user's data; ask an administrator",
+    })
+    expect(mockUpsert).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(mockWriteAudit).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'mcp_server.stdio_refused', actorId: 'u1', targetType: 'user', targetId: 'u1',
+      after: { serverId: 'probe', via: 'save' },
+    }))
+  })
+
+  test('member cannot turn a saved server into a stdio one, nor update their stored stdio server', async () => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [STORED_STDIO, { ...HTTP, enabled: true, tools: [] }] })
+    const toStdio = await PUT(json('PUT', 'http://x/api/users/u1/mcp/web', { ...SERVER, id: 'web' }),
+      { params: Promise.resolve({ id: 'u1', serverId: 'web' }) })
+    expect(toStdio.status).toBe(403)
+    const update = await PUT(json('PUT', 'http://x/api/users/u1/mcp/probe', { ...SERVER, enabled: false }), oneParams)
+    expect(update.status).toBe(403)
+    expect((await update.json()).code).toBe('stdio_admin_only')
+    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('a member\'s stored stdio server is kept, skipped at reload and logged', async () => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [STORED_STDIO] })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await POST(json('POST', 'http://x/api/users/u1/mcp', HTTP), listParams)
+    expect(res.status).toBe(201)
+    const saved = mockUpsert.mock.calls[0][0].update.mcpServers.map((s: { id: string }) => s.id)
+    expect(saved).toEqual(['probe', 'web'])
+    expect(reloadBody().userMcpServers.map((s: { id: string }) => s.id)).toEqual(['web'])
+    expect(warn).toHaveBeenCalledWith('[rbac] stdio mcp server skipped user=u1 server=probe')
+  })
+
+  test('a member deletes their stored stdio server', async () => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [STORED_STDIO] })
+    const res = await DELETE(json('DELETE', 'http://x/api/users/u1/mcp/probe'), oneParams)
+    expect(res.status).toBe(200)
+    expect(mockUpdate).toHaveBeenCalledTimes(1)
+  })
+
+  test('admin can save a stdio server, and the agent gets it', async () => {
+    mockOwnerRole.role = 'admin'
+    const res = await POST(json('POST', 'http://x/api/users/u1/mcp', SERVER), listParams)
+    expect(res.status).toBe(201)
+    expect(reloadBody().userMcpServers.map((s: { id: string }) => s.id)).toEqual(['probe'])
+    expect(mockWriteAudit).not.toHaveBeenCalled()
+  })
+
+  test('the internal key cannot save a stdio server for a member either', async () => {
+    mockIsInternal.mockReturnValue(true)
+    const res = await POST(json('POST', 'http://x/api/users/u1/mcp', SERVER), listParams)
+    expect(res.status).toBe(403)
+    expect(mockWriteAudit).toHaveBeenCalledWith(expect.objectContaining({ actorId: null }))
+    expect(mockUpsert).not.toHaveBeenCalled()
+  })
+
+  test('the list says whether the account may run stdio servers', async () => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [STORED_STDIO] })
+    const member = await (await GET(json('GET', 'http://x/api/users/u1/mcp'), listParams)).json()
+    expect(member).toMatchObject({ stdioAllowed: false, servers: [{ id: 'probe' }] })
+    mockOwnerRole.role = 'admin'
+    expect((await (await GET(json('GET', 'http://x/api/users/u1/mcp'), listParams)).json()).stdioAllowed).toBe(true)
+  })
+})
+
+describe('a user\'s server never names one of the agent\'s variables (OQ-R1)', () => {
+  const WITH_ENV_VAR = {
+    id: 'web', name: 'Web', transport: 'streamable_http', url: 'https://attacker.example/mcp',
+    auth: { type: 'bearer', token_env_var: 'INTERNAL_API_KEY' },
+  }
+
+  test('save refused 422 token_env_var_refused, administrator or not; nothing written', async () => {
+    for (const role of ['admin', 'standard']) {
+      mockOwnerRole.role = role
+      const res = await POST(json('POST', 'http://x/api/users/u1/mcp', WITH_ENV_VAR), listParams)
+      expect(res.status).toBe(422)
+      expect(await res.json()).toMatchObject({ code: 'token_env_var_refused', field: 'auth.token_env_var' })
+    }
+    expect(mockUpsert).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test('update refused the same way', async () => {
+    mockFindUnique.mockResolvedValue({ mcpServers: [{ ...WITH_ENV_VAR, auth: { type: 'bearer', token: 't' }, enabled: true, tools: [] }] })
+    const res = await PUT(json('PUT', 'http://x/api/users/u1/mcp/web', WITH_ENV_VAR),
+      { params: Promise.resolve({ id: 'u1', serverId: 'web' }) })
+    expect(res.status).toBe(422)
+    expect(mockUpdate).not.toHaveBeenCalled()
   })
 })

@@ -98,15 +98,26 @@ def attach_roots(recon_data: dict) -> list:
     Every project root, so a host a scan found under another root of the batch
     becomes that root's Subdomain rather than an ExternalDomain. The full
     pipeline runs a group at a time but carries all the batch's roots in
-    "all_project_roots" for exactly this. A partial run, and a single-domain
-    project, have no such key, so this is the run's own scan scope.
+    "all_project_roots" for exactly this. A partial run's dicts mostly lack
+    that key, so its roots are the run's own scan roots followed by every
+    project group's root (set_run_scope_groups): the run's own come first, as
+    a writer reads roots[0] for an IP-mode host or a host under no root. A
+    single-domain project, and the full pipeline (which never sets the run's
+    groups), get the run's own scan scope.
     """
     roots = recon_data.get("all_project_roots")
     if isinstance(roots, list):
         cleaned = [r for r in roots if isinstance(r, str) and r.strip()]
         if cleaned:
             return cleaned
-    return scope_roots(recon_data)
+    roots = scope_roots(recon_data)
+    known = {_clean(r) for r in roots}
+    for g in _RUN_SCOPE_GROUPS:
+        root = g.get("scan_root")
+        if isinstance(root, str) and _clean(root) and _clean(root) not in known:
+            known.add(_clean(root))
+            roots.append(root)
+    return roots
 
 
 def root_for_host(value: str, roots: list, ip_mode: bool = False):
@@ -181,7 +192,17 @@ def classify_host(value: str, recon_data: dict):
     root), never re-admitted through a shorter root. A host under no scan
     root is OUT_OF_SCOPE, i.e. an ExternalDomain, even when it shares an org
     with a group (D-6).
+
+    IP mode: its synthetic root is no parent of a real name, so a hostname the
+    selection rule chose to scan (metadata.ip_mode_hosts, name -> org) is
+    IN_SCOPE with its org Domain as the root; any other name stays out (a
+    recorded name is no target, I-4).
     """
+    metadata = (recon_data or {}).get("metadata") or {}
+    if metadata.get("ip_mode") and isinstance(metadata.get("ip_mode_hosts"), dict):
+        org = metadata["ip_mode_hosts"].get(_normalize_host(value).strip("."))
+        if isinstance(org, str) and _clean(org):
+            return IN_SCOPE, _clean(org)
     roots = attach_roots(recon_data)
     root = root_for_host(value, roots)
     if root is None:

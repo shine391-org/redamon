@@ -1028,6 +1028,25 @@ _env_strip_var() {
     mv -f "$tmp" "$env_file"
 }
 
+# Write KEY=VALUE where KEY's last assignment in .env stands, so the comment above it
+# stays with it; earlier assignments are dead under compose's last-wins rule and are
+# dropped. With no assignment, the line is appended.
+_env_set_in_place() {
+    local env_file="$1" key="$2" value="$3" last tmp
+    last="$(grep -nE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$env_file" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    if [[ -z "$last" ]]; then
+        echo "${key}=${value}" >> "$env_file"
+        return 0
+    fi
+    tmp="$(mktemp "${env_file}.XXXXXX")" || return 0
+    awk -v k="$key" -v v="$value" -v last="$last" '
+        NR == last { print k "=" v; next }
+        { line = $0; sub(/^[ \t]+/, "", line); sub(/^export[ \t]+/, "", line) }
+        index(line, k "=") != 1' "$env_file" > "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$env_file"
+}
+
 # Write the computed allocation into a managed block in .env.
 #
 # WHY THIS EXISTS: the values used to be `export`ed into a shell that then
@@ -1345,12 +1364,18 @@ _capture_start_post() {
         -o /dev/null 2>/dev/null
 }
 
-# True (0) if the HTTP Traffic Capture master switch is on for any user. The proxy
-# is a global singleton, so one enabled operator means it should run.
+# True (0) if the HTTP Traffic Capture master switch is on for any user, or in the
+# instance settings row, where it lives with RBAC_IDENTITY_ENABLED on (step 2.4). The
+# proxy is a global singleton, so one enabled operator means it should run. Before the
+# webapp's first boot on this version the table does not exist: psql fails, nothing is
+# printed, and the user rows decide alone. stdin stays with the caller.
 _capture_master_switch_on() {
     local v
     v="$(docker compose exec -T postgres psql -U redamon -d redamon -tAc \
-        "SELECT bool_or(capture_proxy_enabled) FROM user_settings;" 2>/dev/null | tr -d '[:space:]')"
+        "SELECT bool_or(capture_proxy_enabled) FROM user_settings;" </dev/null 2>/dev/null | tr -d '[:space:]')"
+    [ "$v" = "t" ] && return 0
+    v="$(docker compose exec -T postgres psql -U redamon -d redamon -tAc \
+        "SELECT capture_proxy_enabled FROM instance_settings WHERE id = 'instance';" </dev/null 2>/dev/null | tr -d '[:space:]')"
     [ "$v" = "t" ]
 }
 
@@ -2023,6 +2048,27 @@ ensure_auth_secrets() {
         fi
     done
     grep -qxF "$switched_on_once" "$env_file" 2>/dev/null || echo "$switched_on_once" >> "$env_file"
+    # The five RBAC switches are ON by default, written EXPLICITLY so the operator
+    # sees them in .env and turns one off by changing one word. A switch with no
+    # line, or only a blank value (the bare `KEY=` placeholder older .env.example
+    # files carried), is written true; any other value is the operator's and is
+    # never changed, so a `false` set by hand survives every update. Read from
+    # .env alone (the subshell's `unset`): a value exported in this shell is gone
+    # at the next update. Listed in requirement order (flags.ts REQUIRES), so a
+    # fresh .env reads top-down the way the chain does.
+    #
+    # On an existing install this runs before the update restarts the webapp, and
+    # `update` then confirms Root (_confirm_root); turning permissions on lapses
+    # the legacy grants nobody decided (CHANGELOG 7.8.0, Upgrade). The sharing
+    # switches share nothing by themselves: Root's sharing policy
+    # (instance_settings.sharing_policy) stays off until Root turns it on.
+    for switch in RBAC_IDENTITY_ENABLED RBAC_PERMISSIONS_ENABLED \
+                  RBAC_SHARING_ENABLED RBAC_SHARING_WRITE_ENABLED RBAC_GOVERNANCE_ENABLED; do
+        value="$(unset "$switch"; _env_compose_value "$switch" "$env_file")"
+        [[ -n "${value//[[:space:]]/}" ]] && continue
+        _env_set_in_place "$env_file" "$switch" true
+        info "Set ${switch}=true in .env (on by default; set it to false to turn it off)"
+    done
     # The plugin platform always runs, so a PLUGINS_ENABLED line left by an older
     # release only misleads whoever reads .env. Nothing reads it.
     if grep -qE '^[[:space:]]*(export[[:space:]]+)?PLUGINS_ENABLED=' "$env_file" 2>/dev/null; then
@@ -2650,11 +2696,17 @@ reconcile_gvm_admin_password() {
     return 0
 }
 
-# S11: minimum admin-password length enforced at creation and reset.
+# S11: minimum admin-password length enforced at creation and reset, plus bcrypt's
+# byte bound: create-admin.mjs and reset-password.mjs refuse a longer password, and
+# checking it here asks again instead of ending the install at ensure_admin.
 MIN_ADMIN_PASSWORD_LEN=12
+MAX_ADMIN_PASSWORD_BYTES=72
 _password_strong_enough() {
     local pw="$1"
     [[ ${#pw} -ge $MIN_ADMIN_PASSWORD_LEN ]]
+}
+_password_fits_bcrypt() {
+    [[ $(printf '%s' "$1" | LC_ALL=C wc -c) -le $MAX_ADMIN_PASSWORD_BYTES ]]
 }
 
 # Poll the webapp health endpoint until it answers. Returns 0 once healthy, 1 if
@@ -2682,8 +2734,10 @@ _admin_exists() {
 # Collect the admin details and upsert via create-admin.mjs. Non-interactive when
 # ADMIN_NAME/ADMIN_EMAIL/ADMIN_PASSWORD are all present in the environment (mirrors
 # the single-host deploy path); otherwise prompts on the controlling terminal.
-# create-admin.mjs upserts on email: a matching email RESETS that admin's
-# password, a new email adds another admin — so re-running is safe.
+# create-admin.mjs: a new email adds an admin; an existing admin's email resets
+# its password and revokes its MCP tokens (the unchanged password changes
+# nothing), so re-running is safe; a member's email is refused (exit 3) unless
+# FORCE_PROMOTE=1 is set, which is passed through to promote it on purpose.
 _prompt_and_create_admin() {
     local a_name="${ADMIN_NAME:-}" a_email="${ADMIN_EMAIL:-}" a_pass="${ADMIN_PASSWORD:-}" a_pass2=""
     if [[ -n "$a_name" && -n "$a_email" && -n "$a_pass" ]]; then
@@ -2691,6 +2745,10 @@ _prompt_and_create_admin() {
         # S11: enforce the minimum password length here too.
         if ! _password_strong_enough "$a_pass"; then
             error "ADMIN_PASSWORD too short (minimum ${MIN_ADMIN_PASSWORD_LEN} characters)."
+            exit 1
+        fi
+        if ! _password_fits_bcrypt "$a_pass"; then
+            error "ADMIN_PASSWORD too long (maximum ${MAX_ADMIN_PASSWORD_BYTES} bytes)."
             exit 1
         fi
     else
@@ -2714,14 +2772,30 @@ _prompt_and_create_admin() {
                 warn "Password too short (minimum ${MIN_ADMIN_PASSWORD_LEN} characters). Try again."
                 continue
             fi
+            if ! _password_fits_bcrypt "$a_pass"; then
+                warn "Password too long (maximum ${MAX_ADMIN_PASSWORD_BYTES} bytes). Try again."
+                continue
+            fi
             break
         done
     fi
-    docker compose exec -T \
-        -e "ADMIN_NAME=$a_name" \
-        -e "ADMIN_EMAIL=$a_email" \
-        -e "ADMIN_PASSWORD=$a_pass" \
-        webapp node scripts/create-admin.mjs
+    local -a exec_env=(-e "ADMIN_NAME=$a_name" -e "ADMIN_EMAIL=$a_email" -e "ADMIN_PASSWORD=$a_pass")
+    if [[ -n "${FORCE_PROMOTE:-}" ]]; then
+        exec_env+=(-e "FORCE_PROMOTE=$FORCE_PROMOTE")
+    fi
+    # Captured, not left to `set -e`: ensure_admin runs this inside install/update/up,
+    # and a refused promotion must not end them.
+    local rc=0
+    docker compose exec -T "${exec_env[@]}" webapp node scripts/create-admin.mjs || rc=$?
+    if [[ $rc -eq 3 ]]; then
+        warn "No admin was created: ${a_email} belongs to an existing member account."
+        warn "To make that member an admin, re-run: FORCE_PROMOTE=1 ./redamon.sh create-admin"
+        echo ""
+        return 0
+    elif [[ $rc -ne 0 ]]; then
+        error "create-admin.mjs failed (exit $rc)."
+        exit "$rc"
+    fi
     success "Admin user ready."
     echo ""
 }
@@ -2744,9 +2818,135 @@ ensure_admin() {
     fi
 }
 
+# The identity switch read as the webapp reads it (webapp/src/lib/authz/flags.ts):
+# true, 1 or yes, in any case, is on; anything else is off. From the app .env, where
+# the operator sets it (deploy.sh forwards no RBAC_* key). Read as compose reads it,
+# not with _env_get: the LAST line wins and an inline " # comment" is dropped. Since
+# ensure_auth_secrets writes the key as false, an operator who appends a =true line
+# below it runs the webapp with identity on, and the Root check must agree.
+_rbac_identity_on() {
+    local v="" env_file="$SCRIPT_DIR/.env"
+    [[ -f "$env_file" ]] && v="$(grep -E '^RBAC_IDENTITY_ENABLED=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    v="$(printf '%s' "$v" | sed -E 's/[[:space:]]+#.*$//' | tr -d "[:space:]\"'" | tr '[:upper:]' '[:lower:]')"
+    [[ "$v" == true || "$v" == 1 || "$v" == yes ]]
+}
+
+# set-root.mjs confirms the account when it is already Root, else moves Root to it.
+# Never fatal: the update is done by the time this runs.
+_set_root_from_update() {
+    local rc=0
+    docker compose exec -T -e "ROOT_EMAIL=$1" webapp node scripts/set-root.mjs </dev/null || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        warn "Root was not changed (set-root.mjs exit $rc). Retry with: ./redamon.sh set-root $1"
+    fi
+}
+
+# After ensure_admin in `update`: confirm the Root the webapp chose at boot (the
+# oldest admin with a password), which has Root's protections but none of its powers
+# until the host confirms it. The only admin with a password is confirmed; with
+# several, a terminal lists them to confirm or choose; a deploy or CI run uses
+# ADMIN_EMAIL (the environment first, as _prompt_and_create_admin reads it: deploy.sh
+# exports deploy.env and never writes it to the app .env; then .env) when it names one
+# of them, else keeps the choice and says how to change it. With no Root chosen yet
+# nothing is assigned without an explicit choice. Never fatal, never reads stdin
+# outside a terminal (the single-host deploy pipes its remote script into the shell).
+_confirm_root() {
+    if ! _rbac_identity_on; then
+        info "Root: not checked by this update (RBAC_IDENTITY_ENABLED is off in .env)."
+        return 0
+    fi
+    local out rc=0
+    out="$(docker compose exec -T webapp node scripts/check-root.mjs --lines </dev/null 2>/dev/null)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        warn "Root check did not run (exit $rc); the update itself does not depend on it."
+        return 0
+    fi
+    local kind a b root="" state="" proposal="" pick="" cand
+    local -a cands=()
+    while IFS=$'\t' read -r kind a b _; do
+        case "$kind" in
+            root) root="$a"; state="$b" ;;
+            candidate) cands+=("$a") ;;
+        esac
+    done <<<"$out"
+
+    if [[ -n "$root" && "$state" == confirmed ]]; then
+        info "Root: $root (confirmed)."
+        return 0
+    fi
+    if [[ ${#cands[@]} -eq 0 ]]; then
+        warn "This instance has no Root: no admin has a password. Create one with: ./redamon.sh create-admin"
+        return 0
+    fi
+    for cand in "${cands[@]}"; do
+        [[ "$cand" == "$root" ]] && proposal="$root"
+    done
+    if [[ -n "$proposal" && ${#cands[@]} -eq 1 ]]; then
+        info "Root: $proposal, the only admin with a password; confirming it."
+        _set_root_from_update "$proposal"
+        return 0
+    fi
+
+    if [[ -n "$proposal" ]]; then
+        info "Root: $proposal was chosen automatically and is not confirmed yet."
+    elif [[ -n "$root" ]]; then
+        warn "Root: $root is not an admin with a password any more."
+    else
+        info "No Root is chosen yet."
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        local i answer ask
+        echo "  Admins who can be Root (oldest first):"
+        for i in "${!cands[@]}"; do
+            if [[ "${cands[$i]}" == "$proposal" ]]; then
+                echo "    $((i + 1))) ${cands[$i]}  (chosen automatically, not confirmed)"
+            else
+                echo "    $((i + 1))) ${cands[$i]}"
+            fi
+        done
+        info "Choosing another admin signs it and the current Root out and revokes its MCP tokens."
+        if [[ -n "$proposal" ]]; then
+            ask="  Enter = confirm $proposal, a number = choose that admin, n = decide later: "
+        else
+            ask="  A number = choose that admin, n = decide later: "
+        fi
+        while true; do
+            read -erp "$ask" answer || answer=n
+            if [[ -z "$answer" && -n "$proposal" ]]; then
+                pick="$proposal"; break
+            elif [[ "$answer" =~ ^[Nn] ]]; then
+                break
+            elif [[ "$answer" =~ ^[0-9]+$ ]] && (( 10#$answer >= 1 && 10#$answer <= ${#cands[@]} )); then
+                pick="${cands[$((10#$answer - 1))]}"; break
+            fi
+            warn "Type a number from 1 to ${#cands[@]}${proposal:+, Enter to confirm} or n."
+        done
+    else
+        local want want_lc
+        want="${ADMIN_EMAIL:-$(_env_get ADMIN_EMAIL)}"
+        want_lc="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+        for cand in "${cands[@]}"; do
+            if [[ -n "$want" && "$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')" == "$want_lc" ]]; then
+                pick="$cand"
+            fi
+        done
+        if [[ -n "$pick" ]]; then
+            info "Root: ADMIN_EMAIL names $pick."
+        elif [[ -n "$want" ]]; then
+            warn "ADMIN_EMAIL ($want) is not an admin with a password; Root is left as it is."
+        fi
+    fi
+    if [[ -z "$pick" ]]; then
+        info "To confirm or choose Root: ./redamon.sh set-root <email> (a non-interactive update uses ADMIN_EMAIL when it names an admin)."
+        return 0
+    fi
+    _set_root_from_update "$pick"
+}
+
 # Standalone admin (re)creation — the reliable path when the automatic prompt was
-# skipped (slow first boot) or the admin password was lost. Safe to re-run: it
-# upserts on email (matching email resets the password; new email adds an admin).
+# skipped (slow first boot) or the admin password was lost. Safe to re-run: an
+# admin's email resets its password, a new email adds an admin, and a member's
+# email is refused unless FORCE_PROMOTE=1.
 cmd_create_admin() {
     print_banner
     check_prerequisites
@@ -2757,12 +2957,37 @@ cmd_create_admin() {
     fi
     if _admin_exists; then
         warn "An admin user already exists."
-        warn "Continuing will ADD a new admin, or RESET the password if you reuse an existing admin's email."
+        warn "Continuing will ADD a new admin, or RESET the password (and revoke the MCP tokens) if you reuse an existing admin's email."
     else
         info "No admin user found yet — let's create one."
     fi
+    info "A member's email is refused; to promote that member on purpose, run: FORCE_PROMOTE=1 ./redamon.sh create-admin"
     echo ""
     _prompt_and_create_admin
+}
+
+# Break-glass: make an account the instance's confirmed Root (set-root.mjs). Works
+# with the identity switch off too, so the choice is ready when it is turned on.
+cmd_set_root() {
+    local email="${1:-}"
+    if [[ -z "$email" ]]; then
+        error "Usage: ./redamon.sh set-root <email>"
+        exit 1
+    fi
+    print_banner
+    check_prerequisites
+    if ! _wait_for_webapp 150; then
+        error "Webapp is not responding at http://localhost:3000/api/health."
+        error "Start the stack first ('./redamon.sh up'), then re-run './redamon.sh set-root $email'."
+        exit 1
+    fi
+    if ! _rbac_identity_on; then
+        info "RBAC_IDENTITY_ENABLED is off in .env: Root is recorded now and takes effect once it is on."
+    fi
+    info "Moving Root to $email signs it and the previous Root out and revokes its MCP tokens; confirming the current Root changes nothing else."
+    local rc=0
+    docker compose exec -T -e "ROOT_EMAIL=$email" webapp node scripts/set-root.mjs </dev/null || rc=$?
+    [[ $rc -eq 0 ]] || exit "$rc"
 }
 
 cmd_reset_password() {
@@ -2781,6 +3006,10 @@ cmd_reset_password() {
     # S11: enforce a minimum password strength on reset too.
     if ! _password_strong_enough "$NEW_PASS"; then
         error "Password too short (minimum ${MIN_ADMIN_PASSWORD_LEN} characters)."
+        exit 1
+    fi
+    if ! _password_fits_bcrypt "$NEW_PASS"; then
+        error "Password too long (maximum ${MAX_ADMIN_PASSWORD_BYTES} bytes)."
         exit 1
     fi
 
@@ -3619,8 +3848,9 @@ _map_tool_changes() {
     # ai-attack-surface: heavy build-only image (Node + promptfoo + per-tool venvs).
     # The adapter .py files are volume-mounted into the scan container at spawn
     # (hot-reload, no rebuild); ONLY the baked-in toolchain — the Dockerfile or any
-    # requirements file — needs a rebuild.
-    if echo "$changed_files" | grep -qE "^scanners/ai_attack_surface_scan/(Dockerfile|.*requirements)"; then
+    # requirements file — needs a rebuild. It also COPYs recon_settings/ (the IP-mode
+    # hostname rule its target loader admits names with), which nothing mounts there.
+    if echo "$changed_files" | grep -qE "^(scanners/ai_attack_surface_scan/(Dockerfile|.*requirements)|recon_settings/)"; then
         rebuild_tools+=(ai-attack-surface)
     fi
     # codefix-sandbox: the isolated CodeFix build sandbox (T6/E10). Build-only
@@ -3726,16 +3956,58 @@ _update_apply_env() {
     fi
 }
 
+# The read-only report of what the new release changes for the accounts of this install
+# (webapp/scripts/rbac-upgrade-preview.mjs), run from the webapp image this update just
+# built against the live database. `run --no-deps` starts a one-off container: the running
+# webapp, its port and its startup scripts are untouched. -T and </dev/null because the
+# single-host deploy pipes its remote script into this shell's stdin, so nothing here may
+# read it. Only an update that rebuilt the webapp changes what the report covers.
+#   $1 true for --preview (print, never ask)   $2 true when the webapp image was rebuilt
+# Returns 0 to go on, 1 when the operator answered no, 2 when --preview got no report.
+_update_preview() {
+    local preview_only="$1" webapp_rebuilt="$2" rc=0 answer=""
+    if [[ "$webapp_rebuilt" != true ]]; then
+        if [[ "$preview_only" == true ]]; then
+            info "This update does not change the webapp: there is nothing to preview."
+        fi
+        return 0
+    fi
+    if ! _service_running postgres; then
+        warn "Upgrade preview skipped: the database is not running."
+        [[ "$preview_only" == true ]] && return 2
+        return 0
+    fi
+    info "Upgrade preview (read-only) from the new webapp image:"
+    docker compose run --rm --no-deps -T --entrypoint node webapp scripts/rbac-upgrade-preview.mjs </dev/null || rc=$?
+    # The script's exit status: 0 nothing changes for anyone (no question, as a
+    # single-operator install expects), 10 (REVIEW_EXIT) changes to read, else no report.
+    case "$rc" in
+        0) return 0 ;;
+        10) ;;
+        *)
+            warn "The upgrade preview did not run (exit $rc); the update itself does not depend on it."
+            [[ "$preview_only" == true ]] && return 2
+            return 0 ;;
+    esac
+    [[ "$preview_only" == true ]] && return 0
+    # A deploy, a CI job or `update | tee` is not someone at a terminal: print and go on.
+    [[ -t 0 && -t 1 ]] || return 0
+    read -erp "Continue? [Y/n] " answer || return 1
+    [[ "$answer" =~ ^[Nn] ]] && return 1
+    return 0
+}
+
 cmd_update() {
     # --gpu / --cpu are accepted here too, so switching the PyTorch variant does
     # not require a full `install`. Unlike install, omitting them PRESERVES the
     # existing sticky choice (same contract as the GVM/KB flags: an update must
     # never silently flip a decision the user made at install time).
-    local gpu_mode="" update_args=()
+    local gpu_mode="" preview_only=false update_args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --gpu) gpu_mode="on";  update_args+=("$1") ;;
             --cpu) gpu_mode="off"; update_args+=("$1") ;;
+            --preview) preview_only=true; update_args+=("$1") ;;
             *) error "Unknown flag: $1"; exit 1 ;;
         esac
         shift
@@ -3816,7 +4088,11 @@ cmd_update() {
 
         if [[ "$old_head" == "$new_head" ]]; then
             success "Already up to date (v$(get_version))."
-            _update_apply_env
+            if [[ "$preview_only" == true ]]; then
+                info "Nothing to preview: there is no new version to apply."
+            else
+                _update_apply_env
+            fi
             return
         fi
 
@@ -3925,14 +4201,16 @@ cmd_update() {
     ensure_osv_db
     ensure_sca_intel
 
-    # Rebuild the capture-proxy image if its source changed, then refresh a running
-    # proxy onto it. Build-only + best-effort: a failure must not abort the update.
+    # Rebuild the capture-proxy image if its source changed; the running proxy is
+    # refreshed onto it after the preview below. Build-only + best-effort: a failure
+    # must not abort the update.
+    local capture_rebuilt=false
     if [[ "$rebuild_capture" == "true" ]]; then
         info "Rebuilding capture proxy image (redamon-capture-proxy:latest)..."
         if ! compose_build --profile capture build capture-proxy; then
             warn "capture-proxy image failed to build; the existing image keeps working. Re-run later: docker compose --profile capture build capture-proxy"
         else
-            _reconcile_capture_if_running
+            capture_rebuilt=true
         fi
     fi
 
@@ -3944,6 +4222,29 @@ cmd_update() {
     if [[ "$rebuild_plugins" == "true" ]] && ! _plugins_build_runner; then
         _update_resume_hint
         exit 1
+    fi
+
+    # Everything is built and nothing has restarted yet: the last point where the
+    # operator can still say no. Stopping here keeps the pre-pull commit in
+    # UPDATE_PENDING_FILE, so the next `update` finishes this one.
+    local webapp_rebuilt=false preview_rc=0
+    [[ " ${rebuild_core[*]-} " == *" webapp "* ]] && webapp_rebuilt=true
+    _update_preview "$preview_only" "$webapp_rebuilt" || preview_rc=$?
+    if [[ "$preview_only" == true ]]; then
+        info "Preview only: the images are built and nothing was restarted. ./redamon.sh update applies v${new_version}."
+        [[ $preview_rc -eq 0 ]] || exit 1
+        return 0
+    fi
+    if [[ $preview_rc -eq 1 ]]; then
+        warn "Update stopped before any service restarted: v${old_version} keeps running on the old images."
+        warn "  Run ./redamon.sh update to finish it; it shows the preview again."
+        exit 1
+    fi
+
+    # It restarts the proxy, so it waits for the answer above; the old orchestrator still
+    # serves it here, and the second reconcile at the end applies the new spawn spec.
+    if [[ "$capture_rebuilt" == true ]]; then
+        _reconcile_capture_if_running
     fi
 
     # Before any service is recreated: it loads the plugins overlay into COMPOSE_FILE.
@@ -4101,6 +4402,7 @@ cmd_update() {
 
     # Ensure an admin user exists (prompts if none found)
     ensure_admin
+    _confirm_root
 
     _urlscan_backfill_once
 
@@ -4109,7 +4411,7 @@ cmd_update() {
     # reconciled AFTER the orchestrator has been recreated onto the new code, not
     # only after its own image was rebuilt.
     #
-    # The early _reconcile_capture_if_running (next to the image build above)
+    # The early _reconcile_capture_if_running (after the image build above)
     # refreshes the pair onto the new IMAGE, but it necessarily runs while the
     # OLD orchestrator is still serving, so the pair comes back with the old
     # SPAWN SPEC - old mounts, old env. Anything this release adds to that spec
@@ -5017,7 +5319,10 @@ cmd_help() {
     echo -e "  ${GREEN}install --kbase${NC}      Build with Knowledge Base (~4.4 GB heavier, local KB enabled)"
     echo -e "  ${GREEN}install --gpu${NC}        Build the KB on CUDA PyTorch (~2.5 GB heavier; needs nvidia-container-toolkit)"
     echo -e "  ${GREEN}install --cpu${NC}        Force CPU-only PyTorch (default; auto-detected when neither flag is given)"
-    echo -e "  ${GREEN}update${NC}           Pull latest version and smart-rebuild changed services"
+    echo -e "  ${GREEN}update${NC}           Pull latest version and smart-rebuild changed services; before the restart"
+    echo -e "                   it previews what changes for existing accounts and, in a terminal, asks to continue"
+    echo -e "  ${GREEN}update --preview${NC} Same pull and build, then print the preview and stop: nothing restarts,"
+    echo -e "                   but the checkout IS pulled (a later 'update' applies it)"
     echo -e "  ${GREEN}up${NC}               Start services"
     echo -e "  ${GREEN}up dev${NC}           Start in dev mode (hot-reload, auto-detects GVM mode)"
     echo -e "  ${GREEN}down${NC}             Stop services (preserves data)"
@@ -5027,6 +5332,8 @@ cmd_help() {
     echo -e "  ${GREEN}migrate-layout${NC}   Move data left at pre-6.9 paths (runs automatically on update/up)"
     echo -e "  ${GREEN}create-admin${NC}     Create the admin login (or reset it); use if no prompt appeared at install"
     echo -e "  ${GREEN}reset-password${NC}   Reset an existing user's password"
+    echo -e "  ${GREEN}set-root <email>${NC} Make that account the instance's Root (break-glass; signs it and the"
+    echo -e "                   previous Root out), or confirm the Root chosen at upgrade"
     echo -e "  ${GREEN}kb <command>${NC}     Knowledge Base management (build/update/rebuild/stats)"
     echo -e "  ${GREEN}supply-chain-sync [ecos]${NC}  Populate the offline OSV DB (default: npm; e.g. 'npm PyPI Go')"
     echo -e "  ${GREEN}sca-intel-sync [--force|--seed-only]${NC}  Populate the supply-chain incident intel (supplychainattack.org; --seed-only installs the bundled offline copy, no network)"
@@ -5040,10 +5347,12 @@ cmd_help() {
     echo "  ./redamon.sh install --gvm --kbase # First-time setup with everything"
     echo "  ./redamon.sh install --kbase --gpu  # Knowledge Base on the GPU (CUDA PyTorch)"
     echo "  ./redamon.sh update           # Update to latest version"
+    echo "  ./redamon.sh update --preview # See what an update changes for accounts; pulls and builds, restarts nothing"
     echo "  ./redamon.sh up               # Start after reboot"
     echo "  ./redamon.sh up dev           # Dev mode with hot-reload (auto-detects GVM)"
     echo "  ./redamon.sh create-admin     # Create the admin login (or reset it)"
     echo "  ./redamon.sh reset-password   # Reset a user's password"
+    echo "  ./redamon.sh set-root a@b.c   # Make a@b.c the instance's Root"
     echo "  ./redamon.sh kb build lite    # Build Knowledge Base"
     echo "  ./redamon.sh kb update        # Refresh all KB sources"
     echo "  ./redamon.sh kb stats         # Show KB chunk counts"
@@ -5369,6 +5678,7 @@ case "${1:-help}" in
         ;;
     reset-password) cmd_reset_password ;;
     create-admin)   cmd_create_admin ;;
+    set-root)       shift; cmd_set_root "$@" ;;
     supply-chain-sync) shift; cmd_supply_chain_sync "$@" ;;
     sca-intel-sync) shift; cmd_sca_intel_sync "$@" ;;
     test)           shift; cmd_test "${1:-unit}" ;;

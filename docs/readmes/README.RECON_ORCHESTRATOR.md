@@ -105,6 +105,8 @@ Content-Type: application/json
 }
 ```
 
+Every start body (recon, partial recon, GVM, GitHub hunt, TruffleHog, supply chain, AI attack surface) may also carry `actor_user_id`, the person who started the scan (RBAC step 5.5), and `actor_max_concurrent`, that person's scan quota: the scan is admitted and capped on the actor (`[scan] start <kind> project=<id> tenant=<owner> actor=<person>`), the actor is kept on the run state and listed by `/system/active-scans`, and the container's own config stays the tenant's. A body without it is admitted on the tenant, as before; a run adopted after an orchestrator restart has no actor.
+
 Starts a new recon container for the specified project. The container will:
 1. Fetch project settings from `{webapp_api_url}/api/projects/{projectId}`
 2. Run the recon pipeline
@@ -299,7 +301,7 @@ targeting modes (`PIPELINE_HEADER_PHASES` in `container_manager.py`; pinned by
 
 | Phase | Header (`[*][Pipeline] ...`) | Label |
 |-------|------------------------------|-------|
-| 1 | `GROUP 1:` | Domain Discovery (IP mode: reverse DNS, DNS, IP WHOIS) |
+| 1 | `GROUP 1:` | Domain Discovery (IP mode: IP WHOIS, plus reverse DNS when Hostnames on target IPs records names) |
 | 2 | `GROUP 3:`, `GROUP 3.5:`, `GROUP 3.6:`, `GROUP 3b:` | Port Scanning |
 | 3 | `GROUP 4:` | HTTP Probing |
 | 4 | `GROUP 5:` | Resource Enumeration |
@@ -380,20 +382,24 @@ networks:
 > (held only by the webapp), so even a host-network peer that can reach
 > `127.0.0.1:8010` cannot drive the API without the key. The recon and partial-recon
 > containers it spawns do **not** receive the raw Docker socket — they mount a
-> filtering broker socket that only permits creating the known tool containers
-> (allowlisted images), so a compromised recon container cannot mount the host
-> filesystem, run privileged, or escape to the host. As of wave 2 (STRIDE E1) the
-> broker also gates **operate-on-existing** verbs (`exec`/`attach`/`start`/`kill`/
-> `archive`/`commit`/etc.) by an owner label (`redamon.broker-owned`): a request is
-> denied unless the target container carries the marker the broker stamps on every
-> container it creates, and container listing is scoped to owned containers only, so
-> a compromised worker can no longer `exec` into the orchestrator/broker (the
-> raw-socket holders) or enumerate infra. The broker also enforces the
-> mount **mode** (STRIDE T1/T2): a host path may be bound read-write only if it is
-> under `ALLOWED_RW_PREFIXES` (default `/tmp/redamon`); source-tree binds must be
-> `:ro`, so a compromised worker cannot overwrite `recon/main.py` or an Agent
-> Skill on the host. Overridable via `DOCKER_BROKER_ALLOWED_RW_PREFIXES` /
-> `ALLOWED_RW_VOLUMES`.
+> filtering broker socket that blocks by default: only the Docker API calls the
+> tools' own `docker` invocations send are forwarded, and `exec`, `archive`,
+> `update`, `commit`, `build`, image push/tag/delete and the rest get a 403 before
+> the daemon is contacted. Creates are limited to the known tool images, so a
+> compromised recon container cannot mount the host filesystem, run privileged,
+> or escape to the host. The verbs it does allow on an existing container
+> (`attach`/`start`/`wait`/`kill`/`stop`/`pause`, logs, inspect, remove) are gated
+> by an owner label (`redamon.broker-owned`): a request is denied unless the
+> target container carries the marker the broker stamps on every container it
+> creates, and container listing is scoped to owned containers only, so a
+> compromised worker cannot touch the orchestrator/broker (the raw-socket
+> holders) or enumerate infra. The broker also enforces mounts (STRIDE T1/T2): a
+> host path may be bound read-write only under `/tmp/redamon`
+> (`DOCKER_BROKER_ALLOWED_RW_PREFIXES` adds more); of the repository only
+> `recon/wordlists`, `mcp/nuclei-templates` and `scanners/supply_chain_common`
+> may be bound, read-only, never the repository root that holds `.env`, so a
+> container spawned through the broker cannot write the source tree. Named volumes mount read-only except
+> `nuclei-templates` (`DOCKER_BROKER_ALLOWED_RW_VOLUMES` adds more).
 
 ## Container Management
 
@@ -401,7 +407,10 @@ networks:
 
 When starting a recon, the orchestrator:
 
-1. Removes any existing container with the same name
+1. Refuses with `409 Recon already active` while a container with the project's
+   recon name is running, paused or restarting, whatever the in-memory status
+   says, and removes nothing when Docker cannot be asked. A finished leftover is
+   removed by id.
 2. Creates a new container with:
    - `network_mode: host` for scanning capabilities
    - `NET_RAW` capability only (for `masscan`/`nmap` SYN scans), plus the D1
@@ -417,22 +426,87 @@ When starting a recon, the orchestrator:
      volume (mounted at `/var/run/broker`) and selected via the `DOCKER_HOST`
      env var; a named volume is used so the unix socket is shareable across
      containers on both macOS (Docker Desktop) and native Linux
-   - Environment variables: `PROJECT_ID`, `USER_ID`, `WEBAPP_API_URL`, and a
-     scoped **`SCANNER_API_KEY`** (STRIDE S3/E6) injected INSTEAD of the master
-     `INTERNAL_API_KEY` (falls back to the master key only pre-secret). It is
-     accepted by the webapp on GET settings + GET projects and by the agent on
-     `/llm/*`; it cannot mint admins or read llm-provider keys.
+   - Environment variables: `PROJECT_ID`, `USER_ID`, `WEBAPP_API_URL`, a
+     scoped **`SCANNER_API_KEY`** (STRIDE S3/E6), never the master
+     `INTERNAL_API_KEY`, and `REDAMON_JOB_CREDENTIAL`, the job credential the
+     webapp minted for this start (RBAC step 1.16). Every start endpoint verifies
+     that credential (`job_credential.py`), admits the scan under its tenant
+     rather than the body's `user_id` (403 `job_credential_*` otherwise; 503
+     `job_credential_unverifiable` first when `INTERNAL_API_KEY` is weak or
+     unset), and refuses with 503 `scanner_key_missing` when no scanner key is
+     configured. The webapp (settings, project, traffic ingest) and the agent
+     (`/llm/*`, `/jev/*`) accept the key only together with the credential, for
+     its tenant and project. The AI attack surface and TruffleHog containers call
+     nothing back and get neither the key nor a credential. Every scan that writes
+     the graph (all but TruffleHog) also gets `NEO4J_URI`/`NEO4J_USER`/
+     `NEO4J_PASSWORD`, the database's one account: a residual
+     (SECURITY_POSTURE §20).
+
+### Partial Recon Typed Input
+
+Before it starts a partial-recon container, `POST /recon/{project_id}/partial`
+filters the typed `user_inputs` / `user_targets` with `filter_partial_user_input`
+(`recon_orchestrator/batch_scope.py`): a host must pass the run's scope groups,
+an IP or CIDR may be no wider than /24 (IPv4) or /120 (IPv6), and an entry the
+project's Rules of Engagement exclude is dropped (a typed CIDR holding an
+excluded address becomes its other hosts). Under RoE IP or CIDR entries a typed
+name (host, URL host, `ip_attach_to`) is also resolved and dropped when any
+address it resolves to is excluded, since the tools are handed the name. Each
+dropped entry is logged; a run that typed targets, kept none and reads no graph
+targets is refused with 400. The recon container runs its own copy of the filter
+again on its own settings.
+
+In IP mode (`ip_mode` projects) a typed address, URL host or CIDR host must be
+one of the project's target IPs, compared as addresses (CIDR-aware, any IPv6
+spelling); a typed CIDR keeps only its target hosts. A typed hostname follows
+the project's Hostnames on target IPs policy (`ip_typed_name_refusal`): refused
+in `ip_only` and `record_only`, matched against the include and exclude entries
+in `record_filter`, any name in `scan_all`, and every typed name through the hard
+guardrail and the RoE. The live half (every address the name resolves to is a
+target) runs in the container. The full and partial starts also hard-guardrail
+an IP project's include entries (`guardrail_targets` returns their base names;
+the addresses themselves are never hard-blocked). The job queue and the
+scheduler reach this filter without the modal, so it is a control, not a
+convenience.
+
+The two copies differ in one place, on purpose. This service resolves from the
+compose network and the scan from the host's resolver (a lab or split-horizon
+zone may answer only there), so a name the orchestrator gets no answer for is
+left to the container, which refuses it when its resolver has no address either
+(noted as a coverage gap under `roe_excluded`). The orchestrator's lookups run
+inside the start request and share a 5 s budget (`dns_budget_s`).
+
+The orchestrator image carries no `recon/`, so `batch_scope.py` keeps a copy
+(`is_roe_excluded`) of the `roe_scope` matcher `_is_roe_excluded`. Both copies run
+`recon/tests/fixtures/roe_exclusion_vectors.json`, and both filters run
+`recon/tests/fixtures/partial_typed_input_roe_vectors.json`: change the matcher
+in both places or neither.
 
 ### Log Streaming Implementation
 
-Logs are streamed using a thread-based approach:
+Every SSE log stream (full and partial recon, AI attack surface, GVM, GitHub
+hunt, TruffleHog, supply chain) uses one reader, `_follow_container_logs`:
 
-1. A background thread reads logs synchronously from Docker SDK
-2. Logs are pushed to an asyncio queue
-3. The async generator yields log events from the queue
-4. SSE events are sent to connected clients
+1. A worker of the shared 64-thread log pool follows `container.logs(follow=True)`
+   synchronously, so the Docker SDK never blocks the event loop
+2. Lines go into a bounded backlog: the reader stays at most
+   `LOG_STREAM_BUFFER_LINES` (1000) lines ahead of the consumer
+3. The async generator yields log events from that backlog as SSE events
+4. When the client disconnects (the generator is closed or its task cancelled),
+   the reader is told to stop and the Docker log stream is closed, which also
+   wakes a reader blocked on a quiet container. Callers wrap the generator in
+   `contextlib.aclosing`
 
-This ensures the Docker SDK's synchronous `container.logs()` doesn't block the async event loop.
+A dropped stream therefore gives its worker back at once instead of holding it
+until the container exits, so reconnects during long scans cannot exhaust the
+pool.
+
+### Status Tracking
+
+The status poll inspects the project's recon container. A running container
+always reads `running`, and a Docker `NotFound` is the real "gone". A Docker API
+error (a daemon 5xx) keeps the last status until Docker answers again, so a live
+run is never recorded as failed, refused a Stop, or removed by the next start.
 
 ## Integration with Webapp
 
@@ -534,11 +608,9 @@ key once from `.env`:
 ```bash
 export KEY=$(grep '^ORCHESTRATOR_API_KEY=' .env | cut -d= -f2)
 
-# Start recon
-curl -X POST http://localhost:8010/recon/test-project/start \
-  -H "X-Orchestrator-Key: $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "user-1"}'
+# Starting a scan is not done here: every start needs the job credential the webapp
+# mints for it (RBAC step 1.16) and is refused without it (403 job_credential_missing).
+# Start scans from the webapp: the UI, or POST /api/recon/<projectId>/start signed in.
 
 # Check status
 curl -H "X-Orchestrator-Key: $KEY" http://localhost:8010/recon/test-project/status

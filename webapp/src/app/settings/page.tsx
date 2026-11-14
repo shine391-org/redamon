@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { Plus, Pencil, Trash2, Loader2, Eye, EyeOff, Upload, Download, Swords, RotateCw, Copy, Check, ExternalLink, ChevronDown, ChevronRight, Info, BookOpen, Server, KeyRound } from 'lucide-react'
 import { useProject } from '@/providers/ProjectProvider'
-import { useAuth } from '@/providers/AuthProvider'
 import { useVersionCheck } from '@/hooks/useVersionCheck'
 // Shared with the inline shortcuts the scan sections render, so a key cannot be
 // described one way here and another way on the card that asks for it.
@@ -32,11 +31,15 @@ import { ApiUsageReportModal } from '@/components/settings/api-usage/ApiUsageRep
 import { ApiUsageLlmChip } from '@/components/settings/api-usage/ApiUsageLlmChip'
 import { llmInventoryHint } from '@/lib/apiUsage/inventory'
 import { FeatureModelsSection } from '@/components/settings/FeatureModelsSection'
+import { InstanceLlmProviders } from '@/components/settings/InstanceLlmProviders'
 import { AgentSkillsTab } from '@/components/settings/AgentSkillsTab'
 import { notifyJevProviderChanged } from '@/hooks/useHasJevProvider'
 import { JevProviderSection } from '@/components/settings/JevProviderSection'
 import { actionFailedText, failureText, saveWarningLines } from '@/components/settings/failureText'
 import { readApiError } from '@/lib/apiError'
+import { StepUpModal } from '@/components/auth/StepUpModal'
+import { TunnelStatusReadOnly } from '@/components/settings/TunnelStatusReadOnly'
+import { InstanceTunnelSection } from '@/components/settings/InstanceTunnelSection'
 
 /** A Secret Multiscanner credential column (TRUFFLEHOG_KEY_FIELDS). */
 type TrufflehogField = `trufflehog${string}`
@@ -214,13 +217,14 @@ function chatImportSummary(data: { imported?: number; message?: string; skippedB
 
 export default function SettingsPage() {
   const { userId } = useProject()
-  const { isAdmin } = useAuth()
   const { alertError, alert: showAlert, confirm: showConfirm } = useAlertModal()
   const toast = useToast()
 
   // LLM Providers
   const [providers, setProviders] = useState<ProviderData[]>([])
   const [providersLoading, setProvidersLoading] = useState(true)
+  // The instance LLM providers the account may use (step 6.11): they open "Models by feature" too.
+  const [instanceProviderCount, setInstanceProviderCount] = useState(0)
   // A failed fetch must not read as "no providers" (or "no Jev providers"); holds the cause to show.
   const [providersError, setProvidersError] = useState<string | null>(null)
   const [showProviderForm, setShowProviderForm] = useState(false)
@@ -238,7 +242,17 @@ export default function SettingsPage() {
   const [settingsLoadError, setSettingsLoadError] = useState<string | null>(null)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
+  // A save that re-points a configured host or tunnel server waits on the password (ID-25).
+  const [settingsStepUp, setSettingsStepUp] = useState<{
+    retry: (password: string) => Promise<void>
+    cancel: () => void
+  } | null>(null)
   const [visibleFields, setVisibleFields] = useState<Record<string, boolean>>({})
+  // The tunnel is one listener for the whole instance (HD-06). Only an explicit `false`
+  // from the settings GET hides its controls: the PUT is what refuses a change.
+  const [canManageTunnels, setCanManageTunnels] = useState(true)
+  // With the identity switch on the tunnel is an instance setting, saved on its own (step 2.4).
+  const [tunnelAtInstance, setTunnelAtInstance] = useState(false)
 
   // Key Rotation
   const [rotationConfigs, setRotationConfigs] = useState<Record<string, RotationInfo>>({})
@@ -542,6 +556,8 @@ export default function SettingsPage() {
         if (data.rotationConfigs) {
           setRotationConfigs(data.rotationConfigs)
         }
+        setCanManageTunnels(data.canManageTunnels !== false)
+        setTunnelAtInstance(data.sharedSettingsAt === 'instance')
         setSettingsLoaded(true)
         setSettingsLoadError(null)
       } else {
@@ -624,17 +640,19 @@ export default function SettingsPage() {
       // here - strip them so a stale save on this page can't clobber those edits.
       // featureModels likewise: the Models by feature tiles save their own keys,
       // and a stale copy riding this save would put back models changed since.
+      // The tunnel fields only from an account that may change the tunnel: anyone
+      // else's save of their own keys must not depend on a tunnel they cannot touch.
       const settingsPayload = Object.fromEntries(
         Object.entries(settings).filter(([k]) =>
-          !k.startsWith('captureProxy') && !k.startsWith('captureEgress') && k !== 'featureModels')
+          !k.startsWith('captureProxy') && !k.startsWith('captureEgress') && k !== 'featureModels'
+          && (canManageTunnels || !(TUNNEL_SETTING_KEYS as readonly string[]).includes(k)))
       )
-      const resp = await fetch(`/api/users/${userId}/settings`, {
+      const send = (stepUpPassword?: string) => fetch(`/api/users/${userId}/settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...settingsPayload, rotationConfigs: rotPayload }),
+        body: JSON.stringify({ ...settingsPayload, rotationConfigs: rotPayload, ...(stepUpPassword ? { stepUpPassword } : {}) }),
       })
-      if (resp.ok) {
-        const data = await resp.json()
+      const applySaved = (data: Awaited<ReturnType<Response['json']>>) => {
         setSettings({
           ...trufflehogValues(data),
           githubAccessToken: data.githubAccessToken || '',
@@ -702,9 +720,32 @@ export default function SettingsPage() {
         toast.success('Settings saved')
         const warnings = saveWarningLines(data)
         if (warnings.length) toast.warning(warnings.join('\n'), 'Saved, but not applied')
+      }
+      const resp = await send()
+      if (resp.ok) {
+        applySaved(await resp.json())
         return true
       }
-      toast.error((await readApiError(resp, 'Failed to save settings')).message)
+      const err = await readApiError(resp, 'Failed to save settings')
+      // The dialog sends the password with the same save; this save resolves with its outcome.
+      if (err.code === 'step_up_required') {
+        return await new Promise<boolean>(resolve => setSettingsStepUp({
+          retry: async (password) => {
+            const again = await send(password)
+            // Thrown, the dialog stays open and shows why (a wrong password, a lockout).
+            if (!again.ok) throw await readApiError(again, 'Failed to save settings')
+            applySaved(await again.json())
+            resolve(true)
+          },
+          cancel: () => resolve(false),
+        }))
+      }
+      toast.error(err.message)
+      // A new GitHub Enterprise host or chisel URL needs its secret typed again
+      // (HD-24): take the person to the field the answer names.
+      if (err.code === 'secret_reentry_required' && typeof err.body?.field === 'string') {
+        focusSecretField(err.body.field)
+      }
       return false
     } catch (err) {
       console.error('Failed to save settings:', err)
@@ -713,7 +754,7 @@ export default function SettingsPage() {
     } finally {
       setSettingsSaving(false)
     }
-  }, [userId, settings, rotationConfigs, settingsLoaded, settingsLoadError])
+  }, [userId, settings, rotationConfigs, settingsLoaded, settingsLoadError, canManageTunnels])
 
   const updateSetting = useCallback(<K extends keyof UserSettings>(field: K, value: UserSettings[K]) => {
     setSettings(prev => ({ ...prev, [field]: value }))
@@ -832,7 +873,7 @@ export default function SettingsPage() {
 
   const confirmImport = useCallback(() => {
     if (!pendingImport) return
-    setSettings(prev => ({ ...prev, ...pendingImport.keys, ...pendingImport.tunneling }))
+    setSettings(prev => ({ ...prev, ...pendingImport.keys, ...(canManageTunnels ? pendingImport.tunneling : {}) }))
     for (const [tool, cfg] of Object.entries(pendingImport.rotation)) {
       setRotationConfigs(prev => ({
         ...prev,
@@ -846,7 +887,7 @@ export default function SettingsPage() {
     setSettingsDirty(true)
     setPendingImport(null)
     toast.success('Keys imported - click "Save Settings" to persist.')
-  }, [pendingImport])
+  }, [pendingImport, canManageTunnels])
 
   const searchParams = useSearchParams()
   const validTabs = ['providers', 'skills', 'chat-skills', 'tradecraft', 'keys', 'mcp', 'mcp-tokens', 'system']
@@ -1161,10 +1202,12 @@ export default function SettingsPage() {
           />
         )}
 
+        {!providerFormOpen && <InstanceLlmProviders onCount={setInstanceProviderCount} />}
+
         {!providerFormOpen && (
           <FeatureModelsSection
             userId={userId}
-            providersCount={chatProviders.length}
+            providersCount={chatProviders.length + instanceProviderCount}
             providersLoading={providersLoading}
           />
         )}
@@ -1703,7 +1746,9 @@ export default function SettingsPage() {
           </h2>
         </div>
         <p className={styles.sectionHint}>
-          Configure reverse shell tunneling. Choose ngrok (free, single port) or chisel (requires VPS). Tunnels must be explicitly enabled below and are turned OFF automatically on restart - re-enable them each session (they expose an internet-reachable listener, breaking the LAN-only posture).
+          {canManageTunnels
+            ? 'Configure reverse shell tunneling. Choose ngrok (free, single port) or chisel (requires VPS). Tunnels must be explicitly enabled below and are turned OFF automatically on restart - re-enable them each session (they expose an internet-reachable listener, breaking the LAN-only posture).'
+            : 'Reverse shell tunneling (ngrok or chisel) is one listener shared by every user of this instance.'}
         </p>
         {settingsLoading ? (
           <div className={styles.emptyState}><Loader2 size={16} className={styles.spin} /> Loading...</div>
@@ -1712,6 +1757,10 @@ export default function SettingsPage() {
             {settingsLoadError}. Saving is off until they load, so nothing stored is overwritten.{' '}
             <button type="button" className="textButton" onClick={retrySettings}>Retry</button>
           </div>
+        ) : tunnelAtInstance ? (
+          <InstanceTunnelSection />
+        ) : !canManageTunnels ? (
+          <TunnelStatusReadOnly />
         ) : (
           <div className={styles.settingsGrid}>
             <div className="formGroup">
@@ -1751,6 +1800,7 @@ export default function SettingsPage() {
             </div>
             <SecretField
               label="Chisel Auth"
+              inputId={secretFieldId('chiselAuth')}
               hint="user:pass for chisel server authentication (optional - only if your chisel server requires auth)"
               value={settings.chiselAuth}
               visible={!!visibleFields.chiselAuth}
@@ -1895,6 +1945,17 @@ export default function SettingsPage() {
 
       <ApiUsageReportModal controller={apiUsage} />
 
+      {settingsStepUp && (
+        <StepUpModal
+          isOpen
+          title="Confirm the new endpoint"
+          message="The GitHub Enterprise token, or the tunnel, will go to a new address. Enter your password to save the change."
+          confirmLabel="Save"
+          onConfirm={settingsStepUp.retry}
+          onClose={() => { settingsStepUp.cancel(); setSettingsStepUp(null) }}
+        />
+      )}
+
       {/* Key Rotation Modal */}
       <Modal
         isOpen={!!rotationModal}
@@ -2000,7 +2061,9 @@ export default function SettingsPage() {
             <ul style={{ margin: 0, paddingLeft: '18px' }}>
               {pendingImport.keyCount > 0 && <li><strong>{pendingImport.keyCount}</strong> API key{pendingImport.keyCount > 1 ? 's' : ''}</li>}
               {pendingImport.rotationCount > 0 && <li><strong>{pendingImport.rotationCount}</strong> rotation config{pendingImport.rotationCount > 1 ? 's' : ''}</li>}
-              {pendingImport.tunnelingCount > 0 && <li><strong>{pendingImport.tunnelingCount}</strong> tunneling field{pendingImport.tunnelingCount > 1 ? 's' : ''}</li>}
+              {pendingImport.tunnelingCount > 0 && <li><strong>{pendingImport.tunnelingCount}</strong> tunneling field{pendingImport.tunnelingCount > 1 ? 's' : ''}{!canManageTunnels && (tunnelAtInstance
+                ? ' (not imported: the tunnel is an instance setting, saved in the Tunneling section)'
+                : ' (not imported: the tunnel is managed by an administrator)')}</li>}
             </ul>
             <p style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>
               Empty values and masked values are skipped. You must click <strong>Save Settings</strong> after import to persist.
@@ -2204,9 +2267,24 @@ const BADGE_STYLES: Record<string, React.CSSProperties> = {
   // every badge you add.
   }
 
+/** The settings that change the instance tunnel, which the PUT refuses without the right. */
+const TUNNEL_SETTING_KEYS = ['tunnelsEnabled', 'ngrokAuthtoken', 'chiselServerUrl', 'chiselAuth'] as const
+
+/** The id of a SecretField input; CredentialDrawer rows use `credential-key-<name>`. */
+const secretFieldId = (name: string) => `settings-secret-${name}`
+
+/** Scroll to the input of a stored secret and focus it, wherever the page renders it. */
+function focusSecretField(name: string) {
+  const input = document.getElementById(`credential-key-${name}`) ?? document.getElementById(secretFieldId(name))
+  if (!(input instanceof HTMLInputElement)) return
+  input.scrollIntoView?.({ block: 'center' })
+  input.focus()
+}
+
 // Reusable secret field component
 function SecretField({
   label,
+  inputId,
   hint,
   signupUrl,
   badges,
@@ -2218,6 +2296,7 @@ function SecretField({
   rotationInfo,
 }: {
   label: string
+  inputId?: string
   hint: string
   signupUrl?: string
   badges?: string[]
@@ -2244,6 +2323,7 @@ function SecretField({
       <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
         <div className={styles.secretInputWrapper} style={{ flex: 1 }}>
           <input
+            id={inputId}
             className="textInput"
             type={visible ? 'text' : 'password'}
             value={value ?? ''}

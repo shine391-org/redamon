@@ -100,6 +100,13 @@ export const VOLATILE_PROPERTIES = new Set([
   // Per-source OpenAPI fetch status: carries the time of the last fetch, so it
   // changes every run without the Domain changing.
   'openapi_source_status',
+  // The newest full links a finding was seen in (graph_db/display_only.py):
+  // they follow the latest sighting, and a delta must not print a secret.
+  'unmasked_url',
+  'unmasked_urls',
+  'unmasked_start_url',
+  'unmasked_redirect_from_urls',
+  'raw_context',
   // Triage and mute state: a run, a verdict or a review rewrites these on
   // every finding without the finding itself changing (C20).
   ...TRIAGE_PROPERTIES,
@@ -126,6 +133,9 @@ export const VOLATILE_PROPERTIES = new Set([
   'anon_page_class',
   'anon_page_class_confidence',
   'anon_page_class_source',
+  // Every IP-mode run re-evaluates every hostname seen on a target IP and
+  // stamps when; the name's reason (ip_hostname_reason) is what changes.
+  'ip_hostname_evaluated_at',
   // Per-host coverage stamps on BaseURL: every run restamps every host it
   // looked at, and a cut that moves between runs is the scan, not the target.
   ...COVERAGE_STAMP_PROPERTIES,

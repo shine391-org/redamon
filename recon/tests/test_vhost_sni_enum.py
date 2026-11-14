@@ -557,15 +557,27 @@ class TestCollectGraphCandidates:
         assert "acme.com" in out
 
     def test_pulls_external_domains(self):
+        # The aggregate's own keys (recon/helpers/external_domains.py). The
+        # source read `name` / `ips`, which nothing writes (B-17).
         recon = {
             "external_domains_aggregated": [
-                {"name": "external.acme.com", "ips": ["5.5.5.5"]},
-                {"name": "wrongip.acme.com", "ips": ["1.1.1.1"]},
+                {"domain": "external.example.com", "ips_seen": ["203.0.113.5"]},
+                {"domain": "wrongip.example.com", "ips_seen": ["198.51.100.1"]},
             ],
         }
-        out = _collect_graph_candidates(recon, "5.5.5.5")
-        assert "external.acme.com" in out
-        assert "wrongip.acme.com" not in out
+        out = _collect_graph_candidates(recon, "203.0.113.5")
+        assert "external.example.com" in out
+        assert "wrongip.example.com" not in out
+
+    def test_builds_the_external_domains_aggregate_when_absent(self):
+        # Phase A runs before the pipeline aggregates them (B-17).
+        recon = {"urlscan": {"external_domains": [
+            {"domain": "external.example.com", "source": "urlscan", "ip": "203.0.113.5"},
+            {"domain": "wrongip.example.com", "source": "urlscan", "ip": "198.51.100.1"},
+        ]}}
+        out = _collect_graph_candidates(recon, "203.0.113.5")
+        assert "external.example.com" in out
+        assert "wrongip.example.com" not in out
 
     def test_pulls_cnames(self):
         recon = {
@@ -647,20 +659,19 @@ class TestBuildFindingRecord:
         assert f["layer"] == "L7"
         assert "Hidden Virtual Host" in f["name"]
         assert "admin" in f["description"]
-        assert f["id"].startswith("vhost_sni_admin_example_com_")
-        assert f["id"].endswith("_l7")
+        assert f["id"] == vsm.finding_id("admin.example.com", "1.2.3.4", 443, "L7")
 
     def test_l4_finding(self):
         f = _build_finding_record(self._anomaly(layer="L4", internal_pattern_match=None), "1.2.3.4", {})
         assert f["type"] == "hidden_sni_route"
         assert "SNI-Routed" in f["name"]
-        assert f["id"].endswith("_l4")
+        assert f["id"] == vsm.finding_id("admin.example.com", "1.2.3.4", 443, "L4")
 
     def test_both_layer_finding(self):
         f = _build_finding_record(self._anomaly(layer="both", severity="high", internal_pattern_match=None), "1.2.3.4", {})
         assert f["type"] == "host_header_bypass"
         assert "Routing Inconsistency" in f["name"]
-        assert f["id"].endswith("_both")
+        assert f["id"] == vsm.finding_id("admin.example.com", "1.2.3.4", 443, "both")
 
     def test_both_layers_serving_the_same_page_is_a_hidden_vhost(self):
         f = _build_finding_record(self._anomaly(layer="both", severity="medium", layers_differ=False),
@@ -669,7 +680,7 @@ class TestBuildFindingRecord:
         assert f["name"] == "Hidden Virtual Host: admin.example.com"
         assert "SNI" in f["description"]
         # The id keeps its layer, so an existing finding is renamed in place.
-        assert f["id"].endswith("_both")
+        assert f["id"] == vsm.finding_id("admin.example.com", "1.2.3.4", 443, "both")
 
     def test_both_layers_disagreeing_is_a_routing_inconsistency(self):
         f = _build_finding_record(self._anomaly(layer="both", severity="medium", layers_differ=True),
@@ -689,9 +700,10 @@ class TestBuildFindingRecord:
 
     def test_id_safe_chars_only(self):
         f = _build_finding_record(self._anomaly(hostname="weird.host:with*chars.com"), "1.2.3.4", {})
-        # All non-[a-z0-9.] in hostname become _, port preserved
-        assert ":" not in f["id"]
-        assert "*" not in f["id"]
+        # A hash, whatever the hostname holds.
+        prefix, digest = f["id"][:len("vhost_sni_")], f["id"][len("vhost_sni_"):]
+        assert prefix == "vhost_sni_"
+        assert len(digest) == 20 and all(c in "0123456789abcdef" for c in digest)
 
 
 # ===========================================================================

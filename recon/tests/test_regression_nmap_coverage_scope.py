@@ -104,7 +104,7 @@ class _Graph:
         return 0
 
     def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
-                              keep_unproven=False):
+                              keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
         self.prunes.append({"sources": list(sources), "keep_hosts": tuple(keep_hosts)})
         return {"pruned": 0, "stale": 0, "revived": 0}
 

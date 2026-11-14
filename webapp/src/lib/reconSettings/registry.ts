@@ -35,13 +35,19 @@ export type Unit =
   | 'bytes' | 'depth' | 'percent' | 'ratio' | 'port' | 'none'
 export type Validator =
   | 'http_header' | 'project_file' | 'project_file_name'
-  | 'status_codes' | 'severity' | 'scan_modules' | 'hostname' | 'hostname_list' | 'url'
+  | 'status_codes' | 'severity' | 'scan_modules' | 'hostname' | 'hostname_list' | 'roe_exclusion' | 'url'
   | 'url_path_list' | 'port_spec' | 'free_text' | 'identifier' | 'json_object' | 'attack_skill_config'
   | 'github_name' | 'github_repo_list' | 'provider_reference'
 export type DenyReason =
   | 'identity' | 'internal' | 'escalation' | 'secret' | 'upload-managed'
   | 'engagement-record' | 'not-tuning' | 'derived'
 export type ReadDenyReason = 'credential' | 'third_party_pii' | 'document_blob' | 'other_user'
+/**
+ * What a collaborator may do with the column when the project is shared (lib/authz/settingsRisk.ts):
+ * `ordinary` is Write's; a `gate` an editor tightens and a co-owner loosens; `scope` a co-owner
+ * narrows and the owner widens; `secret` stays the owner's, unread by anyone else.
+ */
+export type ShareClass = 'ordinary' | 'gate' | 'scope' | 'secret'
 
 /** The coarse shape a value is validated against, joined from Prisma. */
 export type FieldType =
@@ -85,6 +91,11 @@ export interface RegistryField {
    */
   stealth?: { set?: unknown; ceiling?: number }
   read_deny_reason?: ReadDenyReason
+  /**
+   * Absent means ordinary. `secret` is removed from every read by a non-owner (projectReadView);
+   * `gate` and `scope` class the writes (settingsRisk).
+   */
+  share?: ShareClass
   group?: string
   /**
    * The ProjectForm section that renders this field, joined from its tool at
@@ -283,6 +294,16 @@ export function mcpReadableFields(): NamedField[] {
 /** Columns withheld from every MCP read, with the reason. */
 export function readDeniedFields(): NamedField[] {
   return fieldsWhere(f => f.readable === false)
+}
+
+/**
+ * Columns that stay the owner's when the project is shared: removed from every read by anyone
+ * else (projectReadView). Not the MCP read boundary: the custom header lists are readable through
+ * the owner's token, and the owner's id is withheld from MCP reads yet names the owner, which a
+ * project read returns anyway.
+ */
+export function shareSecretFields(): NamedField[] {
+  return fieldsWhere(f => f.share === 'secret')
 }
 
 /**

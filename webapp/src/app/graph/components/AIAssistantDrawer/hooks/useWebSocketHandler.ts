@@ -22,7 +22,11 @@ import {
 import type { ChatItem, Message, FileDownloadItem, Phase, FireteamItem, FireteamMemberPanel } from '../types'
 import type { ThinkingItem, ToolExecutionItem, PlanWaveItem, DeepThinkItem } from '../AgentTimeline'
 import { findToolCardIndex, settleRunningTools } from './toolCardState'
-import { agentErrorText, isPersistFailedNotice, type AgentErrorPayload } from './agentErrorText'
+import { agentErrorText, isPersistFailedNotice, reopensPendingRequest, type AgentErrorPayload } from './agentErrorText'
+import {
+  fireteamUndoKey, refusedAnswer, withFireteamWaveRestored, withItemRestored, withoutItem,
+  type AnswerUndo, type RefusedAnswer,
+} from './answerUndo'
 import { endsRateLimitWait, rateLimitWaitFromPayload, type RateLimitWait } from './rateLimitWait'
 import { stampLoopStatus, type LoopStatusView } from './loopStatus'
 import {
@@ -70,6 +74,10 @@ interface WebSocketHandlerDeps {
   isProcessingToolConfirmation: React.MutableRefObject<boolean>
   pendingApprovalToolId: React.MutableRefObject<string | null>
   pendingApprovalWaveId: React.MutableRefObject<string | null>
+  answerUndo: React.MutableRefObject<AnswerUndo>
+  // Put back what the person entered for a question whose answer the agent refused.
+  setAnswerText?: (v: string) => void
+  setSelectedOptions?: (v: string[]) => void
   // Fired after events that may have written new nodes to the graph DB
   // (TOOL_COMPLETE, FIRETEAM_TOOL_COMPLETE, TASK_COMPLETE, FIRETEAM_COMPLETED).
   // Debounced internally so concurrent wave tools coalesce into one refetch.
@@ -91,7 +99,7 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
     awaitingApprovalRef, isProcessingApproval,
     awaitingQuestionRef, isProcessingQuestion,
     awaitingToolConfirmationRef, isProcessingToolConfirmation,
-    pendingApprovalToolId, pendingApprovalWaveId,
+    pendingApprovalToolId, pendingApprovalWaveId, answerUndo, setAnswerText, setSelectedOptions,
     onGraphMutation, setLoopStatus, setRateLimitWait,
   } = deps
 
@@ -114,6 +122,74 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
   useEffect(() => () => {
     if (graphRefetchTimerRef.current) clearTimeout(graphRefetchTimerRef.current)
   }, [])
+
+  /**
+   * The agent refused an answer and keeps waiting (answerUndo.ts): nothing of that kind stays in
+   * flight, the card the answer hid comes back, the optimistic decision line goes, and the chat
+   * says why. A Fireteam answer never paused the run, so its spinner stays as it is.
+   */
+  const restoreRefusedAnswer = useCallback((refused: RefusedAnswer) => {
+    const undo = answerUndo.current
+    let restore = (items: ChatItem[]) => items
+    if (refused.answer === 'approval') {
+      isProcessingApproval.current = false
+      const entry = undo.approval
+      if (entry) {
+        undo.approval = null
+        awaitingApprovalRef.current = true
+        setApprovalRequest(entry.request)
+        setAwaitingApproval(true)
+        restore = (items) => withoutItem(items, entry.messageId)
+      }
+    } else if (refused.answer === 'question') {
+      isProcessingQuestion.current = false
+      const entry = undo.question
+      if (entry) {
+        undo.question = null
+        awaitingQuestionRef.current = true
+        setQuestionRequest(entry.request)
+        setAwaitingQuestion(true)
+        setAnswerText?.(entry.answerText)
+        setSelectedOptions?.(entry.selectedOptions)
+        restore = (items) => withoutItem(items, entry.messageId)
+      }
+    } else if (refused.answer === 'tool_confirmation') {
+      isProcessingToolConfirmation.current = false
+      const entry = undo.toolConfirmation
+      if (entry) {
+        const { request, item, toolId, waveId } = entry
+        undo.toolConfirmation = null
+        awaitingToolConfirmationRef.current = true
+        pendingApprovalToolId.current = toolId
+        pendingApprovalWaveId.current = waveId
+        setToolConfirmationRequest(request)
+        setAwaitingToolConfirmation(true)
+        if (item) restore = (items) => withItemRestored(items, item)
+      }
+    } else if (refused.answer === 'fireteam_member_confirmation') {
+      const key = fireteamUndoKey(refused.waveId, refused.memberId)
+      const entry = undo.fireteam[key]
+      if (entry) {
+        delete undo.fireteam[key]
+        isProcessingToolConfirmation.current = false
+        restore = (items) => withFireteamWaveRestored(items, refused.waveId, refused.memberId, entry)
+      }
+    }
+    const notice: Message = {
+      type: 'message',
+      id: `error-${Date.now()}-${itemIdCounter.current++}`,
+      role: 'assistant',
+      content: 'Your answer was not applied.',
+      error: refused.text,
+      timestamp: new Date(),
+    }
+    setChatItems(prev => [...restore(prev), notice])
+    if (refused.answer !== 'fireteam_member_confirmation') setIsLoading(false)
+  }, [answerUndo, awaitingApprovalRef, isProcessingApproval, setApprovalRequest, setAwaitingApproval,
+      awaitingQuestionRef, isProcessingQuestion, setQuestionRequest, setAwaitingQuestion,
+      setAnswerText, setSelectedOptions,
+      awaitingToolConfirmationRef, isProcessingToolConfirmation, pendingApprovalToolId, pendingApprovalWaveId,
+      setToolConfirmationRequest, setAwaitingToolConfirmation, setChatItems, setIsLoading, itemIdCounter])
 
   const handleWebSocketMessage = useCallback((message: ServerMessage) => {
     if (endsRateLimitWait(message.type)) setRateLimitWait?.(null)
@@ -834,6 +910,18 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
           } as Message])
           break
         }
+        const refused = refusedAnswer(payload)
+        if (refused) {
+          restoreRefusedAnswer(refused)
+          break
+        }
+        if (reopensPendingRequest(payload)) {
+          // The request comes again at once: the guard against a duplicate request
+          // while an answer is in flight would drop it.
+          isProcessingApproval.current = false
+          isProcessingQuestion.current = false
+          isProcessingToolConfirmation.current = false
+        }
         const errorMessage: Message = {
           type: 'message',
           id: `error-${Date.now()}`,
@@ -886,6 +974,7 @@ export function useWebSocketHandler(deps: WebSocketHandlerDeps) {
           filename: message.payload.filename,
           description: message.payload.description,
           source: message.payload.source,
+          projectId: message.payload.projectId,
         }
         setChatItems(prev => [...prev, fileItem])
         break

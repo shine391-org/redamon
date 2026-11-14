@@ -31,6 +31,8 @@ vi.mock('@/lib/prisma', () => ({
       count: (...a: unknown[]) => h.countAuthorizations(...a),
       findFirst: (...a: unknown[]) => h.findAuthorization(...a),
     },
+    // A collaborator's start writes its credits.used row first (step 5.6, C1).
+    auditLog: { create: async ({ data }: { data: unknown }) => data },
   },
 }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
@@ -242,6 +244,47 @@ describe('preconditions', () => {
     expect(await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' }))
       .toMatchObject({ ok: false, status: 400 })
     expect(h.prepare).not.toHaveBeenCalled()
+  })
+})
+
+describe('an IP project\'s hostname policy (Hostnames on target IPs)', () => {
+  const ipProject = (over: Record<string, unknown> = {}) => ({
+    id: 'p1', userId: 'owner', targetDomain: '', ipMode: true, targetIps: ['203.0.113.0/30'],
+    engagementKind: 'internal', roeGlobalMaxRps: 0, ipHostnameMode: 'record_only', ipHostnameInclude: [],
+    ...over,
+  })
+
+  test('the start loads every policy column, so none reads as its default', async () => {
+    h.findProject.mockResolvedValue(ipProject())
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    const select = h.findProject.mock.calls[0][0].select
+    for (const key of ['ipHostnameMode', 'ipHostnameInclude', 'ipHostnameExclude', 'ipHostnamePassiveExpand',
+      'ipHostnameScanAllConfirmed', 'ipHostnameMaxScanned', 'ipHostnamePassiveMaxNames', 'engagementKind']) {
+      expect(select[key], key).toBe(true)
+    }
+  })
+
+  test.each([
+    ['an unconfirmed scan_all', { ipHostnameMode: 'scan_all', ipHostnameScanAllConfirmed: false }, 'not confirmed'],
+    ['a record_filter with no include entry', { ipHostnameMode: 'record_filter' }, 'no include entry'],
+  ])('%s is refused with 422 before any version work, scheduled or queued', async (_name, over, needle) => {
+    h.findProject.mockResolvedValue(ipProject(over))
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', scheduleId: 's1' })
+    expect(res).toMatchObject({ ok: false, status: 422, code: 'scope_invalid' })
+    if (res.ok) throw new Error('unreachable')
+    expect(res.error).toContain(needle)
+    expect(classifyStartFailure(res.status, res).kind).toBe('permanent')
+    expect(h.prepare).not.toHaveBeenCalled()
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  test.each([
+    ['record_only', {}],
+    ['a confirmed scan_all', { ipHostnameMode: 'scan_all', ipHostnameScanAllConfirmed: true }],
+    ['a record_filter with an include entry', { ipHostnameMode: 'record_filter', ipHostnameInclude: ['*.example.com'] }],
+  ])('%s starts', async (_name, over) => {
+    h.findProject.mockResolvedValue(ipProject(over))
+    expect((await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })).ok).toBe(true)
   })
 })
 
@@ -726,5 +769,49 @@ describe('an orchestrator that never answered says why, and whether anything sta
     })
     const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
     expect(res).toMatchObject({ ok: false, status: 500, upstreamStatus: 500, error: 'Failed to start recon' })
+  })
+})
+
+describe('the job credential (step 1.16)', () => {
+  test('the orchestrator call carries a job credential for the project owner, not the actor', async () => {
+    const { verifyJobCredential } = await import('@/lib/authz/machineCredential')
+    const saved = process.env.INTERNAL_API_KEY
+    process.env.INTERNAL_API_KEY = 'start-path-test-master'
+    try {
+      for (const trigger of ['manual', 'scheduled'] as const) {
+        h.orchestratorFetch.mockClear()
+        const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger, actorUserId: 'admin-1' })
+        expect(res.ok).toBe(true)
+        const sent = orchestratorBody()
+        expect(verifyJobCredential(sent.job_credential)).toMatchObject({ aud: 'scan', ten: 'owner', pid: 'p1' })
+        expect(sent.user_id).toBe('owner')
+      }
+    } finally {
+      if (saved === undefined) delete process.env.INTERNAL_API_KEY
+      else process.env.INTERNAL_API_KEY = saved
+    }
+  })
+})
+
+describe('the actor (step 5.5)', () => {
+  test('the orchestrator call names the actor beside the owner, and the owner when nobody is named', async () => {
+    const { verifyJobCredential } = await import('@/lib/authz/machineCredential')
+    const saved = process.env.INTERNAL_API_KEY
+    process.env.INTERNAL_API_KEY = 'start-path-test-master'
+    try {
+      const cases: Array<[string | null | undefined, string]> = [['collab-1', 'collab-1'], ['owner', 'owner'], [null, 'owner'], [undefined, 'owner']]
+      for (const [actorUserId, expected] of cases) {
+        h.orchestratorFetch.mockClear()
+        const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', actorUserId })
+        expect(res.ok).toBe(true)
+        const sent = orchestratorBody()
+        expect(sent.actor_user_id).toBe(expected)
+        expect(sent.user_id).toBe('owner')
+        expect(verifyJobCredential(sent.job_credential).ten).toBe('owner')
+      }
+    } finally {
+      if (saved === undefined) delete process.env.INTERNAL_API_KEY
+      else process.env.INTERNAL_API_KEY = saved
+    }
   })
 })

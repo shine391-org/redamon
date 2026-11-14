@@ -116,19 +116,26 @@ export const LIVE_GRAPH_QUERY = `
 
         UNION
 
-        // Get GVM Vulnerability -> CVE chain (for CVE enrichment from GVM findings)
-        MATCH (v:Vulnerability {project_id: $projectId})-[r9:HAS_CVE]->(c:CVE)
+        // Vulnerability -> CVE: nmap NSE findings link HAS_CVE; nuclei and the
+        // passive CVE sources (Shodan, InternetDB, Netlas, CriminalIP) link INCLUDES_CVE
+        MATCH (v:Vulnerability {project_id: $projectId})-[r9:HAS_CVE|INCLUDES_CVE]->(c:CVE)
         RETURN v as n, r9 as r, c as m
 
         UNION
 
-        // Get CVE -> CWE -> CAPEC chain from GVM-linked CVEs
-        MATCH (v:Vulnerability {project_id: $projectId})-[:HAS_CVE]->(c:CVE)-[r10:HAS_CWE]->(cwe:MitreData)
+        // ...and that CVE's CWE -> CAPEC chain, read like the Technology one above.
+        // CVE and MitreData are global nodes, so only a branch anchored on the
+        // project's finding reaches them. These rows never return v, so the
+        // union's mute filter cannot see it: without NOT v:Muted a muted
+        // finding's CVE would still show, cut loose with its chain.
+        MATCH (v:Vulnerability {project_id: $projectId})-[:HAS_CVE|INCLUDES_CVE]->(c:CVE)-[r10:HAS_CWE]->(cwe:MitreData)
+        WHERE NOT v:Muted
         RETURN c as n, r10 as r, cwe as m
 
         UNION
 
-        MATCH (v:Vulnerability {project_id: $projectId})-[:HAS_CVE]->(c:CVE)-[:HAS_CWE]->(cwe:MitreData)-[r11:HAS_CAPEC]->(cap:Capec)
+        MATCH (v:Vulnerability {project_id: $projectId})-[:HAS_CVE|INCLUDES_CVE]->(c:CVE)-[:HAS_CWE]->(cwe:MitreData)-[r11:HAS_CAPEC]->(cap:Capec)
+        WHERE NOT v:Muted
         RETURN cwe as n, r11 as r, cap as m
 
         UNION
@@ -151,26 +158,34 @@ export const LIVE_GRAPH_QUERY = `
 
         UNION
 
-        // Get AttackChain nodes and their relationships (HAS_STEP, CHAIN_TARGETS)
+        // Get AttackChain nodes and their relationships (HAS_STEP, CHAIN_TARGETS).
+        // In this and the three chain branches below, a target carrying a
+        // project_id must be this project's (a global CVE carries none): a run of
+        // another project that named this project's chain id (the browser's
+        // session id) once linked its own nodes here.
         MATCH (ac:AttackChain {project_id: $projectId})-[r16]->(target)
+        WHERE target.project_id IS NULL OR target.project_id = $projectId
         RETURN ac as n, r16 as r, target as m
 
         UNION
 
         // Get ChainStep relationships (NEXT_STEP, PRODUCED, FAILED_WITH, LED_TO, STEP_TARGETED, STEP_EXPLOITED)
         MATCH (s:ChainStep {project_id: $projectId})-[r17]->(target)
+        WHERE target.project_id IS NULL OR target.project_id = $projectId
         RETURN s as n, r17 as r, target as m
 
         UNION
 
         // Get ChainFinding bridge relationships (FOUND_ON, FINDING_RELATES_CVE, CREDENTIAL_FOR)
         MATCH (f:ChainFinding {project_id: $projectId})-[r18]->(target)
+        WHERE target.project_id IS NULL OR target.project_id = $projectId
         RETURN f as n, r18 as r, target as m
 
         UNION
 
         // Get ChainDecision outgoing relationships (DECISION_PRECEDED -> ChainStep)
         MATCH (d:ChainDecision {project_id: $projectId})-[r19]->(target)
+        WHERE target.project_id IS NULL OR target.project_id = $projectId
         RETURN d as n, r19 as r, target as m
       }
       // Mute enforcement, applied ONCE to the union rather than inside each

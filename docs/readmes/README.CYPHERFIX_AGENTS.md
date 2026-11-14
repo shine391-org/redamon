@@ -276,7 +276,16 @@ two kinds.
 
 **Project fact sets**, read once per run: which hosts are live, which ports an
 active scan found, which packages are actually served, what the agent proved,
-which hosts appear in threat intelligence, which assets are sensitive.
+which hosts appear in threat intelligence, which assets are sensitive, and what
+the run skipped (a tripped breaker). The `skipped_hosts` query returns the
+coverage record's keys whole, and `build_project_facts` splits them: a
+`host:port` or `[v6]:port` key goes to `ProjectFacts.skipped_ports` and leaves
+only the findings on that host and port "unknown: reachable now"; a bare host
+key, or one whose port does not parse, goes to `skipped_hosts` and covers the
+whole host. A finding's port is its `target_port`, else the port its host
+spelling names, a URL's scheme default included, as `circuit_breaker.host_key`
+keys it; a finding on the host itself, with no port, is covered only by a bare
+host key (`score_model._skipped`, since `SCORE_MODEL_VERSION` v3.12.0).
 
 **One row per finding**, per label, using `COUNT {}` / `EXISTS {}` subqueries
 rather than `OPTIONAL MATCH` chains. That shape is the point: the old queries
@@ -358,9 +367,9 @@ leaves the ranking entirely rather than being demoted to a small number that
 still sorts above something real. `gone` needs evidence of absence: the
 `gone_hosts` fact reads `RESOLVES_TO` from each label's own end (Subdomain ->
 IP, so an IP is gone only when no Subdomain resolves to it) and leaves out every
-host on an org `Domain`'s `recon_skipped_hosts`, normalised as
-`circuit_breaker.hostname_of` does for the prune: a host the run did not
-re-check is unknown, not gone.
+host with any key on an org `Domain`'s `recon_skipped_hosts`, port stripped as
+`circuit_breaker.hostname_of` strips it for the prune: a host the run did not
+re-check, even on one port, is unknown, not gone.
 
 **Agent proof has a confidence floor.** A `ChainFinding` proves the finding it
 `CONFIRMS` only when `coalesce(toInteger(cf.confidence), 80) >= 70`
@@ -420,7 +429,14 @@ v3.0.0 on a graph nobody has clicked. Tests:
   group; a secret's key is a hash of its value, never the value. The `secrets`
   fact query returns `s.matched_text` for that, and names the detector by the
   pattern (`coalesce(s.secret_type, s.key_type)`): js_recon's `key_type` is only
-  the pattern's category. When a run produces a group key no `Remediation` row
+  the pattern's category. The `vulnerabilities` query projects the fields the
+  scanner-specific keys read, so web cache poisoning groups by technique and
+  unkeyed header or parameter (`cache:<technique>:<vector>`), subdomain takeover
+  by provider and method (`takeover:<provider>:<method>`), GraphQL by check type
+  (`graphql:<vulnerability_type>`) and AI findings by OWASP LLM class and
+  payload class (`ai:<owasp>:<payload>`). A node that stores none of those
+  fields (an older or imported one) is its own group, never one key for the
+  whole source. When a run produces a group key no `Remediation` row
   carries, the fix-list route re-points the orphaned row that shares at least
   half of the group's findings (largest overlap, then protected, then newest;
   once per run) instead of creating a duplicate, and reports it as `repointed`.
@@ -450,7 +466,7 @@ import and delete can see one. Four calls, all fail-closed:
 
 | Call | What it does |
 |---|---|
-| `POST /api/internal/triage-runs` | Authorise, BEFORE reading anything. Strict ownership, ignoring `ACCESS_ENFORCE` |
+| `POST /api/internal/triage-runs` | Authorise, BEFORE reading anything. Strict ownership |
 | `.../heartbeat` | Every 30s. The reply carries `abort`; two failures in a row are treated as one |
 | `.../publish` | A conditional `running -> publishing` transition. A run that lost its claim writes nothing |
 | `.../finish` | Always, from a `finally`. A run left `running` blocks activation until its heartbeat expires |

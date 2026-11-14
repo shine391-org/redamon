@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import { FileText, Download, ExternalLink, Trash2, Loader2, AlertCircle, Sparkles, ChevronDown } from 'lucide-react'
 import { useAllReports, type ReportMeta } from '@/hooks/useReports'
 import { useProjects } from '@/hooks/useProjects'
@@ -9,6 +9,9 @@ import { projectTargetLabel } from '@/lib/projectSummary'
 import { useToast, WikiInfoButton } from '@/components/ui'
 import { errorMessage, readApiError, toApiError } from '@/lib/apiError'
 import { FeatureModelLine } from '@/components/shared/FeatureModelGate'
+import { useRefusalCheck } from '@/hooks/useRefusal'
+import { readsOwnerCatalog } from '@/hooks/useProjectOwnerCatalog'
+import type { MyAccess } from '@/lib/authz/projectAccess'
 import styles from './page.module.css'
 
 function formatBytes(bytes: number): string {
@@ -28,6 +31,8 @@ function formatDate(iso: string): string {
 
 /** Why a report has no narratives, from the route's `narrativesSkipped` code. */
 function skippedReason(code: string): string {
+  if (code === 'use_agent_required') return "AI narratives need Use AI agent on this project and the owner's consent to spend their credentials"
+  if (code === 'owner_model_required') return "the project's owner has not chosen a Report narratives model"
   if (code.startsWith('agent_')) return 'the agent could not be reached'
   if (code.startsWith('unreadable_answer')) return "the model's answer could not be read"
   return 'the model call failed'
@@ -54,12 +59,27 @@ export default function ReportsPage() {
   const { data: projects } = useProjects(userId || undefined)
   const [selectedProjectId, setSelectedProjectId] = useState<string>('')
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+  // Reports span projects, so each action reads its own project's access from the list rows
+  // (`myAccess`, RBAC_SHARING_ENABLED on): a read share downloads and opens, and neither generates
+  // nor deletes (step 4.11). Without `myAccess` nothing is refused here.
+  const refusalCheck = useRefusalCheck()
+  const accessOf = useMemo(() => {
+    const byId = new Map<string, MyAccess>()
+    for (const p of projects ?? []) if (p.myAccess) byId.set(p.id, p.myAccess)
+    return (projectId: string) => byId.get(projectId) ?? null
+  }, [projects])
+  const generateRefusal = selectedProjectId
+    ? refusalCheck('reports:generate', accessOf(selectedProjectId))?.text ?? null
+    : null
+  // A project the person does not own runs its narratives on the OWNER's model, or none (P5-06),
+  // by the rule the project form and the graph page read the owner's catalog with.
+  const ownerModel = selectedProjectId ? readsOwnerCatalog(accessOf(selectedProjectId)) : false
 
   const handleGenerate = useCallback(async () => {
     if (!selectedProjectId) return
     try {
       // null: the user cancelled the model prompt, so nothing started.
-      const report = await generate(selectedProjectId)
+      const report = await generate(selectedProjectId, { ownerModel })
       if (!report) return
       if (report.narrativesSkipped) {
         toast.warning(`Report generated without AI narratives: ${skippedReason(report.narrativesSkipped)} (${report.narrativesSkipped}).`)
@@ -70,7 +90,7 @@ export default function ReportsPage() {
       // The same text stays on the page as generateError.
       toast.error(errorMessage(e, 'Failed to generate report'))
     }
-  }, [generate, selectedProjectId, toast])
+  }, [generate, selectedProjectId, ownerModel, toast])
 
   const handleDelete = useCallback(async (projectId: string, reportId: string) => {
     try {
@@ -136,7 +156,8 @@ export default function ReportsPage() {
           <button
             className={styles.generateBtn}
             onClick={handleGenerate}
-            disabled={isGenerating || !selectedProjectId}
+            disabled={isGenerating || !selectedProjectId || !!generateRefusal}
+            title={generateRefusal ?? undefined}
           >
             {isGenerating ? (
               <>
@@ -150,9 +171,25 @@ export default function ReportsPage() {
               </>
             )}
           </button>
-          <FeatureModelLine featureId="report_narratives" label="Narratives model" />
+          {ownerModel ? (
+            <span
+              className={styles.ownerModelLine}
+              data-feature-model="report_narratives"
+              title="The narratives run on the project owner's Report narratives model, which only the owner changes, in their Global Settings"
+            >
+              Narratives model: the project owner&apos;s
+            </span>
+          ) : (
+            <FeatureModelLine featureId="report_narratives" label="Narratives model" />
+          )}
         </div>
       </div>
+
+      {generateRefusal && (
+        <p className={styles.readOnlyNote} role="note">
+          {generateRefusal}: you can download and open this project&apos;s reports, not generate them.
+        </p>
+      )}
 
       {generateError && (
         <div className={styles.error}>
@@ -182,7 +219,9 @@ export default function ReportsPage() {
         </div>
       ) : (
         <div className={styles.list}>
-          {reports.map(report => (
+          {reports.map(report => {
+            const deleteRefusal = refusalCheck('reports:delete', accessOf(report.projectId))?.text ?? null
+            return (
             <div key={report.id} className={styles.row}>
               <div className={styles.rowMain}>
                 <div className={styles.rowTitle}>
@@ -280,14 +319,17 @@ export default function ReportsPage() {
                   <button
                     className={`${styles.actionBtn} ${styles.deleteBtn}`}
                     onClick={() => setDeleteConfirm(report.id)}
-                    title="Delete report"
+                    disabled={!!deleteRefusal}
+                    title={deleteRefusal ?? 'Delete report'}
+                    aria-label="Delete report"
                   >
                     <Trash2 size={14} />
                   </button>
                 )}
               </div>
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>

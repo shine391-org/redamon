@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useId } from 'react'
 import { ChevronDown, Target, ShieldAlert, AlertTriangle, Info, Globe, Network, Layers, Check, Lock, Plus, Minus, Gauge } from 'lucide-react'
 import { AiToggleLabel } from '../AiToggleLabel'
 import { JevEngineControl } from '../JevEngineControl'
@@ -15,11 +15,16 @@ import {
   validateDomainBatch, INVALID_REASON_TEXT, MAX_BATCH_HOSTS, MAX_BATCH_GROUPS, NESTED_WILDCARDS_ENABLED, normalizeHost,
 } from '@/lib/domainBatch'
 import {
-  GRAPH_DOMAIN_IS_ORG, type ScopeFields, isScopeWidening, resolveScopeGroups, scopeGuardrailNames,
+  GRAPH_DOMAIN_IS_ORG, IP_HOSTNAME_DEFAULTS, IP_HOSTNAME_FIELDS, type ScopeFields, ipHostnameModeOf,
+  ipHostnameWidenings, isScopeWidening, resolveScopeGroups, scopeGuardrailNames,
 } from '@/lib/scopeGroups'
 import { deriveRoeEnabled } from '@/lib/engagement'
 import { isValidDomain } from '@/lib/validation'
+import { isUnsetOwnershipToken } from '@/lib/ownershipToken'
 import { FileImportButton } from '../FileImportButton'
+import { IpHostnameModeCards } from '../IpHostnameModeCards'
+import { IpHostnameFilterEditor } from '../IpHostnameFilterEditor'
+import { IpHostnamePreview } from '../IpHostnamePreview'
 import { ModelPicker } from '@/components/shared/ModelPicker'
 import { excludeLoop } from '@/lib/agentInTheLoop'
 import { useProject } from '@/providers/ProjectProvider'
@@ -204,11 +209,21 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
       .catch(() => {})
     return () => { alive = false }
   }, [mode, projectId])
+  // In IP mode the targets are locked; what can widen is the hostname policy
+  // (D-24: the form warns, update_project_scope pauses).
+  const hostnameMode = ipHostnameModeOf(data.ipHostnameMode)
+  const scanAllConfirmed = data.ipHostnameScanAllConfirmed === true
+  const hostnameLabelId = useId()
+  const hostnameWidenings = useMemo(
+    () => (ipMode && savedScope ? ipHostnameWidenings(savedScope, data) : []),
+    [ipMode, savedScope, data]
+  )
   const widensScheduledScope = useMemo(() => {
-    if (!savedScope || enabledSchedules === 0 || ipMode) return false
+    if (!savedScope || enabledSchedules === 0) return false
+    if (ipMode) return hostnameWidenings.length > 0
     const next = batchMode ? batchResult?.groups ?? [] : singleScope?.groups ?? []
     return next.length > 0 && isScopeWidening(resolveScopeGroups(savedScope).groups, next)
-  }, [savedScope, enabledSchedules, ipMode, batchMode, batchResult, singleScope])
+  }, [savedScope, enabledSchedules, ipMode, hostnameWidenings, batchMode, batchResult, singleScope])
   const ownershipPrefix = (data.ownershipTxtPrefix || '').trim() || '_redamon-verify'
   // A half-typed name ("exam") is not yet a hostname, and calling it a public
   // suffix would be wrong: only a well-formed name gets the refusal reason.
@@ -295,7 +310,15 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
       updateField('targetDomain', '')
       updateField('subdomainList', [])
     }
-    if (next !== 'ip') updateField('targetIps', [])
+    if (next !== 'ip') {
+      updateField('targetIps', [])
+      // The hostname policy applies only in IP mode, and a save refuses one left
+      // set on another mode while its controls are hidden.
+      for (const key of IP_HOSTNAME_FIELDS) {
+        const value = IP_HOSTNAME_DEFAULTS[key]
+        updateField(key, (Array.isArray(value) ? [] : value) as never)
+      }
+    }
     if (next !== 'batch') {
       setBatchHostDraft(null)
       updateField('domainBatchHosts', [])
@@ -416,7 +439,8 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
               ) : ipMode ? (
                 <>
                   Targets are IP addresses or CIDR ranges, <strong>public or private</strong>.
-                  The pipeline runs reverse DNS to recover hostnames. For a private/internal
+                  What happens to the hostnames found on these IPs is set below, in{' '}
+                  <strong>Hostnames on target IPs</strong> (by default none is looked up). For a private/internal
                   range or Active Directory, pick the{' '}
                   <strong>Internal Network &amp; Active Directory</strong> recon preset, which
                   turns off the public-only tools (OSINT, subdomain enumeration, WHOIS) that
@@ -703,18 +727,108 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
                   </span>
                 </div>
               )}
+            </div>
+          )}
 
-              {/* Always-on note for IP mode: the domain-only phases don't apply. */}
-              <div className={`${styles.callout} ${styles.calloutInfo}`}>
-                <Info size={16} />
-                <span>
-                  <strong>IP mode:</strong> domain-only steps are skipped. Subdomain
-                  discovery, WHOIS, DNS/email security and subdomain-takeover checks need a
-                  registered domain and do not run against bare IPs. Port scanning, service
-                  and version detection, HTTP probing, CVE lookup and the security checks
-                  work normally.
-                </span>
-              </div>
+          {/* Hostnames on target IPs. Unlike the IP list it stays editable after
+              creation: a change is a rescope, which the save judges like a target
+              change (refused while a scan runs, include entries hard-guardrailed).
+              The cards, the editor and the inputs below hand every value back
+              here, so each updateField call of the section stays in this file. */}
+          {ipMode && (
+            <div className={`${styles.fieldGroup} ${styles.ipHostnameBlock}`} data-testid="ip-hostname-policy">
+              <span className={styles.fieldLabel} id={hostnameLabelId}>Hostnames on target IPs</span>
+              <IpHostnameModeCards
+                value={hostnameMode}
+                labelledBy={hostnameLabelId}
+                thirdParty={data.engagementKind === 'third_party'}
+                onModeChange={(next) => {
+                  updateField('ipHostnameMode', next)
+                  if (next !== 'scan_all') updateField('ipHostnameScanAllConfirmed', false)
+                }}
+              />
+              <span className={styles.fieldHint}>
+                Every name not scanned is saved with the reason (see the graph and the log). A hostname
+                is scanned only when every address it resolves to is one of the target IPs.
+              </span>
+
+              {hostnameMode === 'record_filter' && (
+                <>
+                  <IpHostnameFilterEditor
+                    include={data.ipHostnameInclude ?? []}
+                    exclude={data.ipHostnameExclude ?? []}
+                    passiveExpand={data.ipHostnamePassiveExpand ?? true}
+                    onIncludeChange={(entries) => updateField('ipHostnameInclude', entries)}
+                    onExcludeChange={(entries) => updateField('ipHostnameExclude', entries)}
+                    onPassiveExpandChange={(on) => updateField('ipHostnamePassiveExpand', on)}
+                  />
+                  <IpHostnamePreview
+                    projectId={mode === 'edit' ? projectId : undefined}
+                    mode={hostnameMode}
+                    include={data.ipHostnameInclude ?? []}
+                    exclude={data.ipHostnameExclude ?? []}
+                    maxScanned={data.ipHostnameMaxScanned ?? 100}
+                  />
+                </>
+              )}
+
+              {hostnameMode === 'scan_all' && (
+                <>
+                  <div className={`${styles.callout} ${styles.calloutDanger}`} role="note">
+                    <ShieldAlert size={16} />
+                    <span>
+                      <strong>Every hostname found on your IPs will be scanned</strong>, including sites
+                      you may not own (shared hosting). CDN edge addresses are always skipped. Use this
+                      only for servers that are entirely yours. Not available for third-party engagements.
+                    </span>
+                  </div>
+                  <label className="checkboxLabel">
+                    <input
+                      type="checkbox"
+                      className="checkbox"
+                      checked={data.ipHostnameScanAllConfirmed ?? false}
+                      aria-describedby={scanAllConfirmed ? undefined : `${hostnameLabelId}-confirm`}
+                      onChange={(e) => updateField('ipHostnameScanAllConfirmed', e.target.checked)}
+                    />
+                    I confirm every site hosted on these IPs is in scope.
+                  </label>
+                  {!scanAllConfirmed && (
+                    <span className={styles.fieldHintWarning} id={`${hostnameLabelId}-confirm`}>
+                      Required to save: Record + scan all needs this confirmation.
+                    </span>
+                  )}
+                </>
+              )}
+
+              {(hostnameMode === 'record_filter' || hostnameMode === 'scan_all') && (
+                <details className={styles.ipHostnameAdvanced}>
+                  <summary>Advanced: per-run limits</summary>
+                  <label className={styles.fieldLabel} htmlFor="ipHostnameMaxScanned">Most hostnames scanned per run</label>
+                  <input
+                    id="ipHostnameMaxScanned"
+                    type="number"
+                    className="textInput"
+                    min={1}
+                    max={2000}
+                    value={data.ipHostnameMaxScanned ?? 100}
+                    onChange={(e) => updateField('ipHostnameMaxScanned', parseInt(e.target.value) || 100)}
+                  />
+                  {hostnameMode === 'record_filter' && (
+                    <>
+                      <label className={styles.fieldLabel} htmlFor="ipHostnamePassiveMaxNames">Passive search: most names kept per run</label>
+                      <input
+                        id="ipHostnamePassiveMaxNames"
+                        type="number"
+                        className="textInput"
+                        min={1}
+                        max={10000}
+                        value={data.ipHostnamePassiveMaxNames ?? 500}
+                        onChange={(e) => updateField('ipHostnamePassiveMaxNames', parseInt(e.target.value) || 500)}
+                      />
+                    </>
+                  )}
+                </details>
+              )}
             </div>
           )}
 
@@ -737,9 +851,12 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
                   {enabledSchedules} scheduled scan{enabledSchedules === 1 ? '' : 's'} will run the
                   wider scope.
                 </strong>{' '}
-                This change adds hosts the saved scope did not cover, and every enabled schedule
-                scans them from its next run. Pause a schedule in the Scans tab if that is not
-                intended.
+                {ipMode
+                  ? `This change lets the scan reach hostnames the saved policy did not (${hostnameWidenings.join('; ')}), `
+                    + 'and every enabled schedule scans them from its next run.'
+                  : 'This change adds hosts the saved scope did not cover, and every enabled schedule '
+                    + 'scans them from its next run.'}{' '}
+                Pause a schedule in the Scans tab if that is not intended.
               </span>
             </div>
           )}
@@ -1104,13 +1221,28 @@ export function TargetSection({ data, updateField, mode = 'create', savedScope, 
               {data.verifyDomainOwnership && (
                 <div className={styles.fieldRow}>
                   <div className={styles.fieldGroup}>
-                    <label className={styles.fieldLabel}>Ownership Token</label>
+                    <label className={styles.fieldLabel} htmlFor="ownership-token">Ownership Token</label>
                     <input
+                      id="ownership-token"
                       type="text"
                       className="textInput"
-                      value={data.ownershipToken}
+                      value={data.ownershipToken ?? ''}
+                      placeholder={mode === 'create' ? 'Generated when the project is created' : undefined}
                       onChange={(e) => updateField('ownershipToken', e.target.value)}
                     />
+                    {mode === 'create' && (
+                      <span className={styles.fieldHint}>
+                        Leave it empty and the project gets its own random token on save.
+                      </span>
+                    )}
+                    {mode !== 'create' && isUnsetOwnershipToken(data.ownershipToken) && (
+                      <span className={styles.fieldHintWarning} role="status">
+                        {(data.ownershipToken ?? '').trim()
+                          ? <>This is the placeholder every RedAmon install shipped, so anyone can publish it. </>
+                          : <>This project has no token. </>}
+                        Enter a value of your own and publish that one.
+                      </span>
+                    )}
                   </div>
                   <div className={styles.fieldGroup}>
                     <label className={styles.fieldLabel}>TXT Record Prefix</label>

@@ -1,18 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server'
-import prisma from '@/lib/prisma'
 import { readJsonBody } from '@/lib/jsonBody'
 import { safeErrorCode } from '@/lib/routeErrors'
 import { getSession } from '@/lib/session'
+import { accountHolds } from '@/lib/authz/adminPermission'
 import { LifecycleError } from './lifecycleCommon'
 import { PluginConflictError } from './registry'
 import { crossOriginResponse, sameOrigin } from './sameOrigin'
 
 /**
- * The guard of every plugin lifecycle route. These routes put code on the host, so the
- * admin role is read from the database on each request: the role inside the login JWT
- * lasts seven days after a demotion (RV-11). The login session is the real admin's even
- * while they act as another user (`getSession` ignores the act-as cookie), so acting as a
- * standard user neither removes nor lends these rights, and the admin is the actor.
+ * The guard of every plugin lifecycle route: platform:plugins (every admin with
+ * RBAC_PERMISSIONS_ENABLED off; with it on an admin profile or a member override holding it).
+ * These routes put code on the host, so the account is read from the database on each request:
+ * the role inside the login JWT lasts seven days after a demotion (RV-11). The login session is
+ * the real person's even while they act as another user (`getSession` ignores the act-as cookie),
+ * so acting as a standard user neither removes nor lends these rights, and the real person is the
+ * actor.
  */
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
@@ -54,14 +56,18 @@ export function pluginRoute<A extends unknown[]>(
   }
 }
 
+/**
+ * The signed-in person when they hold `platform:plugins`. The account is read again (fresh): a
+ * change of the person's role or profile reaches the next plugin action at once.
+ */
 export async function requirePluginAdmin(): Promise<{ userId: string } | NextResponse> {
   const session = await getSession()
   if (!session) return errorResponse(401, 'unauthorized', 'Sign in first.')
-  const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, role: true } })
-  if (!user || user.role !== 'admin') {
-    return errorResponse(403, 'admin_required', 'Only an administrator can manage plugins.')
+  if (!(await accountHolds(session.userId, 'platform:plugins', { fresh: true }))) {
+    // `permission` as every permission refusal names it, so a client (and the live matrix) can tell which.
+    return errorResponse(403, 'admin_required', 'Only an administrator can manage plugins.', undefined, { permission: 'platform:plugins' })
   }
-  return { userId: user.id }
+  return { userId: session.userId }
 }
 
 export function lifecycleErrorResponse(e: unknown, what: string): NextResponse {

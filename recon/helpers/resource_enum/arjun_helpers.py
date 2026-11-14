@@ -16,8 +16,8 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Set, Tuple
-from urllib.parse import urlsplit
+from typing import Dict, List, Mapping, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from .classification import classify_endpoint, classify_parameter, infer_parameter_type
 from .arjun_contract import arjun_url_host, reconcile_arjun_schema
@@ -275,6 +275,9 @@ def run_arjun_discovery(
     disable_redirects: bool,
     custom_headers: List[str],
     allowed_hosts: Set[str],
+    *,
+    settings: Optional[Mapping] = None,
+    recon_data: Optional[Mapping] = None,
 ) -> Tuple[List[Dict], Dict]:
     """
     Run Arjun parameter discovery against target URLs with multiple methods in parallel.
@@ -295,13 +298,30 @@ def run_arjun_discovery(
         disable_redirects: Do not follow HTTP redirects
         custom_headers: Custom HTTP headers to include
         allowed_hosts: Set of in-scope hostnames
+        settings, recon_data: the run's. With RoE exclusions or in IP mode
+            redirects are not followed. With ``recon_data`` (the full
+            pipeline) the URLs also go through the target admission gate; a
+            partial run's graph and typed URLs were admitted before.
 
     Returns:
         Tuple of (results_list, metadata_dict)
     """
+    from recon.helpers.target_admission import admission_context, admit_urls
+    if recon_data is not None:
+        # The crawlers' endpoints can name any host they saw; Arjun resolves
+        # each one itself.
+        target_urls, _ = admit_urls(settings, recon_data, list(target_urls or []), module="arjun")
     if not target_urls:
         print("[-][Arjun] No target URLs provided")
         return [], {"external_domains": []}
+    contained = (admission_context(settings, recon_data).active
+                 or bool((settings or {}).get("IP_MODE")))
+    if not disable_redirects and contained:
+        # Arjun's first request to each URL follows redirects and then sends
+        # every GET and POST to the URL it landed on, so an admitted host's
+        # 302 hands Arjun a host the run refused. Arjun has no same-host mode.
+        disable_redirects = True
+        print("[*][Arjun] Redirects not followed: RoE exclusions or the IP target list are in force")
 
     normalized_hosts = {_normalize_scope_host(h) for h in allowed_hosts} - {''}
     supplied_count = len(target_urls)
@@ -400,7 +420,7 @@ def merge_arjun_into_by_base_url(
             continue
         if allowed_hosts is not None and arjun_url_host(url) not in {_normalize_scope_host(h) for h in allowed_hosts}:
             continue
-        parsed = urlsplit(url)
+        parsed = urlparse(url)
         base, path = f"{parsed.scheme}://{parsed.netloc}", parsed.path or '/'
         position = 'body' if mode in ('POST', 'JSON', 'XML') else 'query'
         method = 'POST' if mode in ('JSON', 'XML') else mode

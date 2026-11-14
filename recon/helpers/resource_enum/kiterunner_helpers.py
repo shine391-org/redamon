@@ -16,8 +16,10 @@ import uuid
 import zipfile
 from pathlib import Path
 
+from recon.helpers import request_pacer
+from recon.helpers.docker_helpers import run_tool_container
 from recon.helpers.subprocess_helpers import run_with_heartbeat
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 from .classification import classify_endpoint
@@ -212,6 +214,30 @@ def ensure_kiterunner_binary(wordlist_name: str) -> Tuple[Optional[str], Optiona
     return None, None
 
 
+def _note_not_run_under_ceiling(target_urls: List[str], ceiling: float) -> None:
+    """Kiterunner has no flag that holds a request rate, so under an RoE ceiling it
+    does not run (decision D3).
+
+    kr v1.0.2 parses ``--delay`` into its config and nothing reads it; ``-x``
+    and ``-j`` cap connections per host and hosts at once, not requests per
+    second, so even ``-x 1 -j 1`` sends back to back as fast as the target
+    answers. Recorded as a coverage gap, never as switched off: the run says
+    these targets were not brute-forced. Kiterunner writes Endpoint assets, not
+    findings, so the gap has nothing to keep from the prune. Never raises.
+    """
+    targets = sum(1 for url in target_urls if url.startswith(('http://', 'https://')))
+    print(f"[-][Kiterunner] Not run: kr cannot hold the {ceiling:g} rps RoE ceiling "
+          f"(its --delay is never applied); {targets} target(s) not brute-forced this run")
+    try:
+        from recon.helpers import circuit_breaker as _cb
+        _cb.note_degraded("resource_enum", entries=[{
+            "source": "kiterunner",
+            "reason": f"not run: kr cannot hold the {ceiling:g} rps RoE ceiling",
+            "skipped": targets}])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_kiterunner_discovery(
     target_urls: List[str],
     binary_path: str,
@@ -226,6 +252,9 @@ def run_kiterunner_discovery(
     match_status: List[int],
     min_content_length: int,
     headers: List[str],
+    *,
+    settings: Optional[Mapping] = None,
+    recon_data: Optional[Mapping] = None,
 ) -> List[Dict]:
     """
     Run Kiterunner API endpoint bruteforcing.
@@ -233,12 +262,15 @@ def run_kiterunner_discovery(
     Kiterunner uses Swagger/OpenAPI specs to discover hidden API routes.
     Unlike Katana/GAU, it finds endpoints that aren't linked or archived.
 
+    Under an RoE ceiling (the process-wide request pacer is active) it does not
+    run and returns no endpoints: nothing bounds kr's request rate.
+
     Args:
         target_urls: Base URLs to scan (e.g., ["http://example.com"])
         binary_path: Path to Kiterunner binary (kr)
         wordlist_path: Path to wordlist file (.kite)
         wordlist_name: Name of wordlist for display
-        rate_limit: Requests per second limit
+        rate_limit: Requests per second, passed as --delay, which kr v1.0.2 ignores
         connections: Number of connections
         timeout: Request timeout in seconds
         scan_timeout: Overall scan timeout
@@ -247,6 +279,8 @@ def run_kiterunner_discovery(
         match_status: Status codes to match
         min_content_length: Minimum content length to include
         headers: Custom headers to send
+        settings, recon_data: the run's; under redirects_contained (RoE
+            exclusions, IP mode) kr follows no redirect
 
     Returns:
         List of discovered endpoint dictionaries with url, path, method, status
@@ -257,6 +291,11 @@ def run_kiterunner_discovery(
     print(f"[*][Kiterunner] Targets: {len(target_urls)}")
 
     discovered_endpoints = []
+
+    ceiling = request_pacer.ceiling()
+    if ceiling:
+        _note_not_run_under_ceiling(target_urls, ceiling)
+        return discovered_endpoints
 
     # Check if binary and wordlist are available
     if not binary_path or not wordlist_path:
@@ -306,7 +345,8 @@ def run_kiterunner_discovery(
         else:
             cmd.extend(["-w", wordlist_path])
 
-        # Rate limiting (delay in ms between requests)
+        # kr v1.0.2 never applies --delay, so this paces nothing; it is why a
+        # run under an RoE ceiling stops above instead.
         if rate_limit > 0:
             delay_ms = int(1000 / rate_limit)
             if delay_ms > 0:
@@ -331,8 +371,19 @@ def run_kiterunner_discovery(
         for header in headers:
             cmd.extend(["-H", header])
 
-        # HTTP traffic capture (Phase 1): route through the capture proxy when
-        # enabled + reachable; tag added ONLY in this branch (§20.2 no-leak).
+        from recon.helpers.resource_enum.katana_helpers import redirects_contained
+        if redirects_contained(settings, recon_data):
+            # kr v1.0.2 follows up to 3 redirects to any host by default, so an
+            # admitted target's 302 had each route sent on to a host the run
+            # refused; 0 stops the hop (checked on the release binary).
+            cmd.extend(["--max-redirects", "0"])
+            print("[*][Kiterunner] Redirects not followed: RoE exclusions or the IP target list are in force")
+
+        # kr v1.0.2 cannot use the capture proxy: `scan` has no proxy flag (only
+        # `kb replay` has one; cobra exits 1 on an unknown flag before any
+        # request), and its fasthttp client dials direct, ignoring HTTP(S)_PROXY.
+        # So it runs direct under capture (fail-open, §20.1) and without the
+        # X-Redamon-Ctx tag, which rides only with the proxy (§20.2 no-leak).
         from helpers.proxy_routing import get_capture_routing
         _cap_url, _cap_token = get_capture_routing("kiterunner")
         if _cap_url and _cap_token:
@@ -609,6 +660,28 @@ def merge_kiterunner_into_by_base_url(
     return by_base_url, stats
 
 
+_METHOD_PROBE_TOOL = "kiterunner-methods"
+_METHOD_PROBE_TIMEOUT_S = 300
+
+
+def _note_method_probe_cut(probe: str) -> None:
+    """A method probe that hit its deadline: its container was stopped, and the
+    endpoints it had not answered for keep the method Kiterunner found. A gap
+    entry only: method detection writes no findings, so nothing to keep from the
+    prune. Never raises.
+    """
+    print(f"[!][Kiterunner] {probe} probe timed out after {_METHOD_PROBE_TIMEOUT_S}s -- "
+          f"stopped its container, reading what it wrote")
+    try:
+        from recon.helpers import circuit_breaker as _cb
+        _cb.note_degraded("resource_enum", entries=[{
+            "source": "kiterunner",
+            "reason": f"{probe} method probe timed out after {_METHOD_PROBE_TIMEOUT_S}s",
+            "skipped": 0}])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def detect_kiterunner_methods(
     kr_results: List[Dict],
     verify_docker_image: str,
@@ -711,7 +784,9 @@ def detect_kiterunner_methods(
                 cmd.extend(["-proxy", _cap_url, "-H", f"X-Redamon-Ctx: {_cap_token}"])
 
             try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if run_tool_container(cmd, tool=_METHOD_PROBE_TOOL,
+                                      timeout=_METHOD_PROBE_TIMEOUT_S).timed_out:
+                    _note_method_probe_cut("OPTIONS")
 
                 if output_file.exists():
                     with open(output_file, 'r') as f:
@@ -748,8 +823,6 @@ def detect_kiterunner_methods(
                             except json.JSONDecodeError:
                                 continue
 
-            except subprocess.TimeoutExpired:
-                print("[!][Kiterunner] OPTIONS probe timeout")
             except Exception as e:
                 print(f"[!][Kiterunner] OPTIONS probe error: {e}")
 
@@ -788,7 +861,9 @@ def detect_kiterunner_methods(
                     cmd.extend(["-proxy", _cap_url, "-H", f"X-Redamon-Ctx: {_cap_token}"])
 
                 try:
-                    subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    if run_tool_container(cmd, tool=_METHOD_PROBE_TOOL,
+                                          timeout=_METHOD_PROBE_TIMEOUT_S).timed_out:
+                        _note_method_probe_cut(method)
 
                     if output_file.exists():
                         with open(output_file, 'r') as f:
@@ -812,8 +887,6 @@ def detect_kiterunner_methods(
                                 except json.JSONDecodeError:
                                     continue
 
-                except subprocess.TimeoutExpired:
-                    print(f"[!][Kiterunner] {method} probe timeout")
                 except Exception as e:
                     print(f"[!][Kiterunner] {method} probe error: {e}")
     finally:

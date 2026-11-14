@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Plus, Pencil, Trash2, Loader2, AlertTriangle, CheckCircle2, XCircle, Server, Terminal, Globe, Zap, Eye, EyeOff } from 'lucide-react'
 import {
   mcpServerSchema,
@@ -8,6 +8,7 @@ import {
   TRANSPORTS,
   BUILTIN_RESERVED_TOOL_NAMES,
   SYSTEM_SERVER_IDS,
+  STDIO_ADMIN_ONLY_MESSAGE,
   type MCPServer,
   type ToolSpec,
   type Transport,
@@ -15,11 +16,21 @@ import {
 } from '@/lib/mcp/schema'
 import { MCP_PRESETS, PRESET_CATEGORY_LABELS, type McpPreset } from '@/lib/mcp/presets'
 import { useAlertModal, useToast } from '@/components/ui'
-import { readApiError, toApiError } from '@/lib/apiError'
+import { StepUpModal } from '@/components/auth/StepUpModal'
+import { readApiError, toApiError, type ApiError } from '@/lib/apiError'
 import { actionFailedText, failureText, saveWarningLines } from '../failureText'
 import { useDirtyState } from '@/hooks/useDirtyState'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import styles from './McpServersTab.module.css'
+
+/**
+ * The secret a save or test was refused for because the URL, or a stdio server's command,
+ * changed (HD-24): `auth.token`, `headers.<name>` or `env.<name>`, with the server's sentence.
+ */
+function reentryOf(err: ApiError): { field: string; message: string } | null {
+  const field = err.body?.field
+  return err.code === 'secret_reentry_required' && typeof field === 'string' ? { field, message: err.reason } : null
+}
 
 interface Props {
   userId: string
@@ -169,6 +180,19 @@ function emptyServer(): MCPServer {
   }
 }
 
+/**
+ * A listed server as the table and the editor read it. The list route returns rows as
+ * stored and the schema's defaults apply only on save, so a row written by a script or
+ * an older version can lack the two lists read here without a guard.
+ */
+function withListDefaults(srv: MCPServer): MCPServer {
+  return {
+    ...srv,
+    tools: Array.isArray(srv.tools) ? srv.tools : [],
+    default_phases: Array.isArray(srv.default_phases) ? srv.default_phases : [...PHASES],
+  }
+}
+
 function transportIcon(t: Transport) {
   if (t === 'stdio') return <Terminal size={14} />
   return <Globe size={14} />
@@ -178,6 +202,9 @@ const LOAD_FAILED = "Couldn't load your MCP Tool Plugins"
 
 export default function McpServersTab({ userId, onDirtyChange }: Props) {
   const [servers, setServers] = useState<MCPServer[]>([])
+  // Whether this account's stdio servers run (an administrator's: NF-14). The server
+  // refuses the rest anyway; until it answers, nothing is greyed out.
+  const [stdioAllowed, setStdioAllowed] = useState(true)
   const [loading, setLoading] = useState(false)
   // Never a silent empty list: that reads as "nothing saved" and invites a duplicate.
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -189,6 +216,18 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
   const [saving, setSaving] = useState(false)
   const [topLevelError, setTopLevelError] = useState<string | null>(null)
   const [tokenVisible, setTokenVisible] = useState(false)
+  // Focus target after a re-entry refusal: the token input, the headers box or the env box.
+  const tokenInput = useRef<HTMLInputElement | null>(null)
+  const headersInput = useRef<HTMLTextAreaElement | null>(null)
+  const envInput = useRef<HTMLTextAreaElement | null>(null)
+  const [reentryFocus, setReentryFocus] = useState<{ field: string } | null>(null)
+  useEffect(() => {
+    if (!reentryFocus) return
+    const { field } = reentryFocus
+    const target = field === 'auth.token' ? tokenInput.current
+      : field.startsWith('env.') ? envInput.current : headersInput.current
+    target?.focus()
+  }, [reentryFocus])
   const { dangerConfirm, alertError } = useAlertModal()
   const toast = useToast()
 
@@ -215,7 +254,8 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
       const r = await fetch(`/api/users/${userId}/mcp`)
       if (r.ok) {
         const data = await r.json()
-        setServers(Array.isArray(data.servers) ? data.servers : [])
+        setServers(Array.isArray(data.servers) ? data.servers.map(withListDefaults) : [])
+        setStdioAllowed(data.stdioAllowed !== false)
         setLoadError(null)
       } else {
         setLoadError(failureText(LOAD_FAILED, await readApiError(r, LOAD_FAILED)))
@@ -310,7 +350,15 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ server: draft, userId }),
       })
-      if (!r.ok) throw await readApiError(r, 'The MCP test failed')
+      if (!r.ok) {
+        const err = await readApiError(r, 'The MCP test failed')
+        const reentry = reentryOf(err)
+        if (reentry) {
+          setErrors({ [reentry.field]: reentry.message })
+          setReentryFocus({ field: reentry.field })
+        }
+        throw err
+      }
       const data = await r.json() as Partial<TestResult>
       setTestResult({
         ok: data.ok === true,
@@ -332,6 +380,25 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
     }
   }
 
+  // A saved server re-pointed (a new URL, stdio command or transport) asks for the
+  // signed-in person's password (ID-25); the dialog sends it with the same save.
+  const [stepUpOpen, setStepUpOpen] = useState(false)
+  const sendSave = (srv: MCPServer, stepUpPassword?: string) => fetch(
+    isNew ? `/api/users/${userId}/mcp` : `/api/users/${userId}/mcp/${encodeURIComponent(srv.id)}`,
+    {
+      method: isNew ? 'POST' : 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(stepUpPassword ? { ...srv, stepUpPassword } : srv),
+    },
+  )
+  const saved = async (r: Response) => {
+    warnIfNotReloaded(await r.json().catch(() => null))
+    await load()
+    setEditing(null)
+    setErrors({})
+    setTestResult(null)
+  }
+
   const onSave = async () => {
     if (!editing) return
     const localErrors = validate(editing)
@@ -342,16 +409,13 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
     setSaving(true)
     setTopLevelError(null)
     try {
-      const url = isNew
-        ? `/api/users/${userId}/mcp`
-        : `/api/users/${userId}/mcp/${encodeURIComponent(editing.id)}`
-      const r = await fetch(url, {
-        method: isNew ? 'POST' : 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(editing),
-      })
+      const r = await sendSave(editing)
       if (!r.ok) {
         const err = await readApiError(r, isNew ? 'Failed to add the MCP Tool Plugin' : 'Failed to update the MCP Tool Plugin')
+        if (err.code === 'step_up_required') {
+          setStepUpOpen(true)
+          return
+        }
         setTopLevelError(err.message)
         const issues = err.body?.issues
         if (Array.isArray(issues)) {
@@ -361,18 +425,27 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
           }
           setErrors(issueMap)
         }
+        const reentry = reentryOf(err)
+        if (reentry) {
+          setErrors({ [reentry.field]: reentry.message })
+          setReentryFocus({ field: reentry.field })
+        }
         return
       }
-      warnIfNotReloaded(await r.json().catch(() => null))
-      await load()
-      setEditing(null)
-      setErrors({})
-      setTestResult(null)
+      await saved(r)
     } catch (e) {
       setTopLevelError(toApiError(e, isNew ? 'Failed to add the MCP Tool Plugin' : 'Failed to update the MCP Tool Plugin').message)
     } finally {
       setSaving(false)
     }
+  }
+
+  const confirmStepUp = async (password: string) => {
+    if (!editing) return
+    const r = await sendSave(editing, password)
+    // Thrown, the dialog stays open and shows why (a wrong password, a lockout).
+    if (!r.ok) throw await readApiError(r, 'Failed to update the MCP Tool Plugin')
+    await saved(r)
   }
 
   const onDelete = async (serverId: string) => {
@@ -527,12 +600,14 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
             <div className={styles.presetsGrid}>
               {MCP_PRESETS.map(preset => {
                 const alreadyAdded = servers.some(s => s.id === preset.template.id)
+                const stdioRefused = !stdioAllowed && preset.template.transport === 'stdio'
                 return (
                   <button
                     key={preset.key}
                     className={styles.presetCard}
                     onClick={() => startFromPreset(preset)}
-                    title={preset.whyForRedamon}
+                    disabled={stdioRefused}
+                    title={stdioRefused ? STDIO_ADMIN_ONLY_MESSAGE : preset.whyForRedamon}
                   >
                     <div className={styles.presetCardTop}>
                       <span className={styles.presetCardLabel}>{preset.label}</span>
@@ -571,7 +646,10 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
               </tr>
             </thead>
             <tbody>
-              {servers.map(srv => (
+              {servers.map(srv => {
+                // Kept in the member's settings, never run: the agent is shared (NF-14).
+                const notRun = !stdioAllowed && srv.transport === 'stdio'
+                return (
                 <tr key={srv.id}>
                   <td>
                     <div className={styles.cellTitle}>{srv.name || srv.id}</div>
@@ -581,13 +659,15 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
                     <span className={styles.transportPill}>
                       {transportIcon(srv.transport)} {srv.transport}
                     </span>
+                    {notRun && <div className={styles.cellSub} role="note">{STDIO_ADMIN_ONLY_MESSAGE}</div>}
                   </td>
                   <td>{srv.tools.length}</td>
                   <td>
-                    <label className={styles.switch}>
+                    <label className={styles.switch} title={notRun ? STDIO_ADMIN_ONLY_MESSAGE : undefined}>
                       <input
                         type="checkbox"
-                        checked={srv.enabled}
+                        checked={srv.enabled && !notRun}
+                        disabled={notRun}
                         onChange={() => onToggleEnabled(srv)}
                       />
                       <span></span>
@@ -602,7 +682,8 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
                     </button>
                   </td>
                 </tr>
-              ))}
+                )
+              })}
             </tbody>
           </table>
         )}
@@ -747,7 +828,9 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
         <label className={styles.field}>
           <span>transport</span>
           <select value={editing.transport} onChange={e => updateField('transport', e.target.value as Transport)}>
-            {TRANSPORTS.map(t => <option key={t} value={t}>{t}</option>)}
+            {TRANSPORTS.map(t => (
+              <option key={t} value={t} disabled={t === 'stdio' && !stdioAllowed && editing.transport !== 'stdio'}>{t}</option>
+            ))}
           </select>
         </label>
 
@@ -826,6 +909,8 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
               <span>auth (bearer token, optional)</span>
               <div className={styles.tokenInputRow}>
                 <input
+                  ref={tokenInput}
+                  aria-label="bearer token"
                   type={tokenVisible ? 'text' : 'password'}
                   value={editing.auth?.token || ''}
                   onChange={e => updateField('auth', e.target.value
@@ -847,10 +932,12 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
               <span className={styles.muted} style={{ fontSize: '11px' }}>
                 Sent as <code>Authorization: Bearer …</code> on every MCP request.
               </span>
+              {errOf('auth.token') && <span className={styles.fieldErr} role="alert">{errOf('auth.token')}</span>}
             </div>
             <label className={`${styles.field} ${styles.fieldWide}`}>
               <span>custom headers (one per line, <code>Header-Name: value</code>)</span>
               <textarea
+                ref={headersInput}
                 rows={3}
                 value={Object.entries(editing.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n')}
                 onChange={e => {
@@ -871,6 +958,9 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
               <span className={styles.muted} style={{ fontSize: '11px' }}>
                 Sent verbatim on every MCP request alongside the bearer token. Used by multi-tenant APIs (e.g. Censys requires <code>X-Organization-ID</code>).
               </span>
+              {Object.keys(errors).filter(k => k.startsWith('headers.')).map(k => (
+                <span key={k} className={styles.fieldErr} role="alert">{errors[k]}</span>
+              ))}
             </label>
           </>
         )}
@@ -908,6 +998,7 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
             <label className={`${styles.field} ${styles.fieldWide}`}>
               <span>env vars (one per line, <code>KEY=VALUE</code>)</span>
               <textarea
+                ref={envInput}
                 rows={4}
                 value={Object.entries(editing.env || {}).map(([k, v]) => `${k}=${v}`).join('\n')}
                 onChange={e => {
@@ -930,6 +1021,9 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
               <span className={styles.muted} style={{ fontSize: '11px' }}>
                 Passed to the spawned process as environment variables. Used by stdio MCPs that read API keys from env (Shodan, VirusTotal, Snyk, etc.). Stored as plaintext in the DB.
               </span>
+              {Object.keys(errors).filter(k => k.startsWith('env.')).map(k => (
+                <span key={k} className={styles.fieldErr} role="alert">{errors[k]}</span>
+              ))}
             </label>
           </>
         )}
@@ -1061,6 +1155,16 @@ export default function McpServersTab({ userId, onDirtyChange }: Props) {
           </div>
         </div>
       ))}
+      {stepUpOpen && (
+        <StepUpModal
+          isOpen
+          title="Confirm the new endpoint"
+          message="This MCP Tool Plugin's secrets and the agent's tool calls will go to a new address or process. Enter your password to save the change."
+          confirmLabel="Save"
+          onConfirm={confirmStepUp}
+          onClose={() => setStepUpOpen(false)}
+        />
+      )}
     </div>
   )
 }

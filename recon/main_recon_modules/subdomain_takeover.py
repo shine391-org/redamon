@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -47,7 +48,39 @@ from recon.helpers import (
     resolve_cname_target,
     score_finding,
 )
-from recon.helpers.takeover_helpers import same_provider_family
+from recon.helpers import request_pacer
+from recon.helpers.docker_helpers import run_tool_container, tool_container_name
+from recon.helpers.takeover_helpers import (
+    is_placeholder_provider,
+    provider_from_sans,
+    same_provider_family,
+)
+
+_FINDING_SOURCE = "takeover_scan"
+
+
+def _note_layer_unchecked(layer: str, targets: Iterable[str], reason: str) -> None:
+    """Keep the earlier takeover findings of the hosts a layer did not check. Never raises.
+
+    A layer that times out, crashes or cannot start returns what a clean run
+    returns, and this module reports its own failures to nobody, so the prune
+    would read "no takeover finding on these hosts" as "gone". Every layer
+    writes takeover_scan and every finding names its host, so the cut is by
+    host (README "Degrade by host before degrading by source") and for
+    takeover_scan alone: the other modules reached those hosts. ``reason`` is
+    a fixed phrase or an exception class name, never tool output.
+    """
+    try:
+        from recon.helpers import circuit_breaker as cb
+        hosts = sorted({cb.host_key(t) for t in targets if isinstance(t, str)} - {""})
+        if not hosts:
+            return
+        cb.note_degraded("subdomain_takeover", hosts=hosts, host_source=_FINDING_SOURCE,
+                         source_only_hosts=True, reason=f"{layer} {reason}")
+        print(f"[!][Takeover] {layer} {reason}: {len(hosts)} host(s) not checked, "
+              f"their earlier takeover findings are kept")
+    except Exception:  # noqa: BLE001 - coverage bookkeeping never fails the scan
+        pass
 
 
 def _hosts_answering_2xx(recon_data: dict) -> set[str]:
@@ -220,17 +253,22 @@ def run_subdomain_takeover(
     try:
         normalized: list[dict] = []
 
+        # A layer that raises costs its own targets, not the other layers.
         if subjack_enabled and subdomains:
-            subjack_raw = _run_subjack(
-                subdomains=sorted(subdomains),
-                work_dir=work_dir,
-                settings=settings,
-            )
-            for raw in subjack_raw:
-                norm = normalize_subjack_result(raw)
-                if norm:
-                    normalized.append(norm)
-            print(f"[+][Takeover] Subjack: {sum(1 for r in subjack_raw if r.get('vulnerable'))} vulnerable row(s)")
+            try:
+                subjack_raw = _run_subjack(
+                    subdomains=sorted(subdomains),
+                    work_dir=work_dir,
+                    settings=settings,
+                )
+                for raw in subjack_raw:
+                    norm = normalize_subjack_result(raw)
+                    if norm:
+                        normalized.append(norm)
+                print(f"[+][Takeover] Subjack: {sum(1 for r in subjack_raw if r.get('vulnerable'))} vulnerable row(s)")
+            except Exception as e:
+                print(f"[!][Takeover] Subjack layer failed ({type(e).__name__})")
+                _note_layer_unchecked("Subjack", subdomains, f"raised {type(e).__name__}")
 
         if nuclei_takeovers_enabled and alive_urls:
             try:
@@ -246,7 +284,8 @@ def run_subdomain_takeover(
                         normalized.append(norm)
                 print(f"[+][Takeover] Nuclei takeovers: {len(nuclei_raw)} raw finding(s)")
             except Exception as e:
-                print(f"[!][Takeover] Nuclei takeover scan failed: {e}")
+                print(f"[!][Takeover] Nuclei takeover scan failed ({type(e).__name__})")
+                _note_layer_unchecked("Nuclei", alive_urls, f"raised {type(e).__name__}")
 
         if settings.get("BADDNS_ENABLED", False) and subdomains:
             try:
@@ -261,7 +300,8 @@ def run_subdomain_takeover(
                         normalized.append(norm)
                 print(f"[+][Takeover] BadDNS: {len(baddns_raw)} raw finding(s)")
             except Exception as e:
-                print(f"[!][Takeover] BadDNS scan failed: {e}")
+                print(f"[!][Takeover] BadDNS scan failed ({type(e).__name__})")
+                _note_layer_unchecked("BadDNS", subdomains, f"raised {type(e).__name__}")
 
         # --------------------------------------------------------------
         # 3. Enrich with CNAME resolution + live-target validation
@@ -291,7 +331,7 @@ def run_subdomain_takeover(
             n["cname_target"] = cname
             cname_provider = provider_from_cname(cname)
             current_provider = (n.get("takeover_provider") or "").lower()
-            if current_provider in ("", "unknown", "none"):
+            if is_placeholder_provider(current_provider):
                 if cname_provider:
                     n["takeover_provider"] = cname_provider
             elif cname_provider and not same_provider_family(cname_provider, current_provider):
@@ -349,13 +389,23 @@ def run_subdomain_takeover(
                 cert_prov = provider_from_cert(cert.get("issuer"), sans)
                 if cert_prov:
                     n["cert_provider"] = cert_prov
+                # Only a SAN on the provider's own edge domain says which edge
+                # serves the host. An issuer says who signed the certificate
+                # (Google Trust Services also signs Cloudflare's; ACM and
+                # Cloudflare sign customers' own names), so it is recorded
+                # above and never names, nor contradicts, the provider.
+                edge_prov = provider_from_sans(sans)
+                if edge_prov:
                     current = (n.get("takeover_provider") or "").lower()
-                    if current in ("", "unknown", "none"):
-                        n["takeover_provider"] = cert_prov
-                    elif cert_prov != current:
+                    if is_placeholder_provider(current):
+                        n["takeover_provider"] = edge_prov
+                    elif not same_provider_family(edge_prov, current):
+                        # Same rule as the CNAME check: the edge's default
+                        # certificate (*.azurewebsites.net) corroborates a
+                        # generic `azure` template, it does not contradict it.
                         n["cert_provider_mismatch"] = True
-                    # The edge presents its own default cert (identifies a
-                    # provider) but does NOT name this host -> claimable.
+                    # The edge presents its own default cert and does NOT
+                    # name this host -> claimable.
                     if not n["cert_name_match"]:
                         n["cert_provider_default"] = True
 
@@ -369,17 +419,34 @@ def run_subdomain_takeover(
         # ai_waf_likely back into score_finding() which subtracts 40 points
         # so AI-flagged collisions land in manual_review.
         if ai_classifier_enabled and ai_pipeline_model:
+            # The probe is a request of its own, so it goes only to a host this
+            # run admitted (scope and RoE, every address). A Nuclei finding is
+            # named after the URL that matched, which a followed redirect can put
+            # on a host no layer was handed.
+            from urllib.parse import urlsplit
+            admitted = set(subdomains)
+            for url in alive_urls:
+                try:
+                    host = (urlsplit(url).hostname or "").rstrip(".")
+                except ValueError:
+                    continue
+                if host:
+                    admitted.add(host)
+            probe_able = [n for n in normalized if n.get("hostname") in admitted]
+            if len(probe_able) != len(normalized):
+                print(f"[-][Takeover-AI] {len(normalized) - len(probe_able)} candidate(s) on a host "
+                      "this run did not admit -- not probed, their static signal stands")
             # Skip the LLM for findings the certificate already settles: a clean
             # cert naming this host proves the SaaS edge serves the legit
             # customer, so the WAF-collision question is moot. A handshake is
             # cheaper and deterministic than an LLM call.
             to_disambiguate = [
-                n for n in normalized
+                n for n in probe_able
                 if not (n.get("cert_name_match") and not (n.get("cert_expired")
                         or n.get("cert_self_signed") or n.get("cert_mismatched")))
             ]
             if to_disambiguate:
-                settled = len(normalized) - len(to_disambiguate)
+                settled = len(probe_able) - len(to_disambiguate)
                 print(f"[*][Takeover-AI] Disambiguating {len(to_disambiguate)} candidate(s) via LLM cascade"
                       + (f" ({settled} settled by certificate)" if settled else ""))
                 try:
@@ -395,13 +462,13 @@ def run_subdomain_takeover(
                     # Never let AI failure abort the takeover scan -- emit warning
                     # and continue with the static findings.
                     print(f"[!][Takeover-AI] Cascade pass failed: {e}")
-            elif normalized:
+            elif probe_able:
                 # Candidates exist but a clean certificate already settled every
                 # one of them. Saying "no candidates" here would misreport a
                 # working cost optimisation as an empty scan.
-                print(f"[*][Takeover-AI] All {len(normalized)} candidate(s) settled by "
+                print(f"[*][Takeover-AI] All {len(probe_able)} candidate(s) settled by "
                       "certificate evidence -- no LLM calls needed")
-            else:
+            elif not normalized:
                 # Cascade is on but Subjack/Nuclei produced zero candidates,
                 # so there's nothing for the LLM to classify. Log explicitly
                 # so the absence of [Takeover-AI] activity is intentional,
@@ -534,6 +601,7 @@ def _run_subjack(
     """
     if not shutil.which("subjack"):
         print("[!][Takeover][Subjack] binary not found in PATH -- skipping subjack layer")
+        _note_layer_unchecked("Subjack", subdomains, "binary not found")
         return []
 
     targets_file = work_dir / "subjack_targets.txt"
@@ -566,14 +634,19 @@ def _run_subjack(
             check=False,
         )
     except subprocess.TimeoutExpired:
+        # It never says which names it reached, so every one stays unchecked;
+        # the rows it already wrote are still real findings.
         print(f"[!][Takeover][Subjack] run timed out after {run_timeout}s")
-        return []
+        _note_layer_unchecked("Subjack", subdomains, f"timed out after {run_timeout}s")
+        return _load_subjack_json(output_file) if output_file.exists() else []
     except FileNotFoundError:
         print("[!][Takeover][Subjack] binary not available")
+        _note_layer_unchecked("Subjack", subdomains, "binary not available")
         return []
 
     if proc.returncode not in (0, None):
-        # Subjack sometimes exits non-zero when nothing is vulnerable -- log but continue
+        # Subjack sometimes exits non-zero when nothing is vulnerable, so the
+        # exit code cannot tell a failure from a clean run -- log but continue
         stderr = (proc.stderr or "").strip()
         if stderr:
             print(f"[!][Takeover][Subjack] stderr: {stderr[:300]}")
@@ -635,6 +708,7 @@ def _run_nuclei_takeover(urls: list[str], work_dir: Path, settings: dict) -> lis
     """
     if not is_docker_installed() or not is_docker_running():
         print("[!][Takeover][Nuclei] Docker unavailable -- skipping nuclei layer")
+        _note_layer_unchecked("Nuclei", urls, "Docker unavailable")
         return []
 
     nuclei_image = settings.get("NUCLEI_DOCKER_IMAGE", "projectdiscovery/nuclei:latest")
@@ -659,6 +733,7 @@ def _run_nuclei_takeover(urls: list[str], work_dir: Path, settings: dict) -> lis
     container_name = f"redamon-nuclei-takeover-{uuid.uuid4().hex[:12]}"
     from recon.helpers.auth_profile import append_engagement_identity as _append_identity
     _takeover_headers = _append_identity([], settings)
+    from recon.helpers.target_admission import admission_context
     cmd = build_nuclei_command(
         targets_file=str(targets_file),
         output_file=str(output_file),
@@ -678,41 +753,33 @@ def _run_nuclei_takeover(urls: list[str], work_dir: Path, settings: dict) -> lis
         auth_headers=_takeover_headers,
         container_name=container_name,
         max_host_error=int(settings.get("NUCLEI_MAX_HOST_ERROR", 30)),
+        ip_mode=bool(settings.get("IP_MODE")),
+        # An admitted candidate's 302 can name an excluded host (R-2).
+        roe_exclusions=bool(admission_context(settings).excluded),
     )
     print(f"[*][Takeover][Nuclei] {' '.join(cmd)}")
 
     run_timeout = max(120, int(settings.get("NUCLEI_TAKEOVER_RUN_TIMEOUT", 1800)))
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=run_timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        # The docker CLI is killed by subprocess, but the daemon-owned container
-        # keeps running; kill it by name (mirror _run_baddns) and keep the
-        # partial JSONL that is already on disk.
-        print(f"[!][Takeover][Nuclei] run timed out after {run_timeout}s -- killing container")
-        try:
-            subprocess.run(["docker", "kill", container_name],
-                           capture_output=True, text=True, timeout=15, check=False)
-        except Exception as e:  # noqa: BLE001
-            print(f"[!][Takeover][Nuclei] failed to kill orphan container: {type(e).__name__}")
-        try:
-            fix_file_ownership(output_file)
-        except Exception:
-            pass
-        return _load_nuclei_jsonl(output_file)
+        proc = run_tool_container(cmd, tool="nuclei-takeover", timeout=run_timeout,
+                                  name=container_name)
     except FileNotFoundError:
         print("[!][Takeover][Nuclei] docker binary missing")
+        _note_layer_unchecked("Nuclei", urls, "docker binary missing")
         return []
 
-    if proc.returncode not in (0, None):
+    if proc.timed_out:
+        # Stopped by its name; the JSONL it wrote before the cut is read below.
+        print(f"[!][Takeover][Nuclei] run timed out after {run_timeout}s -- container stopped, "
+              f"keeping its partial results")
+        _note_layer_unchecked("Nuclei", urls, f"timed out after {run_timeout}s")
+    elif proc.returncode not in (0, None):
         stderr = (proc.stderr or "").strip()
         if stderr:
             print(f"[!][Takeover][Nuclei] stderr: {stderr[:300]}")
+        # Nuclei exits 0 whether or not a template matched: anything else is a
+        # docker error, a kill or a fatal nuclei error (as vuln_scan reads it).
+        _note_layer_unchecked("Nuclei", urls, f"exited {proc.returncode}")
 
     # Fix ownership on output so we can read it as the recon user
     try:
@@ -743,6 +810,7 @@ def _run_baddns(
     """
     if not is_docker_installed() or not is_docker_running():
         print("[!][Takeover][BadDNS] Docker unavailable -- skipping baddns layer")
+        _note_layer_unchecked("BadDNS", subdomains, "Docker unavailable")
         return []
 
     baddns_image = settings.get("BADDNS_DOCKER_IMAGE", "redamon-baddns:latest")
@@ -755,9 +823,11 @@ def _run_baddns(
         )
         if inspect.returncode != 0:
             print(f"[!][Takeover][BadDNS] image {baddns_image} not found on host -- run `docker compose --profile tools build baddns-scanner`")
+            _note_layer_unchecked("BadDNS", subdomains, "image not found")
             return []
     except Exception as e:
         print(f"[!][Takeover][BadDNS] cannot inspect image: {e}")
+        _note_layer_unchecked("BadDNS", subdomains, "image inspect failed")
         return []
 
     targets_filename = "baddns_targets.txt"
@@ -782,11 +852,8 @@ def _run_baddns(
     if isinstance(nameservers, str):
         nameservers = [n.strip() for n in nameservers.split(",") if n.strip()]
 
-    # Unique container name so we can reliably `docker kill` on Python
-    # timeout. Without --name, a TimeoutExpired leaves an orphan container
-    # running on the host because subprocess.run kills the docker CLI but
-    # the daemon-owned container keeps going.
-    container_name = f"redamon-baddns-{os.getpid()}-{int(time.time())}"
+    # Named here (not by run_tool_container) so the printed command shows it.
+    container_name = tool_container_name("baddns")
     cmd = build_baddns_command(
         work_dir_host=work_dir_host,
         targets_filename=targets_filename,
@@ -799,43 +866,73 @@ def _run_baddns(
 
     run_timeout = max(120, int(settings.get("BADDNS_RUN_TIMEOUT", 1800)))
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=run_timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"[!][Takeover][BadDNS] run timed out after {run_timeout}s -- killing container")
-        # Reap the orphan so the host doesn't accumulate zombies
-        try:
-            subprocess.run(
-                ["docker", "kill", container_name],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
-        except Exception as e:
-            print(f"[!][Takeover][BadDNS] failed to kill orphan container: {e}")
-        return []
+        proc = run_tool_container(cmd, tool="baddns", timeout=run_timeout, name=container_name)
     except FileNotFoundError:
         print("[!][Takeover][BadDNS] docker binary missing")
+        _note_layer_unchecked("BadDNS", subdomains, "docker binary missing")
         return []
 
-    if proc.returncode not in (0, None):
-        stderr = (proc.stderr or "").strip()
+    findings = _parse_baddns_stdout(proc.stdout)
+    if proc.timed_out:
+        print(f"[!][Takeover][BadDNS] run timed out after {run_timeout}s -- stopped it, "
+              f"keeping the {len(findings)} finding(s) it printed")
+        _note_layer_unchecked("BadDNS", _baddns_unfinished_targets(subdomains, findings),
+                              f"timed out after {run_timeout}s")
+    elif proc.returncode != 0:
+        stderr = proc.stderr.strip()
         if stderr:
             print(f"[!][Takeover][BadDNS] stderr: {stderr[:400]}")
+        # The batch entrypoint ends 0 however its targets went: anything else is
+        # a docker error, a kill or a refused targets file.
+        _note_layer_unchecked("BadDNS", subdomains, f"exited {proc.returncode}")
 
     # Surface the entrypoint's summary line on stderr so orchestrator logs
     # show scanned/skipped/findings totals even on successful runs.
-    stderr = (proc.stderr or "").strip()
+    stderr = proc.stderr.strip()
     if stderr:
         for summary_line in stderr.splitlines():
             if ("baddns-batch] summary:" in summary_line
                     or "] timeout after" in summary_line):
                 print(f"[*][Takeover][BadDNS] {summary_line}")
+    timed_out = _baddns_timed_out_targets(stderr, subdomains)
+    if timed_out:
+        _note_layer_unchecked("BadDNS", timed_out, "per-target timeout")
 
-    return _parse_baddns_stdout(proc.stdout or "")
+    return findings
+
+
+def _baddns_unfinished_targets(subdomains: list[str], findings: list[dict]) -> list[str]:
+    """The names a BadDNS run cut by its deadline may not have finished.
+
+    The batch entrypoint checks the targets file (``subdomains``, in order) one
+    name at a time and prints a name's findings only once it is done with it,
+    and stdout arrives in order. So every name before the last one with a
+    printed finding was finished. That one may have lost lines to the cut, and
+    the names after it may never have been reached; with nothing printed, none
+    is known finished. Only stdout counts: stderr may arrive out of step with it.
+    """
+    printed = {str(f.get("target") or "").strip().lower() for f in findings}
+    frontier = max((i for i, name in enumerate(subdomains) if name.lower() in printed),
+                   default=0)
+    return list(subdomains[frontier:])
+
+
+_BADDNS_TARGET_TIMEOUT = re.compile(r"\[baddns-batch\] timeout after \d+s on (\S+)\s*$")
+
+
+def _baddns_timed_out_targets(stderr: str, subdomains: Iterable[str]) -> list[str]:
+    """The names the batch entrypoint gave up on (its per-target timeout).
+
+    Only names this run asked about count: the line is read back from a
+    container's stderr.
+    """
+    asked = {s.lower() for s in subdomains}
+    names = set()
+    for line in (stderr or "").splitlines():
+        match = _BADDNS_TARGET_TIMEOUT.search(line.strip())
+        if match and match.group(1).lower() in asked:
+            names.add(match.group(1).lower())
+    return sorted(names)
 
 
 def _parse_baddns_stdout(stdout: str) -> list[dict]:
@@ -894,8 +991,9 @@ def _collect_subdomains(recon_data: dict, settings: Optional[dict] = None) -> li
 
     A group's recon file narrows that (§4.6): the scan root only when it is a
     target, an EXACT group's listed hosts and nothing else. IP mode's synthetic
-    root is never a name to check. The RoE applies in every mode, partial runs
-    (which pass a `domains` list and skip the group scope) included.
+    root is never a name to check. A partial run passes a `domains` list and
+    skips the group scope, but each of its roots is still checked only when
+    its group includes the root (L-22). The RoE applies in every mode.
     """
     from recon.helpers.recon_scope import recon_scope
     scope = recon_scope(recon_data)
@@ -904,6 +1002,7 @@ def _collect_subdomains(recon_data: dict, settings: Optional[dict] = None) -> li
     roots = recon_data.get("domains")
     if not isinstance(roots, list) or not roots:
         roots = [recon_data.get("domain") or recon_data.get("metadata", {}).get("target", "")]
+    left_out = _roots_left_out(recon_data, roots, scope)
     for root in roots:
         if isinstance(root, str) and root.strip():
             names.add(root.strip().lower())
@@ -931,11 +1030,12 @@ def _collect_subdomains(recon_data: dict, settings: Optional[dict] = None) -> li
         if scope.admits(h) if scope.mode else any(h.endswith("." + r) for r in root_names):
             names.add(h)
 
-    names = {n for n in names if not n.startswith("ip-targets.")}
+    names = {n for n in names if not n.startswith("ip-targets.") and n.strip(".") not in left_out}
     if scope.mode and not isinstance(recon_data.get("domains"), list):
         if scope.exact:
             names |= set(scope.targets())
         names = {n for n in names if scope.admits(n)}
+    names &= _ip_mode_selected(recon_data, names)
     excluded = _roe_excluded_list(settings)
     if excluded:
         from recon.helpers.roe_scope import _is_roe_excluded
@@ -943,7 +1043,56 @@ def _collect_subdomains(recon_data: dict, settings: Optional[dict] = None) -> li
         if len(kept) != len(names):
             print(f"[RoE] Takeover: skipped {len(names) - len(kept)} excluded name(s)")
         names = kept
-    return [n for n in names if n and "." in n]
+    names = {n for n in names if n and "." in n}
+    if excluded and not (recon_data.get("metadata") or {}).get("ip_mode"):
+        from recon.helpers.target_admission import admission_context, admit_targets, known_addresses
+        if admission_context(settings, recon_data).ip_rules:
+            # Subjack and BadDNS resolve each name themselves (and the AI probe
+            # fetches it), so they may land on any address it has: under RoE IP
+            # or CIDR entries a name goes only when every address the run knows
+            # for it is allowed, and one with no known address is refused and
+            # kept as not checked (D2). IP mode keeps only names whose every
+            # address is an RoE-filtered target already.
+            known = known_addresses(recon_data)
+            names = set(admit_targets(settings, recon_data,
+                                      names={n: known.get(n, []) for n in sorted(names)},
+                                      module="takeover", resolves_names=True).names)
+    return list(names)
+
+
+def _roots_left_out(recon_data: dict, roots, scope) -> set:
+    """The roots whose own group leaves Include Root off: no name to check.
+
+    The group is the one the graph writers read (scope_groups_by_root: the
+    dict's scope_groups, else the partial run's, which _prepare_scope records),
+    so the takeover scan never checks a root they would skip. A root with no
+    group follows the dict's include_root_domain, on unless explicitly off, as
+    the builders' legacy flag does. IP mode has its own rule
+    (_ip_mode_selected).
+    """
+    if scope.ip_mode:
+        return set()
+    from graph_db.mixins.recon.scope import scope_groups_by_root
+    groups = scope_groups_by_root(recon_data)
+    left_out = set()
+    for root in roots:
+        name = str(root or "").strip().strip(".").lower()
+        if not name:
+            continue
+        group = groups.get(name)
+        if not (bool(group.get("include_root")) if group is not None else scope.include_root):
+            left_out.add(name)
+    return left_out
+
+
+def _ip_mode_selected(recon_data: dict, names) -> set:
+    """IP mode: the names the hostname rule selected (metadata.ip_mode_hosts).
+    A takeover is a dangling name; an IP-mode run's labels and addresses are
+    none, and a recorded name is no target (I-4). Outside IP mode: `names`."""
+    metadata = recon_data.get("metadata") or {}
+    if not metadata.get("ip_mode"):
+        return set(names)
+    return set(metadata.get("ip_mode_hosts") or {})
 
 
 def _collect_alive_urls(recon_data: dict, settings: Optional[dict] = None) -> list[str]:
@@ -975,10 +1124,28 @@ def _collect_alive_urls(recon_data: dict, settings: Optional[dict] = None) -> li
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 urls.add(url)
 
+    if (recon_data.get("metadata") or {}).get("ip_mode"):
+        from urllib.parse import urlsplit
+        selected = _ip_mode_selected(recon_data, ())
+
+        def host_of(url):
+            try:
+                return (urlsplit(url).hostname or "").rstrip(".").lower()
+            except ValueError:
+                return ""
+
+        urls = {u for u in urls if host_of(u) in selected}
+
     excluded = _roe_excluded_list(settings)
     if excluded:
         from recon.helpers.roe_scope import _is_roe_excluded
         urls = {u for u in urls if not _is_roe_excluded(u, excluded)}
+        if not (recon_data.get("metadata") or {}).get("ip_mode"):
+            from recon.helpers.target_admission import admission_context, admit_urls
+            if admission_context(settings, recon_data).ip_rules:
+                # Nuclei resolves each URL's host itself: the same address rule
+                # as the names Subjack gets.
+                urls = set(admit_urls(settings, recon_data, sorted(urls), module="takeover")[0])
     return sorted(urls)
 
 
@@ -1006,6 +1173,11 @@ def _probe_for_ai_disambiguation(hostname: str, timeout: int = 10, settings: Opt
     re-trims to 4KB anyway, so capturing more is wasted memory).
     Catches every exception class -- a probe failure must NEVER abort the
     takeover scan.
+
+    Judges the FIRST response and never follows a redirect: a takeover
+    candidate is a host someone else may control, so its Location must not
+    pick the next destination (cloud metadata, the stack's own services, an
+    RoE-excluded host). A 3xx is returned as-is, Location included as data.
     """
     import requests
     import urllib3
@@ -1017,11 +1189,13 @@ def _probe_for_ai_disambiguation(hostname: str, timeout: int = 10, settings: Opt
         {"User-Agent": "Mozilla/5.0 (compatible; RedAmon/4.7)"},
         identity_header_dict(settings))
     for scheme in schemes:
+        # The HTTP fallback is a request of its own: it takes its own RoE slot.
+        request_pacer.acquire()
         try:
             r = requests.get(
                 f"{scheme}://{hostname}/",
                 timeout=timeout,
-                allow_redirects=True,
+                allow_redirects=False,
                 verify=False,
                 headers=headers_base,
             )

@@ -13,6 +13,8 @@ from state import (
     DeepThinkResult,
     ExecutionStep,
     LLMDecision,
+    NO_APPROVAL_ANSWER,
+    NO_TOOL_CONFIRMATION_ANSWER,
     PhaseHistoryEntry,
     PhaseTransitionRequest,
     TargetInfo,
@@ -30,7 +32,7 @@ import orchestrator_helpers.chain_graph_writer as chain_graph
 from orchestrator_helpers.agent_context import get_agent_context
 from orchestrator_helpers.json_utils import json_dumps_safe, normalize_content
 from orchestrator_helpers.parsing import try_parse_llm_decision
-from orchestrator_helpers.config import get_identifiers, is_session_config_complete
+from orchestrator_helpers.config import get_identifiers, get_tenant_id, is_session_config_complete
 from orchestrator_helpers.finding_guard import unrecorded_confirmations, unrecorded_note
 from orchestrator_helpers.llm_retry import retry_llm_call
 from orchestrator_helpers.llm_retry import llm_error_reason
@@ -55,6 +57,7 @@ from orchestrator_helpers.productivity import (
     is_unproductive,
 )
 from project_settings import get_setting, get_allowed_tools_for_phase, get_enabled_builtin_skills, get_enabled_user_skills, is_dangerous_call
+from decision_check import authorize_unasked, run_actor_holds, unasked_refusal_text
 
 from prompts import (
     REACT_SYSTEM_PROMPT,
@@ -169,6 +172,47 @@ def _phase_breadcrumb_trace(state, updates, iteration, phase, *, redundant, coun
     return base + [step.model_dump()]
 
 
+def _refused_transition_trace(state, updates, iteration, phase, to_phase, text):
+    """A transition the project would take unasked, refused for the run's person: in the
+    trace, the channel the think LLM re-reads (see _phase_breadcrumb_trace)."""
+    step = ExecutionStep(
+        iteration=iteration,
+        phase=phase,
+        thought=f"Transition to {to_phase} refused (permission).",
+        reasoning="The project does not ask for this phase approval, and the person running the "
+                  "agent may not give it.",
+        tool_name="phase_transition",
+        tool_args={"to_phase": to_phase, "refused": True},
+        tool_output=f"REFUSED: {text}",
+        success=False,
+        output_analysis=(
+            f"Do NOT request transition_phase to {to_phase} again in this run. Keep working in "
+            f"the {phase} phase with its tools, or complete and report what you found."
+        ),
+    )
+    base = updates["execution_trace"] if "execution_trace" in updates else state.get("execution_trace", [])
+    return base + [step.model_dump()]
+
+
+def _refused_transitions(trace, to_phase) -> int:
+    return sum(1 for s in (trace or []) if isinstance(s, dict)
+               and (s.get("tool_args") or {}).get("refused")
+               and (s.get("tool_args") or {}).get("to_phase") == to_phase)
+
+
+async def _tell_chat_unasked(streaming_callbacks, session_id, check, text) -> None:
+    """Show a refused unasked decision in the chat. The frame names no `answer`: nobody was
+    asked, so the drawer has no card to put back."""
+    cb = (streaming_callbacks or {}).get(session_id)
+    if cb is None:
+        return
+    try:
+        await cb.on_error(text, recoverable=True, code=check.code,
+                          **({"permission": check.permission} if check.permission else {}))
+    except Exception as e:
+        logger.warning(f"[{session_id}] refused decision not shown in the chat: {type(e).__name__}")
+
+
 def build_system_message_content(system_prompt: str, llm, anthropic_caching: bool):
     """The think prompt as tier blocks, or as one string with the markers removed.
 
@@ -217,6 +261,36 @@ def build_system_message_content(system_prompt: str, llm, anthropic_caching: boo
     return content
 
 
+def scope_guardrail_section() -> str:
+    """The SCOPE GUARDRAIL block of the system prompt, or '' when there is no
+    scope to show and the guardrail is off.
+
+    The prompt is the only control on which hosts the agent's tools target (the
+    guardrails judge the project, not each call), so the scope itself is listed
+    whenever there is one; an EXACT project's limits exist nowhere else in the
+    agent's view. An IP-mode project lists its target entries and what a
+    hostname on them is in its hostname mode (compact_scope_text).
+    """
+    from project_settings import compact_scope_text
+    scope_text = compact_scope_text()
+    if not scope_text and not get_setting('AGENT_GUARDRAIL_ENABLED', True):
+        return ''
+    section = (
+        "\n\n## SCOPE GUARDRAIL\n\n"
+        "You must ONLY operate against the project's configured target domain/IPs. "
+        "Never scan, exploit, probe, or interact with domains or IPs outside the authorized scope. "
+        "If the user asks you to target something outside the project scope, refuse and explain why."
+    )
+    if scope_text:
+        section += (
+            "\n\nIn scope:\n" + scope_text + "\n\n"
+            "Nothing else is in scope. A Domain node in the graph names the organisation "
+            "(the registrable domain) and is not automatically in scope: neither it nor a "
+            "host under it is a target unless the list above covers it."
+        )
+    return section
+
+
 async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_creds, streaming_callbacks=None, graph_view_cyphers=None) -> dict:
     """
     Core ReAct reasoning node.
@@ -231,6 +305,9 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         neo4j_creds: Tuple of (neo4j_uri, neo4j_user, neo4j_password).
     """
     user_id, project_id, session_id = get_identifiers(state, config)
+    # The project's owner: the graph the tools read and the chain writes below carry
+    # (user_id is the person, for the logs).
+    tenant_id = get_tenant_id(state, config)
     neo4j_uri, neo4j_user, neo4j_password = neo4j_creds
 
     iteration = state.get("current_iteration", 0) + 1
@@ -244,7 +321,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
     logger.info(f"[{user_id}/{project_id}/{session_id}] Think node - iteration {iteration}, phase: {phase}")
 
     # Set context for tools
-    set_tenant_context(user_id, project_id)
+    set_tenant_context(tenant_id, project_id)
     set_phase_context(phase)
     if graph_view_cyphers:
         set_graph_view_context(graph_view_cyphers.get(session_id))
@@ -582,7 +659,8 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
     # saves ~500 tokens per call and avoids the LLM emitting a gated action.
     ft_action_enum, ft_plan_field, ft_example = build_fireteam_prompt_fragments(
         enabled=get_setting("FIRETEAM_ENABLED", False)
-                and get_setting("PERSISTENT_CHECKPOINTER", False),
+                and get_setting("PERSISTENT_CHECKPOINTER", False)
+                and run_actor_holds("agent:fireteam"),
         phase=phase,
         allowed_phases=get_setting("FIRETEAM_ALLOWED_PHASES", ["informational"]),
         max_members=int(get_setting("FIRETEAM_MAX_MEMBERS", 5)),
@@ -650,26 +728,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
     if get_setting('STEALTH_MODE', False):
         logger.info(f"[{user_id}/{project_id}/{session_id}] STEALTH MODE active — injected stealth rules into prompt")
 
-    # Scope guardrail. The prompt is the only control on which hosts the agent's
-    # tools target (the guardrails judge the project, not each call), so the
-    # scope itself is listed whenever there is one; an EXACT project's limits
-    # exist nowhere else in the agent's view.
-    from project_settings import compact_scope_text
-    _scope_text = compact_scope_text()
-    if _scope_text or get_setting('AGENT_GUARDRAIL_ENABLED', True):
-        system_prompt += (
-            "\n\n## SCOPE GUARDRAIL\n\n"
-            "You must ONLY operate against the project's configured target domain/IPs. "
-            "Never scan, exploit, probe, or interact with domains or IPs outside the authorized scope. "
-            "If the user asks you to target something outside the project scope, refuse and explain why."
-        )
-        if _scope_text:
-            system_prompt += (
-                "\n\nIn scope:\n" + _scope_text + "\n\n"
-                "Nothing else is in scope. A Domain node in the graph names the organisation "
-                "(the registrable domain) and is not automatically in scope: neither it nor a "
-                "host under it is a target unless the list above covers it."
-            )
+    system_prompt += scope_guardrail_section()
 
     # Rules of Engagement injection
     if get_setting('ROE_ENABLED', False):
@@ -1125,6 +1184,12 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             _fireteam_gate_note = "persistent checkpointer required (PERSISTENT_CHECKPOINTER=false); fireteam cannot run safely without it"
         elif phase not in allowed_phases:
             _fireteam_gate_note = f"phase '{phase}' not in allowed phases {allowed_phases}"
+        else:
+            # Nobody is asked before a wave starts, so the run's person must hold it (OQ-R6).
+            _ft_check = await authorize_unasked("fireteam_deploy", "agent:fireteam")
+            if not _ft_check.allowed:
+                _fireteam_gate_note = unasked_refusal_text(_ft_check, "start a Fireteam")
+                await _tell_chat_unasked(streaming_callbacks, session_id, _ft_check, _fireteam_gate_note)
         if _fireteam_gate_note:
             logger.warning(f"[{user_id}/{project_id}/{session_id}] deploy_fireteam rejected: {_fireteam_gate_note}")
             decision = decision.model_copy(update={
@@ -1420,7 +1485,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     step_id=step_id,
                     chain_id=session_id,
                     prev_step_id=prev_step_id,
-                    user_id=user_id, project_id=project_id,
+                    user_id=tenant_id, project_id=project_id,
                     iteration=step_iteration, phase=phase,
                     tool_name=pending_step.get("tool_name"),
                     tool_args_summary=str(pending_step.get("tool_args", {}))[:500],
@@ -1447,7 +1512,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                         neo4j_uri, neo4j_user, neo4j_password,
                         chain_id=session_id,
                         step_id=step_id,
-                        user_id=user_id,
+                        user_id=tenant_id,
                         project_id=project_id,
                         attack_type=details.get("attack_type", state.get("attack_path_type", "cve_exploit")),
                         target_ip=details.get("target_ip", merged_target.primary_target),
@@ -1473,7 +1538,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 chain_graph.fire_record_finding(
                     neo4j_uri, neo4j_user, neo4j_password,
                     chain_id=session_id, step_id=step_id,
-                    user_id=user_id, project_id=project_id,
+                    user_id=tenant_id, project_id=project_id,
                     finding_type=cf.finding_type, severity=cf.severity,
                     title=cf.title, evidence=cf.evidence,
                     confidence=cf.confidence, phase=phase,
@@ -1492,7 +1557,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 chain_graph.fire_record_failure(
                     neo4j_uri, neo4j_user, neo4j_password,
                     chain_id=session_id, step_id=step_id,
-                    user_id=user_id, project_id=project_id,
+                    user_id=tenant_id, project_id=project_id,
                     failure_type="tool_error",
                     tool_name=pending_step.get("tool_name", ""),
                     error_message=pending_step.get("error_message", ""),
@@ -1706,7 +1771,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             combined_extracted = analysis.extracted_info.model_dump() if hasattr(analysis.extracted_info, 'model_dump') else {}
 
         for i, plan_step in enumerate(plan_steps):
-            step_id = uuid4().hex[:8]
+            step_id = uuid4().hex
             step_thought = f"[Wave] {plan_step.get('rationale', '')}"
             step_reasoning = pending_plan.get("plan_rationale", "")
             step_output_analysis = analysis.interpretation if analysis else (plan_step.get("tool_output") or "")[:20000]
@@ -1761,7 +1826,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     step_id=_sid,
                     chain_id=session_id,
                     prev_step_id=_prev,
-                    user_id=user_id, project_id=project_id,
+                    user_id=tenant_id, project_id=project_id,
                     iteration=plan_iteration, phase=phase,
                     tool_name=_ps.get("tool_name", ""),
                     tool_args_summary=str(_ps.get("tool_args", {}))[:500],
@@ -1788,7 +1853,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 chain_graph.fire_record_failure(
                     neo4j_uri, neo4j_user, neo4j_password,
                     chain_id=session_id, step_id=step_id,
-                    user_id=user_id, project_id=project_id,
+                    user_id=tenant_id, project_id=project_id,
                     failure_type="tool_error",
                     tool_name=plan_step.get("tool_name", ""),
                     error_message=plan_step.get("error_message", ""),
@@ -1807,7 +1872,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                         neo4j_uri, neo4j_user, neo4j_password,
                         chain_id=session_id,
                         step_id=last_step_id,
-                        user_id=user_id,
+                        user_id=tenant_id,
                         project_id=project_id,
                         attack_type=details.get("attack_type", state.get("attack_path_type", "cve_exploit")),
                         target_ip=details.get("target_ip", merged_target.primary_target),
@@ -1836,7 +1901,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 chain_graph.fire_record_finding(
                     neo4j_uri, neo4j_user, neo4j_password,
                     chain_id=session_id, step_id=last_step_id,
-                    user_id=user_id, project_id=project_id,
+                    user_id=tenant_id, project_id=project_id,
                     finding_type=cf.finding_type, severity=cf.severity,
                     title=cf.title, evidence=cf.evidence,
                     confidence=cf.confidence, phase=phase,
@@ -2020,6 +2085,20 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 risks=phase_transition.risks if phase_transition else [],
             ).model_dump()
             updates["awaiting_user_approval"] = True
+            updates.update(NO_APPROVAL_ANSWER)
+        elif not (_phase_check := await authorize_unasked("approval", "agent:approve_phase")).allowed:
+            # The approval the project skips is still the run's person's to give.
+            _text = unasked_refusal_text(_phase_check, f"move to the {to_phase} phase")
+            logger.warning(f"[{user_id}/{project_id}/{session_id}] [rbac] unasked transition refused: "
+                           f"{phase} -> {to_phase} code={_phase_check.code}")
+            updates["_decision"]["tool_name"] = None
+            updates["execution_trace"] = _refused_transition_trace(
+                state, updates, iteration, phase, to_phase, _text)
+            updates["messages"] = [HumanMessage(content=f"[system] {_text}")]
+            if _refused_transitions(state.get("execution_trace"), to_phase) >= 2:
+                updates["task_complete"] = True
+                updates["completion_reason"] = _text
+            await _tell_chat_unasked(streaming_callbacks, session_id, _phase_check, _text)
         else:
             logger.info(f"[{user_id}/{project_id}/{session_id}] Auto-approving phase transition (approval not required): {phase} → {to_phase}")
             updates["current_phase"] = to_phase
@@ -2121,9 +2200,17 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             # required we leave the phase as-is so the agent's own transition_phase
             # drives the proper approval routing (switch_skill routes straight back to
             # think and would otherwise bypass the approval gate).
+            _auto_check = None
             if (get_setting('AUTO_TRANSITION_ON_ATTACK_SKILL', True)
                     and should_auto_transition_on_skill(resolved, phase)
                     and not get_setting('REQUIRE_APPROVAL_FOR_EXPLOITATION', True)):
+                # The approval the project skips is still the run's person's to give.
+                _auto_check = await authorize_unasked("approval", "agent:approve_phase")
+            if _auto_check is not None and not _auto_check.allowed:
+                _auto_text = unasked_refusal_text(_auto_check, "move to the exploitation phase")
+                _switch_msg += f" {_auto_text}"
+                await _tell_chat_unasked(streaming_callbacks, session_id, _auto_check, _auto_text)
+            elif _auto_check is not None:
                 logger.info(
                     f"[{user_id}/{project_id}/{session_id}] Auto-transition to "
                     f"exploitation on attack skill '{resolved}' (was informational)"
@@ -2150,6 +2237,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             chain_graph.fire_update_chain_attack_path(
                 neo4j_uri, neo4j_user, neo4j_password,
                 chain_id=session_id, attack_path_type=resolved,
+                user_id=tenant_id, project_id=project_id,
             )
 
     elif decision.action == "ask_user":
@@ -2218,6 +2306,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         action = decision.action
         if action == "use_tool" and is_dangerous_call(decision.tool_name, decision.tool_args):
             updates["awaiting_tool_confirmation"] = True
+            updates.update(NO_TOOL_CONFIRMATION_ANSWER)
             updates["tool_confirmation_pending"] = ToolConfirmationRequest(
                 mode="single",
                 tools=[{
@@ -2242,6 +2331,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             ]
             if dangerous:
                 updates["awaiting_tool_confirmation"] = True
+                updates.update(NO_TOOL_CONFIRMATION_ANSWER)
                 updates["tool_confirmation_pending"] = ToolConfirmationRequest(
                     mode="plan",
                     tools=dangerous,

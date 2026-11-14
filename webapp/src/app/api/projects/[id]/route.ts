@@ -1,50 +1,43 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { plannerWriteProblem } from '@/lib/reconSettings/plannerWrite'
-import { archiveProjectAuthorizations } from '@/lib/engagementArchive'
+import { requireAlso, requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
-import { agentFetch } from '@/lib/agentFetch'
 import { Prisma } from '@prisma/client'
-import { unlink } from 'fs/promises'
-import { existsSync } from 'fs'
-import path from 'path'
-import { getGraphSession } from '@/app/api/graph/neo4j'
-import { batchGroupFiles } from '@/lib/reconOutputFiles'
-import { clearProjectGraph } from '@/lib/graphRestore'
-import { orchestratorFetch } from '@/lib/orchestrator'
 import { isInternalRequest, isScannerRequest } from '@/lib/session'
-import { purgeProjectWorkspace } from '@/lib/workspacePurge'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { teardownProject } from '@/lib/projectTeardown'
 import { toAuthProfileMetadata } from '@/lib/authProfile'
-import { callGraphTriage } from '@/lib/triageClient'
 import { pickProjectColumns } from '@/lib/projectColumns'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import { writeAudit } from '@/lib/audit'
 import { canonicalJson } from '@/lib/fingerprint'
-import { field, fieldsWhere } from '@/lib/reconSettings/registry'
+import { field, fieldsWhere, rescopableFields } from '@/lib/reconSettings/registry'
+import { numericBoundsRefusal } from '@/lib/reconSettings/numericBounds'
 import { checkIdentityHeader } from '@/lib/reconSettings/validators'
 import { STALE_SAVE_MESSAGE } from '@/lib/projectVersion'
+import { ACTIVATION_STATE_TRANSFERRING, holdOf, transferInProgressResponse } from '@/lib/graphHold'
 import { JEV_ENGINE_SELECT, guardProjectWrite, recordProjectWrite } from '@/lib/projectWriteGuards'
 import { seedDomainNames, seedProjectDomains } from '@/lib/graphSeedDomains'
 import { refreshActiveRecordingScope } from '@/lib/recordingSession'
-import { resolveScopeGroups } from '@/lib/scopeGroups'
+import { IP_HOSTNAME_FIELDS, resolveScopeGroups } from '@/lib/scopeGroups'
 import { computeSkillTextOverrides } from '@/lib/plugins/overrideDelivery'
 import { userSkillsForAgent } from '@/lib/userSkillAgentPayload'
 import type { ResolvedPart } from '@/lib/plugins/overrides'
 import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
 import { internalError } from '@/lib/routeErrors'
 import { projectModelProblem } from '@/lib/agentInTheLoop'
-
-// Path to output directories (fallback for local deletion)
-const RECON_OUTPUT_PATH = process.env.RECON_OUTPUT_PATH || '/data/recon-output'
-const GVM_OUTPUT_PATH = process.env.GVM_OUTPUT_PATH || '/data/gvm-output'
-const GITHUB_HUNT_OUTPUT_PATH = process.env.GITHUB_HUNT_OUTPUT_PATH || '/data/github-hunt-output'
+import { templateSelectionRefusal, withoutUnselectableTemplates } from '@/lib/nucleiTemplateOwnership'
+import { isStdioServer } from '@/lib/mcp/schema'
+import { ownerRunsStdio, serversForAgent } from '@/lib/mcp/userServerAccess'
+import { scannerJobRefusal } from '@/lib/authz/jobCredential'
+import { projectReadView, scanReadView } from '@/lib/authz/projectReadView'
+import { actorFields, auditActorOf } from '@/lib/auditActor'
+import { myAccessView, type ProjectAccess } from '@/lib/authz/projectAccess'
+import { rbacFlags } from '@/lib/authz/flags'
+import { classifyChange, riskSelect, settingsRefusal } from '@/lib/authz/settingsRisk'
 
 // Agent API, for the soft (LLM) guardrail on a scope edit. Mirrors the POST route.
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8080'
 const SOFT_GUARDRAIL_TIMEOUT_MS = 10_000
-
-// Recon orchestrator URL for file deletion
-const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -65,6 +58,14 @@ const NOT_WRITABLE_BY_SAVE: ReadonlySet<string> = new Set([
   'activationState', 'activationStartedAt', 'activationVersionId',
   ...fieldsWhere(f => f.deny_reason === 'upload-managed').map(f => f.key),
 ])
+
+/**
+ * The target lists only `project:rescope` reopens (the registry's `rescope` fields, the set MCP
+ * update_project_scope edits), beyond the batch hosts and the IP hostname policy, which the save
+ * judges as part of its scope (scopeChanged).
+ */
+const RESCOPE_ONLY_FIELDS: readonly string[] = rescopableFields().map(f => f.key)
+  .filter(k => k !== 'domainBatchHosts' && !(IP_HOSTNAME_FIELDS as readonly string[]).includes(k))
 
 /** Audited by name only: the value is a credential or a whole document. */
 function auditsValue(key: string): boolean {
@@ -87,12 +88,18 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     // every browser caller may only read a project owned by their effective user
     // (admin only while simulating that user). Closes the BOLA where any
     // logged-in user could read another user's project by id (S15/E15).
+    // The scanner key reads a project only beside the job credential of a scan of
+    // that project (step 1.16, HD-20).
+    if (isScannerRequest(request) && !isInternalRequest(request)) {
+      const refused = scannerJobRefusal(request, { projectId: id })
+      if (refused) return refused
+    }
     const isServiceCaller = isInternalRequest(request) || isScannerRequest(request)
+    let access: ProjectAccess | null = null
     if (!isServiceCaller) {
-      const eff = await requireEffectiveUser()
-      if (eff instanceof NextResponse) return eff
-      const access = await requireProjectAccess(eff, id)
-      if (access instanceof NextResponse) return access
+      const auth = await requirePermission(request, 'recon:read', { projectId: id })
+      if (auth instanceof NextResponse) return auth
+      access = auth.access
     }
 
     const project = await prisma.project.findUnique({
@@ -151,10 +158,21 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
           }
         : {}),
     }
+    // A scan never runs another member's Nuclei template (HD-08). The filter sits on the
+    // read every scan and run makes, so it also covers rows written by import, presets and
+    // MCP tools, which never pass the PUT's check; a browser reads the stored row.
+    let projectForCaller = projectWithoutBinary
+    if (isServiceCaller) {
+      const { project: kept, dropped } = await withoutUnselectableTemplates(prisma, projectWithoutBinary)
+      for (const [field, count] of Object.entries(dropped)) {
+        console.warn(`[rbac] nuclei template dropped project=${id} field=${field} count=${count}`)
+      }
+      projectForCaller = kept
+    }
 
     // Approved plugin overrides of built-in skill text go to the agent's own settings
     // fetch only: its separate flag on the MASTER key. includeSkillContent alone is also
-    // sent by text-to-cypher and accepted from the scanner key, which must not get them.
+    // sent by text-to-cypher, which must not get them.
     // Kept out of projectWithoutBinary, and a failure leaves the payload as it was.
     let skillOverridesField: { skillTextOverrides?: Record<string, ResolvedPart> } = {}
     if (request.nextUrl.searchParams.get('includeSkillOverrides') === 'true' && isInternalRequest(request)) {
@@ -168,8 +186,10 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     // If ?includeSkillContent=true, the enabled user skills' texts for agent consumption:
     // only those set to true (a missing toggle is OFF, as the form shows it), at most 20,
-    // never a quarantined one (lib/userSkillAgentPayload.ts).
+    // never a quarantined one (lib/userSkillAgentPayload.ts). The master key only (NF-15):
+    // the MCP servers below carry the owner's literal bearer tokens, header and env values.
     const includeSkillContent = request.nextUrl.searchParams.get('includeSkillContent') === 'true'
+      && isInternalRequest(request)
     if (includeSkillContent && project.userId) {
       const skills = await userSkillsForAgent(prisma, project.userId, project.attackSkillConfig)
 
@@ -180,17 +200,27 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
         where: { userId: project.userId },
         select: { mcpServers: true },
       })
-      const userMcpServers = (userSettings?.mcpServers as Prisma.JsonValue) ?? []
+      const saved = (userSettings?.mcpServers as Prisma.JsonValue) ?? []
+      // A non-admin owner's stdio servers never run in the shared agent (NF-14).
+      const runsStdio = !Array.isArray(saved) || !saved.some(isStdioServer) || await ownerRunsStdio(project.userId)
+      const userMcpServers = serversForAgent(project.userId, saved, runsStdio)
 
       return NextResponse.json({
-        ...projectWithoutBinary,
+        ...projectForCaller,
         userAttackSkills: skills,
         userMcpServers,
         ...skillOverridesField,
       })
     }
 
-    return NextResponse.json({ ...projectWithoutBinary, ...skillOverridesField })
+    // A browser caller who is not the owner never receives the owner's secrets (HD-27). With
+    // RBAC_SHARING_ENABLED on every browser caller also learns its own access, which the project
+    // screens follow; off, the body stays the owner-only one, without the key (DV-30).
+    const body = isInternalRequest(request)
+      ? projectForCaller
+      : isServiceCaller ? scanReadView(projectForCaller) : projectReadView(projectForCaller, access)
+    const mine = access && rbacFlags().sharing ? { myAccess: myAccessView(access, project.user) } : {}
+    return NextResponse.json({ ...body, ...mine, ...skillOverridesField })
   } catch (error) {
     return internalError(error, 'Failed to fetch project')
   }
@@ -204,11 +234,10 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    // Only the project's effective owner may mutate it (admin while simulating).
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    // project:settings on the project; a scope or target-list change also needs project:rescope.
+    const auth = await requirePermission(request, 'project:settings', { projectId: id })
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
 
     let body
     try {
@@ -268,6 +297,10 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         }
       }
     }
+    // Columns the server writes as a consequence of the save, not as the caller asked: they are
+    // left out when a collaborator's change is judged (the mode or list that caused them is not).
+    const serverDerived = new Set<string>()
+
     if ('openapiSources' in updateData) updateData.openapiSources = cleanOpenApiSources(updateData.openapiSources)
     const openapiError = validateOpenApiSettings(updateData)
     if (openapiError) {
@@ -313,9 +346,18 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         domainBatchMode: true, domainBatchGroups: true, domainBatchHosts: true,
         targetDomain: true, subdomainList: true, ipMode: true, targetIps: true,
         userId: true, targetGuardrailEnabled: true, attackSkillConfig: true,
+        // The hostname policy is judged on the effective row (guardProjectWrite)
+        // and compared for scopeChanged; engagementKind refuses scan_all (D-03).
+        engagementKind: true, ipHostnameMode: true, ipHostnameInclude: true, ipHostnameExclude: true,
+        ipHostnamePassiveExpand: true, ipHostnameScanAllConfirmed: true, ipHostnameMaxScanned: true,
+        ipHostnamePassiveMaxNames: true,
         ...JEV_ENGINE_SELECT,
+        activationState: true, activationStartedAt: true,
       },
     })
+    // An ownership transfer moves the project and clears the settings that name the old owner's own
+    // providers and templates (step 5.12): a save landing meanwhile could write one back.
+    if (holdOf(existing) === ACTIVATION_STATE_TRANSFERRING) return transferInProgressResponse()
     // The form sends the toggles with every whole-row save. Unchanged, they are neither
     // validated nor written: a stored value the rules now refuse (a config saved without
     // builtIn, a quarantined skill left on by a race) must not block an unrelated edit.
@@ -360,6 +402,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       )
       updateData.domainBatchHosts = batch.entries
       updateData.domainBatchGroups = batch.legacy
+      serverDerived.add('domainBatchGroups')
       batchSeedDomains = seedDomainNames(batch.groups)
     }
 
@@ -370,13 +413,30 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         || (existing?.domainBatchHosts?.length ?? 0) > 0 || 'domainBatchHosts' in updateData)) {
       updateData.domainBatchGroups = Prisma.DbNull
       updateData.domainBatchHosts = []
+      serverDerived.add('domainBatchGroups').add('domainBatchHosts')
+    }
+
+    // A project that is not in IP mode keeps no hostname policy, as a non-batch
+    // keeps no batch scope above: it scans nothing there, and a leftover policy
+    // would start applying unseen after a flip back into IP mode.
+    const {
+      IP_HOSTNAME_DEFAULTS, IP_HOSTNAME_FIELDS, ipHostnamePolicyChanged, ipHostnamePolicyNarrowed,
+    } = await import('@/lib/scopeGroups')
+    const nextIpMode = 'ipMode' in updateData ? updateData.ipMode === true : existing?.ipMode === true
+    if (!nextIpMode && existing && (IP_HOSTNAME_FIELDS.some(k => k in updateData)
+        || ipHostnamePolicyChanged(existing, IP_HOSTNAME_DEFAULTS))) {
+      for (const key of IP_HOSTNAME_FIELDS) {
+        const value = IP_HOSTNAME_DEFAULTS[key]
+        updateData[key] = Array.isArray(value) ? [] : value
+        serverDerived.add(key)
+      }
     }
 
     // The scope gates apply to EVERY mode and to a mode flip, not only to a batch
     // host-list edit: a single-domain target change, a batch -> single flip and
     // entering or leaving IP mode re-point the engagement just as much.
     const nextScope = {
-      ipMode: 'ipMode' in updateData ? updateData.ipMode === true : existing?.ipMode === true,
+      ipMode: nextIpMode,
       domainBatchMode: willBeBatch,
       domainBatchHosts: Array.isArray(updateData.domainBatchHosts)
         ? updateData.domainBatchHosts as string[] : existing?.domainBatchHosts ?? [],
@@ -386,6 +446,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         ? updateData.subdomainList as string[] : existing?.subdomainList ?? [],
       targetIps: Array.isArray(updateData.targetIps)
         ? updateData.targetIps as string[] : existing?.targetIps ?? [],
+      // The hostname policy is part of the scope: its include entries get the hard
+      // guardrail below, and any change of it is a scope change.
+      ...Object.fromEntries(IP_HOSTNAME_FIELDS.map(k => [k, k in updateData ? updateData[k] : existing?.[k]])),
     }
     // Mutually exclusive modes, enforced on update as well as create, and on the
     // EFFECTIVE next state: recon checks IP_MODE first, so a project flagged both
@@ -422,7 +485,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       nextScope.ipMode !== (existing.ipMode === true)
       || nextScope.domainBatchMode !== (existing.domainBatchMode === true)
       || (nextScope.ipMode
-        ? !sameSet(nextScope.targetIps, existing.targetIps ?? [])
+        ? !sameSet(nextScope.targetIps, existing.targetIps ?? []) || ipHostnamePolicyChanged(existing, nextScope)
         : nextScope.domainBatchMode
           ? batchScopeChanged
           : singleScopeChanged())
@@ -434,7 +497,26 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       delete updateData.targetDomain
     }
 
+    // A collaborator's save is judged column by column against their level (SH-08, OQ-23):
+    // before anything is written or the soft guardrail spends the owner's model on a scope the
+    // caller may not set. The owner's never is: every change is theirs.
+    if (auth.access?.level !== 'owner') {
+      const requested = Object.fromEntries(Object.entries(updateData).filter(([k]) => !serverDerived.has(k)))
+      const stored = (await prisma.project.findUnique({
+        where: { id },
+        select: riskSelect(Object.keys(requested)) as any,
+      }) ?? {}) as Record<string, unknown>
+      const refusal = settingsRefusal(classifyChange(stored, requested, auth.access), auth.permission)
+      if (refusal) {
+        console.warn(`[rbac] settings_refused project=${id} user=${eff.userId} keys=${refusal.refused.map(r => r.key).join(',')}`)
+        return NextResponse.json(refusal, { status: 403 })
+      }
+    }
+
     if (scopeChanged) {
+      const refused = requireAlso(auth, 'project:rescope')
+      if (refused) return refused
+
       // A version activation clears and restores the graph; a scope written
       // between the two would describe neither.
       const { assertGraphNotActivating } = await import('@/lib/activationLock')
@@ -522,6 +604,28 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       select: Object.fromEntries(Object.keys(updateData).map(k => [k, true])) as any,
     }) ?? {}) as Record<string, unknown>
 
+    // A target list this save CHANGES needs project:rescope; one sent back as stored does not.
+    if (RESCOPE_ONLY_FIELDS.some(k => k in updateData && comparable(updateData[k]) !== comparable(before[k]))) {
+      const refused = requireAlso(auth, 'project:rescope')
+      if (refused) return refused
+    }
+
+    // The project may use only its owner's Nuclei templates and the instance ones
+    // (HD-08). Only the entries this save adds are judged, for the reason given below.
+    const templateRefusal = await templateSelectionRefusal(prisma, {
+      ownerUserId: existing?.userId ?? eff.userId, data: updateData, stored: before,
+    })
+    if (templateRefusal) return NextResponse.json(templateRefusal, { status: 400 })
+
+    // Only a value this save CHANGES is judged, as for the skill toggles above:
+    // the form PUTs the whole row back, and a number stored before its bound
+    // existed must not block an unrelated edit.
+    const outOfBounds = numericBoundsRefusal(
+      updateData, key => comparable(updateData[key]) === comparable(before[key]))
+    if (outOfBounds) {
+      return NextResponse.json({ ...outOfBounds, code: 'setting_rejected' }, { status: 400 })
+    }
+
     updateData.updatedById = eff.userId
     let project
     if (expectedVersion) {
@@ -530,7 +634,8 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
         data: updateData,
       })
       if (count === 0) {
-        return NextResponse.json({ error: STALE_SAVE_MESSAGE }, { status: 409 })
+        // `code` lets a single-field save tell a stale row from the PUT's other 409s (step 5.2).
+        return NextResponse.json({ error: STALE_SAVE_MESSAGE, code: 'stale_save' }, { status: 409 })
       }
       stage = 'after_write'
       project = await prisma.project.findUnique({ where: { id } })
@@ -555,7 +660,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     if (changed.length > 0) {
       const valued = changed.filter(auditsValue)
       void writeAudit({
-        actorId: eff.userId,
+        // The person signed in, and under act-as the account acted as (AU-01): a collaborator's
+        // change names the collaborator, the owner's names the owner, as before.
+        ...actorFields(auditActorOf(auth.principal, eff.userId)),
         action: 'project.update',
         targetType: 'project',
         targetId: id,
@@ -586,9 +693,29 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
     // as an RoE change moves it; a regroup of the same hosts does not (WEB-15b).
     if (scopeChanged) await refreshActiveRecordingScope(prisma, id, project)
 
-    // Exclude binary document data from response (same as GET)
+    // A narrowed hostname policy marks the names earlier runs scanned that it no
+    // longer admits (design §6.3). After the commit and best-effort: the save
+    // stands either way, and every reader re-applies the current policy, so the
+    // answer only tells the caller whether the graph agrees yet.
+    let hostnamePolicyMarked: boolean | undefined
+    if (existing && ipHostnamePolicyNarrowed(existing, project)) {
+      try {
+        const { markOutOfPolicy } = await import('@/lib/ipHostnamePolicy')
+        hostnamePolicyMarked = await markOutOfPolicy(id, project.userId, project)
+      } catch (e) {
+        console.warn('[projects PUT] hostname policy marker failed:', e)
+        hostnamePolicyMarked = false
+      }
+    }
+
+    // Exclude binary document data from response (same as GET), and the owner's secret columns
+    // from anyone else's (a collaborator's save answers the row as their GET reads it, step 5.2).
     const { roeDocumentData: _binary, ...projectWithoutBinary } = project
-    return NextResponse.json({ ...projectWithoutBinary, scopeGroups: resolveScopeGroups(project).groups })
+    return NextResponse.json({
+      ...projectReadView(projectWithoutBinary, auth.access),
+      scopeGroups: resolveScopeGroups(project).groups,
+      ...(hostnamePolicyMarked === undefined ? {} : { hostnamePolicyMarked }),
+    })
   } catch (error: unknown) {
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       console.error('Failed to update project:', error)
@@ -606,229 +733,36 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
   }
 }
 
-/**
- * Stop every running partial recon of a project. They are run-keyed, so each
- * one is listed and stopped by id. A partial run over a Domain batch walks up to
- * fifty roots, long enough to keep writing into a project that no longer exists.
- */
-async function stopPartialRecons(projectId: string): Promise<void> {
-  try {
-    const res = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial/all`)
-    if (!res.ok) return
-    const data = await res.json().catch(() => ({}))
-    const runs: Array<{ run_id?: unknown; status?: unknown }> = Array.isArray(data?.runs) ? data.runs : []
-    await Promise.allSettled(
-      runs
-        .filter(run => typeof run?.run_id === 'string'
-          && (run.status === 'running' || run.status === 'starting' || run.status === 'stopping'))
-        .map(run => orchestratorFetch(
-          `${RECON_ORCHESTRATOR_URL}/recon/${projectId}/partial/${encodeURIComponent(run.run_id as string)}/stop?graceful=false`,
-          { method: 'POST' },
-        )),
-    )
-  } catch (e) {
-    console.warn('Could not stop partial recons before project delete:', e)
-  }
-}
-
 // DELETE /api/projects/[id] - Delete project and all associated data
-/** Stop every live chat run of a project, best-effort (never throws). */
-async function stopProjectChatRuns(projectId: string): Promise<void> {
-  let running: { userId: string; sessionId: string }[] = []
-  try {
-    running = await prisma.conversation.findMany({
-      where: { projectId, agentRunning: true },
-      select: { userId: true, sessionId: true },
-    })
-  } catch (e) {
-    console.warn('Could not read the running chats before project delete:', e)
-    return
-  }
-  const results = await Promise.allSettled(running.map(c => agentFetch('/agent-session/stop', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ user_id: c.userId, project_id: projectId, session_id: c.sessionId }),
-  })))
-  results.forEach((r, i) => {
-    if (r.status === 'rejected' || !r.value.ok) {
-      console.warn(`Could not stop chat ${running[i].sessionId} before project delete (continuing)`)
-    }
-  })
-}
-
 export async function DELETE(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
 
-    // Only the project's effective owner may delete it (admin while simulating).
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    // project:delete on the project (its owner; an admin acting as the owner).
+    const auth = await requirePermission(request, 'project:delete', { projectId: id })
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
+    const access = auth.access
 
-    // Collect captured-traffic body refs BEFORE the cascade removes the rows, so
-    // we can ref-counted-GC the now-unreferenced blobs afterward (§6.6). Prisma
-    // cascade removes the rows but never touches the filesystem.
-    let capturedBodyRefs: (string | null)[] = []
-    try {
-      const doomed = await prisma.capturedHttpTransaction.findMany({
-        where: { projectId: id }, select: { reqBodyRef: true, respBodyRef: true },
-      })
-      capturedBodyRefs = doomed.flatMap(r => [r.reqBodyRef, r.respBodyRef])
-    } catch (e) {
-      console.warn('Could not enumerate captured body refs before project delete:', e)
-    }
-
-    // C-7: stop in-flight work BEFORE deleting. A container that is mid-write keeps
-    // writing project_id-stamped nodes after the row is gone, resurrecting the
-    // deleted project's graph as unreachable orphans; and a scanner falls back to
-    // DEFAULT_*_SETTINGS on a 404, so a job dispatched against a deleted project
-    // would scan with defaults. Cancel queued work and stop running scans first.
-    try {
-      await prisma.jobQueue.updateMany({
-        where: { projectId: id, status: { in: ['queued', 'dispatching', 'running', 'needs_review'] } },
-        data: { status: 'canceled', finishedAt: new Date() },
-      })
-    } catch (e) {
-      console.warn('Could not cancel queued jobs before project delete:', e)
-    }
-
-    // A triage run lives in the agent's memory. Deleting the project without
-    // telling it leaves the run working against a project that no longer
-    // exists, for as long as it takes the next heartbeat to fail (X12).
-    // Best-effort: an unreachable agent must not block the delete, because the
-    // run's publish and heartbeat both fail closed on the missing project.
-    try {
-      await callGraphTriage('stop_run', { userId: eff.userId, projectId: id })
-    } catch (e) {
-      console.warn('Could not stop a triage run before project delete:', e)
-    }
-    // A running chat of this project is an orphan once the row is gone, whatever
-    // its model, and an Agent in the Loop run would keep offering its steps to
-    // the owner's agent. Stopped the way a conversation delete stops its run.
-    // The conversations cascade with the project, so they are read first.
-    // Best-effort: a stop that fails must not block the delete.
-    await stopProjectChatRuns(id)
-    // Best-effort stop of each PROJECT-LEVEL scan container. ai_attack runs are
-    // keyed by run-id, not project, so they are not stopped here; they finish on
-    // their own and their orphaned nodes are swept by the graph read-path
-    // reconcile.
-    // GVM and the GitHub hunt write a stopped run's saved results to the graph
-    // before removing the container, as a backstop for a scan killed mid-write.
-    // The graph is cleared below, so here that write could only land after the
-    // clear and leave the deleted project's nodes behind: ingest=false skips it.
-    // A recon stop drains its queued writes for up to RECON_STOP_GRACE_S unless
-    // it is hard: graceful=false kills it and answers once it is gone.
-    const stopQuery: Record<string, string> = {
-      recon: '?graceful=false', gvm: '?ingest=false', 'github-hunt': '?ingest=false',
-    }
-    await Promise.allSettled([
-      ...['recon', 'gvm', 'github-hunt', 'supply-chain'].map(kind =>
-        orchestratorFetch(
-          `${RECON_ORCHESTRATOR_URL}/${kind}/${id}/stop${stopQuery[kind] ?? ''}`,
-          { method: 'POST' },
-        ),
-      ),
-      // TruffleHog is run-keyed (one run per source, several in parallel), so a
-      // single project-level stop would leave every source but one running with
-      // its project row already gone. stop-all loops the nested state dict.
-      orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/trufflehog/${id}/stop-all`, { method: 'POST' }),
-      stopPartialRecons(id),
-    ])
-
-    // Archive the authorization records BEFORE the delete. Every other Project
-    // child cascades; these do not, because the record of what authorized a
-    // project is the thing an incident review needs most and deleting the
-    // project is exactly when it stops being recoverable. The foreign key is
-    // `Restrict`, so a failed archive fails the delete rather than quietly
-    // taking the records with it.
-    const archived = await archiveProjectAuthorizations(id)
-    if (archived.error) {
-      return NextResponse.json(
-        {
-          error:
-            'Could not archive this project\'s engagement authorization records, so it was ' +
-            'not deleted. The record of what authorized an engagement must outlive the ' +
-            'engagement. Retry, or contact an administrator.',
-          code: 'authorization_archive_failed',
-        },
-        { status: 500 }
-      )
-    }
-    if (archived.archived > 0) {
-      console.log(`[project-delete] archived ${archived.archived} authorization record(s) for ${id}`)
-    }
-
-    // 1. Delete project from PostgreSQL (cascades captured_http_transactions +
-    //    job_queue rows)
-    await prisma.project.delete({
-      where: { id }
-    })
-
-    // 1a. The agent workspace (only once the row is gone: the agent acts only on
-    //     a project the web app answers 404 for).
-    await purgeProjectWorkspace(id)
-
-    // 1b. GC captured body blobs this project exclusively owned (ref-counted).
-    if (capturedBodyRefs.length > 0) {
-      try {
-        const { gcOrphanBodies } = await import('@/lib/captureBodies')
-        const gc = await gcOrphanBodies(capturedBodyRefs)
-        if (gc.deleted > 0) console.log(`[project-delete] GC'd ${gc.deleted} captured body blobs for project ${id}`)
-      } catch (e) {
-        console.warn('Captured body-blob GC failed on project delete:', e)
+    // The teardown's tenant is the owner the access check read.
+    const result = await teardownProject(
+      { id, userId: access?.project.userId ?? eff.userId },
+      { actorUserId: eff.userId },
+    )
+    if (!result.ok) {
+      if (result.failedStep === 'archive_authorizations') {
+        return NextResponse.json(
+          {
+            error:
+              'Could not archive this project\'s engagement authorization records, so it was ' +
+              'not deleted. The record of what authorized an engagement must outlive the ' +
+              'engagement. Retry, or contact an administrator.',
+            code: 'authorization_archive_failed',
+          },
+          { status: 500 }
+        )
       }
-    }
-
-    // 2. Delete all output JSON files via orchestrator (it has write permissions)
-    //    This covers: recon, GVM, and GitHub Secret Hunt JSON files
-    try {
-      const orchestratorResponse = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/project/${id}/files`, {
-        method: 'DELETE',
-      })
-      if (orchestratorResponse.ok) {
-        const result = await orchestratorResponse.json()
-        console.log(`Orchestrator deleted files:`, result.deleted)
-      } else {
-        console.warn(`Orchestrator failed to delete files: ${orchestratorResponse.status}`)
-      }
-    } catch (orchestratorError) {
-      console.warn(`Failed to call orchestrator for file deletion: ${orchestratorError}`)
-
-      // Fallback: try to delete locally (may fail in Docker due to read-only mounts)
-      const filesToDelete = [
-        { path: path.join(RECON_OUTPUT_PATH, `recon_${id}.json`), name: 'recon' },
-        ...(await batchGroupFiles(RECON_OUTPUT_PATH, id)).map(p => ({ path: p, name: 'recon group' })),
-        { path: path.join(GVM_OUTPUT_PATH, `gvm_${id}.json`), name: 'GVM' },
-        { path: path.join(GITHUB_HUNT_OUTPUT_PATH, `github_hunt_${id}.json`), name: 'GitHub hunt' },
-      ]
-      for (const file of filesToDelete) {
-        if (existsSync(file.path)) {
-          try {
-            await unlink(file.path)
-            console.log(`Deleted ${file.name} file locally: ${file.path}`)
-          } catch (err) {
-            console.warn(`Failed to delete ${file.name} file locally: ${err}`)
-          }
-        }
-      }
-    }
-
-    // 3. Delete all Neo4j nodes for this project
-    try {
-      const session = getGraphSession()
-      try {
-        // Via the shared helper: a raw `MATCH (n {project_id})` here also swept
-        // the global CVE/CWE/CAPEC nodes, which are shared with every other
-        // project that found them, taking those projects' links down too.
-        await clearProjectGraph(session, id)
-        console.log(`Deleted Neo4j nodes for project: ${id}`)
-      } finally {
-        await session.close()
-      }
-    } catch (neo4jError) {
-      // Log but don't fail the request if Neo4j cleanup fails
-      console.warn(`Failed to delete Neo4j data: ${neo4jError}`)
+      throw result.error
     }
 
     return NextResponse.json({ success: true })

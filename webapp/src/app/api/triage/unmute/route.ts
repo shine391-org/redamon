@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
+import { triageCaller, triagePerson } from '@/lib/triage/routeCaller'
 import { withRouteErrors } from '@/lib/routeErrors'
 import { readJsonBody } from '@/lib/jsonBody'
-import { requireProjectOwner, graphTriage, realActorUserId } from '@/lib/triageClient'
+import { graphTriage, realActorUserId } from '@/lib/triageClient'
 import { describeNodeFilterWriter } from '@/lib/nodeFilterRun'
 import { activationBusy, activationBusyResponse } from '@/lib/activationLock'
 import { auditUnmute, ensureExemptions } from '@/lib/unmuteExemptions'
@@ -45,8 +47,9 @@ export const POST = withRouteErrors('The findings could not be unmuted.', async 
     projectId?: string; nodeId?: unknown; keys?: unknown; undoBatch?: unknown
   }
 
-  const caller = await requireProjectOwner(projectId)
-  if (caller instanceof NextResponse) return caller
+  const auth = await requirePermission(request, 'triage:mute', { projectId })
+  if (auth instanceof NextResponse) return auth
+  const caller = triageCaller(auth)
 
   const wanted = Array.isArray(keys)
     ? keys.filter((k): k is string => typeof k === 'string' && k.length > 0 && k.length <= 300)
@@ -93,7 +96,7 @@ export const POST = withRouteErrors('The findings could not be unmuted.', async 
   if (batch && result.body.multi_mute !== 1) {
     if (items.length > 0) {
       await auditUnmute({
-        actorId: caller.userId, projectId: caller.projectId, source: 'multi_undo',
+        actorId: triagePerson(auth), projectId: caller.projectId, source: 'multi_undo',
         realActorUserId: realActor, exempted: 0, batchId: batch, items: auditItems,
       })
     }
@@ -105,7 +108,7 @@ export const POST = withRouteErrors('The findings could not be unmuted.', async 
   if (batch) {
     if (items.length > 0) {
       await auditUnmute({
-        actorId: caller.userId,
+        actorId: triagePerson(auth),
         projectId: caller.projectId,
         source: 'multi_undo',
         realActorUserId: realActor,
@@ -125,7 +128,7 @@ export const POST = withRouteErrors('The findings could not be unmuted.', async 
     const result = await ensureExemptions(
       caller.projectId,
       items.map(i => ({ label: i?.label, key: i?.key })),
-      { createdBy: caller.userId, realActorUserId: realActor },
+      { createdBy: triagePerson(auth), realActorUserId: realActor },
     )
     exempted = result.total
   } catch (e) {
@@ -138,7 +141,7 @@ export const POST = withRouteErrors('The findings could not be unmuted.', async 
 
   if (items.length > 0) {
     await auditUnmute({
-      actorId: caller.userId,
+      actorId: triagePerson(auth),
       projectId: caller.projectId,
       source: 'ui',
       realActorUserId: realActor,

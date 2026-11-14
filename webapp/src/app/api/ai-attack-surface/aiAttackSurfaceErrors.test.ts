@@ -22,13 +22,18 @@ vi.mock('@/app/api/graph/neo4j', () => ({
 
 const findUnique = vi.fn()
 vi.mock('@/lib/prisma', () => ({ default: { project: { findUnique: (...a: unknown[]) => findUnique(...a) } } }))
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProject()))
 vi.mock('@/lib/access', () => ({ guardProject: vi.fn().mockResolvedValue(null) }))
 vi.mock('@/lib/scanTimeline', () => ({
   reconcileRunScanJobs: vi.fn().mockResolvedValue(undefined),
   recordScanStart: vi.fn().mockResolvedValue(undefined),
 }))
 vi.mock('@/lib/legacyGraph', () => ({ legacyGraphDomains: vi.fn().mockResolvedValue([]), legacyGraphRefusal: vi.fn() }))
-vi.mock('@/lib/engagement', () => ({ currentRoeTextSha256: vi.fn().mockResolvedValue(null) }))
+// A startable engagement: the R-11 gate has its own tests in start/route.test.ts.
+vi.mock('@/lib/engagement', () => ({
+  currentRoeTextSha256: vi.fn().mockResolvedValue(null),
+  loadEngagement: vi.fn().mockResolvedValue({ blockers: [] }),
+}))
 vi.mock('@/lib/session', () => ({ getEffectiveUser: vi.fn().mockResolvedValue(null) }))
 
 const startRoute = await import('./[projectId]/start/route')

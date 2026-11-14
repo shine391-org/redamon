@@ -5,6 +5,7 @@ Functions for building Nuclei commands, parsing output, and detecting false posi
 """
 
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -80,6 +81,8 @@ def build_nuclei_command(
     auth_headers: List[str] = None,
     container_name: str = None,
     max_host_error: int = 0,
+    ip_mode: bool = False,
+    roe_exclusions: bool = False,
 ) -> List[str]:
     """
     Build nuclei Docker command with all configured parameters.
@@ -92,6 +95,14 @@ def build_nuclei_command(
             filters that would otherwise empty-intersect with the DAST set
             (built-in DAST templates carry tags like xss/sqli/ssti, not the
             detection-class tags users typically configure).
+        ip_mode: the run's targets are addresses, so a redirect is followed
+            only on the same host (B-07): a cross-host Location can name any
+            address on the internet.
+        roe_exclusions: the Rules of Engagement exclude hosts, so a redirect
+            is followed only on the same host too: an admitted target's
+            Location can name an excluded host, and nuclei follows it before
+            any scope check (R-2). With follow_redirects off, these two and an
+            attached session add -disable-redirects.
         ... (configuration parameters)
 
     Returns:
@@ -302,9 +313,16 @@ def build_nuclei_command(
         # A cross-host redirect (an SSO hop, an attacker-controlled Location)
         # re-sends the -H session to whatever host it names. -follow-host-redirects
         # keeps redirect coverage but confines it to the host we scope-checked.
-        cmd.extend(["-follow-host-redirects" if _has_auth else "-follow-redirects"])
+        # The CLI flag also overrides a template's own `redirects: true`.
+        cmd.extend(["-follow-host-redirects" if _has_auth or ip_mode or roe_exclusions
+                    else "-follow-redirects"])
         if max_redirects > 0:
             cmd.extend(["-max-redirects", str(max_redirects)])
+    elif _has_auth or ip_mode or roe_exclusions:
+        # Off is not off for a template that sets `redirects: true`: it still
+        # follows to any host, the session and refused hosts included.
+        # -disable-redirects holds it (checked on nuclei:latest).
+        cmd.append("-disable-redirects")
 
     # Interactsh (OOB testing)
     if not interactsh:
@@ -398,14 +416,91 @@ def _classify_fp_ai(response_text: str, template_id: str, tags: list) -> Optiona
     return result
 
 
+def _tag_list(tags) -> list:
+    """Nuclei tags as a list; a template may carry them as one comma-separated string."""
+    if not tags:
+        return []
+    if isinstance(tags, str):
+        return [t.strip() for t in tags.split(",") if t.strip()]
+    return [str(t) for t in tags if t is not None]
+
+
+def _words(text: str) -> list:
+    return [w for w in re.split(r"[^a-z0-9]+", text.lower()) if w]
+
+
+_TIMING_TAGS = frozenset({"time-based", "blind", "time-based-sqli"})
+
+
+def _is_timing_template(template_id: str, tags: list) -> bool:
+    # Whole words of the id: "time" inside uptime-kuma-panel or iptime-router
+    # is a product name, not a template that measures the server's delay.
+    if any(t.lower() in _TIMING_TAGS for t in tags):
+        return True
+    words = _words(template_id)
+    return "time" in words or "blind" in words
+
+
+# Copy a throttling server writes on its 429/503 page. It counts only once the
+# response head says the server throttled: on a served page these are ordinary
+# words ("Loading, please wait..." above an exposed /.git/config).
+_THROTTLE_PHRASES = (
+    "too many requests",
+    "rate limit",
+    "too many attempts",
+    "please wait",
+    "try again later",
+    "temporarily blocked",
+    "request blocked",
+)
+
+_STATUS_LINE = re.compile(r"HTTP/\d(?:\.\d)?\s+(\d{3})(?:\s|$)")
+_MAX_HEAD_LINES = 100
+
+
+def _response_head(response: str) -> tuple:
+    """(status, lower-cased header names) of a raw HTTP response.
+
+    Nuclei's JSONL has no status field; its `response` is the raw dump, status
+    line first. A DNS, network or file template's response is no HTTP head:
+    (None, set()).
+    """
+    lines = response.lstrip().splitlines()
+    match = _STATUS_LINE.match(lines[0]) if lines else None
+    if not match:
+        return None, set()
+    names = set()
+    for line in lines[1:_MAX_HEAD_LINES]:
+        if not line.strip():
+            break
+        name, sep, _ = line.partition(":")
+        if sep:
+            names.add(name.strip().lower())
+    return int(match.group(1)), names
+
+
+def _throttle_marker(response: str) -> Optional[str]:
+    """What shows the server throttled this response, or None."""
+    status, header_names = _response_head(response)
+    if status == 429:
+        return "HTTP 429"
+    if status != 503 and "retry-after" not in header_names:
+        return None
+    lowered = response.lower()
+    return next((p for p in _THROTTLE_PHRASES if p in lowered), None)
+
+
 def is_false_positive(finding: dict) -> tuple:
     """
     Detect common false positive patterns in nuclei findings.
 
     False positive indicators:
-    1. Rate limiting (429 status) - timing-based attacks become unreliable
+    1. Rate limiting, for time-based and blind templates only: the server
+       throttled the response (status 429, or status 503 / a Retry-After
+       header with throttle wording), so the delay the template measured is
+       the throttle's, not the payload's. Any other template keeps its match,
+       and throttle wording on a page the server did not throttle is copy.
     2. WAF/firewall blocks - response doesn't reflect actual vulnerability
-    3. Generic error pages - timing variations due to error handling
 
     When the AI cascade is enabled (per-scan via set_fp_ai_ctx), responses
     that the static keyword list missed but still LOOK like block pages
@@ -426,24 +521,8 @@ def is_false_positive(finding: dict) -> tuple:
     response = finding.get("response") or ""
     template_id = finding.get("template-id") or ""
     info = finding.get("info") or {}
-    tags = info.get("tags") or []
-    
-    # Patterns that indicate false positives
-    rate_limit_indicators = [
-        "429 Too Many Requests",
-        "HTTP/1.1 429",
-        "HTTP/2 429",
-        "Too Many Requests",
-        "rate limit",
-        "Rate Limit",
-        "too many attempts",
-        "Too many attempts",
-        "please wait",
-        "try again later",
-        "temporarily blocked",
-        "Request blocked",
-    ]
-    
+    tags = _tag_list(info.get("tags"))
+
     waf_block_indicators = [
         "403 Forbidden",
         "Access Denied",
@@ -456,18 +535,11 @@ def is_false_positive(finding: dict) -> tuple:
         "AWS WAF",
     ]
     
-    # Check for rate limiting - especially bad for time-based attacks
-    is_time_based = any(t in ["time-based", "blind", "time-based-sqli"] for t in tags) or \
-                    "time" in template_id.lower() or "blind" in template_id.lower()
-    
-    for indicator in rate_limit_indicators:
-        if indicator.lower() in response.lower():
-            if is_time_based:
-                return True, f"Rate limiting detected ('{indicator}') - invalidates time-based attack detection"
-            else:
-                # For non-time-based, rate limiting is less critical but still suspicious
-                return True, f"Rate limiting detected ('{indicator}') - response may not reflect actual vulnerability"
-    
+    if _is_timing_template(template_id, tags):
+        marker = _throttle_marker(response)
+        if marker:
+            return True, f"Rate limiting detected ('{marker}') - invalidates time-based attack detection"
+
     # Check for WAF blocks on injection attacks
     is_injection = any(t in ["sqli", "xss", "rce", "lfi", "ssti", "injection"] for t in tags)
     
@@ -498,6 +570,64 @@ def is_false_positive(finding: dict) -> tuple:
 # =============================================================================
 # Nuclei Output Parsing
 # =============================================================================
+
+# Order matters: the first key a tag matches decides that tag's category.
+_CATEGORY_BY_TAG = {
+    "xss": "xss",
+    "sqli": "sqli",
+    "rce": "rce",
+    "lfi": "lfi",
+    "rfi": "rfi",
+    "ssrf": "ssrf",
+    "xxe": "xxe",
+    "ssti": "ssti",
+    "cve": "cve",
+    "exposure": "exposure",
+    "misconfig": "misconfiguration",
+    "misconfiguration": "misconfiguration",
+    "default-login": "authentication",
+    "auth-bypass": "authentication",
+    "panel": "exposed_panel",
+    "tech": "technology",
+    "takeover": "takeover",
+    "dos": "dos",
+    "idor": "idor",
+    "csrf": "csrf",
+    "redirect": "open_redirect",
+    "crlf": "crlf",
+    "injection": "injection",
+    "file-upload": "file_upload",
+    "traversal": "path_traversal",
+    "disclosure": "information_disclosure",
+    "ssl": "ssl_tls",
+    "tls": "ssl_tls",
+    "cloud": "cloud",
+    "aws": "cloud",
+    "azure": "cloud",
+    "gcp": "cloud",
+    "kubernetes": "cloud",
+    "docker": "cloud",
+}
+_CATEGORY_KEY_WORDS = tuple((tuple(_words(key)), category)
+                            for key, category in _CATEGORY_BY_TAG.items())
+
+
+def _category_from_tags(tags: list) -> str:
+    """Category of the first tag that names one, else "general".
+
+    A key matches whole words of a tag only (time-based-sqli is sqli,
+    open-redirect is open_redirect), never a substring: "source",
+    "ecommerce" and "salesforce" contain "rce", "sqlite" contains "sqli",
+    and the Priority Board ranks on this category.
+    """
+    for tag in tags:
+        words = tuple(_words(tag))
+        for key, category in _CATEGORY_KEY_WORDS:
+            n = len(key)
+            if any(words[i:i + n] == key for i in range(len(words) - n + 1)):
+                return category
+    return "general"
+
 
 def parse_nuclei_finding(finding: dict) -> dict:
     """
@@ -543,58 +673,9 @@ def parse_nuclei_finding(finding: dict) -> dict:
                         "url": f"https://nvd.nist.gov/vuln/detail/{cid}"
                     })
     
-    # Extract tags
-    tags = info.get("tags", [])
-    if isinstance(tags, str):
-        tags = [t.strip() for t in tags.split(",")]
-    
-    # Determine category from tags
-    category = "general"
-    category_map = {
-        "xss": "xss",
-        "sqli": "sqli",
-        "rce": "rce",
-        "lfi": "lfi",
-        "rfi": "rfi",
-        "ssrf": "ssrf",
-        "xxe": "xxe",
-        "ssti": "ssti",
-        "cve": "cve",
-        "exposure": "exposure",
-        "misconfig": "misconfiguration",
-        "default-login": "authentication",
-        "auth-bypass": "authentication",
-        "panel": "exposed_panel",
-        "tech": "technology",
-        "takeover": "takeover",
-        "dos": "dos",
-        "idor": "idor",
-        "csrf": "csrf",
-        "redirect": "open_redirect",
-        "crlf": "crlf",
-        "injection": "injection",
-        "file-upload": "file_upload",
-        "traversal": "path_traversal",
-        "disclosure": "information_disclosure",
-        "ssl": "ssl_tls",
-        "tls": "ssl_tls",
-        "cloud": "cloud",
-        "aws": "cloud",
-        "azure": "cloud",
-        "gcp": "cloud",
-        "kubernetes": "cloud",
-        "docker": "cloud",
-    }
-    
-    for tag in tags:
-        tag_lower = tag.lower()
-        for key, cat in category_map.items():
-            if key in tag_lower:
-                category = cat
-                break
-        if category != "general":
-            break
-    
+    tags = _tag_list(info.get("tags"))
+    category = _category_from_tags(tags)
+
     # Build result
     result = {
         "template_id": finding.get("template-id", "unknown"),

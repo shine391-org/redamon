@@ -8,10 +8,8 @@
  * entire attack-surface graph.
  *
  * There was nothing to reuse. The existing checks either inline the pattern in
- * a route while calling the session-based, ACCESS_ENFORCE-aware `guardProject`,
- * or take a browser `EffectiveUser`; neither is reachable from a bearer token,
- * and neither refuses in the mode where `ACCESS_ENFORCE=0` degrades an
- * ownership violation to a logged warning.
+ * a route while calling the session-based `guardProject`, or take a browser
+ * `EffectiveUser`; neither is reachable from a bearer token.
  *
  * So: one module, and no tool may reach a child row any other way. Each helper
  * proves the PARENT with `assertMcpProjectAccess` first, then re-resolves the
@@ -24,8 +22,16 @@
  * muteable-label expression, so a foreign id matches zero rows server-side.
  */
 import prisma from '@/lib/prisma'
-import { assertMcpProjectAccess } from '@/lib/mcpAuth'
+import { assertMcpProjectAccess, type McpProjectToken } from '@/lib/mcpAuth'
+import type { ProjectLevel } from '@/lib/authz/permissions'
 import { McpToolError } from '@/lib/mcp/errors'
+
+/**
+ * Who asks and at what level: the token (a bare user id is a token that never
+ * opted in to shared projects) and the level of the tool behind the lookup,
+ * which defaults to the owner's as `assertMcpProjectAccess` does.
+ */
+type Asker = McpProjectToken | string
 
 /**
  * A child row that is either missing or another project's. The caller is not
@@ -70,11 +76,12 @@ export interface OwnedScanVersion {
  * whole-graph dump out of Postgres to find out.
  */
 export async function assertVersionInProject(
-  userId: string,
+  token: Asker,
   projectId: string,
-  versionId: string
+  versionId: string,
+  needed: ProjectLevel = 'O'
 ): Promise<OwnedScanVersion> {
-  await assertMcpProjectAccess(userId, projectId)
+  await assertMcpProjectAccess(token, projectId, needed)
 
   const [row] = await prisma.$queryRaw<Array<{
     id: string
@@ -122,11 +129,12 @@ export interface OwnedJob {
 }
 
 export async function assertJobInProject(
-  userId: string,
+  token: Asker,
   projectId: string,
-  jobId: string
+  jobId: string,
+  needed: ProjectLevel = 'O'
 ): Promise<OwnedJob> {
-  await assertMcpProjectAccess(userId, projectId)
+  await assertMcpProjectAccess(token, projectId, needed)
   const row = await prisma.jobQueue.findUnique({
     where: { id: jobId },
     select: { id: true, projectId: true, kind: true, status: true, runId: true, enqueuedAt: true },
@@ -141,6 +149,8 @@ export interface OwnedGraphView {
   name: string
   description: string
   cypherQuery: string
+  /** The project's owner: the tenant the stored query runs under (on a shared project, not the token's user). */
+  ownerId: string
 }
 
 /**
@@ -151,17 +161,18 @@ export interface OwnedGraphView {
  * model leaks the graph schema and gives it an injection carrier.
  */
 export async function assertViewInProject(
-  userId: string,
+  token: Asker,
   projectId: string,
-  viewId: string
+  viewId: string,
+  needed: ProjectLevel = 'O'
 ): Promise<OwnedGraphView> {
-  await assertMcpProjectAccess(userId, projectId)
+  const project = await assertMcpProjectAccess(token, projectId, needed)
   const row = await prisma.graphView.findUnique({
     where: { id: viewId },
     select: { id: true, projectId: true, name: true, description: true, cypherQuery: true },
   })
   if (!row || row.projectId !== projectId) childNotFound('saved view')
-  return row
+  return { ...row, ownerId: project.userId }
 }
 
 export interface OwnedRemediation {
@@ -172,11 +183,12 @@ export interface OwnedRemediation {
 }
 
 export async function assertRemediationInProject(
-  userId: string,
+  token: Asker,
   projectId: string,
-  remediationId: string
+  remediationId: string,
+  needed: ProjectLevel = 'O'
 ): Promise<OwnedRemediation> {
-  await assertMcpProjectAccess(userId, projectId)
+  await assertMcpProjectAccess(token, projectId, needed)
   const row = await prisma.remediation.findUnique({
     where: { id: remediationId },
     select: { id: true, projectId: true, title: true, status: true },

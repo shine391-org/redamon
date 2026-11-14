@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { guardProject } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { recordRunStopped } from '@/lib/scanTimeline'
 import { internalError, upstreamErrorResponse, upstreamFailureResponse } from '@/lib/routeErrors'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
@@ -12,8 +13,8 @@ interface RouteParams {
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { projectId, runId } = await params
-    const __denied = await guardProject(projectId)
-    if (__denied) return __denied
+    const auth = await requirePermission(request, 'recon:partial', { projectId })
+    if (auth instanceof NextResponse) return auth
 
     let response: Response
     try {
@@ -31,6 +32,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     }
 
     const data = await response.json()
+    await recordRunStopped(projectId, 'partial_recon', runId, data?.status)
     return NextResponse.json(data)
 
   } catch (error) {

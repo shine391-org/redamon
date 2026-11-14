@@ -6,9 +6,10 @@ from urllib.parse import urlencode
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from recon.helpers.ip_placeholders import is_placeholder
 from recon.partial_recon_modules.helpers import (
-    _classify_ip, allowed_hosts_for, include_root_for, org_for_root, project_scan_roots, roe_excluded,
-    root_for_host,
+    _classify_ip, allowed_hosts_for, include_root_for, ip_mode_recon, org_for_root, project_scan_roots,
+    is_run_ip_hostname, roe_excluded, root_for_host, run_ip_hostnames, run_ip_targets, run_is_ip_mode,
 )
 
 #: A path known only from an API specification is requested with GET or HEAD
@@ -288,6 +289,11 @@ class _GraphScope:
     Without scope groups (IP mode, whose hosts are dashed addresses under the
     synthetic root, or a caller not yet migrated) the Domain names are the
     roots, as before, and only a literal group's list narrows.
+
+    IP mode also reads the org Domains of the run's hostnames (S), and keeps a
+    target's label (the builders' rows keep it on its own address only) or a
+    name in S; any other name, an older run's PTR name under the synthetic
+    root or a name of an org Domain the policy no longer admits, is no target.
     """
 
     def __init__(self, roots: list, domain_groups, include_root_domain: bool):
@@ -295,7 +301,12 @@ class _GraphScope:
         self.apex_roots, self.allowed = _root_scope(roots, domain_groups, include_root_domain)
         self.scoped = bool(domain_groups) and all(
             isinstance(g, dict) and "scanRoot" in g for g in domain_groups)
-        if self.scoped:
+        self.ip_names = set(run_ip_hostnames()) if run_is_ip_mode() else None
+        if self.ip_names is not None:
+            orgs = sorted({org.lower() for org in run_ip_hostnames().values()} - {r.lower() for r in roots})
+            self.orgs = list(roots) + orgs
+            self.project_roots = []
+        elif self.scoped:
             self.orgs = list(dict.fromkeys(org_for_root(r, domain_groups).lower() for r in roots))
             self._selected = {r.lower(): r for r in roots}
             self.project_roots = sorted({*self._selected, *project_scan_roots()}, key=len, reverse=True)
@@ -324,6 +335,9 @@ class _GraphScope:
     def keeps(self, host, record_root=None) -> bool:
         if roe_excluded(host):
             return False
+        if self.ip_names is not None:
+            h = (host or "").strip().strip(".").lower()
+            return is_placeholder(h) or h in self.ip_names
         if not self.scoped:
             # A host under no root (IP mode's dashed names) was always kept.
             root = record_root or root_for_host(host, self.roots)
@@ -371,7 +385,7 @@ def graph_scope_subdomains(session, user_id: str, project_id: str, roots: list,
     """The run's Subdomain names for a writer's scope list: every name under
     the run's org Domains that belongs to one of its scan roots (the roots
     themselves included). Without scope groups, every Subdomain under the
-    roots, as before."""
+    roots, as before. IP mode: the target labels and the run's names (S)."""
     scope = _GraphScope(roots, domain_groups, include_root_domain=False)
     record = session.run(
         """
@@ -382,6 +396,8 @@ def graph_scope_subdomains(session, user_id: str, project_id: str, roots: list,
         domains=scope.orgs, uid=user_id, pid=project_id,
     ).single()
     subs = (record["subdomains"] if record else None) or []
+    if scope.ip_names is not None:
+        return [sub for sub in subs if scope.keeps(sub)]
     if not scope.scoped:
         return subs
     return [sub for sub in subs if scope.root_of(sub, apex=False) is not None]
@@ -437,6 +453,132 @@ def _co_hosted_vhost_hosts(session, user_id: str, project_id: str) -> frozenset:
         return frozenset()
 
 
+#: Coverage-note module of the refusals the partial graph readers make.
+_ADMISSION_MODULE = "partial_graph_targets"
+
+
+def _run_roe() -> dict:
+    """The run's RoE in settings form, for the admission gate: the builders get
+    no settings, partial_recon sets the exclusions once (set_run_roe)."""
+    from recon.partial_recon_modules import helpers
+    excluded = list(helpers._RUN_ROE_EXCLUDED)
+    return {"ROE_ENABLED": bool(excluded), "ROE_EXCLUDED_HOSTS": excluded}
+
+
+def _graph_address_gate(session, user_id: str, project_id: str):
+    """``admits(host)`` under the run's RoE IP and CIDR entries, on the addresses
+    the graph resolved each name to (forward DNS).
+
+    The rule is admit_targets', as admit_urls applies it to httpx: a tool
+    handed a URL resolves its host itself, so a name with any excluded address,
+    or with none while such entries exist, is no target. Without an IP or CIDR
+    entry it admits everything and never queries (the name entries are
+    roe_excluded's).
+    """
+    from recon.helpers.target_admission import admission_context, admit_targets
+
+    roe = _run_roe()
+    if not admission_context(roe).ip_rules:
+        return lambda host: True
+    addresses: dict = {}
+    for record in session.run(
+        """
+        MATCH (s:Subdomain {user_id: $uid, project_id: $pid})-[r:RESOLVES_TO]->(i:IP)
+        WHERE """ + FORWARD_DNS + """
+        RETURN toLower(s.name) AS host, i.address AS address
+        """,
+        uid=user_id, pid=project_id,
+    ):
+        holders = addresses.setdefault(record["host"], [])
+        if record["address"] not in holders:
+            holders.append(record["address"])
+    verdicts: dict = {}
+
+    def admits(host: str) -> bool:
+        if host not in verdicts:
+            adm = admit_targets(roe, names={host: addresses.get(host, [])},
+                                module=_ADMISSION_MODULE, resolves_names=True)
+            verdicts[host] = host in adm.names
+        return verdicts[host]
+
+    return admits
+
+
+def _ip_mode_gate():
+    """IP mode: the recon dict the admission gate reads the run's targets
+    from, or None outside IP mode."""
+    targets = run_ip_targets()
+    return None if targets is None else {"metadata": {"ip_mode": True, "expanded_ips": targets}}
+
+
+def _ip_mode_names(names: dict) -> tuple:
+    """IP mode: of ``{host: [addresses]}``, the names a tool may be handed and
+    the target addresses, as the admission gate rules (B-21): a real name only
+    when it has an address and every one is a target, a label only as its own
+    target address. Refusals are logged once. ``(None, None)`` outside IP mode.
+    """
+    gate = _ip_mode_gate()
+    if gate is None:
+        return None, None
+    from recon.helpers.target_admission import admit_targets
+    adm = admit_targets(None, gate, names=names, module=_ADMISSION_MODULE, resolves_names=True)
+    return set(adm.names), set(adm.ips)
+
+
+def _ip_mode_rows(rows, host_key: str, ip_key: str):
+    """IP mode: the Subdomain -> IP rows that stay targets.
+
+    The graph holds, under the synthetic root, each target's label (and the
+    PTR names an older full run kept), and under their org Domains the names
+    a run selected, with source-less RESOLVES_TO edges: an older run (B-01)
+    or a typed attach (B-20) may have left one on an address that is no
+    target. A label keeps only its target address; a name is kept only when
+    it is one of the run's hostnames (S, judged on live DNS at the run's
+    start) and every address the graph resolves it to is a target. Outside
+    IP mode the rows pass as they are.
+    """
+    if not run_is_ip_mode():
+        return rows
+    rows = list(rows)
+    answers: dict = {}
+    for row in rows:
+        if is_placeholder(row[host_key]) or is_run_ip_hostname(row[host_key]):
+            answers.setdefault(row[host_key], []).append(row[ip_key])
+    names, addresses = _ip_mode_names(answers)
+    return [row for row in rows
+            if row[host_key] in names or (is_placeholder(row[host_key]) and row[ip_key] in addresses)]
+
+
+def _ip_mode_kept_host(recon_data: dict, host) -> bool:
+    """IP mode: a name in the flat ``subdomains`` list stays only when its
+    forward rows survived _ip_mode_rows (it is in dns.subdomains). Always
+    True outside IP mode."""
+    if not run_is_ip_mode():
+        return True
+    return host in ((recon_data.get("dns") or {}).get("subdomains") or {})
+
+
+def _ip_mode_url_scope():
+    """IP mode: ``keeps(host)`` for a graph URL's host, or None outside IP
+    mode: a target address (T), or a name the run may scan (S, every address
+    it resolves to a target when the run started). Nothing is queried."""
+    gate = _ip_mode_gate()
+    if gate is None:
+        return None
+    import ipaddress
+    from recon.helpers.target_admission import ip_mode_targets, is_target
+    targets = ip_mode_targets(gate)
+
+    def keeps(host: str) -> bool:
+        try:
+            ipaddress.ip_address(host.strip("[]"))
+            return is_target(host, targets)
+        except ValueError:
+            return is_run_ip_hostname(host)
+
+    return keeps
+
+
 def graph_url_scope(session, user_id: str, project_id: str, domains, domain_groups,
                     include_root_domain: bool = False, apex_filter: bool = True):
     """A predicate over a graph URL's host: is it a target of this run?
@@ -448,6 +590,13 @@ def graph_url_scope(session, user_id: str, project_id: str, domains, domain_grou
     graph knows it only as a co-hosted vhost name (_co_hosted_vhost_hosts). A caller
     not yet migrated (no domain_groups) gets only the apex rule it had. With
     scope groups the decision is _GraphScope's (§4.6, longest scan root).
+    A host the scope keeps must also pass the RoE admission gate on every
+    address the graph resolved it to (_graph_address_gate).
+
+    IP mode (B-21) keeps a host only when it is a target address (T) or one of
+    the run's hostnames (S), under its org Domain or under none (a recorded
+    name the policy admits now). A host under an org Domain but outside S, a
+    third party, a co-hosted vhost name and a label are never kept.
     """
     roots = _as_roots(domains)
     scope = _GraphScope(roots, domain_groups, include_root_domain)
@@ -464,10 +613,18 @@ def graph_url_scope(session, user_id: str, project_id: str, domains, domain_grou
             co_hosted_cache["set"] = _co_hosted_vhost_hosts(session, user_id, project_id)
         return co_hosted_cache["set"]
 
+    admits = _graph_address_gate(session, user_id, project_id)
+    ip_mode_keeps = _ip_mode_url_scope()
+
     def keep(host) -> bool:
         host = (host or "").strip().lower()
-        if not host:
-            return True
+        if ip_mode_keeps is not None:
+            return not host or (not roe_excluded(host) and ip_mode_keeps(host) and admits(host))
+        # Only a host the scope keeps reaches the gate, so a refusal is noted
+        # for a target the RoE took out, never for an out-of-scope host.
+        return not host or (_in_scope(host) and admits(host))
+
+    def _in_scope(host) -> bool:
         if roe_excluded(host):
             return False
         if scope.scoped:
@@ -511,10 +668,21 @@ def graph_target_hosts(user_id: str, project_id: str, domains, domain_groups,
     plus every Subdomain under the run's roots, dropping the hosts a literal
     group never listed. With the graph unreachable, only the apexes are
     returned. A caller not yet migrated (a single string) keeps its one root.
+    IP mode: _ip_mode_target_hosts.
+
+    Every host then passes the RoE admission gate on the addresses the graph
+    resolved it to (_graph_address_gate): Gau's verifier and method probe
+    request each archived URL on these hosts, and resolve the name themselves.
+    Under RoE IP or CIDR entries those addresses are read even when the
+    graph's names are left out, and with no graph to read them from no host is
+    admitted (nothing shows it stays off the excluded ranges).
     """
     from graph_db import Neo4jClient
+    from recon.helpers.target_admission import admission_context, admit_targets
 
     roots = _as_roots(domains)
+    if run_is_ip_mode():
+        return _ip_mode_target_hosts(user_id, project_id, roots, include_graph)
     scope = _GraphScope(roots, domain_groups, include_root_domain)
     allowed = scope.allowed
     hosts = set()
@@ -527,26 +695,41 @@ def graph_target_hosts(user_id: str, project_id: str, domains, domain_groups,
             # Without scope groups a wildcard/single root keeps its apex, and a
             # literal group lists its apex only when it wrote ".".
             hosts.add(root)
-    if not include_graph or not roots:
+    address_rules = admission_context(_run_roe()).ip_rules
+    if not roots or not (include_graph or address_rules):
         return sorted(hosts)
 
     with Neo4jClient() as graph_client:
         if not graph_client.verify_connection():
             print("[!][Partial Recon] Neo4j not reachable, cannot fetch graph subdomains")
-            return sorted(hosts)
+            if not address_rules:
+                return sorted(hosts)
+            return sorted(admit_targets(_run_roe(), names=dict.fromkeys(hosts, ()),
+                                        module=_ADMISSION_MODULE, resolves_names=True).names)
         with graph_client.driver.session() as session:
-            result = session.run(
-                """
-                MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:HAS_SUBDOMAIN]->(s:Subdomain)
-                WHERE toLower(d.name) IN $domains
-                RETURN d.name AS root, s.name AS sub
-                """,
-                domains=scope.orgs, uid=user_id, pid=project_id,
-            )
-            for record in result:
-                if scope.keeps(record["sub"], record["root"]):
-                    hosts.add(record["sub"])
-    return sorted(hosts)
+            if include_graph:
+                result = session.run(
+                    """
+                    MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:HAS_SUBDOMAIN]->(s:Subdomain)
+                    WHERE toLower(d.name) IN $domains
+                    RETURN d.name AS root, s.name AS sub
+                    """,
+                    domains=scope.orgs, uid=user_id, pid=project_id,
+                )
+                for record in result:
+                    if scope.keeps(record["sub"], record["root"]):
+                        hosts.add(record["sub"])
+            admits = _graph_address_gate(session, user_id, project_id)
+            return sorted(h for h in hosts if admits(h.strip().lower()))
+
+
+def _ip_mode_target_hosts(user_id: str, project_id: str, roots: list, include_graph: bool) -> list:
+    """IP mode: the names an archive may be asked about (S-6): the run's
+    hostnames (S), judged on live DNS at its start. Never the synthetic root,
+    which is the project id, nor a label, which no archive knows."""
+    if not include_graph or not roots:
+        return []
+    return sorted(name for name in run_ip_hostnames() if not roe_excluded(name))
 
 
 def _recon_data_ips(recon_data: dict) -> list:
@@ -577,15 +760,24 @@ def attach_graph_ownership(recon_data: dict, user_id: str, project_id: str) -> N
             if not graph_client.verify_connection():
                 return
             with graph_client.driver.session() as session:
+                # The reasons ride along: an IP whose attribution failed is
+                # tagged "unknown", and only its reasons say so (vhost/SNI
+                # tries no recorded hostname there).
                 rows = session.run(
                     """
                     MATCH (i:IP {user_id: $uid, project_id: $pid})
                     WHERE i.address IN $ips AND i.ownership IS NOT NULL
-                    RETURN i.address AS ip, i.ownership AS ownership
+                    RETURN i.address AS ip, i.ownership AS ownership, i.ownership_reasons AS reasons
                     """,
                     ips=ips, uid=user_id, pid=project_id,
                 )
-                by_ip = {r["ip"]: {"ownership": r["ownership"]} for r in rows if r["ip"]}
+                by_ip = {}
+                for r in rows:
+                    if r["ip"]:
+                        entry = {"ownership": r["ownership"]}
+                        if r.get("reasons"):
+                            entry["ownership_reasons"] = list(r["reasons"])
+                        by_ip[r["ip"]] = entry
     except Exception as e:  # noqa: BLE001 - no tag only means the CDN fallbacks apply
         print(f"[!][Partial Recon] Could not read the IP attribution tags: {type(e).__name__}")
         return
@@ -616,7 +808,7 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
     apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": primary,
         "domains": roots,
         "dns": {
@@ -624,7 +816,7 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
             "subdomains": {},
         },
         "metadata": {"include_root_domain": primary in apex_roots},
-    }
+    })
     if not roots:
         return recon_data
 
@@ -666,7 +858,7 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
             )
-            for record in result:
+            for record in _ip_mode_rows(result, "subdomain", "address"):
                 if not scope.keeps(record["subdomain"], record["root"]):
                     continue
                 _add_ip(_dns_entry(record["subdomain"])["ips"], record["address"], record["version"])
@@ -691,6 +883,13 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
     fills dns.domain; another root's apex is recorded as a host under
     dns.subdomains, the one place extract_targets_from_recon reads a second
     apex from. metadata.include_root_domain describes the first root.
+
+    An RoE-excluded address is in dns only, never in the port maps: the
+    admission gate reads dns (known_addresses, extract_targets_from_recon) and
+    needs it to see that a name with one excluded address is no by-name target,
+    while nmap, tlsx and the banner grab connect to what the maps hold.
+    metadata.roe carries the run's RoE, while it has exclusions, for a reader
+    that gets no settings.
     """
     from graph_db import Neo4jClient
 
@@ -699,7 +898,7 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
     apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": primary,
         "domains": roots,
         "port_scan": {
@@ -715,25 +914,41 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
             "subdomains": {},
         },
         "metadata": {"include_root_domain": primary in apex_roots},
-    }
+    })
+    roe = _run_roe()
+    if roe["ROE_ENABLED"]:
+        recon_data["metadata"]["roe"] = roe
 
     all_ports_set = set()
+    ip_mode = run_is_ip_mode()
 
     def _add_host(host: str, ip_addr: str, port_numbers: list, port_details: list,
                   record=None) -> None:
         """Record one host -> IP -> ports row in by_ip, by_host and ip_to_hostnames.
 
-        The IP's CDN tag rides along: a partial run writes this data back through
-        update_graph_from_port_scan, which sets IP.is_cdn from it, so an entry
-        without the tag would reset every tagged IP to false.
+        Everything a write-back through update_graph_from_port_scan could lower
+        rides along: the IP's CDN tag, and on each port detail the IP it is open
+        on and the graph's passive_only mark (null on a Port from before the
+        mark), which tells the writer the port is no active hit of this run.
+        by_host stays keyed by hostname and lists every address's ports, the
+        way the target builders (httpx) read it; the detail's `ip` keeps a
+        port of the host's second address off its first.
+
+        IP mode keys a label's row by its address, as the full run's naabu
+        does (B-21): httpx then probes ``http://<address>``, never the label,
+        and no tool is handed the label as a name.
         """
+        named = not (ip_mode and is_placeholder(host))
+        if not named:
+            host = ip_addr
         get = getattr(record, "get", None)
         is_cdn = bool(get("is_cdn")) if get else False
         cdn = (get("cdn_name") if get else None) or None
+        port_details = [{**pd, "ip": ip_addr} for pd in port_details]
         if ip_addr not in recon_data["port_scan"]["by_ip"]:
             recon_data["port_scan"]["by_ip"][ip_addr] = {
                 "ip": ip_addr,
-                "hostnames": [host],
+                "hostnames": [host] if named else [],
                 "ports": list(port_numbers),
                 "port_details": list(port_details),
                 "is_cdn": is_cdn,
@@ -741,7 +956,7 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
             }
         else:
             existing = recon_data["port_scan"]["by_ip"][ip_addr]
-            if host not in existing["hostnames"]:
+            if named and host not in existing["hostnames"]:
                 existing["hostnames"].append(host)
             for pnum in port_numbers:
                 if pnum not in existing["ports"]:
@@ -765,9 +980,12 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 if pnum not in existing["ports"]:
                     existing["ports"].append(pnum)
             for pd in port_details:
-                if not any(epd["port"] == pd["port"] for epd in existing["port_details"]):
+                if not any(epd["port"] == pd["port"] and epd.get("ip") == pd["ip"]
+                           for epd in existing["port_details"]):
                     existing["port_details"].append(pd)
 
+        if not named:
+            return
         recon_data["port_scan"]["ip_to_hostnames"].setdefault(ip_addr, [])
         if host not in recon_data["port_scan"]["ip_to_hostnames"][ip_addr]:
             recon_data["port_scan"]["ip_to_hostnames"][ip_addr].append(host)
@@ -780,7 +998,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 pnum = int(p["number"])
                 numbers.append(pnum)
                 all_ports_set.add(pnum)
-                details.append({"port": pnum, "protocol": p["protocol"] or "tcp", "service": ""})
+                details.append({"port": pnum, "protocol": p["protocol"] or "tcp", "service": "",
+                                "passive_only": p.get("passive_only")})
         return numbers, details
 
     def _dns_entry(host: str) -> dict:
@@ -805,12 +1024,11 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                     "OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)\n"
                     "RETURN {ROOT}, i.address AS ip, i.version AS version, "
                     "i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, "
-                    "collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports")
+                    "collect(DISTINCT {number: p.number, protocol: p.protocol, "
+                    "passive_only: p.passive_only}) AS ports")
             for record in apex_records:
                 root = record["root"]
                 ip_addr = record["ip"]
-                if roe_excluded(ip_addr):
-                    continue
                 bucket = _classify_ip(ip_addr, record["version"])
                 if root == primary:
                     if ip_addr not in recon_data["dns"]["domain"]["ips"][bucket]:
@@ -820,6 +1038,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                     ips = _dns_entry(root)["ips"][bucket]
                     if ip_addr not in ips:
                         ips.append(ip_addr)
+                if roe_excluded(ip_addr):
+                    continue
                 port_numbers, port_details = _ports(record["ports"])
                 _add_host(root, ip_addr, port_numbers, port_details, record)
 
@@ -832,21 +1052,22 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)
                 RETURN d.name AS root, s.name AS subdomain, i.address AS ip, i.version AS version,
                        i.is_cdn AS is_cdn, i.cdn_name AS cdn_name,
-                       collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports
+                       collect(DISTINCT {number: p.number, protocol: p.protocol,
+                                         passive_only: p.passive_only}) AS ports
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
             )
-            for record in result:
+            for record in _ip_mode_rows(result, "subdomain", "ip"):
                 subdomain = record["subdomain"]
                 if not scope.keeps(subdomain, record["root"]):
                     continue
                 ip_addr = record["ip"]
-                if roe_excluded(ip_addr):
-                    continue
                 bucket = _classify_ip(ip_addr, record["version"])
                 sub_ips = _dns_entry(subdomain)["ips"]
                 if ip_addr not in sub_ips[bucket]:
                     sub_ips[bucket].append(ip_addr)
+                if roe_excluded(ip_addr):
+                    continue
                 port_numbers, port_details = _ports(record["ports"])
                 _add_host(subdomain, ip_addr, port_numbers, port_details, record)
 
@@ -869,11 +1090,14 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
       - 'subdomains': flat list for scope filtering in graph updates
       - 'metadata.include_root_domain': stamped so extract_targets_from_recon
         excludes the first root's apex when scope says so.
+      - 'metadata.roe': the run's RoE, while it has exclusions, for a reader
+        that gets no settings.
 
     `domains` is the run's roots, scoped per root like the other builders.
     BaseURLs are read project-wide and then filtered by graph_url_scope: an
-    excluded apex, a host a literal group never listed, and a host under a
-    Domain this run does not cover are all dropped.
+    excluded apex, a host a literal group never listed, a host under a
+    Domain this run does not cover, and a host the RoE admission gate refuses
+    are all dropped.
     """
     from graph_db import Neo4jClient
 
@@ -882,7 +1106,7 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
     apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": primary,
         "domains": roots,
         "subdomains": [],
@@ -894,13 +1118,18 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
             "by_url": {},
         },
         "metadata": {"include_root_domain": primary in apex_roots},
-    }
+    })
+    roe = _run_roe()
+    if roe["ROE_ENABLED"]:
+        recon_data["metadata"]["roe"] = roe
     if not roots:
         return recon_data
 
+    # An RoE-excluded address is kept: every reader of these addresses passes
+    # them through the admission gate (extract_targets_from_recon), which needs
+    # it to see that a name with one excluded address is no by-name target.
+    # Dropped here, the name would look wholly allowed.
     def _add_ip(ips: dict, addr: str, version) -> None:
-        if roe_excluded(addr):
-            return
         bucket = _classify_ip(addr, version)
         if addr not in ips[bucket]:
             ips[bucket].append(addr)
@@ -938,7 +1167,7 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
             )
-            for record in result:
+            for record in _ip_mode_rows(result, "subdomain", "address"):
                 if not scope.keeps(record["subdomain"], record["root"]):
                     continue
                 _add_ip(_dns_entry(record["subdomain"])["ips"], record["address"], record["version"])
@@ -984,7 +1213,7 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
             if record:
                 recon_data["subdomains"] = [
                     sub for sub in record["subdomains"] or []
-                    if scope.keeps(sub)
+                    if scope.keeps(sub) and _ip_mode_kept_host(recon_data, sub)
                 ]
 
     return recon_data
@@ -1005,6 +1234,14 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
     and BaseURLs/Endpoints filtered by graph_url_scope (a host under a Domain
     this run does not cover, or an excluded apex, is dropped). The first root's
     apex fills dns.domain; another root's apex is a dns.subdomains host.
+
+    An RoE-excluded address is in dns only, never in port_scan.by_ip or the
+    nmap services, as in the port-scan builder: every reader's admission gate
+    (partial Nuclei, takeover, security checks, vhost) reads dns and needs it
+    to see that a name with one excluded address is no by-name target, and
+    that a name whose only address is excluded is excluded rather than
+    unresolved. metadata.roe carries the run's RoE, while it has exclusions,
+    outside IP mode, whose targets the RoE already filtered.
     """
     from graph_db import Neo4jClient
 
@@ -1013,7 +1250,7 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
     apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": primary,
         "domains": roots,
         "subdomains": [],
@@ -1032,14 +1269,17 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
             "by_base_url": {},
             "discovered_urls": [],
         },
-    }
+    })
+    roe = _run_roe()
+    if roe["ROE_ENABLED"] and not run_is_ip_mode():
+        recon_data["metadata"]["roe"] = roe
     if not roots:
         return recon_data
 
     def _hydrate_ip_metadata(addr: str, is_cdn, cdn_name, asn) -> None:
         """Populate port_scan.by_ip with CDN/ASN metadata so collect_cdn_ips
         and collect_asn_cdn_ips can detect CDN IPs in partial-recon mode."""
-        if not addr:
+        if not addr or roe_excluded(addr):
             return
         entry = recon_data["port_scan"]["by_ip"].setdefault(addr, {
             "ip": addr,
@@ -1057,7 +1297,7 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
             entry["asn"] = asn
 
     def _add_ip(ips: dict, addr: str, version) -> None:
-        if roe_excluded(addr):
+        if run_is_ip_mode() and roe_excluded(addr):
             return
         bucket = _classify_ip(addr, version)
         if addr not in ips[bucket]:
@@ -1100,7 +1340,7 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 """,
                 domains=scope.orgs, uid=user_id, pid=project_id,
             )
-            for record in result:
+            for record in _ip_mode_rows(result, "subdomain", "address"):
                 if not scope.keeps(record["subdomain"], record["root"]):
                     continue
                 addr = record["address"]
@@ -1121,7 +1361,7 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
             if record:
                 recon_data["subdomains"] = [
                     sub for sub in record["subdomains"] or []
-                    if scope.keeps(sub)
+                    if scope.keeps(sub) and _ip_mode_kept_host(recon_data, sub)
                 ]
 
             # 3) BaseURL nodes (for build_target_urls http_probe fallback)
@@ -1161,10 +1401,9 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 sub_entry = recon_data["dns"]["subdomains"].get(host)
                 if sub_entry:
                     sub_ips = sub_entry.get("ips", {})
-                    resolved_ip = (
-                        (sub_ips.get("ipv4") or [None])[0]
-                        or (sub_ips.get("ipv6") or [None])[0]
-                    )
+                    resolved_ip = next(
+                        (a for a in (sub_ips.get("ipv4") or []) + (sub_ips.get("ipv6") or [])
+                         if not roe_excluded(a)), None)
                 # The real status (Tomcat's and Fastly's error pages are 500s,
                 # and an open console counts only at 200). An unprobed BaseURL
                 # still reads as live for the target builders, which skip >= 500
@@ -1206,6 +1445,8 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                     if is_reliable_edge_cdn_name(record["cdn"]):
                         sub_ips = sub_entry.get("ips", {})
                         for ip_addr in (sub_ips.get("ipv4") or []) + (sub_ips.get("ipv6") or []):
+                            if roe_excluded(ip_addr):
+                                continue
                             entry = recon_data["port_scan"]["by_ip"].setdefault(ip_addr, {
                                 "ip": ip_addr, "hostnames": [], "ports": [],
                                 "is_cdn": False, "cdn": None, "asn": None,
@@ -1227,6 +1468,7 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 addr
                 for entry in [recon_data["dns"]["domain"], *recon_data["dns"]["subdomains"].values()]
                 for addr in (entry["ips"]["ipv4"] + entry["ips"]["ipv6"])
+                if not roe_excluded(addr)
             })
             services = _graph_nmap_services(session, user_id, project_id, scoped_ips)
             if services:
@@ -1320,7 +1562,7 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
         from recon.project_settings import get_settings
         settings = get_settings()
     roots = _as_roots(domains)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "http_probe": {"by_url": {}},
@@ -1332,7 +1574,7 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
                 "ROE_EXCLUDED_HOSTS": settings.get("ROE_EXCLUDED_HOSTS", []) or [],
             }
         },
-    }
+    }, settings)
 
     with Neo4jClient() as graph_client:
         if not graph_client.verify_connection():
@@ -1504,7 +1746,7 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
         settings = get_settings()
     roots = _as_roots(domains)
     include_root_domain = _should_include_root_domain(settings)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "http_probe": {"by_url": {}},
@@ -1516,7 +1758,7 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                 "ROE_EXCLUDED_HOSTS": settings.get("ROE_EXCLUDED_HOSTS", []) or [],
             }
         },
-    }
+    }, settings)
     if not roots:
         return recon_data
 
@@ -1654,7 +1896,7 @@ def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str
         settings = get_settings()
     roots = _as_roots(domains)
     include_root_domain = _should_include_root_domain(settings)
-    recon_data = {
+    recon_data = ip_mode_recon({
         "domain": roots[0] if roots else "",
         "domains": roots,
         "subdomains": [],
@@ -1662,13 +1904,15 @@ def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str
         "resource_enum": {"by_base_url": {}},
         "metadata": {
             "include_root_domain": include_root_domain,
-            "expanded_ips": list(settings.get("TARGET_IPS") or []) if settings.get("IP_MODE") else [],
+            # ip_mode_recon fills it in IP mode, with the expanded targets,
+            # never the raw CIDRs (B-23).
+            "expanded_ips": [],
             "roe": {
                 "ROE_ENABLED": settings.get("ROE_ENABLED", False),
                 "ROE_EXCLUDED_HOSTS": settings.get("ROE_EXCLUDED_HOSTS", []) or [],
             },
         },
-    }
+    }, settings)
     if not roots:
         return recon_data
 

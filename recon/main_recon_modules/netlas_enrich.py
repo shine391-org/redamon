@@ -58,10 +58,12 @@ def _extract_ips_from_recon(combined_result: dict) -> list[str]:
             if ip:
                 ips.add(ip)
 
-    if combined_result.get("metadata", {}).get("ip_mode"):
-        for ip in combined_result["metadata"].get("expanded_ips", []):
-            if ip:
-                ips.add(ip)
+    # IP mode: the target list only. A DNS answer (a PTR name's forward
+    # address) need not be a target, and the lookup would be about it. A dict
+    # that declares no list asks about nothing (every IP-mode builder declares it).
+    metadata = combined_result.get("metadata") or {}
+    if metadata.get("ip_mode"):
+        return sorted({ip for ip in metadata.get("expanded_ips") or [] if ip})
 
     return sorted(ips)
 
@@ -98,6 +100,16 @@ def _netlas_responses_get(q: str, keys, size: int, *, admitted: bool = False):
 
     return cb.guarded_call(_netlas_breaker(), send, _netlas_classify, keys=keys,
                            admitted=admitted)
+
+
+def _transport_protocol(data: dict) -> str:
+    """The item's layer-4 protocol, the Port's key: tcp unless Netlas says udp.
+
+    A Port keyed on the application protocol is a second node beside the port
+    scan's {443, tcp} for the same socket.
+    """
+    prot4 = str(data.get("prot4") or "").strip().lower()
+    return prot4 if prot4 in ("tcp", "udp") else "tcp"
 
 
 def _netlas_item_to_result(data: dict) -> dict | None:
@@ -165,6 +177,7 @@ def _netlas_item_to_result(data: dict) -> dict | None:
         port_i = int(port) if port is not None else 0
     except (TypeError, ValueError):
         port_i = 0
+    # The application protocol (http, ssh): it names the Service, never the Port.
     protocol = data.get("protocol") or data.get("prot7") or ""
 
     return {
@@ -172,6 +185,7 @@ def _netlas_item_to_result(data: dict) -> dict | None:
         "ip": str(ip) if ip is not None else "",
         "port": port_i,
         "protocol": str(protocol) if protocol is not None else "",
+        "transport": _transport_protocol(data),
         "title": str(title) if title is not None else "",
         "http_status_code": http_status_code,
         "country": country,
@@ -383,8 +397,9 @@ def run_netlas_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
               f"kept as history, not written to the graph")
     netlas_scope.finish("netlas_enrich", payload=netlas_data)
     from recon.helpers.passive_cve_coverage import note_cve_coverage
-    note_cve_coverage("netlas", "netlas_enrich", ips, checked, reached=reached,
-                      no_input=not all_ips or (not is_ip_mode and not domain), failed=failed)
+    note_cve_coverage("netlas", "netlas_enrich", ips, checked, considered=all_ips,
+                      reached=reached, failed=failed,
+                      no_input=not all_ips or (not is_ip_mode and not domain))
     combined_result["netlas"] = netlas_data
     return combined_result
 

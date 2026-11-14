@@ -106,11 +106,12 @@ def _extract_ips_from_recon(combined_result: dict) -> list[str]:
             if ip:
                 ips.add(ip)
 
-    # IP mode: expanded IPs from metadata
-    if combined_result.get("metadata", {}).get("ip_mode"):
-        for ip in combined_result["metadata"].get("expanded_ips", []):
-            if ip:
-                ips.add(ip)
+    # IP mode: the target list only. A DNS answer (a PTR name's forward
+    # address) need not be a target, and the lookup would be about it. A dict
+    # that declares no list asks about nothing (every IP-mode builder declares it).
+    metadata = combined_result.get("metadata") or {}
+    if metadata.get("ip_mode"):
+        return sorted({ip for ip in metadata.get("expanded_ips") or [] if ip})
 
     return sorted(ips)
 
@@ -650,8 +651,13 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
     key_rotator = settings.get("SHODAN_KEY_ROTATOR")
     shodan_workers = settings.get("SHODAN_WORKERS", 5)
 
+    # IP only asks no name and keeps none (I-7), whatever the stored toggle
+    # says: a run that skipped the settings overrides still gets no PTR here.
+    from recon.helpers.ip_hostnames import names_off
+    no_names = names_off(combined_result, settings)
+
     do_host = settings.get("SHODAN_HOST_LOOKUP", False)
-    do_rdns = settings.get("SHODAN_REVERSE_DNS", False)
+    do_rdns = settings.get("SHODAN_REVERSE_DNS", False) and not no_names
     do_ddns = settings.get("SHODAN_DOMAIN_DNS", False)
     do_cves = settings.get("SHODAN_PASSIVE_CVES", False)
 
@@ -702,6 +708,10 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
             shodan_data["hosts"] = _run_host_lookup(ips, api_key, key_rotator=key_rotator,
                                                     max_workers=shodan_workers,
                                                     answered=host_answered)
+            if no_names:
+                for host in shodan_data["hosts"]:
+                    if isinstance(host, dict) and host.get("hostnames"):
+                        host["hostnames"] = []
             print(f"[+][Shodan] Host lookup complete: {len(shodan_data['hosts'])} hosts enriched")
 
         # 2. Reverse DNS (falls back to InternetDB hostnames on 403)
@@ -746,7 +756,7 @@ def run_shodan_enrichment(combined_result: dict, settings: dict[str, Any]) -> di
     shodan_scope.finish("shodan_enrich", payload=shodan_data)
     if do_cves:
         from recon.helpers.passive_cve_coverage import note_cve_coverage
-        note_cve_coverage("shodan", "shodan_enrich", ips, cve_checked,
+        note_cve_coverage("shodan", "shodan_enrich", ips, cve_checked, considered=all_ips,
                           no_input=not all_ips, failed=failed)
     combined_result["shodan"] = shodan_data
     return combined_result

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
-import { requireEffectiveUser } from '@/lib/access'
 import { reconPresetSchema, extractJson, RECON_PARAMETER_CATALOG } from '@/lib/recon-preset-schema'
 import { assertSafeLlmBaseUrl, BaseUrlValidationError } from '@/lib/llm-url-guard'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
@@ -8,6 +8,9 @@ import { readFeatureModelCode } from '@/lib/llmFeatures'
 import { safeErrorCode } from '@/lib/routeErrors'
 import { isChatProvider } from '@/lib/llmProviderKinds'
 import { isLoopModel } from '@/lib/agentInTheLoop'
+import { entitledInstanceProviders, ownProvidersWithheld } from '@/lib/instanceProviders/entitlement'
+import { exhaustedBudget, recordUsage, utcDay } from '@/lib/instanceProviders/budget'
+import { isInstanceModel, splitInstanceModel, type InstanceLlmProviderRecord } from '@/lib/instanceProviders/rows'
 import { builtinSendsTemperature, customSendsTemperature, rejectsTemperature } from '@/lib/llmTemperature'
 
 // ---------------------------------------------------------------------------
@@ -36,6 +39,7 @@ RULES:
 - Numbers must be plain integers or floats (not strings).
 - Arrays must use JSON array syntax.
 - Do NOT include target-specific fields (targetDomain, subdomainList, ipMode, etc.).
+- Do NOT include the IP-mode hostname policy (ipHostnameMode, ipHostnameInclude, ipHostnameExclude, ipHostnamePassiveExpand, ipHostnameScanAllConfirmed, ipHostnameMaxScanned, ipHostnamePassiveMaxNames); it is part of the target scope and only the project owner sets it.
 - Do NOT include OpenAPI source URLs or the project Authenticated Session profile; they are target-specific and may contain credentials.
 - Do NOT include agent behaviour, attack skills, RoE, or CypherFix fields.
 - Focus on enabling/disabling tools and tuning their numeric settings to match the user's intent.
@@ -48,6 +52,12 @@ ${RECON_PARAMETER_CATALOG}
 type Resolved =
   | { kind: 'custom'; providerId: string }
   | { kind: 'builtin'; providerType: string; modelId: string }
+  /** A prefix no provider row serves here: Agent in the Loop, an instance id, the legacy env-var endpoint. */
+  | { kind: 'unsupported' }
+
+// The agent's parse_model_provider routes these to no keyed provider; read as OpenAI they would
+// post a key to api.openai.com with a model it does not have.
+const UNSUPPORTED_PREFIXES = ['loop/', 'instance/', 'openai_compat/']
 
 /**
  * Resolve a model string to either a specific custom provider id or a builtin
@@ -57,6 +67,7 @@ type Resolved =
  * - All other prefixes encode the api model name after the prefix.
  */
 function resolveModel(model: string): Resolved {
+  if (UNSUPPORTED_PREFIXES.some((prefix) => model.startsWith(prefix))) return { kind: 'unsupported' }
   if (model.startsWith('custom/')) {
     return { kind: 'custom', providerId: model.slice('custom/'.length) }
   }
@@ -80,6 +91,17 @@ function resolveModel(model: string): Resolved {
     return { kind: 'builtin', providerType: 'anthropic', modelId: model }
   }
   return { kind: 'builtin', providerType: 'openai', modelId: model }
+}
+
+/**
+ * Whether an instance provider of `kind` serves the resolved model: an OpenAI-compatible endpoint
+ * only its own `custom/<providerId>`, a keyed provider only the models of its kind (the agent's rule,
+ * agentic/llm_builder.py `instance_build_args`).
+ */
+function instanceServes(kind: string, providerId: string, resolved: Resolved): boolean {
+  if (resolved.kind === 'unsupported') return false
+  if (resolved.kind === 'custom') return kind === 'openai_compatible' && resolved.providerId === providerId
+  return resolved.providerType === kind
 }
 
 /**
@@ -271,8 +293,9 @@ export async function POST(request: NextRequest) {
   try {
     // The caller spends the LLM key of whichever user this resolves to, so it is
     // the session's effective user and never a `userId` from the body.
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
+    const auth = await requirePermission(request, 'preset:write')
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
     const userId = eff.userId
 
     // The model is the user's saved "Recon preset generator" model. A `model`
@@ -297,7 +320,26 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    const resolved = resolveModel(model)
+    // An instance provider's model (step 6.11) is built from that provider's row alone, and only
+    // while the person may use it; otherwise refused, never sent on to OpenAI with their own key.
+    const instanceRef = splitInstanceModel(model)
+    const instanceRow = instanceRef
+      ? (await entitledInstanceProviders(userId)).find((p) => p.id === instanceRef.providerId) ?? null
+      : null
+    const resolved = resolveModel(instanceRef ? instanceRef.model : model)
+    if (isInstanceModel(model) && (!instanceRow || !instanceServes(instanceRow.providerType, instanceRow.id, resolved))) {
+      return featureModelErrorResponse('model_unavailable', 'preset_generator', {
+        model,
+        error: `The instance provider of your preset model "${model}" is not available to you. Choose another model.`,
+      })
+    }
+
+    if (resolved.kind === 'unsupported') {
+      return featureModelErrorResponse('model_unavailable', 'preset_generator', {
+        model,
+        error: `Preset generation cannot use "${model}". Choose an OpenAI, Anthropic, OpenAI-Compatible, or other provider model.`,
+      })
+    }
 
     if (resolved.kind === 'builtin' && resolved.providerType === 'bedrock') {
       return featureModelErrorResponse('model_unavailable', 'preset_generator', {
@@ -309,7 +351,24 @@ export async function POST(request: NextRequest) {
     // Chat providers only: a non-chat row (a Jev provider) is never a model to call, and
     // `custom/<id>` accepts any row id, so without this the token would be posted to
     // whatever base URL such a row held.
-    const providers = (await prisma.userLlmProvider.findMany({ where: { userId } })).filter(isChatProvider)
+    // byoLlmForbidden: the agent would not use the account's own rows, so neither does this call.
+    const providers: InstanceLlmProviderRecord[] = instanceRow
+      ? [instanceRow]
+      : (await ownProvidersWithheld(userId))
+        ? []
+        : (await prisma.userLlmProvider.findMany({ where: { userId } })).filter(isChatProvider)
+
+    // The daily budget on instance providers (GV-12): the person's own feature, so one budget.
+    if (instanceRow) {
+      const exhausted = await exhaustedBudget([userId])
+      if (exhausted) {
+        console.info(`[rbac] llm_budget_exhausted: user ${exhausted.userId} limit ${exhausted.limit} used ${exhausted.used}`)
+        return NextResponse.json({
+          error: `Your daily budget of ${exhausted.limit} model calls on instance LLM providers is used up; it starts again at 00:00 UTC.`,
+          code: 'llm_budget_exhausted', featureId: 'preset_generator', model, limit: exhausted.limit,
+        }, { status: 429 })
+      }
+    }
 
     let rawResponse: string
 
@@ -416,6 +475,11 @@ export async function POST(request: NextRequest) {
           sslVerify: provider.sslVerify,
         })
       }
+    }
+
+    if (instanceRow) {
+      await recordUsage([{ userId, day: utcDay(), count: 1 }])
+        .catch((err) => console.error('[rbac] llm_usage_record_failed:', safeErrorCode(err)))
     }
 
     if (!rawResponse) {

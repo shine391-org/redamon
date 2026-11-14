@@ -1,0 +1,209 @@
+# Live RBAC route matrix: Phase 2 (identity). Each step adds the rows of the behaviour it
+# changes; a row of an earlier file whose answer a step changes is tagged superseded-by:p2 there.
+# Columns: id, since, actor, method, path, body, expect, tags (see tests/rbac_matrix_live.sh).
+#
+# id	since	actor	method	path	body	expect	tags
+#
+# ---- step 2.2: the session version in the login token ----
+# member_a and admin_a sign in; the runner raises the account's session version by SQL just
+# before each *_revoked row and puts it back right after (the cookie kept), so the row sends a
+# login cookie of an older version. With the identity switch on the refusal clears the cookie
+# on its own 401 (an expired redamon-auth in the answer's headers) and /api/auth/me says
+# session_ended (the browser goes to /login); off, both stay as after Phase 1. Each control
+# sends the same request with the cookie of the current version. POST /api/users answers a missing session with 403 and refuses an
+# empty body after its admin check (400), so no account is ever created.
+p2-sv-me-control	2.2	member_a	GET	/api/auth/me	-	200;has=rbac-member-a@e2e.local	req:ID-21 req:UP-14
+p2-sv-me-revoked	2.2	member_a_revoked	GET	/api/auth/me	-	401;has=session_ended;hdr=redamon-auth=;hdr=Expires=Thu, 01 Jan 1970	req:ID-21 req:ID-23 identity:on
+p2-sv-me-revoked-off	2.2	member_a_revoked	GET	/api/auth/me	-	401;lacks=session_ended;nohdr=redamon-auth=	req:ID-21 req:ID-23 identity:off
+p2-sv-settings-control	2.2	member_a	GET	/api/users/${MEMBER_A_ID}/settings	-	200	req:ID-21
+p2-sv-settings-revoked	2.2	member_a_revoked	GET	/api/users/${MEMBER_A_ID}/settings	-	401	req:ID-21
+p2-sv-admin-users-list-control	2.2	admin_a	GET	/api/users	-	200;has=rbac-member-a@e2e.local	req:ID-21
+p2-sv-admin-users-list-revoked	2.2	admin_a_revoked	GET	/api/users	-	401	req:ID-21
+p2-sv-admin-users-create-control	2.2	admin_a	POST	/api/users	{}	400	req:ID-21 req:ID-22
+p2-sv-admin-users-create-revoked	2.2	admin_a_revoked	POST	/api/users	{}	403	req:ID-21 req:ID-22
+#
+# ---- step 2.3: account status: disable, enable, sign out everywhere ----
+# No row changes an account: each sends what the route refuses after its checks (another
+# admin's account, the own account, an unknown id, a body that is not JSON), or enables an
+# account that is already active (200 "changed":false). With the identity switch off disable,
+# revoke-sessions and revoke-all do not exist (404 before any check) and enable stays open.
+# The stateful flow (disable, the old cookie and the sign-in refused, enable, revoke) is
+# tests/rbac_account_status_live.sh.
+p2-disable-off	2.3	admin_a	POST	/api/users/${MEMBER_C_ID}/disable	{}	404	req:ID-13 identity:off
+p2-disable-off-member	2.3	member_a	POST	/api/users/${MEMBER_C_ID}/disable	{}	404	req:ID-13 identity:off
+p2-revoke-sessions-off	2.3	admin_a	POST	/api/users/${MEMBER_C_ID}/revoke-sessions	{}	404	req:ID-21 identity:off
+p2-revoke-all-off	2.3	member_a	POST	/api/auth/sessions/revoke-all	{}	404	req:ID-21 identity:off
+p2-disable-anon	2.3	anon	POST	/api/users/${MEMBER_C_ID}/disable	{}	401	req:ID-13
+p2-disable-member-refused	2.3	member_a	POST	/api/users/${MEMBER_C_ID}/disable	{}	403;has=users:disable	req:ID-13 identity:on
+p2-disable-admin-target	2.3	admin_a	POST	/api/users/${ADMIN_B_ID}/disable	{}	403;has=root_only	req:ID-13 identity:on
+p2-disable-own-account	2.3	admin_a	POST	/api/users/${ADMIN_A_ID}/disable	{}	400;has=own_account	req:ID-13 identity:on
+p2-disable-unknown	2.3	admin_a	POST	/api/users/rbac-no-such-account/disable	{}	404;has=user_not_found	req:ID-13 identity:on
+p2-disable-not-json	2.3	admin_a	POST	/api/users/${MEMBER_C_ID}/disable	-	415	req:ID-13 identity:on
+p2-revoke-sessions-member-refused	2.3	member_a	POST	/api/users/${MEMBER_C_ID}/revoke-sessions	{}	403;has=users:revoke_sessions	req:ID-21 identity:on
+p2-revoke-sessions-admin-target	2.3	admin_a	POST	/api/users/${ADMIN_B_ID}/revoke-sessions	{}	403;has=root_only	req:ID-21 identity:on
+p2-revoke-sessions-own-account	2.3	admin_a	POST	/api/users/${ADMIN_A_ID}/revoke-sessions	{}	400;has=revoke-all	req:ID-21 identity:on
+p2-revoke-sessions-not-json	2.3	admin_a	POST	/api/users/${MEMBER_C_ID}/revoke-sessions	-	415	req:ID-21 identity:on
+p2-revoke-all-not-json	2.3	member_a	POST	/api/auth/sessions/revoke-all	-	415	req:ID-21 identity:on
+p2-revoke-all-anon	2.3	anon	POST	/api/auth/sessions/revoke-all	{}	401	req:ID-21
+p2-enable-active-member	2.3	admin_a	POST	/api/users/${MEMBER_C_ID}/enable	{}	200;has="changed":false	req:ID-13
+p2-enable-member-refused	2.3	member_a	POST	/api/users/${MEMBER_C_ID}/enable	{}	403;has=users:disable	req:ID-13
+p2-enable-anon	2.3	anon	POST	/api/users/${MEMBER_C_ID}/enable	{}	401	req:ID-13
+#
+# ---- step 2.4: instance settings (the tunnel and the TrafficMind capture policy) ----
+# With the identity switch on they live in the instance settings: GET/PUT
+# /api/admin/instance-settings as the signed-in person (an admin; the tunnel also the
+# `tunnels` legacy holder, none seeded here), and the user settings PUT refuses a real change
+# of one with 409 before anything is written. Off, the route does not exist (404) and the
+# p1 tunnel rows hold. No row writes: the PUTs are refused before the row is read or written
+# (not JSON 415, a tunnel field that is not text 400, a member 403, a moved field 409). Since
+# step 3.9 a member holding neither field group (no tunnel, no capture) and no administrator
+# account is refused naming platform:tunnels, with the permissions switch on or off
+# (instance:settings is Root's security policy, not this gate). The
+# tunnel sync takes only the sandbox's bearer whatever the switch (the accepted call:
+# tests/test_e2e_security_live.sh).
+p2-instance-settings-off	2.4	admin_a	GET	/api/admin/instance-settings	-	404	req:ID-32 identity:off
+p2-instance-settings-off-put	2.4	admin_a	PUT	/api/admin/instance-settings	{"chiselServerUrl":42}	404	req:ID-32 identity:off
+p2-instance-settings-anon	2.4	anon	GET	/api/admin/instance-settings	-	401	req:ID-32
+p2-instance-settings-member	2.4	member_c	GET	/api/admin/instance-settings	-	403;has="permission":"platform:tunnels"	req:ID-32 identity:on
+p2-instance-settings-member-put	2.4	member_c	PUT	/api/admin/instance-settings	{"captureProxyEnabled":false}	403;has="permission":"platform:tunnels"	req:ID-32 identity:on
+p2-instance-settings-admin	2.4	admin_a	GET	/api/admin/instance-settings	-	200;has="canManageTunnels":true;has="canManageCapture":true;has=captureEgressBlockPrivate	req:ID-32 identity:on
+p2-instance-settings-admin-not-json	2.4	admin_a	PUT	/api/admin/instance-settings	-	415	req:ID-32 identity:on
+p2-instance-settings-admin-bad-field	2.4	admin_a	PUT	/api/admin/instance-settings	{"chiselServerUrl":42}	400;has=invalid_field	req:ID-32 identity:on
+p2-instance-settings-acting-admin	2.4	admin_a_as_member_c	PUT	/api/admin/instance-settings	{"chiselServerUrl":42}	400;has=invalid_field	req:ID-32 identity:on
+p2-instance-moved-tunnel-change-member	2.4	member_b	PUT	/api/users/${MEMBER_B_ID}/settings	{"chiselServerUrl":"http://127.0.0.1:9","githubEnterpriseHost":"127.0.0.1"}	409;has=moved_to_instance_settings;has=chiselServerUrl	req:ID-32 identity:on
+p2-instance-moved-tunnel-enable-member	2.4	member_b	PUT	/api/users/${MEMBER_B_ID}/settings	{"tunnelsEnabled":true,"githubEnterpriseHost":"127.0.0.1"}	409;has=moved_to_instance_settings	req:ID-32 identity:on
+p2-instance-moved-tunnel-change-admin	2.4	admin_a	PUT	/api/users/${ADMIN_A_ID}/settings	{"chiselServerUrl":"http://127.0.0.1:9","githubEnterpriseHost":"127.0.0.1"}	409;has=moved_to_instance_settings	req:ID-32 identity:on
+p2-instance-moved-capture-admin	2.4	admin_a	PUT	/api/users/${ADMIN_A_ID}/settings	{"captureProxyPort":1,"githubEnterpriseHost":"127.0.0.1"}	409;has=captureProxyPort	req:ID-32 identity:on
+p2-instance-moved-hint-admin	2.4	admin_a	GET	/api/users/${ADMIN_A_ID}/settings	-	200;has="canManageTunnels":false;has="sharedSettingsAt":"instance"	req:ID-32 req:UI-04 identity:on
+p2-instance-moved-hint-off	2.4	admin_a	GET	/api/users/${ADMIN_A_ID}/settings	-	200;lacks=sharedSettingsAt	req:ID-32 identity:off
+p2-tunnel-sync-no-bearer	2.4	anon	POST	/api/global/tunnel-config/sync	-	401	req:ID-33
+p2-tunnel-sync-session-no-bearer	2.4	admin_a	POST	/api/global/tunnel-config/sync	-	401	req:ID-33
+#
+# ---- step 2.6: only Root manages admins; the security policy; the Root transfer ----
+# rbac-admin-a is an admin, never Root (on the dev stack Root is the owner's own account), so with
+# the identity switch on every action on rbac-admin-b, a promotion or an admin creation answers
+# 403 root_only before any password is checked: nothing is created or changed, and the rows that
+# carry the right password prove it is never even tried. The p1 step-up rows of the same requests
+# run only with the switch off. The transfer routes do not exist with the switch off (404); on, an
+# admin that is not Root offers nothing, and with no offer pending accept and cancel answer 409
+# before any password. The stateful flows (Root's own powers, a transfer, decline and cancel) run
+# on a disposable instance: tests/rbac_root_admin_live.sh.
+p2-rootonly-demote-admin	2.6	admin_a	PUT	/api/users/${ADMIN_B_ID}	{"role":"standard"}	403;has=root_only	req:PE-08 req:ID-03 identity:on
+p2-rootonly-demote-admin-pw	2.6	admin_a	PUT	/api/users/${ADMIN_B_ID}	{"role":"standard","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:PE-08 req:ID-25 identity:on
+p2-rootonly-edit-admin	2.6	admin_a	PUT	/api/users/${ADMIN_B_ID}	{"name":"RBAC never applied"}	403;has=root_only	req:PE-08 identity:on
+p2-rootonly-delete-admin	2.6	admin_a	DELETE	/api/users/${ADMIN_B_ID}	{"stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:PE-08 req:ID-03 identity:on
+p2-rootonly-reset-admin	2.6	admin_a	PUT	/api/users/${ADMIN_B_ID}/password	{"newPassword":"rbac-never-applied-passphrase","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:PE-08 identity:on
+p2-rootonly-actas-admin	2.6	admin_a	POST	/api/auth/act-as	{"targetUserId":"${ADMIN_B_ID}","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only;nohdr=redamon-act-as=ey	req:PE-08 identity:on
+p2-rootonly-enable-admin	2.6	admin_a	POST	/api/users/${ADMIN_B_ID}/enable	{"stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:PE-08 identity:on
+p2-rootonly-promote-member	2.6	admin_a	PUT	/api/users/${MEMBER_C_ID}	{"role":"admin","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:PE-08 req:ID-03 identity:on
+p2-rootonly-create-admin	2.6	admin_a	POST	/api/users	{"name":"RBAC never","email":"rbac-never-admin@e2e.local","password":"rbac-never-applied-passphrase","role":"admin","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:PE-08 req:ID-03 identity:on
+p2-rootonly-policy	2.6	admin_a	PUT	/api/admin/instance-settings	{"passwordMinLength":14,"stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:ID-03 req:ID-25 identity:on
+p2-rootonly-policy-invalid	2.6	admin_a	PUT	/api/admin/instance-settings	{"passwordMinLength":8}	400;has=invalid_field;has=passwordMinLength	req:ID-03 identity:on
+p2-rootonly-policy-read	2.6	admin_a	GET	/api/admin/instance-settings	-	200;has="canManageSecurityPolicy":false;has=passwordMinLength	req:ID-03 identity:on
+p2-transfer-off	2.6	admin_a	GET	/api/root/transfer	-	404	req:ID-07 identity:off
+p2-transfer-off-offer	2.6	admin_a	POST	/api/root/transfer	{}	404	req:ID-07 identity:off
+p2-transfer-off-accept	2.6	admin_a	POST	/api/root/transfer/accept	{}	404	req:ID-07 identity:off
+p2-transfer-off-cancel	2.6	admin_a	POST	/api/root/transfer/cancel	{}	404	req:ID-07 identity:off
+p2-transfer-anon	2.6	anon	POST	/api/root/transfer	{}	401	req:ID-07 identity:on
+p2-transfer-member	2.6	member_a	POST	/api/root/transfer	{}	403;has=root:transfer	req:ID-07 identity:on
+p2-transfer-admin-not-root	2.6	admin_a	POST	/api/root/transfer	{"targetUserId":"${ADMIN_B_ID}","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:ID-07 req:ID-05 identity:on
+p2-transfer-not-json	2.6	admin_a	POST	/api/root/transfer	-	415	req:ID-07 identity:on
+p2-transfer-read-admin	2.6	admin_a	GET	/api/root/transfer	-	200;has="offer":null	req:ID-07 identity:on
+p2-transfer-accept-none	2.6	admin_a	POST	/api/root/transfer/accept	{"stepUpPassword":"not-the-rbac-password"}	409;has=no_transfer_offer	req:ID-07 identity:on
+p2-transfer-cancel-none	2.6	admin_a	POST	/api/root/transfer/cancel	{}	409;has=no_transfer_offer	req:ID-07 identity:on
+# ---- step 2.8: the configurable password policy ----
+# With the identity switch on every new password meets the policy in force (the instance minimum,
+# the deny list, not the account's email, not one repeated character). Each row is refused after
+# the authorization check, so nothing changes; with the switch off the same requests would set the
+# password, so they run only with it on. Off, the policy route answers 404.
+p2-pwpolicy-read	2.8	member_a	GET	/api/auth/password-policy	-	200;has="rules":true;has="maxBytes":72	req:ID-20 identity:on
+p2-pwpolicy-anon	2.8	anon	GET	/api/auth/password-policy	-	401	req:ID-20
+p2-pwpolicy-off	2.8	member_a	GET	/api/auth/password-policy	-	404	req:ID-20 identity:off
+p2-pwpolicy-create-common	2.8	admin_a	POST	/api/users	{"name":"RBAC Policy","email":"rbac-policy@e2e.local","password":"PasswordPassword"}	400;has=password_common	req:ID-20 identity:on
+p2-pwpolicy-reset-email	2.8	admin_a	PUT	/api/users/${MEMBER_C_ID}/password	{"newPassword":"rbac-member-c@e2e.local"}	400;has=password_is_email	req:ID-20 identity:on
+p2-pwpolicy-own-repeated	2.8	member_b	PUT	/api/users/${MEMBER_B_ID}/password	{"newPassword":"zzzzzzzzzzzzzzzz","currentPassword":"${RBAC_PASSWORD}"}	400;has=password_repeated	req:ID-20 identity:on
+# ---- step 2.9: invite links and the public invite page ----
+# The admin routes exist only with the identity switch on. Each "allowed" row is refused after the
+# authorization check (a bad body, an address in use, an account that is not invited), so no account
+# or link is made. The public paths are reached with no cookie; with the switch off they are like
+# any unknown path (sign-in redirect, 401). The unknown-link row costs one lookup of the per-copy
+# ceiling (30 a minute).
+p2-invite-create-member	2.9	member_a	POST	/api/users/invite	{"name":"RBAC Invitee","email":"rbac-invitee@e2e.local"}	403;has=users:create	req:ID-14 identity:on
+p2-invite-create-anon	2.9	anon	POST	/api/users/invite	{"name":"RBAC Invitee","email":"rbac-invitee@e2e.local"}	401	req:ID-14
+p2-invite-create-bad	2.9	admin_a	POST	/api/users/invite	{"name":"RBAC Invitee"}	400;has=invalid_field	req:ID-14 identity:on
+p2-invite-create-taken	2.9	admin_a	POST	/api/users/invite	{"name":"RBAC Copy","email":"RBAC-MEMBER-C@E2E.LOCAL"}	409;has=email_taken	req:ID-14 identity:on
+p2-invite-create-off	2.9	admin_a	POST	/api/users/invite	{"name":"RBAC Invitee","email":"rbac-invitee@e2e.local"}	404	req:ID-14 identity:off
+p2-invite-resend-member	2.9	member_a	POST	/api/users/${MEMBER_C_ID}/invite/resend	{}	403;has=users:create	req:ID-14 identity:on
+p2-invite-resend-active	2.9	admin_a	POST	/api/users/${MEMBER_C_ID}/invite/resend	{}	409;has=not_invited	req:ID-14 identity:on
+p2-invite-cancel-active	2.9	admin_a	POST	/api/users/${MEMBER_C_ID}/invite/cancel	{}	409;has=not_invited	req:ID-14 identity:on
+p2-invite-cancel-off	2.9	admin_a	POST	/api/users/${MEMBER_C_ID}/invite/cancel	{}	404	req:ID-14 identity:off
+p2-invite-state-anon	2.9	anon	GET	/api/invite/state	-	200;has="valid":false;hdr=referrer-policy: no-referrer;hdr=cache-control: no-store	req:ID-15 identity:on
+p2-invite-state-off	2.9	anon	GET	/api/invite/state	-	401	req:ID-15 identity:off
+p2-invite-accept-anon	2.9	anon	POST	/api/invite/accept	{"password":"rbac-matrix-never-used-1"}	410;has=invite_invalid	req:ID-15 identity:on
+p2-invite-link-unknown	2.9	anon	GET	/invite/rbac-matrix-unknown-link-token	-	303;hdr=/invite;hdr=referrer-policy: no-referrer;nohdr=rbac-matrix-unknown-link-token;nohdr=redamon-invite=e	req:ID-15 req:HD-26 identity:on
+p2-invite-link-off	2.9	anon	GET	/invite/rbac-matrix-unknown-link-token	-	307;hdr=/login	req:ID-15 identity:off
+p2-invite-page	2.9	anon	GET	/invite	-	200;hdr=content-security-policy: default-src 'self';hdr=referrer-policy: no-referrer	req:ID-15 identity:on
+#
+# ---- step 2.10: reset credentials ----
+# No row resets an account: each sends what the route refuses after its checks (a member, the
+# own account, another admin without Root's power, a mode that does not exist, an unknown id, a
+# temporary password the policy refuses once the reason is given). With the identity switch off
+# the route does not exist (404 before any check). The stateful flow (a reset link with a reason,
+# the open session ended, the link used, the notice shown once, one auth.login.after_reset row) is
+# E2E-P2-08, testing/e2e/tests/rbacResetCredentials.spec.ts.
+p2-reset-anon	2.10	anon	POST	/api/users/${MEMBER_C_ID}/reset-credentials	{"mode":"link"}	401	req:ID-18
+p2-reset-off	2.10	admin_a	POST	/api/users/${MEMBER_C_ID}/reset-credentials	{"mode":"link","reason":"rbac matrix"}	404	req:ID-18 identity:off
+p2-reset-member	2.10	member_a	POST	/api/users/${MEMBER_C_ID}/reset-credentials	{"mode":"link","reason":"rbac matrix"}	403;has=users:reset_credentials	req:ID-18 req:PE-12 identity:on
+p2-reset-own	2.10	admin_a	POST	/api/users/${ADMIN_A_ID}/reset-credentials	{"mode":"link","reason":"rbac matrix"}	400;has=own_account	req:ID-18 identity:on
+p2-reset-admin-target	2.10	admin_a	POST	/api/users/${ADMIN_B_ID}/reset-credentials	{"mode":"link","reason":"rbac matrix","stepUpPassword":"${RBAC_PASSWORD}"}	403;has=root_only	req:ID-18 req:PE-08 identity:on
+p2-reset-bad-mode	2.10	admin_a	POST	/api/users/${MEMBER_C_ID}/reset-credentials	{"mode":"email"}	400;has=invalid_field	req:ID-18 identity:on
+p2-reset-unknown	2.10	admin_a	POST	/api/users/rbac-no-such-account/reset-credentials	{"mode":"link","reason":"rbac matrix"}	404;has=user_not_found	req:ID-18 identity:on
+p2-reset-policy	2.10	admin_a	POST	/api/users/${MEMBER_C_ID}/reset-credentials	{"mode":"temporary","temporaryPassword":"PasswordPassword","reason":"rbac matrix"}	400;has=password_common	req:ID-18 req:ID-20 identity:on
+
+# ---- step 2.11: email change, session lifetimes, My activity ----
+# With the identity switch on, changing a sign-in email takes the current password (own) or the
+# admin's own (a member's): without it 403 step_up_required before anything is read or written.
+# An address another account holds in other capitals is 409 email_taken, answered only after the
+# password (rbac-member-b gives its right password, rbac-admin-a its own for member B's address, so
+# nothing is written either way); off, Phase 1 answers the collision without a password
+# (p2-email-taken-off, p1-email-edit-collision). The login cookie lives as long as its token: an admin
+# 12 h, a member 168 h with the switch on (the instance row's defaults, PLACEHOLDER(OQ-38): these rows
+# assume Root left them), 7 days for everyone off. My activity is the signed-in account's, 404 off.
+# The stateful flow (an email change with the password, its notice and activity row, an idle admin
+# sent to sign-in) is E2E-P2-09, tests/rbac_account_live.sh on a disposable instance.
+p2-email-own-nopw	2.11	member_a	PUT	/api/users/${MEMBER_A_ID}	{"email":"rbac-member-a-moved@e2e.local"}	403;has=step_up_required	req:ID-30 req:ID-25 identity:on
+p2-email-admin-nopw	2.11	admin_a	PUT	/api/users/${MEMBER_C_ID}	{"email":"rbac-member-c-moved@e2e.local"}	403;has=step_up_required	req:ID-30 req:ID-25 identity:on
+p2-email-taken	2.11	member_b	PUT	/api/users/${MEMBER_B_ID}	{"email":"RBAC-MEMBER-C@e2e.local","currentPassword":"${RBAC_PASSWORD}"}	409;has=email_taken	req:ID-30 identity:on
+p2-email-admin-taken	2.11	admin_a	PUT	/api/users/${MEMBER_B_ID}	{"email":"RBAC-Member-A@e2e.local","stepUpPassword":"${RBAC_PASSWORD}"}	409;has=email_taken	req:ID-30 req:NF-09 identity:on
+p2-email-taken-off	2.11	member_b	PUT	/api/users/${MEMBER_B_ID}	{"email":"RBAC-MEMBER-C@e2e.local"}	409;has=email_taken	req:ID-30 identity:off
+p2-lifetime-admin	2.11	anon	POST	/api/auth/login	{"email":"${ADMIN_A_EMAIL}","password":"${RBAC_PASSWORD}"}	200;hdr=Max-Age=43200	req:ID-24 identity:on
+p2-lifetime-admin-off	2.11	anon	POST	/api/auth/login	{"email":"${ADMIN_A_EMAIL}","password":"${RBAC_PASSWORD}"}	200;hdr=Max-Age=604800	req:ID-24 identity:off
+p2-lifetime-member	2.11	anon	POST	/api/auth/login	{"email":"${MEMBER_A_EMAIL}","password":"${RBAC_PASSWORD}"}	200;hdr=Max-Age=604800	req:ID-24
+p2-activity-read	2.11	member_a	GET	/api/account/activity	-	200;has="events"	req:UI-09 identity:on
+p2-activity-anon	2.11	anon	GET	/api/account/activity	-	401	req:UI-09
+p2-activity-off	2.11	member_a	GET	/api/account/activity	-	404	req:UI-09 identity:off
+
+# ---- step 2.12: same-origin JSON on the identity routes ----
+# Each row is a page of another site (origin:https://rbac-other-site.example) sending what the route
+# would refuse after its checks anyway (an empty body, the own account, an unknown token, a value
+# that is not valid), so a missing origin check changes nothing: it only answers that refusal
+# instead of 403 cross_origin. The Phase 1 routes check the origin whatever the identity switch (a
+# security fix); the Phase 2 routes answer 404 first with the switch off, so their rows run on only.
+# The control row is the same request from the webapp's own origin (what the app sends), refused
+# for its body after the check. The public invite form checks it too (anon, no session).
+p2-xo-users-create	2.12	admin_a	POST	/api/users	{}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-users-edit	2.12	admin_a	PUT	/api/users/${MEMBER_A_ID}	{"defaultAgentModel":"loop/mcp"}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-users-delete	2.12	admin_a	DELETE	/api/users/${ADMIN_A_ID}	-	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-password	2.12	admin_a	PUT	/api/users/${MEMBER_A_ID}/password	{"newPassword":"short"}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-actas-start	2.12	admin_a	POST	/api/auth/act-as	{}	403;has=cross_origin;nohdr=redamon-act-as=	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-actas-stop	2.12	admin_a	DELETE	/api/auth/act-as	-	403;has=cross_origin;nohdr=redamon-act-as=	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-token-mint	2.12	member_a	POST	/api/users/${MEMBER_A_ID}/mcp-tokens	{}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-token-edit	2.12	member_a	PATCH	/api/users/${MEMBER_A_ID}/mcp-tokens/rbac-no-such-token	{}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-token-delete	2.12	member_a	DELETE	/api/users/${MEMBER_A_ID}/mcp-tokens/rbac-no-such-token	-	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-settings	2.12	member_a	PUT	/api/users/${MEMBER_A_ID}/settings	{"githubEnterpriseHost":"127.0.0.1"}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-enable	2.12	admin_a	POST	/api/users/${MEMBER_A_ID}/enable	{}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-legacy-grants	2.12	admin_a	POST	/api/admin/legacy-grants	{"action":"rbac-none"}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example
+p2-xo-disable	2.12	admin_a	POST	/api/users/${ADMIN_B_ID}/disable	{}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example identity:on
+p2-xo-instance-settings	2.12	admin_a	PUT	/api/admin/instance-settings	{"ngrokAuthtoken":1}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example identity:on
+p2-xo-invite-accept	2.12	anon	POST	/api/invite/accept	{"password":"rbac-never-applied-passphrase"}	403;has=cross_origin	req:ID-26 origin:https://rbac-other-site.example identity:on
+p2-xo-same-origin-control	2.12	admin_a	PUT	/api/users/${MEMBER_A_ID}	{"defaultAgentModel":"loop/mcp"}	400;has=loop_model_not_allowed	req:ID-26

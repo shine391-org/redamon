@@ -11,12 +11,14 @@ from fastapi import HTTPException
 
 import api
 from models import PartialReconStartRequest
+from tests.job_credentials import job_credential, use_keys
 
 KEYS = ("CVE_LOOKUP_ENABLED", "MITRE_ENABLED", "SECURITY_CHECK_ENABLED")
 
 
 @pytest.fixture
 def boundary(monkeypatch):
+    use_keys(monkeypatch)
     calls = []
     saved = {"targetDomain": "example.test", "subdomainList": [],
              "plannerMode": "shadow", "plannerConsumerTwoPass": False,
@@ -35,6 +37,7 @@ def invoke(overrides):
     request = PartialReconStartRequest(
         project_id="p1", user_id="fixture-owner", webapp_api_url="http://localhost:3000",
         tool_id="Nuclei", graph_inputs={}, settings_overrides=overrides,
+        job_credential=job_credential("p1", "fixture-owner"),
     )
     return asyncio.run(api.start_partial_recon("p1", request))
 

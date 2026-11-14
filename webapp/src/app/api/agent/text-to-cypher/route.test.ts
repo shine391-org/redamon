@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   fetch: vi.fn(),
 }))
 
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overEffectiveUser()))
 vi.mock('@/lib/access', () => ({
   requireEffectiveUser: (...a: unknown[]) => h.eff(...a),
   requireProjectAccess: (...a: unknown[]) => h.access(...a),
@@ -43,6 +44,11 @@ describe('identity comes from the session, never the body', () => {
   test('a body-supplied user_id is overridden by the session identity', async () => {
     await post({ question: 'list ips', user_id: 'victim', project_id: 'p1' })
     expect(agentBody().user_id).toBe('owner')
+  })
+
+  test("the graph tenant and the key owner sent upstream are the project's owner; a body's tenant_user_id is ignored (step 4.6, NF-11)", async () => {
+    await post({ question: 'q', project_id: 'p1', user_id: 'victim', tenant_user_id: 'victim' })
+    expect(agentBody()).toMatchObject({ user_id: 'owner', tenant_user_id: 'owner', project_id: 'p1' })
   })
 
   test('the project id sent upstream is the one the access check resolved', async () => {

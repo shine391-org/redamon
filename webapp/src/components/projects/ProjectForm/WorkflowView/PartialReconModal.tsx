@@ -3,13 +3,18 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Play, Loader2, ArrowRight, Upload, FileText, Trash2, Info } from 'lucide-react'
 import { Modal, Tooltip, WikiInfoButton } from '@/components/ui'
-import { type ProjectRoots, admitsPartialHost } from '@/lib/partialReconScope'
-import { type ScopeGroup, groupLabel } from '@/lib/scopeGroups'
+import {
+  type IpTargetMatcher, type ProjectRoots, type TypedHostnamePolicy, admitsPartialHost, ipModeRefusal, ipTargetMatcher,
+  typedHostnameRefusal,
+} from '@/lib/partialReconScope'
+import { type ScopeGroup, groupLabel, ipHostnameModeOf } from '@/lib/scopeGroups'
+import { ipHostnameModeLabel } from '@/lib/ipHostnameModeLabels'
 import { isValidDomain } from '@/lib/validation'
 import { announceProjectWrite } from '@/lib/projectVersion'
 import { errorMessage, fetchJson, formatApiError, readApiError, toApiError } from '@/lib/apiError'
 import type { GraphInputs, PartialReconParams, UserTargets } from '@/lib/recon-types'
 import { useOpenApiSourceLabels } from '@/hooks/useOpenApiSourceLabels'
+import { readKeySettings, useOwnerKeys } from '@/hooks/useOwnerCatalog'
 import { publicDocumentUrl, type OpenApiSourceRow } from '@/lib/openapiSourceStatus'
 import { SECTION_INPUT_MAP, SECTION_NODE_MAP, SECTION_ENRICH_MAP } from '../nodeMapping'
 import { WORKFLOW_TOOLS } from './workflowDefinition'
@@ -113,7 +118,8 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
   Tlsx:
     'Grabs the TLS certificate on each open non-HTTP port with a single handshake (SMTPS, IMAPS, LDAPS, and any odd TLS port). ' +
     'Targets are loaded from the graph (IPs + open ports from prior port scanning); you can also provide custom IPs and ports below. ' +
-    'Certificate nodes, IP HAS_CERTIFICATE edges, COVERS_HOST edges to in-scope SAN hostnames, and TLS posture on the Service are merged into the existing graph.',
+    'Certificate nodes, IP HAS_CERTIFICATE edges, COVERS_HOST edges to the SAN hostnames already in the graph as Subdomains, ' +
+    'and TLS posture on the Service are merged into the existing graph. This run adds no Subdomain: other SAN names stay on the certificate.',
   Httpx:
     'Probes HTTP services on discovered ports and subdomains using httpx. ' +
     'Detects live services, technologies, SSL/TLS certificates, and response metadata. ' +
@@ -224,8 +230,10 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
     'Discovers hidden virtual hosts on every target IP using two crafted curl probes per candidate hostname: ' +
     'L7 (overrides the HTTP Host header) catches classic vhosts, L4 (uses --resolve to force the TLS SNI) catches ingress / k8s / Cloudflare routing. ' +
     'Each response is compared to a baseline (raw IP request) and anomalies become Vulnerability nodes with source="vhost_sni_enum". ' +
-    'Candidate hostnames come from the graph (Subdomains, ExternalDomains, TLS SANs, CNAMEs, PTR records resolving to the target IP) ' +
+    'Candidate hostnames come from the graph (Subdomains, ExternalDomains, TLS SANs and CNAMEs on the target IP) ' +
     'plus the bundled vhost-common.txt wordlist (~2,300 prefixes) and any custom wordlist set in the project. ' +
+    'In an IP-mode project they are the hostnames recorded on each target IP instead (never on a shared CDN edge, none in IP only), ' +
+    'and only the full hostnames of the custom wordlist join them. ' +
     'You can also provide custom subdomains (added as candidate hostnames) and IPs (added as extra targets) below.',
   GraphqlScan:
     'Active GraphQL security scanner. Discovers GraphQL endpoints from crawled BaseURLs + Endpoints + JS findings, ' +
@@ -243,6 +251,7 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
   Shodan:
     'Passive OSINT enrichment using the Shodan API (or free InternetDB fallback). ' +
     'Enriches discovered IPs with geolocation, OS, ISP, open ports, service banners, reverse DNS hostnames, and known CVEs. ' +
+    'In an IP-mode project reverse DNS is off in IP only, and this run writes no hostname: a full run records them under Hostnames on target IPs. ' +
     'Targets are loaded from the graph (IPs from prior Subdomain Discovery). ' +
     'Port, Service, Subdomain, ExternalDomain, DNSRecord, Vulnerability, and CVE nodes are merged into the existing graph.',
   Urlscan:
@@ -311,8 +320,10 @@ function describeScope(scope: ProjectRoots): string {
 // apply (§4.6): strictly under an enumerated scan root, one of a listed group's
 // hosts, or a scan root itself only when Root is on. In IP mode the run's root is
 // the `ip-targets.<id>` placeholder, so the rule is theirs for IP mode instead:
-// the host is one of the project's addresses (filter_partial_user_input).
-function validateUrl(value: string, scope: ProjectRoots, ipTargets: ReadonlySet<string> | null): string | null {
+// an address is one of the project's, CIDR-aware, and a name passes the saved
+// hostname policy (typedHostnameRefusal; filter_partial_user_input decides).
+function validateUrl(value: string, scope: ProjectRoots, ipTargets: IpTargetMatcher | null,
+  hostnamePolicy: TypedHostnamePolicy | null = null): string | null {
   try {
     const url = new URL(value)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return `URL must use http or https: ${value}`
@@ -320,7 +331,11 @@ function validateUrl(value: string, scope: ProjectRoots, ipTargets: ReadonlySet<
     if (ipTargets) {
       // URL keeps an IPv6 host's brackets; the server's urlsplit drops them.
       const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
-      return ipTargets.has(host) ? null : `${host} is not one of this project's target IPs`
+      if (ipTargets.has(host)) return null
+      const isName = !/^[\d.]+$/.test(host) && !host.includes(':')
+      return isName && hostnamePolicy
+        ? typedHostnameRefusal(host, hostnamePolicy)
+        : `${host} is not one of this project's target IPs`
     }
     if (scope.roots.length && !admitsPartialHost(scope, url.hostname)) {
       return `${url.hostname} is out of scope for this run (${describeScope(scope)})`
@@ -427,8 +442,14 @@ export function PartialReconModal({
   const [loadingInputs, setLoadingInputs] = useState(false)
   // Set when the graph could not be read: the counts are then unknown, not zero.
   const [graphReadError, setGraphReadError] = useState<string | null>(null)
-  const [userSettings, setUserSettings] = useState<Record<string, string> | null>(null)
+  const [userSettings, setUserSettings] = useState<Record<string, unknown> | null>(null)
+  // A collaborator's form: the run spends the project owner's keys (step 5.7).
+  const ownerKeys = useOwnerKeys()
   const [customSubdomains, setCustomSubdomains] = useState('')
+  const [ipHostnames, setIpHostnames] = useState<{ mode: string; recorded: number | null } | null>(null)
+  // The SAVED project's hostname policy (04_ui_spec.md §5): what the
+  // orchestrator and the container judge typed names by, not the open form.
+  const [savedPolicy, setSavedPolicy] = useState<TypedHostnamePolicy | null>(null)
   const [customIps, setCustomIps] = useState('')
   const [ipAttachTo, setIpAttachTo] = useState<string | null>(null)
   const [customPorts, setCustomPorts] = useState('')
@@ -457,6 +478,29 @@ export function PartialReconModal({
   const [uploadError, setUploadError] = useState<string | null>(null)
   const jsFileInputRef = useRef<HTMLInputElement>(null)
 
+  // IP mode: the saved hostname mode and how many names the last run recorded.
+  const isIpProject = ipTargets != null
+  useEffect(() => {
+    if (!isOpen || !projectId || !isIpProject) {
+      setIpHostnames(null)
+      return
+    }
+    let alive = true
+    setIpHostnames(null)
+    fetchJson<{ mode?: unknown; totals?: { recorded?: unknown } }>(
+      `/api/projects/${encodeURIComponent(projectId)}/ip-hostnames?limit=1`, undefined,
+      "Couldn't read the project's hostname mode",
+    )
+      .then(body => {
+        if (!alive) return
+        setIpHostnames(typeof body?.mode === 'string'
+          ? { mode: body.mode, recorded: typeof body.totals?.recorded === 'number' ? body.totals.recorded : null }
+          : null)
+      })
+      .catch(() => { if (alive) setIpHostnames(null) })
+    return () => { alive = false }
+  }, [isOpen, projectId, isIpProject])
+
   // A string, so a fresh projectRoots array on every parent render does not refetch.
   const formRootsKey = (projectRoots?.length ? projectRoots : (targetDomain ? [targetDomain] : [])).join(',')
 
@@ -484,10 +528,16 @@ export function PartialReconModal({
       existing_subdomains_count: 0, existing_ips_count: 0, existing_ports_count: 0, source: 'settings',
     }
     setScopeGroups(null)
+    setSavedPolicy(null)
     fetch(`/api/projects/${projectId}`)
       .then(res => (res.ok ? res.json() : null))
-      .then(project => setScopeGroups(Array.isArray(project?.scopeGroups) ? project.scopeGroups : null))
-      .catch(() => setScopeGroups(null))
+      .then(project => {
+        setScopeGroups(Array.isArray(project?.scopeGroups) ? project.scopeGroups : null)
+        setSavedPolicy(project && typeof project === 'object'
+          ? { mode: project.ipHostnameMode, include: project.ipHostnameInclude, exclude: project.ipHostnameExclude }
+          : null)
+      })
+      .catch(() => { setScopeGroups(null); setSavedPolicy(null) })
     setGraphReadError(null)
     fetchJson<(GraphInputs & { degraded?: string; code?: string }) | null>(
       `/api/recon/${projectId}/graph-inputs/${toolId}`, undefined, 'Could not read the graph',
@@ -513,14 +563,13 @@ export function PartialReconModal({
     }
     // Fetch user settings for API key warnings (only for tools that need keys)
     if (userId && TOOL_API_KEYS[toolId]) {
-      fetch(`/api/users/${userId}/settings`)
-        .then(r => r.ok ? r.json() : null)
+      readKeySettings(userId, ownerKeys)
         .then(s => setUserSettings(s || {}))
         .catch(() => setUserSettings(null))
     } else {
       setUserSettings(null)
     }
-  }, [isOpen, toolId, projectId, formRootsKey, userId])
+  }, [isOpen, toolId, projectId, formRootsKey, userId, ownerKeys])
 
   // JS file upload handlers (JsRecon only)
   const handleJsFileUpload = useCallback(async (file: File) => {
@@ -627,23 +676,46 @@ export function PartialReconModal({
   const isOriginDiscovery = toolId === 'OriginDiscovery'
   const hasUserInputs = isPortScanner || isNmap || isTlsx || isHttpx || isResourceEnum || isArjun || isGau || isParamSpider || isSecurityChecks || isShodan || isOsintEnrichment || isGraphql || isSubdomainTakeover || isVhostSni || isWebCachePoison || isSerializedScan || isRouteExposure || isOriginDiscovery
   const hasIpInput = isPortScanner || isNmap || isTlsx || isHttpx || isSecurityChecks || isShodan || isOsintEnrichment || isVhostSni
-  const hasSubdomainInput = toolId === 'Naabu' || isHttpx || isGau || isParamSpider || isSecurityChecks || isSubdomainTakeover || isVhostSni || isOriginDiscovery
+  const toolTakesSubdomains = toolId === 'Naabu' || isHttpx || isGau || isParamSpider || isSecurityChecks || isSubdomainTakeover || isVhostSni || isOriginDiscovery
+  // IP mode: the saved Hostnames on target IPs mode; unknown (still loading, or
+  // unreadable) reads as IP only, as the container reads it.
+  const hostnameMode = ipHostnameModeOf(savedPolicy?.mode ?? ipHostnames?.mode)
+  const hostnamePolicy = useMemo<TypedHostnamePolicy | null>(
+    () => (ipTargets != null ? { ...savedPolicy, mode: hostnameMode } : null),
+    [ipTargets, savedPolicy, hostnameMode],
+  )
+  const namesScanned = hostnameMode === 'record_filter' || hostnameMode === 'scan_all'
+  // A typed hostname in an IP project only where the policy scans names: the
+  // orchestrator and the container refuse every one in IP only and Record
+  // hostnames, and a box whose every line is refused would only disable Run.
+  const hasSubdomainInput = toolTakesSubdomains && (ipTargets == null || namesScanned)
   const hasPortInput = isNmap || isTlsx || isHttpx
   // GraphqlScan / WebCachePoison SECTION_INPUT_MAP = [BaseURL, Endpoint]. Per
   // PROMPT.ADD_PARTIAL_RECON.md, BaseURL-accepting tools get a URL textarea;
   // Endpoint is graph-only (never manually entered).
   const hasUrlInput = isResourceEnum || isArjun || isSecurityChecks || isGraphql || isWebCachePoison || isSerializedScan || isRouteExposure
 
-  // Subdomain validation
+  // Subdomain validation. IP mode: the saved policy's pattern half and the hard
+  // guardrail (typedHostnameRefusal); the addresses are re-checked at run time.
   const subdomainValidation = useMemo(
-    () => validateLines(customSubdomains, v => validateSubdomain(v, partialScope)),
-    [customSubdomains, partialScope],
+    () => validateLines(customSubdomains, v => hostnamePolicy
+      ? typedHostnameRefusal(v, hostnamePolicy)
+      : validateSubdomain(v, partialScope)),
+    [customSubdomains, partialScope, hostnamePolicy],
   )
+
+  // The project's addresses in IP mode, CIDR-aware: the only hosts a typed IP,
+  // CIDR or URL may name (B-20, B-22).
+  const ipTargetSet = useMemo(
+    () => ipTargets ? ipTargetMatcher(ipTargets) : null,
+    [ipTargets],
+  )
+  const ipModeRefused = ipModeRefusal(toolId, ipTargets != null, hostnameMode)
 
   // IP validation
   const ipValidation = useMemo(
-    () => validateLines(customIps, validateIp),
-    [customIps],
+    () => validateLines(customIps, v => validateIp(v) ?? (ipTargetSet ? ipTargetSet.outside(v) : null)),
+    [customIps, ipTargetSet],
   )
 
   // Port validation (Nmap only)
@@ -653,13 +725,9 @@ export function PartialReconModal({
   )
 
   // URL validation (resource enum tools: Katana, Hakrawler) -- must be in project scope
-  const ipTargetSet = useMemo(
-    () => ipTargets ? new Set(ipTargets.map(ip => ip.trim().toLowerCase())) : null,
-    [ipTargets],
-  )
   const urlValidation = useMemo(
-    () => validateLines(customUrls, v => validateUrl(v, partialScope, ipTargetSet)),
-    [customUrls, partialScope, ipTargetSet],
+    () => validateLines(customUrls, v => validateUrl(v, partialScope, ipTargetSet, hostnamePolicy)),
+    [customUrls, partialScope, ipTargetSet, hostnamePolicy],
   )
 
   const hasValidationErrors = (hasSubdomainInput && subdomainValidation.errors.length > 0)
@@ -673,13 +741,16 @@ export function PartialReconModal({
     return TOOL_API_KEYS[toolId].filter(req => !userSettings[req.key])
   }, [toolId, userSettings])
 
-  // Build dropdown options: graph subdomains + custom subdomains (live)
+  // Build dropdown options: graph subdomains + custom subdomains (live). In IP
+  // mode only a target's own label: the link is written as a RESOLVES_TO that
+  // later runs read as forward DNS, so a name may never take typed IPs (B-20).
   const attachToOptions = useMemo(() => {
-    const graphSubs = graphInputs?.existing_subdomains || []
+    const graphSubs = (graphInputs?.existing_subdomains || [])
+      .filter(s => !ipTargetSet || ipTargetSet.isLabel(s))
     const customSubs = customSubdomains
       .split('\n')
       .map(s => s.trim().toLowerCase())
-      .filter(s => s && isValidDomain(s) && admitsPartialHost(partialScope, s))
+      .filter(s => s && isValidDomain(s) && admitsPartialHost(partialScope, s) && !ipTargetSet)
     // Deduplicate, graph first
     const seen = new Set<string>()
     const options: { value: string; label: string; source: string }[] = []
@@ -690,7 +761,7 @@ export function PartialReconModal({
       if (!seen.has(s)) { seen.add(s); options.push({ value: s, label: s, source: 'custom' }) }
     }
     return options
-  }, [graphInputs?.existing_subdomains, customSubdomains, partialScope])
+  }, [graphInputs?.existing_subdomains, customSubdomains, partialScope, ipTargetSet])
 
   // Build dropdown options for URL attachment: existing BaseURLs from graph
   const urlAttachToOptions = useMemo(() => {
@@ -712,7 +783,7 @@ export function PartialReconModal({
   }, [urlAttachToOptions, urlAttachTo])
 
   const handleRun = useCallback(() => {
-    if (!runDomains.length || hasValidationErrors) return
+    if (!runDomains.length || hasValidationErrors || ipModeRefused) return
 
     if (hasUserInputs) {
       const subdomains = hasSubdomainInput ? customSubdomains.split('\n').map(s => s.trim()).filter(Boolean) : []
@@ -766,7 +837,7 @@ export function PartialReconModal({
         ...nucleiOverrides,
       })
     }
-  }, [runDomains, hasValidationErrors, hasUserInputs, hasSubdomainInput, hasIpInput, hasPortInput, hasUrlInput, isNmap, toolId, onConfirm, customSubdomains, customIps, ipAttachTo, customPorts, customUrls, urlAttachTo, includeGraphTargets, isNuclei, nucleiCveLookup, nucleiMitre, nucleiSecurityChecks])
+  }, [runDomains, hasValidationErrors, ipModeRefused, hasUserInputs, hasSubdomainInput, hasIpInput, hasPortInput, hasUrlInput, isNmap, toolId, onConfirm, customSubdomains, customIps, ipAttachTo, customPorts, customUrls, urlAttachTo, includeGraphTargets, isNuclei, nucleiCveLookup, nucleiMitre, nucleiSecurityChecks])
 
   if (!isOpen || !toolId) return null
 
@@ -929,6 +1000,11 @@ export function PartialReconModal({
           </div>
         </div>
 
+        {ipModeRefused && (
+          <div style={legacyGraphStyle} role="alert" data-testid="partial-recon-ip-mode-refused">
+            Not available for an IP-mode project. {ipModeRefused}
+          </div>
+        )}
         {oldModelGraph && (
           <div style={legacyGraphStyle} role="alert" data-testid="partial-recon-legacy-graph">
             This project&apos;s graph was built before the current scope model
@@ -1154,14 +1230,31 @@ export function PartialReconModal({
           </div>
         )}
 
+        {ipTargets != null && hostnameMode === 'record_only' && ipHostnames != null && ipHostnames.recorded !== null && (
+          <div style={noteStyle} data-testid="partial-recon-ip-recorded">
+            {ipHostnames.recorded} name{ipHostnames.recorded === 1 ? '' : 's'} recorded, not scanned
+            (Hostnames on target IPs: {ipHostnameModeLabel('record_only')}).
+          </div>
+        )}
+        {toolTakesSubdomains && ipTargets != null && !namesScanned && !ipModeRefused && (
+          <div style={noteStyle} data-testid="partial-recon-ip-names-off">
+            Typed hostnames are not taken with Hostnames on target IPs set to{' '}
+            {ipHostnameModeLabel(hostnameMode)}: no hostname is a target, only the target IPs.
+          </div>
+        )}
+
         {/* === Section A - Custom Subdomains (only for tools that consume Subdomain) === */}
         {hasSubdomainInput && (
           <div>
-            <div style={labelStyle}>Custom subdomains (optional, one per line)</div>
+            <div style={labelStyle}>
+              {ipTargets != null ? 'Custom hostnames' : 'Custom subdomains'} (optional, one per line)
+            </div>
             <textarea
               value={customSubdomains}
               onChange={e => setCustomSubdomains(e.target.value)}
-              placeholder={`api.${domain || 'example.com'}\nstaging.${domain || 'example.com'}`}
+              placeholder={ipTargets != null
+                ? 'app.example.com\nshop.example.com'
+                : `api.${domain || 'example.com'}\nstaging.${domain || 'example.com'}`}
               rows={2}
               style={textareaStyle(subdomainValidation.errors.length > 0)}
             />
@@ -1170,6 +1263,11 @@ export function PartialReconModal({
                 {subdomainValidation.errors.map((err, i) => (
                   <div key={i} style={errorLineStyle}>Line {err.line}: {err.error}</div>
                 ))}
+              </div>
+            ) : ipTargets != null ? (
+              <div style={hintStyle} data-testid="partial-recon-ip-names-recheck">
+                Re-checked at run time: every address the name resolves to must be one of your target IPs
+                (Hostnames on target IPs: {ipHostnameModeLabel(hostnameMode)}).
               </div>
             ) : (
               <div style={hintStyle}>Will be DNS-resolved and added to the graph as Subdomain nodes</div>
@@ -1416,7 +1514,7 @@ export function PartialReconModal({
         )}
 
         {/* SubdomainDiscovery: which roots to enumerate */}
-        {isSubdomainDiscovery && !loadingInputs && (domains.length > 1 || (domains.length === 1 && enumerableDomains.length === 0)) && (
+        {isSubdomainDiscovery && !loadingInputs && !ipModeRefused && (domains.length > 1 || (domains.length === 1 && enumerableDomains.length === 0)) && (
           <div>
             <div style={labelStyle}>Scan roots to enumerate</div>
             <div
@@ -1454,7 +1552,7 @@ export function PartialReconModal({
             <div style={hintStyle}>Only an enumerated scope group (a *.name entry) runs subdomain discovery; a listed group scans exactly its hosts.</div>
           </div>
         )}
-        {isSubdomainDiscovery && !loadingInputs && domains.length > 0 && runDomains.length === 0 && (
+        {isSubdomainDiscovery && !loadingInputs && !ipModeRefused && domains.length > 0 && runDomains.length === 0 && (
           <div style={errorBoxStyle}>
             {enumerableDomains.length === 0
               ? 'No scan root in this project may be enumerated: only an enumerated scope group (a *.name entry) runs subdomain discovery.'
@@ -1510,7 +1608,7 @@ export function PartialReconModal({
           <button
             type="button"
             onClick={handleRun}
-            disabled={!runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || routeExposureNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || ipAttributionNoIps || originDiscoveryNoFronted || oldModelGraph}
+            disabled={!runDomains.length || isStarting || hasValidationErrors || noTargetsToScan || nmapNoPorts || httpxNoPorts || resourceEnumNoUrls || zapAjaxSpiderNoUrls || arjunNoUrls || webCachePoisonNoUrls || serializedScanNoUrls || routeExposureNoUrls || securityChecksNoUrls || shodanNoIps || osintNoIps || ipAttributionNoIps || originDiscoveryNoFronted || oldModelGraph || !!ipModeRefused}
             style={{
               padding: '8px 16px', borderRadius: '6px', border: 'none',
               backgroundColor: '#3b82f6', color: '#fff',

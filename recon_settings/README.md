@@ -137,6 +137,42 @@ is pinned to it by a shared fixture table.
   beside its tool automatically. An explicit `null` means "no input anywhere",
   which the parity test reads to tell a deliberate omission from a forgotten one.
 
+## Who may read or change a field: `readable:` and `share:`
+
+- **`readable: false`** withholds the column from every MCP read
+  (`mcpReadableFields`), with `read_deny_reason` saying why. Absent means readable.
+- **`share: secret`** keeps the column the owner's when the project is shared:
+  `projectReadView` (`webapp/src/lib/authz/projectReadView.ts`) removes it from
+  every project read by anyone else. Absent means `ordinary`. It covers every
+  `readable: false` column except `userId` (the owner's id names the owner, which
+  the project read returns anyway) and the custom request-header lists, which an
+  owner's token reads but which is where an operator puts an API key. The build
+  refuses a `readable: false` column that is not `share: secret` unless its
+  reason is `other_user`, so a credential column added later is never shared by
+  default. `share` is not `deny_reason: secret`, which refuses an MCP write.
+- **`share: gate`** and **`share: scope`** class the writes on a shared project
+  (`webapp/src/lib/authz/settingsRisk.ts`, asked by every writer of the project
+  row). Ordinary columns are Write's. A `gate` is a safety gate: Write may
+  tighten it, loosening it needs Manage, plus Exploitation & shells for the
+  agent's approval, tool-phase, tunnel and Kali switches. A `scope` column decides what the
+  engagement targets or permits: Manage narrows it, only the owner widens it.
+  "Looser" and "wider" are the RoE review's `wideningReason`
+  (`webapp/src/lib/roe/roeWidening.ts`), which reads `roe_safe_value`; the
+  fields it does not judge have a row in `settingsRisk.ts`. Both judge a value by
+  what its readers do with it: a value outside its `values` or bounds, or a time or
+  date not in the HH:MM / YYYY-MM-DD form the readers parse, sits on no order and
+  is judged wider; the window's two ends are judged together, an end before the
+  start crossing midnight; an empty subdomain list scans every subdomain. The build makes every
+  `roe_parse: tighten_only` switch a `gate` and every field of the `scope` and
+  `engagement_limits` groups `scope` (the ownership token stays `secret`), so a
+  safety switch or target column added later is not an editor's by default.
+  Two kinds of ordinary column stay the owner's anyway: the identity columns
+  (`deny_reason: identity`) and `engagementKind`. A refused change answers 403
+  naming each column and the level it needs, and writes nothing; the owner's
+  saves are never judged. A RoE replace or removal by a co-owner is judged by
+  the review instead: none of its rows may widen (`wideningReason`), and a
+  project's first RoE is the owner's.
+
 ## Bounds are not decoration
 
 The form input and the MCP validator are both generated from `bounds`, so a fake

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
 import { internalError } from '@/lib/routeErrors'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { toAuthProfileMetadata } from '@/lib/authProfile'
 import {
   deriveProfileFromMaterial,
@@ -14,17 +14,15 @@ interface RouteParams {
   params: Promise<{ id: string }>
 }
 
-// POST /api/projects/[id]/recording/commit — owner-only. body { save: boolean }.
+// POST /api/projects/[id]/recording/commit — auth_profile:manage (the owner, or a co-owner with Manage). body { save: boolean }.
 // save=true saves the recorded session into the ProjectAuthProfile (source
 // "recorded"); save=false discards it. Refuses to overwrite a profile with an
 // EMPTY capture (G3). Never echoes the value back — returns metadata only.
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'auth_profile:manage', { projectId: id })
+    if (auth instanceof NextResponse) return auth
 
     let body: unknown = {}
     try { body = await request.json() } catch { /* empty body allowed */ }

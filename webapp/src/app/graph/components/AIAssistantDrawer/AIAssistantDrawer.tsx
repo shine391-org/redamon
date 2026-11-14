@@ -22,6 +22,7 @@ import { useModelPicker } from './hooks/useModelPicker'
 import { useSettingsModal } from './hooks/useSettingsModal'
 import { useWebSocketHandler } from './hooks/useWebSocketHandler'
 import { useConversationRestoration } from './hooks/useConversationRestoration'
+import { useSessionChangeReset } from './hooks/useSessionChangeReset'
 import { clearProjectSession } from './sessionMemory'
 import { useSendHandlers } from './hooks/useSendHandlers'
 import { useDownloadMarkdown } from './hooks/useDownloadMarkdown'
@@ -35,7 +36,10 @@ import { useOptionalAuth } from '@/providers/AuthProvider'
 import { useOptionalProject } from '@/providers/ProjectProvider'
 import { loopDisplay, stampLoopStatus, type LoopStatusView } from './hooks/loopStatus'
 import { useRateLimitWait } from './hooks/rateLimitWait'
-import { useConversations } from '@/hooks/useConversations'
+import { useConversationPolicy, useConversations } from '@/hooks/useConversations'
+import { useProjectAccess, useRefusal } from '@/hooks/useRefusal'
+import type { ConversationSharingControls } from './ConversationHistory'
+import { ReadOnlyConversationNotice } from './ReadOnlyConversationNotice'
 import { useChatPersistence } from '@/hooks/useChatPersistence'
 import { useToast } from '@/components/ui'
 import { CONVERSATION_FAILURE_TITLE, DECISION_NOT_SENT, deleteWarningsText } from './drawerNotices'
@@ -126,7 +130,7 @@ export function AIAssistantDrawer({
     approvalRequest, setApprovalRequest,
     modificationText, setModificationText,
     awaitingToolConfirmation, setAwaitingToolConfirmation,
-    setToolConfirmationRequest,
+    toolConfirmationRequest, setToolConfirmationRequest,
     awaitingQuestion, setAwaitingQuestion,
     questionRequest, setQuestionRequest,
     answerText, setAnswerText,
@@ -134,7 +138,7 @@ export function AIAssistantDrawer({
     isProcessingApproval, awaitingApprovalRef,
     isProcessingQuestion, awaitingQuestionRef,
     isProcessingToolConfirmation, awaitingToolConfirmationRef,
-    pendingApprovalToolId, pendingApprovalWaveId,
+    pendingApprovalToolId, pendingApprovalWaveId, answerUndo,
     resetInteractionState,
   } = useInteractionState()
 
@@ -148,6 +152,7 @@ export function AIAssistantDrawer({
 
   const {
     missingApiKeys,
+    apiKeysReadOnly,
     apiKeyModal,
     apiKeyValue, setApiKeyValue,
     apiKeyVisible, setApiKeyVisible,
@@ -197,6 +202,7 @@ export function AIAssistantDrawer({
     createConversation,
     deleteConversation,
     loadConversation,
+    shareConversation,
   } = useConversations(projectId, userId, {
     // The list is polled while the history is open: its failure is shown there, not toasted every 5s.
     onError: (action, err) => {
@@ -219,6 +225,8 @@ export function AIAssistantDrawer({
     handleHistoryNewChat,
     handleDeleteConversation,
     restoreForProject,
+    readOnlyView,
+    clearReadOnlyView,
   } = useConversationRestoration({
     loadConversation,
     deleteConversation,
@@ -264,6 +272,7 @@ export function AIAssistantDrawer({
     resetChatState()
     resetInteractionState()
     resetScrollState()
+    clearReadOnlyView()
     setConversationId(null)
     setShowHistory(false)
     setActiveSkill(null)
@@ -271,7 +280,27 @@ export function AIAssistantDrawer({
     // switch back starts fresh rather than reopening the abandoned chat.
     clearProjectSession(projectId)
     onResetSession?.()
-  }, [resetChatState, resetInteractionState, resetScrollState, setConversationId, setShowHistory, setActiveSkill, onResetSession, projectId])
+  }, [resetChatState, resetInteractionState, resetScrollState, clearReadOnlyView, setConversationId, setShowHistory, setActiveSkill, onResetSession, projectId])
+
+  // ─── Conversation sharing (step 5.8): write sharing in force only ─────────
+  const sharingState = useOptionalAuth()?.user?.sharing
+  const conversationSharing = sharingState?.enabled === true && sharingState.maxLevel === 'write'
+  const shareRefusal = useRefusal('agent:conversations_share', projectId || null)
+  const myAccess = useProjectAccess(projectId || null)
+  const { managersSeeAll, setManagersSeeAll } = useConversationPolicy(projectId, conversationSharing && showHistory, (err) =>
+    toast.error(err.message, 'Could not change who reads the sessions'))
+  const historySharing = useMemo<ConversationSharingControls | null>(() => {
+    if (!conversationSharing) return null
+    return {
+      canShare: shareRefusal === null,
+      onShare: (id, shared) => { void shareConversation(id, shared) },
+      policy: managersSeeAll === null ? null : {
+        managersSeeAll,
+        editable: myAccess?.level === 'owner',
+        onChange: (value) => { void setManagersSeeAll(value) },
+      },
+    }
+  }, [conversationSharing, managersSeeAll, setManagersSeeAll, shareRefusal, shareConversation, myAccess?.level])
 
   // Keep ref up-to-date
   useEffect(() => { handleNewChatRef.current = handleNewChat }, [handleNewChat])
@@ -287,7 +316,7 @@ export function AIAssistantDrawer({
     awaitingApprovalRef, isProcessingApproval,
     awaitingQuestionRef, isProcessingQuestion,
     awaitingToolConfirmationRef, isProcessingToolConfirmation,
-    pendingApprovalToolId, pendingApprovalWaveId,
+    pendingApprovalToolId, pendingApprovalWaveId, answerUndo, setAnswerText, setSelectedOptions,
     onGraphMutation: onRefetchGraph,
     setLoopStatus,
     setRateLimitWait,
@@ -346,14 +375,14 @@ export function AIAssistantDrawer({
     isLoading, setIsLoading, setIsStopped, setIsStopping,
     setChatItems, chatItems,
     activeSkill, setActiveSkill,
-    awaitingApproval, setAwaitingApproval, setApprovalRequest, modificationText, setModificationText,
+    awaitingApproval, setAwaitingApproval, approvalRequest, setApprovalRequest, modificationText, setModificationText,
     awaitingQuestion, setAwaitingQuestion, questionRequest, setQuestionRequest,
     answerText, setAnswerText, selectedOptions, setSelectedOptions,
-    awaitingToolConfirmation, setAwaitingToolConfirmation, setToolConfirmationRequest,
+    awaitingToolConfirmation, setAwaitingToolConfirmation, toolConfirmationRequest, setToolConfirmationRequest,
     isProcessingApproval, awaitingApprovalRef,
     isProcessingQuestion, awaitingQuestionRef,
     isProcessingToolConfirmation, awaitingToolConfirmationRef,
-    pendingApprovalToolId, pendingApprovalWaveId,
+    pendingApprovalToolId, pendingApprovalWaveId, answerUndo,
     sendQuery, sendGuidance, sendSkillInject, sendApproval, sendToolConfirmation, sendFireteamMemberConfirmation, sendAnswer, sendStop, sendResume, sendToolStop,
     conversationId, setConversationId, projectId, userId, sessionId,
     createConversation, saveMessage, updateConvMeta,
@@ -413,19 +442,13 @@ export function AIAssistantDrawer({
     onArmed: useCallback(() => setShowHistory(false), [setShowHistory]),
   })
 
-  // Reset state when session changes (skip when restoring a conversation)
-  useEffect(() => {
-    if (isRestoringConversation.current) {
-      isRestoringConversation.current = false
-      return
-    }
+  useSessionChangeReset(sessionId, isRestoringConversation, () => {
     resetChatState()
     resetInteractionState()
     resetScrollState()
     setConversationId(null)
     setActiveSkill(null)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId])
+  })
 
   // Per-project session memory: when the current project actually changes,
   // restore THAT project's last-open session (or a fresh chat), so the previous
@@ -527,6 +550,7 @@ export function AIAssistantDrawer({
         socketUrl={socketUrl}
         agentHealthError={agentHealth.status === 'offline' ? agentHealth.error : null}
         conversationsError={conversationsError}
+        historySharing={historySharing}
       />
 
       <PhaseIndicatorBar
@@ -612,7 +636,7 @@ export function AIAssistantDrawer({
         isConnected={isConnected}
         setInputValue={setInputValue}
         missingApiKeys={missingApiKeys}
-        openApiKeyModal={openApiKeyModal}
+        openApiKeyModal={apiKeysReadOnly ? undefined : openApiKeyModal}
         handleTimelineToolConfirmation={guardedToolConfirmation}
         handleToolStop={handleToolStop}
         loop={loop}
@@ -641,28 +665,32 @@ export function AIAssistantDrawer({
         isConnected={isConnected}
       />
 
-      <InputArea
-        inputRef={inputRef}
-        inputValue={inputValue}
-        handleInputChange={handleInputChange}
-        handleKeyDown={handleKeyDown}
-        handleSend={handleSend}
-        handleStop={handleStop}
-        handleResume={handleResume}
-        isConnected={isConnected}
-        isLoading={isLoading}
-        isStopped={isStopped}
-        isStopping={isStopping}
-        awaitingApproval={awaitingApproval}
-        awaitingQuestion={awaitingQuestion}
-        awaitingToolConfirmation={awaitingToolConfirmation}
-        userId={userId}
-        setInputValue={setInputValue}
-        activeSkill={activeSkill}
-        setActiveSkill={setActiveSkill}
-        onSkillActivate={activateSkill}
-        userResizedRef={userResizedRef}
-      />
+      {readOnlyView ? (
+        <ReadOnlyConversationNotice view={readOnlyView} onNewChat={handleNewChat} />
+      ) : (
+        <InputArea
+          inputRef={inputRef}
+          inputValue={inputValue}
+          handleInputChange={handleInputChange}
+          handleKeyDown={handleKeyDown}
+          handleSend={handleSend}
+          handleStop={handleStop}
+          handleResume={handleResume}
+          isConnected={isConnected}
+          isLoading={isLoading}
+          isStopped={isStopped}
+          isStopping={isStopping}
+          awaitingApproval={awaitingApproval}
+          awaitingQuestion={awaitingQuestion}
+          awaitingToolConfirmation={awaitingToolConfirmation}
+          userId={userId}
+          setInputValue={setInputValue}
+          activeSkill={activeSkill}
+          setActiveSkill={setActiveSkill}
+          onSkillActivate={activateSkill}
+          userResizedRef={userResizedRef}
+        />
+      )}
 
       <ApiKeyModal
         apiKeyModal={apiKeyModal}

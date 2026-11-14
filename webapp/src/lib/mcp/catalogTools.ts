@@ -23,6 +23,7 @@
 import { settableFieldCount } from '@/lib/reconSettings/filter'
 import {
   loadRegistry,
+  rescopableFields,
   settableFields,
   type RegistryField,
 } from '@/lib/reconSettings/registry'
@@ -105,6 +106,24 @@ export function settingGroups(): SettingGroup[] {
   return cachedGroups
 }
 
+/** A rescopable target list, as describe_recon_settings documents it. */
+export interface ScopeFieldDoc extends SettingDoc {
+  group: string
+  /** The Prisma default a new project gets; the shape, not a project's value. */
+  default: unknown
+  changedBy: 'update_project_scope'
+}
+
+/** The create_only fields update_project_scope may change, with their bounds. */
+export function scopeFieldDocs(): ScopeFieldDoc[] {
+  return rescopableFields().map(f => ({
+    ...toDoc(f.key, f),
+    group: groupName(f.tool),
+    default: f.default,
+    changedBy: 'update_project_scope' as const,
+  }))
+}
+
 /** Test seam: the grouping is cached because the registry is constant per build. */
 export function __resetCatalogCache(): void {
   cachedGroups = null
@@ -144,7 +163,7 @@ const NOTES = [
     'roeForbiddenTools, roeForbiddenCategories, the allow flags and roeMaxSeverityPhase - ARE ' +
     'listed and ARE settable here, in either direction. What keeps them honest is not a ' +
     'write-time direction rule but that every one of them is enforced at scan start whatever ' +
-    'the setting says: a ceiling still rewrites all 17 rate fields, an excluded host is still ' +
+    'the setting says: a ceiling still caps every rate field it governs, an excluded host is still ' +
     'dropped in three places. Read preflight_scope_check to see the resolved configuration.',
   'The engagement RECORD - the client name, the contacts, the dates, the document - is not ' +
     'here and is not writable by any tool on this surface. It is the contract, a person ' +
@@ -209,8 +228,10 @@ export async function describeReconSettings(ctx: McpContext, args: { group?: str
   const groups = wanted
     ? all.filter(g => g.group.toLowerCase().includes(wanted))
     : all
+  const scopeFields = scopeFieldDocs()
+    .filter(s => !wanted || s.group.toLowerCase().includes(wanted) || s.key.toLowerCase().includes(wanted))
 
-  if (wanted && groups.length === 0) {
+  if (wanted && groups.length === 0 && scopeFields.length === 0) {
     throw new McpToolError(
       `No settings group matches '${args.group}'. Call this tool with no arguments to see the ` +
       `group names.`,
@@ -222,10 +243,15 @@ export async function describeReconSettings(ctx: McpContext, args: { group?: str
     phases: SCAN_MODULE_VALUES.map(module => ({ module, what: PHASE_NOTES[module] ?? '' })),
     enums: { scanModules: SCAN_MODULE_VALUES, severity: SEVERITY_VALUES },
     groups,
+    // Not settable here: the target lists update_project_scope changes, an IP
+    // project's hostname policy and its caps among them. Listed with their
+    // bounds so a rescope can be composed without a refusal.
+    scopeFields,
     settableFieldCount: settableFieldCount(),
     dispositions: {
       settable: 'write any time through update_recon_settings',
-      create_only: 'the engagement scope: set once by create_project, immutable after',
+      create_only: 'the engagement scope: set once by create_project, immutable after, except ' +
+        'the target lists in scopeFields, which update_project_scope changes',
       never: 'not a pipeline parameter; refused with its class',
     },
     notes: NOTES,

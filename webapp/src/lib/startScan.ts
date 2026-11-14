@@ -9,15 +9,22 @@
  * version freeze). Every other kind forwards to its orchestrator start endpoint,
  * mirroring its /api/.../start route body exactly.
  */
+import { NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
-import { loadEngagement } from '@/lib/engagement'
+import { currentRoeTextSha256 } from '@/lib/engagement'
+import { assertEngagementStartable } from '@/lib/engagementGate'
+import { assertGraphNotActivating } from '@/lib/activationLock'
+import { describeNodeFilterWriter } from '@/lib/nodeFilterRun'
 import { resolveTrufflehogStart } from '@/lib/trufflehogStart'
 import { orchestratorFetch } from '@/lib/orchestrator'
+import { scanStartFields } from '@/lib/scanJobCredential'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
-import { classifyOrchestratorThrow, startFullScan } from '@/lib/startFullScan'
-import { parseScanMode, type ScanTrigger } from '@/lib/scanTimeline'
+import { classifyOrchestratorThrow, graphLockedStartRefusal, startFullScan } from '@/lib/startFullScan'
+import { withGraphStartLock } from '@/lib/projectGraphLock'
+import { parseScanMode, recordScanStart, type ScanTrigger } from '@/lib/scanTimeline'
 import { legacyGraphDomains, legacyGraphRefusal } from '@/lib/legacyGraph'
-import { resolveScopeGroups } from '@/lib/scopeGroups'
+import { IP_HOSTNAME_SELECT, ipHostnameStartProblem, resolveScopeGroups } from '@/lib/scopeGroups'
+import { secondWriterRefusal, secondWriterResponse } from '@/lib/authz/projectWriters'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 const WEBAPP_URL = process.env.WEBAPP_URL || 'http://localhost:3000'
@@ -95,6 +102,57 @@ export async function stopScan(kind: string, projectId: string, runId = ''): Pro
   }
 }
 
+/** A start route's refusal response, in the shape the queue classifies. */
+async function routeRefusal(res: NextResponse): Promise<DispatchStartResult> {
+  const body = (await res.json().catch(() => ({}))) as { error?: unknown; activationInProgress?: unknown }
+  return {
+    ok: false,
+    status: res.status,
+    ...(typeof body.error === 'string' ? { error: body.error } : {}),
+    ...(body.activationInProgress === true ? { activationInProgress: true } : {}),
+  }
+}
+
+/**
+ * The checks the start buttons make before a run may write the live graph.
+ * Every kind waits out a version activation swapping the graph; a partial recon
+ * also waits out a mute-rule apply, which it would race for the same findings.
+ * Both are 409s the queue reads as a capacity wait: requeued, never started.
+ */
+async function graphBusyRefusal(kind: string, projectId: string): Promise<DispatchStartResult | null> {
+  const activating = await assertGraphNotActivating(projectId)
+  if (activating) return routeRefusal(activating)
+  if (kind !== 'partial_recon') return null
+  const applying = await describeNodeFilterWriter(projectId)
+  if (!applying) return null
+  return {
+    ok: false,
+    status: 409,
+    busy: applying,
+    error: `Cannot start a partial recon while ${applying}. Try again when it finishes.`,
+  }
+}
+
+/**
+ * The run id each kind's start button records its ScanJob under, which is how
+ * the reconcile matches a row to its run. supply_chain_repo has no button and
+ * no ScanJob: its history is the queue row.
+ */
+const HISTORY_RUN_ID: Partial<Record<string, (state: unknown, body: Record<string, unknown>) => string>> = {
+  partial_recon: state => runId(state),
+  ai_attack: state => runId(state),
+  trufflehog: (_state, body) => (typeof body.source === 'string' ? body.source : ''),
+  gvm: () => '',
+  github_hunt: () => '',
+  supply_chain: () => '',
+}
+
+/** The roots the orchestrator granted a partial recon, as its route records them. */
+function grantedRoots(state: unknown): string[] {
+  const roots = (state as { roots?: unknown } | null)?.roots
+  return Array.isArray(roots) ? roots.filter((r): r is string => typeof r === 'string') : []
+}
+
 export async function dispatchStart(
   kind: string,
   projectId: string,
@@ -130,14 +188,85 @@ export async function dispatchStart(
     }
   }
 
+  // S-4: every other kind writes the live graph too (graphWriters.ts counts each
+  // as a writer), so like its button it holds the project's graph lock.
+  const held = await withGraphStartLock(projectId, () => dispatchOtherStart(kind, projectId, opts))
+  if (held.acquired) return held.value
+  const refused = graphLockedStartRefusal(held.heldBy)
+  return {
+    ok: false,
+    status: refused.status,
+    error: refused.error,
+    ...(refused.activationInProgress ? { activationInProgress: true } : {}),
+    ...(refused.busy ? { busy: refused.busy } : {}),
+  }
+}
+
+/**
+ * Run a start button's route holding the project's graph lock
+ * (projectGraphLock.ts), for a scan whose run writes the live graph: from the
+ * route's activation check through the orchestrator's answer, after which an
+ * activation's or a version save's writer check sees the run. Without it an
+ * activation could begin swapping the graph between the check and the start,
+ * and the run would write into the half-restored graph; a save could freeze
+ * the graph while the run writes into it. A save or an activation holding the
+ * lock refuses the start with 409.
+ *
+ * `writer` is who starts it: inside the lock, before the route's own checks,
+ * another person writing the project refuses the start (step 5.11), so two
+ * people pressing Start at once meet each other here.
+ */
+export async function startUnderGraphLock(
+  projectId: string,
+  start: () => Promise<NextResponse>,
+  writer: { personId: string; ownerId?: string },
+): Promise<NextResponse> {
+  const held = await withGraphStartLock(projectId, async () =>
+    (await secondWriterResponse({ projectId, ...writer })) ?? start())
+  if (held.acquired) return held.value
+  const refused = graphLockedStartRefusal(held.heldBy)
+  return NextResponse.json(
+    {
+      error: refused.error,
+      ...(refused.activationInProgress ? { activationInProgress: true } : {}),
+      ...(refused.busy ? { busy: refused.busy } : {}),
+    },
+    { status: refused.status },
+  )
+}
+
+async function dispatchOtherStart(
+  kind: string,
+  projectId: string,
+  opts: { actorUserId?: string | null; payload?: StartScanPayload },
+): Promise<DispatchStartResult> {
+  const payload = opts.payload ?? {}
+
+  const graphBusy = await graphBusyRefusal(kind, projectId)
+  if (graphBusy) return graphBusy
+
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     select: {
       id: true, userId: true, supplyChainInputMode: true,
       targetDomain: true, subdomainList: true, ipMode: true, domainBatchMode: true, domainBatchHosts: true,
+      engagementKind: true, ...IP_HOSTNAME_SELECT,
     },
   })
   if (!project) return { ok: false, status: 404, error: 'Project not found' }
+
+  // Another person writing the project: 409, which the queue reads as busy and
+  // requeues, so a deferred start waits its turn (step 5.11).
+  const otherWriter = await secondWriterRefusal({ projectId, personId: opts.actorUserId ?? null, ownerId: project.userId })
+  if (otherWriter) return { ok: false, status: 409, error: otherWriter.error, busy: otherWriter.busy, code: otherWriter.code }
+
+  // A partial run loads the project settings as a full one does, and recon
+  // refuses an IP-mode hostname policy it may not run (an unconfirmed scan_all,
+  // a record_filter with no include entry). The queue gets the reason now.
+  if (kind === 'partial_recon' && project.ipMode) {
+    const problem = ipHostnameStartProblem(project)
+    if (problem) return { ok: false, status: 422, error: problem }
+  }
 
   // The writers that attach to Domain nodes refuse an old-model graph
   // (§4.11.6). 422, not the routes' 409: the queue reads a 409 as "busy" and
@@ -157,19 +286,11 @@ export async function dispatchStart(
   // The queue dispatcher and the scheduler both arrive through this function
   // with nobody watching, which is exactly why the check is server-side: an
   // agent-facing rule that only applies when an agent is present is not a
-  // control.
-  const engagement = await loadEngagement(projectId)
-  if (engagement.blockers.length > 0) {
-    // 422 as in startFullScan: the queue reads a 409 as "busy" and would
-    // requeue this until a person fixed the engagement record.
-    return {
-      ok: false,
-      status: 422,
-      error:
-        'This is a third-party engagement and it is not startable: ' +
-        engagement.blockers.join(' '),
-    }
-  }
+  // control. The refusal is the manual routes': 422 and the full start's
+  // message. A 409 would read as "busy" to the queue and requeue this until a
+  // person fixed the engagement record.
+  const engagementBlocked = await assertEngagementStartable(projectId)
+  if (engagementBlocked) return routeRefusal(engagementBlocked)
 
   // 'org' is not an input this scan can read: it means "enumerate the account
   // and queue one scan per repo", which is a different kind (supply_chain_repo).
@@ -259,6 +380,13 @@ export async function dispatchStart(
     return { ok: false, status: 400, error: `Unknown scan kind: ${kind}` }
   }
 
+  body = { ...body, ...(await scanStartFields(projectId, project.userId, opts.actorUserId)) }
+
+  const historyRunId = HISTORY_RUN_ID[kind]
+  // Read before the start, as the routes do, so a RoE replaced mid-start cannot
+  // misattribute the run.
+  const roeTextSha256 = historyRunId ? await currentRoeTextSha256(projectId) : null
+
   let response: Response
   try {
     response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}${path}`, {
@@ -299,5 +427,17 @@ export async function dispatchStart(
   }
 
   const state = await response.json().catch(() => ({}))
-  return { ok: true, status: 200, state, runId: runId(state) }
+  const scanJobId = historyRunId
+    ? await recordScanStart({
+        projectId,
+        kind,
+        runId: historyRunId(state, body),
+        initiatedByUserId: opts.actorUserId ?? null,
+        // As for the queue's full recon: nobody pressed a button for this run.
+        trigger: 'scheduled',
+        targets: kind === 'partial_recon' ? grantedRoots(state) : [],
+        roeTextSha256,
+      })
+    : null
+  return { ok: true, status: 200, state, runId: runId(state), scanJobId }
 }

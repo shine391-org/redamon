@@ -163,7 +163,7 @@ flag it manages. Control KB with `ENABLE_KB` only.
 ### First admin (required for init)
 | Key | Purpose |
 |---|---|
-| `ADMIN_NAME` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` | The first admin user, created automatically during `init`. There is **no** app-layer login lockout, so use a strong password (nginx `limit_req` is the only brute-force brake). |
+| `ADMIN_NAME` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` | The first admin user, created automatically during `init`; it is the instance's Root. The password must be 12 characters to 72 bytes (bcrypt reads no further); `init` refuses anything else before it touches the server. Use a strong password: the app locks an email for 15 minutes after 5 failed sign-ins, and nginx `limit_req` brakes the login route. With `RBAC_IDENTITY_ENABLED=true` in the app `.env` on the server, every `update` confirms the admin `ADMIN_EMAIL` names as Root when there are several (see Update and rollback). |
 
 ### Optional app config (appended to the server .env)
 | Key | Purpose |
@@ -475,6 +475,12 @@ the prod overlay's build-arg, so redamon.sh's own webapp rebuild bakes the right
 **All engagement data (Postgres, Neo4j, reports, GVM feeds, models) lives in named volumes
 that survive `update`.**
 
+When the update rebuilds the webapp, `redamon.sh update` prints a read-only report of what it
+changes for your accounts (legacy grants, tunnel rows, members' stdio MCP servers, who becomes
+Root) before anything restarts. `./deploy.sh update` has no terminal, so it prints the report
+and goes on; to read it first, run `./redamon.sh update --preview` in the checkout on the
+server, which pulls and builds but restarts nothing.
+
 The first `update` onto 7.7.0 also runs a one-off backfill (`tooling/scripts/urlscan_backfill.py
 --apply`, in the recon image). It masks the urlscan tokens earlier releases stored in clear, in
 the graph and in the recon JSON files, then writes two marker files in `recon/output/` so it
@@ -493,6 +499,22 @@ at `$HOME/.redamon-deploy` (outside the checkout, so it never blocks `git pull -
 sets `NEXT_PUBLIC_AGENT_WS_URL=wss://<host>/ws/agent` as the webapp build-arg. The deploy works
 even if `tooling/deploy/single-host/` is not committed to the cloned branch (committing it is still fine
 and makes the overlay part of the repo history).
+
+The identity controls (Root, account status, invites, shorter admin sessions) follow
+`RBAC_IDENTITY_ENABLED`, which `deploy.sh` never writes. `redamon.sh` writes it to the app `.env`
+on the server as `true` (with the other four `RBAC_*_ENABLED` switches: permissions, sharing,
+write sharing and the IAM console) whenever a line is missing or blank, and keeps any value
+already there (`seed` keeps lines it does not own too), so all five are on unless you change a
+line to `false` and run `update`. No project is shared until Root turns the sharing policy on
+(**IAM**, **Instance**). After the restart
+`redamon.sh update` confirms Root: the only admin with a password, or the admin `ADMIN_EMAIL`
+names (exported from this `.env`); otherwise it leaves Root unconfirmed and prints how to set it
+(`./redamon.sh set-root <email>` in the checkout on the server). Invite and reset links point at
+the deploy's public origin (`PLUGINS_ALLOWED_ORIGIN`, which `deploy.sh` seeds) until Root sets
+a `publicBaseUrl`. Invitees open those links through the same firewall and nginx gate as you:
+add their addresses to `OPERATOR_ALLOW_CIDRS` (and, under `GATE_MODE=basic_auth`, give them the
+Basic-auth login) before you send an invite, or the link never reaches the app. The rendered nginx also closes `/api/internal/` and the tunnel config paths
+(404); the same `update` re-renders it.
 
 Rollback is manual: `git reset --hard <prev>` on the host checkout, then `./deploy.sh update`.
 

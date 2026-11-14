@@ -160,7 +160,7 @@ The recon module uses a **Docker-in-Docker (DinD)** pattern where the main recon
 
 ### How It Works
 
-The recon container reaches the host's Docker daemon through a **filtering broker** rather than the raw socket. The broker validates every container-creation request — permitting only the known tool images, with mounts restricted to the shared scratch / output directories — and forwards the approved ones to the host daemon. All tool containers are therefore **siblings** managed by the same host daemon, while the recon container itself cannot create a container that mounts the host filesystem, runs privileged, or uses an unapproved image.
+The recon container reaches the host's Docker daemon through a **filtering broker** (`services/docker_broker/broker.py`) rather than the raw socket. The broker blocks by default: it forwards only the Docker API calls the tools' own `docker` invocations send (create, pull, attach, start/wait/kill/stop, logs, remove, and inspect or create of the tool volumes and networks) and refuses anything else with a 403 before the daemon sees it. A container create may use only the known tool images, bind only the shared scratch dir `/tmp/redamon` (read-write) and three repository subdirectories (`recon/wordlists`, `mcp/nuclei-templates`, `scanners/supply_chain_common`, read-only), and mount named volumes read-only except `nuclei-templates`. Verbs on an existing container work only on containers the broker created. All tool containers are therefore **siblings** managed by the same host daemon, while the recon container itself cannot create a container that mounts the host filesystem, runs privileged, or uses an unapproved image.
 
 ```mermaid
 flowchart TB
@@ -169,7 +169,7 @@ flowchart TB
             Socket["/var/run/docker.sock"]
         end
 
-        Broker["🛡️ docker-broker<br/>validates container creates<br/>allowlisted images + scratch mounts only"]
+        Broker["🛡️ docker-broker<br/>default-deny API allowlist<br/>tool images + scratch mounts only"]
 
         subgraph Containers["Sibling Containers"]
             Recon["redamon-recon<br/>Python Orchestrator<br/>📋 Coordinates all scans"]
@@ -181,11 +181,11 @@ flowchart TB
             PurednsC["puredns<br/>frost19k/puredns<br/>🧹 Wildcard Filter"]
         end
 
-        Volume["📁 Shared Volume<br/>recon/output/"]
+        Volume["📁 Shared scratch dir<br/>/tmp/redamon/"]
     end
 
     Broker -.->|filtered socket| Recon
-    Broker -.->|approved creates| Socket
+    Broker -.->|allowlisted calls| Socket
     Recon -->|docker run| NaabuC
     Recon -->|docker run| HttpxC
     Recon -->|docker run| NucleiC
@@ -229,7 +229,7 @@ sequenceDiagram
     and
         Recon->>Recon: URLScan.io enrichment
     end
-    Note over Recon: Fan-In — merge results + Puredns wildcard filtering + DNS (20 parallel workers)
+    Note over Recon: Fan-In — merge results + Puredns wildcard filtering + DNS (DNS_MAX_WORKERS, default 80)
     Recon->>GraphBG: Background: domain discovery graph update
 
     Note over Recon,Naabu: GROUP 3 — Fan-Out (parallel)
@@ -338,14 +338,17 @@ flowchart LR
     end
 
     subgraph G5["GROUP 5 — parallel + sequential"]
-        RE[Resource Enum<br/>Katana ∥ Hakrawler ∥ GAU ∥ ParamSpider ∥ Kiterunner<br/>then jsluice → FFuf → Arjun → OpenAPI]
+        RE[Resource Enum<br/>Katana ∥ Hakrawler ∥ GAU ∥ ParamSpider ∥ Kiterunner<br/>crawlers one at a time under an RoE ceiling<br/>then jsluice → FFuf → Arjun → OpenAPI]
     end
 
-    subgraph G6["GROUP 6 Phase A — parallel (4-way fan-out)"]
+    subgraph G6["GROUP 6 Phase A — parallel (up to 7-way fan-out, enabled tools only; one at a time under an RoE ceiling)"]
         VS[Vuln Scan — Nuclei]
         GQL[GraphQL Security<br/>Introspection + graphql-cop]
         TKO[Subdomain Takeover<br/>Subjack + Nuclei + BadDNS]
         VHOST[VHost & SNI Enum<br/>L7 Host header + L4 SNI probing]
+        WCP[Web Cache Poisoning<br/>WCVS + native confirmer]
+        ORIG[Origin Discovery]
+        REXP[Route Exposure]
     end
 
     subgraph G6B["GROUP 6 Phase B — sequential"]
@@ -405,7 +408,7 @@ flowchart TB
         Knock --> Merge
 
         Merge --> Puredns[Puredns Wildcard Filter<br/>Validates against public resolvers<br/>Removes wildcards & poisoned entries]
-        Puredns --> DNS[DNS Resolution<br/>20 parallel workers<br/>A, AAAA, MX, NS, TXT, CNAME]
+        Puredns --> DNS[DNS Resolution<br/>DNS_MAX_WORKERS parallel workers, default 80<br/>A, AAAA, MX, NS, TXT, CNAME]
         DNS --> Out1[(Subdomains + IPs)]
     end
 
@@ -494,16 +497,19 @@ flowchart TB
         FwSink --> Out4b
     end
 
-    subgraph Phase5["GROUP 6 Phase A — Fan-Out: Nuclei ∥ GraphQL ∥ Takeover ∥ VHost/SNI (parallel)"]
+    subgraph Phase5["GROUP 6 Phase A — Fan-Out: Nuclei ∥ GraphQL ∥ Takeover ∥ VHost/SNI ∥ Cache ∥ Origin ∥ Route Exposure (parallel)"]
         direction TB
         Out4b --> FanOut6
 
-        subgraph FanOut6["ThreadPoolExecutor — 4 parallel tasks (_isolated wrappers, deep-copy snapshots)"]
+        subgraph FanOut6["ThreadPoolExecutor — up to 7 parallel tasks, one worker under an RoE ceiling (one shared deep-copy snapshot; _isolated wrappers copy again)"]
             direction LR
             Nuclei[Nuclei Scanner]
             GraphQL[GraphQL Security Scanner]
             Takeover[Subdomain Takeover Scanner]
             VhostSni[VHost & SNI Enum]
+            CachePoison[Web Cache Poisoning]
+            OriginDisc[Origin Discovery]
+            RouteExp[Route Exposure]
         end
 
         subgraph NucleiFeatures["Nuclei Scan Types"]
@@ -561,10 +567,13 @@ flowchart TB
         L7 --> FanIn6
         L4 --> FanIn6
         Anomaly --> FanIn6
+        CachePoison --> FanIn6
+        OriginDisc --> FanIn6
+        RouteExp --> FanIn6
     end
 
     subgraph Phase5b["GROUP 6 Phase B — MITRE Enrichment (sequential, depends on Nuclei CVEs)"]
-        FanIn6[Fan-In: Merge Nuclei + GraphQL + Takeover + VHost/SNI findings] --> MITRE[MITRE Enrichment<br/>CWE + CAPEC]
+        FanIn6[Fan-In: merge each Phase A tool's findings as it lands] --> MITRE[MITRE Enrichment<br/>CWE + CAPEC]
         MITRE --> Out5[(Vulnerabilities + Attack Patterns)]
     end
 
@@ -634,21 +643,21 @@ The recon pipeline uses a **fan-out / fan-in** pattern with Python's `concurrent
 
 | Group | Modules | Parallelism | Dependencies |
 |-------|---------|-------------|--------------|
-| **GROUP 1** | WHOIS + Subdomain Discovery + URLScan | 3 parallel tasks | Only needs `root_domain`. URLScan's recent host names join the merged host list (`merge_group_hosts`, `extra_hosts`) through the late-name gates; its findings are written right after discovery |
+| **GROUP 1** | WHOIS + Subdomain Discovery + URLScan | 3 parallel tasks | Only needs `root_domain`. URLScan's recent host names join the merged host list (`merge_group_hosts`, `extra_hosts`) through the late-name gates; its findings are written right after discovery. Under RoE IP or CIDR entries the merge drops a discovered name (URLScan's included) with any excluded address, noted `roe_excluded` (Module 1, *RoE exclusions on addresses*) |
 | *Discovery* | crt.sh + HackerTarget + Subfinder + Amass + Knockpy | 5 parallel tools | Part of GROUP 1 |
 | *Puredns* | Wildcard filtering (validates against public resolvers) | Sequential | After discovery fan-in, before DNS |
-| *DNS* | DNS resolution for all subdomains | 20 parallel workers | After puredns filtering |
+| *DNS* | DNS resolution for all subdomains | `DNS_MAX_WORKERS` parallel workers (default 80) | After puredns filtering |
 | **GROUP 2b** | Uncover Target Expansion (13 search engines) | Sequential | Needs domain from GROUP 1; runs before GROUP 3 |
-| **GROUP 3** | Shodan Enrichment + Port Scan (Naabu) | 2 parallel tasks | Needs IPs from GROUP 1 + GROUP 2b |
-| **GROUP 3b** | OSINT Enrichment (Censys + FOFA + OTX + Netlas + VirusTotal + ZoomEye + CriminalIP) | 7 parallel tasks | Needs IPs/domains from GROUP 1; runs concurrently with GROUP 3 |
+| **GROUP 3** | Shodan Enrichment + Port Scan (Naabu, Masscan) | Up to 3 parallel tasks, each enabled tool only | Needs IPs from GROUP 1 + GROUP 2b; then Nmap (3.5; `NMAP_PARALLELISM` IPs at a time, one under an RoE ceiling) and tlsx (3.6) run in sequence |
+| **GROUP 3b** | OSINT Enrichment (Censys + FOFA + OTX + Netlas + VirusTotal + ZoomEye + CriminalIP) | Up to 7 tasks on 5 workers, each enabled tool only | Needs IPs/domains from GROUP 1; runs after GROUPs 3, 3.5 and 3.6 |
 | **GROUP 4** | HTTP Probe (httpx) | Sequential (internally parallel) | Needs ports from GROUP 3 |
-| *Late names* | uncover, tlsx, certificate-SAN and JS Recon names get their DNS; after the port scan, the ports their addresses showed (or a port scan of an unscanned address); after httpx, a probe of their own (`recon/helpers/late_names.py`) | Sequential | At each merge point (2b, 3.6, after GROUP 4, 5b) |
+| *Late names* | uncover, tlsx, certificate-SAN and JS Recon names get their DNS; after the port scan, the ports their addresses showed (or a port scan of an unscanned address); after httpx, a probe of their own (`recon/helpers/late_names.py`). Under RoE IP or CIDR entries a name is admitted on its resolved addresses and judged again on the DNS answer the step stores | Sequential | At each merge point (2b, 3.6, after GROUP 4, 5b) |
 | *Takeover verdict* | Which deleted-service pages urlscan recorded still describe their host, from this scan's DNS and live pages (`main_recon_modules/urlscan_takeover.py`) | Sequential; DNS only, through the `dns:takeover-verdict` breaker | After GROUP 4, outside the httpx step; before Phase A, whose Subdomain Takeover reads `urlscan.takeover_hosts` |
 | *IP attribution* | Tags every IP `shared_edge` / `dedicated` / `unknown` (`main_recon_modules/ip_attribution.py`), then writes the Shodan CVEs and the Netlas data GROUP 3/3b held back | Sequential; the TLS handshakes without SNI in a small pool, paced at the RoE ceiling | After GROUP 4 and the certificate SAN feedback; before GROUP 5 and 6. Runs if `IP_ATTRIBUTION_ENABLED` |
 | **GROUP 5** | Resource Enum (Katana + GAU + Kiterunner, then OpenAPI) | 3 tools internally parallel | Needs live URLs from GROUP 4 |
 | **GROUP 5b** | JS Recon Scanner (250+ regex patterns, key validation, source maps, dependency confusion, endpoint extraction, DOM sinks; optionally TruffleHog in a hardened sidecar, its keys merged one per key) | 5 analyzers parallel per file (TruffleHog in its own worker, on its own running-time budget) | Needs JS files from GROUP 5; runs if `JS_RECON_ENABLED` |
 | **GROUP 5.5** | Supply-Chain Recon (black-box package harvest + offline OSV verdict, retire.js over served JS, optional GuardDog; then incident enrichment, malicious-host correlation and typosquat detection) | Sequential; dispatches the DIRTY analyzer | Needs JS files from GROUP 5b; runs if `SUPPLY_CHAIN_RECON_ENABLED` |
-| **GROUP 6 Phase A** | Vuln Scan (Nuclei) ∥ GraphQL Security Testing ∥ Subdomain Takeover ∥ VHost & SNI Enumeration ∥ Web Cache Poisoning ∥ Origin Discovery ∥ Route Exposure | Up to 7 parallel tasks (ThreadPoolExecutor, `_isolated` wrappers), each only when enabled | Needs endpoints from GROUP 5/5b |
+| **GROUP 6 Phase A** | Vuln Scan (Nuclei) ∥ GraphQL Security Testing ∥ Subdomain Takeover ∥ VHost & SNI Enumeration ∥ Web Cache Poisoning ∥ Origin Discovery ∥ Route Exposure | Up to 7 parallel tasks (ThreadPoolExecutor, `_isolated` wrappers), each only when enabled; under an RoE rate ceiling one at a time, in the same order (`_run_phase_a_fan_out`) | Needs endpoints from GROUP 5/5b |
 | **GROUP 6 Phase B** | MITRE Enrichment (CWE + CAPEC) | Sequential | Needs CVEs from Phase A (Nuclei) |
 
 ### IP attribution
@@ -677,7 +686,9 @@ Output: `combined_result["ip_attribution"]["by_ip"]`, written by
 `update_graph_from_ip_attribution` to the existing IP (`ownership`,
 `ownership_reasons`, `default_cert_names`, `current_dns_names`, plus the CDN
 tag on a shared edge). Consumers read it through `shared_edge_ips()`:
-vhost/SNI (`_shared_edge_ips`, plan 07's CDN check as the fallback for an
+the IP-mode hostnames step (`scan_all` refuses a name seen on or resolving to a
+`shared_edge` IP, and every name when the step did not run or failed on its IP;
+`current_dns_names` is then the number of names recorded on the IP), vhost/SNI (`_shared_edge_ips`, plan 07's CDN check as the fallback for an
 untagged IP), origin discovery (`_cdn_flagged_ips`), the Shodan CVE write
 (`_write_shodan_cves`) and the Netlas write (`_write_netlas`, both held back
 until the step runs), and the Priority Board (`ip_ownership` fact). A partial
@@ -696,7 +707,7 @@ All log messages use a consistent `[level][Module]` prefix format (e.g., `[+][cr
 
 Each parallelized tool function is thread-safe:
 - Discovery tools (`query_crtsh`, `query_hackertarget`, etc.) create their own `requests.Session` instances
-- Module `_isolated` variants (e.g., `run_port_scan_isolated`, `run_shodan_enrichment_isolated`) accept a read-only snapshot of `combined_result` and return only their data section
+- Module `_isolated` variants (e.g., `run_port_scan_isolated`, `run_shodan_enrichment_isolated`) accept a read-only snapshot of `combined_result`, deep-copy it, and return only their data section. Every fan-out (GROUP 3, the GROUP 3b OSINT pool, GROUP 6 Phase A) takes one `_fan_out_snapshot` (a deep copy) before its first submit and hands every worker that copy, never the live `combined_result` the main thread merges answers into: a wrapper copying the live dict mid-merge raised "dictionary changed size during iteration" and lost its tool. A failed GROUP 3 or OSINT worker is recorded in `metadata.phase_errors`, as a Phase A one is
 - The main thread handles all merging — no shared mutable state between workers
 
 ---
@@ -709,6 +720,12 @@ three places, all in `recon/main.py`:
 1. **Clear, at the start** (`_clear_recon_graph`). It removes the project's
    previous recon *assets* and records the run's start time. Findings are NOT
    cleared up front: the operator's mutes, verdicts and fix items hang off them.
+   It runs only after `_refuse_before_clear` let at least one scan root through
+   the same Rules of Engagement and ownership checks `run_domain_group` makes
+   (ownership answers cached for the run): when every root is refused the run
+   returns 1 with the graph as it was ("Nothing was cleared"), and a batch with
+   one eligible root clears once while its refused groups still refuse in the
+   loop. IP mode has no root check and clears directly.
 2. **Prune, after a successful run** (`_prune_recon_findings`, which calls
    `prune_unseen_findings`). It deletes the findings from recon's own sources
    (`RECON_FINDING_SOURCES` in `recon/helpers/finding_sources.py`) that this run
@@ -753,12 +770,120 @@ What follows from that:
   provider never degrades the whole source, or its stale findings would never
   be pruned. The provider names one coverage gap: `note_degraded(aliases=...)`
   cuts its other source values with it.
+- **A failed graph write keeps its findings.** `_WRITER_SOURCES` maps each
+  background writer of findings to the `_PHASE_FINDING_SOURCES` phase whose
+  sources it writes. A writer that raises, reports an item error on a finding,
+  finds Neo4j unreachable, or is never queued because the writer was already
+  closed notes those sources degraded (`graph write failed (<writer>)`), which
+  wins over any `note_checked`. Writers of assets only, and errors that cost no
+  finding, degrade nothing. A new writer of findings needs its row (a test
+  enforces it).
+- **A failed layer or input phase keeps what it did not re-check.** Subdomain
+  Takeover notes each failed layer's targets by host for `takeover_scan` alone
+  (Subjack or BadDNS: every subdomain; Nuclei: the hosts of its live URLs; a
+  BadDNS per-target timeout: that name); a Subjack timeout still keeps the rows
+  it wrote, and a BadDNS run timeout keeps the findings it printed and notes
+  only the names from the last one with a printed finding onwards (BadDNS
+  prints a name's findings once it is done with it, in target order). The
+  GraphQL scan keeps `graphql_cop` alone, by host, on an endpoint whose
+  graphql-cop timed out, could not start or returned no report; the native
+  GraphQL checks reached that host. The cache scan does the same for `cache_poisoning` (and its `wcvs`
+  alias) on the hosts past the 200-URL cap, of a URL whose confirmation raised
+  or that never answered the oracle, and on every target of an unfinished WCVS
+  run. The serialized scan degrades its whole source on an error, or when
+  `http_probe` or `resource_enum` is in `metadata.phase_errors`.
+- **Skipped for no live URL.** When `should_skip_active_scans` fires, Subdomain
+  Takeover still runs, and so do the port and service checks
+  (`_maybe_run_port_checks`), the org DNS checks (`_maybe_run_dns_checks`) and
+  certificate hygiene. `_note_gate_skipped` keeps, by host on the group's hosts,
+  the findings of every enabled source the skip stopped (resource_enum, nuclei,
+  the Phase A tools in `_LIVE_URL_PHASE_A`); `security_check` is kept except on
+  the addresses the port checks read and the orgs the DNS checks asked. A tool
+  switched off prunes as before.
+- **A failed probe is not "no live URL".** When httpx could not run (Docker
+  missing or down, the image unavailable, an exit or its runtime budget with
+  nothing written, an exception), `run_http_probe` records
+  `metadata.phase_errors.http_probe`, keeps the `http_probe` source, and is not
+  listed in `modules_executed`. `should_skip_active_scans` then takes the skip
+  above with the reason `http_probe failed (...)`, and `_note_gate_skipped`
+  notes "http_probe failed, no host probed": `security_check` is kept on every
+  host, the port- and DNS-check ones included, and JS Recon and AI Surface
+  Recon, which still run without httpx's pages, keep their findings by host
+  too. A tlsx run cut short (timeout, exit, missing runner) keeps the rows it
+  printed (on `TLSX_RUN_TIMEOUT` its container is first killed by its name,
+  `tlsx-<run id>-<8 hex>`, so no handshake goes out after the cut)
+  and notes `security_check` by host on every target it did not answer,
+  under module `tlsx`; one that answered nothing records a phase error.
+- **A finding is matched on every host it names.** The keep regexes and the
+  `only_hosts` lookup read the scalar host fields (`_KEEP_HOST_FIELDS` in
+  `graph_db/mixins/base_mixin.py`) and each element of a list field
+  (`_KEEP_HOST_LIST_FIELDS`: `source_urls`, the JS files that import a
+  dependency-confusion package). A cut host among them keeps the finding; a
+  re-checked one makes it a prune candidate, and a kept host still wins. Host
+  names may contain `_` (`_dmarc.example.com`): the coverage notes keep them
+  like any other host.
+- **A source can prune only the hosts it re-checked (positive coverage).** A
+  module that calls `circuit_breaker.note_checked(source, hosts=..., checks=...,
+  module=...)` records the hosts it reached a verdict on, and
+  `_checked_prune_batches` prunes that source through
+  `prune_unseen_findings(only_hosts=..., types=...)`: a host it never reached
+  keeps its findings even when nothing noted it degraded. Degraded wins: a host
+  cut for the source, or for every source, leaves its checked set and is kept.
+  Hosts match by hostname, so any port checked counts the host as checked. An
+  empty `only_hosts` prunes nothing (the revive still runs).
+  `coverage_stamps.note_rows_checked(source, rows)` turns a per-host coverage
+  record into the same note: `complete` is checked, `partial` or `failed` is cut
+  for that host and source, `no_input` is neither. A source that records
+  nothing keeps the source-level rule above.
+- **`security_check` records per finding type.** The DNS checks (SPF, DMARC,
+  DNSSEC, zone transfer) record each verdict on the org (`Vulnerability.domain`),
+  Redis No Auth and SMTP Open Relay on the IP. A check with no verdict (a
+  timeout, SERVFAIL, a reset: `CheckUnknown`) records its type on no host, so
+  its finding there is kept, and leaves a coverage gap. Every type the source
+  did not record (headers, TLS, cookies, a switched-off check) is pruned by one
+  more source-level call with `exclude_types=`, as before. DNS findings written
+  before they stored `domain` get the org of the Domain they hang off first
+  (`backfill_security_check_domains`); if that fails, the DNS types prune
+  nothing that run.
+- **The security checks keep the hosts they did not probe.** A domain run
+  probes a host only on a web port its port scan or httpx found live, and never
+  a host the Rules of Engagement refuse
+  ([README.VULN_SCAN.md](README.VULN_SCAN.md#which-hosts-the-checks-probe)).
+  A host with no live port in that data, one with an unproven web port while an
+  evidence source was cut, and an RoE-refused host are noted degraded for
+  `security_check` alone (`source_only_hosts`): the prune keeps their findings,
+  and none is marked unreachable, which would keep the host's findings for every
+  source. In a partial run, a typed host the graph has no live row for is probed
+  on both web ports. An RoE refusal (`roe_excluded`) and the RoE ceiling's
+  `httpx_jarm` / `httpx_favicon` gaps are no cut, so a finished port scan stays
+  a verdict under an RoE exclusion; any other gap under naabu, masscan or httpx,
+  an unknown source included, is one.
+- **Passive CVE lookups record positive coverage.** Shodan (with InternetDB),
+  Netlas and CriminalIP pass `note_cve_coverage` the IPs they started from
+  (`considered=`), the ones they asked about and the ones whose whole answer
+  they saw ("no data" included). It notes as checked, for every source value of
+  the provider, the IPs answered whole plus the IPs the CDN or private-address
+  filter dropped before asking (decided, not skipped: an edge's CVEs describe
+  the provider). The prune then deletes a stale passive CVE only on those IPs.
+  An IP no longer in the run (DNS stopped pointing at it, it left the target
+  list) keeps its CVEs until a run asks about it again; the asset clear removed
+  its IP node, so the Priority Board reads their reach as unknown
+  (`target_ip_in_graph` in `agentic/cypherfix_triage/fact_queries.py`).
+- **Restored findings prune like any others.** The export and the Scan Timeline
+  snapshot flatten Neo4j DateTimes to ISO strings. A restore writes RedAmon's
+  own timestamps (`updated_at`, `stale_since`, `created_at`, the triage and
+  coverage `*_at`) back as DateTimes (`webapp/src/lib/graphRestore.ts`), and the
+  prune and its revive also read an ISO-string `updated_at`, so a graph
+  restored by an earlier release needs no rescan. A value that is no timestamp
+  keeps its finding.
 - **Older passive CVEs get their host first.** `backfill_passive_cve_hosts`
   sets `target_ip` from the id (`shodan-<cve>-<ip>`, `criminalip-<cve>-<ip>`)
   on rows written before the writers stored it, so the by-host keep can match
   them. If it fails, passive sources are left out of that run's prune.
 - **Passive CVEs are checked against the port scan.** `_reachcheck_shodan_cves`
-  runs after the CDN drop in both pipelines and sets `port_confirmed` from
+  runs after the nmap merge (which adds the open ports nmap confirmed and the
+  port scan missed), right before `_write_shodan_cves`, in both pipelines, and
+  sets `port_confirmed` from
   `recon/helpers/port_coverage.py`: open, looked at and not open, or unknown.
   What a scan looked at comes from its recorded `ports_config`: a custom list
   or `top-full` is known; naabu's and masscan's top-100/1000 lists are not
@@ -771,6 +896,23 @@ What follows from that:
   `tooling/scripts/netlas_finding_rekey.py` (dry run by default; `--apply`
   with the services stopped, before the first scan on the new release) moves
   their mutes, layers, proof edges and Postgres references.
+- **An AI Surface Recon MCP finding is per YARA rule.** Its id hashes type,
+  base URL, path, tool and the rule name (`_mk_finding` in
+  `recon/main_recon_modules/ai_surface_recon.py`). Rows from earlier releases
+  merged every rule on a server into one node; `tooling/scripts/aisr_finding_rekey.py`
+  (dry run by default; `--apply` with the services stopped, before the first
+  scan on the new release) moves each to the id of the rule its stored `name`
+  gives, and the other rules come back as new findings.
+- **A VHost/SNI finding id is a hash of hostname, IP, port and layer**
+  (`finding_id` in `recon/main_recon_modules/vhost_sni_enum.py`,
+  `vhost_sni_<20 hex>`, the IP canonicalised). The earlier id folded
+  punctuation to `_`, so `dev-api` and `dev.api` on one IP and port were one
+  node. `tooling/scripts/vhost_finding_rekey.py` (same usage) moves rows from
+  earlier releases; a node two names collided on moves to the name it stores.
+- **A web-cache-deception finding is keyed on the page, not the plant URL.**
+  `cache_param` holds the leaked shape (`static-suffix:/.css`) and the random
+  plant URL stays in `poc_link`. `tooling/scripts/cache_deception_rekey.py`
+  (same usage) moves rows from earlier releases, which got a new id every run.
 - **A JS Recon Secret's id is a hash of its pattern, match and file**
   (`_make_finding_id` in `recon/helpers/js_recon/patterns.py`). The keyword
   gap of about 70 patterns is now `[^\n]{0,120}?` (the nearest value, at most
@@ -917,8 +1059,87 @@ afterwards, and all three run the **same** pipeline.
 | Mode | Target | What differs |
 | --- | --- | --- |
 | **Single Domain** | one root domain plus optional subdomain prefixes | the default; full OSINT and subdomain discovery are available |
-| **IP / CIDR** | a list of addresses or ranges | skips domain ownership, subdomain enumeration and domain WHOIS; runs reverse DNS and IP WHOIS instead |
+| **IP / CIDR** | a list of addresses or ranges | skips domain ownership, subdomain enumeration and domain WHOIS; runs IP WHOIS, and reverse DNS only when its hostname mode records names (below) |
 | **Domain batch** | a list of hostnames spanning several domains | groups them by registrable domain and scans each group in turn, in one run; a `*.example.com` entry enumerates that domain instead of scanning it literally |
+
+### IP / CIDR: hostnames on target IPs
+
+Every scanner of an IP-mode run reads the expanded target IPs after the RoE
+filter (`metadata.expanded_ips`; the admission helpers in
+`recon/helpers/target_admission.py`), and each IP keeps its dashed placeholder
+(`recon/helpers/ip_placeholders.py`) in `dns.subdomains`, `subdomains`,
+`subdomain_filter` and `ip_to_hostname`, so no tool is handed a real name by
+GROUP 1. A reverse-DNS answer is evidence, never a scope entry: its own A/AAAA
+can point anywhere. httpx follows redirects with `-fhr` and no `-tls-probe`,
+nuclei with `-follow-host-redirects` (`-disable-redirects` with Follow Redirects
+off), Katana, Kiterunner, Arjun and FFuf follow none, Hakrawler crawls each
+seed's own host, JS recon follows them only to admitted hosts, origin discovery
+is skipped, GVM takes the IPs only, and nmap runs with `-n`. In IP mode the NSE
+vuln set leaves out `http-cross-domain-policy`
+(`--script "vuln and not http-cross-domain-policy"`), because that script
+follows a redirect off the target address on its own.
+
+What happens to the names seen on the IPs is the project's **Hostnames on target
+IPs** policy (`IP_HOSTNAME_MODE` and six more `IP_HOSTNAME_*` settings, validated
+by `_resolve_ip_hostname_policy` in `recon/project_settings.py`, which refuses an
+unconfirmed `scan_all` and a `record_filter` with no readable include entry):
+
+| Mode | GROUP 1 PTR | Name sources | Scanned names |
+| --- | --- | --- | --- |
+| `ip_only` (default) | off | none; Shodan rDNS and vhost graph candidates forced off | none |
+| `record_only` | every answer | all, recorded | none |
+| `record_filter` | every answer | all + passive search of the `*.x` include entries (`recon/helpers/ip_hostnames_expand.py`) | include − exclude, every address a target |
+| `scan_all` | every answer | all | every name not on a `shared_edge` IP, every address a target |
+
+`apply_ip_hostname_overrides` (after the stealth profile in `get_settings`)
+forces `TLSX_REV_PTR_SNI` off in every mode and `SHODAN_REVERSE_DNS` and
+`VHOST_SNI_USE_GRAPH_CANDIDATES` off in `ip_only`; `print_effective_settings`
+marks them `(forced by ...)`. The webapp copy is `webapp/src/lib/ipHostnameOverrides.ts`,
+pinned by `recon/tests/test_ip_hostname_overrides.py`.
+
+The **hostnames step** (`hostname_step` in `recon/helpers/ip_hostnames.py`, called
+by `_ip_hostnames_step` in `main.py` after IP attribution and the Shodan CVE write,
+before `should_skip_active_scans`) collects the candidates of every source bound
+to the target IP they were seen on (at most 500 per IP and 20,000 per run, live
+sources first, the rest counted as `truncated`), evaluates them with the one
+selection rule, `recon_settings/ip_hostnames.py` (`evaluate`, mirrored for the
+form preview by `webapp/src/lib/ipHostnameFilter.ts`, both pinned by
+`tests/fixtures/ip_hostname_vectors.json`), and in the scanning modes resolves
+the survivors (A and AAAA, the resolver breaker's canary armed first), keeps a
+name only when every address is a target (`address_verdict`), inserts the
+selected ones with their pinned answer and scans them through the IP-mode path of
+`recon/helpers/late_names.py` (`_scan_pinned`): the pinned answer only fills the
+recon dict's DNS block and attaches the ports the port scan found on those target
+IPs (no second naabu); httpx is handed the names and resolves them itself, with
+no `--resolve`. A post-probe guard drops a row whose address is not a target
+(`moved_during_scan`). `update_graph_from_ip_hostnames`
+(`graph_db/mixins/recon/ip_hostnames_mixin.py`) writes recorded names as
+`ExternalDomain` + `SEEN_ON` and scanned ones as `Subdomain` under their org
+`Domain {ip_hostname_org: true}`; `classify_host` admits only
+`metadata.ip_mode_hosts`. The log prints one `[*][IpNames]` line per IP and a
+total; the recon JSON carries `ip_hostnames.summary`. Names cut by the cap, DNS
+off or a resolver outage are noted degraded, so the prune keeps their findings.
+
+VHost & SNI (off by default) tries every recorded name on the target IP it was
+seen on, in all three recording modes, whatever the selection decided
+(`_ip_mode_names` with `may_send`): only `invalid_name`, `hard_blocked` and
+`roe_excluded` (`NEVER_SENT`) are withheld, and no name goes to a `shared_edge`
+IP. An exclude entry therefore stops a name from being scanned, not from being
+sent as `Host`/SNI to its own target IP; the RoE exclusions keep it off the wire.
+
+Residual risk: a name is checked right before its scan, but the tools resolve it
+again and nothing pins them to the checked address, so a DNS change inside that
+window of seconds can send a tool to a new address. The post-probe guard discards
+such a probe answer and the check repeats every run.
+
+The one name lookup outside this policy is the agent's soft guardrail, which
+reverse-resolves the public target addresses at session start and project save in
+every mode, `ip_only` included (README.AGENTIC_SYSTEM.md, "Soft Guardrail, LLM Judgment"). The
+recon run itself sends nothing name-related in `ip_only`.
+
+Partial recon follows the mode (`recon/partial_recon_modules/ip_hostname_scope.py`):
+each run computes the names it may scan once, from the graph with the current
+policy and live DNS, and refuses typed names in `ip_only` and `record_only`.
 
 ### Domain batch
 
@@ -1041,9 +1262,10 @@ dead resolver every lookup would then wait out dnspython's 5 s timeout.
 WHOIS, Shodan domain DNS, OTX/VirusTotal/Criminal IP domain reports and FOFA
 `domain=` are asked for the org by the org's first group that passed RoE and
 ownership, and its other groups get a copy (`[*][...] <org>: answered earlier
-this run, reused`). SPF/DMARC/DNSSEC run on the org once, inside vuln_scan, for
-the first group of that org that reaches it; when no group of an org reached
-them, `security_check` is marked degraded so the prune keeps the old findings.
+this run, reused`). SPF/DMARC/DNSSEC and the zone transfer run on the org once,
+inside vuln_scan, for the first group of that org that reaches it; when no group
+of an org reached them, that org keeps its DNS findings and only those
+(`_note_unchecked_dns_orgs`): the rest of `security_check` prunes as usual.
 Origin discovery keys its candidate sources on the org only when the org is in
 scope (some group's scan root is the org, or ownership was proven at the org),
 else on the scan root (`[*][Origin] candidate key: <root> (org not in scope)`).
@@ -1115,6 +1337,8 @@ Partial Recon lets you run any single tool from the pipeline independently, with
 
 A partial run applies the Mute Rules that are active on new scans to what it wrote, in a `finally` and with its own start time, exactly as a full run does ([How a Run Ends](#-how-a-run-ends-prune-and-mute-rules)). It prunes nothing. The webapp refuses to start one while an "apply to current graph" is running.
 
+Who may start one: the start and stop routes ask `recon:partial` on the project, the graph-input lists `recon:read`, and a full scan's start `recon:scan` (plus `recon:overwrite` for an overwrite run); with `RBAC_PERMISSIONS_ENABLED` off every project owner holds all of them, as before. A *Read-only analyst* reads the results and is refused a start (403 naming `recon:partial`).
+
 > **[Wiki: Recon Pipeline Workflow -- Partial Recon](https://github.com/samugit83/redamon/wiki/Recon-Pipeline-Workflow#partial-recon)**
 
 ---
@@ -1138,7 +1362,7 @@ SCAN_MODULES="domain_discovery,port_scan,http_probe"
 
 ### Module 1: `domain_discovery`
 
-All 5 subdomain discovery tools run **concurrently** via `ThreadPoolExecutor(max_workers=5)`. Each tool is a thread-safe function with its own HTTP session. After merging, **Puredns** validates the combined list against public DNS resolvers to remove wildcard and DNS-poisoned entries. DNS resolution is then parallelized with **20 concurrent workers**. WHOIS and URLScan run in a separate parallel group alongside discovery.
+All 5 subdomain discovery tools run **concurrently** via `ThreadPoolExecutor(max_workers=5)`. Each tool is a thread-safe function with its own HTTP session. After merging, **Puredns** validates the combined list against public DNS resolvers to remove wildcard and DNS-poisoned entries. DNS resolution is then parallelized with **`DNS_MAX_WORKERS` concurrent workers** (default 80). WHOIS and URLScan run in a separate parallel group alongside discovery.
 
 ```mermaid
 flowchart LR
@@ -1158,7 +1382,7 @@ flowchart LR
         MergeDedupe[Merge & Dedupe]
     end
 
-    subgraph DNSPhase["DNS Resolution (20 parallel workers)"]
+    subgraph DNSPhase["DNS Resolution (DNS_MAX_WORKERS workers, default 80)"]
         DNS[DNS Resolver<br/>A, AAAA, MX, NS, TXT, CNAME]
     end
 
@@ -1194,7 +1418,7 @@ flowchart LR
 | **WHOIS lookup** | Registrar, creation date, owner info |
 | **Subdomain discovery** | Finds subdomains via 5 parallel sources (crt.sh, HackerTarget, Subfinder, Amass, Knockpy) |
 | **Wildcard filtering** | Puredns validates subdomains against public DNS resolvers, removes wildcards and DNS-poisoned entries |
-| **DNS enumeration** | A, AAAA, MX, NS, TXT, CNAME records (20 parallel workers) |
+| **DNS enumeration** | A, AAAA, MX, NS, TXT, CNAME records (`DNS_MAX_WORKERS` parallel workers, default 80) |
 | **Wildcard control** | RedAmon's own check after DNS: drops names that answer only through their zone's wildcard DNS, and stamps the zone |
 | **IP resolution** | Maps all discovered hostnames to IPs |
 
@@ -1245,6 +1469,26 @@ resolved. `Subdomain.status` is shared with http_probe, which later writes
 `"no_http"` or the HTTP code; the readers count "resolved" by a `RESOLVES_TO` edge
 (report, Insights) or by `status = 'resolved'` (http_probe's `no_http` demotion),
 so an unverified name never counts as resolved.
+
+**RoE exclusions on addresses** (domain mode, RoE IP or CIDR entries). The name
+filters (`_filter_roe_excluded`, `_drop_roe_excluded_subdomains`) drop what an
+entry names, with a log line only. On top, `merge_group_hosts` passes each
+discovered name that has an address, URLScan's included, through the admission
+gate (`_roe_refused_discoveries`, `recon/helpers/target_admission.py`) on the
+addresses discovery's DNS pass resolved, with no new query. A name with any
+excluded address is dropped from the subdomain list, the DNS map and the status
+map, never narrowed, and noted `roe_excluded` under `domain_recon` (`urlscan`
+for an injected name). A name with no address, the scan root and the operator's
+listed hosts are left to the tools' target gate. Partial Subdomain Discovery
+applies the same rule before its graph write (`_drop_roe_refused_discoveries`,
+module `partial_recon`, the typed hosts counting as the operator's). Late names
+(certificate SANs from tlsx and the httpx SAN feedback, JS Recon, Uncover) are
+judged in `merge_discovered_hostnames` on the addresses its own lookup saw and
+those the run's DNS data holds (`_admit_late_names`): any excluded address
+refuses the name, and so does no address. The late-name DNS step (`give_dns`,
+`recon/helpers/late_names.py`) checks the answer it stores again and drops a
+name whose answer holds an excluded address. Each refusal is noted under the
+source that offered the name.
 
 📖 **Key Parameters:**
 ```python
@@ -1448,7 +1692,7 @@ Seven workloads run per host (hosts in parallel, workloads sequential within a h
 |---|----------|---------------------|
 | 1 | Chat-shape probe | LLM chat endpoint, dialect, streaming, p50 latency |
 | 2 | MCP handshake + `tools/list` + YARA | MCP server, tools, capabilities, tool-poisoning findings |
-| 3 | OpenAPI / manifest / model listing | tool/vision/streaming support, model ids + family, cached spec |
+| 3 | OpenAPI / manifest / model listing | tool/vision/streaming support, model ids + family, cached spec (only in-document `#/` refs inlined, no I/O) |
 | 4 | Julius probe pack (YAML) | confirmed AI `Technology` (vLLM, Ollama, …) |
 | 5 | Vector-DB confirmation reads | qdrant / chroma / weaviate / milvus, unauthenticated read exposure |
 | 6 / 7 | latency baseline + summary glue | counters, merged model family |
@@ -1457,7 +1701,7 @@ Seven workloads run per host (hosts in parallel, workloads sequential within a h
 (AI flags), `port_scan.by_host` (AI + vector-DB ports).
 **Output:** `combined_result["ai_surface_recon"]` → graph via
 `update_graph_from_ai_surface_recon` (enriches `Endpoint` / `Parameter` /
-`Technology`, adds `Vulnerability` nodes). Heavy deps (`mcp`, `yara`, `prance`,
+`Technology`, adds `Vulnerability` nodes). Heavy deps (`mcp`, `yara`,
 `jq`, `PyYAML`) are lazy-imported, so a missing dep degrades one workload, not the job.
 
 📖 **Detailed documentation:** [docs/readmes/AI_SURFACE_RECON_MODULE.md](AI_SURFACE_RECON_MODULE.md)
@@ -1537,7 +1781,7 @@ flowchart TB
 
 ### Module 5b: `graphql_scan`
 
-Dedicated GraphQL security scanner -- runs as **GROUP 6 Phase A in parallel with Nuclei, Subdomain Takeover, and VHost & SNI Enumeration** because all four scanners consume `BaseURL` / `Endpoint` / `Technology` / `Subdomain` / `IP` and emit `Vulnerability` nodes but have zero data dependency on each other. Each phase-A tool is wrapped in an `_isolated` variant that deep-copies `combined_result` so the four threads never race on the shared dict.
+Dedicated GraphQL security scanner -- runs as **GROUP 6 Phase A in parallel with Nuclei, Subdomain Takeover, and VHost & SNI Enumeration** because all four scanners consume `BaseURL` / `Endpoint` / `Technology` / `Subdomain` / `IP` and emit `Vulnerability` nodes but have zero data dependency on each other. Every Phase A tool is handed one `_fan_out_snapshot` of `combined_result`, taken before the first submit, and its `_isolated` variant deep-copies that again, so no thread reads the dict the main thread merges finished answers into.
 
 Toggle: `GRAPHQL_SECURITY_ENABLED` (default: `false`, opt-in).
 
@@ -1625,12 +1869,12 @@ flowchart TB
 | **Endpoint discovery** | Merges user-specified URLs, HTTP probe matches (`Content-Type: application/graphql`), resource-enum endpoints (paths containing `graphql`/`gql`/`query` via POST, or with `query`/`mutation`/`variables`/`operationName` parameters), JS Recon findings (`graphql` / `graphql_introspection` types), and pattern probes (primary `/graphql`, `/api/graphql`, `/v1/graphql`, `/v2/graphql`; secondary `/query`, `/gql`, `/graphiql`, `/playground` only on bases with prior evidence). |
 | **RoE filtering** | Drops endpoints matching `ROE_EXCLUDED_HOSTS` (wildcards supported). Skipped count exposed in `summary.endpoints_skipped`. |
 | **Native introspection test** | 3-step probe per endpoint: `POST { __typename }` reachability, simple introspection, full introspection at configurable TypeRef depth (1-20, default 10). Extracts schema hash (16-char SHA256), query/mutation/subscription counts, and sensitive-field list (`password`, `secret`, `token`, `key`, `api`, `private`, `credential`, `auth`, `ssn`, `credit`, `card`, `payment`, `bank`, `account`, `pin`, `cvv`, `salary`, `medical`). Response larger than 10 MB falls back to simple result. |
-| **graphql-cop (opt-in)** | Docker-in-Docker wrapper around `dolevf/graphql-cop:1.14`. Runs 12 checks per endpoint: field suggestions, GraphiQL/Playground detection, trace mode, GET-method queries/mutations, POST url-encoded CSRF, alias overloading (DoS), batch query (DoS), directive overloading (DoS), circular introspection (DoS), unhandled errors. Per-test toggles are applied post-execution because the `1.14` image does not honor the `-e` flag. |
+| **graphql-cop (opt-in)** | Docker-in-Docker wrapper around `dolevf/graphql-cop:1.14`. Runs 12 checks per endpoint: field suggestions, GraphiQL/Playground detection, trace mode, GET-method queries/mutations, POST url-encoded CSRF, alias overloading (DoS), batch query (DoS), directive overloading (DoS), circular introspection (DoS), unhandled errors. The `1.14` image does not honor the `-e` flag, so `run_graphql_cop` builds no command while any DoS test is excluded (logged; no `graphql_cop_ran`, earlier findings prune like a switched-off source's); excluding only non-DoS tests runs it and filters their results post-execution. |
 | **Authentication** | 5 modes: `bearer`, `cookie`, `header` (custom name), `basic` (base64), `apikey`. Values masked in logs. Same headers propagate to graphql-cop via `-H '{"K":"V"}'` JSON args. |
-| **Rate limiting + retries** | Global RPS cap (`GRAPHQL_RATE_LIMIT`, 0-100), retry on `429`/`5xx` with exponential backoff (`GRAPHQL_RETRY_COUNT`, `GRAPHQL_RETRY_BACKOFF`), concurrency clamp (1-20). Sequential mode at `concurrency=1`. |
-| **Endpoint enrichment** | Updates existing `Endpoint` nodes with capability flags (`graphql_graphiql_exposed`, `graphql_tracing_enabled`, `graphql_get_allowed`, `graphql_field_suggestions_enabled`, `graphql_batching_enabled`, `graphql_cop_ran`) — recorded even on negative results so the graph captures server state explicitly. |
+| **Rate limiting + retries** | Global RPS cap (`GRAPHQL_RATE_LIMIT`, 0-100; `zero_means: unlimited`, and under an RoE ceiling `apply_roe_rate_cap` raises 0 to the ceiling), retry on `429`/`5xx` with exponential backoff (`GRAPHQL_RETRY_COUNT`, `GRAPHQL_RETRY_BACKOFF`), concurrency clamp (1-20). Sequential mode at `concurrency=1`. |
+| **Endpoint enrichment** | Updates existing `Endpoint` nodes with capability flags (`graphql_graphiql_exposed`, `graphql_tracing_enabled`, `graphql_get_allowed`, `graphql_field_suggestions_enabled`, `graphql_batching_enabled`) — recorded even on negative results so the graph captures server state explicitly — and `graphql_cop_scanned_at`, the time graphql-cop last ran on the endpoint. The recon JSON's `graphql_cop_ran` flag is what sets that timestamp; the graph does not store the flag. |
 
-**Stealth overrides:** `GRAPHQL_RATE_LIMIT=2`, `GRAPHQL_CONCURRENCY=1`, `GRAPHQL_TIMEOUT=60`, and the four DoS-class graphql-cop tests (alias / batch / directive / circular) forced off.
+**Stealth overrides:** `GRAPHQL_RATE_LIMIT=2`, `GRAPHQL_CONCURRENCY=1`, `GRAPHQL_TIMEOUT=60`, the four DoS-class graphql-cop tests (alias / batch / directive / circular) forced off, and `GRAPHQL_COP_ENABLED=false` (full pipeline and partial recon).
 
 **Schema contract:** `KNOWN_VULN_KEYS` + `KNOWN_ENDPOINT_INFO_KEYS` in [graph_db/mixins/graphql_mixin.py](../../graph_db/mixins/graphql_mixin.py) pin every field the scanner may emit. Adding a new key without updating the mixin triggers a warning at graph-ingest time — no silent drops.
 
@@ -1663,7 +1907,7 @@ flowchart TB
         IPs[IPs from port_scan + DNS]
         DefaultWL[Default wordlist<br/>2,471 entries]
         CustomWL[Custom wordlist setting]
-        GraphCands[Graph-derived candidates<br/>DNS subdomains, httpx hosts,<br/>TLS SANs, CNAME, PTR, co-resident]
+        GraphCands[Graph-derived candidates<br/>DNS subdomains, httpx hosts,<br/>TLS SANs, CNAME, co-resident<br/>IP mode: the names recorded on the IP]
     end
 
     subgraph CandidateSet["Candidate Set Build"]
@@ -1734,7 +1978,7 @@ flowchart TB
 | Layer | What It Does |
 |-------|--------------|
 | **IP target collection** | Merges (no fallback) every available IP source: `port_scan.by_host` (authoritative ports + per-port scheme overrides), then `dns.subdomains[*].ips.ipv4` and `dns.domain.ips.ipv4` get default 80/443 added. Per-IP port list deduped on `(port, scheme)`. |
-| **Candidate set build** | Six sources merged: default wordlist (2,471 entries shipped in-image), custom wordlist setting, DNS subdomains resolving to the IP, httpx-known hosts on the IP, TLS SAN list per-URL, and CNAME/PTR/co-resident external domains. UTF-8 BOM auto-handled for Windows-edited overrides. Hostname validation uses `\Z` to block newline-injected hostnames from corrupting `--resolve` syntax. |
+| **Candidate set build** | Six sources merged: default wordlist (2,471 entries shipped in-image), custom wordlist setting, DNS subdomains resolving to the IP, httpx-known hosts on the IP, TLS SAN list per-URL, and CNAME/co-resident external domains. In IP mode the graph sources are the hostnames the hostnames step recorded on that IP (`_ip_mode_names`: only on an IP they were seen on, never on a `shared_edge` IP, none without IP attribution, none in `ip_only`), and there is no apex, so neither the default wordlist nor a bare prefix is used. UTF-8 BOM auto-handled for Windows-edited overrides. Hostname validation uses `\Z` to block newline-injected hostnames from corrupting `--resolve` syntax. |
 | **Per-port baseline** | One raw-IP curl request per port. Status `0` (curl couldn't connect) is dropped as no-data instead of being recorded as a real probe. |
 | **L7 probing** | `-H "Host: <candidate>"` against `https://<ip>:<port>/`. Catches classic Apache / Nginx vhost routing. |
 | **L4 probing** | `--resolve <candidate>:<port>:<ip>` so the TLS handshake carries the candidate as SNI. Catches modern reverse proxies (NGINX ingress, Traefik, Cloudflare, k8s) that route at the TLS layer. Skipped when scheme is `http` (no SNI to set). |

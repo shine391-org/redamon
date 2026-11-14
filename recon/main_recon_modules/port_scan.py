@@ -137,9 +137,16 @@ def pull_naabu_docker_image(docker_image: str) -> bool:
 # Target Extraction
 # =============================================================================
 
-def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
+def extract_targets_from_recon(recon_data: dict, settings: dict = None) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
     """
-    Extract IPs and hostnames from recon data.
+    Extract IPs and hostnames from recon data, through the RoE admission gate.
+
+    Under an RoE IP or CIDR exclusion naabu is handed addresses only: it
+    resolves a name itself, and its answer could be an address the gate never
+    saw. Each name still gets its ports, through ip_to_hostnames
+    (parse_naabu_output). IP mode does the same: the targets are the listed
+    addresses, each once (the gate keeps them to the target list and turns an
+    IP-mode label into its address, so no label reaches naabu or by_host).
 
     Returns:
         Tuple of (unique_ips, unique_hostnames, ip_to_hostnames_mapping)
@@ -189,6 +196,13 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
                 if subdomain not in ip_to_hostnames[ip]:
                     ip_to_hostnames[ip].append(subdomain)
 
+    from recon.helpers.target_admission import admission_context, admit_host_targets
+    unique_ips, unique_hostnames, ip_to_hostnames = admit_host_targets(
+        settings, recon_data, unique_ips, unique_hostnames, ip_to_hostnames,
+        module="naabu", resolves_names=False)
+    context = admission_context(settings, recon_data)
+    if context.ip_rules or context.targets is not None:
+        unique_hostnames = set()
     return unique_ips, unique_hostnames, ip_to_hostnames
 
 
@@ -224,7 +238,8 @@ def get_host_path(container_path: str) -> str:
     return container_path
 
 
-def build_naabu_command(targets_file: str, output_file: str, settings: dict) -> List[str]:
+def build_naabu_command(targets_file: str, output_file: str, settings: dict,
+                        container_name: str = None) -> List[str]:
     """
     Build the Docker command for running Naabu.
 
@@ -232,6 +247,7 @@ def build_naabu_command(targets_file: str, output_file: str, settings: dict) -> 
         targets_file: Path to file containing targets (one per line)
         output_file: Path for JSON output
         settings: Settings dictionary from main.py
+        container_name: the name the run timeout kills the container by
 
     Returns:
         List of command arguments
@@ -263,9 +279,13 @@ def build_naabu_command(targets_file: str, output_file: str, settings: dict) -> 
     cmd = [
         "docker", "run", "--rm",
         "--net=host",  # Required for SYN scans
+    ]
+    if container_name:
+        cmd.extend(["--name", container_name])
+    cmd.extend([
         "-v", f"{targets_host_path}:/targets:ro",
         "-v", f"{output_host_path}:/output",
-    ]
+    ])
 
     # Add image
     cmd.append(NAABU_DOCKER_IMAGE)
@@ -317,8 +337,33 @@ def build_naabu_command(targets_file: str, output_file: str, settings: dict) -> 
 # Result Parsing
 # =============================================================================
 
+def _add_port_detail(entry: dict, port: int, protocol: str, ip: Optional[str] = None) -> bool:
+    """Add an open port to a by_host entry; False when it is already there.
+
+    With ``ip`` (a domain run) the detail names the address the port was found
+    on, and a port is listed once per address: a name's addresses can have
+    different ports open, and the graph writer puts each detail under its own
+    ``ip``, else under the entry's first address. Without it (IP mode, whose
+    by_host is keyed by address) a port is listed once per entry.
+    """
+    details = entry["port_details"]
+    if ip:
+        if any(d.get("port") == port and d.get("ip") == ip for d in details):
+            return False
+    elif port in entry["ports"]:
+        return False
+    if port not in entry["ports"]:
+        entry["ports"].append(port)
+    detail = {"port": port, "protocol": protocol, "service": get_service_name(port)}
+    if ip:
+        detail["ip"] = ip
+    details.append(detail)
+    return True
+
+
 def parse_naabu_output(output_file: str, settings: dict = None,
-                       ip_to_hostnames: Optional[Dict[str, list]] = None) -> Dict:
+                       ip_to_hostnames: Optional[Dict[str, list]] = None, *,
+                       ip_mode: bool = False) -> Dict:
     """
     Parse Naabu JSON Lines output into structured format.
 
@@ -337,6 +382,8 @@ def parse_naabu_output(output_file: str, settings: dict = None,
             every name that resolves to a scanned address takes that address's
             open ports: by_host is what httpx probes, and keyed by address alone
             no virtual host is ever probed.
+        ip_mode: an IP-mode run. A domain run tags every port detail with the
+            address it was found on (_add_port_detail); IP mode keeps its shape.
 
     Returns:
         Structured dictionary with by_host, by_ip, and summary sections
@@ -407,16 +454,8 @@ def parse_naabu_output(output_file: str, settings: dict = None,
                         "is_cdn": bool(cdn or cdn_name)
                     }
 
-                if port and port not in by_host[host_key]["ports"]:
-                    by_host[host_key]["ports"].append(port)
-
-                    # Determine service based on common port mappings
-                    service = get_service_name(port)
-                    by_host[host_key]["port_details"].append({
-                        "port": port,
-                        "protocol": "tcp",
-                        "service": service
-                    })
+                if port:
+                    _add_port_detail(by_host[host_key], port, "tcp", None if ip_mode else ip)
 
             # Organize by IP
             if ip:
@@ -440,11 +479,11 @@ def parse_naabu_output(output_file: str, settings: dict = None,
             if not isinstance(name, str) or not name or name in by_host:
                 continue
             by_host[name] = {
-                "host": name, "ip": ip, "ports": list(ip_entry["ports"]),
-                "port_details": [{"port": p, "protocol": "tcp", "service": get_service_name(p)}
-                                 for p in ip_entry["ports"]],
+                "host": name, "ip": ip, "ports": [], "port_details": [],
                 "cdn": ip_entry.get("cdn"), "is_cdn": ip_entry.get("is_cdn", False),
             }
+            for p in ip_entry["ports"]:
+                _add_port_detail(by_host[name], p, "tcp", None if ip_mode else ip)
             if name not in ip_entry["hostnames"]:
                 ip_entry["hostnames"].append(name)
 
@@ -504,6 +543,35 @@ def fix_file_ownership(file_path: Path) -> None:
         pass  # Silently ignore if we can't change ownership
 
 
+def _targets_without_ports(targets: List[str], results: Dict) -> List[str]:
+    """The targets a cut naabu wrote no open port for: it did not finish them,
+    so they are not known to have none."""
+    found = set(results.get("by_host") or {}) | set(results.get("by_ip") or {})
+    return [t for t in targets if t not in found]
+
+
+def _note_naabu_cut(targets: List[str], unscanned: List[str], kept_ports: bool, reason: str) -> None:
+    """Record what a naabu run cut by its timeout did not port-scan. Never raises.
+
+    With the ports it did write kept, the downstream tools probe only those,
+    so no tool re-checked the hosts it left without one: they are cut for
+    every source. With nothing written there is no port data at all, as for a
+    failed scan: httpx falls back to the DNS names and the pipeline keeps
+    nmap's findings, so this is a coverage gap only.
+    """
+    try:
+        from recon.helpers import circuit_breaker
+        if kept_ports:
+            if unscanned:
+                circuit_breaker.note_degraded("port_scan", hosts=unscanned, host_source="naabu",
+                                              reason=reason)
+        else:
+            circuit_breaker.note_degraded("port_scan", entries=[
+                {"source": "naabu", "reason": reason, "skipped": len(targets)}])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # =============================================================================
 # Main Scan Function
 # =============================================================================
@@ -545,6 +613,7 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             ("NAABU_THREADS", "Performance"),
             ("NAABU_TIMEOUT", "Performance"),
             ("NAABU_RETRIES", "Performance"),
+            ("NAABU_RUN_TIMEOUT", "Performance"),
             ("NAABU_SCAN_TYPE", "Behavior"),
             ("NAABU_EXCLUDE_CDN", "Behavior"),
             ("NAABU_DISPLAY_CDN", "Behavior"),
@@ -579,9 +648,12 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
     # Extract targets
     print("[*][Naabu] Extracting targets from recon data...")
-    unique_ips, unique_hostnames, ip_to_hostnames = extract_targets_from_recon(recon_data)
+    unique_ips, unique_hostnames, ip_to_hostnames = extract_targets_from_recon(recon_data, settings)
 
-    # Combine targets - prefer hostnames for better accuracy
+    # Every name and every address. The filter removes nothing, because
+    # ip_to_hostnames is keyed by address, so an address is scanned even when
+    # a name of its is too. In IP mode (and under an RoE IP rule) there are no
+    # names here at all: the addresses only, each once.
     all_targets = list(unique_hostnames) + [ip for ip in unique_ips if ip not in [
         h_ip for h in unique_hostnames for h_ip in ip_to_hostnames.get(h, [])
     ]]
@@ -609,9 +681,6 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         # Set output file
         naabu_output = scan_temp_dir / "naabu_output.json"
 
-        # Build and run command
-        cmd = build_naabu_command(str(targets_file), str(naabu_output), settings)
-
         print(f"[*][Naabu] Starting scan...")
         print(f"[*][Naabu] Scan type: {'SYN' if NAABU_SCAN_TYPE == 's' else 'CONNECT'}")
         print(f"[*][Naabu] Ports: {NAABU_CUSTOM_PORTS if NAABU_CUSTOM_PORTS else f'top {NAABU_TOP_PORTS}'}")
@@ -629,17 +698,26 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         start_time = datetime.now()
 
         # Execute scan with fallback mechanism
+        from recon.helpers.docker_helpers import kill_container, tool_container_name
         scan_succeeded = False
+        timed_out = False
+        run_timeout = int(settings.get('NAABU_RUN_TIMEOUT', 1800))
         actual_scan_type = NAABU_SCAN_TYPE
 
         for attempt, scan_type in enumerate([NAABU_SCAN_TYPE, 'c'] if NAABU_SCAN_TYPE == 's' else [NAABU_SCAN_TYPE]):
+            # One name per attempt: a timeout kills the container by it.
+            container_name = tool_container_name("naabu")
             if attempt > 0:
                 # Retry with CONNECT scan after SYN scan failed
                 print(f"[*][Naabu] Retrying with CONNECT scan...")
                 settings_copy = settings.copy()
                 settings_copy['NAABU_SCAN_TYPE'] = 'c'
-                cmd = build_naabu_command(str(targets_file), str(naabu_output), settings_copy)
+                cmd = build_naabu_command(str(targets_file), str(naabu_output), settings_copy,
+                                          container_name=container_name)
                 actual_scan_type = 'c'
+            else:
+                cmd = build_naabu_command(str(targets_file), str(naabu_output), settings,
+                                          container_name=container_name)
 
             process = subprocess.Popen(
                 cmd,
@@ -648,7 +726,21 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                 text=True
             )
 
-            _, stderr = process.communicate(timeout=1800)  # 30 min timeout
+            try:
+                _, stderr = process.communicate(timeout=run_timeout)
+            except subprocess.TimeoutExpired:
+                # Killing the docker CLI alone leaves the container scanning.
+                # No CONNECT retry: the budget is spent.
+                print(f"[!][Naabu] Scan timed out after {run_timeout}s -- stopping it, "
+                      f"keeping the ports it wrote")
+                kill_container(container_name)
+                try:
+                    process.kill()
+                    process.communicate(timeout=10)
+                except Exception:  # noqa: BLE001
+                    pass
+                timed_out = True
+                break
 
             # Check for SIGSEGV crash (common in SYN mode)
             if 'SIGSEGV' in stderr or 'segmentation' in stderr.lower():
@@ -682,16 +774,29 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
-        if not scan_succeeded and not naabu_output.exists():
+        if not timed_out and not scan_succeeded and not naabu_output.exists():
             print(f"[!][Naabu] All scan attempts failed")
             return recon_data
 
         # Parse results
         print(f"[*][Naabu] Parsing results...")
         results = parse_naabu_output(str(naabu_output), settings=settings,
+                                     ip_mode=bool((recon_data.get("metadata") or {}).get("ip_mode")),
                                      ip_to_hostnames=ip_to_hostnames)
         if results.get("summary", {}).get("ai_ports_annotated"):
             print(f"[+][Naabu] AI port catalog matched {results['summary']['ai_ports_annotated']} port(s)")
+
+        unscanned = []
+        if timed_out:
+            unscanned = _targets_without_ports(all_targets, results)
+            _note_naabu_cut(all_targets, unscanned, bool(results["by_host"]),
+                            f"naabu timed out after {run_timeout}s")
+            if not results["by_host"]:
+                # An empty port list would read as "no open port anywhere".
+                print(f"[!][Naabu] Nothing was written before the timeout - no port data")
+                return recon_data
+            print(f"[!][Naabu] {len(unscanned)} of {len(all_targets)} target(s) got no port "
+                  f"before the timeout; their earlier findings are kept")
 
         # Build final structure
         naabu_results = {
@@ -714,10 +819,18 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
             "ip_to_hostnames": ip_to_hostnames,
             "summary": results["summary"]
         }
+        if timed_out:
+            # port_coverage reads these: a port of a target the cut run never
+            # reached is unknown, never closed. Listed here, before masscan's
+            # rows are merged into by_ip and hide which ones naabu wrote.
+            naabu_results["scan_metadata"].update(timed_out=True, unchecked_targets=unscanned)
 
         # Print summary
         summary = results["summary"]
-        print(f"[✓][Naabu] Scan completed in {duration:.1f} seconds")
+        if timed_out:
+            print(f"[!][Naabu] Scan cut at its {run_timeout}s timeout")
+        else:
+            print(f"[✓][Naabu] Scan completed in {duration:.1f} seconds")
         if actual_scan_type != NAABU_SCAN_TYPE:
             print(f"[*][Naabu] Note: Used CONNECT scan (SYN scan crashed)")
         print(f"[+][Naabu] Hosts with open ports: {summary['hosts_with_open_ports']}")
@@ -743,9 +856,6 @@ def run_port_scan(recon_data: dict, output_file: Path = None, settings: dict = N
 
         return recon_data
 
-    except subprocess.TimeoutExpired:
-        print("[!][Naabu] Scan timed out after 30 minutes")
-        return recon_data
     except Exception as e:
         print(f"[!][Naabu] Error during scan: {e}")
         return recon_data
@@ -805,7 +915,9 @@ def run_port_scan_isolated(recon_data: dict, settings: dict = None) -> dict:
         or empty dict if scan produced no results.
     """
     import copy
-    snapshot = copy.copy(recon_data)  # shallow copy — safe for read-only access
+    # Deep, not shallow: the fan-out hands every worker one shared copy, which
+    # a nested write would change under the others' copies.
+    snapshot = copy.deepcopy(recon_data)
     run_port_scan(snapshot, output_file=None, settings=settings)
     return snapshot.get("port_scan", {})
 

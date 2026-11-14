@@ -3,11 +3,14 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { GraphToolbar } from './components/GraphToolbar'
+import {
+  agentStopFailureLabel, agentStopSummary, isEmergencyStopScope, type EmergencyStopScope,
+} from './components/GraphToolbar/emergencyStopScope'
 import { FileSystemDrawer } from './components/FileSystemDrawer'
 import { GraphCanvas, AUTO_2D_THRESHOLD } from './components/GraphCanvas'
 import { GraphEmptyState } from './components/GraphEmptyState'
 import { NodeDrawer } from './components/NodeDrawer'
-import { AIAssistantDrawer } from './components/AIAssistantDrawer'
+import { AgentDrawer } from './components/AIAssistantDrawer'
 import type { PendingNodeQuery } from './components/AIAssistantDrawer/types'
 import { PageBottomBar } from './components/PageBottomBar'
 import { ReconConfirmModal } from './components/ReconConfirmModal'
@@ -43,6 +46,7 @@ import { RoeViewer } from './components/RoeViewer'
 import { KaliTerminal } from './components/KaliTerminal'
 import { GraphViews } from './components/GraphViews'
 import { GitHubStarBanner } from './components/GitHubStarBanner'
+import { ProjectWriters } from '@/components/projects/ProjectWriters'
 import { useGraphData, useDimensions, useNodeSelection, useTableData, useGraphViews } from './hooks'
 import { useScanVersions } from './hooks/useScanVersions'
 import { useUnseenCounts } from './hooks/useUnseenCounts'
@@ -66,6 +70,10 @@ import { useTheme, useSession, useReconStatus, useReconSSE, useGvmStatus, useGvm
 import { useErrorToast } from '@/hooks/useErrorToast'
 import { useProjectById } from '@/hooks/useProjects'
 import { useScanStartFailure } from '@/hooks/useScanStartFailure'
+import { usePermissionRefused } from '@/hooks/useCan'
+import { useProjectAccess, useRefusal } from '@/hooks/useRefusal'
+import { OwnerCatalogContext } from '@/hooks/useOwnerCatalog'
+import { useProjectOwnerCatalog } from '@/hooks/useProjectOwnerCatalog'
 import { useDrawerOffsets } from '@/hooks/useDrawerOffsets'
 import { useGraphTypeFilterPrefs, useGraphViewPrefs } from '@/hooks/useUserPreferences'
 import { useProject } from '@/providers/ProjectProvider'
@@ -77,6 +85,7 @@ import { OtherScansModal } from './components/OtherScansModal/OtherScansModal'
 import { parseScanModal } from '@/lib/scanModalLink'
 import { useAlertModal, useToast } from '@/components/ui'
 import { readApiError, toApiError } from '@/lib/apiError'
+import { useProjectFieldSave } from '@/hooks/useProjectFieldSave'
 import {
   downloadScanFile, fetchGvmAvailability, probeScanData, scanFailureToast, type GvmAvailability,
 } from '@/components/scans/scanErrors'
@@ -101,6 +110,15 @@ export default function GraphPage() {
   const { projectId, userId, currentProject, setCurrentProject, isLoading: projectLoading } = useProject()
   // Scan Queue (Phase 3): on a temporary start failure, offer Cancel / Add to queue.
   const { handleStartFailure } = useScanStartFailure(projectId)
+  // What the start routes and the agent socket's ticket ask (route manifest). The buttons and the
+  // drawer refuse on their own; the page keeps a deep link from opening a dialog whose start is refused.
+  const reconRefused = usePermissionRefused('recon:scan', projectId)
+  const gvmRefused = usePermissionRefused('scan:gvm', projectId)
+  const agentRefused = usePermissionRefused('agent:chat', projectId)
+  // A read share (step 4.11) mutes nothing and deletes no node: the mute buttons say whose read access
+  // it is, and node delete is not offered, as on a saved version.
+  const muteRefusal = useRefusal('triage:mute', projectId)
+  const graphEditRefused = usePermissionRefused('graph:edit', projectId)
 
   const [activeView, setActiveView] = useState<ViewMode>('graph')
 
@@ -118,6 +136,12 @@ export default function GraphPage() {
     isLoading: graphPrefsLoading,
   } = useGraphViewPrefs(projectId)
   const [isAIOpen, setIsAIOpen] = useState(false)
+  // On a project the person does not own, scans and agent runs spend the OWNER's keys, models,
+  // skills and MCP servers, so Other Scans and the AI drawer show the owner's, read once here by the
+  // settings form's rule (step 5.7); null for the owner and with sharing off (DV-30). The owner's
+  // models only while the drawer, where they are picked, is open.
+  const ownerCatalog = useProjectOwnerCatalog(projectId, useProjectAccess(projectId), { models: isAIOpen })
+  const readsOwnerCatalog = ownerCatalog !== null
   const [pendingNodeQuery, setPendingNodeQuery] = useState<PendingNodeQuery | null>(null)
   const [isFileSystemOpen, setIsFileSystemOpen] = useState(false)
   const [isReconModalOpen, setIsReconModalOpen] = useState(false)
@@ -244,6 +268,11 @@ export default function GraphPage() {
   }>({ activeCount: 0, conversations: [] })
 
   useEffect(() => {
+    // The list asks agent:chat (route manifest): without it there is no chat to show and nothing to poll.
+    if (agentRefused) {
+      setAgentSummary({ activeCount: 0, conversations: [] })
+      return
+    }
     if (!projectId || !userId) return
     const fetchStatus = async () => {
       try {
@@ -257,7 +286,7 @@ export default function GraphPage() {
     fetchStatus()
     const interval = setInterval(fetchStatus, 5000)
     return () => clearInterval(interval)
-  }, [projectId, userId])
+  }, [projectId, userId, agentRefused])
 
   // Tunnel status polling - check every 10s which tunnels are active
   const [tunnelStatus, setTunnelStatus] = useState<TunnelStatus>()
@@ -274,9 +303,10 @@ export default function GraphPage() {
     return () => clearInterval(interval)
   }, [])
 
-  // Check if user has a GitHub access token configured in global settings
+  // Check if user has a GitHub access token configured in global settings (the owner's, on a
+  // project the person does not own: answered by the owner catalog).
   useEffect(() => {
-    if (!userId) return
+    if (!userId || readsOwnerCatalog) return
     const checkToken = async () => {
       try {
         const res = await fetch(`/api/users/${userId}/settings`)
@@ -287,7 +317,8 @@ export default function GraphPage() {
       } catch { /* ignore */ }
     }
     checkToken()
-  }, [userId])
+  }, [userId, readsOwnerCatalog])
+  const githubTokenSet = ownerCatalog ? ownerCatalog.catalog?.keys.githubAccessToken === true : hasGithubToken
 
   // Recon status hook - must be before useGraphData to provide isReconRunning
   const {
@@ -1208,54 +1239,27 @@ export default function GraphPage() {
   // and hand it the seed message. The drawer sends it once that socket is up.
   const handleStartAgentSession = useCallback((request: string, context: string, nodeLabel: string) => {
     clearSelection()
+    // The drawer shows the refusal; a fresh session and a seeded message would wait there for nothing.
+    if (agentRefused) {
+      setIsAIOpen(true)
+      return
+    }
     resetSession()
     setIsAIOpen(true)
     setPendingNodeQuery({ token: Date.now(), nodeLabel, context, request })
-  }, [clearSelection, resetSession])
+  }, [clearSelection, resetSession, agentRefused])
 
   const handlePendingNodeQueryConsumed = useCallback(() => setPendingNodeQuery(null), [])
 
-  const handleToggleStealth = useCallback(async (newValue: boolean) => {
-    if (!projectId) return
-    try {
-      const res = await fetch(`/api/projects/${projectId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stealthMode: newValue }),
-      })
-      if (!res.ok) {
-        toast.error((await readApiError(res, 'Could not change Stealth Mode')).message)
-        return
-      }
-      if (currentProject) {
-        setCurrentProject({ ...currentProject, stealthMode: newValue })
-      }
-    } catch (error) {
-      console.error('Failed to toggle stealth mode:', error)
-      toast.error(toApiError(error, 'Could not change Stealth Mode').message)
-    }
-  }, [projectId, currentProject, setCurrentProject, toast])
+  const saveProjectField = useProjectFieldSave(projectId, currentProject, setCurrentProject)
 
-  const handleModelChange = useCallback(async (modelId: string) => {
-    if (!projectId) return
-    try {
-      const res = await fetch(`/api/projects/${projectId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agentOpenaiModel: modelId }),
-      })
-      if (!res.ok) {
-        toast.error((await readApiError(res, 'Could not change the agent model')).message)
-        return
-      }
-      if (currentProject) {
-        setCurrentProject({ ...currentProject, agentOpenaiModel: modelId })
-      }
-    } catch (error) {
-      console.error('Failed to change model:', error)
-      toast.error(toApiError(error, 'Could not change the agent model').message)
-    }
-  }, [projectId, currentProject, setCurrentProject, toast])
+  const handleToggleStealth = useCallback(
+    (newValue: boolean) => saveProjectField('stealthMode', newValue, 'Could not change Stealth Mode'),
+    [saveProjectField])
+
+  const handleModelChange = useCallback(
+    (modelId: string) => saveProjectField('agentOpenaiModel', modelId, 'Could not change the agent model'),
+    [saveProjectField])
 
   const handleStartRecon = useCallback(() => {
     setIsReconModalOpen(true)
@@ -1576,6 +1580,18 @@ export default function GraphPage() {
     }
   }, [isEmergencyPausing, isAnyPipelineRunning])
 
+  // Whose agent runs a press stops (every user's for an admin, otherwise the person's
+  // own), for the tooltip. A failed read leaves it unknown and the tooltip says both.
+  const [emergencyStopScope, setEmergencyStopScope] = useState<EmergencyStopScope | undefined>()
+  useEffect(() => {
+    let live = true
+    fetch('/api/agent/emergency-stop-all')
+      .then(res => (res.ok ? res.json() : null))
+      .then(answer => { if (live && isEmergencyStopScope(answer?.scope)) setEmergencyStopScope(answer.scope) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [])
+
   const handleEmergencyPauseAll = useCallback(async () => {
     setIsEmergencyPausing(true)
     // Each target answers with the reason it did not stop, or null when it did:
@@ -1611,19 +1627,28 @@ export default function GraphPage() {
         tasks.push(stopPartialRecon(run.run_id).then(r => { if (!r) partialFailed = true; return null }, () => { partialFailed = true; return null }))
       }
     }
-    // Stop all running AI agent conversations
+    // Stop the AI agent runs the person may stop: every user's, or their own.
+    let agentSummary: string | null = null
+    const agentLabel = agentStopFailureLabel(emergencyStopScope)
     tasks.push(fetch('/api/agent/emergency-stop-all', { method: 'POST' }).then(
-      async res => res.ok ? null : `AI agents: ${(await readApiError(res, 'Failed to stop agents')).message}`,
-      err => `AI agents: ${toApiError(err, 'Failed to stop agents').message}`,
+      async res => {
+        if (!res.ok) return `${agentLabel}: ${(await readApiError(res, 'Failed to stop agents')).message}`
+        const answer = await res.json().catch(() => null)
+        if (isEmergencyStopScope(answer?.scope)) setEmergencyStopScope(answer.scope)
+        agentSummary = agentStopSummary(answer)
+        return null
+      },
+      err => `${agentLabel}: ${toApiError(err, 'Failed to stop agents').message}`,
     ))
     const failures = (await Promise.allSettled(tasks))
       .map(r => r.status === 'fulfilled' ? r.value : `${toApiError(r.reason, 'request failed').message}`)
       .filter((f): f is string => !!f)
     if (failures.length) toast.error(failures.join('; '), 'Emergency pause: not everything stopped')
+    if (agentSummary) toast.info(agentSummary)
     // The recon hooks keep their reason for the next render (see reportReconFailure).
     if (reconFailed) reportReconFailure('Emergency pause: recon did not pause', 'recon')
     if (partialFailed) reportReconFailure('Emergency pause: a partial recon did not stop', 'partial')
-  }, [reconState?.status, gvmState?.status, githubHuntState?.status, trufflehogRuns, activePartialRecons, pauseRecon, pauseGvm, pauseGithubHunt, stopTrufflehog, stopPartialRecon, getGvmActionError, getGithubActionError, getTrufflehogActionError, reportReconFailure, toast])
+  }, [reconState?.status, gvmState?.status, githubHuntState?.status, trufflehogRuns, activePartialRecons, pauseRecon, pauseGvm, pauseGithubHunt, stopTrufflehog, stopPartialRecon, getGvmActionError, getGithubActionError, getTrufflehogActionError, reportReconFailure, toast, emergencyStopScope])
 
   // Show message if no project is selected
   if (!projectLoading && !projectId) {
@@ -1727,6 +1752,7 @@ export default function GraphPage() {
         onEmergencyPauseAll={handleEmergencyPauseAll}
         isAnyPipelineRunning={isAnyPipelineRunning}
         isEmergencyPausing={isEmergencyPausing}
+        emergencyStopScope={emergencyStopScope}
         tunnelStatus={tunnelStatus}
         // Scan Timeline (version switch)
         scanVersions={scanVersions}
@@ -1740,11 +1766,12 @@ export default function GraphPage() {
         agentConversations={agentSummary.conversations}
       />
 
+      <OwnerCatalogContext.Provider value={ownerCatalog}>
       <OtherScansModal
         isOpen={isOtherScansModalOpen}
         onClose={() => setIsOtherScansModalOpen(false)}
         hasReconData={hasReconData}
-        hasGithubToken={hasGithubToken}
+        hasGithubToken={githubTokenSet}
         // Scan Timeline: past versions are read-only; the raw JSON is latest-only.
         viewingPastVersion={isViewingPastVersion}
         isActivatingVersion={isActivatingVersion}
@@ -1788,6 +1815,9 @@ export default function GraphPage() {
         projectId={projectId || undefined}
         isSupplyChainLogsOpen={activeLogsDrawer === 'supplyChain'}
       />
+      </OwnerCatalogContext.Provider>
+
+      <ProjectWriters projectId={projectId} />
 
       <ViewTabs
         activeView={activeView}
@@ -1845,7 +1875,7 @@ export default function GraphPage() {
             node={selectedNode}
             isOpen={drawerOpen}
             onClose={clearSelection}
-            onDeleteNode={isViewingPastVersion ? undefined : handleDeleteNode}
+            onDeleteNode={isViewingPastVersion || graphEditRefused ? undefined : handleDeleteNode}
             expandedChild={expandedChild}
             onExpandChild={expandChild}
             onCollapseChild={collapseChild}
@@ -2150,7 +2180,8 @@ export default function GraphPage() {
         />
       ))}
 
-      <AIAssistantDrawer
+      <OwnerCatalogContext.Provider value={ownerCatalog}>
+      <AgentDrawer
         isOpen={isAIOpen}
         onClose={handleCloseAI}
         userId={userId || ''}
@@ -2173,6 +2204,7 @@ export default function GraphPage() {
         pendingNodeQuery={pendingNodeQuery}
         onPendingNodeQueryConsumed={handlePendingNodeQueryConsumed}
       />
+      </OwnerCatalogContext.Provider>
 
       <FileSystemDrawer
         isOpen={isFileSystemOpen}
@@ -2181,7 +2213,7 @@ export default function GraphPage() {
       />
 
       <ReconConfirmModal
-        isOpen={isReconModalOpen}
+        isOpen={isReconModalOpen && !reconRefused}
         onClose={() => setIsReconModalOpen(false)}
         onConfirm={handleConfirmRecon}
         projectName={currentProject?.name || 'Unknown'}
@@ -2207,7 +2239,7 @@ export default function GraphPage() {
       />
 
       <GvmConfirmModal
-        isOpen={isGvmModalOpen}
+        isOpen={isGvmModalOpen && !gvmRefused}
         onClose={() => setIsGvmModalOpen(false)}
         onConfirm={handleConfirmGvm}
         projectName={currentProject?.name || 'Unknown'}
@@ -2245,7 +2277,8 @@ export default function GraphPage() {
   return (
     <MuteNodeProvider
       projectId={projectId}
-      readOnly={isViewingPastVersion}
+      readOnly={isViewingPastVersion || muteRefusal !== null}
+      readOnlyReason={isViewingPastVersion ? undefined : muteRefusal?.text}
       onViewMuted={viewMutedNodes}
       onGraphChanged={refetchGraph}
       onOpenMuteRules={openMuteRulesKind}

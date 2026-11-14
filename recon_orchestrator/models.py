@@ -28,6 +28,21 @@ class ReconStartRequest(BaseModel):
     # pipeline behaves identically either way, because a full recon always wipes
     # and rebuilds the live graph. Forwarded to the container as SCAN_MODE.
     mode: Optional[str] = None
+    # Step 1.16: minted by the webapp for this start; verified here, admitted under
+    # its tenant, handed to the scan container. Optional in every start request
+    # model so a missing one gets the endpoint's coded 403, not a bare 422.
+    job_credential: Optional[str] = None
+    # Step 5.5 (D-14): who started the scan, which may be a collaborator on the
+    # owner's project. Admission's per-user ceiling counts this person; the
+    # container still runs under user_id (the credential's tenant). Absent or empty
+    # (an owner's start, an older webapp) means the tenant. Every start request
+    # model carries it.
+    actor_user_id: Optional[str] = None
+    # Step 6.8 (GV-10): the actor's maxConcurrentScans quota, when one is set. Admission
+    # caps the actor at the smaller of it and RECON_MAX_CONCURRENT_PER_USER; absent means
+    # no quota (an unlimited actor, the governance switch off, an older webapp). Every start
+    # request model carries it.
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
 
 
 class CaptureProxyConfig(BaseModel):
@@ -95,6 +110,9 @@ class ReconState(BaseModel):
     # is never carried here -- only the pointer, so the webapp can persist it
     # on the ScanJob row and read it back through the plan-manifest reader.
     plan_manifest_pointers: Optional[list] = None
+    # Who started this run (step 5.5); None for a run adopted after an orchestrator
+    # restart, which keeps no record of it. Every run state carries it.
+    actor_user_id: Optional[str] = None
 
 
 class ReconLogEvent(BaseModel):
@@ -148,6 +166,9 @@ class GvmStartRequest(BaseModel):
     project_id: str
     user_id: str
     webapp_api_url: str
+    job_credential: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
 
 
 class GvmState(BaseModel):
@@ -161,6 +182,7 @@ class GvmState(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     container_id: Optional[str] = None
+    actor_user_id: Optional[str] = None
 
 
 class GvmLogEvent(BaseModel):
@@ -195,6 +217,9 @@ class GithubHuntStartRequest(BaseModel):
     project_id: str
     user_id: str
     webapp_api_url: str
+    job_credential: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
 
 
 class GithubHuntState(BaseModel):
@@ -208,6 +233,7 @@ class GithubHuntState(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     container_id: Optional[str] = None
+    actor_user_id: Optional[str] = None
     #: Needed by the orchestrator-side ingest backstop, which writes the graph
     #: when the container died before it could (SIGKILL, OOM, crash).
     user_id: Optional[str] = None
@@ -261,6 +287,9 @@ class TrufflehogStartRequest(BaseModel):
     #: only: the webapp start route reads them, the orchestrator injects the ones
     #: this source needs, and they are never persisted or logged.
     secrets: dict = Field(default_factory=dict)
+    job_credential: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
 
 
 class TrufflehogState(BaseModel):
@@ -281,6 +310,7 @@ class TrufflehogState(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     container_id: Optional[str] = None
+    actor_user_id: Optional[str] = None
     #: Set once the clean ingest step has written this run's findings to Neo4j.
     ingested: bool = False
     #: Bounded so a permanently-failing ingest is not retried on every 30 s sweep.
@@ -339,6 +369,9 @@ class SupplyChainStartRequest(BaseModel):
     repo_override_ref: Optional[str] = None
     repo_override_scope: Optional[str] = None
     repo_override_deep: Optional[bool] = None
+    job_credential: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
 
 
 class GuarddogRequest(BaseModel):
@@ -367,6 +400,7 @@ class SupplyChainState(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     container_id: Optional[str] = None
+    actor_user_id: Optional[str] = None
 
 
 class SupplyChainLogEvent(BaseModel):
@@ -402,6 +436,9 @@ class PartialReconStartRequest(BaseModel):
     user_targets: dict | None = None          # structured inputs (Naabu: {subdomains, ips, ip_attach_to})
     include_graph_targets: bool = True        # whether to include existing graph data in scan
     settings_overrides: dict = {}             # optional per-tool settings
+    job_credential: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
 
 
 class PartialReconState(BaseModel):
@@ -411,6 +448,7 @@ class PartialReconState(BaseModel):
     tool_id: str = ""
     status: PartialReconStatus = PartialReconStatus.IDLE
     container_id: Optional[str] = None
+    actor_user_id: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
@@ -466,6 +504,16 @@ class AiAttackSurfaceStartRequest(BaseModel):
     api_key: str = ""
     auth_header: str = ""
     auth_scheme: str = ""
+    job_credential: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_max_concurrent: Optional[int] = Field(default=None, ge=0)
+    # The project's IP-mode scope, from its row (design §11): the scanner admits
+    # each target by it. None = not stated, which the scanner refuses for a
+    # project whose graph is IP mode.
+    ip_mode: Optional[bool] = None
+    target_ips: list[str] = []
+    roe_excluded_hosts: list[str] = []
+    ip_hostname_policy: Optional[dict] = None   # {mode, include, exclude}
 
 
 class AiAttackSurfaceState(BaseModel):
@@ -478,6 +526,7 @@ class AiAttackSurfaceState(BaseModel):
     phase_number: Optional[Union[int, float]] = None
     total_phases: int = 4
     container_id: Optional[str] = None
+    actor_user_id: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None

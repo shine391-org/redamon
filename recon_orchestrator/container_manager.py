@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import aclosing
 import os
 import re
 import shutil
@@ -78,6 +79,12 @@ def _secret_hmac_env() -> dict:
     only when set, so an unset key leaves no value_hmac rather than a fixed one."""
     key = (os.environ.get("REDAMON_SECRET_HMAC_KEY") or "").strip()
     return {"REDAMON_SECRET_HMAC_KEY": key} if key else {}
+
+
+def scanner_key() -> str:
+    """SCANNER_API_KEY, or "" while it is unset or still the compose default."""
+    key = os.environ.get("SCANNER_API_KEY", "")
+    return key if key and key != "changeme" else ""
 
 
 #: The urlscan lab's hooks: a fake urlscan (it receives the project's urlscan key)
@@ -290,6 +297,15 @@ PARTIAL_RECON_PHASE_NUMBER = 1
 # A status poll with no log stream attached reads new log lines at most this often.
 PHASE_POLL_INTERVAL_S = 10.0
 
+# How far a log stream's reader may run ahead of its SSE client before it waits.
+LOG_STREAM_BUFFER_LINES = 1000
+# A log stream with no new line for this long asks Docker whether its container
+# still runs, so a stream whose container is gone ends.
+LOG_STREAM_IDLE_CHECK_S = 1.0
+# The reader's own liveness check, throttled: one reload() per line was a daemon
+# round-trip per line, and a 100k-line scan flooded Docker (the parallel-scan freeze).
+LOG_STREAM_LIVENESS_S = 30.0
+
 
 class PhaseTracker:
     """The phase of one log, fed its lines in order.
@@ -441,6 +457,17 @@ def _env_size(name: str, default: str) -> str:
     return raw if raw else default
 
 
+def _positive_int(value) -> Optional[int]:
+    """`value` as a positive int, or None when absent, blank, malformed or not positive."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 def _stop_grace_s() -> float:
     """How long a stopped recon or partial-recon run may drain before SIGKILL.
 
@@ -456,6 +483,10 @@ def _stop_grace_s() -> float:
         value = 45.0
     return value if value > 0 else 45.0
 
+
+# Docker container states in which a scan process still exists (or is about to
+# run again), so its container must not be removed to make room for a new one.
+_LIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 
 # A run in any of these is live: its container exists and may still write the
 # graph, so it keeps its reservation and blocks a conflicting start. STOPPING is
@@ -664,17 +695,21 @@ class ContainerManager:
         return f"partial_recon:{tool_id}" if tool_id else "partial_recon"
 
     async def _admit_scan(self, kind: str, project_id: str, run_id: Optional[str] = None,
-                          user_id: Optional[str] = None) -> str:
+                          user_id: Optional[str] = None, max_per_user: Optional[int] = None) -> str:
         """Reserve RAM for a scan of `kind`; raise AdmissionError if it doesn't fit.
         Returns the reservation key (release via reconcile / release_nowait).
-        `user_id` (D3) subjects the scan to the per-user concurrent-scan ceiling."""
+        `user_id` (D3) subjects the scan to the per-user concurrent-scan ceiling: the
+        start's ACTOR (step 5.5, D-14), never its tenant, so a collaborator's scans on
+        another person's project count against the collaborator. `max_per_user` is that
+        actor's maxConcurrentScans quota (step 6.8), when the webapp sent one."""
         key = self._scan_key(kind, project_id, run_id)
         envelope = self.ledger.envelope_for(kind)
-        result = await self.ledger.try_admit(key, envelope, user_id=user_id)
+        result = await self.ledger.try_admit(key, envelope, user_id=user_id, max_per_user=max_per_user)
         if not result.admitted:
-            logger.info(f"[governor] admission denied for {key}: {result.limit_type} - {result.detail}")
+            logger.info(f"[governor] admission denied for {key} for {user_id or '-'}: "
+                        f"{result.limit_type} - {result.detail}")
             raise AdmissionError(result)
-        logger.info(f"[governor] admitted {key} (envelope {envelope // (1024**2)} MB, "
+        logger.info(f"[governor] admitted {key} for {user_id or '-'} (envelope {envelope // (1024**2)} MB, "
                     f"committed {self.ledger.committed_bytes() // (1024**2)} MB / "
                     f"pool {self.ledger.scan_pool() // (1024**2)} MB)")
         return key
@@ -892,16 +927,21 @@ class ContainerManager:
             return 512
 
     def _scanner_env(self) -> dict:
-        """S3/E6: give scan spawns the SCOPED scanner token instead of the master
+        """S3/E6: give scan spawns the SCOPED scanner token, never the master
         INTERNAL_API_KEY, so a compromised scanner cannot mint an admin, harvest
-        LLM-provider keys, or reach the control plane. Falls back to the master
-        key ONLY when SCANNER_API_KEY is unset/placeholder (pre-secret installs),
-        so an operator who runs `up` before `update` is never hard-broken; the
-        scope closes automatically once redamon.sh generates the key."""
-        scanner = os.environ.get("SCANNER_API_KEY", "")
-        if scanner and scanner != "changeme":
-            return {"SCANNER_API_KEY": scanner}
-        return {"INTERNAL_API_KEY": os.environ.get("INTERNAL_API_KEY", "")}
+        LLM-provider keys, or reach the control plane. Without a configured
+        scanner key they get no key at all (NF-16): the API refuses the starts
+        whose container calls back first (`scanner_key_missing`), so this only
+        keeps any other caller from handing out the master key."""
+        key = scanner_key()
+        return {"SCANNER_API_KEY": key} if key else {}
+
+    @staticmethod
+    def _job_env(job_credential: Optional[str]) -> dict:
+        """The scan's job credential (step 1.16): its calls back to the webapp and
+        the agent send it as X-Redamon-Job, and the scanner key opens nothing
+        there without it."""
+        return {"REDAMON_JOB_CREDENTIAL": job_credential} if job_credential else {}
 
     # The dirty-analyzer knobs an operator may pin in .env. They are read from
     # os.environ by BOTH spawn implementations (this module for the SDK path,
@@ -1151,6 +1191,12 @@ class ContainerManager:
                     if container.status == "paused":
                         state.status = ReconStatus.PAUSED
                     elif container.status == "running":
+                        # The container is the truth while it lives: a resume,
+                        # or a failed Pause call, may have left another status.
+                        if state.status != ReconStatus.RUNNING:
+                            state.status = ReconStatus.RUNNING
+                            state.error = None
+                            state.completed_at = None
                         self._poll_phase_cursor(project_id, container)
                     elif container.status != "running":
                         # Container stopped - check exit code
@@ -1177,10 +1223,12 @@ class ContainerManager:
                         state.status = ReconStatus.ERROR
                         state.error = "Container not found"
                 except APIError as e:
-                    logger.warning(f"Docker API error checking recon container for {project_id}: {e}")
-                    if state.status not in (ReconStatus.COMPLETED, ReconStatus.ERROR):
-                        state.status = ReconStatus.ERROR
-                        state.error = f"Docker API error: {e}"
+                    # A daemon 5xx says nothing about the scan. Failing it here
+                    # recorded a live run as failed, refused its Stop and let the
+                    # next start remove it, so the last status stands until
+                    # Docker answers again (NotFound is the real "gone").
+                    logger.warning(f"Docker API error checking recon container for {project_id}, "
+                                   f"keeping status {state.status.value}: {e}")
 
             state.plan_manifest_pointers = self._plan_manifest_pointers(
                 project_id)
@@ -1207,6 +1255,23 @@ class ContainerManager:
             plan_manifest_pointers=self._plan_manifest_pointers(project_id),
         )
 
+    def _leftover_recon_container(self, project_id: str, container_name: str):
+        """The finished container still holding this project's recon name, for
+        the start to remove, or None. Blocking: call through _run_blocking.
+
+        Raises ValueError while that container is live, whatever the in-memory
+        state says: a stale `error` (or a lost entry) must never let a start
+        force-remove a running scan. An APIError propagates for the same reason:
+        a start that cannot tell whether the old run lives removes nothing.
+        """
+        try:
+            container = self.client.containers.get(container_name)
+        except NotFound:
+            return None
+        if container.status in _LIVE_CONTAINER_STATUSES:
+            raise ValueError(f"Recon already active for project {project_id}")
+        return container
+
     async def start_recon(
         self,
         project_id: str,
@@ -1217,6 +1282,9 @@ class ContainerManager:
         scan_mode: Optional[str] = None,
         continuation_run_id: Optional[str] = None,
         project_revision: str = "",
+        job_credential: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        actor_max_concurrent: Optional[int] = None,
     ) -> ReconState:
         """Start a recon container for a project.
 
@@ -1236,11 +1304,14 @@ class ContainerManager:
             raise ValueError("project_start_busy")
         async with lock:
             return await self._start_recon_locked(project_id, user_id, webapp_api_url,
-                recon_path, custom_templates_path, scan_mode, continuation_run_id, project_revision)
+                recon_path, custom_templates_path, scan_mode, continuation_run_id,
+                project_revision, job_credential, actor_user_id, actor_max_concurrent)
 
     async def _start_recon_locked(self, project_id, user_id, webapp_api_url,
                                  recon_path, custom_templates_path, scan_mode,
-                                 continuation_run_id, project_revision):
+                                 continuation_run_id, project_revision,
+                                 job_credential=None, actor_user_id=None,
+                                 actor_max_concurrent=None):
         # Check if already running, paused or still draining a stop: the
         # force-remove below would otherwise cut a stopped run's drain short.
         current_state = await self.get_status(project_id)
@@ -1256,11 +1327,19 @@ class ContainerManager:
             identifier(continuation_run_id)
             continuation_work(Path(recon_path) / "output", project_id,
                               continuation_run_id, user_id, project_revision)
+        container_name = self._get_container_name(project_id)
+        leftover = await self._run_blocking(
+            self._leftover_recon_container, project_id, container_name)
+
         # Memory admission (Part 1): reserve this scan's RAM envelope or reject.
         previous = self.running_states.get(project_id)
-        self.running_states[project_id] = ReconState(project_id=project_id, status=ReconStatus.STARTING)
+        actor = actor_user_id or user_id
+        self.running_states[project_id] = ReconState(
+            project_id=project_id, status=ReconStatus.STARTING, actor_user_id=actor,
+        )
         try:
-            await self._admit_scan("full_recon", project_id, user_id=user_id)
+            await self._admit_scan("full_recon", project_id, user_id=actor,
+                                   max_per_user=actor_max_concurrent)
         except BaseException:
             if previous is None:
                 self.running_states.pop(project_id, None)
@@ -1281,14 +1360,13 @@ class ContainerManager:
         # transaction with it so the /traffic UI can group "this scan's traffic".
         recon_run_id = continuation_run_id or str(uuid.uuid4())
 
-        # Clean up any existing container
-        container_name = self._get_container_name(project_id)
-        try:
-            old_container = self.client.containers.get(container_name)
-            old_container.remove(force=True)
-            logger.info(f"Removed old container {container_name}")
-        except NotFound:
-            pass
+        # By id, not by name: the name may already belong to a newer container.
+        if leftover is not None:
+            try:
+                leftover.remove(force=True)
+                logger.info(f"Removed old container {container_name}")
+            except NotFound:
+                pass
 
         # Create new state
         state = ReconState(
@@ -1296,6 +1374,7 @@ class ContainerManager:
             status=ReconStatus.STARTING,
             run_id=recon_run_id,
             started_at=datetime.now(timezone.utc),
+            actor_user_id=actor,
         )
         self.running_states[project_id] = state
         # The previous run's log position means nothing for this container.
@@ -1312,6 +1391,8 @@ class ContainerManager:
                     tag=self.recon_image,
                     rm=True,
                 )
+
+            capture_env = await self._run_blocking(self._capture_recon_env)
 
             # Start container with environment variables
             container = self.client.containers.run(
@@ -1355,6 +1436,7 @@ class ContainerManager:
                     "NEO4J_USER": os.environ.get("NEO4J_USER", "neo4j"),
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
                     **self._scanner_env(),  # S3/E6: scoped scanner token
+                    **self._job_env(job_credential),
                     # Agent API for AI hooks (FFuf AI extensions, etc.)
                     "AGENT_API_URL": os.environ.get("AGENT_API_URL", "http://localhost:8090"),
                     # The recon CLI (docker run/pull/info) honors DOCKER_HOST, so
@@ -1372,6 +1454,7 @@ class ContainerManager:
                     # OAST providers). Sourced from the DB by api.py's
                     # capture-config reconciler; empty = shipped defaults.
                     "CAPTURE_IOC_IGNORE_SUFFIXES": getattr(self, "sca_intel_ignore_suffixes", "") or "",
+                    **capture_env,
                     # Operator overrides for the dirty analyzer L2 spawns itself.
                     **self._analyzer_env(),
                 },
@@ -1665,9 +1748,11 @@ class ContainerManager:
 
     def sweep_trufflehog_stages(self, root: Optional[str] = None) -> int:
         """At startup: delete the stage dirs whose run has no live recon or
-        partial-recon container. Runs survive an orchestrator restart and are
-        re-adopted, so a live run's dir is spared; when the containers cannot
-        be listed nothing is deleted."""
+        partial-recon container. A scan outlives an orchestrator restart but
+        the new process does not adopt it, so liveness comes from the daemon's
+        container list, not the state dicts: a run whose container is neither
+        exited nor dead keeps its dir. When the containers cannot be listed
+        nothing is deleted."""
         try:
             live = set()
             for prefix in ("redamon-recon-", "redamon-partial-recon-"):
@@ -1977,6 +2062,58 @@ class ContainerManager:
         except (TypeError, ValueError):
             return 8888
 
+    def _capture_published_port(self) -> Optional[int]:
+        """The host port Docker publishes the capture proxy on, or None.
+        Blocking. A compose-started proxy publishes CAPTURE_PROXY_PORT in front
+        of mitmdump's fixed 8888, so the host side is the one recon dials."""
+        try:
+            attrs = self.client.containers.get(self.CAPTURE_PROXY_NAME).attrs
+        except Exception:  # noqa: BLE001 - absent, or Docker cannot say
+            return None
+        bindings = (attrs.get("HostConfig") or {}).get("PortBindings") if isinstance(attrs, dict) else None
+        if not isinstance(bindings, dict):
+            return None
+        for published in bindings.values():
+            for binding in published or []:
+                port = _positive_int(binding.get("HostPort")) if isinstance(binding, dict) else None
+                if port:
+                    return port
+        return None
+
+    def _capture_effective_port(self) -> int:
+        """The port the capture proxy answers on: Docker's own record (it
+        outlives an orchestrator restart), else the last start's, else compose's.
+        Blocking."""
+        return (self._capture_published_port()
+                or _positive_int(getattr(self, "_capture_started_port", None))
+                or self._capture_port())
+
+    @staticmethod
+    def _capture_config_max_body_kb() -> Optional[int]:
+        """The operator's body cap from the capture config api.py's reconciler
+        writes from the DB. Read at each spawn: a cap change restarts no proxy."""
+        path = os.environ.get("CAPTURE_CONFIG_FILE", "/spool/.capture-config.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                body = json.load(f).get("body") or {}
+            return _positive_int(body.get("max_body_kb"))
+        except Exception:  # noqa: BLE001 - absent or malformed: the compose value
+            return None
+
+    def _capture_recon_env(self) -> dict:
+        """CAPTURE_PROXY_PORT and CAPTURE_PROXY_MAX_BODY_KB for a recon container.
+
+        Recon reads both from its environment (helpers/proxy_routing.py,
+        helpers/traffic_capture.py) and dials the proxy's loopback publish from
+        the host network, so without them a proxy on any port but 8888 looked
+        unreachable and the scan ran uncaptured. Blocking; never raises.
+        """
+        max_body_kb = (self._capture_config_max_body_kb()
+                       or _positive_int(os.environ.get("CAPTURE_PROXY_MAX_BODY_KB"))
+                       or 64)
+        return {"CAPTURE_PROXY_PORT": str(self._capture_effective_port()),
+                "CAPTURE_PROXY_MAX_BODY_KB": str(max_body_kb)}
+
     def _remove_container_if_exists(self, name: str) -> None:
         try:
             self.client.containers.get(name).remove(force=True)
@@ -2089,6 +2226,7 @@ class ContainerManager:
             restart_policy={"Name": "unless-stopped"},
             labels={"redamon.capture": "proxy"},
         )
+        self._capture_started_port = port
 
         # --- Ingest: redamon-network, scoped INSERT-only role + verify keys ---
         self.client.containers.run(
@@ -2169,7 +2307,7 @@ class ContainerManager:
             "proxy": proxy,
             "ingest": ingest,
             "running": proxy == "running" and ingest == "running",
-            "port": self._capture_port(),
+            "port": self._capture_effective_port(),
         }
 
     def _parse_log_line(self, line: str, current_phase: Optional[str], current_phase_num: Optional[int],
@@ -2278,6 +2416,100 @@ class ContainerManager:
             if line.strip():
                 self._feed_phase_cursor(project_id, line.rstrip())
 
+    @staticmethod
+    def _container_running(container) -> bool:
+        """Reload and report whether a container is still running or paused.
+        Blocking: call through _run_blocking. An error reads as stopped."""
+        try:
+            container.reload()
+            return container.status in ("running", "paused")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _follow_container_logs(self, container, **log_kwargs) -> AsyncGenerator[bytes, None]:
+        """A container's raw log lines as Docker writes them (follow=True),
+        until the container stops or the consumer goes away. The one reader
+        behind every SSE log stream.
+
+        docker-py blocks, so a worker of the log-stream pool reads, at most
+        LOG_STREAM_BUFFER_LINES ahead of the consumer. When the consumer leaves
+        (it closes the generator, or its task is cancelled because the SSE
+        client disconnected) the reader is told to stop and the Docker log
+        stream is closed, which wakes a reader blocked on a quiet container.
+        Without that, a dropped stream held its worker, and queued lines, until
+        the scan ended, and enough reconnects left no worker for any log stream.
+
+        Wrap it in contextlib.aclosing, so the reader stops when the caller
+        exits rather than whenever the abandoned generator is collected.
+        """
+        loop = asyncio.get_running_loop()
+        lines: asyncio.Queue = asyncio.Queue()
+        room = threading.Semaphore(LOG_STREAM_BUFFER_LINES)
+        stop = threading.Event()
+        opened: list = []
+        opened_lock = threading.Lock()
+        end = object()
+
+        def close_streams() -> None:
+            with opened_lock:
+                streams = list(opened)
+            for stream in streams:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001 - already closed or torn down
+                        pass
+
+        def read() -> None:
+            try:
+                stream = container.logs(stream=True, follow=True, **log_kwargs)
+                with opened_lock:
+                    opened.append(stream)
+                # After publishing the stream: a consumer that left before this
+                # found nothing to close, so the reader must notice and stop.
+                if stop.is_set():
+                    return
+                next_liveness = time.monotonic() + LOG_STREAM_LIVENESS_S
+                for line in stream:
+                    while not room.acquire(timeout=0.5):
+                        if stop.is_set():
+                            return
+                    if stop.is_set():
+                        return
+                    loop.call_soon_threadsafe(lines.put_nowait, line)
+                    if time.monotonic() >= next_liveness:
+                        next_liveness = time.monotonic() + LOG_STREAM_LIVENESS_S
+                        if not self._container_running(container):
+                            break
+            except Exception as e:  # noqa: BLE001
+                if not stop.is_set():
+                    logger.error(f"Error in log reader thread for container "
+                                 f"{getattr(container, 'id', '?')}: {e}")
+            finally:
+                close_streams()
+                try:
+                    loop.call_soon_threadsafe(lines.put_nowait, end)
+                except RuntimeError:  # the event loop is already closed
+                    pass
+
+        loop.run_in_executor(self._log_stream_executor, read)
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(lines.get(), timeout=LOG_STREAM_IDLE_CHECK_S)
+                except asyncio.TimeoutError:
+                    if not await self._run_blocking(self._container_running, container):
+                        break
+                    continue
+                if item is end:
+                    break
+                room.release()
+                yield item
+        finally:
+            stop.set()
+            close_streams()
+
     async def stream_logs(self, project_id: str) -> AsyncGenerator[ReconLogEvent, None]:
         """Stream logs from a recon container"""
         state = await self.get_status(project_id)
@@ -2299,84 +2531,23 @@ class ContainerManager:
         try:
             container = self.client.containers.get(state.container_id)
 
-            # Use asyncio queue to bridge sync Docker logs to async generator
-            log_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-
-            # Capture the event loop before starting the thread
-            loop = asyncio.get_running_loop()
-
-            def read_logs():
-                """Synchronous function to read logs and put them in the queue"""
-                try:
-                    # Throttle the per-line liveness reload() below: next allowed
-                    # Docker status poll, in monotonic seconds (list = mutable box).
-                    _log_status_gate = [time.monotonic() + 30.0]
-                    for line in container.logs(stream=True, follow=True, timestamps=True):
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(line),
-                            loop
-                        ).result(timeout=5)
-                        # Check if container is still running
-                        # Liveness check, THROTTLED to once per ~30s. Previously
-                        # reload() ran on EVERY log line -- a Docker round-trip per
-                        # line. A scan emitting 100k+ lines flooded the daemon,
-                        # slowing every request and starving the event loop (the
-                        # parallel-scan freeze). The stream generator ending already
-                        # stops the loop when a container exits, so a 30s liveness
-                        # poll loses nothing but the wasted daemon load.
-                        if time.monotonic() >= _log_status_gate[0]:
-                            _log_status_gate[0] = time.monotonic() + 30.0
-                            try:
-                                container.reload()
-                                if container.status not in ("running", "paused"):
-                                    break
-                            except Exception:
-                                break
-                except Exception as e:
-                    logger.error(f"Error in log reader thread: {e}")
-                finally:
-                    # Signal end of logs
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(None),
-                            loop
-                        ).result(timeout=5)
-                    except Exception:
-                        pass
-
-            # Start log reader in a thread
-            loop.run_in_executor(self._log_stream_executor, read_logs)
-
-            # Process logs from queue
-            while True:
-                try:
-                    line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
-                    if line is None:
-                        break
-
+            async with aclosing(self._follow_container_logs(container, timestamps=True)) as lines:
+                async for line in lines:
                     decoded_line = line.decode("utf-8", errors="replace").rstrip()
-                    if decoded_line:
-                        docker_ts, log_text = _split_docker_stamp(decoded_line)
+                    if not decoded_line:
+                        continue
+                    docker_ts, log_text = _split_docker_stamp(decoded_line)
 
-                        # The run's shared cursor parses each line once; a line
-                        # it saw already (a stream attached late replays the log
-                        # from the start) is shown with the current phase.
-                        changed = self._feed_phase_cursor(project_id, decoded_line)
-                        if not log_text:
-                            continue
-                        tracker = self._phase_cursor(project_id).tracker
-                        yield self._log_event(
-                            ANSI_ESCAPE.sub('', log_text), tracker.phase, tracker.phase_number,
-                            changed, docker_ts or datetime.now(timezone.utc))
-
-                except asyncio.TimeoutError:
-                    # Check if container is still running or paused
-                    try:
-                        container.reload()
-                        if container.status not in ("running", "paused"):
-                            break
-                    except Exception:
-                        break
+                    # The run's shared cursor parses each line once; a line it
+                    # saw already (a stream attached late replays the log from
+                    # the start) is shown with the current phase.
+                    changed = self._feed_phase_cursor(project_id, decoded_line)
+                    if not log_text:
+                        continue
+                    tracker = self._phase_cursor(project_id).tracker
+                    yield self._log_event(
+                        ANSI_ESCAPE.sub('', log_text), tracker.phase, tracker.phase_number,
+                        changed, docker_ts or datetime.now(timezone.utc))
 
         except (NotFound, APIError):
             yield ReconLogEvent(
@@ -2554,6 +2725,9 @@ class ContainerManager:
         config: dict,
         recon_path: str,
         custom_templates_path: str = "",
+        job_credential: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        actor_max_concurrent: Optional[int] = None,
     ) -> PartialReconState:
         """Start a partial recon container for a specific tool.
 
@@ -2583,7 +2757,9 @@ class ContainerManager:
         # Memory admission (Part 1): reserve this run's RAM envelope or reject.
         # Tool-qualified: SupplyChainRecon costs ~3x a normal partial step.
         partial_kind = self._partial_kind(tool_id)
-        await self._admit_scan(partial_kind, project_id, run_id, user_id=config.get("user_id"))
+        actor = actor_user_id or config.get("user_id")
+        await self._admit_scan(partial_kind, project_id, run_id, user_id=actor,
+                               max_per_user=actor_max_concurrent)
 
         # Lazy-on-scan OSV DB refresh, but ONLY for the supply-chain partial tool -
         # other partial tools have nothing to do with the OSV feed. TTL-guarded +
@@ -2598,6 +2774,7 @@ class ContainerManager:
             status=PartialReconStatus.STARTING,
             started_at=datetime.now(timezone.utc),
             roots=list(config.get("domains") or []),
+            actor_user_id=actor,
         )
         self.partial_recon_states.setdefault(project_id, {})[run_id] = state
 
@@ -2620,6 +2797,8 @@ class ContainerManager:
             config_path = config_dir / f"partial_{project_id}_{run_id}.json"
             with open(config_path, "w") as f:
                 json.dump(config, f)
+
+            capture_env = await self._run_blocking(self._capture_recon_env)
 
             # Start container with the partial_recon.py entry point. containers.run
             # is blocking; run it in the thread pool so the spawn never stalls the
@@ -2659,6 +2838,7 @@ class ContainerManager:
                     "NEO4J_USER": os.environ.get("NEO4J_USER", "neo4j"),
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
                     **self._scanner_env(),  # S3/E6: scoped scanner token
+                    **self._job_env(job_credential),
                     # Agent API for AI hooks (FFuf AI extensions, etc.)
                     "AGENT_API_URL": os.environ.get("AGENT_API_URL", "http://localhost:8090"),
                     # The recon CLI (docker run/pull/info) honors DOCKER_HOST, so
@@ -2676,6 +2856,7 @@ class ContainerManager:
                     # OAST providers). Sourced from the DB by api.py's
                     # capture-config reconciler; empty = shipped defaults.
                     "CAPTURE_IOC_IGNORE_SUFFIXES": getattr(self, "sca_intel_ignore_suffixes", "") or "",
+                    **capture_env,
                     # Operator overrides for the dirty analyzer L2 spawns itself.
                     **self._analyzer_env(),
                 },
@@ -2796,60 +2977,16 @@ class ContainerManager:
         try:
             container = self.client.containers.get(state.container_id)
 
-            log_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
             # On reconnect, resume from the last timestamp we already emitted so
             # the SSE client doesn't receive duplicate history. Docker's `since`
             # is second-granular, so advance by 1us to avoid re-emitting the
             # boundary line (timestamps we tracked are sub-second precise).
-            since_ts = None
+            log_kwargs = {"timestamps": True}
             if state.last_log_timestamp is not None:
-                since_ts = state.last_log_timestamp + timedelta(microseconds=1)
+                log_kwargs["since"] = state.last_log_timestamp + timedelta(microseconds=1)
 
-            def read_logs():
-                try:
-                    log_stream_kwargs = {"stream": True, "follow": True, "timestamps": True}
-                    if since_ts is not None:
-                        log_stream_kwargs["since"] = since_ts
-                    _log_status_gate = [time.monotonic() + 30.0]
-                    for line in container.logs(**log_stream_kwargs):
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(line), loop
-                        ).result(timeout=5)
-                        # Liveness check, THROTTLED to once per ~30s. Previously
-                        # reload() ran on EVERY log line -- a Docker round-trip per
-                        # line. A scan emitting 100k+ lines flooded the daemon,
-                        # slowing every request and starving the event loop (the
-                        # parallel-scan freeze). The stream generator ending already
-                        # stops the loop when a container exits, so a 30s liveness
-                        # poll loses nothing but the wasted daemon load.
-                        if time.monotonic() >= _log_status_gate[0]:
-                            _log_status_gate[0] = time.monotonic() + 30.0
-                            try:
-                                container.reload()
-                                if container.status not in ("running", "paused"):
-                                    break
-                            except Exception:
-                                break
-                except Exception as e:
-                    logger.error(f"Error in partial recon log reader: {e}")
-                finally:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(None), loop
-                        ).result(timeout=5)
-                    except Exception:
-                        pass
-
-            loop.run_in_executor(self._log_stream_executor, read_logs)
-
-            while True:
-                try:
-                    line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
-                    if line is None:
-                        break
-
+            async with aclosing(self._follow_container_logs(container, **log_kwargs)) as lines:
+                async for line in lines:
                     decoded_line = line.decode("utf-8", errors="replace").rstrip()
                     docker_ts, log_text = _split_docker_stamp(decoded_line)
                     if not log_text:
@@ -2866,14 +3003,6 @@ class ContainerManager:
                             if cur is None or docker_ts > cur:
                                 self.partial_recon_states[project_id][run_id].last_log_timestamp = docker_ts
                     yield event
-
-                except asyncio.TimeoutError:
-                    try:
-                        container.reload()
-                        if container.status not in ("running", "paused"):
-                            break
-                    except Exception:
-                        break
 
         except (NotFound, APIError):
             yield ReconLogEvent(
@@ -2989,6 +3118,8 @@ class ContainerManager:
         webapp_api_url: str,
         run_config: dict,
         ai_attack_path: str,
+        actor_user_id: Optional[str] = None,
+        actor_max_concurrent: Optional[int] = None,
     ) -> AiAttackSurfaceState:
         """Spawn an AI Attack Surface job: ensure the Ollama judge is up
         (ref-counted), write the run config, and start the scan container.
@@ -3011,12 +3142,15 @@ class ContainerManager:
         tool = run_config.get("tool", "skeleton")
 
         # Memory admission (Part 1): reserve this run's RAM envelope or reject.
-        await self._admit_scan("ai_attack", project_id, run_id, user_id=user_id)
+        actor = actor_user_id or user_id
+        await self._admit_scan("ai_attack", project_id, run_id, user_id=actor,
+                               max_per_user=actor_max_concurrent)
 
         state = AiAttackSurfaceState(
             project_id=project_id, run_id=run_id, tool=tool,
             status=AiAttackSurfaceStatus.STARTING,
             started_at=datetime.now(timezone.utc),
+            actor_user_id=actor,
         )
         self.ai_attack_states.setdefault(project_id, {})[run_id] = state
         config_path = None   # set once written; may be None if we fail before that
@@ -3081,7 +3215,8 @@ class ContainerManager:
                     "NEO4J_URI": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
                     "NEO4J_USER": os.environ.get("NEO4J_USER", "neo4j"),
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
-                    **self._scanner_env(),  # S3/E6: scoped scanner token
+                    # No scanner key: this run calls nothing back, and the bare key
+                    # would still sign a `source=recon` capture tag for any tenant.
                 },
                 volumes={
                     "/tmp/redamon": {"bind": "/tmp/redamon", "mode": "rw"},
@@ -3224,49 +3359,13 @@ class ContainerManager:
 
         try:
             container = self.client.containers.get(state.container_id)
-            log_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
 
             # Always replay from the start of the container's logs on every
             # (re)connect, so a page refresh restores the FULL status + phase +
             # log history (the client resets its log view on stream open to avoid
             # duplicates). This makes a running scan stateful across reloads.
-            def read_logs():
-                try:
-                    log_stream_kwargs = {"stream": True, "follow": True, "timestamps": True}
-                    _log_status_gate = [time.monotonic() + 30.0]
-                    for line in container.logs(**log_stream_kwargs):
-                        asyncio.run_coroutine_threadsafe(log_queue.put(line), loop).result(timeout=5)
-                        # Liveness check, THROTTLED to once per ~30s. Previously
-                        # reload() ran on EVERY log line -- a Docker round-trip per
-                        # line. A scan emitting 100k+ lines flooded the daemon,
-                        # slowing every request and starving the event loop (the
-                        # parallel-scan freeze). The stream generator ending already
-                        # stops the loop when a container exits, so a 30s liveness
-                        # poll loses nothing but the wasted daemon load.
-                        if time.monotonic() >= _log_status_gate[0]:
-                            _log_status_gate[0] = time.monotonic() + 30.0
-                            try:
-                                container.reload()
-                                if container.status not in ("running", "paused"):
-                                    break
-                            except Exception:
-                                break
-                except Exception as e:
-                    logger.error(f"Error in AI attack log reader: {e}")
-                finally:
-                    try:
-                        asyncio.run_coroutine_threadsafe(log_queue.put(None), loop).result(timeout=5)
-                    except Exception:
-                        pass
-
-            loop.run_in_executor(self._log_stream_executor, read_logs)
-
-            while True:
-                try:
-                    line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
-                    if line is None:
-                        break
+            async with aclosing(self._follow_container_logs(container, timestamps=True)) as lines:
+                async for line in lines:
                     decoded_line = line.decode("utf-8", errors="replace").rstrip()
                     docker_ts, log_text = _split_docker_stamp(decoded_line)
                     if not log_text:
@@ -3283,14 +3382,6 @@ class ContainerManager:
                             if cur is None or docker_ts > cur:
                                 runs[run_id].last_log_timestamp = docker_ts
                     yield event
-
-                except asyncio.TimeoutError:
-                    try:
-                        container.reload()
-                        if container.status not in ("running", "paused"):
-                            break
-                    except Exception:
-                        break
 
         except (NotFound, APIError):
             yield AiAttackSurfaceLogEvent(
@@ -3393,6 +3484,9 @@ class ContainerManager:
         webapp_api_url: str,
         recon_path: str,
         gvm_scan_path: str,
+        job_credential: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        actor_max_concurrent: Optional[int] = None,
     ) -> GvmState:
         """Start a GVM vulnerability scanner container for a project"""
 
@@ -3406,7 +3500,8 @@ class ContainerManager:
             raise ValueError(f"GVM scan for project {project_id} is still stopping")
 
         # Memory admission (Part 1): reserve this scan's RAM envelope or reject.
-        await self._admit_scan("gvm", project_id, user_id=user_id)
+        actor = actor_user_id or user_id
+        await self._admit_scan("gvm", project_id, user_id=actor, max_per_user=actor_max_concurrent)
 
         # Clean up any existing container
         container_name = self._get_gvm_container_name(project_id)
@@ -3422,6 +3517,7 @@ class ContainerManager:
             project_id=project_id,
             status=GvmStatus.STARTING,
             started_at=datetime.now(timezone.utc),
+            actor_user_id=actor,
         )
         self.gvm_states[project_id] = state
 
@@ -3458,6 +3554,7 @@ class ContainerManager:
                     "NEO4J_USER": os.environ.get("NEO4J_USER", "neo4j"),
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
                     **self._scanner_env(),  # S3/E6: scoped scanner token
+                    **self._job_env(job_credential),
                     # GVM connection settings
                     # Operator pin for the stall watchdog. Forwarded ONLY when set,
                     # so an unset knob reaches the scan as "use the shipped default"
@@ -3737,78 +3834,26 @@ class ContainerManager:
         try:
             container = self.client.containers.get(state.container_id)
 
-            log_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
-            def read_logs():
-                try:
-                    # Throttle the per-line liveness reload() below: next allowed
-                    # Docker status poll, in monotonic seconds (list = mutable box).
-                    _log_status_gate = [time.monotonic() + 30.0]
-                    for line in container.logs(stream=True, follow=True, timestamps=True):
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(line),
-                            loop
-                        ).result(timeout=5)
-                        # Liveness check, THROTTLED to once per ~30s. Previously
-                        # reload() ran on EVERY log line -- a Docker round-trip per
-                        # line. A scan emitting 100k+ lines flooded the daemon,
-                        # slowing every request and starving the event loop (the
-                        # parallel-scan freeze). The stream generator ending already
-                        # stops the loop when a container exits, so a 30s liveness
-                        # poll loses nothing but the wasted daemon load.
-                        if time.monotonic() >= _log_status_gate[0]:
-                            _log_status_gate[0] = time.monotonic() + 30.0
-                            try:
-                                container.reload()
-                                if container.status not in ("running", "paused"):
-                                    break
-                            except Exception:
-                                break
-                except Exception as e:
-                    logger.error(f"Error in GVM log reader thread: {e}")
-                finally:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(None),
-                            loop
-                        ).result(timeout=5)
-                    except Exception:
-                        pass
-
-            loop.run_in_executor(self._log_stream_executor, read_logs)
-
-            while True:
-                try:
-                    line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
-                    if line is None:
-                        break
-
+            async with aclosing(self._follow_container_logs(container, timestamps=True)) as lines:
+                async for line in lines:
                     decoded_line = line.decode("utf-8", errors="replace").rstrip()
-                    if decoded_line:
-                        docker_ts, log_text = _split_docker_stamp(decoded_line)
-                        if not log_text:
-                            continue
+                    if not decoded_line:
+                        continue
+                    docker_ts, log_text = _split_docker_stamp(decoded_line)
+                    if not log_text:
+                        continue
 
-                        event = self._parse_gvm_log_line(log_text, current_phase, current_phase_num, timestamp=docker_ts)
+                    event = self._parse_gvm_log_line(log_text, current_phase, current_phase_num, timestamp=docker_ts)
 
-                        if event.is_phase_start:
-                            current_phase = event.phase
-                            current_phase_num = event.phase_number
+                    if event.is_phase_start:
+                        current_phase = event.phase
+                        current_phase_num = event.phase_number
 
-                            if project_id in self.gvm_states:
-                                self.gvm_states[project_id].current_phase = current_phase
-                                self.gvm_states[project_id].phase_number = current_phase_num
+                        if project_id in self.gvm_states:
+                            self.gvm_states[project_id].current_phase = current_phase
+                            self.gvm_states[project_id].phase_number = current_phase_num
 
-                        yield event
-
-                except asyncio.TimeoutError:
-                    try:
-                        container.reload()
-                        if container.status not in ("running", "paused"):
-                            break
-                    except Exception:
-                        break
+                    yield event
 
         except (NotFound, APIError):
             yield GvmLogEvent(
@@ -3924,6 +3969,9 @@ class ContainerManager:
         user_id: str,
         webapp_api_url: str,
         github_hunt_path: str,
+        job_credential: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        actor_max_concurrent: Optional[int] = None,
     ) -> GithubHuntState:
         """Start a GitHub secret hunt container for a project"""
 
@@ -3933,7 +3981,8 @@ class ContainerManager:
             raise ValueError(f"GitHub hunt already active for project {project_id}")
 
         # Memory admission (Part 1): reserve this scan's RAM envelope or reject.
-        await self._admit_scan("github_hunt", project_id, user_id=user_id)
+        actor = actor_user_id or user_id
+        await self._admit_scan("github_hunt", project_id, user_id=actor, max_per_user=actor_max_concurrent)
 
         # Clean up any existing container
         container_name = self._get_github_hunt_container_name(project_id)
@@ -3950,6 +3999,7 @@ class ContainerManager:
             status=GithubHuntStatus.STARTING,
             started_at=datetime.now(timezone.utc),
             user_id=user_id,
+            actor_user_id=actor,
         )
         self.github_hunt_states[project_id] = state
 
@@ -3986,6 +4036,7 @@ class ContainerManager:
                     "NEO4J_USER": os.environ.get("NEO4J_USER", "neo4j"),
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
                     **self._scanner_env(),  # S3/E6: scoped scanner token
+                    **self._job_env(job_credential),
                 },
                 volumes={
                     # GitHub hunt output (read-write, for saving results)
@@ -4155,78 +4206,26 @@ class ContainerManager:
         try:
             container = self.client.containers.get(state.container_id)
 
-            log_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
-            def read_logs():
-                try:
-                    # Throttle the per-line liveness reload() below: next allowed
-                    # Docker status poll, in monotonic seconds (list = mutable box).
-                    _log_status_gate = [time.monotonic() + 30.0]
-                    for line in container.logs(stream=True, follow=True, timestamps=True):
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(line),
-                            loop
-                        ).result(timeout=5)
-                        # Liveness check, THROTTLED to once per ~30s. Previously
-                        # reload() ran on EVERY log line -- a Docker round-trip per
-                        # line. A scan emitting 100k+ lines flooded the daemon,
-                        # slowing every request and starving the event loop (the
-                        # parallel-scan freeze). The stream generator ending already
-                        # stops the loop when a container exits, so a 30s liveness
-                        # poll loses nothing but the wasted daemon load.
-                        if time.monotonic() >= _log_status_gate[0]:
-                            _log_status_gate[0] = time.monotonic() + 30.0
-                            try:
-                                container.reload()
-                                if container.status not in ("running", "paused"):
-                                    break
-                            except Exception:
-                                break
-                except Exception as e:
-                    logger.error(f"Error in GitHub hunt log reader thread: {e}")
-                finally:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(None),
-                            loop
-                        ).result(timeout=5)
-                    except Exception:
-                        pass
-
-            loop.run_in_executor(self._log_stream_executor, read_logs)
-
-            while True:
-                try:
-                    line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
-                    if line is None:
-                        break
-
+            async with aclosing(self._follow_container_logs(container, timestamps=True)) as lines:
+                async for line in lines:
                     decoded_line = line.decode("utf-8", errors="replace").rstrip()
-                    if decoded_line:
-                        docker_ts, log_text = _split_docker_stamp(decoded_line)
-                        if not log_text:
-                            continue
+                    if not decoded_line:
+                        continue
+                    docker_ts, log_text = _split_docker_stamp(decoded_line)
+                    if not log_text:
+                        continue
 
-                        event = self._parse_github_hunt_log_line(log_text, current_phase, current_phase_num, timestamp=docker_ts)
+                    event = self._parse_github_hunt_log_line(log_text, current_phase, current_phase_num, timestamp=docker_ts)
 
-                        if event.is_phase_start:
-                            current_phase = event.phase
-                            current_phase_num = event.phase_number
+                    if event.is_phase_start:
+                        current_phase = event.phase
+                        current_phase_num = event.phase_number
 
-                            if project_id in self.github_hunt_states:
-                                self.github_hunt_states[project_id].current_phase = current_phase
-                                self.github_hunt_states[project_id].phase_number = current_phase_num
+                        if project_id in self.github_hunt_states:
+                            self.github_hunt_states[project_id].current_phase = current_phase
+                            self.github_hunt_states[project_id].phase_number = current_phase_num
 
-                        yield event
-
-                except asyncio.TimeoutError:
-                    try:
-                        container.reload()
-                        if container.status not in ("running", "paused"):
-                            break
-                    except Exception:
-                        break
+                    yield event
 
         except (NotFound, APIError):
             yield GithubHuntLogEvent(
@@ -5144,12 +5143,16 @@ exit $RC
                                  repo_override_host: Optional[str] = None,
                                  repo_override_ref: Optional[str] = None,
                                  repo_override_scope: Optional[str] = None,
-                                 repo_override_deep: Optional[bool] = None) -> "SupplyChainState":
+                                 repo_override_deep: Optional[bool] = None,
+                                 job_credential: Optional[str] = None,
+                                 actor_user_id: Optional[str] = None,
+                                 actor_max_concurrent: Optional[int] = None) -> "SupplyChainState":
         current = await self.get_supply_chain_status(project_id)
         if current.status in (SupplyChainStatus.RUNNING, SupplyChainStatus.PAUSED):
             raise ValueError(f"Supply-chain scan already active for project {project_id}")
 
-        await self._admit_scan("supply_chain", project_id, user_id=user_id)
+        actor = actor_user_id or user_id
+        await self._admit_scan("supply_chain", project_id, user_id=actor, max_per_user=actor_max_concurrent)
 
         # Lazy-on-scan: refresh the offline OSV DB if it is stale (TTL-guarded, so
         # this is a ~1s no-op when already fresh). Best-effort - never blocks the
@@ -5167,7 +5170,7 @@ exit $RC
 
         state = SupplyChainState(
             project_id=project_id, status=SupplyChainStatus.STARTING,
-            started_at=datetime.now(timezone.utc))
+            started_at=datetime.now(timezone.utc), actor_user_id=actor)
         self.supply_chain_states[project_id] = state
 
         # Scan Queue Phase 6: per-repo override for an org-batch item. When set, the
@@ -5222,6 +5225,7 @@ exit $RC
                     "NEO4J_USER": os.environ.get("NEO4J_USER", "neo4j"),
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
                     **self._scanner_env(),
+                    **self._job_env(job_credential),
                     # Operator overrides for the dirty analyzer this scan spawns.
                     **self._analyzer_env(),
                     # Per-repo override for an org-batch item (Phase 6); empty otherwise.
@@ -5347,42 +5351,18 @@ exit $RC
         return state
 
     async def stream_supply_chain_logs(self, project_id: str) -> AsyncGenerator["SupplyChainLogEvent", None]:
-        # L1-4: the blocking container.logs(follow=True) iterator must run in the
-        # log-stream executor and bridge via an asyncio.Queue, or it blocks the
-        # single event loop between log lines (freezing every other request -
-        # the exact hazard the dual-threadpool design prevents). Mirrors
-        # stream_trufflehog_logs / stream_logs.
         state = await self.get_supply_chain_status(project_id)
         if not state.container_id:
             return
-        container_id = state.container_id
-        loop = asyncio.get_event_loop()
-        queue: asyncio.Queue = asyncio.Queue()
-        _SENTINEL = object()
-
-        def _reader():
-            try:
-                container = self.client.containers.get(container_id)
-                for raw in container.logs(stream=True, follow=True):
-                    try:
-                        line = raw.decode("utf-8", errors="replace").rstrip("\n")
-                    except Exception:
-                        continue
-                    if line:
-                        loop.call_soon_threadsafe(queue.put_nowait, line)
-            except (NotFound, APIError):
-                pass
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning(f"[supply-chain] log reader error: {exc}")
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, _SENTINEL)
-
-        self._log_stream_executor.submit(_reader)
-        while True:
-            item = await queue.get()
-            if item is _SENTINEL:
-                break
-            yield SupplyChainLogEvent(log=item, timestamp=datetime.now(timezone.utc))
+        try:
+            container = await self._run_blocking(self.client.containers.get, state.container_id)
+        except (NotFound, APIError):
+            return
+        async with aclosing(self._follow_container_logs(container)) as lines:
+            async for raw in lines:
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                if line:
+                    yield SupplyChainLogEvent(log=line, timestamp=datetime.now(timezone.utc))
 
     def get_supply_chain_running_count(self) -> int:
         return sum(1 for st in self.supply_chain_states.values()
@@ -5469,6 +5449,8 @@ exit $RC
         config: Optional[dict] = None,
         common: Optional[dict] = None,
         secrets: Optional[dict] = None,
+        actor_user_id: Optional[str] = None,
+        actor_max_concurrent: Optional[int] = None,
     ) -> TrufflehogState:
         """Start ONE TruffleHog source for a project.
 
@@ -5536,9 +5518,11 @@ exit $RC
             raise ValueError(
                 f"A {src.label} scan is already running for project {project_id}"
             )
+        actor = actor_user_id or user_id
         state = TrufflehogState(
             project_id=project_id,
             user_id=user_id,
+            actor_user_id=actor,
             source=source,
             run_id=source,
             target=target,
@@ -5552,7 +5536,7 @@ exit $RC
             # Memory admission on the source-qualified kind; the reconcile key in
             # _active_scan_keys is built the same way or the reaper frees this.
             await self._admit_scan(self._trufflehog_kind(source), project_id, source,
-                                   user_id=user_id)
+                                   user_id=actor, max_per_user=actor_max_concurrent)
         except Exception:
             # Release the slot: a rejected admission must not leave a phantom
             # STARTING run that blocks every later start of this source.
@@ -5998,81 +5982,29 @@ exit $RC
         try:
             container = self.client.containers.get(state.container_id)
 
-            log_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
-            def read_logs():
-                try:
-                    # Throttle the per-line liveness reload() below: next allowed
-                    # Docker status poll, in monotonic seconds (list = mutable box).
-                    _log_status_gate = [time.monotonic() + 30.0]
-                    for line in container.logs(stream=True, follow=True, timestamps=True):
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(line),
-                            loop
-                        ).result(timeout=5)
-                        # Liveness check, THROTTLED to once per ~30s. Previously
-                        # reload() ran on EVERY log line -- a Docker round-trip per
-                        # line. A scan emitting 100k+ lines flooded the daemon,
-                        # slowing every request and starving the event loop (the
-                        # parallel-scan freeze). The stream generator ending already
-                        # stops the loop when a container exits, so a 30s liveness
-                        # poll loses nothing but the wasted daemon load.
-                        if time.monotonic() >= _log_status_gate[0]:
-                            _log_status_gate[0] = time.monotonic() + 30.0
-                            try:
-                                container.reload()
-                                if container.status not in ("running", "paused"):
-                                    break
-                            except Exception:
-                                break
-                except Exception as e:
-                    logger.error(f"Error in TruffleHog log reader thread: {e}")
-                finally:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            log_queue.put(None),
-                            loop
-                        ).result(timeout=5)
-                    except Exception:
-                        pass
-
-            loop.run_in_executor(self._log_stream_executor, read_logs)
-
-            while True:
-                try:
-                    line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
-                    if line is None:
-                        break
-
+            async with aclosing(self._follow_container_logs(container, timestamps=True)) as lines:
+                async for line in lines:
                     decoded_line = line.decode("utf-8", errors="replace").rstrip()
-                    if decoded_line:
-                        docker_ts, log_text = _split_docker_stamp(decoded_line)
-                        if not log_text:
-                            continue
+                    if not decoded_line:
+                        continue
+                    docker_ts, log_text = _split_docker_stamp(decoded_line)
+                    if not log_text:
+                        continue
 
-                        if th_sources is not None:
-                            log_text = th_sources.redact(log_text, dict(os.environ))
-                        event = self._parse_trufflehog_log_line(log_text, current_phase, current_phase_num, timestamp=docker_ts)
+                    if th_sources is not None:
+                        log_text = th_sources.redact(log_text, dict(os.environ))
+                    event = self._parse_trufflehog_log_line(log_text, current_phase, current_phase_num, timestamp=docker_ts)
 
-                        if event.is_phase_start:
-                            current_phase = event.phase
-                            current_phase_num = event.phase_number
+                    if event.is_phase_start:
+                        current_phase = event.phase
+                        current_phase_num = event.phase_number
 
-                            run = self.trufflehog_states.get(project_id, {}).get(source)
-                            if run is not None:
-                                run.current_phase = current_phase
-                                run.phase_number = current_phase_num
+                        run = self.trufflehog_states.get(project_id, {}).get(source)
+                        if run is not None:
+                            run.current_phase = current_phase
+                            run.phase_number = current_phase_num
 
-                        yield event
-
-                except asyncio.TimeoutError:
-                    try:
-                        container.reload()
-                        if container.status not in ("running", "paused"):
-                            break
-                    except Exception:
-                        break
+                    yield event
 
         except (NotFound, APIError):
             yield TrufflehogLogEvent(

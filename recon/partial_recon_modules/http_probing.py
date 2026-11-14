@@ -18,11 +18,35 @@ from recon.partial_recon_modules.helpers import (
     _resolve_hostname,
     _should_include_root_domain,
     host_in_roots,
+    ip_mode_recon,
     partial_settings,
     root_for_host,
     scope_roots,
+    typed_host_domain,
+    typed_ip_attach_to,
+    keep_selected_names,
 )
 from recon.partial_recon_modules.graph_builders import _build_port_scan_data_from_graph
+from recon.partial_recon_modules.port_scanning import measured_port_data
+
+
+def _answered_ports(result: dict) -> dict:
+    """{host: {port, ...}} from the URLs httpx was asked for and got a response on.
+
+    by_url is keyed by the requested URL, so its host and port are the probe's
+    target even when the page redirected elsewhere.
+    """
+    from urllib.parse import urlsplit
+    answered: dict = {}
+    for url in ((result.get("http_probe") or {}).get("by_url") or {}):
+        try:
+            parts = urlsplit(str(url))
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+        except ValueError:
+            continue
+        if parts.hostname:
+            answered.setdefault(parts.hostname.lower(), set()).add(port)
+    return answered
 
 
 def run_httpx(config: dict) -> None:
@@ -88,7 +112,7 @@ def run_httpx(config: dict) -> None:
             except (ValueError, TypeError):
                 print(f"[!][Partial Recon] Skipping invalid port: {entry}")
 
-        ip_attach_to = user_targets.get("ip_attach_to")
+        ip_attach_to = typed_ip_attach_to(user_targets)
 
     if user_hostnames:
         print(f"[+][Partial Recon] Validated {len(user_hostnames)} custom hostnames")
@@ -140,7 +164,7 @@ def run_httpx(config: dict) -> None:
         )
     else:
         print(f"[*][Partial Recon] Skipping graph targets (user opted out)")
-        recon_data = {
+        recon_data = ip_mode_recon({
             "domain": roots[0] if roots else "",
             "domains": roots,
             "port_scan": {
@@ -151,7 +175,7 @@ def run_httpx(config: dict) -> None:
                 "domain": {"ips": {"ipv4": [], "ipv6": []}, "has_records": False},
                 "subdomains": {},
             },
-        }
+        }, settings)
 
     # STEP 1: Resolve user-provided hostnames and add to recon_data DNS section
     resolved_hostnames = {}
@@ -182,6 +206,9 @@ def run_httpx(config: dict) -> None:
                         driver = graph_client.driver
                         with driver.session() as session:
                             for hostname, ips in resolved_hostnames.items():
+                                # The source is provenance: a name another writer
+                                # made keeps its own (an IP-mode typed name is the
+                                # hostname writer's, and S is read by that source).
                                 session.run(
                                     """
                                     MERGE (s:Subdomain {name: $name, user_id: $uid, project_id: $pid})
@@ -189,7 +216,7 @@ def run_httpx(config: dict) -> None:
                                         s.status = coalesce(s.status, 'resolved'),
                                         s.discovered_at = coalesce(s.discovered_at, datetime()),
                                         s.updated_at = datetime(),
-                                        s.source = 'partial_recon_user_input'
+                                        s.source = coalesce(s.source, 'partial_recon_user_input')
                                     """,
                                     name=hostname, uid=user_id, pid=project_id,
                                 )
@@ -200,7 +227,7 @@ def run_httpx(config: dict) -> None:
                                     MERGE (s)-[:BELONGS_TO]->(d)
                                     MERGE (d)-[:HAS_SUBDOMAIN]->(s)
                                     """,
-                                    domain=attach_org(root_for_host(hostname, roots)), sub=hostname,
+                                    domain=typed_host_domain(hostname, roots), sub=hostname,
                                     uid=user_id, pid=project_id,
                                 )
                                 for ip_version in ("ipv4", "ipv6"):
@@ -419,6 +446,9 @@ def run_httpx(config: dict) -> None:
     # scope guard — otherwise a project-level custom-port setting could drop the
     # ports the user picked for this specific partial run.
     settings["HTTPX_ENFORCE_CUSTOM_PORT_SCOPE"] = False
+    # IP mode: the run's hostnames (S) are probed by name and their rows kept,
+    # as the full run keeps its selected names.
+    keep_selected_names(recon_data)
     print(f"[*][Partial Recon] Running httpx HTTP probing...")
     result = _run_http_probe(recon_data, output_file=None, settings=settings)
 
@@ -429,10 +459,18 @@ def run_httpx(config: dict) -> None:
         with Neo4jClient() as graph_client:
             if graph_client.verify_connection():
                 # Create Port nodes for user-injected targets (subdomains + IPs)
-                # so the full chain IP -> Port -> Service -> BaseURL connects
+                # so the full chain IP -> Port -> Service -> BaseURL connects.
+                # Only the typed targets' ports httpx got an answer on: the
+                # graph's own ports, and a probed port that stayed silent, are
+                # not this run's measurement (D5).
                 if (resolved_hostnames or user_ip_addrs) and "port_scan" in result:
+                    typed = {h.lower() for h in [*resolved_hostnames, *user_ip_addrs]}
+                    answered = _answered_ports(result)
+                    measured = {key: answered[key.lower()]
+                                for key in result["port_scan"].get("by_host", {})
+                                if key.lower() in typed and key.lower() in answered}
                     ps_stats = graph_client.update_graph_from_port_scan(
-                        recon_data=result,
+                        recon_data=measured_port_data(result, measured),
                         user_id=user_id,
                         project_id=project_id,
                     )
@@ -480,7 +518,7 @@ def run_httpx(config: dict) -> None:
                                     version=ip_version, ui_id=user_input_id,
                                 )
                             graph_client.update_user_input_status(
-                                user_input_id, "completed", stats
+                                user_input_id, "completed", stats, user_id=user_id, project_id=project_id
                             )
                             print(f"[+][Partial Recon] Linked {len(user_ip_addrs)} IPs via UserInput PRODUCED")
 
@@ -495,7 +533,7 @@ def run_httpx(config: dict) -> None:
                 from graph_db import Neo4jClient
                 with Neo4jClient() as gc:
                     if gc.verify_connection():
-                        gc.update_user_input_status(user_input_id, "error", {"error": str(e)})
+                        gc.update_user_input_status(user_input_id, "error", {"error": str(e)}, user_id=user_id, project_id=project_id)
             except Exception:
                 pass
         raise

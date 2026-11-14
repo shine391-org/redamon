@@ -69,10 +69,12 @@ def _extract_ips_from_recon(combined_result: dict) -> list[str]:
             if ip:
                 ips.add(ip)
 
-    if combined_result.get("metadata", {}).get("ip_mode"):
-        for ip in combined_result["metadata"].get("expanded_ips", []):
-            if ip:
-                ips.add(ip)
+    # IP mode: the target list only. A DNS answer (a PTR name's forward
+    # address) need not be a target, and the lookup would be about it. A dict
+    # that declares no list asks about nothing (every IP-mode builder declares it).
+    metadata = combined_result.get("metadata") or {}
+    if metadata.get("ip_mode"):
+        return sorted({ip for ip in metadata.get("expanded_ips") or [] if ip})
 
     return sorted(ips)
 
@@ -375,6 +377,10 @@ def run_otx_enrichment(combined_result: dict, settings: dict[str, Any]) -> dict:
 
     domain = combined_result.get("domain", "") or ""
     is_ip_mode = combined_result.get("metadata", {}).get("ip_mode", False)
+    # IP only asks no name about a target (I-7): the per-IP passive DNS is
+    # nothing but names.
+    from recon.helpers.ip_hostnames import names_off
+    ask_passive_dns = not names_off(combined_result, settings)
     ips = _extract_ips_from_recon(combined_result)
     ips = filter_ips_for_enrichment(ips, combined_result, "OTX")
 
@@ -422,7 +428,8 @@ def run_otx_enrichment(combined_result: dict, settings: dict[str, Any]) -> dict:
                 return None
             gen_body = gen.data
 
-            pdns_records = _otx_passive_dns_records(_section(passive_dns, f"/IPv4/{ip}/passive_dns"))
+            pdns_records = (_otx_passive_dns_records(_section(passive_dns, f"/IPv4/{ip}/passive_dns"))
+                            if ask_passive_dns else [])
             malware_list = _otx_malware_samples(_section(malware, f"/IPv4/{ip}/malware"))
             url_count = _otx_url_count(_section(url_list, f"/IPv4/{ip}/url_list"))
 

@@ -419,9 +419,11 @@ between a compromised publisher and code on the host is the catalog signature
 explicit `PLUGINS_EXTRA_TRUSTED_KEYS` opt-in), the archive's SHA-256, a catalog
 `serial` that may never go backwards, and an unpack that rejects absolute paths,
 `..`, links and oversize archives. Installing, updating, enabling, rolling back
-and uninstalling are instance-wide, admin-only actions, and the admin role is
-read from the database on every request rather than from the login token, which
-can outlive a demotion by up to seven days.
+and uninstalling are instance-wide actions of whoever holds `platform:plugins`
+(every admin while `RBAC_PERMISSIONS_ENABLED` is off; with it on, an admin profile
+or a member override that holds it), and the account is read from the database on
+every request rather than from the login token, which can outlive a demotion by up
+to seven days.
 
 **Plugin code is treated as hostile once it runs.** Containment does not depend
 on the plugin using the SDK:
@@ -548,9 +550,9 @@ graph TB
     subgraph TB3 [Semi-trusted compute]
         AGENT[agent - holds INTERNAL_API_KEY, NEO4J, LLM keys]
     end
-    subgraph TB4 [Least-trusted - target facing, no secrets]
+    subgraph TB4 [Least-trusted - target facing, no master key]
         KALI[kali-sandbox worker]
-        SCAN[spawned scanners - host net, INTERNAL_API_KEY]
+        SCAN[spawned scanners - host net, SCANNER_API_KEY + job credential, NEO4J_PASSWORD]
     end
     subgraph TB5 [External / untrusted]
         TGT[Targets + OSINT + LLM APIs]
@@ -582,10 +584,10 @@ graph TB
 |-------------------|-------------------------------|-------------------|
 | Browser → webapp | JWT (HS256) in httpOnly cookie; `middleware.ts` verifies + injects `x-user-id`/`x-user-role`; public-path allowlist | `AUTH_SECRET`/keys default to `changeme` if unset |
 | webapp → orchestrator | `X-Orchestrator-Key`, constant-time `hmac.compare_digest`; fail-closed; orchestrator bound to `127.0.0.1` + isolated network | Single shared static key |
-| webapp/agent → service APIs | `X-Internal-Key` (`INTERNAL_API_KEY`) header; as of wave 2 `/graph/exec` and `/emergency-stop-all` also require `require_internal_auth` (a valid `INTERNAL_API_KEY`/scoped `SCANNER_API_KEY`) | Tenant identity in the body of `/graph/exec` is now dual-mode (accepted and logged) pending the R12 enforce flip |
-| orchestrator → Docker daemon | **docker-broker** filters `create`: image allowlist, denies `--privileged`, host-root binds, docker.sock mount, dangerous caps/namespaces, `unconfined` | Broker is sole guard for host-root-equivalent socket |
-| worker → graph | `/graph/exec` requires `require_internal_auth`; the worker now presents the scoped `SCANNER_API_KEY` (never a master secret); write Cypher blocked (regex, now incl. `apoc.atomic.*`) + `user_id`/`project_id` tenant filter injected; worker holds no Neo4j creds | Tenant identity is authenticated at the caller but the body-supplied tenant is still dual-mode (logged), not yet enforced |
-| spawned scanner → host | Host network + `NET_RAW`; mounts the **broker** socket, not raw socket; capability-restricted | Scanners do hold `INTERNAL_API_KEY` |
+| webapp/agent → service APIs | `X-Internal-Key` (`INTERNAL_API_KEY`) header; the scoped `SCANNER_API_KEY` opens only the scan routes (the agent's `/llm/*` and `/jev/*`; the webapp's settings, project and traffic-ingest reads) and only beside the scan's job credential, bound to its tenant and project (RBAC step 1.16); `/graph/exec` takes the master key or a run credential (worker → graph below) | A master-key caller of `/graph/exec` names the tenant in the body |
+| orchestrator → Docker daemon | **docker-broker** blocks by default: only the Docker API routes the tools use are forwarded (exec, archive, update, build, image push/tag and the rest get a 403); `create` is filtered: image allowlist, denies `--privileged`, binds outside `/tmp/redamon` and three read-only repository tool directories, docker.sock mount, read-write named volumes other than `nuclei-templates`, dangerous caps/namespaces, `unconfined` | Broker is sole guard for host-root-equivalent socket |
+| worker → graph | `/graph/exec` and `/text-to-cypher` require the master key or a `graph` run credential (`require_master_or_run_credential`); the terminal's `redagraph` presents the one the agent minted for that connection (one user and project, honoured only while that connection is open, at most 12 h), never the scanner key, which the worker no longer holds; write Cypher blocked (regex, now incl. `apoc.atomic.*`) + `user_id`/`project_id` tenant filter injected; worker holds no Neo4j creds | With a run credential the tenant comes from it and the body's ids are ignored; master-key callers (the webapp) still name the tenant in the body |
+| spawned scanner → host | Host network + `NET_RAW`; mounts the **broker** socket, not raw socket; capability-restricted; no `INTERNAL_API_KEY`: the five scans that call back hold the scoped `SCANNER_API_KEY` and their job credential (one tenant and project, 7 days), the AI attack and TruffleHog containers neither | Every scan that writes the graph (all but TruffleHog) holds `NEO4J_PASSWORD`, the database's one account, so a compromised scan container reads and writes every tenant's graph; the bare scanner key still signs `source=recon` capture tags for any tenant (SECURITY_POSTURE §20) |
 | platform → targets/LLMs | Hard guardrail (`.gov/.mil/.edu/.int` + ~310 intergovernmental domains, non-disableable) + LLM soft guardrail + RoE time-window pre-flight | Soft guardrail is LLM-based ("be lenient"); fails open |
 | DBs | PostgreSQL/Neo4j on bridge net with credentials | Secrets stored plaintext at rest in `user_settings`/`user_llm_providers` |
 | plugin worker → webapp Gateway | Only through the `plugin-gateway` proxy, which passes `/api/plugin-gateway/v1/*` and `/api/plugin-runner/v1/*` and nothing else; a call token bound to (plugin, user, project, session), limited to its action or job and to `PLUGIN_GATEWAY_CALLS_PER_TOKEN` calls; every call re-checks the plugin's state, the permission (granted and declared) and the tenancy; transcripts masked and capped | A plugin with `session:read` sees target data; masking is not anonymisation |
@@ -620,7 +622,7 @@ Host-published listeners (from `docker-compose.yml`), shown for the **local** po
 | MCP playwright | kali-sandbox | SSE/HTTP | `127.0.0.1:8005` | Bearer `MCP_AUTH_TOKEN` | **Loopback only** |
 | MSF / Hydra progress | kali-sandbox | HTTP | `127.0.0.1:8013` / `8014` | None (loopback + agent-internal) | **Loopback only** (2026-07-05) |
 | Tunnel manager | kali-sandbox | HTTP | `127.0.0.1:8015` | Push-config trigger (loopback) | **Loopback only** (2026-07-05) |
-| Interactive terminal WS | kali-sandbox | WS | `127.0.0.1:8016` | Init-frame tenant ctx | **Loopback only** |
+| Interactive terminal WS | kali-sandbox | WS | `kali-sandbox:8016` | Bearer `MCP_AUTH_TOKEN` (the agent's proxy only) + the proxy's ticket identity | **Not published** (GHSA-3cjg-8cp8-j269) |
 | Reverse-shell / ngrok | kali-sandbox | TCP/HTTP | `4444` / `127.0.0.1:4040` | None | 4444 LAN (direct reverse shells) local; **public: `127.0.0.1`, `ufw`-opened to target CIDRs per engagement**; 4040 loopback |
 | Ollama judge (on-demand) | local-llm | HTTP | `11434` | None | Spawned per scan |
 | GVM (gvmd/ospd) | GVM stack | Unix socket | n/a | Socket + GVM `admin/admin` | Internal only (no host port) |
@@ -634,7 +636,7 @@ Webapp server-side routes under `webapp/src/app/api/` (all behind `middleware.ts
 | Route group | Examples | Auth / validation |
 |-------------|----------|-------------------|
 | Auth | `/api/auth/login`, `/logout`, `/me` | Public login; bcrypt compare → JWT cookie |
-| Public allowlist | `/api/health`, `/api/version/check`, `/api/global/tunnel-config/sync` | **Unauthenticated by design** |
+| Public allowlist | `/api/health`, `/api/version/check`; `/api/global/tunnel-config/sync`; `/api/mcp-server`; with `RBAC_IDENTITY_ENABLED` on, `/invite` and `/api/invite/*` | No session cookie. The first two are **unauthenticated by design**; the sync takes only the sandbox's `TUNNEL_AUTH_TOKEN` bearer, the MCP server a personal access token, the invite paths a one-time invite link |
 | Scan orchestration | `/api/recon|gvm|trufflehog|github-hunt|ai-attack-surface/[projectId]/*` (start/stop/status/logs) | JWT; proxied with `X-Orchestrator-Key` |
 | Agent | `/api/agent/command-whisperer`, `/api/agent/sessions/*`, `/api/agent/workspace/*` | JWT; agent proxy (no auth header to agent) |
 | Graph | `/api/graph`, `/api/graph-views/*` | JWT; Neo4j basic auth server-side |
@@ -645,10 +647,10 @@ Webapp server-side routes under `webapp/src/app/api/` (all behind `middleware.ts
 | Reports / analytics | `/api/reports/*`, `/api/analytics/redzone/*`, `/api/projects/[id]/reports` | JWT |
 | **File uploads** | `/api/projects/[id]/wordlists` (≤50 MB `.txt`), `/api/nuclei-templates` (≤1 MB `.yaml`), `/api/js-recon/[projectId]/upload` (≤10 MB), `/api/roe/parse` (≤20 MB PDF/DOCX → LLM), `/api/users/[id]/attack-skills/batch` (up to 50 `.md` skills of up to 500 KB each, sent as JSON, at most 8 MB: a larger `content-length` is refused with 413 before the body is read) | JWT; extension allowlist + `path.basename` sanitization; the skill batch is text read by the browser, never stored as a file |
 | Projects | `/api/projects/*` (CRUD, import/export, presets) | JWT |
-| Triage and Mute Rules | `/api/triage/{findings,verdict,mute,unmute,muted,preflight}`, `/api/projects/[id]/node-filters/{,preview,apply,disarm,exemptions,status,runs/[runId]}` | JWT; strict owner check (`requireProjectOwner`: 404, not relaxed by `ACCESS_ENFORCE=0`), because these decide what the operator and the agent can see; every mutation with a body is JSON-only (415); Mute Rules changes and unmutes are audited with the real actor (a person's mute and a UI verdict are not) |
+| Triage and Mute Rules | `/api/triage/{findings,verdict,mute,unmute,muted,preflight}`, `/api/projects/[id]/node-filters/{,preview,apply,disarm,exemptions,status,runs/[runId]}` | JWT; strict owner check (`requireProjectOwner`: 404), because these decide what the operator and the agent can see; every mutation with a body is JSON-only (415); Mute Rules changes and unmutes are audited with the real actor (a person's mute and a UI verdict are not) |
 | User presets | `/api/presets/*` (recon), `/api/mute-rule-presets/*` (Mute Rules) | JWT; scoped to the effective user; another user's preset answers 404 |
 | Internal check-ins | `/api/internal/triage-runs/*`, `/api/internal/node-filter-runs/[runId]{,/heartbeat,/finish}` | `X-Internal-Key` + route allowlist; each route re-checks `isInternalRequest`, and the run id, never the body, decides the project |
-| Plugins | Lifecycle: `/api/plugins`, `/api/plugins/[pluginId]/{install,update,enable,disable,rollback,uninstall,logs,export}`, `/api/plugins/offline-install`. Use: `/api/plugins/{status,contributions,llm-features}`, `/api/plugins/[pluginId]/actions/[actionId]`, `/api/plugins/jobs/[jobId]{,/cancel}`, `/api/plugins/overrides/{versions,summary,reset}`, `/api/plugins/overrides/change-sets/[id]{,/approve,/reject}` | JWT; same-origin JSON only (`PLUGINS_ALLOWED_ORIGIN` behind a reverse proxy). Lifecycle routes are instance-wide and admin-only, with the role read from the database on every request; actions, jobs and override decisions are scoped to the acting user. Lifecycle operations and override decisions are audited |
+| Plugins | Lifecycle: `/api/plugins`, `/api/plugins/[pluginId]/{install,update,enable,disable,rollback,uninstall,logs,export}`, `/api/plugins/offline-install`. Use: `/api/plugins/{status,contributions,llm-features}`, `/api/plugins/[pluginId]/actions/[actionId]`, `/api/plugins/jobs/[jobId]{,/cancel}`, `/api/plugins/overrides/{versions,summary,reset}`, `/api/plugins/overrides/change-sets/[id]{,/approve,/reject}` | JWT; same-origin JSON only (`PLUGINS_ALLOWED_ORIGIN` behind a reverse proxy). Lifecycle routes are instance-wide and need `platform:plugins` (every admin while `RBAC_PERMISSIONS_ENABLED` is off), asked of the account read from the database on every request; actions, jobs and override decisions are scoped to the acting user. Lifecycle operations and override decisions are audited |
 | Plugin Gateway (plugin code) | `/api/plugin-gateway/v1/{session/read,data/{get,put,query,count,delete},llm/invoke,override/{get,propose,withdraw},jobs/{progress,complete}}` | **No session cookie** (middleware token-auth prefix): a call token only, re-authorized on every call; JSON only; body sizes bounded. Reached by plugin workers through the proxy; **nginx answers `404` in the public posture** |
 | Plugin runner callback | `/api/plugin-runner/v1/run-list` | **No session cookie**: `PLUGIN_RUNNER_KEY`, fail-closed; **nginx `404` in the public posture** |
 | Plugin reconcile | `POST /api/internal/plugins/reconcile` | `X-Internal-Key` + route allowlist, re-checked with `isInternalRequest`; called by the recon orchestrator every `PLUGIN_RECONCILE_INTERVAL` (300 s); **nginx `404` in the public posture** |
@@ -677,7 +679,7 @@ Webapp server-side routes under `webapp/src/app/api/` (all behind `middleware.ts
 | On-demand Ollama judge | AI-attack-surface scan launch | Ref-counted lease; torn down at zero leases (`local_llm_manager.py`) |
 | KB-refresh sidecar | `--profile kb-refresh`, opt-in | Sleep-loop scheduler: daily NVD, weekly ExploitDB/Nuclei, monthly GTFOBins/LOLBAS (`docker-compose.yml`) |
 | MSF / Nuclei auto-update | `MSF_AUTO_UPDATE` / `NUCLEI_AUTO_UPDATE` env on kali boot | Pulls external content into the worker |
-| Tunnel-config sync | Worker boot → webapp push to `:8015` | Worker calls unauthenticated `/api/global/tunnel-config/sync`; webapp pushes config |
+| Tunnel-config sync | Worker boot → webapp push to `:8015` | Worker calls `/api/global/tunnel-config/sync` with the `TUNNEL_AUTH_TOKEN` bearer (sent on stdin; 401 otherwise); webapp pushes config |
 | CodeFix / Triage agents | Operator-initiated code fix | Clone GitHub repo (token via `GIT_ASKPASS`); **build/test (`github_bash`) runs in an isolated per-job sandbox** via `docker exec` (agent → webapp → orchestrator), not in the agent; commit stages **only approved files** (no `git add -A`); push refused to default/`main`/`master` (`cypherfix_codefix/`, `scanners/codefix_sandbox/`) |
 | LangGraph checkpointer | Every agent/fireteam step | Persists agent state to PostgreSQL (`PERSISTENT_CHECKPOINTER=true`) |
 | Plugin workers | A user's plugin action | Started by the runner's supervisor, one process per plugin version under its own UID; killed on timeout or limit; reach the stack only through the proxy |
@@ -750,7 +752,7 @@ Per-listener reachability in each posture (host publish → who can connect):
 | `8000/8002/8003/8004/8005` | Kali MCP servers | `127.0.0.1` | `127.0.0.1` |
 | `8013` / `8014` | MSF / Hydra progress | `127.0.0.1` | `127.0.0.1` |
 | `8015` | tunnel manager | `127.0.0.1` | `127.0.0.1` |
-| `8016` | terminal PTY | `127.0.0.1` | `127.0.0.1` |
+| `8016` | terminal PTY | not published | not published |
 | `4040` | ngrok API | `127.0.0.1` | `127.0.0.1` |
 | `7071` / `7072` | plugin-gateway proxy | not published (internal plugin networks) | not published |
 | `7080` | plugin runner supervisor | not published (`redamon-plugins-net`) | not published |
@@ -776,7 +778,9 @@ The webapp middleware (`webapp/src/middleware.ts`) enforces the JWT cookie on ev
 - `/api/auth/login`, `/api/auth/logout`
 - `/api/health`
 - `/api/version/check`
-- `/api/global/tunnel-config/sync`
+- `/api/global/tunnel-config/sync` (the sandbox's `TUNNEL_AUTH_TOKEN` bearer instead of a cookie)
+- `/api/mcp-server` (a personal access token instead of a cookie)
+- with `RBAC_IDENTITY_ENABLED` on, `/invite`, `/invite/<token>` and `/api/invite/*` (an invite or reset link)
 - static assets (`/_next/*`, `/favicon*`, `/logo.png`, `/js_logo.png`)
 
 Every other `/api/*` route requires a valid `redamon-auth` JWT cookie. The `X-Internal-Key` / `X-Scanner-Key` service headers (cleared by nginx at the edge) are accepted only from internal callers on the Docker network.

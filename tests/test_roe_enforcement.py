@@ -29,7 +29,7 @@ _dns_stub.__path__ = []  # make it a package
 for mod_name in [
     'dns', 'dns.resolver', 'dns.rdatatype', 'dns.name', 'dns.reversename',
     'dns.exception', 'dns.rcode', 'dns.zone', 'dns.query', 'dns.rdataclass',
-    'dns.tokenizer', 'dns.entropy',
+    'dns.tokenizer', 'dns.entropy', 'dns.xfr',
     'whois', 'docker', 'neo4j', 'knockpy',
 ]:
     if mod_name not in sys.modules:
@@ -41,6 +41,9 @@ for mod_name in [
             sys.modules[mod_name] = _dns_stub
         else:
             sys.modules[mod_name] = types.ModuleType(mod_name)
+# check_zone_transfer names it in an except clause, which must evaluate.
+if not hasattr(sys.modules['dns.xfr'], 'TransferError'):
+    sys.modules['dns.xfr'].TransferError = type('TransferError', (Exception,), {})
 
 
 # =============================================================================
@@ -117,11 +120,15 @@ class TestTimeWindowEnforcement(unittest.TestCase):
         allowed, _ = _check_roe_time_window(self._make_settings(), _now=fake_now)
         self.assertTrue(allowed)
 
-    def test_at_exact_end_time_blocked(self):
-        """Pipeline blocked at exactly the end time (end is exclusive)."""
+    def test_at_exact_end_time_allowed(self):
+        """The end minute is inside the window, as the orchestrator that admits
+        the start reads it; the minute after is not (R-32)."""
         import zoneinfo
         tz = zoneinfo.ZoneInfo('UTC')
         fake_now = datetime(2026, 3, 25, 18, 0, 0, tzinfo=tz)  # Wednesday 18:00
+        allowed, _ = _check_roe_time_window(self._make_settings(), _now=fake_now)
+        self.assertTrue(allowed)
+        fake_now = datetime(2026, 3, 25, 18, 1, 0, tzinfo=tz)
         allowed, _ = _check_roe_time_window(self._make_settings(), _now=fake_now)
         self.assertFalse(allowed)
 

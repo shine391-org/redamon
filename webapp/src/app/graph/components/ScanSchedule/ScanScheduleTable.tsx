@@ -1,12 +1,13 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { Loader2, Plus, Play, Pause, Trash2, CalendarClock } from 'lucide-react'
+import { Loader2, Plus, Play, Pause, Trash2, CalendarClock, UserCheck } from 'lucide-react'
 import { useAlertModal, useToast, WikiInfoButton } from '@/components/ui'
 import { ScanQueuePanel, kindLabel } from './ScanQueuePanel'
 import { usePaged, Pager } from './pagination'
 import { scopeStartProblem } from '@/lib/scopeGroups'
 import { fetchJson, toApiError } from '@/lib/apiError'
+import { useRefusal } from '@/hooks/useRefusal'
 import styles from './ScanScheduleTable.module.css'
 
 interface Schedule {
@@ -20,6 +21,20 @@ interface Schedule {
   enabled: boolean
   nextRunAt: string | null
   lastRunAt: string | null
+  /** Who created it (absent from an older server). */
+  createdBy?: Person | null
+  /**
+   * Why the schedule stopped itself (step 5.5): `actor_no_access` when the person it runs as lost
+   * access to the project, `ownership_transferred` when it was the old owner's and the project changed
+   * owner (step 5.12). Only a confirmation turns it back on. Absent from an older server.
+   */
+  pausedReason?: string | null
+}
+
+/** A person the timeline names: who created a schedule or started a run. */
+interface Person {
+  name: string | null
+  email: string
 }
 
 interface Job {
@@ -38,6 +53,8 @@ interface Job {
    *  null = unknown/complete, N>0 = partial. */
   degradedSources: number | null
   version: { seq: number; label: string } | null
+  /** Who started it, where the run records it (absent from an older server). */
+  startedBy?: Person | null
 }
 
 interface ScanScheduleTableProps {
@@ -50,6 +67,10 @@ function fmt(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? '-' : d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
 }
 
+function personLabel(p: Person | null | undefined): string {
+  return p ? p.name || p.email : '-'
+}
+
 function duration(job: Job): string {
   if (!job.startedAt || !job.finishedAt) return '-'
   const ms = new Date(job.finishedAt).getTime() - new Date(job.startedAt).getTime()
@@ -57,6 +78,10 @@ function duration(job: Job): string {
   const mins = Math.floor(ms / 60000)
   return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`
 }
+
+// Both pauses wait for a confirmation, which makes the confirmer the schedule's actor (step 5.5): the
+// person it ran as lost access, or the project changed owner and it was the old owner's (step 5.12).
+const pausedForAccess = (s: Schedule) => s.pausedReason === 'actor_no_access' || s.pausedReason === 'ownership_transferred'
 
 function describeSchedule(s: Schedule): string {
   if (s.mode === 'once') return `once at ${fmt(s.runAt)}`
@@ -73,7 +98,10 @@ function describeSchedule(s: Schedule): string {
  * with the reason, rather than silently not happening.
  */
 export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
-  const { alertError, dangerConfirm } = useAlertModal()
+  const { alertError, confirm, dangerConfirm } = useAlertModal()
+  // A read share lists schedules and runs (recon:read) and changes none (step 4.11).
+  const scheduleRefusal = useRefusal('recon:schedule', projectId)?.text ?? null
+  const historyRefusal = useRefusal('scan:versions_delete', projectId)?.text ?? null
   const toast = useToast()
   const [schedules, setSchedules] = useState<Schedule[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
@@ -164,6 +192,35 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
       load()
     } catch (err) {
       alertError(toApiError(err, 'Could not update the schedule').message, 'Schedule')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  // A schedule paused because its actor lost access is taken over, never re-enabled as that person
+  // (D-13): the confirmation makes the person confirming its actor.
+  const confirmSchedule = async (s: Schedule) => {
+    if (!projectId) return
+    const why = s.pausedReason === 'ownership_transferred'
+      ? `The project changed owner and it ran as ${personLabel(s.createdBy)}, so it paused.`
+      : `${personLabel(s.createdBy)} no longer has access to this project, so it paused.`
+    const yes = await confirm(
+      `Run this schedule (${describeSchedule(s)}) as you from now on? ${why} Its next run is counted from now; ` +
+      'missed runs are not caught up.',
+      'Confirm schedule',
+    )
+    if (!yes) return
+    setBusyId(s.id)
+    try {
+      await fetchJson(`/api/projects/${projectId}/schedules/${s.id}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }, 'Could not confirm the schedule')
+      toast.info('Schedule confirmed: it now runs as you')
+      load()
+    } catch (err) {
+      alertError(toApiError(err, 'Could not confirm the schedule').message, 'Schedule')
     } finally {
       setBusyId(null)
     }
@@ -297,7 +354,8 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
             Label
             <input className={styles.input} value={label} maxLength={120} onChange={e => setLabel(e.target.value)} placeholder="optional" />
           </label>
-          <button className={styles.createBtn} onClick={create} disabled={creating || !projectId}>
+          <button className={styles.createBtn} onClick={create} disabled={creating || !projectId || !!scheduleRefusal}
+            title={scheduleRefusal ?? undefined}>
             {creating ? <Loader2 size={13} className={styles.spinner} /> : <Plus size={13} />}
             <span>Add schedule</span>
           </button>
@@ -307,12 +365,12 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
           <thead>
             <tr>
               <th>Label</th><th>Schedule</th><th>Previous graph</th>
-              <th>Next run</th><th>Last run</th><th>State</th><th>Actions</th>
+              <th>Next run</th><th>Last run</th><th>Created by</th><th>State</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {schedules.length === 0 && (
-              <tr><td colSpan={7} className={styles.empty}>No scheduled scans.</td></tr>
+              <tr><td colSpan={8} className={styles.empty}>No scheduled scans.</td></tr>
             )}
             {schedPage.slice.map(s => (
               <tr key={s.id}>
@@ -321,10 +379,18 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
                 <td>{s.scanMode === 'new' ? 'keep as version' : 'overwrite'}</td>
                 <td className={styles.muted}>{s.enabled ? fmt(s.nextRunAt) : '-'}</td>
                 <td className={styles.muted}>{fmt(s.lastRunAt)}</td>
+                <td className={styles.muted} title={s.createdBy?.email}>{personLabel(s.createdBy)}</td>
                 <td>
                   <span className={s.enabled ? styles.badgeOn : styles.badgeOff}>
                     {s.enabled ? 'Enabled' : 'Disabled'}
                   </span>
+                  {pausedForAccess(s) && (
+                    <span className={styles.accessBadge}>
+                      {s.pausedReason === 'ownership_transferred'
+                        ? <>paused: the project changed owner and it ran as {personLabel(s.createdBy)}; confirm to run it as you</>
+                        : <>paused: {personLabel(s.createdBy)} no longer has access to this project; confirm to run it as you</>}
+                    </span>
+                  )}
                   {scopeProblem && (
                     <span className={styles.scopeBadge} title={scopeProblem.message}>
                       {s.enabled ? 'next run will be refused' : 'paused'}: the saved scope is no longer valid
@@ -334,19 +400,31 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
                   )}
                 </td>
                 <td className={styles.actions}>
-                  <button
-                    className={styles.iconBtn}
-                    disabled={busyId === s.id || (!s.enabled && !!scopeProblem)}
-                    onClick={() => patch(s, { enabled: !s.enabled })}
-                    title={s.enabled ? 'Disable' : scopeProblem ? 'Fix the target list before enabling' : 'Enable'}
-                  >
-                    {s.enabled ? <Pause size={13} /> : <Play size={13} />}
-                  </button>
+                  {pausedForAccess(s) && !s.enabled ? (
+                    <button
+                      className={styles.iconBtn}
+                      disabled={busyId === s.id || !!scopeProblem || !!scheduleRefusal}
+                      onClick={() => confirmSchedule(s)}
+                      title={scheduleRefusal ?? (scopeProblem ? 'Fix the target list before confirming' : 'Confirm: run it as you')}
+                      aria-label="Confirm schedule"
+                    >
+                      <UserCheck size={13} />
+                    </button>
+                  ) : (
+                    <button
+                      className={styles.iconBtn}
+                      disabled={busyId === s.id || (!s.enabled && !!scopeProblem) || !!scheduleRefusal}
+                      onClick={() => patch(s, { enabled: !s.enabled })}
+                      title={scheduleRefusal ? scheduleRefusal : s.enabled ? 'Disable' : scopeProblem ? 'Fix the target list before enabling' : 'Enable'}
+                    >
+                      {s.enabled ? <Pause size={13} /> : <Play size={13} />}
+                    </button>
+                  )}
                   <button
                     className={`${styles.iconBtn} ${styles.dangerBtn}`}
-                    disabled={busyId === s.id}
+                    disabled={busyId === s.id || !!scheduleRefusal}
                     onClick={() => remove(s)}
-                    title="Delete schedule"
+                    title={scheduleRefusal ?? 'Delete schedule'}
                   >
                     <Trash2 size={13} />
                   </button>
@@ -366,7 +444,8 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
         <div className={styles.historyHead}>
           <h3 className={styles.heading}>Run history</h3>
           {selected.size > 0 && (
-            <button className={styles.clearBtn} onClick={deleteSelected} disabled={clearing}>
+            <button className={styles.clearBtn} onClick={deleteSelected} disabled={clearing || !!historyRefusal}
+              title={historyRefusal ?? undefined}>
               {clearing ? <Loader2 size={13} className={styles.spinner} /> : <Trash2 size={13} />}
               <span>Delete selected ({selected.size})</span>
             </button>
@@ -386,12 +465,12 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
                 />
               </th>
               <th>Type</th><th>Trigger</th><th>Mode</th><th>Status</th><th>Version</th>
-              <th>Started</th><th>Duration</th><th className={styles.num}>Nodes</th><th>Reason</th>
+              <th>Started</th><th>Started by</th><th>Duration</th><th className={styles.num}>Nodes</th><th>Reason</th>
             </tr>
           </thead>
           <tbody>
             {jobs.length === 0 && (
-              <tr><td colSpan={10} className={styles.empty}>No scans recorded yet.</td></tr>
+              <tr><td colSpan={11} className={styles.empty}>No scans recorded yet.</td></tr>
             )}
             {historyPage.slice.map(j => (
               <tr key={j.id} className={selected.has(j.id) ? styles.rowSelected : undefined}>
@@ -424,6 +503,7 @@ export function ScanScheduleTable({ projectId }: ScanScheduleTableProps) {
                 </td>
                 <td className={styles.muted}>{j.version ? `v${j.version.seq}` : '-'}</td>
                 <td className={styles.muted}>{fmt(j.startedAt ?? j.createdAt)}</td>
+                <td className={styles.muted} title={j.startedBy?.email}>{personLabel(j.startedBy)}</td>
                 <td className={styles.muted}>{duration(j)}</td>
                 <td className={styles.num}>{j.nodeCount ?? '-'}</td>
                 <td className={styles.muted}>{j.ramReason ?? '-'}</td>

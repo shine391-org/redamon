@@ -14,8 +14,9 @@ real finding that must survive. Stdlib only. See README.md for the case table.
     ROLE=spa        single-page app + JS bundles + source maps (catch-all HTML shell)
     ROLE=vendor     a third-party script host, and a third-party SAML login page
     ROLE=shodan     canned Shodan host API + InternetDB answers for the lab IPs;
-                    /_lab/shodan?unavailable=<ips>&hide=<cves> makes some IPs fail
-                    (503) and drops some CVEs until the next call or a restart
+                    /_lab/shodan?unavailable=<ips>&hide=<cves>&cdn=<ips> makes some IPs
+                    fail (503), drops some CVEs and tags some IPs `cdn` until the next
+                    call or a restart
     ROLE=api        a JSON API: 200 on /api/v1, 404 {"code":"NOT_FOUND"} elsewhere
     ROLE=jsonall    a JSON catch-all: 200 {"code":"NOT_FOUND"} on every path
     ROLE=sso        / answers 302 to the vendor host's SAML login (outside the project)
@@ -30,10 +31,30 @@ real finding that must survive. Stdlib only. See README.md for the case table.
     ROLE=down       503 "under maintenance" on every path, no links: http_probe records
                     it, and neither JS Recon nor Nuclei takes a 5xx host as a target
     ROLE=plainjs    a page and one script with nothing in it JS Recon reports
+    ROLE=pleasewait a site whose pages read "Loading, please wait..." and quote a rate
+                    limit, serving an exposed /.git/config (200) with the same footer
+    ROLE=throttled  429 Too Many Requests + Retry-After on every path, "please wait" copy
+    ROLE=redis      a Redis stand-in on 6379 (PING -> +PONG, no auth) and on 80 its toggle,
+                    /_lab/redis?mode=open|delay|auth: a PONG held past the check timeout,
+                    or -NOAUTH as a password-protected Redis answers
+    ROLE=tlsmail    TLS on 993 with an IMAP greeting (no HTTP) and on 80 its toggle,
+                    /_lab/tls?cert=expired|valid&stall=0|1: the certificate presented,
+                    or a handshake that never completes
+    ROLE=smtp       an SMTP server on 25 whose RCPT answer is SMTP_RCPT, greeting and
+                    HELO answer split across writes and lines as real servers send them
+    ROLE=login      LOGIN_MODE shell|real|all: a "login" shell with no password field on
+                    every path, a real /login form, or one password page on every path
+    ROLE=graphql    a minimal GraphQL server on /graphql (introspection, batches)
+
+Toggles on existing roles: /_lab/vhost?drop_bare=1|0 on fastly (with a name in
+Host) closes bare-IP connections unanswered; /_lab/cache?mode=open|stall on
+cache answers the cache scanner's own requests CACHE_STALL_S late; /_lab/js
+?show=r14|r14js on spa links the R-14 source-map and redirecting bundles.
 """
 
 import base64
 import hashlib
+import socketserver
 import itertools
 import json
 import os
@@ -60,8 +81,23 @@ class Base(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt, *args):
-        # Never log a query string: the Shodan stub may receive an API key.
-        print(f"[{ROLE}] {self.command} {self.path.split('?', 1)[0]} host={self.headers.get('Host', '')}", flush=True)
+        # Never log a query string (the Shodan stub may receive an API key) nor an
+        # Authorization value: auth= says only whether the request carried one.
+        # ua= (spaces folded, 60 characters) names the tool behind a burst; it
+        # comes last so the fields before it keep their place.
+        # A request line the parser refused (nmap's probes send some) reaches
+        # here through send_error before any header or path was read.
+        headers = getattr(self, "headers", None) or {}
+        auth = "yes" if headers.get("Authorization") else "no"
+        ua = "_".join(str(headers.get("User-Agent", "-")).split())[:60] or "-"
+        path = (getattr(self, "path", None) or "-").split("?", 1)[0]
+        print(f"[{ROLE}] {getattr(self, 'command', None) or '-'} {path} host={headers.get('Host', '')} "
+              f"auth={auth} ua={ua}", flush=True)
+
+    def log_error(self, fmt, *args):
+        # send_error logs here and then again through send_response's
+        # log_request: one request, two lines. The R-8 ceiling check counts lines.
+        pass
 
     def send(self, status, body=b"", ctype="text/html; charset=utf-8", headers=None):
         if isinstance(body, str):
@@ -88,13 +124,36 @@ class Base(BaseHTTPRequestHandler):
 
 
 # --------------------------------------------------------------------------- vhost edges
+# /_lab/vhost?drop_bare=1 (sent with a name in Host, never the bare IP): close
+# every bare-IP connection unanswered, so the vhost module's baseline fails (R-46).
+_vhost_state = {"drop_bare": False}
+
+
 class Fastly(Base):
     def do_GET(self):
         host = self.host()
+        path, _, query = self.path.partition("?")
+        if path == "/_lab/vhost" and not self.is_bare_ip():
+            from urllib.parse import parse_qs
+            flag = (parse_qs(query).get("drop_bare") or [""])[0]
+            if flag in ("0", "1"):
+                _vhost_state["drop_bare"] = flag == "1"
+            return self.send(200, json.dumps(_vhost_state), "application/json")
         if self.is_bare_ip():
+            if _vhost_state["drop_bare"]:
+                print(f"[{ROLE}] dropped bare-IP {self.command} {path}", flush=True)
+                self.close_connection = True
+                return None
             return self.send(421, "<h1>Misdirected Request</h1>")
         if host == f"admin.{APEX}":
             return self.send(200, '{"service":"admin-api","version":"3.2.1"}', "application/json")
+        # Two names one punctuation mark apart, two apps: each needs its own
+        # finding id (R-46).
+        if host == f"dev-api.{APEX}":
+            return self.send(200, '{"service":"dev-api","stage":"integration"}', "application/json")
+        if host == f"dev.api.{APEX}":
+            return self.send(200, '{"service":"api","stage":"dev","region":"eu-west-1","build":"9d2c"}',
+                             "application/json")
         if host == f"wiki.{APEX}":
             n = next(_counter)
             return self.send(200, f"<html><head><title>Internal Wiki</title></head><body>Main page. "
@@ -163,11 +222,32 @@ _cache = {}
 _renders = itertools.count()
 
 
+# /_lab/cache?mode=stall: the cache scanner's own requests (its native engine
+# and WCVS, told apart by User-Agent) get their answer CACHE_STALL_S late, past
+# the native per-request timeout and slow enough to keep WCVS running past its
+# own timeout; every other client is answered at once (R-23, R-9).
+_cache_state = {"mode": "open"}
+CACHE_STALL_S = int(os.environ.get("CACHE_STALL_S", "10"))
+_CACHE_SCANNER_UAS = ("RedAmon-CachePoison", "WebCacheVulnerabilityScanner")
+
+
 class Cache(Base):
     """A shared cache keyed on path + query only, so request headers are unkeyed."""
     TTL = 300
 
     def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/_lab/cache":
+            from urllib.parse import parse_qs
+            mode = (parse_qs(query).get("mode") or [""])[0]
+            if mode in ("open", "stall"):
+                _cache_state["mode"] = mode
+            return self.send(200, json.dumps(_cache_state), "application/json")
+        ua = self.headers.get("User-Agent") or ""
+        scanner = next((u for u in _CACHE_SCANNER_UAS if u in ua), None)
+        if _cache_state["mode"] == "stall" and scanner:
+            print(f"[{ROLE}] stalled {self.command} {path} ua={scanner} for {CACHE_STALL_S}s", flush=True)
+            time.sleep(CACHE_STALL_S)
         key = self.path
         with _lock:
             hit = _cache.get(key)
@@ -186,8 +266,10 @@ class Cache(Base):
     def origin(self):
         path = self.path.split("?", 1)[0]
         if path == "/":
+            # /search?q= gives the crawl a Parameter with a sample value (R-27).
             return 200, ('<html><head><title>Shop</title></head><body><a href="/promo">Promo</a> '
-                         '<a href="/home">Home</a></body></html>'), "text/html; charset=utf-8"
+                         '<a href="/home">Home</a> <a href="/search?q=shoes">Shoes</a></body></html>'), \
+                "text/html; charset=utf-8"
         if path == "/promo":
             # An A/B bucket picked per origin render: two variants, same size.
             variant = "AB"[next(_renders) % 2]
@@ -197,6 +279,10 @@ class Cache(Base):
             xfh = self.headers.get("X-Forwarded-Host") or "shop.fplab.test"
             return 200, (f'<html><head><script src="https://{xfh}/static/app.js"></script></head>'
                          f'<body>Welcome</body></html>'), "text/html; charset=utf-8"
+        if path == "/search":
+            # Echoes nothing of the request, so it gives the cache scan nothing to poison.
+            return 200, "<html><body><h1>Search results</h1><p>3 products</p></body></html>", \
+                "text/html; charset=utf-8"
         return 404, "<h1>not found</h1>", "text/html; charset=utf-8"
 
 
@@ -238,6 +324,41 @@ _EXTRA_JS = {
 # Synthetic, unsigned, built by concatenation; the lab keeps key validation off.
 _LAB_STRIPE_KEY = "sk_live_" + "4mQ9tR2vX7cL1nB8kP3wZ6sD"
 _SPA_HIDDEN = set()   # /_lab/js?hide=<path>: answer that path with the shell, for a rerun
+# /_lab/js?show=r29: the shell also links the R-29 scripts, a relative call on
+# .20 and the same relative path on .22, for the --r29 project only.
+_SPA_SHOWN = set()
+_SPA_EXTRA_TAGS = {
+    "r29": ('<script src="/static/js/r29.relative.js"></script>'
+            '<script src="http://192.88.94.22/js/client.js"></script>'),
+    # R-14: source maps named off the scanned host, directly or by a redirect.
+    "r14": ('<script src="/static/js/r14.offhost.4d1e.js"></script>'
+            '<script src="/static/js/r14.bounce.5e2f.js"></script>'
+            '<script src="/static/js/r14.moved.6f3a.js"></script>'),
+    # R-14 (JS downloads): a bundle that redirects off the host, one that
+    # redirects to another path on it.
+    "r14js": ('<script src="/static/js/r14js.offhost.7a8b.js"></script>'
+              '<script src="/static/js/r14js.moved.8b9c.js"></script>'),
+}
+_R14_MAP = {"version": 3, "file": "r14.moved.js", "mappings": "AAAA",
+            "sources": ["webpack:///./src/r14/moved.ts"],
+            "sourcesContent": ["export const moved = () => fetch('/api/r14/moved');\n"]}
+# path -> (switch, body). Without the switch the shell answers the path.
+_SWITCHED_JS = {
+    "/static/js/r14.offhost.4d1e.js": ("r14", "function r14a(){return 1}\n"
+                                              "//# sourceMappingURL=http://192.88.94.21/loader.js.map\n"),
+    "/static/js/r14.bounce.5e2f.js": ("r14", "function r14b(){return 2}\n//# sourceMappingURL=/r14/bounce.js.map\n"),
+    "/static/js/r14.moved.6f3a.js": ("r14", "function r14c(){return 3}\n//# sourceMappingURL=/r14/moved.js.map\n"),
+    "/static/js/r14.moved.6f3a.js.map": ("r14", json.dumps(_R14_MAP)),
+    "/static/js/r14js.target.8b9c.js": ("r14js", "!function(){fetch('/api/r14js/moved');"
+                                                 "document.getElementById('o').innerHTML=location.hash}();\n"),
+}
+# path -> (switch, status, Location)
+_SWITCHED_REDIRECTS = {
+    "/r14/bounce.js.map": ("r14", 302, "http://192.88.94.21/loader.js.map"),
+    "/r14/moved.js.map": ("r14", 301, "/static/js/r14.moved.6f3a.js.map"),
+    "/static/js/r14js.offhost.7a8b.js": ("r14js", 302, "http://192.88.94.21/loader.js"),
+    "/static/js/r14js.moved.8b9c.js": ("r14js", 301, "/static/js/r14js.target.8b9c.js"),
+}
 
 
 class Spa(Base):
@@ -273,8 +394,16 @@ class Spa(Base):
             with _lock:
                 _SPA_HIDDEN.clear()
                 _SPA_HIDDEN.update(h for h in query.get("hide", "").split(",") if h)
-                hidden = sorted(_SPA_HIDDEN)
-            return self.send(200, json.dumps({"hidden": hidden}), "application/json")
+                _SPA_SHOWN.clear()
+                _SPA_SHOWN.update(h for h in query.get("show", "").split(",") if h in _SPA_EXTRA_TAGS)
+                hidden, shown = sorted(_SPA_HIDDEN), sorted(_SPA_SHOWN)
+            return self.send(200, json.dumps({"hidden": hidden, "shown": shown}), "application/json")
+        if path in _SWITCHED_JS and _SWITCHED_JS[path][0] in _SPA_SHOWN:
+            body = _SWITCHED_JS[path][1]
+            return self.send(200, body, "application/json" if path.endswith(".map") else "application/javascript")
+        if path in _SWITCHED_REDIRECTS and _SWITCHED_REDIRECTS[path][0] in _SPA_SHOWN:
+            _, status, location = _SWITCHED_REDIRECTS[path]
+            return self.send(status, b"", ctype=None, headers={"Location": location})
         if path not in _SPA_HIDDEN:
             if path in _EXTRA_JS:
                 return self.send(200, _EXTRA_JS[path], "application/javascript")
@@ -296,11 +425,18 @@ class Spa(Base):
         if path == "/static/js/private.9c3d.js.map":
             return self.send(403, "<h1>Forbidden</h1>")
         local = os.path.join(STATIC, path[len("/static/"):])
-        if path.startswith("/static/") and os.path.isfile(local) and ".." not in path and path not in _SPA_HIDDEN:
+        # Outside the --r29 run the R-29 script does not exist: the shell answers it.
+        r29_off = path == "/static/js/r29.relative.js" and "r29" not in _SPA_SHOWN
+        if path.startswith("/static/") and os.path.isfile(local) and ".." not in path and path not in _SPA_HIDDEN \
+                and not r29_off:
             with open(local, "rb") as f:
                 return self.send(200, f.read(), "application/javascript" if path.endswith(".js") else "application/octet-stream")
         with open(os.path.join(STATIC, "index.html"), "rb") as f:   # the SPA catch-all
-            return self.send(200, f.read(), "text/html; charset=utf-8")
+            page = f.read()
+        extra = "".join(_SPA_EXTRA_TAGS[k] for k in sorted(_SPA_SHOWN))
+        if extra:
+            page = page.replace(b"</body>", extra.encode() + b"\n</body>")
+        return self.send(200, page, "text/html; charset=utf-8")
 
 
 # --------------------------------------------------------------------------- bulk JS (plan 06.2)
@@ -393,8 +529,12 @@ NOT_FOUND_JSON = '{"code":"NOT_FOUND","message":"No route matches the request"}'
 
 
 class Api(Base):
-    """A real API next to its catch-all twin (JsonAll): only /api/v1 exists."""
+    """A real API next to its catch-all twin (JsonAll): only /api/v1 exists, and
+    one script calling it by a relative path (R-29, linked from .20's shell)."""
     def do_GET(self):
+        if self.path.split("?", 1)[0] == "/js/client.js":
+            return self.send(200, 'fetch("/api/v1").then(function(r){return r.json()});\n',
+                             "application/javascript")
         if self.path.split("?", 1)[0] == "/api/v1":
             return self.send(200, '{"service":"orders","version":"2.1","endpoints":["/api/v1/orders"]}',
                              "application/json")
@@ -491,6 +631,13 @@ SHODAN_HOSTS = {
                                 "data": "", "_shodan": {"module": "https"},
                                 "vulns": {"CVE-2023-44487": {"cvss": 7.5, "verified": False}}}]}
        for n in (31, 32)},
+    # S-22: .49 serves 80 and 8081; naabu scans 22,80,443 in the --s22 project,
+    # so Port 8081 comes from this record alone (passive_only) until a partial
+    # Nmap or Httpx answers on it. No CVE: the case is the port, not a finding.
+    f"{NET}.49": {"org": "Example Hosting Ltd", "isp": "Example Hosting Ltd", "tags": [], "ports": [80, 8081],
+                  "vulns": [],
+                  "data": [{"port": 8081, "transport": "tcp", "product": "nginx", "version": "1.25.2",
+                            "data": "HTTP/1.1 200 OK\r\nServer: nginx", "_shodan": {"module": "http"}}]},
     # The nested-wildcard lab's web1, scanned in domain mode (plan 11): a PTR name
     # under nwlab.test that no zone has.
     "192.88.99.60": {"org": "Example Hosting Ltd", "isp": "Example Hosting Ltd", "tags": [], "ports": [443],
@@ -505,13 +652,16 @@ SHODAN_DOMAIN_DNS = {
 }
 
 # What the next lookups see, set over /_lab/shodan by e2e_fp.py: IPs whose lookup
-# fails (a provider that could not be asked) and CVEs the provider dropped.
-_shodan_state = {"unavailable": set(), "hide": set()}
+# fails (a provider that could not be asked), CVEs the provider dropped, and IPs
+# it now tags `cdn` (an address that became a CDN edge since the last run).
+_shodan_state = {"unavailable": set(), "hide": set(), "cdn": set()}
 
 
 def _shodan_view(ip):
-    """The record for `ip` as this run's provider has it, CVEs hidden."""
+    """The record for `ip` as this run's provider has it: CVEs hidden, `cdn` tag added."""
     host = SHODAN_HOSTS.get(ip)
+    if host and ip in _shodan_state["cdn"]:
+        host = {**host, "tags": sorted(set(host.get("tags") or []) | {"cdn"})}
     if not host or not _shodan_state["hide"]:
         return host
     hide = _shodan_state["hide"]
@@ -527,7 +677,7 @@ class Shodan(Base):
             from urllib.parse import parse_qs
             params = parse_qs(query)
             with _lock:
-                for key in ("unavailable", "hide"):
+                for key in ("unavailable", "hide", "cdn"):
                     _shodan_state[key] = {v for raw in params.get(key, []) for v in raw.split(",") if v}
             return self.send(200, json.dumps({k: sorted(v) for k, v in _shodan_state.items()}),
                              "application/json")
@@ -589,11 +739,293 @@ class CdnCert(Base):
         return self.send(403, "<html><head><title>Forbidden</title></head><body><h1>Forbidden</h1></body></html>")
 
 
+# --------------------------------------------------------------------------- Nuclei throttle filter (R-19)
+# Copy a page may carry without the server throttling anything. Before R-19 the
+# Nuclei false-positive filter dropped every finding whose response held it.
+PLEASE_WAIT_FOOTER = "Loading, please wait... API clients are subject to a rate limit of 60 requests per minute."
+GIT_CONFIG = ("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+              "\tlogallrefupdates = true\n[remote \"origin\"]\n\turl = https://git.fplab.test/shop/storefront.git\n"
+              "\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch \"main\"]\n\tremote = origin\n"
+              "\tmerge = refs/heads/main\n")
+
+
+class PleaseWait(Base):
+    """A served site (200) whose every page ends in the throttle-sounding footer,
+    with its /.git/config exposed: a real finding the old filter dropped."""
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/.git/config":
+            return self.send(200, GIT_CONFIG + f"; {PLEASE_WAIT_FOOTER}\n", "text/plain; charset=utf-8")
+        if path == "/":
+            return self.send(200, "<html><head><title>Storefront</title></head><body><div id=app>"
+                                  f"<p>Loading, please wait&hellip;</p></div><footer>{PLEASE_WAIT_FOOTER}</footer>"
+                                  "</body></html>")
+        return self.send(404, f"<html><body><h1>Not found</h1><footer>{PLEASE_WAIT_FOOTER}</footer></body></html>")
+
+
+class Throttled(Base):
+    """A server that throttles every request: 429 + Retry-After, "please wait" copy.
+    A timing template's match here is the throttle's; any other template keeps its."""
+    def do_GET(self):
+        return self.send(429, "<html><head><title>Too Many Requests</title></head><body><h1>Too Many Requests</h1>"
+                              "<p>Please wait 60 seconds and try again later.</p></body></html>",
+                         headers={"Retry-After": "60"})
+
+
+# --------------------------------------------------------------------------- Redis (R-24)
+# What the stand-in answers to PING, set over /_lab/redis on port 80:
+#   open  -> +PONG at once (no auth: must fire)
+#   delay -> +PONG after REDIS_DELAY seconds, past the check's timeout (no verdict)
+#   auth  -> -NOAUTH, as a password-protected Redis answers (a verdict: clean)
+_redis_state = {"mode": "open"}
+REDIS_DELAY = int(os.environ.get("REDIS_DELAY", "25"))
+
+
+class RedisStandIn(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            data = self.request.recv(1024)
+        except OSError:
+            return
+        if not data:
+            return
+        mode = _redis_state["mode"]
+        command = data.split(b"\r", 1)[0].decode(errors="replace")[:40]
+        print(f"[redis] {command} mode={mode}", flush=True)
+        if mode == "delay":
+            time.sleep(REDIS_DELAY)
+        reply = b"-NOAUTH Authentication required.\r\n" if mode == "auth" else b"+PONG\r\n"
+        try:
+            self.request.sendall(reply)
+        except OSError:
+            pass
+
+
+class RedisToggle(Base):
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/_lab/redis":
+            from urllib.parse import parse_qs
+            mode = (parse_qs(query).get("mode") or [""])[0]
+            if mode in ("open", "delay", "auth"):
+                _redis_state["mode"] = mode
+            return self.send(200, json.dumps(_redis_state), "application/json")
+        return self.send(200, "<html><head><title>Cache node</title></head><body><h1>cache-01</h1></body></html>")
+
+
+def _serve_tcp(port, handler):
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    srv = socketserver.ThreadingTCPServer(("0.0.0.0", port), handler)
+    srv.daemon_threads = True
+    print(f"[{ROLE}] listening on {port} (tcp)", flush=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+def _serve_redis():
+    _serve_tcp(6379, RedisStandIn)
+
+
+PLAIN_PAGE = ("<html><head><title>{title}</title></head><body><h1>{title}</h1>"
+              "<p>Internal service.</p></body></html>")
+
+
+# --------------------------------------------------------------------------- TLS on a non-HTTP port (R-21, R-9)
+# 993 speaks TLS, then an IMAP greeting: no HTTP, so tlsx is the only reader of
+# its certificate. /_lab/tls on port 80 sets, for the next connections:
+#   cert=expired|valid  the certificate presented (expired: not_after 2021)
+#   stall=1|0           accept the TCP connection and never answer the
+#                       ClientHello, so tlsx waits until its run timeout
+_tls_state = {"cert": "expired", "stall": False}
+TLS_STALL_S = int(os.environ.get("TLS_STALL_S", "120"))
+_MAIL_CONTEXTS = {}
+
+
+def _mail_context(kind):
+    if kind not in _MAIL_CONTEXTS:
+        cert, key = f"/tmp/mail-{kind}.pem", f"/tmp/mail-{kind}.key"
+        dates = (["-not_before", "20200101000000Z", "-not_after", "20210101000000Z"] if kind == "expired"
+                 else ["-days", "30"])
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+                        "-out", cert, *dates, "-subj", f"/CN=mail.{APEX}"], check=True, capture_output=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        _MAIL_CONTEXTS[kind] = ctx
+    return _MAIL_CONTEXTS[kind]
+
+
+class TlsMailStandIn(socketserver.BaseRequestHandler):
+    def handle(self):
+        conn, port = self.request, self.server.server_address[1]
+        if _tls_state["stall"]:
+            print(f"[{ROLE}] stalled a TLS handshake on {port} for {TLS_STALL_S}s", flush=True)
+            time.sleep(TLS_STALL_S)
+            return
+        kind = _tls_state["cert"]
+        try:
+            conn.settimeout(10)
+            tls = _mail_context(kind).wrap_socket(conn, server_side=True)
+            tls.sendall(b"* OK [CAPABILITY IMAP4rev1] fplab mail ready\r\n")
+            print(f"[{ROLE}] TLS handshake on {port}, {kind} certificate", flush=True)
+            try:
+                tls.recv(1024)
+            except OSError:
+                pass
+        except (OSError, ssl.SSLError):
+            pass
+
+
+class TlsMailToggle(Base):
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/_lab/tls":
+            from urllib.parse import parse_qs
+            params = parse_qs(query)
+            cert = (params.get("cert") or [""])[0]
+            stall = (params.get("stall") or [""])[0]
+            if cert in ("expired", "valid"):
+                _tls_state["cert"] = cert
+            if stall in ("0", "1"):
+                _tls_state["stall"] = stall == "1"
+            return self.send(200, json.dumps(_tls_state), "application/json")
+        if path == "/":
+            return self.send(200, PLAIN_PAGE.format(title="Webmail"))
+        return self.send(404, "<h1>not found</h1>")
+
+
+# --------------------------------------------------------------------------- SMTP open relay (L-20)
+# A real server's dialogue, TCP-split the way real ones arrive: a two-line 220
+# greeting in two writes, a multi-line 250- answer to HELO. Only SMTP_RCPT
+# differs between the hosts: "554 ..." refuses the relay, "250 ..." accepts it,
+# "451 ..." asks to try later (no verdict).
+SMTP_RCPT = os.environ.get("SMTP_RCPT", "554 5.7.1 Relay access denied")
+
+
+class SmtpStandIn(socketserver.BaseRequestHandler):
+    def handle(self):
+        sock = self.request
+        sock.settimeout(15)
+        try:
+            sock.sendall(b"220-mail.fplab.test ESMTP fplab\r\n")
+            time.sleep(0.05)
+            sock.sendall(b"220 mail.fplab.test ready\r\n")
+            buf = b""
+            while True:
+                data = sock.recv(1024)
+                if not data:
+                    return
+                buf += data
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    verb = line.strip().split(b" ", 1)[0].upper().decode(errors="replace")
+                    print(f"[{ROLE}] {verb}", flush=True)
+                    if verb in ("HELO", "EHLO"):
+                        sock.sendall(b"250-mail.fplab.test\r\n250-PIPELINING\r\n250 8BITMIME\r\n")
+                    elif verb == "MAIL":
+                        sock.sendall(b"250 2.1.0 Ok\r\n")
+                    elif verb == "RCPT":
+                        sock.sendall(SMTP_RCPT.encode() + b"\r\n")
+                    elif verb == "QUIT":
+                        sock.sendall(b"221 2.0.0 Bye\r\n")
+                        return
+                    else:
+                        sock.sendall(b"502 5.5.2 Error: command not recognized\r\n")
+        except OSError:
+            return
+
+
+class SmtpWeb(Base):
+    def do_GET(self):
+        if self.path.split("?", 1)[0] == "/":
+            return self.send(200, PLAIN_PAGE.format(title="Mail relay"))
+        return self.send(404, "<h1>not found</h1>")
+
+
+# --------------------------------------------------------------------------- login forms over HTTP (L-21)
+# LOGIN_MODE picks the shape:
+#   shell  every path 200, a single-page shell saying "login" with a search form
+#          and no password field (not a login form)
+#   real   /login is a real form with a password field, every other path 404
+#   all    every path answers the same password page (a catch-all)
+LOGIN_MODE = os.environ.get("LOGIN_MODE", "real")
+LOGIN_SHELL = ('<html><head><title>Portal</title></head><body><nav><a href="/login">Login</a></nav>'
+               '<form action="/search" method="get"><input type="search" name="q"><button>Search</button>'
+               '</form><div id="app">Please login to continue.</div></body></html>')
+LOGIN_FORM = ('<html><head><title>Sign in</title></head><body><form method="post" action="/login">'
+              '<input name="username"><input type="password" name="password"><button>Sign in</button>'
+              '</form></body></html>')
+
+
+class Login(Base):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if LOGIN_MODE == "shell":
+            return self.send(200, LOGIN_SHELL)
+        if LOGIN_MODE == "all" or path == "/login":
+            return self.send(200, LOGIN_FORM)
+        if path == "/":
+            return self.send(200, PLAIN_PAGE.format(title="Staff portal"))
+        return self.send(404, "<h1>not found</h1>")
+
+
+# --------------------------------------------------------------------------- GraphQL (R-7, R-42)
+# Enough of a GraphQL server for introspection and graphql-cop: one Query field.
+_GQL_SCHEMA = {"__schema": {
+    "queryType": {"name": "Query"}, "mutationType": None, "subscriptionType": None,
+    "types": [
+        {"kind": "OBJECT", "name": "Query", "description": None, "interfaces": [], "enumValues": None,
+         "possibleTypes": None, "inputFields": None,
+         "fields": [{"name": "hello", "description": None, "args": [], "isDeprecated": False,
+                     "deprecationReason": None, "type": {"kind": "SCALAR", "name": "String", "ofType": None}}]},
+        {"kind": "SCALAR", "name": "String", "description": None, "fields": None, "interfaces": None,
+         "enumValues": None, "possibleTypes": None, "inputFields": None},
+        {"kind": "SCALAR", "name": "Boolean", "description": None, "fields": None, "interfaces": None,
+         "enumValues": None, "possibleTypes": None, "inputFields": None},
+    ],
+    "directives": [],
+}}
+
+
+class GraphQL(Base):
+    def _answer(self, query):
+        if "__schema" in (query or ""):
+            return {"data": _GQL_SCHEMA}
+        # graphql-cop's GraphQL detection asks {__typename}.
+        return {"data": {"__typename": "Query", "hello": "world"}}
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(min(length, 1_000_000)) if length else b""
+        if path != "/graphql":
+            return self.send(404, '{"error":"not found"}', "application/json")
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return self.send(400, '{"errors":[{"message":"invalid JSON"}]}', "application/json")
+        if isinstance(body, list):
+            out = [self._answer((b or {}).get("query")) for b in body if isinstance(b, dict)]
+        else:
+            out = self._answer(body.get("query") if isinstance(body, dict) else "")
+        return self.send(200, json.dumps(out), "application/json")
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/graphql":
+            from urllib.parse import parse_qs
+            return self.send(200, json.dumps(self._answer((parse_qs(query).get("query") or [""])[0])),
+                             "application/json")
+        if path == "/":
+            return self.send(200, PLAIN_PAGE.format(title="Orders API"))
+        return self.send(404, '{"error":"not found"}', "application/json")
+
+
 # --------------------------------------------------------------------------- main
 ROLES = {"fastly": Fastly, "cloudflare": Cloudflare, "redirect": Redirect, "akamai": Akamai,
          "ratelimit": RateLimit, "cache": Cache, "spa": Spa, "vendor": Vendor, "shodan": Shodan,
          "api": Api, "jsonall": JsonAll, "sso": Sso, "loginwall": LoginWall, "deny": Deny, "bulk": Bulk,
-         "tlsvhost": TlsVhost, "cdncert": CdnCert, "down": Down, "plainjs": PlainJs}
+         "tlsvhost": TlsVhost, "cdncert": CdnCert, "down": Down, "plainjs": PlainJs,
+         "pleasewait": PleaseWait, "throttled": Throttled, "redis": RedisToggle,
+         "tlsmail": TlsMailToggle, "smtp": SmtpWeb, "login": Login, "graphql": GraphQL}
 
 # A self-signed certificate's issuer is its subject, so TLS_SUBJECT also sets
 # the issuer tlsx reads.
@@ -616,6 +1048,14 @@ def _tls_context():
 
 def main():
     handler = ROLES[ROLE]
+    if ROLE == "redis":
+        _serve_redis()
+    if ROLE == "tlsmail":
+        _mail_context("expired")
+        _mail_context("valid")
+        _serve_tcp(993, TlsMailStandIn)
+    if ROLE == "smtp":
+        _serve_tcp(25, SmtpStandIn)
     servers = []
     for port in PORTS:
         srv = ThreadingHTTPServer(("0.0.0.0", port), handler)

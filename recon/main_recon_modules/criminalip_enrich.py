@@ -53,10 +53,12 @@ def _extract_ips_from_recon(combined_result: dict) -> list[str]:
             if ip:
                 ips.add(ip)
 
-    if combined_result.get("metadata", {}).get("ip_mode"):
-        for ip in combined_result["metadata"].get("expanded_ips", []):
-            if ip:
-                ips.add(ip)
+    # IP mode: the target list only. A DNS answer (a PTR name's forward
+    # address) need not be a target, and the lookup would be about it. A dict
+    # that declares no list asks about nothing (every IP-mode builder declares it).
+    metadata = combined_result.get("metadata") or {}
+    if metadata.get("ip_mode"):
+        return sorted({ip for ip in metadata.get("expanded_ips") or [] if ip})
 
     return sorted(ips)
 
@@ -437,7 +439,7 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
 
     cip_scope.finish("criminalip_enrich", payload=cip_data)
     from recon.helpers.passive_cve_coverage import note_cve_coverage
-    note_cve_coverage("criminalip", "criminalip_enrich", ips, checked,
+    note_cve_coverage("criminalip", "criminalip_enrich", ips, checked, considered=all_ips,
                       no_input=not all_ips, failed=failed)
     combined_result["criminalip"] = cip_data
     return combined_result

@@ -10,6 +10,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from recon.partial_recon_modules.helpers import (
     STATUS_NO_RESULTS,
     STATUS_OK,
+    _group_for,
     _norm_host,
     admits_partial_host,
     attach_org,
@@ -24,19 +25,14 @@ from recon.partial_recon_modules.helpers import (
 from recon.helpers.roe_scope import _filter_roe_excluded
 
 
-def _drop_roe_excluded_discoveries(result: dict, settings: dict) -> list:
-    """Remove RoE-excluded names from a discover_subdomains result, in place.
-
-    Mirrors merge_group_hosts in the full pipeline. The graph writer MERGEs
-    every name in result["subdomains"], and partial Naabu/httpx/Nuclei later
-    read their targets back from the graph, so a name left here is actively
-    scanned. Returns the kept subdomain list.
-    """
+def _remove_discoveries(result: dict, dropped) -> list:
+    """Remove names from the list, the DNS map and the status map of a
+    discover_subdomains result, in place. Returns the kept subdomain list."""
     discovered = result.get("subdomains", [])
-    kept = _filter_roe_excluded(discovered, settings, label="discovered subdomain")
-    if len(kept) == len(discovered):
+    dropped = set(dropped)
+    if not dropped:
         return discovered
-    dropped = set(discovered) - set(kept)
+    kept = [name for name in discovered if name not in dropped]
     result["subdomains"] = kept
     result["subdomain_count"] = len(kept)
     dns_subs = (result.get("dns") or {}).get("subdomains")
@@ -48,6 +44,82 @@ def _drop_roe_excluded_discoveries(result: dict, settings: dict) -> list:
         for name in dropped:
             status_map.pop(name, None)
     return kept
+
+
+def _drop_roe_excluded_discoveries(result: dict, settings: dict) -> list:
+    """Remove RoE-excluded names from a discover_subdomains result, in place.
+
+    The full pipeline drops them from the same three places (merge_group_hosts,
+    through _drop_roe_excluded_subdomains). The graph writer MERGEs every name
+    in result["subdomains"], and partial Naabu/httpx/Nuclei later read their
+    targets back from the graph, so a name left here is actively scanned.
+    Returns the kept subdomain list.
+    """
+    discovered = result.get("subdomains", [])
+    kept = _filter_roe_excluded(discovered, settings, label="discovered subdomain")
+    return _remove_discoveries(result, set(discovered) - set(kept))
+
+
+def _drop_never_scannable_discoveries(result: dict, domain: str, operator_hosts) -> list:
+    """Remove discovered names that resolve to a never-scannable address, in place.
+
+    merge_group_hosts' SSRF guard: a discovered name is the domain owner's DNS,
+    and `localhost.<domain> -> 127.0.0.1` or a name on 169.254.169.254 (cloud
+    metadata) is no host a scanner may probe. The scan root and the hosts the
+    operator typed are kept, as in the full pipeline: scanning them is the
+    operator's decision. Private addresses are kept too (is_never_scannable_ip).
+    Reads the addresses the run's DNS pass already resolved. Returns the kept
+    subdomain list.
+    """
+    from recon.main_recon_modules.ip_filter import is_never_scannable_ip
+
+    dns_subs = (result.get("dns") or {}).get("subdomains") or {}
+    dropped = {}
+    for host in result.get("subdomains", []):
+        if host == domain or host in operator_hosts:
+            continue
+        ips = (dns_subs.get(host) or {}).get("ips") or {}
+        flat = list(ips.get("ipv4") or []) + list(ips.get("ipv6") or [])
+        if any(is_never_scannable_ip(a) for a in flat):
+            dropped[host] = flat
+    for host, flat in dropped.items():
+        print(f"[!][Scope] Dropped discovered host {host} -> {flat}: "
+              f"loopback/link-local/multicast is never a scan target")
+    return _remove_discoveries(result, dropped)
+
+
+def _drop_roe_refused_discoveries(result: dict, settings: dict, domain: str,
+                                  operator_hosts) -> list:
+    """Remove discovered names the admission gate refuses on their addresses,
+    in place, under RoE IP or CIDR entries. Returns the kept subdomain list.
+
+    _drop_roe_excluded_discoveries checks names only, and the writer turns
+    every address in dns.subdomains into a RESOLVES_TO that partial Naabu,
+    httpx and Nuclei read back. As merge_group_hosts does
+    (_roe_refused_discoveries): judged on the addresses the run's DNS pass
+    resolved (no new query), any excluded address refuses the name whole,
+    never narrowed, noted roe_excluded. A name with no address is left to the
+    builders' gate, which refuses it as not checked; so are the scan root and
+    the operator's hosts, as for the SSRF guard.
+    """
+    from recon.helpers.target_admission import admission_context, admit_targets
+
+    if not admission_context(settings).ip_rules:
+        return result.get("subdomains", [])
+    dns_subs = (result.get("dns") or {}).get("subdomains") or {}
+    names = {}
+    for host in result.get("subdomains", []):
+        if host == domain or host in operator_hosts:
+            continue
+        ips = (dns_subs.get(host) or {}).get("ips") or {}
+        addresses = [a for a in list(ips.get("ipv4") or []) + list(ips.get("ipv6") or []) if a]
+        if addresses:
+            names[host] = addresses
+    if not names:
+        return result.get("subdomains", [])
+    admission = admit_targets(settings, None, names=names, module="partial_recon",
+                              resolves_names=True)
+    return _remove_discoveries(result, set(names) - set(admission.names))
 
 
 def _enumerable_roots(roots: list, config: dict, settings: dict) -> list:
@@ -176,6 +248,12 @@ def run_subdomain_discovery(config: dict) -> dict:
                     if info.get("has_records", False):
                         subdomain_status_map[s] = "resolved"
             result["subdomain_status_map"] = subdomain_status_map
+        listed = {_norm_host(h) for h in (_group_for(domain, config.get("domain_groups"))
+                                          or {}).get("exactHosts") or []}
+        operator_hosts = listed | set(my_user_subs)
+        _drop_never_scannable_discoveries(result, domain, operator_hosts)
+        # After the re-resolution above: the answer judged is the one written.
+        _drop_roe_refused_discoveries(result, settings, domain, operator_hosts)
 
         result["domain"] = domain
         groups = config.get("domain_groups") or []
@@ -229,7 +307,7 @@ def run_subdomain_discovery(config: dict) -> dict:
             )
 
             if user_input_id:
-                graph_client.update_user_input_status(user_input_id, "completed", stats)
+                graph_client.update_user_input_status(user_input_id, "completed", stats, user_id=user_id, project_id=project_id)
                 print(f"[+][Partial Recon] Created UserInput + linked to discovery results")
 
             print(f"[+][Partial Recon] {domain}: {json.dumps(stats, default=str)}")

@@ -65,6 +65,7 @@ export const reconPresetSchema = z.object({
   naabuThreads: int,
   naabuTimeout: int,
   naabuRetries: int,
+  naabuRunTimeout: int,
   naabuScanType: str,
   naabuExcludeCdn: bool,
   naabuDisplayCdn: bool,
@@ -175,7 +176,6 @@ export const reconPresetSchema = z.object({
   aiSurfaceReconVectorDbReadEnabled: bool,
   aiSurfaceReconJuliusProbePackEnabled: bool,
   aiSurfaceReconLatencyBaselineEnabled: bool,
-  aiSurfaceReconCacheEnabled: bool,
   aiSurfaceReconProbePackVersion: str,
 
   // -- Web Crawling: Katana --
@@ -187,7 +187,6 @@ export const reconPresetSchema = z.object({
   katanaJsCrawl: bool,
   katanaParamsOnly: bool,
   katanaExcludePatterns: strArr,
-  katanaScope: str,
   katanaCustomHeaders: strArr,
   katanaParallelism: int,
   katanaConcurrency: int,
@@ -288,7 +287,6 @@ export const reconPresetSchema = z.object({
   jsReconIncludeFrameworkJs: bool,
   jsReconIncludeArchivedJs: bool,
   jsReconMinConfidence: str,
-  jsReconStandaloneCrawlDepth: int,
   jsReconAiSdkDetectionEnabled: bool,
 
   // -- GraphQL Security Scanner --
@@ -685,6 +683,7 @@ export const RECON_PARAMETER_CATALOG = `
 - naabuThreads: integer
 - naabuTimeout: integer - Timeout in milliseconds
 - naabuRetries: integer
+- naabuRunTimeout: integer - Wall-clock cap on the whole naabu run in seconds. Default 1800.
 - naabuScanType: string - "s" (SYN) or "c" (connect)
 - naabuExcludeCdn: boolean - Skip CDN IPs
 - naabuDisplayCdn: boolean - Show CDN info
@@ -791,7 +790,6 @@ export const RECON_PARAMETER_CATALOG = `
 - aiSurfaceReconVectorDbReadEnabled: boolean - One benign read to candidate vector-DB ports (Chroma/Qdrant/Weaviate/Milvus) to confirm Technology(category=ai-vector-db). Off in stealth.
 - aiSurfaceReconJuliusProbePackEnabled: boolean - Run the vendored Julius HTTP fingerprint packs to identify AI service software and promote a Technology node.
 - aiSurfaceReconLatencyBaselineEnabled: boolean - Record p50 latency of the chat ping on each LLM endpoint (Endpoint.ai_latency_p50_ms).
-- aiSurfaceReconCacheEnabled: boolean - Cache probe responses on disk so repeat scans skip already-tested payloads.
 - aiSurfaceReconProbePackVersion: string - Pinned probe-pack identifier recorded on every annotation (default "latest").
 
 ## Web Crawling - Katana
@@ -803,7 +801,6 @@ export const RECON_PARAMETER_CATALOG = `
 - katanaJsCrawl: boolean - Crawl JS files
 - katanaParamsOnly: boolean - Only extract parameterized URLs
 - katanaExcludePatterns: string[] - Regex patterns to exclude from crawling
-- katanaScope: string - Scope filter: "dn" (domain), "rdn" (root domain), etc.
 - katanaCustomHeaders: string[] - Custom HTTP headers for crawler
 - katanaParallelism: integer - Targets crawled simultaneously
 - katanaConcurrency: integer - Concurrent fetchers per target
@@ -897,7 +894,6 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - jsReconIncludeFrameworkJs: boolean
 - jsReconIncludeArchivedJs: boolean
 - jsReconMinConfidence: string - "low", "medium", "high"
-- jsReconStandaloneCrawlDepth: integer
 - jsReconAiSdkDetectionEnabled: boolean - Adversarial AI Phase 6. Scan every harvested JS bundle for AI/LLM SDK imports (OpenAI, Anthropic, Gemini, LangChain, LlamaIndex, Vercel AI SDK, MCP, vector DBs), hard-coded provider keys (sk-, sk-ant-, hf_, lsv2_, gsk_, r8_, …), dangerouslyAllowBrowser opt-in, and AI-frontend product markers in async-loaded chunks the http_probe Wappalyzer pass cannot see. Writes JsReconFinding nodes with finding_type ai-sdk-client / ai-sdk-key-literal / ai-sdk-browser-allowed / ai-frontend-detected / ai-provider-url and enriches matching Secret nodes with ai_provider. Default true.
 
 ## GraphQL Security Scanner (Group 6 - active, sends introspection probes)
@@ -1061,7 +1057,7 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - vhostSniTestL4: boolean - Run the TLS SNI trick via curl --resolve (catches modern reverse proxies, k8s ingress, Cloudflare). Default true.
 - vhostSniInjectDiscovered: boolean - When a hidden vhost is confirmed, create a BaseURL node so a follow-up partial recon (Katana, Nuclei) can scan it. Default true.
 - vhostSniUseDefaultWordlist: boolean - Use the bundled vhost-common.txt wordlist (~2,300 admin/dev/staging/internal/modern-stack prefixes, expanded as {prefix}.{target_apex}). Default true.
-- vhostSniUseGraphCandidates: boolean - Pull hostnames from existing Subdomain, ExternalDomain, TLS SAN list, CNAME targets and reverse-DNS PTR records resolving to each target IP. Highest signal source. Default true.
+- vhostSniUseGraphCandidates: boolean - Pull hostnames already known on each target IP (Subdomain, ExternalDomain, TLS SAN list, CNAME targets). In an IP-mode project they are the hostnames the run recorded on that IP (reverse DNS, certificates, passive DNS), never tried on a shared CDN edge IP, and none when Hostnames on target IPs is ip_only (forced off). Highest signal source. Default true.
 - vhostSniMaxCandidatesPerIp: integer - Hard cap on candidates per IP to bound run time. Default 2000.
 - tlsxEnabled: boolean - Master switch for the tlsx TLS certificate grab (GROUP 3.6). One TLS handshake per open non-HTTP port. Active but quiet; net-zero on the 5 SSL ports httpx already dials. Default TRUE. Passive/zero-packet presets MUST set this false.
 - tlsxScanMode: string - TLS stack: ctls|ztls|openssl|auto. Default auto.
@@ -1073,7 +1069,7 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - tlsxDelay: string - Optional -delay between connections (e.g. "200ms"); stealth only. Default "".
 - tlsxIncludeHttpPorts: boolean - Also grab certs on HTTP/HTTPS ports httpx already covers (duplicate handshakes). Default false.
 - tlsxInjectHostnames: boolean - Merge in-scope certificate SAN hostnames into dns.subdomains as new probe targets. Default true.
-- tlsxRevPtrSni: boolean - Reverse-PTR to derive an SNI for bare IPs (extra DNS lookups). Default false.
+- tlsxRevPtrSni: boolean - Reverse-PTR to derive an SNI for bare IPs (extra DNS lookups). Forced off in every IP-mode project: a PTR name there is a recorded hostname, never an SNI. Default false.
 - tlsxMaxHostnamesPerIp: integer - When one IP serves several known hostnames, how many to scan (each may present a different cert). Default 1.
 - tlsxProbeJarm: boolean - Compute JARM + JA3 fingerprints (~10 extra handshakes per target, loud). Default false.
 - tlsxVersionEnum: boolean - Enumerate every supported TLS version (extra connections per target). Default false.
@@ -1088,7 +1084,7 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 - webCachePoisonTimeoutPerReq: integer - Native confirmation per-request timeout in seconds. Default 10.
 - webCachePoisonConcurrency: integer - WCVS threads for the breadth sweep. Higher = faster, louder. Default 10.
 - webCachePoisonConfirmWorkers: integer - Native confirmation parallel workers (how many URLs are tested concurrently; bounds in-flight requests). 1 = fully sequential/stealthiest, up to 16. Default 6.
-- webCachePoisonMaxRpsPerHost: number - Requests/sec cap per host (0 = unlimited). Default 0.
+- webCachePoisonMaxRpsPerHost: number - Requests/sec cap for the whole WCVS sweep (WCVS -rr): one rate shared by every thread and URL, NOT per host despite the name (0 = unlimited). Default 0.
 - webCachePoisonMinConfidence: number - Only findings scoring at or above this (0-1) become Vulnerability nodes. 0.8 keeps Confirmed + Strong. Default 0.8.
 - webCachePoisonAllowFrameworkPacks: boolean - Fire Next.js/Nuxt/Remix-specific vectors only when the tech fingerprint matches. Default true.
 - webCachePoisonAllowDeception: boolean - Web cache deception (path-confusion .css tricks). Default true.
@@ -1103,7 +1099,7 @@ OpenAPI source URLs and the project Authenticated Session profile are project-sp
 
 ## Route Exposure (active, GET/HEAD only)
 - routeExposureEnabled: boolean - Request the routes recon found plus generated ones (internal/admin/debug seed paths, .git/.env/web.config, backup copies, older API versions) without credentials, and logged in where the authentication profile covers the host. Writes info-severity leads the agent's access_control skill confirms (a route answering anonymously where auth was expected, or returning sensitive fields / other people's personal data) and signature findings with real severity (exposed .git, .env, backups, debug consoles, actuator env, debug pages). Never requests logout/delete/reset paths. Runs in GROUP 6 whenever active scanning runs. Good fit for API, web-app and bug-bounty presets. Default false.
-- routeExposureMaxRps: number - Requests per second across all hosts (1-50), capped to the RoE ceiling. Adds to the other Phase A scanners' load. Default 5.
+- routeExposureMaxRps: number - Requests per second across all hosts (1-50), capped to the RoE ceiling. With no ceiling it runs alongside the other Phase A scanners and adds to their load; under a ceiling Phase A runs one scanner at a time. Default 5.
 - routeExposureWorkers: integer - Routes requested at once (1-16). Default 4.
 - routeExposureTimeout: integer - Seconds to wait for one answer (2-60). Default 10.
 - routeExposureMaxRoutesPerHost: integer - Route budget per host (10-5000); OpenAPI-secured, seen-denied and .git/.env routes go first. Default 300.
@@ -1212,7 +1208,7 @@ These do not run as part of the recon pipeline and are not gated by scanModules.
 - osintEnrichmentEnabled: boolean - Master switch for OSINT enrichment
 - shodanEnabled: boolean - Shodan lookups
 - shodanHostLookup: boolean
-- shodanReverseDns: boolean
+- shodanReverseDns: boolean - Names Shodan knows for each IP. In an IP-mode project forced off when Hostnames on target IPs is ip_only; in the other modes the names are recorded on their IP and scanned only if the mode selects them. A preset never sets that mode
 - shodanDomainDns: boolean
 - shodanPassiveCves: boolean - Passive CVE lookup via Shodan
 - shodanWorkers: integer - Parallel IP lookup workers
@@ -1222,7 +1218,7 @@ These do not run as part of the recon pipeline and are not gated by scanModules.
 - urlscanInjectMaxAgeDays: integer - days: urlscan host names seen within this window join the scan like discovered subdomains (default 90)
 - urlscanMaxInjectedHosts: integer - the most urlscan host names joining one scan per domain, newest first; 0 adds none (default 200)
 - urlscanLeakedLinks: boolean - findings for the target's leaked password-reset, invite, payment and login links seen on urlscan (never opened)
-- urlscanSecretsInUrls: boolean - Secrets for passwords, API keys, tokens and JWTs written in URLs seen on urlscan, stored masked
+- urlscanSecretsInUrls: boolean - Secrets for passwords, API keys, tokens and JWTs written in URLs seen on urlscan (the URL is never requested)
 - urlscanSensitiveFiles: boolean - findings for sensitive files (.env, .git, dumps, backups, keys, logs, installers, debug consoles) seen on urlscan
 - urlscanDocumentLinks: boolean - marks documents opened by direct link (PDF, Office, CSV, archives, JSON, raw text) on their urlscan endpoints
 - urlscanRedirectSearch: boolean - one extra urlscan search per domain for visits that started on the target and ended on another site (open redirects, leaked links); +1 search

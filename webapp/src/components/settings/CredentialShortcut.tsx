@@ -5,8 +5,34 @@ import Link from 'next/link'
 import { Eye, EyeOff, ExternalLink } from 'lucide-react'
 import { SETTINGS_KEYS_HREF } from '@/lib/settingsLinks'
 import { credentialField, isSecretField } from '@/lib/credentialFields'
-import type { CredentialKeysApi } from '@/hooks/useCredentialKeys'
+import { useOptionalAlertModal } from '@/components/ui/AlertModal'
+import { StepUpModal } from '@/components/auth/StepUpModal'
+import type { CredentialKeysApi, SecretReentryPrompt } from '@/hooks/useCredentialKeys'
 import styles from './CredentialShortcut.module.css'
+
+/** The secrets a re-pointed endpoint needs again, typed in the confirm dialog. */
+function ReentryFields({ prompt, onChange }: { prompt: SecretReentryPrompt; onChange: (field: string, value: string) => void }) {
+  const baseId = useId()
+  return (
+    <div className={styles.reentry}>
+      <p>{prompt.message}</p>
+      {prompt.fields.map((f, i) => (
+        <div key={f} className={styles.reentryField}>
+          <label htmlFor={`${baseId}-${i}`}>{credentialField(f)?.label ?? f}</label>
+          <input
+            id={`${baseId}-${i}`}
+            className="textInput"
+            type="password"
+            autoComplete="new-password"
+            spellCheck={false}
+            onChange={e => onChange(f, e.target.value)}
+          />
+        </div>
+      ))}
+      <p className={styles.hint}>Leave it empty to clear the stored value: nothing stored is sent to the new address.</p>
+    </div>
+  )
+}
 
 interface CredentialShortcutProps {
   /** The UserSettings column, e.g. 'trufflehogGithubToken'. */
@@ -30,6 +56,10 @@ interface CredentialShortcutProps {
  * read, so the box always starts empty and a save REPLACES rather than edits.
  * The reveal toggle therefore only shows what the user is currently typing,
  * which is what it is for - checking a pasted token.
+ *
+ * Keys that are not the person's own (a collaborator's project form, step 5.7:
+ * `keys.readOnly`) show whether the project owner has set the key, and nothing
+ * to type into.
  */
 export function CredentialShortcut({
   settingsKey,
@@ -39,9 +69,12 @@ export function CredentialShortcut({
 }: CredentialShortcutProps) {
   const field = credentialField(settingsKey)
   const inputId = useId()
+  const alerts = useOptionalAlertModal()
   const [draft, setDraft] = useState('')
   const [visible, setVisible] = useState(false)
   const [justSaved, setJustSaved] = useState(false)
+  // Re-pointing a configured endpoint takes the password (ID-25): the dialog answers the save.
+  const [stepUpAsk, setStepUpAsk] = useState<{ resolve: (password: string | null) => void } | null>(null)
 
   // An unknown key would render an unlabelled box telling the user to set
   // something it cannot name. credentialFields.test.ts makes this unreachable.
@@ -52,10 +85,49 @@ export function CredentialShortcut({
   const busy = keys.saving === settingsKey
   const blocking = !isSet && !optional
 
+  if (keys.readOnly) {
+    return (
+      <div className={`${styles.wrap} ${blocking ? styles.missing : ''}`} data-testid={`owner-key-${settingsKey}`}>
+        <div className={styles.head}>
+          <span>{field.label}</span>
+          <span className={`${styles.badge} ${styles.badgeGlobal}`}>Owner&apos;s setting</span>
+          {isSet ? (
+            <span className={`${styles.badge} ${styles.badgeSet}`}>Set</span>
+          ) : optional ? (
+            <span className={`${styles.badge} ${styles.badgeOptional}`}>Optional</span>
+          ) : (
+            <span className={`${styles.badge} ${styles.badgeMissing}`}>Required</span>
+          )}
+        </div>
+        {keys.loadError && (
+          <p className={styles.error} role="alert">{keys.loadError}, so this key may already be set.</p>
+        )}
+        <p className={styles.hint}>
+          This project runs on its owner&apos;s keys. Only the owner can {isSet ? 'replace' : 'set'} this one, in their Global Settings.
+        </p>
+      </div>
+    )
+  }
+
+  // A new endpoint (the GitHub Enterprise host) whose stored secret the server will not
+  // carry over (HD-24): ask for it, or to clear it, so both go in the same save.
+  const askForSecrets = async (prompt: SecretReentryPrompt): Promise<Record<string, string> | null> => {
+    if (!alerts) return null
+    const typed: Record<string, string> = Object.fromEntries(prompt.fields.map(f => [f, '']))
+    const confirmed = await alerts.confirm(
+      <ReentryFields prompt={prompt} onChange={(f, v) => { typed[f] = v }} />,
+      `Save the new ${field.label}`,
+      { confirmLabel: 'Save' },
+    )
+    return confirmed ? Object.fromEntries(Object.entries(typed).map(([k, v]) => [k, v.trim()])) : null
+  }
+
+  const askForPassword = () => new Promise<string | null>(resolve => setStepUpAsk({ resolve }))
+
   const commit = async () => {
     const value = draft.trim()
     if (!value || busy) return
-    const ok = await keys.save(settingsKey, value)
+    const ok = await keys.save(settingsKey, value, { onSecretReentry: askForSecrets, onStepUp: askForPassword })
     if (ok) {
       setDraft('')
       setVisible(false)
@@ -123,6 +195,17 @@ export function CredentialShortcut({
       )}
 
       {!compact && <p className={styles.hint}>{field.hint}</p>}
+
+      {stepUpAsk && (
+        <StepUpModal
+          isOpen
+          title={`Save the new ${field.label}`}
+          message="What is stored for it, and the requests that use it, will go to a new address. Enter your password to save the change."
+          confirmLabel="Save"
+          onConfirm={async password => { stepUpAsk.resolve(password) }}
+          onClose={() => { stepUpAsk.resolve(null); setStepUpAsk(null) }}
+        />
+      )}
 
       <div className={styles.links}>
         <Link href={SETTINGS_KEYS_HREF}>All keys in Global Settings</Link>

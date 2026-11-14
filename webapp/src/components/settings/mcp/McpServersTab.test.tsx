@@ -7,7 +7,7 @@
  * showed a SyntaxError on a proxy's HTML page.
  */
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react'
 
 const ui = vi.hoisted(() => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() },
@@ -22,6 +22,9 @@ const ui = vi.hoisted(() => ({
 vi.mock('@/components/ui', () => ({
   useToast: () => ui.toast,
   useAlertModal: () => ui.alerts,
+  // StepUpModal is built on Modal (ID-25: re-pointing asks for the password).
+  Modal: ({ isOpen, title, children }: { isOpen: boolean; title?: string; children: React.ReactNode }) =>
+    isOpen ? <div role="dialog" aria-label={title}>{children}</div> : null,
 }))
 
 import McpServersTab from './McpServersTab'
@@ -78,6 +81,23 @@ describe('list', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(await screen.findByText('Probe')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  test('a stored server without its lists renders and opens for editing', async () => {
+    // The list route returns rows as stored; a row written by a script or an older
+    // version can lack `tools` and `default_phases` (the schema's defaults apply only on save).
+    const { tools: _t, default_phases: _p, tags: _g, args: _a, env: _e, headers: _h, ...bare } = SERVER
+    answers.list = json(200, { servers: [{ ...bare, transport: 'streamable_http', url: 'http://127.0.0.1:9/mcp', command: undefined }] })
+    render(<McpServersTab userId="u1" />)
+    const row = (await screen.findByText('Probe')).closest('tr') as HTMLElement
+    expect(within(row).getByText('0')).toBeInTheDocument()
+
+    fireEvent.click(within(row).getByTitle('Edit'))
+    await screen.findByText('Edit MCP Tool Plugin: probe')
+    expect(screen.getByText(/No tools yet/)).toBeInTheDocument()
+    const phases = within(screen.getByText(/^default phases/).closest('label') as HTMLElement).getAllByRole('checkbox')
+    expect(phases.map((box) => [box.parentElement?.textContent, (box as HTMLInputElement).checked]))
+      .toEqual([['informational', true], ['exploitation', true], ['post_exploitation', true]])
   })
 })
 
@@ -144,5 +164,142 @@ describe('Test (Discover)', () => {
     await openEdit()
     fireEvent.click(screen.getByRole('button', { name: /Discover and add new tools/ }))
     expect(await screen.findByText(/server is disabled/)).toBeInTheDocument()
+  })
+})
+
+describe('HD-24: a new URL with the masked token or header asks for it again', () => {
+  const HTTP_SERVER = {
+    ...SERVER, transport: 'streamable_http', command: '', url: 'https://mcp.example.com/mcp',
+    auth: { type: 'bearer', token: '••••••••1234' }, headers: { 'X-Api-Key': '••••••••9999' },
+  }
+  const refusal = (field: string) => json(400, {
+    error: 'The server URL changed: type the bearer token again, or clear it. A stored secret is never sent to a new address unless it is entered again.',
+    code: 'secret_reentry_required', field, fields: [field], endpoint: 'url',
+  })
+
+  async function changeUrl() {
+    answers.list = json(200, { servers: [HTTP_SERVER] })
+    await openEdit()
+    fireEvent.change(screen.getByPlaceholderText(/my-mcp:8080/), { target: { value: 'https://elsewhere.example.net/mcp' } })
+  }
+
+  test('Save: the token field shows the message and takes the focus', async () => {
+    answers.put = refusal('auth.token')
+    await changeUrl()
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('type the bearer token again')
+    await waitFor(() => expect(screen.getByLabelText('bearer token')).toHaveFocus())
+    expect(screen.getByText(/\(secret_reentry_required · HTTP 400\)/)).toBeInTheDocument()
+  })
+
+  test('Save: a header value named by the refusal focuses the headers box', async () => {
+    answers.put = refusal('headers.X-Api-Key')
+    await changeUrl()
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByRole('alert')
+    await waitFor(() => expect(screen.getByPlaceholderText(/X-Organization-ID/)).toHaveFocus())
+  })
+
+  test('Test (Discover): the same refusal focuses the token field', async () => {
+    answers.test = refusal('auth.token')
+    await changeUrl()
+    fireEvent.click(screen.getByRole('button', { name: /Discover and add new tools/ }))
+    await waitFor(() => expect(screen.getByLabelText('bearer token')).toHaveFocus())
+    expect(screen.getByRole('alert')).toHaveTextContent('type the bearer token again')
+  })
+})
+
+describe('review of 1.6: a new stdio command with masked env values asks for them again', () => {
+  const STDIO = { ...SERVER, command: 'npx', env: { SHODAN_API_KEY: '••••••••5555' } }
+
+  test('Save: the env box shows the message and takes the focus', async () => {
+    answers.list = json(200, { servers: [STDIO] })
+    answers.put = json(400, {
+      error: 'The command changed: type the value of the environment variable "SHODAN_API_KEY" again, or clear it. A stored secret is never sent to a new address unless it is entered again.',
+      code: 'secret_reentry_required', field: 'env.SHODAN_API_KEY', fields: ['env.SHODAN_API_KEY'], endpoint: 'command',
+    })
+    await openEdit()
+    fireEvent.change(screen.getByPlaceholderText('uvx, npx, python, ...'), { target: { value: 'sh' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('environment variable "SHODAN_API_KEY"')
+    await waitFor(() => expect(screen.getByPlaceholderText(/SHODAN_API_KEY=/)).toHaveFocus())
+  })
+})
+
+describe('ID-25: re-pointing a saved server asks for the password (review of 1.6)', () => {
+  const HTTP_SERVER = {
+    ...SERVER, transport: 'streamable_http', command: '', url: 'https://mcp.example.com/mcp',
+    auth: { type: 'bearer', token: '••••••••1234' },
+  }
+
+  test('the refused save opens the password dialog; the password goes with the same save', async () => {
+    answers.list = json(200, { servers: [HTTP_SERVER] })
+    const puts: Record<string, unknown>[] = []
+    const queue = [
+      json(403, { error: 'Enter your password to confirm this action.', code: 'step_up_required' }),
+      json(200, { server: HTTP_SERVER, servers: [HTTP_SERVER] }),
+    ]
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'PUT') {
+        puts.push(JSON.parse(String(init!.body)))
+        return queue.shift()!
+      }
+      return resolve(answers.list).clone()
+    })
+    await openEdit()
+    fireEvent.change(screen.getByPlaceholderText(/my-mcp:8080/), { target: { value: 'https://elsewhere.example.net/mcp' } })
+    fireEvent.change(screen.getByLabelText('bearer token'), { target: { value: 'typed-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveTextContent('new address')
+    fireEvent.change(screen.getByLabelText('Your password'), { target: { value: 'my-password' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(puts).toHaveLength(2))
+    expect(puts[0].stepUpPassword).toBeUndefined()
+    expect(puts[1]).toMatchObject({ url: 'https://elsewhere.example.net/mcp', stepUpPassword: 'my-password' })
+    await waitFor(() => expect(screen.queryByText('Edit MCP Tool Plugin: probe')).toBeNull())
+  })
+})
+
+describe('stdio servers are an administrator\'s (NF-14, OQ-48)', () => {
+  const STDIO_ONLY = "stdio servers run inside the agent with every user's data; ask an administrator"
+
+  test('a member sees a saved stdio server as not run, with the reason, and cannot switch it on', async () => {
+    answers.list = json(200, { servers: [SERVER], stdioAllowed: false })
+    render(<McpServersTab userId="u1" />)
+    const row = (await screen.findByText('Probe')).closest('tr') as HTMLElement
+    expect(within(row).getByText(STDIO_ONLY)).toBeTruthy()
+    const toggle = within(row).getByRole('checkbox') as HTMLInputElement
+    expect(toggle.disabled).toBe(true)
+    expect(toggle.checked).toBe(false)
+  })
+
+  test('a member is offered no stdio preset and no stdio transport', async () => {
+    answers.list = json(200, { servers: [SERVER], stdioAllowed: false })
+    render(<McpServersTab userId="u1" />)
+    await screen.findByText('Probe')
+    const stdioPresets = screen.getAllByText('stdio').map(el => el.closest('button')).filter(Boolean) as HTMLButtonElement[]
+    expect(stdioPresets.length).toBeGreaterThan(0)
+    for (const card of stdioPresets) {
+      expect(card.disabled).toBe(true)
+      expect(card.title).toBe(STDIO_ONLY)
+    }
+    fireEvent.click(screen.getByText('Add MCP'))
+    const option = (await screen.findByRole('option', { name: 'stdio' })) as HTMLOptionElement
+    expect(option.disabled).toBe(true)
+  })
+
+  test('an administrator keeps every stdio control', async () => {
+    answers.list = json(200, { servers: [SERVER], stdioAllowed: true })
+    render(<McpServersTab userId="u1" />)
+    const row = (await screen.findByText('Probe')).closest('tr') as HTMLElement
+    expect(within(row).queryByText(STDIO_ONLY)).toBeNull()
+    expect((within(row).getByRole('checkbox') as HTMLInputElement).disabled).toBe(false)
+    fireEvent.click(screen.getByText('Add MCP'))
+    expect(((await screen.findByRole('option', { name: 'stdio' })) as HTMLOptionElement).disabled).toBe(false)
   })
 })

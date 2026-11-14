@@ -20,7 +20,8 @@ Report file is written as `WCVS_<date>_<rand>_Report.json` in the generate path.
 
 import glob
 import json
-import subprocess
+import math
+import subprocess  # noqa: F401 - the tool tests fake docker through wcvs_runner.subprocess
 import uuid
 from pathlib import Path
 
@@ -73,6 +74,28 @@ def build_wcvs_command(
     return cmd
 
 
+def wcvs_ceiling_rate(ceiling: float) -> float:
+    """WCVS's ``-rr`` under an RoE ceiling of ``ceiling`` requests per second.
+
+    ``-rr`` is one token bucket (burst 1) shared by every thread and URL, but on
+    a cache that answers with an Age header WCVS takes a token, sleeps 2 s and
+    only then sends (its cache-buster checks, pkg/recon.go). With one thread the
+    next token is free by then, so two requests leave together, and the next
+    one follows 1/rr later:
+
+    - ceiling >= 2: a pair is allowed, so 1 + (rr tokens in the second after
+      it) <= ceiling, which gives rr = ceiling - 1;
+    - below 2 a pair is not: the next token must come 1/ceiling after the
+      delayed send, 1/rr - 2 >= 1/ceiling, which gives rr = 1 / (2 + 1/ceiling).
+
+    Rounded down to a thousandth (WCVS reads a float). Measured on a loopback
+    copy of the FP lab cache at a ceiling of 2: -rr 2 put 3 requests in one
+    second and -rr 1 never more than 2.
+    """
+    rate = ceiling - 1 if ceiling >= 2 else 1 / (2 + 1 / ceiling)
+    return math.floor(rate * 1000) / 1000
+
+
 def safety_skip_tests(allow_deception: bool, allow_cpdos: bool) -> list[str]:
     """Build the -skiptest list that enforces the safety profile."""
     skip: list[str] = []
@@ -83,7 +106,8 @@ def safety_skip_tests(allow_deception: bool, allow_cpdos: bool) -> list[str]:
     return skip
 
 
-def run_wcvs(target_urls: list[str], settings: dict, work_dir: str = "/tmp/redamon/.cache_scan") -> list[dict]:
+def run_wcvs(target_urls: list[str], settings: dict, work_dir: str = "/tmp/redamon/.cache_scan",
+             outcome: dict | None = None) -> list[dict]:
     """Run WCVS over the target URLs and return parsed candidate findings.
 
     Each candidate dict: {url, technique, vector_name, reason, reflections,
@@ -91,8 +115,12 @@ def run_wcvs(target_urls: list[str], settings: dict, work_dir: str = "/tmp/redam
     raw_request, raw_response, source="wcvs"}.
 
     Returns [] on any error (non-fatal — the native engine can still run its own
-    hypotheses). Temp files are always cleaned up.
+    hypotheses). Temp files are always cleaned up. A run that did not finish
+    (a timeout, no report, an error) returns what it got, so ``outcome``, when
+    given, gains ``incomplete``: a fixed phrase saying why. The caller cannot
+    tell that from a clean sweep that found nothing otherwise.
     """
+    outcome = outcome if outcome is not None else {}
     if not target_urls:
         return []
 
@@ -103,6 +131,21 @@ def run_wcvs(target_urls: list[str], settings: dict, work_dir: str = "/tmp/redam
     req_rate = settings.get("WEB_CACHE_POISON_MAX_RPS_PER_HOST", 0)
     cache_header = settings.get("WEB_CACHE_POISON_CACHE_HEADER", "") or ""
     timeout = int(settings.get("WEB_CACHE_POISON_TIMEOUT", 1800))
+
+    from recon.helpers.request_pacer import ceiling_rps
+    ceiling = ceiling_rps(settings)
+    if ceiling:
+        # More threads only add their own late sends to the bunching
+        # wcvs_ceiling_rate allows for.
+        threads = 1
+        paced = wcvs_ceiling_rate(ceiling)
+        try:
+            configured = float(req_rate or 0)
+        except (TypeError, ValueError):
+            configured = 0.0
+        req_rate = min(configured, paced) if configured > 0 else paced
+        print(f"[*][CachePoison] WCVS paced to the {ceiling:g} rps RoE ceiling: "
+              f"one thread, -rr {req_rate:g}")
 
     skip_tests = safety_skip_tests(
         allow_deception=is_deception_allowed(settings),
@@ -129,15 +172,18 @@ def run_wcvs(target_urls: list[str], settings: dict, work_dir: str = "/tmp/redam
 
         print(f"[*][CachePoison] WCVS scanning {len(target_urls)} URL(s) "
               f"(threads={threads}, skip={skip_tests or 'none'})")
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            print(f"[!][CachePoison] WCVS timed out after {timeout}s — parsing partial report")
+        from recon.helpers.docker_helpers import run_tool_container
+        if run_tool_container(cmd, tool="wcvs", timeout=timeout).timed_out:
+            # Which URLs a cut-short run finished is not known: none counts as swept.
+            print(f"[!][CachePoison] WCVS timed out after {timeout}s — stopped it, "
+                  f"parsing partial report")
+            outcome["incomplete"] = f"timed out after {timeout}s"
 
         # WCVS writes WCVS_<date>_<rand>_Report.json into out_dir.
         reports = glob.glob(str(out_dir / "*_Report.json"))
         if not reports:
             print("[-][CachePoison] WCVS produced no report")
+            outcome.setdefault("incomplete", "produced no report")
             return []
         from recon.helpers.docker_helpers import fix_file_ownership
         for r in reports:
@@ -151,7 +197,8 @@ def run_wcvs(target_urls: list[str], settings: dict, work_dir: str = "/tmp/redam
         print(f"[+][CachePoison] WCVS surfaced {len(candidates)} candidate(s)")
         return candidates
     except Exception as e:
-        print(f"[!][CachePoison] WCVS run failed: {e}")
+        print(f"[!][CachePoison] WCVS run failed ({type(e).__name__})")
+        outcome["incomplete"] = f"failed ({type(e).__name__})"
         return []
     finally:
         # Clean the run dir (targets + report already parsed into memory).

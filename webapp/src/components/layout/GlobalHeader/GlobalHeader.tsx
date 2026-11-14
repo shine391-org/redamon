@@ -6,17 +6,26 @@ import Image from 'next/image'
 // navigating, so header links prompt when a dirty form would lose edits.
 import { GuardedLink as Link } from '@/components/GuardedLink'
 import { usePathname } from 'next/navigation'
-import { Crosshair, FolderOpen, Shield, BookOpen, TrendingUp, FileText, Settings, Users, GitBranch, Network, Puzzle } from 'lucide-react'
+import { Crosshair, FolderOpen, Shield, BookOpen, TrendingUp, FileText, Settings, Users, GitBranch, Network, Puzzle, LayoutDashboard } from 'lucide-react'
 import { ThemeToggle } from '@/components/ThemeToggle'
 import { ProjectSelector } from './ProjectSelector'
 import { UserSelector } from './UserSelector'
+import { AdminBanners } from '@/components/admin/CompatBanner'
+import { ActAsBannerSlot } from '@/components/auth/ActAsBanner'
+import { ProjectTransferBanners } from '@/components/projects/OwnershipTransfer/ProjectTransferBanners'
 import { useAuth } from '@/providers/AuthProvider'
+import { useCan, useRbacFlags } from '@/hooks/useCan'
+import { holdsConsolePermission } from '@/app/admin/consoleSections'
 import { useProject } from '@/providers/ProjectProvider'
 import styles from './GlobalHeader.module.css'
 
 export function GlobalHeader() {
   const pathname = usePathname()
-  const { isAdmin } = useAuth()
+  const { user, capabilities } = useAuth()
+  const canReadUsers = useCan('users:read')
+  // Governance switch on (step 6.1): "Admin" to the console replaces "Users", for any console permission.
+  const governance = useRbacFlags()?.governance === true
+  const showAdmin = governance && holdsConsolePermission((p) => capabilities.has(p))
   const { projectId } = useProject()
 
   const coreNav: Array<{ label: string; href: string; icon: ReactNode; isNew?: boolean }> = [
@@ -28,13 +37,14 @@ export function GlobalHeader() {
     { label: 'Insights', href: '/insights', icon: <TrendingUp size={14} /> },
     // TrafficMind table view is visible to everyone (view captured traffic for
     // their project). Only the TrafficMind *settings* (egress guard, master
-    // switch) are admin-only, gated in Global Settings.
+    // switch) need platform:traffic_capture, gated on the /traffic page.
     { label: 'TrafficMind', href: '/traffic', icon: <Network size={14} /> },
     { label: 'Plugins', href: '/plugins', icon: <Puzzle size={14} /> },
     { label: 'Reports', href: '/reports', icon: <FileText size={14} /> },
   ]
 
   return (
+    <>
     <header className={styles.header}>
       <Link href="/graph" className={styles.logo}>
         <Image src="/logo.png" alt="RedAmon" width={28} height={28} className={styles.logoImg} />
@@ -71,7 +81,17 @@ export function GlobalHeader() {
           <span>Projects</span>
         </Link>
 
-        {isAdmin && (
+        {showAdmin && (
+          <Link
+            href="/admin"
+            className={`${styles.navItem} ${pathname === '/admin' || pathname.startsWith('/admin/') ? styles.navItemActive : ''}`}
+          >
+            <LayoutDashboard size={14} />
+            <span>IAM</span>
+          </Link>
+        )}
+
+        {!governance && canReadUsers && (
           <Link
             href="/settings/users"
             className={`${styles.navItem} ${pathname === '/settings/users' ? styles.navItemActive : ''}`}
@@ -116,5 +136,12 @@ export function GlobalHeader() {
         </Link>
       </div>
     </header>
+    {/* While an admin acts as someone (permissions switch on, step 3.14): on every page. */}
+    <ActAsBannerSlot />
+    {/* /api/auth/me sends `rbac` to administrator accounts only. */}
+    <AdminBanners adminAccount={user?.rbac !== undefined} rbac={user?.rbac} pathname={pathname} />
+    {/* Ownership transfer offers and the new owner's settings to re-pick (step 5.12): write sharing in force only. */}
+    <ProjectTransferBanners />
+    </>
   )
 }

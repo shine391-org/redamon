@@ -2,7 +2,7 @@
 
 import { PlannerSection } from './sections/PlannerSection'
 
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useContext, useMemo, useRef, type ReactNode } from 'react'
 import { Save, X, Loader2, Download, ShieldAlert, Zap, Bookmark, FolderOpen, List, GitBranch, Play, Check } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 import dynamic from 'next/dynamic'
@@ -10,11 +10,19 @@ import type { Project } from '@prisma/client'
 import { validateProjectForm } from '@/lib/validation'
 import { firstHardBlocked } from '@/lib/hard-guardrail'
 import { validateDomainBatch } from '@/lib/domainBatch'
-import { scopeGuardrailNames } from '@/lib/scopeGroups'
+import { type ScopeFields, ipHostnamePolicyProblem, scopeGuardrailNames } from '@/lib/scopeGroups'
 import { ipModeRoot, resolveProjectRoots } from '@/lib/partialReconScope'
 import { tabForAnchor } from '@/lib/projectSettingsLinks'
 import { graphScanHref, type ScanModal } from '@/lib/scanModalLink'
 import { useProject } from '@/providers/ProjectProvider'
+import { ProjectAccessContext } from '@/providers/projectAccessContext'
+import type { MyAccess } from '@/lib/authz/projectAccess'
+import { levelRefusalText } from '@/lib/readOnlyProject'
+import { fieldChangeRefusal, writeAccessSummary, type FieldChangeRefusal } from '@/lib/settingsFieldAccess'
+import { OwnerCatalogContext } from '@/hooks/useOwnerCatalog'
+import { useProjectOwnerCatalog } from '@/hooks/useProjectOwnerCatalog'
+import { RefusalNotice } from '@/components/auth/ForbiddenNotice'
+import { RegistryFieldsReadOnly } from './RegistryFields'
 import { JevSelectionProvider } from '@/hooks/useHasJevProvider'
 import useReconStatus from '@/hooks/useReconStatus'
 import { useScanControls } from '@/hooks/useScanControls'
@@ -99,7 +107,7 @@ import { ReconPresetModal } from './ReconPresetModal'
 import { ProviderRequiredModal, ModelSelectionModal } from './ProjectLlmGate'
 import {
   seedInitialModels, needsModelGate, hasNoConfiguredProvider, providerGateApplies,
-  pipelineModelOptional, loopModelOffered,
+  pipelineModelOptional, loopModelOffered, instanceModelOffered,
 } from './projectLlmGate.logic'
 import { fetchModelOptions } from '@/components/shared/modelOptions'
 import { LOOP_MODEL_ID } from '@/lib/agentInTheLoop'
@@ -116,11 +124,16 @@ import {
 } from '@/lib/project-preset-utils'
 import { useUpdateProject } from '@/hooks/useProjects'
 import { onProjectWrite, versionOf } from '@/lib/projectVersion'
+import { STALE_FIELD_NOTICE, reloadProjectRow, saveProjectFields } from '@/lib/projectFieldSave'
+import { shareSecretFields } from '@/lib/reconSettings/registry'
 
 const WorkflowView = dynamic(
   () => import('./WorkflowView/WorkflowView').then(m => ({ default: m.WorkflowView })),
   { ssr: false, loading: () => <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>Loading workflow...</div> }
 )
+
+/** The `share: secret` columns (registry): the owner's alone, never in a collaborator's save. */
+const OWNER_SECRET_KEYS: readonly string[] = shareSecretFields().map(f => f.key)
 
 type ProjectFormData = Omit<Project, 'id' | 'userId' | 'createdAt' | 'updatedAt' | 'user'>
 
@@ -425,6 +438,9 @@ export function ProjectForm({
   // Agent in the Loop needs no provider: offered from the provider gate while
   // the deployment has it on (the model list then carries it).
   const [loopAvailable, setLoopAvailable] = useState(false)
+  // An instance LLM provider an administrator assigned to the person's sets (step 6.11) is a
+  // configured provider too: its models are in the person's model list.
+  const [instanceAvailable, setInstanceAvailable] = useState(false)
   const [noProvider, setNoProvider] = useState(false)
   // create mode: false until the provider check resolves; gates the form render
   // so a no-provider user sees the "configure provider" gate immediately, not
@@ -444,19 +460,7 @@ export function ProjectForm({
     return () => clearRoeEntry('create')
   }, [mode])
 
-  // GitHub Access Token check (stored in Global Settings, not project)
   const { userId } = useProject()
-  const [hasGithubToken, setHasGithubToken] = useState(false)
-
-  useEffect(() => {
-    if (!userId) return
-    fetch(`/api/users/${userId}/settings`)
-      .then(r => r.ok ? r.json() : null)
-      .then(settings => {
-        if (settings) setHasGithubToken(!!settings.githubAccessToken)
-      })
-      .catch(() => setHasGithubToken(false))
-  }, [userId])
 
   // Deep link into one section: /projects/<id>/settings#github-secret-hunting.
   // The tab has to be selected first - the section is not in the DOM until then -
@@ -490,6 +494,55 @@ export function ProjectForm({
   )
   const projectId =
     projectIdFromRoute ?? (initialData as { id?: string } | undefined)?.id ?? (mode === 'create' ? generatedId : undefined)
+
+  // Read-only mode (step 4.11): the person's access to this project, from the header's project when it
+  // is this one (the stale-access poll keeps that fresh), else from the read the form was opened with.
+  // A read share sees every setting and saves none. With RBAC_SHARING_ENABLED off no read carries
+  // `myAccess` and nothing here changes (DV-30).
+  const headerAccess = useContext(ProjectAccessContext)
+  const formAccess: MyAccess | null = mode !== 'edit' ? null
+    : (headerAccess?.projectId === projectId ? headerAccess?.myAccess : null)
+      ?? (initialData as { myAccess?: MyAccess | null } | undefined)?.myAccess
+      ?? null
+  const readOnlyText = levelRefusalText(formAccess, 'project:settings')
+  const readOnly = readOnlyText !== null
+  // A collaborator's form never holds the owner's secret columns (their read withholds them), so a
+  // save that sent the form's defaults for them would read as a change of the owner's secrets and be
+  // refused (step 5.1b). They are left out of a non-owner's saves and stay as stored (step 5.2).
+  const notOwner = !!formAccess && formAccess.level !== 'owner'
+  const withoutOwnerSecrets = useCallback(<T extends object>(data: T): T => {
+    if (!notOwner) return data
+    const kept = { ...data } as Record<string, unknown>
+    for (const key of OWNER_SECRET_KEYS) delete kept[key]
+    return kept as T
+  }, [notOwner])
+  // A collaborator's form reads the project OWNER's catalogs (step 5.7): the providers, keys, skills
+  // and MCP servers this project runs on are the owner's, not the collaborator's own. Picking from
+  // them needs Manage, and only then are the owner's models listed.
+  const ownerCatalog = useProjectOwnerCatalog(projectId, formAccess)
+  const writeSummary = writeAccessSummary(formAccess)
+
+  // GitHub Access Token check (stored in Global Settings, not project): the owner's, on a shared project.
+  const [ownGithubToken, setHasGithubToken] = useState(false)
+  useEffect(() => {
+    if (!userId || notOwner) return
+    fetch(`/api/users/${userId}/settings`)
+      .then(r => r.ok ? r.json() : null)
+      .then(settings => {
+        if (settings) setHasGithubToken(!!settings.githubAccessToken)
+      })
+      .catch(() => setHasGithubToken(false))
+  }, [userId, notOwner])
+  const hasGithubToken = notOwner ? ownerCatalog?.catalog?.keys.githubAccessToken === true : ownGithubToken
+
+  const presetRefusal = levelRefusalText(formAccess, 'preset:apply')
+  const exportRefusal = levelRefusalText(formAccess, 'project:export')
+  const reconStartRefusal = levelRefusalText(formAccess, 'recon:scan')
+  // Every control under the form asks about this project, not the header's (create mode: none yet).
+  const formAccessScope = useMemo(
+    () => ({ projectId: projectId ?? null, myAccess: formAccess }),
+    [projectId, formAccess],
+  )
 
   // The row's updatedAt as this form last saw it written. A full save sends it
   // back and the PUT refuses a stale one with 409, so an MCP agent's change made
@@ -708,9 +761,14 @@ export function ProjectForm({
     fetchJson<unknown>(`/api/users/${userId}/llm-providers`, undefined, 'Could not check your LLM providers')
       .then(async (providers) => {
         if (hasNoConfiguredProvider(providers)) {
-          setNoProvider(true)
-          setLoopAvailable(await fetchModelOptions(userId).then(loopModelOffered, () => false))
-          setShowProviderGate(true)
+          const models = await fetchModelOptions(userId).catch(() => null)
+          setLoopAvailable(models ? loopModelOffered(models) : false)
+          const instance = models ? instanceModelOffered(models) : false
+          setInstanceAvailable(instance)
+          if (!instance) {
+            setNoProvider(true)
+            setShowProviderGate(true)
+          }
         }
         setProviderChecked(true)
       })
@@ -724,45 +782,73 @@ export function ProjectForm({
   // Log drawers pin to the body wrapper, which moves as the form scrolls.
   useDrawerOffsets(bodyRef, { trackScroll: true })
 
+  // A collaborator's change their access does not reach (a gate loosened, the scope changed, the
+  // owner's secret) is refused where it is made, with the reason (step 5.7); the project PUT would
+  // refuse the whole save for it (step 5.1). Judged against the row as stored, as the PUT judges.
+  const changeRefusal = useCallback((changes: Record<string, unknown>): FieldChangeRefusal | null => fieldChangeRefusal(
+    serverRowRef.current ?? {}, formDataRef.current as unknown as Record<string, unknown>, changes, formAccess,
+  ), [formAccess])
+  // One notice per field while the person keeps trying (a locked text box gets a key press each time).
+  const refusalShownAt = useRef<Record<string, number>>({})
+  const announceRefusal = (refusal: FieldChangeRefusal) => {
+    const now = Date.now()
+    if (now - (refusalShownAt.current[refusal.key] ?? 0) < 4000) return
+    refusalShownAt.current[refusal.key] = now
+    toast.warning(refusal.text, 'Not changed')
+  }
+
   const updateField = <K extends keyof ProjectFormData>(
     field: K,
     value: ProjectFormData[K]
   ) => {
+    // A control the read-only fieldset cannot disable (one drawn without a form element) still changes nothing.
+    if (readOnly) return
+    const refusal = changeRefusal({ [field]: value })
+    if (refusal) {
+      announceRefusal(refusal)
+      return
+    }
     setFormData(prev => ({ ...prev, [field]: value }))
   }
 
-  // Auto-save a single toggle field directly to DB (used in workflow mode)
+  // Auto-save a single toggle field directly to DB (used in workflow mode). It sends the row's
+  // version as the full save does (step 5.2): a value someone else changed since is refused (409),
+  // and the form then takes the row as it is now, keeping this person's other unsaved edits.
   const autoSaveField = useCallback(async <K extends keyof ProjectFormData>(
     field: K,
     value: ProjectFormData[K]
   ) => {
-    if (!projectId || mode !== 'edit') return
+    // updateField has already said why a refused change was not made.
+    if (!projectId || mode !== 'edit' || readOnly || changeRefusal({ [field]: value })) return
     try {
-      const res = await fetch(`/api/projects/${projectId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [field]: value }),
-      })
-      if (!res.ok) {
-        const failure = await readApiError(res, 'Failed to save')
-        if (await savedDespiteError(failure)) {
-          setBaseline(prev => ({ ...prev, [field]: value }))
-          toast.error(`Setting saved, but a step after the save failed: ${failure.message}`)
-          return
-        }
-        toast.error(failure.message)
+      const saved = await saveProjectFields(projectId, { [field]: value }, savedVersionRef.current, 'Failed to save')
+      if (!saved.ok) {
+        toast.warning(STALE_FIELD_NOTICE)
+        const row = await reloadProjectRow(projectId)
+        if (row) onServerRowMergedRef.current(row, [field as string])
         return
       }
-      adoptSavedVersion(await res.json().catch(() => null))
+      adoptSavedVersion(saved.row)
       // Workflow toggles persist immediately; adopt the saved field into the
       // baseline so the batched Update button + guard don't flag it as unsaved.
       setBaseline(prev => ({ ...prev, [field]: value }))
     } catch (err) {
+      if (await savedDespiteError(err)) {
+        setBaseline(prev => ({ ...prev, [field]: value }))
+        toast.error(`Setting saved, but a step after the save failed: ${toApiError(err, 'Failed to save').message}`)
+        return
+      }
       toast.error(toApiError(err, 'Failed to save setting').message)
     }
-  }, [projectId, mode, toast, setBaseline, adoptSavedVersion, savedDespiteError])
+  }, [projectId, mode, readOnly, changeRefusal, toast, setBaseline, adoptSavedVersion, savedDespiteError])
 
   const updateMultipleFields = (fields: Partial<ProjectFormData>) => {
+    if (readOnly) return
+    const refusal = changeRefusal(fields as Record<string, unknown>)
+    if (refusal) {
+      announceRefusal(refusal)
+      return
+    }
     setFormData(prev => ({ ...prev, ...fields }))
   }
 
@@ -792,6 +878,9 @@ export function ProjectForm({
     setBaseline(merged.baseline as unknown as ProjectFormData)
     adoptSavedVersion(row)
   }, [setBaseline, adoptSavedVersion])
+  // autoSaveField is declared before this callback; it reaches it through the ref.
+  const onServerRowMergedRef = useRef(onServerRowMerged)
+  onServerRowMergedRef.current = onServerRowMerged
 
   /**
    * Load a preset: confirm, replace every preset-owned setting, and in edit mode
@@ -886,7 +975,7 @@ export function ProjectForm({
     }
     // A compare-and-swap like a whole-row save: a RoE replaced or an MCP write
     // made in another tab since this form loaded is refused (409), not reverted.
-    const versioned = savedVersionRef.current ? { ...saved, updatedAt: savedVersionRef.current } : saved
+    const versioned = withoutOwnerSecrets(savedVersionRef.current ? { ...saved, updatedAt: savedVersionRef.current } : saved)
     const invalid = validateProjectForm(next as unknown as Record<string, unknown>)
       .filter(e => e.field in saved)
     if (invalid.length > 0) {
@@ -920,8 +1009,8 @@ export function ProjectForm({
     if (mode !== 'create' || !userId) return true
     try {
       const providers = await fetchJson<unknown>(`/api/users/${userId}/llm-providers`, undefined, 'Could not check your LLM providers')
-      setNoProvider(hasNoConfiguredProvider(providers))
-      if (providerGateApplies(providers, formData.agentOpenaiModel as string, loopAvailable)) {
+      setNoProvider(hasNoConfiguredProvider(providers) && !instanceAvailable)
+      if (providerGateApplies(providers, formData.agentOpenaiModel as string, loopAvailable, instanceAvailable)) {
         setShowProviderGate(true)
         return false
       }
@@ -933,6 +1022,7 @@ export function ProjectForm({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (readOnly) return
 
     if (!formData.name.trim()) {
       alertWarning('Project name is required')
@@ -972,13 +1062,13 @@ export function ProjectForm({
 
     try {
       // Attach roeFile and pre-generated ID to form data for submission
-      const submitData = {
+      const submitData = withoutOwnerSecrets({
         ...formData,
         reconPresetId: appliedPreset?.id ?? formData.reconPresetId ?? null,
         ...(roeFile ? { roeFile } : {}),
         ...(mode === 'create' && projectId ? { id: projectId } : {}),
         ...(mode === 'edit' && savedVersionRef.current ? { updatedAt: savedVersionRef.current } : {}),
-      }
+      })
       const togglesChanged = !deepEqual(formData.attackSkillConfig, baseline.attackSkillConfig)
       adoptSavedVersion(await onSubmit(submitData))
       // Other open windows of this project (the chat drawer) take the new toggles.
@@ -1014,7 +1104,7 @@ export function ProjectForm({
    *  back to the graph with their unsaved input and only a transient alert to
    *  explain it. */
   const handleSaveAndStay = async (after?: () => void): Promise<boolean> => {
-    if (!onSaveAndStay) return false
+    if (!onSaveAndStay || readOnly) return false
 
     if (!formData.name.trim()) {
       // Jump to the tab that owns the offending field, so the operator is not
@@ -1051,13 +1141,13 @@ export function ProjectForm({
       return false
     }
     try {
-      const submitData = {
+      const submitData = withoutOwnerSecrets({
         ...formData,
         reconPresetId: appliedPreset?.id ?? formData.reconPresetId ?? null,
         ...(roeFile ? { roeFile } : {}),
         ...(mode === 'create' && projectId ? { id: projectId } : {}),
         ...(mode === 'edit' && savedVersionRef.current ? { updatedAt: savedVersionRef.current } : {}),
-      }
+      })
       const togglesChanged = !deepEqual(formData.attackSkillConfig, baseline.attackSkillConfig)
       adoptSavedVersion(await onSaveAndStay(submitData))
       if (togglesChanged) postUserSkillsChanged({ projectId })
@@ -1212,7 +1302,14 @@ export function ProjectForm({
   }, [projectId, alertError])
 
   // Determine if form can be submitted
-  const canSubmit = !isSubmitting && !isLoadingDefaults
+  // Record + scan all is saved only once confirmed (04_ui_spec.md §8). The
+  // reason is the save routes' and MCP's own sentence (the cross-field rule), so
+  // the form and the API refuse in the same words; this only says it before the
+  // round trip.
+  const saveBlockedReason = formData.ipMode && formData.ipHostnameMode === 'scan_all' && !formData.ipHostnameScanAllConfirmed
+    ? ipHostnamePolicyProblem(formData as unknown as ScopeFields)
+    : null
+  const canSubmit = !isSubmitting && !isLoadingDefaults && saveBlockedReason === null
 
   // Create mode: resolve the LLM-provider gate BEFORE rendering the project form.
   // While the check is in flight, show a brief loader (not the form); if no
@@ -1233,10 +1330,20 @@ export function ProjectForm({
   }
 
   return (
+    <ProjectAccessContext.Provider value={formAccessScope}>
+    <OwnerCatalogContext.Provider value={ownerCatalog}>
+    <RegistryFieldsReadOnly.Provider value={readOnly}>
     <JevSelectionProvider
       ownerUserId={mode === 'create' ? userId : initialData?.userId ?? null}
       ownerUnavailable={mode === 'edit' && !initialData?.userId}
       selectedProviderId={formData.jevProviderId ?? null}
+      catalog={ownerCatalog ? {
+        status: ownerCatalog.status,
+        providers: ownerCatalog.catalog?.jevProviders ?? [],
+        error: ownerCatalog.error,
+        retry: ownerCatalog.retry,
+        selectionRefusal: ownerCatalog.pickRefusal,
+      } : null}
     >
     <form onSubmit={handleSubmit} className={styles.form}>
       <div className={styles.header}>
@@ -1254,8 +1361,8 @@ export function ProjectForm({
                 type="button"
                 className={`reconStartButton${isReconBusy ? ' reconStartButtonActive' : ''}`}
                 onClick={() => guardedNavigate(() => router.push(isReconBusy ? `/graph?project=${projectId}&openlogs=recon` : `/graph?project=${projectId}&autostart=true`))}
-                disabled={isSubmitting || runningPartialToolIds.size > 0}
-                title={runningPartialToolIds.size > 0 ? 'Partial recon is running -- stop it first' : isReconRunning ? 'Recon is running -- click to view progress' : isReconPaused ? 'Recon is paused -- click to view' : reconStatusError ? `${reconStatusError} -- a recon may be running; the graph page shows it` : 'Navigate to the graph page and start the full recon pipeline'}
+                disabled={isSubmitting || runningPartialToolIds.size > 0 || (!isReconBusy && !!reconStartRefusal)}
+                title={!isReconBusy && reconStartRefusal ? reconStartRefusal : runningPartialToolIds.size > 0 ? 'Partial recon is running -- stop it first' : isReconRunning ? 'Recon is running -- click to view progress' : isReconPaused ? 'Recon is paused -- click to view' : reconStatusError ? `${reconStatusError} -- a recon may be running; the graph page shows it` : 'Navigate to the graph page and start the full recon pipeline'}
               >
                 {isReconRunning ? (
                   <Loader2 size={14} className={styles.spinner} />
@@ -1294,8 +1401,8 @@ export function ProjectForm({
             type="button"
             className="secondaryButton"
             onClick={() => setIsUserPresetDrawerOpen(true)}
-            disabled={isSubmitting || isLoadingDefaults}
-            title="Replace this project's settings with a saved preset. Asks first, and saves the project straight away. The target, RoE, uploaded files and credentials are kept"
+            disabled={isSubmitting || isLoadingDefaults || !!presetRefusal}
+            title={presetRefusal ?? "Replace this project's settings with a saved preset. Asks first, and saves the project straight away. The target, RoE, uploaded files and credentials are kept"}
           >
             <FolderOpen size={14} />
             Load Preset
@@ -1315,8 +1422,8 @@ export function ProjectForm({
               type="button"
               className="secondaryButton"
               onClick={() => void exportProject()}
-              disabled={isExporting}
-              title="Download a full project backup as a ZIP file including settings, conversations, graph data, reports, and artifacts"
+              disabled={isExporting || !!exportRefusal}
+              title={exportRefusal ?? "Download a full project backup as a ZIP file including settings, conversations, graph data, reports, and artifacts"}
             >
               {isExporting ? <Loader2 size={14} className={styles.spinner} /> : <Download size={14} />}
               {isExporting ? 'Exporting...' : 'Export'}
@@ -1325,8 +1432,9 @@ export function ProjectForm({
           <button
             type="submit"
             className="primaryButton"
-            disabled={!canSubmit || !isDirty}
-            title={mode === 'create' ? 'Create the project with the current settings and start working' : !isDirty ? 'No unsaved changes' : 'Save all changes to the project settings'}
+            disabled={!canSubmit || !isDirty || readOnly}
+            aria-describedby={saveBlockedReason ? 'project-save-blocked' : undefined}
+            title={readOnlyText ?? saveBlockedReason ?? (mode === 'create' ? 'Create the project with the current settings and start working' : !isDirty ? 'No unsaved changes' : 'Save all changes to the project settings')}
           >
             {isLoadingDefaults ? (
               <>
@@ -1342,6 +1450,17 @@ export function ProjectForm({
           </button>
         </div>
       </div>
+      {readOnlyText && (
+        <RefusalNotice refusal={{ kind: 'level', permission: 'project:settings', text: readOnlyText }} className={styles.readOnlyNotice} />
+      )}
+      {writeSummary && (
+        <div className={`${styles.callout} ${styles.calloutInfo} ${styles.readOnlyNotice}`} role="note" data-testid="write-access-notice">
+          <span>{writeSummary}</span>
+        </div>
+      )}
+      {saveBlockedReason && (
+        <p id="project-save-blocked" className={styles.saveBlockedReason} role="status">{saveBlockedReason}</p>
+      )}
 
       {defaultsWarning && (
         <div className={`${styles.callout} ${styles.calloutWarning}`} role="alert" data-testid="defaults-warning">
@@ -1396,9 +1515,11 @@ export function ProjectForm({
                               key={tab.id}
                               type="button"
                               className={`tab ${activeTab === tab.id ? 'tabActive' : ''} ${styles.compactTab} ${tab.id === 'preset' ? styles.presetTab : ''} ${tab.id !== 'preset' && viewMode !== 'tabs' ? styles.hiddenTab : ''}`}
+                              disabled={tab.id === 'preset' && !!presetRefusal}
+                              title={tab.id === 'preset' && presetRefusal ? presetRefusal : undefined}
                               onClick={() => {
                                 if ((tab.id as string) === 'preset') {
-                                  setIsPresetModalOpen(true)
+                                  if (!presetRefusal) setIsPresetModalOpen(true)
                                 } else if (viewMode === 'tabs') {
                                   setActiveTab(tab.id)
                                 }
@@ -1456,6 +1577,7 @@ export function ProjectForm({
           </div>
 
           <div className={viewMode === 'workflow' && RECON_TAB_IDS.has(activeTab) ? styles.contentWorkflow : styles.content}>
+            <ReadOnlyFieldset readOnly={readOnly}>
             {/* Workflow view -- replaces recon tab content when in workflow mode */}
             {viewMode === 'workflow' && RECON_TAB_IDS.has(activeTab) && (
               <WorkflowView
@@ -1463,7 +1585,7 @@ export function ProjectForm({
                 updateField={updateField}
                 projectId={projectId}
                 mode={mode}
-                onSave={onSaveAndStay ? handleSaveAndStay : undefined}
+                onSave={onSaveAndStay && !readOnly ? handleSaveAndStay : undefined}
                 onRunPartial={(toolId) => setPartialReconToolId(toolId)}
                 runningPartialToolIds={runningPartialToolIds}
                 onAutoSaveField={autoSaveField}
@@ -1616,6 +1738,7 @@ export function ProjectForm({
         {activeTab === 'cypherfix' && (
           <CypherFixSettingsSection data={formData} updateField={updateField} />
         )}
+            </ReadOnlyFieldset>
           </div>
         </>
       )}
@@ -1629,6 +1752,7 @@ export function ProjectForm({
         onLoadUserPreset={(preset) => loadPreset({ kind: 'user', ...preset })}
         currentPresetId={appliedPreset?.id}
         userId={userId}
+        hostnamePolicy={{ ipMode: formData.ipMode, ipHostnameMode: formData.ipHostnameMode }}
       />
 
       {/* User Preset: Save modal */}
@@ -1783,7 +1907,16 @@ export function ProjectForm({
       />
     </form>
     </JevSelectionProvider>
+    </RegistryFieldsReadOnly.Provider>
+    </OwnerCatalogContext.Provider>
+    </ProjectAccessContext.Provider>
   )
+}
+
+/** The settings sections behind one disabled fieldset at read: every input, select and button in them. */
+function ReadOnlyFieldset({ readOnly, children }: { readOnly: boolean; children: ReactNode }) {
+  if (!readOnly) return <>{children}</>
+  return <fieldset disabled className={styles.readOnlyFieldset}>{children}</fieldset>
 }
 
 export default ProjectForm

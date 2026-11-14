@@ -8,7 +8,13 @@ export interface User {
   name: string
   email: string
   role: string
+  /** active | invited | disabled */
+  status?: string
   hasPassword: boolean
+  /** The last sign-in (ISO), null when none is recorded (step 2.12, ID-27). */
+  lastLoginAt?: string | null
+  /** Identity switch on only: the password must change at the next sign-in. */
+  mustChangePassword?: boolean
   createdAt: string
   updatedAt: string
   _count?: {
@@ -36,8 +42,23 @@ async function fetchUser(userId: string): Promise<UserWithProjects> {
   return fetchJson<UserWithProjects>(`/api/users/${userId}`, undefined, 'Failed to fetch user')
 }
 
+/**
+ * Creating an admin with the identity switch on carries Root's own password (step-up, step 2.6).
+ */
+export interface CreateUserData {
+  name: string
+  email: string
+  password?: string
+  role?: string
+  stepUpPassword?: string
+  /** Identity switch on: the password is temporary, changed at the first sign-in (default true). */
+  requirePasswordChange?: boolean
+  /** Permissions switch on: the member sets the account starts with (step 3.13); none, the instance default. */
+  sets?: string[]
+}
+
 // Create a new user
-async function createUser(data: { name: string; email: string; password?: string; role?: string }): Promise<User> {
+async function createUser(data: CreateUserData): Promise<User> {
   return fetchJson<User>('/api/users', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -45,8 +66,14 @@ async function createUser(data: { name: string; email: string; password?: string
   }, 'Failed to create user')
 }
 
+/**
+ * A role change of another admin, and with the identity switch on any change Root makes to
+ * another admin or a promotion, carries the acting admin's own password (step-up).
+ */
+export type UpdateUserData = Partial<{ name: string; email: string; role: string; stepUpPassword: string }>
+
 // Update a user
-async function updateUser(userId: string, data: Partial<{ name: string; email: string; role: string }>): Promise<User> {
+async function updateUser(userId: string, data: UpdateUserData): Promise<User> {
   return fetchJson<User>(`/api/users/${userId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -54,13 +81,36 @@ async function updateUser(userId: string, data: Partial<{ name: string; email: s
   }, 'Failed to update user')
 }
 
-// Delete a user
-async function deleteUser(userId: string): Promise<void> {
-  await fetchOk(`/api/users/${userId}`, { method: 'DELETE' }, 'Failed to delete user')
+/** Deleting another admin carries the acting admin's own password (step-up). */
+export type DeleteUserArg = string | { userId: string; stepUpPassword: string }
+
+async function deleteUser(arg: DeleteUserArg): Promise<void> {
+  if (typeof arg === 'string') {
+    await fetchOk(`/api/users/${arg}`, { method: 'DELETE' }, 'Failed to delete user')
+    return
+  }
+  await fetchOk(`/api/users/${arg.userId}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stepUpPassword: arg.stepUpPassword }),
+  }, 'Failed to delete user')
 }
 
-// Change user password
-async function changePassword(userId: string, data: { newPassword: string; currentPassword?: string }): Promise<void> {
+/**
+ * `currentPassword` for your own password; `stepUpPassword` (your own) when an admin
+ * resets another admin's.
+ */
+export interface ChangePasswordData {
+  newPassword: string
+  currentPassword?: string
+  stepUpPassword?: string
+  /** Identity switch on, someone else's password: changed at the next sign-in (default true). */
+  requirePasswordChange?: boolean
+  /** Identity switch on, someone else's password (a reset, step 2.10): shown to the person. */
+  reason?: string
+}
+
+async function changePassword(userId: string, data: ChangePasswordData): Promise<void> {
   await fetchOk(`/api/users/${userId}/password`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -102,7 +152,7 @@ export function useUpdateUser() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: ({ userId, data }: { userId: string; data: Partial<{ name: string; email: string; role: string }> }) =>
+    mutationFn: ({ userId, data }: { userId: string; data: UpdateUserData }) =>
       updateUser(userId, data),
     onSuccess: (user) => {
       queryClient.invalidateQueries({ queryKey: ['users'] })
@@ -126,7 +176,7 @@ export function useDeleteUser() {
 // Hook for changing password
 export function useChangePassword() {
   return useMutation({
-    mutationFn: ({ userId, data }: { userId: string; data: { newPassword: string; currentPassword?: string } }) =>
+    mutationFn: ({ userId, data }: { userId: string; data: ChangePasswordData }) =>
       changePassword(userId, data),
   })
 }

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import ipaddress
 import difflib
 import re
 import socket
@@ -51,6 +52,7 @@ from recon.helpers.peer_cert import (
     tls_handshake_cert as _tls_handshake_cert,
 )
 from recon.helpers.public_suffix import org_domain
+from recon.helpers import request_pacer
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -133,6 +135,24 @@ class _RateLimiter:
             time.sleep(delay)
 
 
+#: Retry-After is the target's to set: one answer holds every in-process
+#: requester back this long at most.
+_BACK_OFF_MAX_S = 30.0
+
+
+def _back_off_if_throttled(resp) -> None:
+    """A 429 from a target pushes the next slot of every in-process requester
+    back (the RoE clock; inert with no ceiling): Retry-After seconds, else 1 s,
+    capped."""
+    if getattr(resp, "status_code", None) != 429:
+        return
+    try:
+        seconds = float(resp.headers.get("Retry-After"))
+    except (AttributeError, TypeError, ValueError):
+        seconds = 1.0
+    request_pacer.pacer().back_off(min(_BACK_OFF_MAX_S, max(1.0, seconds)))
+
+
 class _SearchBudget:
     """Per-scan ceiling on genuine (non-cached) keyed search calls (G3).
 
@@ -143,12 +163,14 @@ class _SearchBudget:
 
     def __init__(self, limit: int):
         self._remaining = max(0, int(limit))
+        self._refused = 0
         self._lock = threading.Lock()
         self.exhausted_logged = False
 
     def take(self) -> bool:
         with self._lock:
             if self._remaining <= 0:
+                self._refused += 1
                 return False
             self._remaining -= 1
             return True
@@ -158,9 +180,16 @@ class _SearchBudget:
         with self._lock:
             return self._remaining
 
+    @property
+    def refused(self) -> int:
+        """Searches the budget turned away; a host that saw one was not fully checked."""
+        with self._lock:
+            return self._refused
+
 
 class _RunCtx:
-    """Per-run shared state: rate limiter, budget, and the (source, key) cache."""
+    """Per-run shared state: rate limiter, budget, the (source, key) cache and
+    the fronted hosts' reference certificates."""
 
     def __init__(self, settings: dict):
         self.settings = settings
@@ -176,8 +205,61 @@ class _RunCtx:
         self.budget = _SearchBudget(int(settings.get("ORIGIN_DISCOVERY_MAX_SEARCH_CALLS", 50) or 50))
         self.roe_enabled = bool(settings.get("ROE_ENABLED"))
         self.roe_excluded = settings.get("ROE_EXCLUDED_HOSTS", []) or []
+        self._operator_targets = None
         self._cache: Dict[Tuple[str, str], List[str]] = {}
         self._cache_lock = threading.Lock()
+        self._misses = 0
+        self._ref_certs: Dict[Tuple[str, int], Optional[dict]] = {}
+        self._ref_cert_locks: Dict[Tuple[str, int], threading.Lock] = {}
+
+    def reference_cert(self, host: str, port: int, dial) -> Optional[dict]:
+        """The fronted host's certificate on ``port``, dialled once per run.
+
+        Every candidate is compared against the same certificate, so one
+        handshake to the host serves them all. A failed dial is kept as well:
+        an edge that does not serve TLS on a port would otherwise cost one
+        timeout per candidate. Candidates checked at the same time wait for
+        the first dial instead of each sending one.
+        """
+        key = (host.lower(), port)
+        with self._cache_lock:
+            lock = self._ref_cert_locks.setdefault(key, threading.Lock())
+        with lock:
+            if key not in self._ref_certs:
+                self._ref_certs[key] = dial()
+            return self._ref_certs[key]
+
+    @property
+    def operator_targets(self):
+        """(hosts, networks) the operator typed; none when they cannot be
+        read, so the stricter rule applies."""
+        if self._operator_targets is None:
+            try:
+                from recon.helpers.openapi.discovery import operator_targets
+                self._operator_targets = operator_targets(self.settings)
+            except Exception:  # noqa: BLE001
+                self._operator_targets = (set(), [])
+        return self._operator_targets
+
+    def pace(self) -> None:
+        """Before every packet to a target (a connect, a handshake, a GET, a
+        redirect hop): the module's own rate, then a slot of the RoE clock
+        every in-process requester shares (inert with no ceiling). A search
+        API is not the target's traffic: it waits on ``rate`` alone."""
+        self.rate.wait()
+        request_pacer.acquire()
+
+    def note_miss(self) -> None:
+        """A candidate source gave no answer for the host being processed."""
+        with self._cache_lock:
+            self._misses += 1
+
+    @property
+    def misses(self) -> int:
+        """Hosts are processed one at a time, so the change across one host's
+        gathering is that host's: _process_host compares it before and after."""
+        with self._cache_lock:
+            return self._misses
 
     def cached(self, source: str, key: str, producer) -> List[str]:
         """Memoize a per-domain search by (source, key) for the whole run (G3).
@@ -186,7 +268,8 @@ class _RunCtx:
         genuine "nothing found" (NO_DATA) - is cached for every later host that
         shares the key, and a failure (timeout, 5xx, refused key, a paused
         source, an exhausted budget) never is, so a transient error cannot
-        black out the key for the rest of the run. A keyless producer returns a
+        black out the key for the rest of the run; it counts as a miss for the
+        host being processed instead. A keyless producer returns a
         plain list, which cannot tell "none" from "failed", so only a non-empty
         one is cached.
         """
@@ -201,6 +284,8 @@ class _RunCtx:
             if result.answered:
                 with self._cache_lock:
                     self._cache[ck] = ips
+            else:
+                self.note_miss()
             return ips
         ips = list(result or [])
         if ips:
@@ -212,7 +297,9 @@ class _RunCtx:
         """None when a keyed search may go out; else the typed skip to return.
 
         The breaker is checked BEFORE the budget, so a paused or refused source
-        never draws the keyed-search budget down.
+        never draws the keyed-search budget down. A budget refusal leaves the
+        breaker's skip count alone, which would cut the whole source: the
+        budget counts it, and _process_host cuts only the host it was for.
         """
         from recon.helpers.circuit_breaker import CallResult, Outcome
         if not breaker.allow():
@@ -287,10 +374,11 @@ def _favicon_hash_for_host(host: str, existing: Any, ctx: _RunCtx) -> Optional[i
         if not is_url_safe_to_probe(url):
             continue
         try:
-            ctx.rate.wait()
+            ctx.pace()
             resp = requests.get(url, timeout=ctx.timeout, verify=False,
                                 headers=_target_headers(ctx),
                                 stream=True)
+            _back_off_if_throttled(resp)
             if resp.status_code != 200:
                 resp.close()
                 continue
@@ -902,6 +990,81 @@ def _extract_text(body: bytes) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+def _operator_typed(host: str, ctx: _RunCtx) -> bool:
+    """A host or address the operator named (operator_targets), which every
+    caller of the address rule scans whatever it resolves to."""
+    hosts, networks = ctx.operator_targets
+    if host in hosts:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(address in net for net in networks if address.version == net.version)
+
+
+def _reference_hop_safe(url: str, fronted: str, ctx: _RunCtx) -> bool:
+    """The reference fetch's SSRF guard, the caller's as js_recon's downloads
+    apply it. Recon runs with host networking, so a Location naming cloud
+    metadata or an internal address would be fetched from inside the stack.
+    The fronted host's own hops pass (its address passed the pipeline's rule
+    before it was selected), and so does a host the operator typed; any other
+    host a redirect names is target-controlled and must resolve to public
+    addresses only."""
+    from recon.helpers.js_recon.hop_guard import url_host
+    host = url_host(url)
+    if host == fronted or _operator_typed(host, ctx):
+        return True
+    return is_url_safe_to_probe(url)
+
+
+def _get_hop_by_hop(url: str, headers: dict, ctx: _RunCtx):
+    """The reference GET, its redirects followed by hand (hop_guard): requests'
+    own following checks no hop. Every hop, the first URL included, passes the
+    RoE (inert without an exclusion; R-2) and _reference_hop_safe before it
+    is sent. None when a hop is refused: the host then has no reference and
+    keeps its earlier findings. Each hop waits like the first (the module's
+    rate here, the RoE clock in fetch_hop_by_hop), and a cookie a hop sets
+    rides on to the next, as requests' redirects carry it."""
+    from recon.helpers.js_recon.hop_guard import fetch_hop_by_hop, url_host
+    jar = requests.cookies.RequestsCookieJar()
+    sent: list = []
+
+    def send(_method, hop_url, *, timeout, headers, allow_redirects):
+        for earlier in sent:
+            _close_quietly(earlier)
+        sent.clear()
+        ctx.rate.wait()
+        resp = requests.get(hop_url, timeout=timeout, verify=False, allow_redirects=False,
+                            headers=headers, stream=True, cookies=jar)
+        sent.append(resp)
+        cookies = getattr(resp, "cookies", None)
+        if cookies:
+            jar.update(cookies)
+        return resp
+
+    fronted = url_host(url)
+    refusal: dict = {}
+    resp = fetch_hop_by_hop("GET", url, timeout=ctx.timeout, headers=headers,
+                            settings={"ROE_ENABLED": ctx.roe_enabled,
+                                      "ROE_EXCLUDED_HOSTS": ctx.roe_excluded},
+                            url_guard=lambda hop: _reference_hop_safe(hop, fronted, ctx),
+                            refusal=refusal, send=send, module="origin_discovery")
+    if resp is None:
+        for earlier in sent:
+            _close_quietly(earlier)
+        _log("-", f"reference fetch stopped at redirect hop {refusal.get('hop')} "
+                  f"({refusal.get('reason')}): the host keeps its earlier findings")
+    return resp
+
+
+def _close_quietly(resp) -> None:
+    try:
+        resp.close()
+    except Exception:  # noqa: BLE001 - a response that cannot close holds nothing we need
+        pass
+
+
 def _fetch(url: str, host_header: str, ctx: _RunCtx, allow_redirects: bool = False) -> Optional[dict]:
     """GET url (optionally with a forged Host), returning text/headers/status.
 
@@ -910,7 +1073,8 @@ def _fetch(url: str, host_header: str, ctx: _RunCtx, allow_redirects: bool = Fal
     internal or cloud-metadata host the G11 IP filter never saw, turning the
     probe into an SSRF pivot. The trusted reference fetch (the in-scope fronted
     host) passes allow_redirects=True so a canonical 301 (apex->www, http->https)
-    doesn't collapse its body and destroy the HTML-similarity signal.
+    doesn't collapse its body and destroy the HTML-similarity signal, hop by
+    hop through the RoE and the SSRF guard (_get_hop_by_hop).
 
     That trusted reference fetch also returns the raw page (its ``<script
     src>`` are where the site's own file is found) and the URL it ended on,
@@ -920,9 +1084,15 @@ def _fetch(url: str, host_header: str, ctx: _RunCtx, allow_redirects: bool = Fal
     if host_header:
         headers["Host"] = host_header
     try:
-        ctx.rate.wait()
-        resp = requests.get(url, timeout=ctx.timeout, verify=False, allow_redirects=allow_redirects,
-                            headers=headers, stream=True)
+        if allow_redirects:
+            resp = _get_hop_by_hop(url, headers, ctx)
+            if resp is None:
+                return None
+        else:
+            ctx.pace()
+            resp = requests.get(url, timeout=ctx.timeout, verify=False, allow_redirects=False,
+                                headers=headers, stream=True)
+        _back_off_if_throttled(resp)
         body = resp.raw.read(_MAX_HTML_BYTES, decode_content=True) or b""
         status = resp.status_code
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
@@ -1001,9 +1171,10 @@ def _file_sha256(url: str, host_header: str, ctx: _RunCtx, from_edge_ok: bool = 
     if host_header:
         headers["Host"] = host_header
     try:
-        ctx.rate.wait()
+        ctx.pace()
         resp = requests.get(url, timeout=ctx.timeout, verify=False, allow_redirects=False,
                             headers=headers, stream=True)
+        _back_off_if_throttled(resp)
         try:
             if resp.status_code != 200 or (not from_edge_ok and edge_from_headers(
                     {k.lower(): v for k, v in resp.headers.items()}) is not None):
@@ -1091,9 +1262,15 @@ def _fetch_peer_cert(host_or_ip: str, sni: str, port: int, timeout: int) -> Opti
 
 
 def _compare_certs(host: str, ip: str, port: int, ctx: _RunCtx) -> float:
-    ref = _fetch_peer_cert(host, host, port, timeout=min(ctx.timeout, 5))
-    cand = _fetch_peer_cert(ip, host, port, timeout=min(ctx.timeout, 5))
-    if not ref or not cand:
+    def dial(target: str) -> Optional[dict]:
+        ctx.pace()
+        return _fetch_peer_cert(target, host, port, timeout=min(ctx.timeout, 5))
+
+    ref = ctx.reference_cert(host, port, lambda: dial(host))
+    if not ref:
+        return 0.0
+    cand = dial(ip)
+    if not cand:
         return 0.0
     score = 0.0
     if ref["serial"] and cand["serial"] and ref["serial"] == cand["serial"]:
@@ -1123,7 +1300,8 @@ def _default_cert_check(host: str, ip: str, port: int, ctx: _RunCtx) -> Tuple[st
 
     The candidate came from passive sources and is untrusted: the routability
     guard is applied again right before the dial, nothing it returns is
-    followed, and the dial obeys the RoE, the module's rate limit and host health.
+    followed, and the dial obeys the RoE, the module's rate limit, the RoE
+    ceiling and host health.
     """
     from recon.helpers import circuit_breaker as cb
     if is_non_routable_ip(ip):
@@ -1133,7 +1311,7 @@ def _default_cert_check(host: str, ip: str, port: int, ctx: _RunCtx) -> Tuple[st
     target = f"https://{_url_host(ip)}:{port}"
     if not cb.host_health.allow(target):
         return "not_checked", "host marked unreachable"
-    ctx.rate.wait()
+    ctx.pace()
     try:
         cert = _tls_handshake_cert(ip, None, port, min(ctx.timeout, 5))
     except (OSError, ssl.SSLError, ValueError) as e:
@@ -1181,6 +1359,8 @@ def _score_candidate(host: str, reference: dict, ip: str, ctx: _RunCtx,
     best_attempt: Optional[dict] = None
     port_timeout = max(2.0, min(ctx.timeout / 5.0, 5.0))  # unwaf: timeout/5, floor 2s
     for port in WEB_PORTS:
+        # A connect is a packet to the candidate like any fetch: same rate limits.
+        ctx.pace()
         if not _port_open(ip, port, port_timeout):
             continue  # closed/filtered — don't spend HTTP + TLS timeouts on it
         scheme = "https" if port in _TLS_PORTS else "http"
@@ -1312,11 +1492,13 @@ class _UrlscanSource:
                 "sha256": sha}
 
     def _search(self, query: str, host: str) -> Optional[list]:
+        """The visits found, or None when the cap or the budget refused the search."""
         with self._lock:
-            if self._searches >= _URLSCAN_MAX_FILE_SEARCHES:
-                return None
-            self._searches += 1
-        if not self.ctx.budget.take():
+            refused = self._searches >= _URLSCAN_MAX_FILE_SEARCHES
+            if not refused:
+                self._searches += 1
+        if refused or not self.ctx.budget.take():
+            self.ctx.note_miss()
             return None
         from recon.main_recon_modules import urlscan_enrich as us
         results = us.urlscan_search(
@@ -1358,7 +1540,10 @@ class _UrlscanSource:
         if results is not None and not results and _BUILD_CODE_RE.search(own["name"]):
             source = "urlscan_filename"
             results = self._search(f'filename:"{own["name"]}"', host)
-        suspects = self._filter(results or [])
+        if results is None:
+            # Not an answer: a host sharing the file asks again, and is cut too.
+            return [], source
+        suspects = self._filter(results)
         with self._lock:
             self._by_sha[own["sha256"]] = suspects
         return suspects, source
@@ -1402,6 +1587,7 @@ def _gather_candidates(host: str, entry: dict, ctx: _RunCtx, meta: dict,
                 candidates.setdefault(ip, name)
                 methods.add(method)
         except Exception as e:  # never-raise per source
+            ctx.note_miss()
             meta.setdefault("errors", {})[name] = str(e)[:200]
             # surface it (e.g. an invalid API key) instead of a silent empty result
             _log("-", f"{host}: source '{name}' failed: {str(e)[:120]}")
@@ -1506,10 +1692,22 @@ def _own_file_source(ctx: _RunCtx, combined_result: dict, urlscan: Optional[_Url
     return urlscan if urlscan is not None else _UrlscanSource(combined_result, ctx)
 
 
+#: Why a fronted host was not fully checked: the reason its coverage gap gives.
+_CUT_BUDGET = "keyed-search budget exhausted"
+_CUT_SOURCE = "a candidate source did not answer"
+_CUT_REFERENCE = "the fronted host did not answer the reference fetch for comparison"
+_CUT_CHECK = "a candidate check failed"
+_CUT_CRASH = "processing the host failed"
+
+
 def _process_host(host: str, entry: dict, ctx: _RunCtx, key=_KEY_FROM_HOST,
                   flagged: Set[str] = frozenset(), urlscan: Optional[_UrlscanSource] = None,
                   files: Optional[_UrlscanSource] = None) -> Tuple[List[dict], dict]:
+    """The host's confirmed origins and its meta. ``meta["unchecked"]`` names
+    why the host was not fully checked: a source or a candidate the run never
+    asked would otherwise read as "no origin", and its findings be pruned."""
     meta: dict = {"candidates": [], "methods": [], "errors": {}}
+    misses, refused = ctx.misses, ctx.budget.refused
     reference = own = None
     if urlscan is not None:
         # The file search needs the reference page's scripts: the same request, earlier.
@@ -1517,6 +1715,12 @@ def _process_host(host: str, entry: dict, ctx: _RunCtx, key=_KEY_FROM_HOST,
         own = urlscan.own_file(host, reference)
     candidates = _gather_candidates(host, entry, ctx, meta, key=key, urlscan=urlscan,
                                     own_file=own, flagged=flagged)
+    if ctx.budget.refused > refused:
+        meta["unchecked"] = _CUT_BUDGET
+    elif ctx.misses > misses:
+        meta["unchecked"] = _CUT_SOURCE
+    elif urlscan is not None and reference is None:
+        meta["unchecked"] = _CUT_REFERENCE
     kept = _dedup_and_filter(candidates, entry, ctx, meta, flagged=flagged)
     meta["candidates"] = [ip for ip, _ in kept]
     if not kept:
@@ -1528,6 +1732,7 @@ def _process_host(host: str, entry: dict, ctx: _RunCtx, key=_KEY_FROM_HOST,
             own = files.own_file(host, reference)
     if reference is None:
         meta["errors"]["reference"] = "could not fetch the fronted host for comparison"
+        meta["unchecked"] = _CUT_REFERENCE
         return [], meta
     if own:
         meta["own_file"] = own["path"]
@@ -1542,6 +1747,7 @@ def _process_host(host: str, entry: dict, ctx: _RunCtx, key=_KEY_FROM_HOST,
             try:
                 match = fut.result()
             except Exception:
+                meta.setdefault("unchecked", _CUT_CHECK)
                 match = None
             if not match:
                 continue
@@ -1591,6 +1797,12 @@ def run_origin_discovery_enrichment(combined_result: dict, settings: dict) -> di
     if not settings.get("ORIGIN_DISCOVERY_ENABLED", False):
         return combined_result
 
+    # Its whole job is to find and probe origin addresses behind an edge, which
+    # by design are not in an IP-mode target list (B-08).
+    if (combined_result.get("metadata") or {}).get("ip_mode") or settings.get("IP_MODE"):
+        _log("-", "skipped in IP mode: the origins it would probe are not targets")
+        return combined_result
+
     ctx = _run_ctx(settings)
     key_for = _candidate_key_rule(combined_result)
     fronted = _select_fronted_hosts(combined_result, ctx)
@@ -1612,7 +1824,8 @@ def run_origin_discovery_enrichment(combined_result: dict, settings: dict) -> di
             confirmed, meta = _process_host(host, entry, ctx, key=key_for(host), flagged=flagged,
                                             urlscan=urlscan, files=files)
         except Exception as e:  # a host never sinks the whole module
-            payload["candidates_meta"][host] = {"errors": {"fatal": str(e)[:200]}}
+            payload["candidates_meta"][host] = {"errors": {"fatal": str(e)[:200]},
+                                                "unchecked": _CUT_CRASH}
             _log("!", f"{host}: {e}")
             continue
         all_confirmed.extend(confirmed)
@@ -1622,9 +1835,31 @@ def run_origin_discovery_enrichment(combined_result: dict, settings: dict) -> di
     _log("*" if all_confirmed else "-",
          f"origin discovery complete: {len(all_confirmed)} confirmed origin(s) "
          f"across {len(fronted)} fronted host(s)")
+    _note_unchecked_hosts(payload["candidates_meta"])
     # A provider it could not ask cuts its own findings: keep the previous ones.
     od_scope.finish("origin_discovery", sources=["origin_discovery"], payload=payload)
     return combined_result
+
+
+def _note_unchecked_hosts(candidates_meta: Dict[str, dict]) -> None:
+    """Keep the earlier origin findings of every host this run did not fully check.
+
+    Cut for origin_discovery alone (the other tools did re-check these hosts),
+    so a host checked to the end with no origin still prunes. Never raises.
+    """
+    by_reason: Dict[str, List[str]] = {}
+    for host, meta in candidates_meta.items():
+        reason = (meta or {}).get("unchecked")
+        if reason:
+            by_reason.setdefault(reason, []).append(host)
+    if not by_reason:
+        return
+    from recon.helpers import circuit_breaker as cb
+    for reason, hosts in sorted(by_reason.items()):
+        cb.note_degraded("origin_discovery", hosts=sorted(hosts), host_source="origin_discovery",
+                         source_only_hosts=True, reason=reason)
+    _log("!", f"{sum(len(h) for h in by_reason.values())} fronted host(s) not fully checked "
+              f"({'; '.join(sorted(by_reason))}): their earlier origin findings are kept")
 
 
 # Every keyed provider origin discovery asks, by breaker key prefix.

@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { readJsonBody } from '@/lib/jsonBody'
-import { getEffectiveUser, getSession } from '@/lib/session'
+import { auditActor } from '@/lib/auditActor'
+import { getEffectiveUser } from '@/lib/session'
 import { auditPlugin } from '@/lib/plugins/audit'
-import { bodyOwnerMatches, ownsScope } from '@/lib/plugins/changeSetAccess'
+import { bodyOwnerMatches, scopeRefusal, scopeRefusalResponse, userScopeWriteRefusal } from '@/lib/plugins/changeSetAccess'
 import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
@@ -15,11 +16,15 @@ import {
 } from '@/lib/plugins/skillPartsRegistry'
 import { adoptUserSkillVersion } from '@/lib/plugins/userSkillAdoption'
 import { auditActorFor, userSkillErrorResponse } from '@/lib/userSkillWrites'
+import { requirePermission } from '@/lib/authz/guards'
 
 /**
  * POST /api/plugins/overrides/change-sets/[id]/approve: make a proposed version active
- * (design §6; OQ-08). The scope owner (or an admin acting as them) only; a user scope carries
- * `scopeOwnerId`, which must equal the effective user (the act-as cookie is site-wide; RV-33).
+ * (design §6; OQ-08). The scope owner (or an admin acting as them), or a co-owner with Manage on
+ * a project scope (step 5.10; 403 below it), only; a user scope carries
+ * `scopeOwnerId`, which must equal the effective user (the act-as cookie is site-wide; RV-33),
+ * and follows the account write rule: an admin acting as a member who can sign in is refused,
+ * one acting as a passwordless managed account is not (HD-23, OQ-49).
  *
  * The factory hashes AND texts come from the agent registry WITHOUT its cache, and the set is
  * re-validated by the agent's batch validator (whole-skill total included, so a lowered
@@ -44,6 +49,8 @@ export const POST = pluginRoute('override approve', 'The proposal could not be a
   { params }: { params: Promise<{ id: string }> },
 ) => {
   if (!sameOrigin(request)) return crossOriginResponse(request)
+  const auth = await requirePermission(request, 'plugins:approve_overrides')
+  if (auth instanceof NextResponse) return auth
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
   const eff = await getEffectiveUser()
@@ -51,19 +58,23 @@ export const POST = pluginRoute('override approve', 'The proposal could not be a
 
   const { id } = await params
   const set = await ov.getChangeSet(id)
-  if (!set || !(await ownsScope(set.scope, eff.userId))) return notFound()
+  if (!set) return notFound()
+  const refused = await scopeRefusal(set.scope, eff.userId, { actingAs: !!auth.actingAs })
+  if (refused) return scopeRefusalResponse(refused, 'plugins:approve_overrides')
   if (!bodyOwnerMatches(set.scope, eff.userId, parsed.body.scopeOwnerId)) {
     return refuse(403, 'wrong_owner', 'This version does not belong to the user you are acting as.')
   }
+  const notAccountWriter = await userScopeWriteRefusal(set.scope)
+  if (notAccountWriter) return notAccountWriter
 
   if (set.point === ov.USER_SKILL_POINT) {
     const body = parsed.body
-    const session = await getSession()
+    const skillActor = (await auditActor(eff)).actorId ?? eff.userId
     try {
       const saved = await adoptUserSkillVersion({
         changeSetId: id,
         ownerId: eff.userId,
-        actor: { ...auditActorFor(session?.userId ?? eff.userId, eff.userId), actorId: session?.userId ?? eff.userId },
+        actor: { ...auditActorFor(skillActor, eff.userId), actorId: skillActor },
         name: body.name,
         description: body.description,
         projectId: typeof body.projectId === 'string' && body.projectId ? body.projectId : null,
@@ -112,9 +123,9 @@ export const POST = pluginRoute('override approve', 'The proposal could not be a
     throw e
   }
 
-  const session = await getSession()
   // decidedBy is the audit actor: the real session user, even when an admin acts as the owner.
-  const actor = session?.userId ?? eff.userId
+  const real = await auditActor(eff)
+  const actor = real.actorId ?? eff.userId
   let result: ov.ApproveResult
   try {
     result = await ov.approve(id, actor, hashes, undefined, texts)
@@ -141,7 +152,7 @@ export const POST = pluginRoute('override approve', 'The proposal could not be a
       scope: set.scope.type,
       scopeId: set.scope.id,
       revision: result.revision,
-      ...(session && session.userId !== eff.userId ? { onBehalfOf: eff.userId } : {}),
+      ...(real.onBehalfOfUserId ? { onBehalfOf: real.onBehalfOfUserId } : {}),
       ...(result.replaced ? { replaced: result.replaced } : {}),
     },
     source: 'ui',

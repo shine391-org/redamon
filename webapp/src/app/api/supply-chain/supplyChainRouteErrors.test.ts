@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   readFile: vi.fn(),
 }))
 
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProject()))
 vi.mock('@/lib/access', () => ({ guardProject: (...a: unknown[]) => h.guard(...a) }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
 vi.mock('@/lib/scanTimeline', () => ({
@@ -30,7 +31,11 @@ vi.mock('@/lib/scanTimeline', () => ({
   recordScanStart: (...a: unknown[]) => h.recordScanStart(...a),
 }))
 vi.mock('@/lib/session', () => ({ getEffectiveUser: vi.fn().mockResolvedValue({ userId: 'u1' }) }))
-vi.mock('@/lib/engagement', () => ({ currentRoeTextSha256: vi.fn().mockResolvedValue(null) }))
+// A startable engagement: the R-11 gate has its own tests in start/route.test.ts.
+vi.mock('@/lib/engagement', () => ({
+  currentRoeTextSha256: vi.fn().mockResolvedValue(null),
+  loadEngagement: vi.fn().mockResolvedValue({ blockers: [] }),
+}))
 vi.mock('@/lib/activationLock', () => ({ assertGraphNotActivating: vi.fn().mockResolvedValue(null) }))
 vi.mock('@/lib/prisma', () => ({
   default: {

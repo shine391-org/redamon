@@ -115,6 +115,7 @@ from recon.helpers.resource_enum import (
 # Import via the module (not the names) so monkey-patched catalogues in tests
 # are picked up at call time.
 from recon.helpers import ai_signal_catalog as _ai_catalog
+from recon.helpers.archive_leaks import report_archive_leaks
 
 
 def _build_parent_ai_map(recon_data: dict) -> dict[str, bool]:
@@ -697,7 +698,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     #      by source 1 — catches new subdomains discovered after httpx ran.
     # Replaces the old cascade where the subdomain fallback was skipped entirely
     # whenever httpx returned even a single URL.
-    ips, hostnames, _ = extract_targets_from_recon(recon_data)
+    ips, hostnames, _ = extract_targets_from_recon(recon_data, settings)
     target_urls = build_target_urls(
         hostnames, ips, recon_data, scan_all_ips=False
     )
@@ -998,7 +999,16 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         from recon.helpers.ai_planner.crawl_seed_order import hakrawler_seed_order
         hakrawler_seeds = hakrawler_seed_order(target_urls, recon_data)
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # The archive URLs the quarantine holds back, as (archive, url): never
+    # requested, reported as archive leaks below.
+    archive_quarantined: list = []
+
+    # Under an RoE ceiling each crawler is held to the whole ceiling, so they run
+    # one at a time (D3). The results below are read in submission order, so each
+    # tool's wait still starts about when the tool does.
+    from recon.helpers import request_pacer
+    crawler_workers = 1 if request_pacer.ceiling_rps(settings) else 4
+    with ThreadPoolExecutor(max_workers=crawler_workers) as executor:
         futures = {}
 
         # Submit Katana crawler if enabled
@@ -1018,6 +1028,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 KATANA_EXCLUDE_PATTERNS,
                 KATANA_PARALLELISM,
                 KATANA_CONCURRENCY,
+                settings=settings,
+                recon_data=recon_data,
             )
 
         # Submit Hakrawler crawler if enabled
@@ -1036,6 +1048,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 HAKRAWLER_CUSTOM_HEADERS,
                 KATANA_EXCLUDE_PATTERNS,
                 HAKRAWLER_PARALLELISM,
+                settings=settings,
+                recon_data=recon_data,
             )
 
         # Submit GAU discovery if enabled
@@ -1053,6 +1067,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 GAU_VERBOSE,
                 URLSCAN_API_KEY,
                 GAU_WORKERS,
+                quarantined_out=archive_quarantined,
             )
 
         # Submit ParamSpider discovery if enabled
@@ -1063,6 +1078,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 PARAMSPIDER_PLACEHOLDER,
                 PARAMSPIDER_TIMEOUT,
                 PARAMSPIDER_WORKERS,
+                quarantined_out=archive_quarantined,
             )
 
         # Collect results from all parallel tools
@@ -1128,7 +1144,9 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 KITERUNNER_IGNORE_STATUS,
                 KITERUNNER_MATCH_STATUS,
                 KITERUNNER_MIN_CONTENT_LENGTH,
-                KITERUNNER_HEADERS
+                KITERUNNER_HEADERS,
+                settings=settings,
+                recon_data=recon_data,
             )
             return wordlist_name, wordlist_results
 
@@ -1160,7 +1178,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # Organize discovered endpoints
     if katana_urls:
         print("\n[*][Katana] Organizing endpoints...")
-    organized_data = organize_endpoints(katana_urls, settings=settings)
+    organized_data = organize_endpoints(katana_urls, settings=settings, recon_data=recon_data)
 
     # Mark all Katana endpoints with sources=['katana'] (array format)
     for base_url, base_data in organized_data['by_base_url'].items():
@@ -1184,7 +1202,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
 
     if HAKRAWLER_ENABLED and hakrawler_urls:
         print("\n[*][Hakrawler] Organizing and merging endpoints...")
-        hakrawler_organized = organize_endpoints(hakrawler_urls, settings=settings)
+        hakrawler_organized = organize_endpoints(hakrawler_urls, settings=settings, recon_data=recon_data)
         organized_data['by_base_url'], hakrawler_stats = merge_hakrawler_into_by_base_url(
             hakrawler_organized['by_base_url'],
             organized_data['by_base_url'],
@@ -1382,6 +1400,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 target_domains,
                 discovered_base_paths,
                 FFUF_PARALLELISM,
+                settings=settings,
+                recon_data=recon_data,
                 # F11: ownership execution path, shadows nothing when disabled.
                 origin_plan=(ownership_plan.origin_base_paths() if (ownership_plan is not None and ownership_plan.execute) else None),
                 extensions_by_origin=(extensions_by_origin if ownership_plan is not None and ownership_plan.execute else None),
@@ -1519,6 +1539,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
                 ARJUN_DISABLE_REDIRECTS,
                 ARJUN_CUSTOM_HEADERS,
                 target_domains,
+                settings=settings,
+                recon_data=recon_data,
             )
 
             record_arjun_selection(arjun_meta, arjun_unexecuted)
@@ -1656,12 +1678,16 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
         "paramspider_overlap": 0,
         "paramspider_out_of_scope": 0,
     }
+    in_scope_paramspider = []
 
     if PARAMSPIDER_ENABLED and paramspider_urls:
+        from recon.helpers.resource_enum.paramspider_helpers import paramspider_urls_in_scope
+        in_scope_paramspider = paramspider_urls_in_scope(paramspider_urls, target_domains, settings)
+
         print("\n[*][ParamSpider] Merging parameterized endpoints into results...")
         keys_before_paramspider = _merged_keys()
         organized_data['by_base_url'], paramspider_stats = merge_paramspider_into_by_base_url(
-            paramspider_urls,
+            in_scope_paramspider,
             organized_data['by_base_url'],
             target_domains,
             exact=_exact_group,
@@ -1913,7 +1939,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     # quarantine's rules missed): nuclei DAST and the recon JSON get them
     # masked, as urlscan's are.
     from recon.helpers.url_leaks import mask_url
-    archive_masked = [m for m in (mask_url(u) for u in in_scope_gau + paramspider_urls) if m]
+    archive_masked = [m for m in (mask_url(u) for u in in_scope_gau + in_scope_paramspider) if m]
     jsluice_in_scope_urls = jsluice_result.get("urls", []) if JSLUICE_ENABLED else []
     ffuf_discovered_urls = [r["url"] for r in ffuf_results] if FFUF_ENABLED else []
     all_discovered_urls = sorted(set(
@@ -1931,7 +1957,7 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
     live_seen = set(katana_urls + hakrawler_urls + crawl_js_urls + jsluice_in_scope_urls
                     + ffuf_discovered_urls + zap_ajax_urls)
     archived_only_urls = sorted(
-        {mask_url(u) for u in set(in_scope_gau + urlscan_urls + paramspider_urls) - live_seen} - {""})
+        {mask_url(u) for u in set(in_scope_gau + urlscan_urls + in_scope_paramspider) - live_seen} - {""})
 
     # Build result structure
     resource_enum_result = {
@@ -2080,6 +2106,8 @@ def run_resource_enum(recon_data: dict, output_file: Optional[Path] = None, sett
             'categories': {}
         },
         'jsluice_secrets': jsluice_result.get("secrets", []),
+        'archive_leaks': report_archive_leaks(archive_quarantined, settings,
+                                              recon_data.get("domain") or ""),
         'external_domains': (
             gau_external_domains
             + katana_meta.get("external_domains", [])

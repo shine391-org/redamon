@@ -1,10 +1,16 @@
 'use client'
 
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react'
 import { useSearchParams, useRouter, usePathname } from 'next/navigation'
 import { useAuth } from './AuthProvider'
+import { useCan, useRbacFlags } from '@/hooks/useCan'
 import { type ProjectSummary, toProjectSummary } from '@/lib/projectSummary'
 import { type ApiError, readApiError, toApiError } from '@/lib/apiError'
+import { ActAsDialog, type ActAsDialogTarget } from '@/components/auth/ActAsDialog'
+import { ACT_AS_PICK_KEY, forgetActAsPick, recallActAsPick, rememberActAsPick } from '@/lib/actAsPick'
+import type { MyAccess } from '@/lib/authz/projectAccess'
+import { sameMyAccess } from '@/lib/readOnlyProject'
+import { ProjectAccessContext } from './projectAccessContext'
 
 export type { ProjectSummary } from '@/lib/projectSummary'
 
@@ -13,7 +19,16 @@ interface ProjectContextValue {
   setCurrentProject: (project: ProjectSummary | null) => void
   projectId: string | null
   userId: string | null
-  setUserId: (id: string | null) => void
+  /**
+   * Switch the effective user. Acting as another admin needs `stepUpPassword` (the
+   * signed-in admin's own); a refused one resolves the error and changes nothing, so
+   * the dialog that asked can ask again. Resolves null on success.
+   *
+   * With RBAC_PERMISSIONS_ENABLED on (step 3.14) every impersonation takes a reason, a duration
+   * and the admin's password: without `stepUpPassword` this opens the act-as dialog (named by
+   * `target` when the caller knows the account) and resolves when it closes, null when cancelled.
+   */
+  setUserId: (id: string | null, opts?: SetUserIdOptions) => Promise<ApiError | null>
   isLoading: boolean
   /**
    * Why the last user switch was refused (the effective user stayed the admin's
@@ -21,18 +36,86 @@ interface ProjectContextValue {
    * shows the message.
    */
   userSwitchError: ApiError | null
+  /**
+   * The open project's access ended or changed under the person (a share revoked, expired or left,
+   * or narrowed), as the stale-access poll found it. This provider sits above the toast layer, so a
+   * component under it shows the message and dismisses it.
+   */
+  accessNotice: AccessNotice | null
+  dismissAccessNotice: () => void
+  /** Ask /my-access now instead of at the next poll (after leaving a share, for one). */
+  checkAccessNow: () => Promise<void>
+}
+
+export interface AccessNotice {
+  kind: 'ended' | 'changed'
+  projectName: string
+  /** `changed`: the access now in force. */
+  myAccess?: MyAccess
+}
+
+/**
+ * How often an open project asks whether the person still has it (step 4.11): one request per open
+ * page every 30 s, well inside nginx's /api/ zone. A failed answer doubles the wait up to the cap.
+ */
+export const ACCESS_POLL_MS = 30_000
+export const ACCESS_POLL_MAX_MS = 5 * 60_000
+
+type AccessAnswer =
+  | { kind: 'access'; myAccess: MyAccess }
+  | { kind: 'gone' }
+  | { kind: 'ownerView' }
+  | { kind: 'retry' }
+
+/**
+ * The person's own access to `projectId` now. /my-access answers 404 both when the access ended and
+ * when RBAC_SHARING_ENABLED is off (the route does not exist then), so a 404 is confirmed with the
+ * project read: 404 there too is "gone"; a project answered without `myAccess` is the owner's own
+ * view with the switch off, never a reason to send the owner away.
+ */
+async function readOwnAccess(projectId: string): Promise<AccessAnswer> {
+  const id = encodeURIComponent(projectId)
+  const res = await fetch(`/api/projects/${id}/my-access`, { cache: 'no-store' })
+  if (res.ok) {
+    const body = await res.json().catch(() => null)
+    return body?.myAccess ? { kind: 'access', myAccess: body.myAccess } : { kind: 'retry' }
+  }
+  if (res.status !== 404) return { kind: 'retry' }
+  const project = await fetch(`/api/projects/${id}`, { cache: 'no-store' })
+  if (project.status === 404) return { kind: 'gone' }
+  if (!project.ok) return { kind: 'retry' }
+  const row = await project.json().catch(() => null)
+  if (!row) return { kind: 'retry' }
+  return row.myAccess ? { kind: 'access', myAccess: row.myAccess } : { kind: 'ownerView' }
+}
+
+function withoutAccess(project: ProjectSummary): ProjectSummary {
+  const rest = { ...project }
+  delete rest.myAccess
+  return rest
+}
+
+export interface SetUserIdOptions {
+  stepUpPassword?: string
+  /** Permissions switch on: why and for how long (the act-as dialog sends them). */
+  reason?: string
+  durationMinutes?: number
+  /** Permissions switch on: how the dialog names the account, when the caller knows it. */
+  target?: ActAsDialogTarget
 }
 
 const ProjectContext = createContext<ProjectContextValue | null>(null)
 
 const STORAGE_KEY_PROJECT = 'redamon-current-project'
-const STORAGE_KEY_USER = 'redamon-current-user'
 
 export function ProjectProvider({ children }: { children: ReactNode }) {
   const [currentProject, setCurrentProjectState] = useState<ProjectSummary | null>(null)
   const [userId, setUserIdState] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [userSwitchError, setUserSwitchError] = useState<ApiError | null>(null)
+  const [accessNotice, setAccessNotice] = useState<AccessNotice | null>(null)
+  const currentProjectRef = useRef<ProjectSummary | null>(null)
+  const checkAccessRef = useRef<(() => Promise<void>) | null>(null)
   // Gates data loads until the server-side act-as cookie has been reconciled with
   // the restored (localStorage) impersonation selection, so an admin's first load
   // after a refresh never fetches with a stale/absent cookie (which would 404
@@ -41,19 +124,37 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const searchParams = useSearchParams()
   const router = useRouter()
   const pathname = usePathname()
-  const { user: authUser, isLoading: authLoading, isAdmin } = useAuth()
+  const { user: authUser, isLoading: authLoading, refresh: refreshSession } = useAuth()
+  // Acting as another account is `users:impersonate`'s (the act-as route asks it).
+  const canSwitchUser = useCan('users:impersonate')
+  // Permissions switch on (step 3.14): the server says whom the admin acts as (/api/auth/me
+  // `actingAs`), with a time limit the browser must not outlive, so nothing is restored here.
+  const rbacFlags = useRbacFlags()
+  const serverOwned = rbacFlags?.permissions === true
+  // Identity switch on: only a pick the signed-in admin made is remembered and restored (lib/actAsPick).
+  // Then only a person's pick asks for another account here: the projects page chooses nobody (3.16c).
+  const identityOn = rbacFlags?.identity === true || serverOwned
+  const actingAsId = authUser?.actingAs?.id ?? null
+  // The act-as dialog waiting for an answer, and who is waiting for its outcome.
+  const [actAsRequest, setActAsRequest] = useState<{ target: ActAsDialogTarget; settle: (r: ApiError | null) => void } | null>(null)
+  // The id, not the object: reading the session again (after a switch) must not reconcile again.
+  const authUserId = authUser?.id ?? null
 
   // Sync userId with auth state + reconcile the server act-as cookie.
   useEffect(() => {
     if (authLoading) return
-    if (!authUser) return
+    if (!authUserId) return
     let cancelled = false
 
-    if (isAdmin) {
-      // Admin: restore the saved impersonation target (or own id).
-      const savedUserId = localStorage.getItem(STORAGE_KEY_USER)
-      const target = savedUserId && savedUserId !== authUser.id ? savedUserId : null
-      setUserIdState(target || authUser.id)
+    if (serverOwned) {
+      // No silent restore (IM-02): a selection a previous version remembered is dropped.
+      forgetActAsPick()
+      setUserIdState(actingAsId ?? authUserId)
+      setImpersonationSynced(true)
+    } else if (canSwitchUser) {
+      // Restore the saved impersonation target (or own id).
+      const target = recallActAsPick(authUserId, identityOn)
+      setUserIdState(target || authUserId)
       // Make the server-side impersonation match, THEN allow loads.
       ;(async () => {
         try {
@@ -70,9 +171,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
             // the user_id foreign key as an opaque 500. Fall back to the
             // admin's own id and forget the stale selection.
             if (!resp.ok) {
-              localStorage.removeItem(STORAGE_KEY_USER)
-              if (!cancelled) setUserIdState(authUser.id)
+              forgetActAsPick()
+              if (!cancelled) setUserIdState(authUserId)
               await fetch('/api/auth/act-as', { method: 'DELETE' }).catch(() => {})
+            } else {
+              // The session read at load may predate the cookie: what may be used while acting differs.
+              await refreshSession?.()
             }
           } else {
             await fetch('/api/auth/act-as', { method: 'DELETE' })
@@ -83,13 +187,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         if (!cancelled) setImpersonationSynced(true)
       })()
     } else {
-      // Standard user: always locked to own id; no impersonation cookie.
-      setUserIdState(authUser.id)
-      localStorage.setItem(STORAGE_KEY_USER, authUser.id)
+      // Anyone who may not act as others: always locked to own id; no impersonation cookie.
+      setUserIdState(authUserId)
+      // Switches off the own id is saved, as before (DV-30); with identity on a pick is an admin's.
+      if (identityOn) forgetActAsPick()
+      else localStorage.setItem(ACT_AS_PICK_KEY, authUserId)
       setImpersonationSynced(true)
     }
     return () => { cancelled = true }
-  }, [authUser, authLoading, isAdmin])
+  }, [authUserId, authLoading, canSwitchUser, refreshSession, serverOwned, identityOn, actingAsId])
 
   // Initialize from URL or localStorage (after impersonation is reconciled)
   useEffect(() => {
@@ -123,8 +229,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     }
   }, [searchParams, authLoading, impersonationSynced])
 
+  useEffect(() => { currentProjectRef.current = currentProject }, [currentProject])
+
   const setCurrentProject = useCallback((project: ProjectSummary | null) => {
-    setCurrentProjectState(project)
+    // A summary built from a read that carries no access (a save's answer) keeps the access known.
+    setCurrentProjectState(prev => (
+      project && !project.myAccess && prev?.id === project.id && prev.myAccess
+        ? { ...project, myAccess: prev.myAccess }
+        : project
+    ))
     if (project) {
       localStorage.setItem(STORAGE_KEY_PROJECT, project.id)
       // Update URL without navigation if we're on a page that uses project context
@@ -143,24 +256,159 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     }
   }, [searchParams, router, pathname])
 
-  const setUserId = useCallback((id: string | null) => {
-    // Standard users cannot switch users
-    if (!isAdmin && authUser) {
+  // The stale-access poll (step 4.11, SH-11): only while the open project's read carried `myAccess`,
+  // which it does only with RBAC_SHARING_ENABLED on (DV-30: with it off nothing is asked).
+  const pollProjectId = currentProject?.myAccess ? currentProject.id : null
+  // Read through refs so a navigation does not restart the poll's timer.
+  const navigationRef = useRef({ pathname, router })
+  useEffect(() => { navigationRef.current = { pathname, router } }, [pathname, router])
+
+  const applyAccessAnswer = useCallback((projectId: string, answer: AccessAnswer) => {
+    const open = currentProjectRef.current
+    if (!open || open.id !== projectId) return
+    if (answer.kind === 'access') {
+      if (sameMyAccess(open.myAccess, answer.myAccess)) return
+      setCurrentProjectState(p => (p && p.id === projectId ? { ...p, myAccess: answer.myAccess } : p))
+      setAccessNotice({ kind: 'changed', projectName: open.name, myAccess: answer.myAccess })
+    } else if (answer.kind === 'ownerView') {
+      setCurrentProjectState(p => (p && p.id === projectId ? withoutAccess(p) : p))
+    } else if (answer.kind === 'gone') {
+      setCurrentProjectState(p => (p && p.id === projectId ? null : p))
+      if (localStorage.getItem(STORAGE_KEY_PROJECT) === projectId) localStorage.removeItem(STORAGE_KEY_PROJECT)
+      setAccessNotice({ kind: 'ended', projectName: open.name })
+      const nav = navigationRef.current
+      if (nav.pathname !== '/projects') nav.router.replace('/projects')
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!pollProjectId) return
+    let cancelled = false
+    let inFlight = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let delay = ACCESS_POLL_MS
+    let lastAsked = Date.now()
+    const schedule = (ms: number) => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => { void check() }, ms)
+    }
+    const check = async (): Promise<void> => {
+      if (cancelled || inFlight) return
+      // A hidden tab asks nothing; it asks at once when shown again.
+      if (document.visibilityState === 'hidden') { schedule(delay); return }
+      inFlight = true
+      lastAsked = Date.now()
+      let answer: AccessAnswer
+      try {
+        answer = await readOwnAccess(pollProjectId)
+      } catch {
+        answer = { kind: 'retry' }
+      }
+      inFlight = false
+      if (cancelled) return
+      applyAccessAnswer(pollProjectId, answer)
+      // Gone or the owner's own view: the project or its `myAccess` is cleared, which ends the poll.
+      if (answer.kind === 'gone' || answer.kind === 'ownerView') return
+      delay = answer.kind === 'retry' ? Math.min(delay * 2, ACCESS_POLL_MAX_MS) : ACCESS_POLL_MS
+      schedule(delay)
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible' && Date.now() - lastAsked >= ACCESS_POLL_MS) schedule(0)
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    checkAccessRef.current = check
+    schedule(delay)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+      if (checkAccessRef.current === check) checkAccessRef.current = null
+    }
+  }, [pollProjectId, applyAccessAnswer])
+
+  const checkAccessNow = useCallback(async () => {
+    await checkAccessRef.current?.()
+  }, [])
+
+  const dismissAccessNotice = useCallback(() => setAccessNotice(null), [])
+
+  const accessScope = useMemo(() => ({
+    projectId: currentProject?.id ?? null,
+    myAccess: currentProject?.myAccess ?? null,
+  }), [currentProject?.id, currentProject?.myAccess])
+
+  /** Permissions switch on: start (from the dialog) or stop an impersonation; the server holds it. */
+  const switchOnServer = useCallback(async (id: string | null, opts?: SetUserIdOptions): Promise<ApiError | null> => {
+    if (!authUser) return null
+    const other = id && id !== authUser.id ? id : null
+    if (other && opts?.stepUpPassword === undefined) {
+      return new Promise<ApiError | null>((settle) => {
+        // A caller that does not name the account gets "this account", never its raw id.
+        setActAsRequest({ target: opts?.target ?? { id: other, name: '', email: '' }, settle })
+      })
+    }
+    try {
+      const resp = other
+        ? await fetch('/api/auth/act-as', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            targetUserId: other, stepUpPassword: opts?.stepUpPassword, reason: opts?.reason, durationMinutes: opts?.durationMinutes,
+          }),
+        })
+        : await fetch('/api/auth/act-as', { method: 'DELETE' })
+      if (!resp.ok) return await readApiError(resp, other ? 'Could not switch user' : 'Could not stop acting as this user')
+    } catch (e) {
+      return toApiError(e, other ? 'Could not switch user' : 'Could not stop acting as this user')
+    }
+    setUserSwitchError(null)
+    setUserIdState(other ?? authUser.id)
+    // The previous account's project is not the new one's.
+    setCurrentProjectState(null)
+    localStorage.removeItem(STORAGE_KEY_PROJECT)
+    // The banner, the switcher and what may be used follow the cookie (/api/auth/me answers it).
+    await refreshSession?.()
+    return null
+  }, [authUser, refreshSession])
+
+  const setUserId = useCallback(async (id: string | null, opts?: SetUserIdOptions): Promise<ApiError | null> => {
+    // Only an account that may act as others switches users.
+    if (!canSwitchUser && authUser) {
       setUserIdState(authUser.id)
-      return
+      return null
+    }
+    if (serverOwned) return switchOnServer(id, opts)
+    if (opts?.stepUpPassword !== undefined && id && id !== authUser?.id) {
+      try {
+        const resp = await fetch('/api/auth/act-as', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUserId: id, stepUpPassword: opts.stepUpPassword }),
+        })
+        if (!resp.ok) return await readApiError(resp, 'Could not switch user')
+      } catch (e) {
+        return toApiError(e, 'Could not switch user')
+      }
+      rememberActAsPick(id, authUser?.id, identityOn)
+      setUserSwitchError(null)
+      setUserIdState(id)
+      // What may be used follows the act-as cookie (/api/auth/me answers it).
+      void refreshSession?.()
+      return null
     }
     // Persist the UI hint immediately; the localStorage value is NOT trusted for
     // authorization - the server derives the effective user from the signed
     // `redamon-act-as` cookie set below (admin-only, verified server-side).
     if (id && id !== authUser?.id) {
-      localStorage.setItem(STORAGE_KEY_USER, id)
+      rememberActAsPick(id, authUser?.id, identityOn)
     } else {
-      localStorage.removeItem(STORAGE_KEY_USER)
+      forgetActAsPick()
     }
     // Set the server cookie FIRST, then flip the effective userId so that the data
     // fetches it triggers already carry the correct impersonation (no race / no
     // transient 404 under enforcement).
-    void (async () => {
+    let refusal: ApiError | null = null
+    {
       let impersonated = Boolean(id && id !== authUser?.id)
       try {
         if (impersonated) {
@@ -173,8 +421,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
           // target must never become the effective id.
           if (!resp.ok) {
             impersonated = false
-            setUserSwitchError(await readApiError(resp, 'Could not switch user'))
-            localStorage.removeItem(STORAGE_KEY_USER)
+            refusal = await readApiError(resp, 'Could not switch user')
+            setUserSwitchError(refusal)
+            forgetActAsPick()
             await fetch('/api/auth/act-as', { method: 'DELETE' }).catch(() => {})
           } else {
             setUserSwitchError(null)
@@ -189,13 +438,22 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         // as for a refused target, instead of a half-switched session.
         if (impersonated) {
           impersonated = false
-          localStorage.removeItem(STORAGE_KEY_USER)
-          setUserSwitchError(toApiError(e, 'Could not switch user'))
+          forgetActAsPick()
+          refusal = toApiError(e, 'Could not switch user')
+          setUserSwitchError(refusal)
         }
       }
       setUserIdState(impersonated ? id : (authUser?.id ?? null))
-    })()
-  }, [isAdmin, authUser])
+      // What may be used follows the act-as cookie just set or cleared (/api/auth/me answers it).
+      void refreshSession?.()
+    }
+    return refusal
+  }, [canSwitchUser, authUser, refreshSession, serverOwned, identityOn, switchOnServer])
+
+  const closeActAs = useCallback(() => {
+    actAsRequest?.settle(null)
+    setActAsRequest(null)
+  }, [actAsRequest])
 
   return (
     <ProjectContext.Provider value={{
@@ -206,8 +464,27 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       setUserId,
       isLoading,
       userSwitchError,
+      accessNotice,
+      dismissAccessNotice,
+      checkAccessNow,
     }}>
-      {children}
+      <ProjectAccessContext.Provider value={accessScope}>
+        {children}
+      </ProjectAccessContext.Provider>
+      {serverOwned && (
+        <ActAsDialog
+          isOpen={actAsRequest !== null}
+          target={actAsRequest?.target ?? null}
+          maxMinutes={authUser?.impersonation?.maxMinutes ?? 720}
+          reasonRequired={authUser?.impersonation?.reasonRequired ?? false}
+          onConfirm={async ({ reason, durationMinutes, password }) => {
+            if (!actAsRequest) return
+            const refusal = await switchOnServer(actAsRequest.target.id, { stepUpPassword: password, reason, durationMinutes })
+            if (refusal) throw refusal
+          }}
+          onClose={closeActAs}
+        />
+      )}
     </ProjectContext.Provider>
   )
 }

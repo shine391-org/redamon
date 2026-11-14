@@ -9,9 +9,10 @@
  * (mcp_plan.md P0-3).
  */
 import { NextRequest, NextResponse } from 'next/server'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 import { readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
+import { recordFeatureSpend } from '@/lib/authz/ownerSpend'
 
 // Up to three generations, each with its own provider retries: as long as the
 // raw fetch this replaced waited for headers.
@@ -32,9 +33,6 @@ function providerFacts(json: Record<string, unknown> | null): Record<string, unk
 }
 
 export async function POST(request: NextRequest) {
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-
   let body: Record<string, unknown>
   try {
     body = await request.json()
@@ -43,8 +41,15 @@ export async function POST(request: NextRequest) {
   }
 
   const projectId = typeof body.project_id === 'string' ? body.project_id : ''
-  const access = await requireProjectAccess(eff, projectId)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'agent:assistants', { projectId })
+  if (auth instanceof NextResponse) return auth
+  const access = auth.access!
+  // The graph tenant is the project's owner, whose id its nodes carry. The key owner is the
+  // owner too: a collaborator reaches agent:assistants (W+A) only through Use AI agent, which
+  // counts only with the owner's consent, and the spend is recorded as theirs (step 5.6, C1).
+  const owner = access.project.userId
+  const unrecorded = await recordFeatureSpend(auth, 'text_to_cypher')
+  if (unrecorded) return unrecorded
 
   try {
     const resp = await agentFetch('/text-to-cypher', {
@@ -52,9 +57,10 @@ export async function POST(request: NextRequest) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...body,
-        // The session decides whose projects and whose LLM key are used, never
+        // The access check decides whose graph and whose LLM key are used, never
         // the caller's body.
-        user_id: eff.userId,
+        user_id: owner,
+        tenant_user_id: owner,
         project_id: access.project.id,
       }),
     }, { timeoutMs: GENERATE_TIMEOUT_MS })

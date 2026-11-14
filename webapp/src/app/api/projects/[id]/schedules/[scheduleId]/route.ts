@@ -1,12 +1,14 @@
 /**
  * Scan Timeline - one schedule (Section 7.2).
  *
- * PATCH  enable/disable, retime, change scan mode or label
+ * PATCH  enable/disable, retime, change scan mode or label. A schedule that paused itself because
+ *        its actor lost access (`pausedReason`, step 5.5) is not turned back on here: the
+ *        confirmation route makes the person confirming its actor (D-13); 409 schedule_paused.
  * DELETE remove the schedule (its ScanJob history survives, schedule_id -> NULL)
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { requireAlso, requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { writeAudit } from '@/lib/audit'
 import {
   validateSchedule,
@@ -15,7 +17,7 @@ import {
   ScheduleValidationError,
 } from '@/lib/scanSchedule'
 import { fetchScanEnvelope } from '@/lib/scanEnvelope'
-import { scopeStartProblem } from '@/lib/scopeGroups'
+import { IP_HOSTNAME_SELECT, scopeStartProblem } from '@/lib/scopeGroups'
 import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
@@ -34,22 +36,40 @@ const NOT_FOUND = () => NextResponse.json({ error: 'Not found' }, { status: 404 
 
 export const PATCH = withRouteErrors('Failed to update the schedule', async (request: NextRequest, { params }: RouteParams) => {
   const { id, scheduleId } = await params
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'recon:schedule', { projectId: id })
+  if (auth instanceof NextResponse) return auth
+  const eff = auth.effective
 
   const existing = await loadOwnedSchedule(id, scheduleId)
   if (!existing) return NOT_FOUND()
 
   const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+  // Re-enabling would run it again as the person who lost access to the project.
+  if (body.enabled === true && existing.pausedReason) {
+    return NextResponse.json(
+      {
+        error: 'This schedule paused because the person it runs as no longer has access to this project. ' +
+          'Confirm it to run it as you instead.',
+        code: 'schedule_paused',
+        pausedReason: existing.pausedReason,
+      },
+      { status: 409 },
+    )
+  }
+  // Turning a schedule on lets it start full recons as its author; overwrite mode replaces the graph.
+  const refused = (body.enabled === true ? requireAlso(auth, 'recon:scan') : null)
+    ?? (body.scanMode === 'overwrite' ? requireAlso(auth, 'recon:overwrite') : null)
+  if (refused) return refused
 
   // A schedule paused because its saved scope is no longer valid would fail
   // again on its next tick: the scope is fixed first, then the schedule.
   if (body.enabled === true) {
     const project = await prisma.project.findUnique({
       where: { id },
-      select: { ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true },
+      select: {
+        ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true,
+        engagementKind: true, ...IP_HOSTNAME_SELECT,
+      },
     })
     const problem = project ? scopeStartProblem(project) : null
     if (problem) {
@@ -182,12 +202,11 @@ export const PATCH = withRouteErrors('Failed to update the schedule', async (req
   }
 })
 
-export const DELETE = withRouteErrors('Failed to delete the schedule', async (_request: NextRequest, { params }: RouteParams) => {
+export const DELETE = withRouteErrors('Failed to delete the schedule', async (request: NextRequest, { params }: RouteParams) => {
   const { id, scheduleId } = await params
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'recon:schedule', { projectId: id })
+  if (auth instanceof NextResponse) return auth
+  const eff = auth.effective
 
   const existing = await loadOwnedSchedule(id, scheduleId)
   if (!existing) return NOT_FOUND()

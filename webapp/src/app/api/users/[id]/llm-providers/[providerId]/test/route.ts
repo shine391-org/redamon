@@ -4,6 +4,9 @@ import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
 import { isJevProvider, jevPinnedConfig, type JevProviderType } from '@/lib/llmProviderKinds'
 import { internalError, readUpstreamBody, upstreamFailure } from '@/lib/routeErrors'
+import { llmProviderSecretReentry, secretReentryResponse } from '@/lib/authz/secretEndpointRebind'
+import { restoreMaskedHeaders } from '@/lib/llmProviderMask'
+import { requireSelfPermission } from '@/lib/authz/selfService'
 
 interface RouteParams {
   params: Promise<{ id: string; providerId: string }>
@@ -40,8 +43,10 @@ function hopBudgetMs(configuredSeconds: unknown): number {
 export async function POST(request: NextRequest, { params }: RouteParams) {
   try {
     const { id, providerId } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'write' })
     if (__denied) return __denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:llm_providers')
+    if (selfRefused) return selfRefused
     const body = await request.json()
 
     let config: Record<string, unknown>
@@ -73,6 +78,13 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         && (storedIsJev || isJevProvider({ providerType: body.providerType }))) {
         return NextResponse.json({ success: false, error: 'The backend of a Jev provider cannot be changed' }, { status: 400 })
       }
+      // The stored key is tested against the stored endpoint only: an edited base
+      // URL or type needs the key typed again (HD-24), or a test would deliver it
+      // to the new address.
+      if (!storedIsJev) {
+        const reentry = llmProviderSecretReentry(provider, body)
+        if (reentry) return secretReentryResponse(reentry, { success: false })
+      }
       config = { ...(provider as unknown as Record<string, unknown>) }
       for (const [key, value] of Object.entries(body)) {
         if (SECRET_FIELDS.has(key) && isMasked(value)) {
@@ -80,7 +92,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
           continue
         }
         if (storedIsJev && LOCKED_FOR_JEV.has(key)) continue
-        config[key] = value
+        // Header values come back masked like the key; the masked ones keep the stored value.
+        config[key] = key === 'defaultHeaders' ? restoreMaskedHeaders(value, provider.defaultHeaders) : value
       }
     }
 

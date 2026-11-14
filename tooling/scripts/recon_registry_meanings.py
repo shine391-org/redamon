@@ -232,9 +232,13 @@ OVERRIDES: dict[str, str] = {
         "engagement ceiling a 0 here is rewritten to the ceiling at scan start."
     ),
     "webCachePoisonMaxRpsPerHost": (
-        "Requests per second the web-cache-poisoning scan sends to any ONE host. ZERO MEANS "
-        "UNLIMITED, so 0 is the most aggressive value available and not the safest. Under an "
-        "engagement ceiling a 0 here is rewritten to the ceiling at scan start."
+        "Requests per second of the web-cache-poisoning breadth sweep (WCVS -rr). Despite "
+        "the name it is NOT per host: it is one rate for the whole WCVS process, shared by "
+        "every thread and URL. ZERO MEANS UNLIMITED, so 0 is the most aggressive value "
+        "available and not the safest. Under an engagement ceiling a 0 here is rewritten to "
+        "the ceiling at scan start, and WCVS then runs one thread at a rate below the "
+        "ceiling (ceiling - 1 from 2 rps up, 1 / (2 + 1/ceiling) below 2), or at this value "
+        "when it is lower, because its cache-buster checks can send two requests together."
     ),
     "purednsRateLimit": (
         "DNS queries per second puredns sends to its resolvers. ZERO MEANS UNLIMITED, so 0 "
@@ -330,8 +334,26 @@ OVERRIDES: dict[str, str] = {
     "cveLookupMaxCves": "Maximum CVEs attached to one service before enrichment stops adding more.",
     "wappalyzerMinConfidence": "The confidence percentage below which a Wappalyzer technology match is discarded.",
     "wappalyzerRequireHtml": "Whether a technology match requires an HTML response, which suppresses matches on JSON and binary endpoints.",
-    "jsReconStandaloneCrawlScope": "How far a standalone JS recon run may crawl from its seed: same host, same domain, or anywhere.",
-    "jsReconStandaloneCrawlDepth": "How many links deep a standalone JS recon run crawls from its seed.",
+    # Retired columns, kept so an upgrade or a rollback never drops data. Spelled
+    # out because the templates would describe them as live: aiSurfaceReconCacheEnabled
+    # matches `*Enabled` ("Whether ... runs").
+    "jsReconStandaloneCrawlScope": (
+        "Retired: nothing reads it. JS recon has no standalone crawl; it analyses the "
+        "JavaScript the pipeline's crawlers found. Closed on every surface, with no input."
+    ),
+    "jsReconStandaloneCrawlDepth": (
+        "Retired: nothing reads it. JS recon has no standalone crawl; it analyses the "
+        "JavaScript the pipeline's crawlers found. Closed on every surface, with no input."
+    ),
+    "katanaScope": (
+        "Retired: nothing reads it. Katana always crawls with field scope fqdn. Closed on "
+        "every surface, with no input."
+    ),
+    "aiSurfaceReconCacheEnabled": (
+        "Retired: nothing reads it. AI attack-surface recon has no probe cache, and one that "
+        "skipped re-testing would leave earlier findings unchecked. Closed on every surface, "
+        "with no input."
+    ),
     "jsReconRegexPatterns": "Additional regular expressions applied to retrieved JavaScript, on top of the shipped set.",
     "kiterunnerMethodDetectionMode": "How kiterunner establishes which HTTP methods a discovered route accepts.",
     "trufflehogIncludeDetectors": "Restricts the run to these detectors. Empty means every detector runs.",
@@ -490,10 +512,14 @@ TEMPLATES: list[tuple[re.Pattern[str], str]] = [
         "runs INSIDE its phase, and scanModules decides whether the phase runs at all. Setting "
         "one without the other is a silent no-op.",
     ),
+    # The name says only that a clock stops something. Whether it bounds one
+    # request or the whole run, and what a cut run keeps, differ per tool, so a
+    # claim about either belongs in an OVERRIDE or the curated YAML.
     (
         re.compile(r"(Timeout|ScanTimeout|RunTimeout|ValidationTimeout)$"),
-        "How long {tool} may spend before it is abandoned, in {unit}. A run that hits it "
-        "contributes whatever it found so far rather than failing the scan.",
+        "A wall-clock time limit for {tool}, in {unit}. Whether it bounds one request, one "
+        "target or the whole run, and what a run that hits it keeps, depend on the tool: "
+        "the name says neither.",
     ),
     (
         re.compile(r"(Threads|Concurrency|Workers|Parallelism|Connections)$"),

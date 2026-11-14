@@ -1,25 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
 import prisma from '@/lib/prisma'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
 import { internalError } from '@/lib/routeErrors'
 import { writeAudit } from '@/lib/audit'
 import { actingAdminId } from '@/lib/roe/actor'
 import { attachmentDisposition, downloadContentType } from '@/lib/roe/limits'
+import { ROE_DOCUMENT_OWNER_ONLY, ownerOnlyRefusal } from '@/lib/authz/projectReadView'
 
 // GET /api/projects/[id]/roe/download - Download the original RoE document
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params
 
     // The document names the client, their contacts and what may be attacked:
-    // it is the owner's, like every other project read.
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, id)
-    if (access instanceof NextResponse) return access
+    // it stays the owner's even on a shared project (OQ-53), whatever roe:read reaches.
+    const auth = await requirePermission(request, 'roe:read', { projectId: id })
+    if (auth instanceof NextResponse) return auth
+    const refused = ownerOnlyRefusal(auth.access, 'roe:read', ROE_DOCUMENT_OWNER_ONLY)
+    if (refused) return refused
+    const eff = auth.effective
 
     const project = await prisma.project.findUnique({
       where: { id },

@@ -8,15 +8,21 @@ Supports streaming of LLM thoughts, tool executions, and interactive approval/qu
 import asyncio
 import json
 import logging
+import time
+import weakref
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, Iterable, List, Optional, Any, Callable
 from enum import Enum
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 from orchestrator_helpers import create_config
-from orchestrator_helpers.chat_persistence import save_chat_message, update_conversation
+from orchestrator_helpers.chat_persistence import post_agent_decision, save_chat_message, update_conversation
+from decision_check import UNAVAILABLE as DECISION_CHECK_UNAVAILABLE, RunActor, authorize_decision, bind_run_actor
+from writer_check import WRITER_BUSY, second_writer_check
 from agent_in_the_loop.broker import get_broker
+from sandbox_runs import schedule_sandbox_stop
 
 
 def serialize_for_json(obj):
@@ -238,8 +244,18 @@ class WebSocketConnection:
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
         self.user_id: Optional[str] = None
+        #: The project's owner (the ticket's `ten`, ws_ticket.ticket_tenant): the graph
+        #: tenant the session's runs read and write. `user_id` stays the person, who keys
+        #: the session, the chat and the loop scope. None until a verified init.
+        self.tenant_id: Optional[str] = None
         self.project_id: Optional[str] = None
         self.session_id: Optional[str] = None
+        #: The person signed in when an admin acts as `user_id` (the ticket's `act`),
+        #: so closing that person's sockets reaches this one too.
+        self.actor_id: Optional[str] = None
+        #: The agent permissions the ticket's person holds on the project (its `cap`,
+        #: ws_ticket.ticket_cap); None for a ticket without one, which allows everything.
+        self.cap: Optional[frozenset] = None
         self.graph_view_cypher: Optional[str] = None
         self.authenticated = False
         self.connected_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -281,6 +297,26 @@ class WebSocketConnection:
             return f"{self.user_id}:{self.project_id}:{self.session_id}"
         return None
 
+    def holds(self, permission: str) -> bool:
+        """Whether this connection's person may take a decision that needs `permission`."""
+        return self.cap is None or permission in self.cap
+
+    def decision_actor(self) -> dict:
+        """Who answered on this connection, as a saved decision records it."""
+        return {"sub": self.user_id, **({"act": self.actor_id} if self.actor_id else {})}
+
+    def run_actor(self) -> RunActor:
+        """Who a run this connection starts or resumes acts for: the decisions the project's
+        settings take without asking need this person's permissions (decision_check)."""
+        return RunActor(user_id=self.user_id, tenant_id=self.tenant_id or self.user_id,
+                        project_id=self.project_id, session_id=self.session_id,
+                        actor_id=self.actor_id, cap=self.cap)
+
+
+#: What an emergency stop tells the open socket of each run it stops.
+EMERGENCY_STOP_ALL_MESSAGE = "Emergency stop — all agents halted"
+EMERGENCY_STOP_OWN_MESSAGE = "Emergency stop — your agent runs were halted"
+
 
 class WebSocketManager:
     """Manages active WebSocket connections"""
@@ -296,6 +332,9 @@ class WebSocketManager:
         # persist queue — the DB otherwise lags the live stream, so the restore
         # read returns a stale/empty timeline. See handle_init flush-on-connect.
         self._active_callbacks: Dict[str, 'StreamingCallback'] = {}
+        # Keyed by the run's task itself, so an entry leaves with the run however
+        # its registration ends (released, stopped, found done, emergency stop).
+        self._run_actors: 'weakref.WeakKeyDictionary[asyncio.Task, str]' = weakref.WeakKeyDictionary()
         # Per-tool task registry for individual tool cancellation.
         # Keyed by f"{session_key}|{wave_id or '__standalone__'}|{step_index if step_index is not None else -1}|{tool_name}".
         # Populated by execute_tool_node / execute_plan_node before awaiting the
@@ -451,9 +490,22 @@ class WebSocketManager:
                 else:
                     logger.debug(f"Skipped disconnect for {session_key} — connection already replaced")
 
-    def register_task(self, session_key: str, task: asyncio.Task):
-        """Register an active task for a session (survives connection replacement)"""
+    def register_task(self, session_key: str, task: asyncio.Task,
+                      actor_id: Optional[str] = None):
+        """Register an active task for a session (survives connection replacement).
+
+        `actor_id` is the admin who started it while acting as the session's user
+        (the starting socket's `actor_id`). It stays with the run, so closing that
+        admin's sockets finds the run after its tab is gone (close_sockets).
+        """
         self._active_tasks[session_key] = task
+        if actor_id:
+            self._run_actors[task] = actor_id
+
+    def run_actor(self, session_key: str) -> Optional[str]:
+        """The admin who started the session's registered run while acting, if any."""
+        task = self._active_tasks.get(session_key)
+        return self._run_actors.get(task) if task is not None else None
 
     def get_task(self, session_key: str) -> Optional[asyncio.Task]:
         """Get active (non-done) task for a session"""
@@ -491,6 +543,46 @@ class WebSocketManager:
                 live.append(session_id)
         return live
 
+    def all_sessions(self) -> List[dict]:
+        """Every session of the instance with an open socket or a registered run, for the
+        admin operations view (step 6.5): its person, project and session, whether a run is
+        in progress, whether a socket is open, and the admin behind an act-as run (the run's,
+        else the open socket's). Keys are parsed as live_session_ids does. Ids and flags only:
+        never a message, a title, a ticket or the tenant.
+        """
+        sessions = []
+        for key in sorted(set(self.active_connections) | set(self._active_tasks)):
+            user_id, _, rest = key.partition(":")
+            project_id, _, session_id = rest.partition(":")
+            if not (user_id and project_id and session_id):
+                continue
+            running = self.get_task(key) is not None
+            connection = self.active_connections.get(key)
+            if not running and connection is None:
+                # A run that ended with no socket left: get_task has just forgotten it.
+                continue
+            actor_id = (self.run_actor(key) if running else None) or (connection.actor_id if connection else None)
+            sessions.append({
+                "user_id": user_id, "project_id": project_id, "session_id": session_id,
+                "running": running, "connected": connection is not None, "actor_id": actor_id or None,
+            })
+        return sessions
+
+    def live_run_count(self, user_id: str) -> int:
+        """How many of `user_id`'s runs are in progress, for the agent-run quota (step 6.8).
+
+        The person is the session key's user, parsed as live_session_ids does, so an admin's
+        act-as run is the member's. An open socket without a run does not count.
+        """
+        if not user_id:
+            return 0
+        count = 0
+        for key in list(self._active_tasks):
+            key_user, _, _rest = key.partition(":")
+            if key_user == user_id and self.get_task(key) is not None:
+                count += 1
+        return count
+
     def register_callback(self, session_key: str, callback: 'StreamingCallback'):
         """Register the live StreamingCallback for a session (survives reconnect)."""
         self._active_callbacks[session_key] = callback
@@ -518,47 +610,76 @@ class WebSocketManager:
         return len(self.active_connections)
 
     async def stop_all(self) -> int:
-        """Emergency stop: cancel every running agent task and notify clients.
+        """Emergency stop: stop every running agent run, of every user.
 
-        Returns the number of tasks that were cancelled.
+        Returns the number of runs that were cancelled.
         """
+        return await self._emergency_stop(list(self._active_tasks), EMERGENCY_STOP_ALL_MESSAGE)
+
+    async def stop_for_user(self, user_id: str, project_ids: Optional[Iterable[str]] = None) -> int:
+        """Emergency stop for one user: stop the runs registered under `user_id`.
+
+        A run's key names the ticket's subject, the effective user, so a run an
+        admin started acting as the member is the member's and stops here too.
+        `project_ids`, when given, limits it to those projects. Returns the number
+        of runs that were cancelled; an unknown user stops nothing.
+        """
+        if not user_id:
+            return 0
+        projects = None if project_ids is None else set(project_ids)
+        keys = []
+        # Parsed as live_session_ids does: the user is everything before the first ':'.
+        for key in list(self._active_tasks):
+            key_user, _, rest = key.partition(":")
+            key_project, _, _session = rest.partition(":")
+            if key_user == user_id and (projects is None or key_project in projects):
+                keys.append(key)
+        return await self._emergency_stop(keys, EMERGENCY_STOP_OWN_MESSAGE)
+
+    async def stop_project_session(self, project_id: str, session_id: str,
+                                   message: str = "Session stopped (conversation deleted)") -> bool:
+        """stop_session for every key of `session_id` in `project_id`, whoever's.
+
+        For a caller that knows the session but not its person: an orphan attack
+        chain names its project's owner (the tenant), never the person whose run
+        keys it. Parsed as live_session_ids does. True if a live run was cancelled.
+        """
+        if not project_id or not session_id:
+            return False
+        cancelled = False
+        for key in sorted(set(self._active_tasks) | set(self.active_connections)):
+            _user, _, rest = key.partition(":")
+            key_project, _, key_session = rest.partition(":")
+            if key_project == project_id and key_session == session_id:
+                cancelled = await self.stop_session(key, message=message) or cancelled
+        return cancelled
+
+    async def _emergency_stop(self, keys, message: str) -> int:
+        """stop_session for each key with a live run (its tool tasks too)."""
         stopped = 0
-        for session_key, task in list(self._active_tasks.items()):
-            if task and not task.done():
-                task.cancel()
-                stopped += 1
-                self._active_tasks.pop(session_key, None)
-
-                # Notify the connected client and mark as stopped
-                conn = self.active_connections.get(session_key)
-                if conn:
-                    conn._is_stopped = True
-                    try:
-                        await conn.send_message(MessageType.STOPPED, {
-                            "message": "Emergency stop — all agents halted",
-                            "iteration": 0,
-                            "phase": "informational",
-                        })
-                    except Exception:
-                        pass
-
-                    # Mark conversation as not running in DB
-                    if conn and conn.session_id:
-                        try:
-                            await update_conversation(conn.session_id, {"agentRunning": False})
-                        except Exception:
-                            pass
-
+        for key in keys:
+            if self.get_task(key) is None:
+                continue
+            if not await self.stop_session(key, message=message):
+                continue
+            stopped += 1
+            # The run's own `finally` clears the flag as well, but a run cancelled
+            # before its first step never executes it.
+            session_id = key.split(":", 2)[2] if key.count(":") >= 2 else ""
+            if session_id:
+                asyncio.create_task(update_conversation(session_id, {"agentRunning": False}))
         return stopped
 
-    async def stop_session(self, session_key: str) -> bool:
+    async def stop_session(self, session_key: str,
+                           message: str = "Session stopped (conversation deleted)") -> bool:
         """Cancel the running agent task for a SINGLE session key.
 
         Used when its conversation is deleted so the backing agent loop halts
         instead of continuing headlessly (and re-seeding the attack-chain graph
-        after the UI clears it). Also cancels any in-flight tool tasks for the
-        session and marks a connected socket stopped. Returns True if a live
-        task was cancelled.
+        after the UI clears it), and when the person's access is revoked
+        (close_sockets). Also cancels any in-flight tool tasks for the session and
+        marks a connected socket stopped, telling it `message`. Returns True if a
+        live task was cancelled.
         """
         cancelled = False
         task = self._active_tasks.get(session_key)
@@ -569,17 +690,24 @@ class WebSocketManager:
 
         # Cancel any in-flight tool/wave tasks for this session (keys are
         # "<session_key>|...", see _tool_task_key).
+        tools_cancelled = False
         for k, t in list(self._tool_tasks.items()):
             if k.startswith(f"{session_key}|") and t and not t.done():
                 t.cancel()
+                tools_cancelled = True
                 self._tool_tasks.pop(k, None)
+
+        # Cancelling only stops the agent waiting; the sandbox ends the run's
+        # processes itself (GHSA-8whg-rvcr-r88r).
+        if cancelled or tools_cancelled:
+            schedule_sandbox_stop(session_key.split(":", 2)[-1])
 
         conn = self.active_connections.get(session_key)
         if conn:
             conn._is_stopped = True
             try:
                 await conn.send_message(MessageType.STOPPED, {
-                    "message": "Session stopped (conversation deleted)",
+                    "message": message,
                     "iteration": 0,
                     "phase": "informational",
                 })
@@ -589,8 +717,200 @@ class WebSocketManager:
 
 
 # =============================================================================
+# PROXIED SOCKETS AND CLOSING BY USER (T16, DV-21)
+# =============================================================================
+
+#: Every socket kind a ticket can open (ws_ticket.WS_AUDIENCES); `agent` lives in
+#: WebSocketManager, the other three in PROXIED_SOCKETS.
+SOCKET_KINDS = ("agent", "kali-terminal", "cypherfix-triage", "cypherfix-codefix")
+PROXIED_KINDS = SOCKET_KINDS[1:]
+
+#: 4403: an application close code (4000-4999) the browser shows with its reason.
+ACCESS_REVOKED_CODE = 4403
+ACCESS_REVOKED_REASON = "Access revoked"
+
+
+@dataclass
+class ProxiedSocket:
+    ws: Any
+    kind: str
+    sub: str
+    act: Optional[str]
+    pid: str
+    sid: str
+    opened_at: float = field(default_factory=time.time)
+    # The run of the graph credential a terminal's shell was handed: it is honoured
+    # only while this entry exists (holds_run).
+    run: Optional[str] = None
+    # The ticket's graph tenant (ws_ticket.ticket_tenant), whom that credential names.
+    # Revocation matches `sub`, the person, never this: a collaborator's revoke must not
+    # close the owner's sockets.
+    ten: str = ""
+
+
+class ProxiedSocketRegistry:
+    """The open /ws/kali-terminal, /ws/cypherfix-triage and /ws/cypherfix-codefix
+    sockets, with the verified ticket's identity. Each handler adds its socket
+    after the ticket check and accept(), and removes it in its `finally`, so a
+    revoke can find a socket whose ticket was valid when it opened.
+    """
+
+    def __init__(self):
+        # By identity: two sockets of the same user, project and kind are two entries.
+        self._entries: Dict[int, ProxiedSocket] = {}
+
+    def add(self, ws, kind: str, claims: dict, run: Optional[str] = None) -> ProxiedSocket:
+        if kind not in PROXIED_KINDS:
+            raise ValueError(f"not a proxied socket kind: {kind!r}")
+        from ws_ticket import ticket_tenant
+        entry = ProxiedSocket(
+            ws=ws, kind=kind, sub=str(claims["sub"]),
+            act=str(claims["act"]) if claims.get("act") else None,
+            pid=str(claims["pid"]), sid=str(claims["sid"]), run=run or None,
+            ten=ticket_tenant(claims))
+        self._entries[id(ws)] = entry
+        return entry
+
+    def holds_run(self, run: str, tenant: str, project_id: str) -> bool:
+        """Whether an open terminal socket was handed the graph credential of `run`,
+        for that tenant (the credential's `ten`) and project: a copy of the credential
+        dies with the socket."""
+        return bool(run) and any(
+            e.kind == "kali-terminal" and e.run == run and e.ten == tenant and e.pid == project_id
+            for e in list(self._entries.values()))
+
+    def remove(self, ws) -> None:
+        entry = self._entries.get(id(ws))
+        if entry is not None and entry.ws is ws:
+            del self._entries[id(ws)]
+
+    def matching(self, *, kinds, user_id: Optional[str] = None,
+                 project_id: Optional[str] = None, scope: str = "access",
+                 actor_id: Optional[str] = None) -> List[ProxiedSocket]:
+        _check_scope(scope, user_id=user_id, actor_id=actor_id)
+        return [e for e in list(self._entries.values())
+                if e.kind in kinds
+                and _names(user_id, e.sub, e.act, scope=scope, project_id=project_id, actor_id=actor_id)
+                and (project_id is None or e.pid == project_id)]
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+PROXIED_SOCKETS = ProxiedSocketRegistry()
+
+
+#: What ended for the user a close names (`scope` of close_sockets and POST /ws/close).
+CLOSE_SCOPES = ("access", "account", "act_as")
+
+
+def _check_scope(scope: str, *, user_id: Optional[str] = None, actor_id: Optional[str] = None) -> None:
+    if scope not in CLOSE_SCOPES:
+        raise ValueError(f"unknown close scope: {scope!r}")
+    # One impersonation names both people; any other scope names no admin.
+    if scope == "act_as" and not (user_id and actor_id):
+        raise ValueError("the act_as scope needs user_id and actor_id")
+    if scope != "act_as" and actor_id is not None:
+        raise ValueError("actor_id belongs to the act_as scope")
+
+
+def _names(user_id: Optional[str], sub: str, act: Optional[str], *,
+           scope: str, project_id: Optional[str], actor_id: Optional[str] = None) -> bool:
+    """Whether a socket or run opened as `sub` (by admin `act`, when acting) is `user_id`'s.
+
+    See close_sockets for the rule.
+    """
+    if scope == "act_as":
+        return sub == user_id and act == actor_id
+    if user_id is None or user_id == (act or sub):
+        return True
+    return user_id == sub and (scope == "account" or project_id is not None)
+
+
+async def close_sockets(manager: Optional[WebSocketManager], registry: ProxiedSocketRegistry, *,
+                        kinds, user_id: Optional[str] = None,
+                        project_id: Optional[str] = None, scope: str = "access",
+                        actor_id: Optional[str] = None) -> dict:
+    """Close the open sockets of `kinds` that match the user and/or the project.
+
+    A ticket is checked once, at the handshake, so a revoke, a disabled account or
+    a removed grant must end what is already open. Closing means, per kind:
+    `agent` stops the session's run too (a run outlives its socket by design, so a
+    headless run of the user is stopped as well); `cypherfix-codefix` cancels its
+    run (its handler's `finally`); `cypherfix-triage` only detaches from the
+    project's run, which keeps going; `kali-terminal` ends the proxy, which closes
+    the sandbox's PTY. A socket that fails to close is still forgotten.
+
+    Matching a `user_id`. An admin acting as a member opens sockets as the member
+    (`sub`) with the admin as `act`; the ticket route checks the project for the
+    member and the terminal grant on the admin. `scope` says what ended:
+    - `access` (default), something the user's own access gave, such as a legacy
+      grant: a socket matches the person whose access opened it, `act` when set,
+      else `sub`. The member losing a grant leaves the admin's act-as socket open.
+    - `account`, the account itself (disabled, deleted, sessions revoked): every
+      socket naming the user, as `sub` or as `act`.
+    - `act_as`, one impersonation ended (Stop, its time limit, sign-out, the admin
+      losing the right): only what admin `actor_id` opened or started acting as
+      `user_id`. The member's own sockets and runs, the admin's own, and other
+      admins' impersonations of the member stay.
+    With a `project_id`, the user's access to that project ended, which an act-as
+    socket relied on, so it matches as `account` inside that project. An agent
+    run matches by who started it (recorded at its start, so a run whose tab is
+    closed is still found) and its socket by who holds it: stopping one never
+    ends another person's.
+    """
+    _check_scope(scope, user_id=user_id, actor_id=actor_id)
+    by_kind: Dict[str, int] = {}
+    stopped_runs = 0
+
+    def ours(sub: str, act: Optional[str]) -> bool:
+        return _names(user_id, sub, act, scope=scope, project_id=project_id, actor_id=actor_id)
+
+    if "agent" in kinds and manager is not None:
+        keys = set(manager.active_connections) | set(manager._active_tasks)
+        for key in sorted(keys):
+            sub, _, rest = key.partition(":")
+            pid, _, _sid = rest.partition(":")
+            if project_id is not None and pid != project_id:
+                continue
+            if key in manager._active_tasks and ours(sub, manager.run_actor(key)):
+                if await manager.stop_session(key, message="Session stopped (access revoked)"):
+                    stopped_runs += 1
+            conn = manager.active_connections.get(key)
+            if conn is None or not ours(sub, conn.actor_id):
+                continue
+            try:
+                await conn.websocket.close(code=ACCESS_REVOKED_CODE, reason=ACCESS_REVOKED_REASON)
+            except Exception as e:
+                logger.warning("[rbac] socket-close failed kind=agent: %s", type(e).__name__)
+            await manager.disconnect(conn)
+            # Any frame that still arrives before the disconnect is refused.
+            conn.authenticated = False
+            by_kind["agent"] = by_kind.get("agent", 0) + 1
+
+    for entry in registry.matching(kinds=[k for k in kinds if k in PROXIED_KINDS],
+                                   user_id=user_id, project_id=project_id, scope=scope,
+                                   actor_id=actor_id):
+        try:
+            await entry.ws.close(code=ACCESS_REVOKED_CODE, reason=ACCESS_REVOKED_REASON)
+        except Exception as e:
+            logger.warning("[rbac] socket-close failed kind=%s: %s", entry.kind, type(e).__name__)
+        registry.remove(entry.ws)
+        by_kind[entry.kind] = by_kind.get(entry.kind, 0) + 1
+
+    return {"closed": sum(by_kind.values()), "by_kind": by_kind, "stopped_runs": stopped_runs}
+
+
+# =============================================================================
 # STREAMING CALLBACK INTERFACE
 # =============================================================================
+
+_PENDING_REQUEST_FRAMES = {
+    "approval": MessageType.APPROVAL_REQUEST,
+    "question": MessageType.QUESTION_REQUEST,
+    "tool_confirmation": MessageType.TOOL_CONFIRMATION_REQUEST,
+}
+
 
 class StreamingCallback:
     """Callback interface for streaming events from orchestrator.
@@ -1241,6 +1561,11 @@ class StreamingCallback:
         self._loop_note("awaiting_human", kind="tool_confirmation")
         logger.info(f"Tool confirmation request sent to session {self.connection.session_id}")
 
+    async def resend_pending_request(self, kind: str, request: dict):
+        """Show a request again after the person's answer to it was refused. Sent
+        only: the stored timeline still ends on this request, unanswered."""
+        await self.connection.send_message(_PENDING_REQUEST_FRAMES[kind], request)
+
     async def on_response(self, answer: str, iteration_count: int, phase: str, task_complete: bool, response_tier: str = "full_report"):
         """Called when agent provides final response"""
         if not self._response_sent:
@@ -1329,6 +1654,112 @@ class WebSocketHandler:
         self.orchestrator = orchestrator
         self.ws_manager = ws_manager
 
+    async def _refused_without(self, connection: WebSocketConnection, *permissions: str,
+                               answer: str, **request) -> bool:
+        """Refuse a decision the connection's person may not take (step 3.9b).
+
+        Checked before anything runs or is saved, so the agent's prompt stays open for
+        someone who holds the permission. The frame names the refused `answer` (and the
+        Fireteam wave and member in `request`), so the drawer puts back the card it hid for
+        it. True when refused (the frame is sent).
+        """
+        missing = next((p for p in permissions if not connection.holds(p)), None)
+        if missing is None:
+            return False
+        logger.warning("[rbac] decision refused permission=%s session=%s", missing, connection.session_id)
+        await connection.send_message(MessageType.ERROR, {
+            "message": f"You do not hold the permission this answer needs ({missing}). "
+                       "The agent keeps waiting for someone who does.",
+            "code": "permission_required",
+            "permission": missing,
+            "answer": answer,
+            **request,
+            "recoverable": True,
+        })
+        return True
+
+    async def _refused_now(self, connection: WebSocketConnection, *permissions: str,
+                           answer: str, mode: Optional[str] = None, **request) -> bool:
+        """Refuse a decision the person may no longer take, asked of the webapp now (step 5.4).
+
+        The ticket's `cap` is from when the socket opened: the account, the share, a toggle or a
+        permission may have gone since the prompt was shown. So after the cap, and before
+        anything runs or is saved, the webapp decides the decision's kind (`answer`) again for the
+        ticket's person (`sub`, with `act` under act-as), never for anyone a frame names. Fail
+        closed: an unreachable webapp is a refusal (`decision_check_unavailable`). A refusal for
+        a permission keeps the `permission_required` frame of `_refused_without`, so the drawer
+        puts the card back. `mode` is the decision's mode the webapp maps (decision_check
+        DECISION_MODES). True when refused (the frame is sent).
+        """
+        check = await authorize_decision(
+            kind=answer, user_id=connection.user_id, project_id=connection.project_id,
+            session_id=connection.session_id, actor_id=connection.actor_id, permissions=permissions,
+            **({"mode": mode} if mode else {}))
+        if check.allowed:
+            return False
+        if check.code == DECISION_CHECK_UNAVAILABLE:
+            await connection.send_message(MessageType.ERROR, {
+                "message": "Your answer was not applied: RedAmon could not check that you may still "
+                           "take this decision. Try again in a moment.",
+                "code": DECISION_CHECK_UNAVAILABLE,
+                "answer": answer,
+                **request,
+                "recoverable": True,
+            })
+            return True
+        permission = check.permission or permissions[0]
+        logger.warning("[rbac] decision refused at decision time permission=%s reason=%s session=%s",
+                       permission, check.reason, connection.session_id)
+        await connection.send_message(MessageType.ERROR, {
+            "message": f"You no longer hold the permission this answer needs ({permission}) on this project. "
+                       "The agent keeps waiting for someone who does.",
+            "code": "permission_required",
+            "permission": permission,
+            "reason": check.reason,
+            "answer": answer,
+            **request,
+            "recoverable": True,
+        })
+        return True
+
+    async def _refused_second_writer(self, connection: WebSocketConnection, start: str,
+                                     answer: Optional[str] = None) -> bool:
+        """Refuse to start a run while another person writes the project (step 5.11 follow-up).
+
+        The ticket was refused at socket open while someone else wrote the project, but runs start
+        over the socket for as long as it stays open, so each start asks the webapp again for the
+        ticket's person (writer_check). Asked after the decision checks and before anything runs or
+        is saved: a refused answer leaves its request open, and the frame names it (`answer`) so the
+        drawer puts its card back. The frame carries the webapp's 409 as the ticket refusal does:
+        its sentence and `busy`, naming who holds the project. True when refused (the frame is sent).
+        """
+        check = await second_writer_check(
+            user_id=connection.user_id, tenant_id=connection.tenant_id or connection.user_id,
+            project_id=connection.project_id, session_id=connection.session_id,
+            actor_id=connection.actor_id, start=start)
+        if check.allowed:
+            return False
+        await connection.send_message(MessageType.ERROR, {
+            "message": check.message,
+            "code": WRITER_BUSY,
+            "busy": check.busy,
+            **({"answer": answer} if answer else {}),
+            "recoverable": True,
+        })
+        return True
+
+    def _record_decision(self, connection: WebSocketConnection, callback: 'StreamingCallback',
+                         kind: str, row: str, data: dict):
+        """An admitted answer: saved with who gave it, and posted for the audit row.
+
+        `connection` is the socket the answer came on, not the run's current one (a
+        reconnect moves the run), so the record names the person who answered.
+        """
+        callback._persist(row, {**data, "actor": connection.decision_actor()})
+        asyncio.create_task(post_agent_decision(
+            kind=kind, session_id=connection.session_id, project_id=connection.project_id,
+            user_id=connection.user_id, actor_id=connection.actor_id, decision=data["decision"]))
+
     async def handle_init(self, connection: WebSocketConnection, payload: dict):
         """Handle session initialization"""
         try:
@@ -1341,7 +1772,7 @@ class WebSocketHandler:
             # trusting the self-asserted identity. redamon.sh ensure_auth_secrets
             # always generates AGENT_WS_TICKET_SECRET, so real installs are
             # unaffected; only a token-less dev stack is refused (by design).
-            from ws_ticket import ticket_secret, verify_ws_ticket
+            from ws_ticket import ticket_cap, ticket_secret, ticket_tenancy_refusal, ticket_tenant, verify_ws_ticket
 
             secret = ticket_secret()
             user_id = init_msg.user_id
@@ -1368,15 +1799,23 @@ class WebSocketHandler:
                 await _reject_ticket("ticket auth not configured", "ws_ticket_not_configured")
                 return
 
-            claims = verify_ws_ticket(init_msg.ticket, secret)
+            claims = verify_ws_ticket(init_msg.ticket, secret, expected_aud="agent")
             if claims is None:
                 await _reject_ticket("Invalid or missing ticket", "ws_ticket_invalid")
+                return
+            # A ticket minted before an ownership transfer names the old owner: never opened after it.
+            tenancy = await asyncio.to_thread(ticket_tenancy_refusal, claims)
+            if tenancy:
+                await _reject_ticket(tenancy, "ws_ticket_tenant")
                 return
             # Identity comes from the verified ticket, not the client body.
             user_id = str(claims["sub"])
             project_id = str(claims["pid"])
             session_id = str(claims["sid"])
             verified = True
+            connection.tenant_id = ticket_tenant(claims)
+            connection.actor_id = str(claims["act"]) if claims.get("act") else None
+            connection.cap = ticket_cap(claims)
 
             # Authenticate connection
             await self.ws_manager.authenticate(
@@ -1479,6 +1918,8 @@ class WebSocketHandler:
                     "recoverable": False
                 })
                 return
+            if await self._refused_second_writer(connection, "query"):
+                return
 
             # Create streaming callback with ws_manager for dynamic connection resolution
             callback = StreamingCallback(connection, self.ws_manager)
@@ -1500,7 +1941,7 @@ class WebSocketHandler:
                 self._run_orchestrator_query(connection, query_msg.question, callback)
             )
             connection._active_task = task
-            self.ws_manager.register_task(connection.get_key(), task)
+            self.ws_manager.register_task(connection.get_key(), task, actor_id=connection.actor_id)
             self.ws_manager.register_callback(connection.get_key(), callback)
 
         except ValidationError as e:
@@ -1510,6 +1951,7 @@ class WebSocketHandler:
 
     async def _run_orchestrator_query(self, connection: WebSocketConnection, question: str, callback):
         """Background coroutine that runs the orchestrator invocation."""
+        bind_run_actor(connection.run_actor())
         try:
             result = await self.orchestrator.invoke_with_streaming(
                 question=question,
@@ -1519,6 +1961,7 @@ class WebSocketHandler:
                 streaming_callback=callback,
                 guidance_queue=connection.guidance_queue,
                 graph_view_cypher=connection.graph_view_cypher,
+                tenant_user_id=connection.tenant_id,
             )
             logger.info(f"Query completed for session {connection.session_id}")
         except asyncio.CancelledError:
@@ -1549,17 +1992,17 @@ class WebSocketHandler:
                     "recoverable": False
                 })
                 return
+            if await self._refused_without(connection, "agent:approve_phase", answer="approval"):
+                return
+            if await self._refused_now(connection, "agent:approve_phase", answer="approval"):
+                return
+            if await self._refused_second_writer(connection, "approval", answer="approval"):
+                return
 
             callback = StreamingCallback(connection, self.ws_manager)
             connection._is_stopped = False
 
             logger.info(f"Processing approval for session {connection.session_id}: {approval_msg.decision}")
-
-            # Persist the user's approval decision so it survives conversation reload
-            callback._persist("approval_response", {
-                "decision": approval_msg.decision,
-                "modification": approval_msg.modification,
-            })
 
             asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": True}))
 
@@ -1567,7 +2010,7 @@ class WebSocketHandler:
                 self._run_orchestrator_approval(connection, approval_msg, callback)
             )
             connection._active_task = task
-            self.ws_manager.register_task(connection.get_key(), task)
+            self.ws_manager.register_task(connection.get_key(), task, actor_id=connection.actor_id)
             self.ws_manager.register_callback(connection.get_key(), callback)
 
         except ValidationError as e:
@@ -1577,15 +2020,24 @@ class WebSocketHandler:
 
     async def _run_orchestrator_approval(self, connection: WebSocketConnection, approval_msg: ApprovalMessage, callback):
         """Background coroutine that runs approval resumption."""
+        bind_run_actor(connection.run_actor())
         try:
             result = await self.orchestrator.resume_after_approval_with_streaming(
                 session_id=connection.session_id,
                 user_id=connection.user_id,
+                tenant_user_id=connection.tenant_id,
                 project_id=connection.project_id,
                 decision=approval_msg.decision,
                 modification=approval_msg.modification,
                 streaming_callback=callback,
                 guidance_queue=connection.guidance_queue,
+                # Saved (it survives a reload) only once the run is admitted: a
+                # refused resume leaves the request unanswered, and shows it again.
+                on_admitted=lambda: self._record_decision(
+                    connection, callback, "approval", "approval_response", {
+                        "decision": approval_msg.decision,
+                        "modification": approval_msg.modification,
+                    }),
             )
             logger.info(f"Approval processed for session {connection.session_id}")
         except asyncio.CancelledError:
@@ -1616,16 +2068,15 @@ class WebSocketHandler:
                     "recoverable": False
                 })
                 return
+            if await self._refused_now(connection, "agent:chat", answer="question"):
+                return
+            if await self._refused_second_writer(connection, "question", answer="question"):
+                return
 
             callback = StreamingCallback(connection, self.ws_manager)
             connection._is_stopped = False
 
             logger.info(f"Processing answer for session {connection.session_id}")
-
-            # Persist the user's answer so it survives conversation reload
-            callback._persist("answer_response", {
-                "answer": answer_msg.answer,
-            })
 
             asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": True}))
 
@@ -1633,7 +2084,7 @@ class WebSocketHandler:
                 self._run_orchestrator_answer(connection, answer_msg.answer, callback)
             )
             connection._active_task = task
-            self.ws_manager.register_task(connection.get_key(), task)
+            self.ws_manager.register_task(connection.get_key(), task, actor_id=connection.actor_id)
             self.ws_manager.register_callback(connection.get_key(), callback)
 
         except ValidationError as e:
@@ -1643,14 +2094,17 @@ class WebSocketHandler:
 
     async def _run_orchestrator_answer(self, connection: WebSocketConnection, answer: str, callback):
         """Background coroutine that runs answer resumption."""
+        bind_run_actor(connection.run_actor())
         try:
             result = await self.orchestrator.resume_after_answer_with_streaming(
                 session_id=connection.session_id,
                 user_id=connection.user_id,
+                tenant_user_id=connection.tenant_id,
                 project_id=connection.project_id,
                 answer=answer,
                 streaming_callback=callback,
                 guidance_queue=connection.guidance_queue,
+                on_admitted=lambda: callback._persist("answer_response", {"answer": answer}),
             )
             logger.info(f"Answer processed for session {connection.session_id}")
         except asyncio.CancelledError:
@@ -1691,8 +2145,16 @@ class WebSocketHandler:
                 "recoverable": False,
             })
             return
+        if await self._refused_without(connection, "agent:fireteam", "agent:approve_dangerous",
+                                       answer="fireteam_member_confirmation",
+                                       wave_id=msg.wave_id, member_id=msg.member_id):
+            return
+        if await self._refused_now(connection, "agent:fireteam", "agent:approve_dangerous",
+                                   answer="fireteam_member_confirmation",
+                                   wave_id=msg.wave_id, member_id=msg.member_id):
+            return
 
-        from orchestrator_helpers.fireteam_confirmation_registry import resolve as _resolve
+        from orchestrator_helpers.fireteam_confirmation_registry import applied_decision, resolve as _resolve
         ok = _resolve(
             session_id=connection.session_id,
             wave_id=msg.wave_id,
@@ -1713,12 +2175,21 @@ class WebSocketHandler:
                     "member_id": msg.member_id,
                     "decision": msg.decision,
                     "resolved": ok,
+                    "actor": connection.decision_actor(),
                 },
                 fireteam_id_key=msg.wave_id,
                 member_id_key=msg.member_id,
             )
         except Exception:
             logger.exception("fireteam_member_confirmation: persist failed")
+        # Only an answer that reached a waiting member decided anything, and the audit row
+        # names what the member was given, never the raw word.
+        if ok:
+            asyncio.create_task(post_agent_decision(
+                kind="fireteam_member_confirmation", session_id=connection.session_id,
+                project_id=connection.project_id, user_id=connection.user_id,
+                actor_id=connection.actor_id, decision=applied_decision(msg.decision),
+                wave_id=msg.wave_id, member_id=msg.member_id))
 
     async def handle_tool_confirmation(self, connection: WebSocketConnection, payload: dict):
         """Handle tool confirmation response — launches as background task"""
@@ -1732,17 +2203,18 @@ class WebSocketHandler:
                     "recoverable": False
                 })
                 return
+            needs, mode = await self._tool_confirmation_needs(connection)
+            if await self._refused_without(connection, *needs, answer="tool_confirmation"):
+                return
+            if await self._refused_now(connection, *needs, answer="tool_confirmation", mode=mode):
+                return
+            if await self._refused_second_writer(connection, "tool_confirmation", answer="tool_confirmation"):
+                return
 
             callback = StreamingCallback(connection, self.ws_manager)
             connection._is_stopped = False
 
             logger.info(f"Processing tool confirmation for session {connection.session_id}: {confirmation_msg.decision}")
-
-            # Persist the user's tool confirmation decision
-            callback._persist("tool_confirmation_response", {
-                "decision": confirmation_msg.decision,
-                "modifications": confirmation_msg.modifications,
-            })
 
             asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": True}))
 
@@ -1750,7 +2222,7 @@ class WebSocketHandler:
                 self._run_orchestrator_tool_confirmation(connection, confirmation_msg, callback)
             )
             connection._active_task = task
-            self.ws_manager.register_task(connection.get_key(), task)
+            self.ws_manager.register_task(connection.get_key(), task, actor_id=connection.actor_id)
             self.ws_manager.register_callback(connection.get_key(), callback)
 
         except ValidationError as e:
@@ -1758,17 +2230,43 @@ class WebSocketHandler:
             await connection.send_message(
                 MessageType.ERROR, _invalid_frame("Invalid tool confirmation format", e, True))
 
+    async def _tool_confirmation_needs(self, connection: WebSocketConnection) -> tuple:
+        """The permissions a tool confirmation needs, and the mode to send with it.
+
+        Answering a Fireteam member's escalation redeploys that member (fireteam_redeploy), so it
+        needs `agent:fireteam` as well, as the member's own confirmation does. The mode is read
+        from the run's state, never from the frame; a state that cannot be read asks for both.
+        """
+        try:
+            mode = await self.orchestrator.pending_tool_confirmation_mode(
+                user_id=connection.user_id, project_id=connection.project_id,
+                session_id=connection.session_id)
+        except Exception as e:
+            logger.warning("[rbac] tool confirmation mode unreadable, asking for both permissions "
+                           "error=%s session=%s", type(e).__name__, connection.session_id)
+            mode = "fireteam_escalation"
+        if mode == "fireteam_escalation":
+            return ("agent:approve_dangerous", "agent:fireteam"), mode
+        return ("agent:approve_dangerous",), None
+
     async def _run_orchestrator_tool_confirmation(self, connection: WebSocketConnection, confirmation_msg: ToolConfirmationMessage, callback):
         """Background coroutine that runs tool confirmation resumption."""
+        bind_run_actor(connection.run_actor())
         try:
             result = await self.orchestrator.resume_after_tool_confirmation_with_streaming(
                 session_id=connection.session_id,
                 user_id=connection.user_id,
+                tenant_user_id=connection.tenant_id,
                 project_id=connection.project_id,
                 decision=confirmation_msg.decision,
                 modifications=confirmation_msg.modifications,
                 streaming_callback=callback,
                 guidance_queue=connection.guidance_queue,
+                on_admitted=lambda: self._record_decision(
+                    connection, callback, "tool_confirmation", "tool_confirmation_response", {
+                        "decision": confirmation_msg.decision,
+                        "modifications": confirmation_msg.modifications,
+                    }),
             )
             logger.info(f"Tool confirmation processed for session {connection.session_id}")
         except asyncio.CancelledError:
@@ -1884,10 +2382,12 @@ class WebSocketHandler:
             task.cancel()
             connection._is_stopped = True
             self.ws_manager.clear_task(session_key)
+            schedule_sandbox_stop(connection.session_id)
 
             # Get current state for the STOPPED message
             try:
-                config = create_config(connection.user_id, connection.project_id, connection.session_id)
+                config = create_config(connection.user_id, connection.project_id, connection.session_id,
+                                       connection.tenant_id)
                 current_state = await self.orchestrator.graph.aget_state(config)
                 iteration = current_state.values.get("current_iteration", 0) if current_state and current_state.values else 0
                 phase = current_state.values.get("current_phase", "informational") if current_state and current_state.values else "informational"
@@ -1969,6 +2469,9 @@ class WebSocketHandler:
                 "recoverable": True,
             })
             return
+        # Before the stopped flag clears, so a refused resume can be asked again.
+        if await self._refused_second_writer(connection, "resume"):
+            return
 
         connection._is_stopped = False
         callback = StreamingCallback(connection, self.ws_manager)
@@ -1979,15 +2482,17 @@ class WebSocketHandler:
             self._run_orchestrator_resume(connection, callback)
         )
         connection._active_task = task
-        self.ws_manager.register_task(connection.get_key(), task)
+        self.ws_manager.register_task(connection.get_key(), task, actor_id=connection.actor_id)
         self.ws_manager.register_callback(connection.get_key(), callback)
         logger.info(f"Resuming execution for session {connection.session_id}")
 
     async def _run_orchestrator_resume(self, connection: WebSocketConnection, callback):
         """Background coroutine that resumes orchestrator from checkpoint."""
+        bind_run_actor(connection.run_actor())
         try:
             result = await self.orchestrator.resume_execution_with_streaming(
                 user_id=connection.user_id,
+                tenant_user_id=connection.tenant_id,
                 project_id=connection.project_id,
                 session_id=connection.session_id,
                 streaming_callback=callback,

@@ -2,8 +2,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import { graphError } from '../../graph/graphErrors'
 import { getGraphSession } from '../../graph/neo4j'
 import { formatGraphRecords } from '../../graph/format'
-import { injectProjectFilter, findUnscopedNodePattern, namesMutedLabel, hasVariableLengthPath, findDisallowedCall } from './injectProjectFilter'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import {
+  injectProjectFilter, findUnscopedNodePattern, namesMutedLabel, hasVariableLengthPath, findDisallowedCall,
+  findStepContentReference, findWriteClause, unreadableQuery,
+} from './injectProjectFilter'
+import { requirePermission } from '@/lib/authz/guards'
+import { graphReadView } from '@/lib/authz/graphReadView'
+import { readsStepContent } from '@/lib/authz/stepContent'
 
 /**
  * Execute a Cypher query (from a saved graph view) against Neo4j,
@@ -21,17 +26,25 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Only the project's effective owner may run a (read-only) view query against
-    // its subgraph.
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, projectId)
-    if (access instanceof NextResponse) return access
+    // Anyone who reads the project's graph may run a (read-only) view query against
+    // it; the tenant filter below is the project, never the caller.
+    const auth = await requirePermission(request, 'graph:cypher', { projectId })
+    if (auth instanceof NextResponse) return auth
 
-    // Block write operations -- data filters are read-only
-    const upper = cypherQuery.toUpperCase().replace(/\/\/[^\n]*/g, '')
-    const WRITE_KEYWORDS = ['CREATE', 'MERGE', 'DELETE', 'DETACH', 'SET', 'REMOVE', 'DROP', 'CALL']
-    const found = WRITE_KEYWORDS.find(kw => new RegExp(`\\b${kw}\\b`).test(upper))
+    // Every check below reads the query with its comments and literals set aside;
+    // one it cannot read that way (an unterminated string, unbalanced parentheses)
+    // is refused rather than guessed at.
+    if (typeof cypherQuery !== 'string') {
+      return NextResponse.json({ error: 'cypherQuery must be a string' }, { status: 400 })
+    }
+    const unreadable = unreadableQuery(cypherQuery)
+    if (unreadable) {
+      return NextResponse.json({ error: unreadable }, { status: 400 })
+    }
+
+    // Data filters are read-only. The session below is read-only too, so Neo4j
+    // refuses any write this check misses; this answers a clear 400 first.
+    const found = findWriteClause(cypherQuery)
     if (found) {
       return NextResponse.json(
         { error: `Write operations are not allowed in data filters (found: ${found})` },
@@ -48,12 +61,12 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // A namespaced function bypasses the CALL block above (apoc.* functions need
-    // no CALL) and runs unscoped Cypher / fetches URLs from inside the DB.
+    // Only the built-in pure functions: a plugin function needs no CALL (apoc's
+    // runFirstColumn* runs unscoped Cypher, apoc.load.* fetches URLs).
     const badCall = findDisallowedCall(cypherQuery)
     if (badCall) {
       return NextResponse.json(
-        { error: `The function or procedure '${badCall}' is not permitted in a view query.` },
+        { error: `The function or procedure '${badCall}' is not permitted in a view query: views may call Cypher's built-in functions only.` },
         { status: 400 }
       )
     }
@@ -66,6 +79,18 @@ export async function POST(request: NextRequest) {
         { error: 'Variable-length and quantified path patterns are not allowed: their intermediate nodes cannot be tenant-scoped.' },
         { status: 400 }
       )
+    }
+
+    // Below Raw data & files the answer loses the step content (graphReadView), but a
+    // filter on it would still read it from which rows come back (SH-30).
+    if (!readsStepContent(auth.access)) {
+      const stepContent = findStepContentReference(cypherQuery)
+      if (stepContent) {
+        return NextResponse.json(
+          { error: `This view reads attack-chain step content (${stepContent}), which needs the Raw data & files access.` },
+          { status: 400 }
+        )
+      }
     }
 
     // Inject project_id filter into every node pattern in the Cypher query.
@@ -82,10 +107,10 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const session = getGraphSession()
+    const session = getGraphSession({ readOnly: true })
     try {
       const result = await session.run(filtered, { projectId })
-      const { nodes, links } = formatGraphRecords(result.records)
+      const { nodes, links } = graphReadView(formatGraphRecords(result.records), auth.access)
       return NextResponse.json({ nodes, links, projectId })
     } finally {
       await session.close()

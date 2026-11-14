@@ -6,12 +6,17 @@
  *   current version -> the LIVE graph, through the same read path as /api/graph
  *   past version    -> the stored snapshot bytes, converted to the render shape
  *
+ * A reader without Raw data & files gets each attack-chain step without its content
+ * (stripStepContent, SH-30). Only the live graph holds chain nodes (snapshots leave
+ * them out), but both answers pass through it.
+ *
  * This endpoint is READ-ONLY and never touches Neo4j for a past version. Making a
  * past version the graph the agent works on is a different, deliberate action
  * (POST .../activate).
  */
 import { NextRequest, NextResponse } from 'next/server'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
+import { stripStepContent } from '@/lib/authz/stepContent'
 import { requireVersionInProject } from '@/lib/scanVersionAccess'
 import { loadSnapshot, snapshotToGraphPayload } from '@/lib/scanSnapshot'
 import { readLiveGraph } from '@/app/api/graph/liveRead'
@@ -21,13 +26,11 @@ interface RouteParams {
   params: Promise<{ id: string; versionId: string }>
 }
 
-export const GET = withRouteErrors('Failed to read version graph', async (_request: NextRequest, { params }: RouteParams) => {
+export const GET = withRouteErrors('Failed to read version graph', async (request: NextRequest, { params }: RouteParams) => {
   const { id, versionId } = await params
 
-  const eff = await requireEffectiveUser()
-  if (eff instanceof NextResponse) return eff
-  const access = await requireProjectAccess(eff, id)
-  if (access instanceof NextResponse) return access
+  const auth = await requirePermission(request, 'recon:read', { projectId: id })
+  if (auth instanceof NextResponse) return auth
 
   // Anti-IDOR: the version id is client-supplied and must belong to this project.
   const version = await requireVersionInProject(id, versionId)
@@ -37,7 +40,7 @@ export const GET = withRouteErrors('Failed to read version graph', async (_reque
     if (version.isCurrent) {
       const { nodes, links } = await readLiveGraph(id)
       return NextResponse.json(
-        { nodes, links, projectId: id, versionId, isCurrent: true, live: true },
+        { nodes: stripStepContent(nodes, auth.access), links, projectId: id, versionId, isCurrent: true, live: true },
         { headers: { 'Cache-Control': 'private, no-cache' } }
       )
     }
@@ -55,7 +58,7 @@ export const GET = withRouteErrors('Failed to read version graph', async (_reque
 
     const { nodes, links } = snapshotToGraphPayload(snapshot)
     return NextResponse.json(
-      { nodes, links, projectId: id, versionId, isCurrent: false, live: false },
+      { nodes: stripStepContent(nodes, auth.access), links, projectId: id, versionId, isCurrent: false, live: false },
       { headers: { 'Cache-Control': 'private, no-cache' } }
     )
   } catch (error) {

@@ -23,6 +23,7 @@ vi.mock('@/lib/prisma', () => ({
     apiKeyRotationConfig: { findMany: async () => [] },
   },
 }))
+vi.mock('@/lib/authz/selfService', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overSelfService()))
 vi.mock('@/lib/session', () => ({
   requireUserAccess: async () => null,
   isInternalRequest: () => false,
@@ -37,7 +38,7 @@ describe('PUT response masking', () => {
   test('a save that sends masked values back returns every credential masked', async () => {
     const masked = Object.fromEntries(TRUFFLEHOG_KEY_FIELDS.map(f => [f.name, '••••••••xxxx']))
     const res = await PUT(
-      new NextRequest('http://x', { method: 'PUT', body: JSON.stringify({ ...masked, shodanApiKey: '••••••••9999' }) }),
+      new NextRequest('http://x', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...masked, shodanApiKey: '••••••••9999' }) }),
       { params: Promise.resolve({ id: 'u1' }) },
     )
     expect(res.status).toBe(200)

@@ -17,6 +17,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { getEffectiveUser, getSession, isInternalRequest, isScannerRequest } from '@/lib/session'
+import { ownedProjectsWhere } from '@/lib/authz/visibleProjects'
 import { writeAudit } from '@/lib/audit'
 import { readJsonBody } from '@/lib/jsonBody'
 import { safeErrorCode } from '@/lib/routeErrors'
@@ -25,6 +26,8 @@ import { buildJobs, trackedFields, type LlmProviderRow } from '@/lib/apiUsage/cr
 import { runJobs } from '@/lib/apiUsage/runner'
 import { COOLDOWN_MS, checksEnabled, lastFinishedAt, release, runningFor, setRunKeys, tryAcquire } from '@/lib/apiUsage/state'
 import type { ApiUsageReportV1, UserActivity } from '@/lib/apiUsage/types'
+import { requireSelfPermission } from '@/lib/authz/selfService'
+import { collaboratorSpends, type CollaboratorSpends } from '@/lib/authz/ownerCredentials'
 
 export const dynamic = 'force-dynamic'
 
@@ -50,20 +53,21 @@ async function authorize(request: NextRequest, id: string): Promise<NextResponse
 }
 
 /**
- * Scans and agent runs in flight on THIS user's projects. Scoped through
- * project.userId server-side: never ids from the request, and never the kali
+ * Scans and agent runs in flight on the projects THIS user owns (ownedProjectsWhere: a shared
+ * project's runs spend its owner's keys, not this user's),
+ * scoped server-side: never ids from the request, and never the kali
  * sandbox's session list (it spans every user and is the wrong kind of session).
  */
 async function loadActivity(userId: string): Promise<UserActivity> {
   const [scans, convs] = await Promise.all([
     prisma.scanJob.findMany({
-      where: { status: 'running', project: { userId } },
+      where: { status: 'running', project: ownedProjectsWhere({ userId }) },
       select: { projectId: true, kind: true, startedAt: true, project: { select: { name: true } } },
       orderBy: { createdAt: 'asc' },
       take: 20,
     }),
     prisma.conversation.findMany({
-      where: { agentRunning: true, project: { userId } },
+      where: { agentRunning: true, project: ownedProjectsWhere({ userId }) },
       select: { projectId: true, project: { select: { name: true } } },
       distinct: ['projectId'],
       take: 20,
@@ -99,6 +103,8 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id } = await params
   const auth = await authorize(request, id)
   if (auth instanceof NextResponse) return auth
+  const selfRefused = await requireSelfPermission(request, id, 'self:api_keys')
+  if (selfRefused) return selfRefused
   try {
     const row = await prisma.apiUsageReport.findUnique({ where: { userId: id } })
     let runBy: { id: string; name: string } | null = null
@@ -113,6 +119,14 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       // Unknown activity only matters to a POST, which fails closed on its own lookup.
       console.error('[api-usage] activity lookup failed:', e)
     }
+    // Step 5.6 (C1, GV-12): what collaborators spent of this user's credentials on the projects they own,
+    // by collaborator. Present only with write sharing on; a failed read leaves it out of the answer.
+    let spends: CollaboratorSpends | null = null
+    try {
+      spends = await collaboratorSpends(id)
+    } catch (e) {
+      console.error(`[api-usage] collaborator spends lookup failed: ${safeErrorCode(e)}`)
+    }
     return json({
       enabled: checksEnabled(),
       report: row ? (row.report as unknown as ApiUsageReportV1) : null,
@@ -120,6 +134,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       runBy,
       activity,
       tracked: trackedFields(PROBES),
+      ...(spends ? { collaboratorSpends: spends } : {}),
     })
   } catch (error) {
     console.error('[api-usage] failed to load the report:', error)
@@ -132,6 +147,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
   const { id } = await params
   const auth = await authorize(request, id)
   if (auth instanceof NextResponse) return auth
+  const selfRefused = await requireSelfPermission(request, id, 'self:api_keys')
+  if (selfRefused) return selfRefused
   const { actorId } = auth
 
   if (!checksEnabled()) return json({ error: 'disabled' }, 409)

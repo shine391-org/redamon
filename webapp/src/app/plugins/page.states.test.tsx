@@ -47,7 +47,7 @@ function entry(state: PluginEntry['state'], over: Partial<PluginEntry> = {}): Pl
 
 function model(plugins: PluginEntry[], over: Partial<PluginsPage> = {}): PluginsPage {
   return {
-    platformVersion: '1.0.0', isAdmin: true,
+    platformVersion: '1.0.0', managesPlugins: true,
     catalog: { state: 'ok', message: null, official: true, extraKey: false, replayed: false, serial: 3 },
     plugins, ...over,
   }
@@ -124,6 +124,15 @@ describe('the page', () => {
     expect(await screen.findByText('The Plugins page could not be loaded.')).toBeTruthy()
     expect(screen.getByText('The Plugins page could not be read; see the webapp log. (P2024 · HTTP 500)')).toBeTruthy()
     expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
+  })
+
+  test('refused for plugins:use: the permission and what it allows, no error and no retry (step 3.9)', async () => {
+    pageAnswer = async () => new Response(JSON.stringify({ error: 'You do not hold the permission this action needs (plugins:use).', code: 'forbidden', permission: 'plugins:use' }), { status: 403 })
+    show()
+    expect(await screen.findByText('You do not have the permission this needs.')).toBeTruthy()
+    expect(screen.getByText('plugins:use')).toBeTruthy()
+    expect(screen.queryByText('The Plugins page could not be loaded.')).toBeNull()
+    expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
   })
 
   test("Next's empty 500 still names its status", async () => {

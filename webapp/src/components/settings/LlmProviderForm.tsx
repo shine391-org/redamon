@@ -1,15 +1,16 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { Loader2, CheckCircle, XCircle, Plus, Trash2, Eye, EyeOff, ExternalLink, AlertTriangle, RefreshCw } from 'lucide-react'
 import { useToast } from '@/components/ui'
+import { StepUpModal } from '@/components/auth/StepUpModal'
 import { useAgentHealth } from '@/hooks/useAgentHealth'
 import { useDirtyState } from '@/hooks/useDirtyState'
 import { useUnsavedChangesGuard } from '@/hooks/useUnsavedChangesGuard'
 import { PROVIDER_TYPES, OPENAI_COMPAT_PRESETS, NON_CHAT_PROVIDER_TYPES, JEV_MODEL, JEV_BACKENDS, isJevProvider } from '@/lib/llmProviderPresets'
 import type { ProviderType } from '@/lib/llmProviderPresets'
 import { REASONING_EFFORTS } from '@/lib/llmReasoning'
-import { fetchJson, readApiError, toApiError } from '@/lib/apiError'
+import { fetchJson, readApiError, toApiError, type ApiError } from '@/lib/apiError'
 import type { ReasoningEffort } from '@/lib/llmReasoning'
 import styles from './Settings.module.css'
 
@@ -55,6 +56,17 @@ export interface ProviderData {
 }
 
 type BedrockAuthMethod = 'iam' | 'bearer'
+
+/** The secret field a save or test was refused for: its endpoint changed (HD-24). */
+interface Reentry { field: string; message: string }
+
+/** The refusal's field for a kept Extra Headers value: `defaultHeaders.<name>`. */
+const HEADER_FIELD = 'defaultHeaders.'
+
+function reentryOf(err: ApiError): Reentry | null {
+  const field = err.body?.field
+  return err.code === 'secret_reentry_required' && typeof field === 'string' ? { field, message: err.reason } : null
+}
 
 const EMPTY_PROVIDER: ProviderData = {
   providerType: '',
@@ -116,10 +128,32 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
   const [bedrockAuth, setBedrockAuth] = useState<BedrockAuthMethod>(
     () => (form.awsBearerToken ? 'bearer' : 'iam'),
   )
+  // A changed base URL or type with a kept (masked) key is refused by the server:
+  // the message goes under that key's input, which takes the focus. A kept header value
+  // (`defaultHeaders.<name>`) goes under Extra Headers, with the header named and its
+  // value field focused, so adding it again replaces the masked one.
+  const [reentry, setReentry] = useState<Reentry | null>(null)
+  const secretInputs = useRef<Record<string, HTMLInputElement | null>>({})
+  const secretRef = (field: string) => (el: HTMLInputElement | null) => { secretInputs.current[field] = el }
+  const headerValueInput = useRef<HTMLInputElement | null>(null)
+  const reentryHeader = reentry?.field.startsWith(HEADER_FIELD) ? reentry.field.slice(HEADER_FIELD.length) : null
+  useEffect(() => {
+    if (!reentry) return
+    if (reentry.field.startsWith(HEADER_FIELD)) headerValueInput.current?.focus()
+    else secretInputs.current[reentry.field]?.focus()
+  }, [reentry])
+  const showReentry = useCallback((r: Reentry | null) => {
+    setReentry(r)
+    if (r?.field.startsWith(HEADER_FIELD)) setHeaderKey(r.field.slice(HEADER_FIELD.length))
+  }, [])
+  const reentryHint = (field: string) => reentry?.field === field && (
+    <span className="formHint" role="alert" style={{ color: 'var(--text-error)' }}>{reentry.message}</span>
+  )
 
   const updateForm = useCallback(<K extends keyof ProviderData>(field: K, value: ProviderData[K]) => {
     setForm(prev => ({ ...prev, [field]: value }))
     setTestResult(null)
+    setReentry(prev => (prev?.field === field ? null : prev))
   }, [])
 
   const selectType = useCallback((type: ProviderType) => {
@@ -135,13 +169,15 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
   }, [])
 
   const addHeader = useCallback(() => {
-    if (headerKey.trim()) {
+    const key = headerKey.trim()
+    if (key) {
       setForm(prev => ({
         ...prev,
-        defaultHeaders: { ...prev.defaultHeaders, [headerKey.trim()]: headerValue },
+        defaultHeaders: { ...prev.defaultHeaders, [key]: headerValue },
       }))
       setHeaderKey('')
       setHeaderValue('')
+      setReentry(prev => (prev?.field === HEADER_FIELD + key ? null : prev))
     }
   }, [headerKey, headerValue])
 
@@ -151,6 +187,7 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
       delete headers[key]
       return { ...prev, defaultHeaders: headers }
     })
+    setReentry(prev => (prev?.field === HEADER_FIELD + key ? null : prev))
   }, [])
 
   // A Jev row carries only its backend, name and key: the server pins the model and
@@ -182,41 +219,63 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
         error: result.error || (result.success === true ? undefined : 'The provider test failed'),
       })
     } catch (err) {
-      setTestResult({ success: false, error: toApiError(err, 'The provider test failed').message })
+      const apiErr = toApiError(err, 'The provider test failed')
+      setTestResult({ success: false, error: apiErr.message })
+      showReentry(reentryOf(apiErr))
     } finally {
       setTesting(false)
     }
-  }, [userId, provider?.id, requestBody])
+  }, [userId, provider?.id, requestBody, showReentry])
+
+  const [stepUpOpen, setStepUpOpen] = useState(false)
+  const sendSave = useCallback((stepUpPassword?: string) => fetch(
+    isEditing ? `/api/users/${userId}/llm-providers/${provider!.id}` : `/api/users/${userId}/llm-providers`,
+    {
+      method: isEditing ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(stepUpPassword ? { ...requestBody(), stepUpPassword } : requestBody()),
+    },
+  ), [isEditing, userId, provider, requestBody])
+  const saved = useCallback(() => {
+    toast.success(isEditing ? 'Provider updated' : 'Provider added')
+    setBaseline(form)
+    onSave()
+  }, [isEditing, form, onSave, setBaseline])
 
   const handleSave = useCallback(async () => {
     setSaving(true)
     try {
-      const url = isEditing
-        ? `/api/users/${userId}/llm-providers/${provider!.id}`
-        : `/api/users/${userId}/llm-providers`
-      const method = isEditing ? 'PUT' : 'POST'
-
-      const resp = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody()),
-      })
-
-      if (!resp.ok) throw await readApiError(resp, 'Failed to save provider')
-
-      toast.success(isEditing ? 'Provider updated' : 'Provider added')
-      setBaseline(form)
-      onSave()
+      const resp = await sendSave()
+      if (!resp.ok) {
+        const apiErr = await readApiError(resp, 'Failed to save provider')
+        // A new base URL or type asks for the signed-in person's password (ID-25): the
+        // dialog sends it with the same save.
+        if (apiErr.code === 'step_up_required') {
+          setStepUpOpen(true)
+          return
+        }
+        throw apiErr
+      }
+      saved()
     } catch (err) {
       console.error('Failed to save provider:', err)
       // Show what the server actually said. The blanket message hid the real
       // cause of issue #173 (a write against a user id that no longer exists)
       // behind an unactionable "Failed to save provider".
-      toast.error(toApiError(err, 'Failed to save provider').message)
+      const apiErr = toApiError(err, 'Failed to save provider')
+      toast.error(apiErr.message)
+      showReentry(reentryOf(apiErr))
     } finally {
       setSaving(false)
     }
-  }, [isEditing, userId, provider, form, requestBody, onSave, setBaseline])
+  }, [sendSave, saved, showReentry])
+
+  const confirmStepUp = useCallback(async (password: string) => {
+    const resp = await sendSave(password)
+    // Thrown, the dialog stays open and shows why (a wrong password, a lockout).
+    if (!resp.ok) throw await readApiError(resp, 'Failed to save provider')
+    saved()
+  }, [sendSave, saved])
 
   // Step 1: Choose provider type
   if (step === 'type') {
@@ -341,6 +400,7 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
           <label className="formLabel formLabelRequired">API Key</label>
           <div className={styles.secretInputWrapper}>
             <input
+              ref={secretRef('apiKey')}
               className="textInput"
               type={showApiKey ? 'text' : 'password'}
               value={form.apiKey}
@@ -358,6 +418,7 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
               {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
             </button>
           </div>
+          {reentryHint('apiKey')}
         </div>
       )}
 
@@ -423,20 +484,24 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
               <div className="formGroup">
                 <label className="formLabel formLabelRequired">AWS Access Key ID</label>
                 <input
+                  ref={secretRef('awsAccessKeyId')}
                   className="textInput"
                   type="password"
                   value={form.awsAccessKeyId}
                   onChange={e => updateForm('awsAccessKeyId', e.target.value)}
                 />
+                {reentryHint('awsAccessKeyId')}
               </div>
               <div className="formGroup">
                 <label className="formLabel formLabelRequired">AWS Secret Access Key</label>
                 <input
+                  ref={secretRef('awsSecretKey')}
                   className="textInput"
                   type="password"
                   value={form.awsSecretKey}
                   onChange={e => updateForm('awsSecretKey', e.target.value)}
                 />
+                {reentryHint('awsSecretKey')}
               </div>
             </>
           )}
@@ -444,12 +509,14 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
             <div className="formGroup">
               <label className="formLabel formLabelRequired">Bedrock API Key</label>
               <input
+                ref={secretRef('awsBearerToken')}
                 className="textInput"
                 type="password"
                 value={form.awsBearerToken}
                 onChange={e => updateForm('awsBearerToken', e.target.value)}
                 placeholder="bedrock-api-key-..."
               />
+              {reentryHint('awsBearerToken')}
               <span className="formHint">Generate in AWS Bedrock console: API keys -&gt; Long-term API keys.</span>
             </div>
           )}
@@ -500,13 +567,17 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
           <div className="formGroup">
             <label className="formLabel">API Key</label>
             <input
+              ref={secretRef('apiKey')}
               className="textInput"
               type="password"
               value={form.apiKey}
               onChange={e => updateForm('apiKey', e.target.value)}
               placeholder="Optional (leave empty for Ollama)"
+              aria-label="API key"
             />
-            <span className="formHint">Leave empty for local servers that don&apos;t require auth</span>
+            {reentryHint('apiKey') || (
+              <span className="formHint">Leave empty for local servers that don&apos;t require auth</span>
+            )}
           </div>
 
           <div className={styles.reasoningControl}>
@@ -559,6 +630,7 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
                 style={{ flex: 1 }}
               />
               <input
+                ref={headerValueInput}
                 className="textInput"
                 value={headerValue}
                 onChange={e => setHeaderValue(e.target.value)}
@@ -569,6 +641,9 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
                 <Plus size={12} />
               </button>
             </div>
+            {reentryHeader !== null && (
+              <span className="formHint" role="alert" style={{ color: 'var(--text-error)' }}>{reentry?.message}</span>
+            )}
           </div>
 
           {/* Advanced params */}
@@ -655,6 +730,16 @@ export function LlmProviderForm({ userId, provider, existingProviderTypes = [], 
           </div>
         )}
       </div>
+      {stepUpOpen && (
+        <StepUpModal
+          isOpen
+          title="Confirm the new endpoint"
+          message="This provider's key, headers and your prompts will go to a new address. Enter your password to save the change."
+          confirmLabel="Save"
+          onConfirm={confirmStepUp}
+          onClose={() => setStepUpOpen(false)}
+        />
+      )}
     </div>
   )
 }

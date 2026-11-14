@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, NamedTuple, Optional
 
+from recon.helpers import request_pacer
 from recon.helpers.roe_scope import _is_roe_excluded
 from recon.helpers.catchall import canonical_bytes, replace_hostnames as _replace_hostnames
 
@@ -75,6 +77,8 @@ DEFAULT_WORDLIST_CONTAINER_PATH = "/app/recon/wordlists/vhost-common.txt"
 # answers every one of up to VHOST_SNI_MAX_CANDIDATES_PER_IP names per port, so
 # the full list would not fit sensibly on one property.
 SUPPRESSED_SAMPLE_MAX = 20
+
+_SOURCE = "vhost_sni_enum"
 
 
 # =============================================================================
@@ -141,7 +145,7 @@ def run_vhost_sni_enrichment(
     # --------------------------------------------------------------
     # 1. Build IP -> ports map from prior pipeline data
     # --------------------------------------------------------------
-    ip_port_map = _collect_ip_targets(combined_result)
+    ip_port_map = _collect_ip_targets(combined_result, settings)
     if not ip_port_map:
         print("[-][VhostSni] No IP targets available -- skipping")
         combined_result["vhost_sni"] = _empty_result(reason="no_ip_targets")
@@ -177,8 +181,11 @@ def run_vhost_sni_enrichment(
     # --------------------------------------------------------------
     # 4. Curl availability check
     # --------------------------------------------------------------
+    from recon.helpers import circuit_breaker as _cb
     if not _is_curl_available():
-        print("[!][VhostSni] curl binary not found in PATH -- aborting")
+        # Meant to run and re-checked nothing: the earlier findings stay.
+        print("[!][VhostSni] curl binary not found in PATH -- aborting, previous findings are kept")
+        _cb.note_degraded(_SOURCE, sources=(_SOURCE,), reason="curl unavailable")
         combined_result["vhost_sni"] = _empty_result(reason="curl_unavailable")
         return combined_result
 
@@ -198,8 +205,10 @@ def run_vhost_sni_enrichment(
         "info_severity": 0,
     }
 
-    from recon.helpers import circuit_breaker as _cb
     vhost_scope = _cb.scope((), label="VhostSni", unit="port(s)")
+    # IP:ports this module gave up on while they may still answer the other
+    # tools (a failed baseline, a probing error): cut for this source only.
+    unchecked_ports: list[str] = []
     candidate_scope = _build_candidate_scope(combined_result, settings)
 
     # A shared CDN edge answers almost any name with some customer's site or
@@ -215,6 +224,14 @@ def run_vhost_sni_enrichment(
             "source": "vhost_sni_wordlist", "reason": "shared CDN edge",
             "skipped": len(wordlist_skipped),
         }])
+    ip_mode_names = _ip_mode_names(combined_result, settings, ip_port_map) if use_graph_candidates else None
+
+    # IP mode's base URLs are its addresses: a name answering on one is a
+    # finding on that address, never a new URL to probe (a recorded name is no
+    # target, I-4; a selected one reaches httpx through the name selection).
+    if inject_discovered and (combined_result.get("metadata") or {}).get("ip_mode"):
+        print("[-][VhostSni] IP mode: a hidden vhost is reported on its IP, never added as a base URL")
+        inject_discovered = False
 
     # Engagement identity header on every curl probe: attribution applies to
     # this module's direct HTTP traffic exactly as it does to the -H tools.
@@ -230,7 +247,10 @@ def run_vhost_sni_enrichment(
                 apex_domain=apex,
                 default_prefixes=default_prefixes if use_default_wordlist and ip not in edge_ips else [],
                 custom_lines=custom_lines,
-                graph_candidates=_collect_graph_candidates(combined_result, ip) if use_graph_candidates else [],
+                graph_candidates=(
+                    [] if not use_graph_candidates
+                    else ip_mode_names.get(ip, []) if ip_mode_names is not None
+                    else _collect_graph_candidates(combined_result, ip)),
                 test_l7=test_l7,
                 test_l4=test_l4,
                 timeout=timeout,
@@ -242,12 +262,20 @@ def run_vhost_sni_enrichment(
                 identity=_identity,
             )
         except Exception as e:
-            print(f"[!][VhostSni] IP {ip} probing failed: {e}")
+            print(f"[!][VhostSni] IP {ip} probing failed: {e} -- its previous findings are kept")
+            unchecked_ports.extend(_port_key(ip, p.get("port")) for p in ports)
             continue
 
-        by_ip[ip] = ip_result
         for dead in ip_result.get("unreachable_ports", []):
             vhost_scope.note_host_skipped(dead)
+        unchecked_ports.extend(ip_result.get("unchecked_ports", []))
+        if ip_result.get("ports_tested") == 0:
+            # by_ip is what the graph writer stamps vhost_sni_tested and
+            # hidden_vhost_count=0 on; with no usable baseline that would claim
+            # "checked, nothing hidden". The IP node keeps what it had.
+            print(f"[!][VhostSni] IP {ip}: no port gave a usable baseline -- not marked as tested")
+            continue
+        by_ip[ip] = ip_result
         summary_counts["ips_tested"] += 1
         summary_counts["candidates_total"] += ip_result.get("candidates_tested", 0)
 
@@ -304,7 +332,14 @@ def run_vhost_sni_enrichment(
     }
 
     # IP:ports that died mid-run: the prune keeps their previous findings.
-    vhost_scope.finish("vhost_sni_enum", host_source="vhost_sni_enum", payload=result)
+    vhost_scope.finish(_SOURCE, host_source=_SOURCE, payload=result)
+    if unchecked_ports:
+        unchecked_ports = sorted(set(unchecked_ports))
+        print(f"[!][VhostSni] {len(unchecked_ports)} IP:port(s) not checked this run -- "
+              f"their previous vhost findings are kept")
+        _cb.note_degraded(_SOURCE, hosts=unchecked_ports, host_source=_SOURCE,
+                          source_only_hosts=True, reason="baseline probe failed or probing errored")
+        result["unchecked_ports"] = unchecked_ports
     combined_result["vhost_sni"] = result
 
     print(
@@ -410,6 +445,7 @@ def _probe_single_ip(
     suppressed_dns_known: set[str] = set()
     suppressed_as_noise: list[str] = []
     dead_ports: list[str] = []
+    unchecked_ports: list[str] = []
 
     # Engagement identity header, resolved once by the caller (run_*): every
     # curl probe this IP run sends carries it, so the traffic is attributable.
@@ -437,7 +473,10 @@ def _probe_single_ip(
             identity_header=_identity,
         )
         if baseline is None:
-            print(f"[!][VhostSni] IP {ip}:{port} ({scheme}) baseline failed -- skipping port")
+            # Nothing on this port was re-checked, so it must not read as
+            # "checked, no hidden vhost": its earlier findings are kept.
+            unchecked_ports.append(port_key)
+            print(f"[!][VhostSni] IP {port_key} ({scheme}) baseline failed -- skipping port")
             continue
         baselines[(port, scheme)] = baseline
 
@@ -618,6 +657,7 @@ def _probe_single_ip(
         "suppressed_as_noise_sample": sorted(suppressed_as_noise)[:SUPPRESSED_SAMPLE_MAX],
         "hosts_hidden_vhosts": len(anomalies) > 0,
         **({"unreachable_ports": dead_ports} if dead_ports else {}),
+        **({"unchecked_ports": unchecked_ports} if unchecked_ports else {}),
     }
 
 
@@ -708,6 +748,10 @@ def _curl_probe(
             cmd += ["-H", identity_header]
         cmd.append(url)
 
+    # One curl is one request (no -L): its slot of the process-wide RoE pacer
+    # keeps the whole worker pool, with every other in-process requester,
+    # under the ceiling. Inert with no ceiling.
+    request_pacer.acquire()
     try:
         proc = subprocess.run(
             cmd,
@@ -1236,6 +1280,11 @@ def _dns_known_names(combined_result: dict, ip: str) -> set[str]:
         host = str(info.get("host") or "").strip().lower().rstrip(".")
         if host and not _looks_like_ip(host):
             names.add(host)
+    # IP mode keeps its names out of the dns block: every hostname the run
+    # recorded on its targets was seen there (a PTR answer, a certificate,
+    # passive DNS), so it is that host's own site, never a hidden one.
+    if (combined_result.get("metadata") or {}).get("ip_mode"):
+        names |= set(((combined_result.get("ip_hostnames") or {}).get("candidates")) or {})
     return names
 
 
@@ -1270,12 +1319,16 @@ def _collect_graph_candidates(combined_result: dict, ip: str) -> list[str]:
                 if isinstance(san, str) and san.strip():
                     out.add(san.strip().lower().lstrip("*."))
 
-    # 4. ExternalDomain / aggregated external_domains co-resident on IP
-    for ed in (combined_result.get("external_domains_aggregated") or []):
-        if isinstance(ed, dict):
-            for ed_ip in (ed.get("ips") or []):
-                if ed_ip == ip and ed.get("name"):
-                    out.add(str(ed["name"]).strip().lower())
+    # 4. External domains seen on this IP. The pipeline aggregates them only
+    # after this module ran, so the aggregate is built here when absent; its
+    # entries are {domain, ips_seen} (recon/helpers/external_domains.py).
+    aggregated = combined_result.get("external_domains_aggregated")
+    if aggregated is None:
+        from recon.helpers.external_domains import _aggregate_external_domains
+        aggregated = _aggregate_external_domains(combined_result)
+    for ed in aggregated or []:
+        if isinstance(ed, dict) and ed.get("domain") and ip in (ed.get("ips_seen") or []):
+            out.add(str(ed["domain"]).strip().lower())
 
     # 5. CNAME targets from DNSRecord-shaped entries in dns map
     for sub_name, sub_info in (dns.get("subdomains") or {}).items():
@@ -1286,9 +1339,6 @@ def _collect_graph_candidates(combined_result: dict, ip: str) -> list[str]:
         for cn in cnames:
             if isinstance(cn, str) and cn.strip():
                 out.add(cn.strip().lower().rstrip("."))
-
-    # IP mode's PTR names need no source of their own: main records each one in
-    # the dns block with its address, so source 1 reads it (as a DNS-known name).
 
     # 6. tlsx SAN list, matched on the scanned IP. Covers non-HTTP TLS ports and
     # bare IPs httpx never dialled; empty when tlsx is off (harmless).
@@ -1304,10 +1354,54 @@ def _collect_graph_candidates(combined_result: dict, ip: str) -> list[str]:
     return [h for h in out if h and "." in h]
 
 
+def _ip_mode_names(combined_result: dict, settings: dict, ips: Iterable[str]) -> Optional[dict[str, list[str]]]:
+    """IP mode: {target IP: the recorded hostnames this probe may try on it};
+    None outside IP mode, where the graph sources above apply.
+
+    A name is tried only on a target IP it was seen on, so the probe stays on
+    the targets. None in IP only (D-09: the custom FQDN lines are its only
+    names). None at all when IP attribution did not run, and none on a shared
+    CDN edge or on an IP whose attribution failed (B-31): an edge answers a
+    name with whichever tenant's site it serves.
+    """
+    if not (combined_result.get("metadata") or {}).get("ip_mode"):
+        return None
+    from recon.helpers.ip_hostnames import hostname_mode, may_send
+    from recon.main_recon_modules.ip_attribution import ATTRIBUTION_FAILED
+    if hostname_mode(settings) == "ip_only":
+        print("[-][VhostSni] IP only: no discovered hostname is tried (custom FQDN lines only)")
+        return {}
+    attribution = combined_result.get("ip_attribution")
+    if not isinstance(attribution, dict):
+        print("[-][VhostSni] IP attribution did not run: no recorded hostname is tried on the target IPs")
+        return {}
+    by_ip = attribution.get("by_ip") or {}
+    usable, edges = set(), set()
+    for ip in ips:
+        entry = by_ip.get(ip)
+        if not isinstance(entry, dict) or ATTRIBUTION_FAILED in (entry.get("ownership_reasons") or ()):
+            continue
+        (edges if entry.get("ownership") == "shared_edge" else usable).add(ip)
+    if edges:
+        print(f"[-][VhostSni] Recorded hostnames are not tried on {len(edges)} shared CDN edge IP(s)")
+    out: dict[str, list[str]] = {}
+    for name, candidate in (((combined_result.get("ip_hostnames") or {}).get("candidates")) or {}).items():
+        if may_send(candidate):
+            ips = list(candidate.get("ips_seen") or ())
+            # A selected name is a target on its pinned answer too (all target
+            # IPs, checked by the rule); the edge rule still applies there.
+            if candidate.get("reason") == "scanned":
+                ips += [ip for ip in candidate.get("resolves_to_now") or () if ip not in ips]
+            for ip in ips:
+                if ip in usable:
+                    out.setdefault(ip, []).append(name)
+    return out
+
+
 # =============================================================================
 # IP / port / wordlist / apex helpers
 # =============================================================================
-def _collect_ip_targets(combined_result: dict) -> dict[str, list[dict]]:
+def _collect_ip_targets(combined_result: dict, settings: Optional[dict] = None) -> dict[str, list[dict]]:
     """
     Build {ip: [{port, protocol, scheme}, ...]} by MERGING every available source
     (no fallback / either-or). Sources walked in order:
@@ -1320,6 +1414,9 @@ def _collect_ip_targets(combined_result: dict) -> dict[str, list[dict]]:
     Merging (rather than the previous fallback-on-empty behaviour) ensures that
     a partial-recon run with both a custom IP AND a graph-known IP probes BOTH
     instead of silently dropping the graph IPs.
+
+    Every address then passes the RoE admission gate (``settings``, else the
+    RoE a partial builder stamped in ``metadata.roe``).
     """
     ip_to_ports: dict[str, list[dict]] = {}
 
@@ -1376,6 +1473,21 @@ def _collect_ip_targets(combined_result: dict) -> dict[str, list[dict]]:
             {"port": 80, "protocol": "tcp", "scheme": "http"},
         ])
 
+    # ---- IP mode: the target addresses only -----------------------------
+    # Every probe is pinned to the IP it is built for, so an address a DNS
+    # answer brought in that is not a target is never one to probe (B-01).
+    from recon.helpers.target_admission import clamp_to_targets
+    kept = set(clamp_to_targets(combined_result, list(ip_to_ports)))
+    ip_to_ports = {ip: plist for ip, plist in ip_to_ports.items() if ip in kept}
+
+    # ---- RoE: an excluded address is never probed ------------------------
+    # Every source can bring one: a name resolving into an excluded range, a
+    # graph row, a partial run's typed IP. Inert with no exclusion in force.
+    from recon.helpers.target_admission import admit_targets
+    admitted = set(admit_targets(settings, combined_result, ips=list(ip_to_ports),
+                                 module="vhost_sni").ips)
+    ip_to_ports = {ip: plist for ip, plist in ip_to_ports.items() if ip in admitted}
+
     # ---- Dedupe ports per IP (port + scheme key, preserves first occurrence) ---
     for ip, plist in ip_to_ports.items():
         seen = set()
@@ -1388,7 +1500,49 @@ def _collect_ip_targets(combined_result: dict) -> dict[str, list[dict]]:
             unique.append(p)
         ip_to_ports[ip] = unique
 
+    from recon.helpers.target_admission import ip_mode_targets
+    if ip_mode_targets(combined_result) is not None:
+        ip_to_ports = _ip_mode_live_only(combined_result, ip_to_ports)
     return ip_to_ports
+
+
+def _ip_mode_live_only(combined_result: dict, ip_to_ports: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """IP mode: an address is probed only on ports this run found live.
+
+    Every target sits in the DNS block (its placeholder), so the default 80/443
+    above reached every one of them: on an HTTP-only target the :443 baseline
+    failed and the port was recorded as a skipped host, which the triage reads
+    as the whole address left unchecked. The evidence is security_checks' (open
+    ports, live httpx URLs). A port with none is neither probed nor recorded.
+    When an evidence source was cut, an unproven port may still be live: the
+    source is noted degraded so its earlier findings stay, naming no host.
+    """
+    from recon.helpers.security_checks import _canonical_ip, _evidence_cuts, _ip_mode_live_ports
+    live = {ip: set(ports) for ip, ports in (_ip_mode_live_ports(combined_result) or {}).items()}
+    # The port scan's by_host rows (source 1 above) list open ports too.
+    for key, row in (((combined_result.get("port_scan") or {}).get("by_host")) or {}).items():
+        if not isinstance(row, dict):
+            continue
+        address = _canonical_ip(row.get("ip") or key)
+        for p in row.get("ports") or []:
+            number = p.get("port") or p.get("number") if isinstance(p, dict) else p
+            if address and isinstance(number, int):
+                live.setdefault(address, set()).add(number)
+    kept: dict[str, list[dict]] = {}
+    unproven = 0
+    for ip, plist in ip_to_ports.items():
+        ports = live.get(_canonical_ip(ip) or ip, frozenset())
+        proven = [p for p in plist if p["port"] in ports]
+        unproven += len(plist) - len(proven)
+        if proven:
+            kept[ip] = proven
+    if unproven:
+        print(f"[-][VhostSni] IP mode: {unproven} port(s) with no live evidence are not probed")
+        if _evidence_cuts(combined_result):
+            from recon.helpers import circuit_breaker as _cb
+            _cb.note_degraded(_SOURCE, sources=(_SOURCE,),
+                              reason="live-port evidence cut: unproven ports not probed")
+    return kept
 
 
 def _shared_edge_ips(combined_result: dict, ips: Iterable[str]) -> set[str]:
@@ -1507,6 +1661,30 @@ def _is_curl_available() -> bool:
 # =============================================================================
 # Output assembly helpers
 # =============================================================================
+def finding_id(hostname: str, ip: str, port, layer: str) -> str:
+    """The Vulnerability id of one (hostname, IP, port, layer) anomaly.
+
+    A hash of the exact values: folding punctuation to "_" made dev-api and
+    dev.api (and IPv6 addresses sharing their digits) one node, and a 253-char
+    name overran the 200-char id the Priority Board and MCP accept. The IP is
+    canonicalised so one address spelled two ways stays one finding.
+    tooling/scripts/vhost_finding_rekey.py computes the same id (a recon test
+    pins the two together); change both or neither.
+    """
+    host = str(hostname or "").strip().lower().rstrip(".")
+    addr = str(ip or "").strip()
+    try:
+        addr = ipaddress.ip_address(addr).compressed
+    except ValueError:
+        addr = addr.lower()
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        pass
+    key = f"{host}|{addr}|{port}|{str(layer or '').lower()}"
+    return "vhost_sni_" + hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:20]
+
+
 def _build_finding_record(anomaly: dict, ip: str, ip_result: dict) -> dict:
     """Convert an anomaly dict into a Vulnerability-shaped record for the graph."""
     hostname = anomaly["hostname"]
@@ -1557,15 +1735,8 @@ def _build_finding_record(anomaly: dict, ip: str, ip_result: dict) -> dict:
     if internal_kw:
         description += f" The hostname pattern '{internal_kw}' suggests an internal/admin application."
 
-    finding_id = "vhost_sni_{h}_{i}_{p}_{l}".format(
-        h=re.sub(r"[^a-z0-9]", "_", hostname.lower()),
-        i=re.sub(r"[^0-9.]", "_", ip),
-        p=port,
-        l=layer.lower(),
-    )
-
     return {
-        "id": finding_id,
+        "id": finding_id(hostname, ip, port, layer),
         "name": vuln_name,
         "type": vuln_type,
         "severity": severity,

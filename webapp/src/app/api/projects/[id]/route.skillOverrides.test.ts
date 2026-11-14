@@ -35,6 +35,7 @@ vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: vi.fn() }))
 vi.mock('@/lib/plugins/overrides', () => ({
   resolveForProject: (...a: unknown[]) => mockResolveForProject(...a),
 }))
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overEffectiveUser()))
 vi.mock('@/lib/access', async () => {
   const actual = await vi.importActual<typeof import('@/lib/access')>('@/lib/access')
   return { ...actual, requireEffectiveUser: () => mockGetEffectiveUser() }
@@ -42,6 +43,7 @@ vi.mock('@/lib/access', async () => {
 
 import { GET } from './route'
 import { computeSkillTextOverrides } from '@/lib/plugins/overrideDelivery'
+import { mintJobCredential } from '@/lib/authz/machineCredential'
 
 const OVERRIDES = {
   'path_traversal/payload_reference': {
@@ -65,8 +67,12 @@ function wireProject() {
 }
 
 function get(query: string, key?: string): NextRequest {
+  // Step 1.16: the scanner key reads only beside its scan's job credential.
+  const job: Record<string, string> = key === SCANNER
+    ? { 'x-redamon-job': mintJobCredential({ tenant: 'owner-1', projectId: 'proj-1' }) }
+    : {}
   return new NextRequest(`http://x/api/projects/proj-1${query}`,
-    key === undefined ? {} : { headers: { 'x-internal-key': key } })
+    key === undefined ? {} : { headers: { 'x-internal-key': key, ...job } })
 }
 const params = { params: Promise.resolve({ id: 'proj-1' }) }
 

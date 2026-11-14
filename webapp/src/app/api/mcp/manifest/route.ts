@@ -1,27 +1,37 @@
 /**
- * GET /api/mcp/manifest - proxy to agent's /mcp/manifest.
- *
- * Returns the merged view (system + user MCP servers) the agent currently
- * has loaded. Used by ToolMatrixSection to render dynamic phase toggles.
+ * GET /api/mcp/manifest - the caller's own MCP Tool Plugin servers, read from their
+ * saved settings, secrets masked as the agent's view masks them (HD-15). No agent
+ * call: the agent's manifest held the servers of whichever account's project it
+ * loaded last. Same shape as the agent's answer (servers, errors, warnings,
+ * system_server_ids), plus `stdioAllowed` (a member's stdio servers never run).
  */
-import { NextRequest, NextResponse } from 'next/server'
-import { internalKeyHeaders } from '@/lib/agentAuth'
+import { NextResponse, type NextRequest } from 'next/server'
+import prisma from '@/lib/prisma'
+import { requirePermission } from '@/lib/authz/guards'
+import { SYSTEM_SERVER_IDS, type MCPServer } from '@/lib/mcp/schema'
+import { maskMcpServersForApi } from '@/lib/mcp/mask'
+import { ownerRunsStdio } from '@/lib/mcp/userServerAccess'
+import { internalError } from '@/lib/routeErrors'
 
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://agent:8080'
-
-export async function GET(_request: NextRequest) {
+export async function GET(request: NextRequest) {
   try {
-    const upstream = await fetch(`${AGENT_API_URL}/mcp/manifest`, {
-      headers: internalKeyHeaders(),
-      signal: AbortSignal.timeout(10_000),
+    const auth = await requirePermission(request, 'self:mcp_servers')
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
+    const settings = await prisma.userSettings.findUnique({
+      where: { userId: eff.userId },
+      select: { mcpServers: true },
     })
-    const data = await upstream.json().catch(() => ({}))
-    return NextResponse.json(data, { status: upstream.status })
+    const raw = settings?.mcpServers as unknown
+    const servers = Array.isArray(raw) ? (raw as MCPServer[]) : []
+    return NextResponse.json({
+      servers: maskMcpServersForApi(servers),
+      errors: [],
+      warnings: [],
+      system_server_ids: [...SYSTEM_SERVER_IDS].sort(),
+      stdioAllowed: await ownerRunsStdio(eff.userId),
+    })
   } catch (error) {
-    console.error('Failed to proxy /mcp/manifest:', error)
-    return NextResponse.json(
-      { servers: [], errors: [], warnings: [], system_server_ids: [] },
-      { status: 200 },  // graceful: UI can render built-ins-only when agent unreachable
-    )
+    return internalError(error, 'Failed to read your MCP servers')
   }
 }

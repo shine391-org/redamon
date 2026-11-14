@@ -16,6 +16,7 @@ ONE BaseURL per service, MANY Endpoints per BaseURL.
 """
 import json
 import hashlib
+import ipaddress
 import re
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
@@ -37,6 +38,20 @@ from graph_db.endpoint_paths import normalize_endpoint_path
 #: is one shared deny or parking page, not each host's own content.
 SHARED_BODY_MIN_BASEURLS = 3
 
+#: Appended to a Technology MERGE: adds `$detector` to the comma-joined
+#: `detected_by` instead of overwriting it. clear_recon_data spares a Technology
+#: only while `gvm` is listed, so an overwrite let the next full recon delete a
+#: GVM-tagged node with its vulnerabilities. `gvm` stays last, as
+#: absorb_technology keeps it, because clear_gvm_data deletes an exact 'gvm' and
+#: strips only a ',gvm'.
+_ADD_DETECTOR = """
+    WITH t, [s IN split(coalesce(t.detected_by, '') + ',' + $detector, ',')
+             WHERE trim(s) <> '' | trim(s)] AS parts
+    WITH t, reduce(acc = [], s IN parts | CASE WHEN s IN acc THEN acc ELSE acc + s END) AS seen
+    SET t.detected_by = reduce(out = '', s IN [d IN seen WHERE d <> 'gvm'] + [d IN seen WHERE d = 'gvm'] |
+                               CASE WHEN out = '' THEN s ELSE out + ',' + s END)
+"""
+
 
 def _split_url(url: str) -> tuple[str, str]:
     """Return ``(base_url, path)`` where ``base_url = scheme://host:port``
@@ -57,6 +72,90 @@ def _asn_label(value) -> str | None:
         value = value.get("as_number")
     match = re.search(r"\d+", str(value or ""))
     return f"AS{match.group(0)}" if match else None
+
+
+def _ip_key(value) -> str:
+    try:
+        return ipaddress.ip_address(str(value).strip().strip("[]")).compressed
+    except ValueError:
+        return str(value or "").strip().lower()
+
+
+def _host_key(value) -> str:
+    return str(value or "").strip().lower().rstrip(".")
+
+
+def _as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _answer_addresses(recon_data: dict):
+    """Return ``(host, port, reported_ip) -> [address, ...]``: the addresses an
+    httpx answer on host:port is written under (Port, Service, SERVES_URL).
+
+    For a name with several addresses httpx's address is not the one it
+    connected to. Measured on httpx v1.12: `host` is the name, so the parser
+    falls back to `a[0]`, the first resolved address; `host_ip` is kept per
+    name and a concurrent probe of the name's other port overwrites it; and
+    when the first address refuses the port httpx connects to the next one
+    and still names the first. In a domain run the port scan's details name
+    the address each port is open on (S-20): when the port is open on other
+    addresses of the name and not on the reported one, the answer goes to
+    those. The reported address stays when it has the port, when no address
+    has it in the port data, when the details name no address, when the run
+    does not know it as one of the name's, and in IP mode.
+    """
+    if _as_dict(recon_data.get("metadata")).get("ip_mode"):
+        return lambda host, port, reported: [reported]
+
+    open_on: dict = {}
+    known: dict = {}
+    by_host = _as_dict(_as_dict(recon_data.get("port_scan")).get("by_host"))
+    for name, entry in by_host.items():
+        details = [d for d in _as_dict(entry).get("port_details") or [] if isinstance(d, dict)]
+        if not any(d.get("ip") for d in details):
+            continue
+        host = _host_key(name)
+        own = entry.get("ip")
+        addresses = known.setdefault(host, set())
+        if own:
+            addresses.add(_ip_key(own))
+        for d in details:
+            address = d.get("ip") or own
+            if not address:
+                continue
+            addresses.add(_ip_key(address))
+            if str(d.get("protocol") or "tcp").lower() != "tcp":
+                continue
+            try:
+                port = int(d.get("port"))
+            except (TypeError, ValueError):
+                continue
+            open_on.setdefault((host, port), {}).setdefault(_ip_key(address), address)
+
+    dns = _as_dict(recon_data.get("dns"))
+    entries = dict(_as_dict(dns.get("subdomains")))
+    if isinstance(recon_data.get("domain"), str):
+        entries.setdefault(recon_data["domain"], _as_dict(dns.get("domain")))
+    for name, entry in entries.items():
+        host = _host_key(name)
+        if host not in known:
+            continue
+        ips = _as_dict(_as_dict(entry).get("ips"))
+        for address in list(ips.get("ipv4") or []) + list(ips.get("ipv6") or []):
+            if address:
+                known[host].add(_ip_key(address))
+
+    def addresses(host, port, reported):
+        found = open_on.get((_host_key(host), port))
+        if not reported or not found:
+            return [reported]
+        reported_key = _ip_key(reported)
+        if reported_key in found or reported_key not in known.get(_host_key(host), ()):
+            return [reported]
+        return list(found.values())
+
+    return addresses
 
 
 class HttpMixin:
@@ -110,6 +209,7 @@ class HttpMixin:
             by_url = http_probe_data.get("by_url", {})
             wappalyzer = http_probe_data.get("wappalyzer", {})
             all_technologies = wappalyzer.get("all_technologies", {})
+            answer_addresses = _answer_addresses(recon_data)
 
             # Process each URL
             for url, url_info in by_url.items():
@@ -330,14 +430,15 @@ class HttpMixin:
                     # Create relationship: Service -[:SERVES_URL]-> BaseURL
                     # BaseURLs are served by HTTP/HTTPS services running on ports
                     if host:
-                        resolved_ip = url_info.get("ip")
                         # Extract actual port from URL (e.g., http://example.com:8080)
                         # Only use default ports (80/443) if no explicit port in URL
                         parsed_url = urlparse(url)
                         port_number = parsed_url.port or (443 if scheme == "https" else 80)
                         default_service_name = "https" if scheme == "https" else "http"
 
-                        if resolved_ip:
+                        for resolved_ip in answer_addresses(host, port_number, url_info.get("ip")):
+                            if not resolved_ip:
+                                continue
                             # Check if a service already exists for this port/IP (from port scan)
                             # If so, reuse it instead of creating a duplicate with different name
                             existing_service = session.run(
@@ -378,11 +479,13 @@ class HttpMixin:
                             )
                             stats["relationships_created"] += 1
 
-                            # Also ensure Port node exists and is connected to Service
+                            # Also ensure Port node exists and is connected to Service.
+                            # httpx got an answer on it: an active hit, so a port
+                            # only a passive provider had reported is one no more.
                             session.run(
                                 """
                                 MERGE (p:Port {number: $port_number, protocol: 'tcp', ip_address: $ip_addr, user_id: $user_id, project_id: $project_id})
-                                SET p.state = 'open',
+                                SET p.state = 'open', p.passive_only = false,
                                     p.updated_at = datetime()
                                 WITH p
                                 MATCH (svc:Service {name: $service_name, port_number: $port_number, ip_address: $ip_addr, user_id: $user_id, project_id: $project_id})
@@ -431,7 +534,6 @@ class HttpMixin:
                                 "version": tech_version,
                                 "categories": categories,
                                 "confidence": confidence,
-                                "detected_by": "httpx"
                             }
 
                             # Remove None values
@@ -453,8 +555,9 @@ class HttpMixin:
                                     MERGE (t:Technology {name: $name, version: $version, user_id: $user_id, project_id: $project_id})
                                     SET t += $props,
                                         t.updated_at = datetime()
-                                    """,
+                                    """ + _ADD_DETECTOR,
                                     name=tech_name, version=tech_version, props=tech_props,
+                                    detector="httpx",
                                     user_id=user_id, project_id=project_id
                                 )
                                 processed_techs.add((tech_name_key(tech_name), tech_version))
@@ -464,8 +567,8 @@ class HttpMixin:
                                     MERGE (t:Technology {name: $name, version: '', user_id: $user_id, project_id: $project_id})
                                     ON CREATE SET t += $props, t.updated_at = datetime()
                                     ON MATCH SET t.updated_at = datetime()
-                                    """,
-                                    name=tech_name, props=tech_props,
+                                    """ + _ADD_DETECTOR,
+                                    name=tech_name, props=tech_props, detector="httpx",
                                     user_id=user_id, project_id=project_id
                                 )
                                 processed_techs.add((tech_name_key(tech_name), None))
@@ -585,7 +688,6 @@ class HttpMixin:
                                 "version": tech_version,
                                 "categories": categories,
                                 "confidence": confidence,
-                                "detected_by": "wappalyzer"
                             }
 
                             # Remove None values
@@ -608,8 +710,9 @@ class HttpMixin:
                                     MERGE (t:Technology {name: $name, version: $version, user_id: $user_id, project_id: $project_id})
                                     SET t += $props,
                                         t.updated_at = datetime()
-                                    """,
+                                    """ + _ADD_DETECTOR,
                                     name=tech_name, version=tech_version, props=tech_props,
+                                    detector="wappalyzer",
                                     user_id=user_id, project_id=project_id
                                 )
                             else:
@@ -618,8 +721,8 @@ class HttpMixin:
                                     MERGE (t:Technology {name: $name, version: '', user_id: $user_id, project_id: $project_id})
                                     ON CREATE SET t += $props, t.updated_at = datetime()
                                     ON MATCH SET t.updated_at = datetime()
-                                    """,
-                                    name=tech_name, props=tech_props,
+                                    """ + _ADD_DETECTOR,
+                                    name=tech_name, props=tech_props, detector="wappalyzer",
                                     user_id=user_id, project_id=project_id
                                 )
                             stats["technologies_created"] += 1
@@ -729,7 +832,13 @@ class HttpMixin:
 
             # --- Update Subdomain nodes with HTTP probe status ---
             by_host = http_probe_data.get("by_host", {})
-            for hostname, host_info in by_host.items():
+            # IP mode probes the IP literal while the Subdomain node carries the
+            # placeholder name minted for that IP ("21.40.250.84" -> "21-40-250-84").
+            # A hostname the run scanned is keyed by its own name, which the map
+            # never holds, so it keeps matching its own Subdomain.
+            ip_to_hostname = (recon_data.get("metadata") or {}).get("ip_to_hostname") or {}
+            for probed_host, host_info in by_host.items():
+                hostname = ip_to_hostname.get(probed_host, probed_host)
                 try:
                     status_codes = host_info.get("status_codes", [])  # already sorted int list
                     live_urls = host_info.get("live_urls", [])
@@ -760,12 +869,9 @@ class HttpMixin:
                 except Exception as e:
                     stats["errors"].append(f"Subdomain status update for {hostname}: {e}")
 
-            # Mark resolved subdomains that got no HTTP response at all as "no_http"
+            # Mark resolved subdomains that got no HTTP response at all as "no_http".
+            # Translated like the loop above, or every live IP-mode host is demoted.
             all_probed_hosts = set(by_host.keys())
-            # IP mode probes the IP literal while the Subdomain node carries the
-            # placeholder name minted for that IP ("21.40.250.84" -> "21-40-250-84"),
-            # so translate before the diff or every live IP-mode host is demoted.
-            ip_to_hostname = (recon_data.get("metadata") or {}).get("ip_to_hostname", {})
             all_probed_hosts |= {ip_to_hostname[h] for h in all_probed_hosts if h in ip_to_hostname}
             all_target_subs = set(recon_data.get("subdomains", []))
             no_response_hosts = all_target_subs - all_probed_hosts

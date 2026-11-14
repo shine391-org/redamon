@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireUserAccess } from '@/lib/session'
 import prisma from '@/lib/prisma'
 import { internalError } from '@/lib/routeErrors'
+import { requireSelfPermission } from '@/lib/authz/selfService'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -84,8 +85,10 @@ const BUILT_IN_SKILLS = [
 export async function GET(request: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params
-    const __denied = await requireUserAccess(request, id)
+    const __denied = await requireUserAccess(request, id, { mode: 'read' })
     if (__denied) return __denied
+    const selfRefused = await requireSelfPermission(request, id, 'self:attack_skills')
+    if (selfRefused) return selfRefused
 
     const userSkills = await prisma.userAttackSkill.findMany({
       where: { userId: id },

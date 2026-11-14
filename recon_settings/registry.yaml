@@ -264,6 +264,12 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "web_crawling"
     form_section: "KatanaSection"
+    footguns:
+      - >-
+        The crawl scope is fixed at fqdn (the seed URLs' exact hosts) and is not a
+        setting. Katana's output is filtered to the seed hosts, so a wider scope
+        would only send requests to hosts no scan admitted and discard the
+        results.
   kiterunner:
     title: "Kiterunner"
     phase: resource_enum
@@ -681,6 +687,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: never
+    share: secret
     stealth: { set: [] }
     deny_reason: secret
     readable: false
@@ -763,6 +770,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: false
     group: agent
@@ -817,6 +825,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: false
     group: agent
@@ -883,6 +892,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: true
     group: agent
@@ -910,6 +920,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: deny
     validator: free_text
     group: agent
@@ -924,6 +935,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: false
     group: agent
@@ -937,6 +949,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: allow
     validator: free_text
     group: agent
@@ -1180,6 +1193,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: false
     group: agent
@@ -1261,6 +1275,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: true
     group: agent
@@ -1275,6 +1290,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: true
     group: agent
@@ -1289,6 +1305,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: true
     group: agent
@@ -1315,6 +1332,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: deny
     validator: json_object
     group: agent
@@ -1370,18 +1388,20 @@ fields:
     form_section: "TargetSection"
   aiSurfaceReconCacheEnabled:
     tool: ai_surface_recon
-    runtime_key: "AI_SURFACE_RECON_CACHE_ENABLED"
+    runtime_key: null
     unit: none
     phase: http_probe
     traffic: active
     roe_capped: false
-    mcp: settable
-    group: llm
+    mcp: never
+    deny_reason: internal
+    group: retired
+    form_section: null
     meaning: >-
-      Whether AI attack-surface recon runs. Configuration is two levels: this flag
-      decides whether the tool runs INSIDE its phase, and scanModules decides
-      whether the phase runs at all. Setting one without the other is a silent
-      no-op.
+      Retired: nothing reads it. AI attack-surface recon has no probe cache, and
+      one that skipped re-testing would leave earlier findings unchecked. The
+      column is kept so an upgrade or a rollback never drops data; it is closed
+      on every surface and has no input.
   aiSurfaceReconChatShapeProbeEnabled:
     tool: ai_surface_recon
     runtime_key: "AI_SURFACE_RECON_CHAT_SHAPE_PROBE_ENABLED"
@@ -1550,9 +1570,11 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: llm
     meaning: >-
-      How long AI attack-surface recon may spend before it is abandoned, in
-      seconds. A run that hits it contributes whatever it found so far rather than
-      failing the scan.
+      Per-request timeout, in seconds: how long each AI attack-surface probe waits
+      for its answer (the chat-shape POSTs, the MCP handshake, the OpenAPI and
+      model-list fetches, the Julius probe pack, the vector-database reads), NOT a
+      cap on the whole run; listing an MCP server's tools, resources and prompts
+      may take four times this value. A request that times out is skipped.
   aiSurfaceReconUserAgent:
     tool: ai_surface_recon
     runtime_key: "AI_SURFACE_RECON_USER_AGENT"
@@ -1674,6 +1696,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-
@@ -1688,7 +1711,11 @@ fields:
     mcp: settable
     group: not-tuning
     meaning: >-
-      Disable following redirects
+      Disables following redirects (arjun --disable-redirects). Forced on in IP
+      mode and while roeExcludedHosts is non-empty: Arjun's first request to a URL
+      follows redirects and every later GET and POST for that URL goes where it
+      landed, which can be an excluded host or an address off the target list,
+      and Arjun has no same-host mode.
   arjunEnabled:
     tool: arjun
     runtime_key: "ARJUN_ENABLED"
@@ -1767,8 +1794,12 @@ fields:
     bounds: { min: 60, max: 86400 }
     group: unbounded
     meaning: >-
-      How long arjun may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on one Arjun run (one HTTP method against every
+      target endpoint, in full and partial recon; the methods in arjunMethods run
+      side by side): Arjun is stopped once this value plus 60 seconds have passed.
+      A run that hits it keeps the parameters Arjun had saved for the endpoints it
+      finished, since it rewrites its JSON output after each endpoint where it
+      finds some, and the scan goes on.
   arjunStable:
     tool: arjun
     runtime_key: "ARJUN_STABLE"
@@ -1805,8 +1836,9 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long arjun may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long Arjun waits for the answer to one
+      request (arjun's -T), NOT a cap on the whole run. The wall-clock cap for a
+      run is arjunScanTimeout.
   attackSkillConfig:
     tool: agent
     runtime_key: null
@@ -1880,8 +1912,12 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long baddns may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on the takeover scan's one BadDNS run over every
+      name; a value under 120 counts as 120. A run that hits it is stopped with
+      its container and keeps the findings BadDNS had printed. Every name from the
+      last one with a printed finding on (every name, when it printed none) is
+      recorded as not checked, so its earlier takeover findings are kept rather
+      than pruned, and the scan goes on.
   bannerGrabEnabled:
     tool: banner_grab
     runtime_key: "BANNER_GRAB_ENABLED"
@@ -1935,9 +1971,11 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long Banner grab may spend before it is abandoned, in seconds. A run
-      that hits it contributes whatever it found so far rather than failing the
-      scan.
+      Per-connection timeout, in seconds: how long banner grabbing waits to
+      connect to one non-HTTP port (and to finish the TLS handshake on a TLS
+      port), and for the answer to the probe it sends when the service has not
+      spoken first (it waits a fixed 3 seconds for that greeting), NOT a cap on
+      the whole run. A port that does not answer in time gets no banner.
     form_section: "HttpxSection"
   captureProxyEnabled:
     tool: capture_proxy
@@ -2155,6 +2193,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     readable: false
     validator: free_text
     deny_reason: secret
@@ -2185,6 +2224,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: gate
     group: agent
     meaning: >-
       Whether a CypherFix patch must be approved by a human before it is pushed.
@@ -2362,6 +2402,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     validator: json_object
     group: scope
     meaning: >-
@@ -2383,6 +2424,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: free_text
     group: scope
@@ -2402,6 +2444,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     group: scope
     meaning: >-
       Domain batch: the third targeting mode. Mutually exclusive with ipMode. One
@@ -2493,6 +2536,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     validator: http_header
     meaning: >-
       A header every request carries so the target's operators can attribute the
@@ -2567,6 +2611,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-
@@ -2633,7 +2678,10 @@ fields:
     group: not-tuning
     meaning: >-
       Follows a redirect rather than recording it, which can turn one request into
-      several.
+      several (ffuf -r). Forced off in IP mode and while roeExcludedHosts is
+      non-empty: ffuf follows a redirect to any host and has no same-host mode, so
+      an admitted target's redirect would send every word on to an excluded host
+      or an address off the target list.
   ffufJevBasePaths:
     tool: ffuf
     runtime_key: "FFUF_JEV_BASE_PATHS"
@@ -2782,8 +2830,9 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long ffuf may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long ffuf waits for the answer to one
+      request (ffuf's -timeout), NOT a cap on the whole run. The wall-clock cap
+      for a run is ffufMaxTime.
   ffufWordlist:
     tool: ffuf
     runtime_key: "FFUF_WORDLIST"
@@ -3047,8 +3096,9 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long gau may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long httpx waits for one OPTIONS probe
+      of gau's method detection, or for its GET fallback (httpx's -timeout), NOT a
+      cap on the whole detection run.
   gauProviders:
     tool: gau
     runtime_key: "GAU_PROVIDERS"
@@ -3087,8 +3137,12 @@ fields:
     bounds: { min: 10, max: 86400 }
     group: unbounded
     meaning: >-
-      How long gau may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long gau waits for one answer from an
+      archive provider (gau's --timeout), NOT a cap on the whole run. It also
+      sizes gau's wall-clock cap for one domain, this value times the number of
+      gauProviders plus 120 seconds: a domain whose run outlives it is stopped
+      with its container and keeps the URLs gau had printed for it, and the scan
+      goes on.
   gauVerbose:
     tool: gau
     runtime_key: "GAU_VERBOSE"
@@ -3154,8 +3208,9 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long gau may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long httpx waits for one URL check
+      when gau's URLs are verified (httpx's -timeout), NOT a cap on the whole
+      verification run.
   gauVerifyUrls:
     tool: gau
     runtime_key: "GAU_VERIFY_URLS"
@@ -3261,6 +3316,7 @@ fields:
     traffic: passive
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: github_name
     group: othertarget
@@ -3277,6 +3333,7 @@ fields:
     traffic: passive
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: github_repo_list
     group: othertarget
@@ -3316,6 +3373,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     roe_parse: deny
     readable: false
     validator: free_text
@@ -3357,10 +3415,13 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    stealth: { set: false }
     meaning: >-
       Whether GraphQL Cop runs. Configuration is two levels: this flag decides
       whether the tool runs INSIDE its phase, and scanModules decides whether the
-      phase runs at all. Setting one without the other is a silent no-op.
+      phase runs at all. Setting one without the other is a silent no-op. Off in
+      stealth mode: its image cannot leave out a single test, so its four
+      denial-of-service probes would run whatever their own switches say.
   graphqlCopForceScan:
     tool: graphql_cop
     runtime_key: "GRAPHQL_COP_FORCE_SCAN"
@@ -3383,7 +3444,8 @@ fields:
     stealth: { set: false }
     group: not-tuning
     meaning: >-
-      HIGH DoS, 101-alias rate-limit bypass (default true, disabled in stealth)
+      HIGH DoS, 101-alias rate-limit bypass (default true). Off skips GraphQL Cop
+      entirely: its image cannot leave out a single test.
   graphqlCopTestBatchQuery:
     tool: graphql_cop
     runtime_key: "GRAPHQL_COP_TEST_BATCH_QUERY"
@@ -3395,7 +3457,8 @@ fields:
     stealth: { set: false }
     group: not-tuning
     meaning: >-
-      HIGH DoS, array-based batch queries (default true, disabled in stealth)
+      HIGH DoS, array-based batch queries (default true). Off skips GraphQL Cop
+      entirely: its image cannot leave out a single test.
   graphqlCopTestCircularIntrospection:
     tool: graphql_cop
     runtime_key: "GRAPHQL_COP_TEST_CIRCULAR_INTROSPECTION"
@@ -3407,7 +3470,8 @@ fields:
     stealth: { set: false }
     group: not-tuning
     meaning: >-
-      HIGH DoS, deep nested introspection (default true, disabled in stealth)
+      HIGH DoS, deep nested introspection (default true). Off skips GraphQL Cop
+      entirely: its image cannot leave out a single test.
   graphqlCopTestDirectiveOverloading:
     tool: graphql_cop
     runtime_key: "GRAPHQL_COP_TEST_DIRECTIVE_OVERLOADING"
@@ -3419,7 +3483,8 @@ fields:
     stealth: { set: false }
     group: not-tuning
     meaning: >-
-      HIGH DoS (default true, disabled in stealth)
+      HIGH DoS (default true). Off skips GraphQL Cop entirely: its image cannot
+      leave out a single test.
   graphqlCopTestFieldSuggestions:
     tool: graphql_cop
     runtime_key: "GRAPHQL_COP_TEST_FIELD_SUGGESTIONS"
@@ -3518,9 +3583,11 @@ fields:
     mcp: settable
     bounds: { min: 10, max: 600 }
     meaning: >-
-      How long GraphQL Cop may spend before it is abandoned, in seconds. A run
-      that hits it contributes whatever it found so far rather than failing the
-      scan.
+      How long one GraphQL Cop run against one endpoint may take, in seconds. A
+      run that hits it is stopped, its container included. GraphQL Cop prints its
+      report only after its last test, so a cut run adds no new findings: the
+      host's earlier GraphQL Cop findings are kept rather than pruned, and the scan
+      goes on.
   graphqlDepthLimit:
     tool: graphql
     runtime_key: "GRAPHQL_DEPTH_LIMIT"
@@ -3566,10 +3633,19 @@ fields:
     roe_capped: true
     mcp: settable
     bounds: { min: 0, max: 100 }
+    zero_means: unlimited
     stealth: { set: 2 }
     meaning: >-
-      Requests per second graphql sends. Capped to the engagement ceiling at scan
-      start, so a value above the ceiling is rewritten rather than refused.
+      How many GraphQL endpoints the scan starts testing per second, at most: it
+      spaces the start of each endpoint's test, not the requests inside one (the
+      `__typename` probe, the introspection queries and their retries), which up to
+      graphqlConcurrency workers send as fast as the target answers. ZERO MEANS
+      UNLIMITED, so 0 is the most aggressive value available and not the safest.
+      Under an engagement ceiling (a non-zero roeGlobalMaxRps) a 0 here, or a
+      value above the ceiling, is rewritten to the ceiling at scan start rather
+      than refused, and every request of the scanner itself, retries and redirect
+      hops included, also takes a slot of that ceiling (graphql-cop runs in its
+      own container and is not paced by it).
   graphqlRetryBackoff:
     tool: graphql
     runtime_key: "GRAPHQL_RETRY_BACKOFF"
@@ -3618,8 +3694,10 @@ fields:
     bounds: { min: 1, max: 600 }
     stealth: { set: 60 }
     meaning: >-
-      How long graphql may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long the GraphQL scanner waits for the
+      answer to each request it sends, retries included (the `{ __typename }`
+      probe and the introspection queries), NOT a cap on the whole scan. GraphQL
+      Cop's runs have their own cap, graphqlCopTimeout.
   graphqlVerifySsl:
     tool: graphql
     runtime_key: "GRAPHQL_VERIFY_SSL"
@@ -3693,6 +3771,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     values: [both, ips_only, hostnames_only]
     group: othertarget
@@ -3711,8 +3790,12 @@ fields:
     bounds: { min: 0, max: 86400 }
     group: unbounded
     meaning: >-
-      How long gvm may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on one GVM scan task; every IP and every
+      hostname is scanned as a task of its own. 0 means no limit. A task that
+      outlives it gets no report: that target adds no findings and counts as a
+      failed one (three failed targets in a row abort the scan), its earlier GVM
+      findings are kept rather than pruned, and the scan goes on to the next
+      target.
   hackerTargetEnabled:
     tool: hackertarget
     runtime_key: "HACKERTARGET_ENABLED"
@@ -3746,6 +3829,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-
@@ -3784,7 +3868,17 @@ fields:
     mcp: settable
     group: not-tuning
     meaning: >-
-      Follows links onto subdomains of the target rather than staying on one host.
+      Follows links onto subdomains of each seed's host (hakrawler -subs), every
+      sibling subdomain when the scan root is itself a seed, rather than staying on
+      one host. Forced off on an EXACT scope group, which scans only its listed
+      hosts: per group in the full pipeline, and for the whole partial run when any
+      of its roots is in an EXACT group, since one flag serves every seed. ENUMERATE
+      groups keep this setting, except when roeExcludedHosts is non-empty or the
+      project is in IP mode: then it is forced off for the whole run, full and
+      partial, because -subs lets hakrawler follow links and redirects into any
+      sibling subdomain, an RoE-excluded one or a name outside the IP target list
+      included. Off, hakrawler still crawls each seed's own host, same-host
+      redirects included.
   hakrawlerInsecure:
     tool: hakrawler
     runtime_key: "HAKRAWLER_INSECURE"
@@ -3870,8 +3964,11 @@ fields:
     bounds: { min: 5, max: 86400 }
     group: unbounded
     meaning: >-
-      How long hakrawler may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-seed cap, in seconds: how long hakrawler may crawl one seed URL
+      (hakrawler's -timeout), NOT a cap on the whole crawl. A seed still running
+      after twice this value plus 60 seconds is stopped with its container and
+      keeps the URLs it had printed; the wait for the whole crawl is sized from
+      that per-seed budget, with the seeds crawled hakrawlerParallelism at a time.
   httpProbeAiFaviconHashEnabled:
     tool: http_probe_ai
     runtime_key: "HTTP_PROBE_AI_FAVICON_HASH_ENABLED"
@@ -3936,6 +4033,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-
@@ -3977,7 +4075,11 @@ fields:
     group: not-tuning
     meaning: >-
       Follows a redirect to its destination rather than recording the redirect
-      itself.
+      itself (httpx -fr). Same host only (-fhr) when a session is attached, in IP
+      mode and while roeExcludedHosts is non-empty, because a redirect from an
+      admitted host can name an excluded host or an address off the target list:
+      a URL that redirects to another host then keeps its own answer (the 3xx and
+      its Location), not the other host's page.
   httpxIncludeResponse:
     tool: httpx
     runtime_key: "HTTPX_INCLUDE_RESPONSE"
@@ -4278,9 +4380,10 @@ fields:
     mcp: settable
     group: not-tuning
     meaning: >-
-      Whether httpx records this attribute while probing. Each probe adds work per
-      host, and several add requests beyond the first, so the set of probes
-      decides both how much the scan learns and how loud it is.
+      httpx -tls-probe: also probes the names the TLS certificate of each probed
+      host lists. Forced off in IP mode and while roeExcludedHosts is non-empty,
+      since those names can include an excluded host or one off the target list;
+      httpxProbeTlsGrab still reads the certificate.
   httpxProbeWordCount:
     tool: httpx
     runtime_key: "HTTPX_PROBE_WORD_COUNT"
@@ -4345,8 +4448,12 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long httpx may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long httpx waits for one URL's answer
+      (httpx's -timeout), NOT a cap on the whole run. It also sizes the run's
+      wall-clock budget: the URLs httpxThreads at a time, each allowed this value
+      times (httpxRetries + 1), plus 60 seconds. A run that outlives the budget is
+      stopped, later phases work on what it had already found, and its
+      http_probe findings are kept rather than pruned.
   hydraConnectionTimeout:
     tool: hydra
     runtime_key: null
@@ -4358,8 +4465,10 @@ fields:
     bounds: { min: 5, max: 120 }
     group: intrusive
     meaning: >-
-      How long hydra may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      How long hydra waits for a response, in seconds (hydra's -w), NOT a cap on
+      the whole attack. It reaches hydra only through the flags the brute-force
+      skill's prompt tells the agent to pass, and only when it differs from
+      hydra's own default of 32.
   hydraEnabled:
     tool: hydra
     runtime_key: null
@@ -4421,9 +4530,11 @@ fields:
     bounds: { min: 1, max: 64 }
     group: intrusive
     meaning: >-
-      How many hydra operations run at once. The memory governor scales it down
-      when the host is short of RAM, so the effective value can be below what is
-      written here.
+      How many connections hydra opens in parallel against one target (hydra's
+      -t). It reaches hydra only through the flags the brute-force skill's prompt
+      tells the agent to pass, and that prompt lowers it for the protocols that
+      break under parallel logins (at most 4 for SSH and VNC, 1 for RDP), so the
+      value used there can be below what is written here.
   hydraVerbose:
     tool: hydra
     runtime_key: null
@@ -4438,7 +4549,7 @@ fields:
   hydraWaitBetweenConnections:
     tool: hydra
     runtime_key: null
-    unit: threads
+    unit: seconds
     phase: standalone
     traffic: active
     roe_capped: false
@@ -4447,9 +4558,11 @@ fields:
     zero_means: literal
     group: intrusive
     meaning: >-
-      How many hydra operations run at once. The memory governor scales it down
-      when the host is short of RAM, so the effective value can be below what is
-      written here.
+      How long, in seconds, each of hydra's parallel tasks waits between one
+      connection and its next (hydra's -W): the attack then opens at most
+      hydraThreads / this value new connections a second. 0 means no wait, and
+      the flag is not passed. It reaches hydra only through the flags the
+      brute-force skill's prompt tells the agent to pass.
   id:
     tool: project
     runtime_key: null
@@ -4496,6 +4609,138 @@ fields:
       to. 0 means no handshake at all: the tag then uses only the CDN signals the
       run already holds. The handshakes skip RoE-excluded hosts and are paced at
       the engagement rate ceiling, and stealth mode sets this to 0.
+  ipHostnameExclude:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_EXCLUDE"
+    unit: none
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    validator: hostname
+    group: scope
+    meaning: >-
+      IP mode with ipHostnameMode record_filter: hostnames never scanned even
+      when an include entry matches them (exclude wins). Domain-batch syntax:
+      "*.example.com" matches its subdomains only, "example.com" that exact
+      host; no IP literal, no public suffix, at most 200 entries. Adding an
+      entry narrows what is scanned, removing one is a widening. An entry recon
+      cannot read at load stops every name from being scanned in that run.
+      Changed after creation only by update_project_scope or the project form.
+  ipHostnameInclude:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_INCLUDE"
+    unit: none
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    validator: hostname
+    group: scope
+    meaning: >-
+      IP mode with ipHostnameMode record_filter: which hostnames seen on the
+      target IPs may be scanned. Domain-batch syntax: "*.example.com" matches
+      its subdomains only, "example.com" that exact host; no IP literal, no
+      public suffix, no protected government or public-institution domain, at
+      most 200 entries, and record_filter needs at least one. A matching name
+      is scanned only when no exclude entry matches it and every address it
+      resolves to is a target. Adding an entry is a widening. Changed after
+      creation only by update_project_scope or the project form.
+  ipHostnameMaxScanned:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_MAX_SCANNED"
+    unit: count
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    bounds: { min: 1, max: 2000 }
+    group: scope
+    meaning: >-
+      IP mode with ipHostnameMode record_filter or scan_all: the most hostnames
+      one run scans, across every target IP. The names past it, in sorted
+      order, are recorded with the reason cap_reached and not scanned. Raising
+      it is a widening. Changed after creation only by update_project_scope or
+      the project form.
+  ipHostnameMode:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_MODE"
+    unit: none
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    values: [ip_only, record_only, record_filter, scan_all]
+    group: scope
+    meaning: >-
+      Hostnames on target IPs: what an IP-mode project does with the names it
+      sees on its addresses (certificate names, reverse DNS, passive DNS,
+      redirects). ip_only (the default) looks none up and never sends one;
+      record_only records them in the graph and scans only the IPs;
+      record_filter also scans the names matching ipHostnameInclude minus
+      ipHostnameExclude; scan_all scans every name found except on shared CDN
+      edges, needs ipHostnameScanAllConfirmed and is refused on a third_party
+      engagement. A name is scanned only when every address it resolves to is
+      a target. Ignored outside IP mode. Moving towards scan_all is a widening:
+      over update_project_scope it pauses the enabled schedules and, on a
+      third_party engagement, needs an authorization record.
+  ipHostnamePassiveExpand:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_PASSIVE_EXPAND"
+    unit: none
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    group: scope
+    meaning: >-
+      IP mode with ipHostnameMode record_filter: also search passive sources
+      (certificate logs, HackerTarget, Subfinder, urlscan) for the subdomains of
+      every "*.x" include entry, at most ipHostnamePassiveMaxNames names per
+      run. A name found this way still has to pass the same filters and resolve
+      only to target IPs. Turning it on is a widening.
+  ipHostnamePassiveMaxNames:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_PASSIVE_MAX_NAMES"
+    unit: count
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    bounds: { min: 1, max: 10000 }
+    group: scope
+    meaning: >-
+      IP mode with ipHostnamePassiveExpand on: the most names the passive search
+      of the include domains keeps in one run, across all of them, before any
+      is resolved. Raising it is a widening.
+  ipHostnameScanAllConfirmed:
+    tool: targeting
+    runtime_key: "IP_HOSTNAME_SCAN_ALL_CONFIRMED"
+    unit: none
+    phase: standalone
+    traffic: none
+    roe_capped: false
+    mcp: create_only
+    share: scope
+    rescope: true
+    group: scope
+    meaning: >-
+      The operator's confirmation that every hostname found on the target IPs
+      may be scanned. ipHostnameMode scan_all requires it (a write without it is
+      refused, and so is a run), and any write that leaves scan_all resets it to
+      false, so returning to scan_all asks again.
   ipMode:
     tool: targeting
     runtime_key: "IP_MODE"
@@ -4504,6 +4749,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     group: scope
     meaning: >-
       Switches targeting from a domain to the explicit IP list. Mutually exclusive
@@ -4692,6 +4938,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-
@@ -4814,30 +5061,38 @@ fields:
       source rather than the bundle.
   jsReconStandaloneCrawlDepth:
     tool: js_recon
-    runtime_key: "JS_RECON_STANDALONE_CRAWL_DEPTH"
+    runtime_key: null
     unit: depth
     phase: js_recon
     traffic: active
     roe_capped: false
-    mcp: settable
+    mcp: never
     bounds: { min: 0, max: 50 }
-    group: unbounded
+    deny_reason: internal
+    group: retired
+    form_section: null
     meaning: >-
-      How many links deep a standalone JS recon run crawls from its seed.
+      Retired: nothing reads it. JS recon has no standalone crawl; it analyses
+      the JavaScript the pipeline's crawlers found. The column is kept so an
+      upgrade or a rollback never drops data; it is closed on every surface and
+      has no input.
   jsReconStandaloneCrawlScope:
     tool: js_recon
-    runtime_key: "JS_RECON_STANDALONE_CRAWL_SCOPE"
+    runtime_key: null
     unit: none
     phase: js_recon
     traffic: active
     roe_capped: false
-    mcp: settable
-    roe_parse: allow
+    mcp: never
     validator: free_text
-    group: not-tuning
+    deny_reason: internal
+    group: retired
+    form_section: null
     meaning: >-
-      How far a standalone JS recon run may crawl from its seed: same host, same
-      domain, or anywhere.
+      Retired: nothing reads it. JS recon has no standalone crawl; it analyses
+      the JavaScript the pipeline's crawlers found. The column is kept so an
+      upgrade or a rollback never drops data; it is closed on every surface and
+      has no input.
   jsReconTimeout:
     tool: js_recon
     runtime_key: "JS_RECON_TIMEOUT"
@@ -4849,8 +5104,15 @@ fields:
     bounds: { min: 60, max: 86400 }
     group: unbounded
     meaning: >-
-      How long JS recon may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Wall-clock budget, in seconds, for analyzing the downloaded JS files:
+      source-map discovery may spend half of it, and the analyzers must finish
+      within it, except TruffleHog, which gets what is left of it (at most 600
+      seconds) as a budget of its own. An analyzer still running when it runs out
+      adds nothing (the ones that finished are kept), and the hosts of the files
+      it was analyzing keep their earlier JS recon findings rather than having
+      them pruned. It also sizes each JS download's timeout (a tenth of it, at
+      most 30 seconds) and each source-map fetch's (a sixtieth, at least 10
+      seconds).
   jsReconTrufflehogEnabled:
     tool: js_recon
     runtime_key: "JS_RECON_TRUFFLEHOG_ENABLED"
@@ -4916,6 +5178,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: gate
     roe_parse: tighten_only
     roe_safe_value: false
     stealth: { set: false }
@@ -4935,8 +5198,12 @@ fields:
     mcp: settable
     bounds: { min: 1, max: 30 }
     meaning: >-
-      How long JS recon may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds, for JS recon's live checks: each request
+      that tests a found key with its provider, each probe of an endpoint found in
+      the JS, and the time TruffleHog gives each detector, verification included
+      (its --detector-timeout), NOT a cap on the whole run. A key check that times
+      out leaves the key's status unknown, never dead; an endpoint probe that
+      times out marks the endpoint not hittable.
   jsluiceConcurrency:
     tool: jsluice
     runtime_key: "JSLUICE_CONCURRENCY"
@@ -5045,8 +5312,12 @@ fields:
     bounds: { min: 30, max: 86400 }
     group: unbounded
     meaning: >-
-      How long jsluice may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on one jsluice run, NOT on the whole analysis:
+      jsluice runs once to extract URLs and once to extract secrets from each
+      site's downloaded JS files, and each run has this cap. A run that hits it is
+      killed and adds nothing: a cut URL run contributes no URLs for that site,
+      and a cut secrets run keeps every earlier jsluice secret finding rather than
+      pruning it. The scan goes on.
   jsluiceVerifyAcceptStatus:
     tool: jsluice
     runtime_key: "JSLUICE_VERIFY_ACCEPT_STATUS"
@@ -5096,8 +5367,9 @@ fields:
     mcp: settable
     bounds: { min: 1, max: 60 }
     meaning: >-
-      How long jsluice may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long httpx waits for one URL check when
+      jsluice's URLs are verified (httpx's -timeout), NOT a cap on the whole
+      verification run.
   jsluiceVerifyUrls:
     tool: jsluice
     runtime_key: "JSLUICE_VERIFY_URLS"
@@ -5134,6 +5406,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-
@@ -5251,12 +5524,15 @@ fields:
     phase: resource_enum
     traffic: active
     roe_capped: false
-    mcp: settable
-    roe_parse: deny
+    mcp: never
     validator: free_text
-    group: not-tuning
+    deny_reason: internal
+    group: retired
+    form_section: null
     meaning: >-
-      Scope filter: "dn" (domain), "rdn" (root domain), etc.
+      Retired: nothing reads it. Katana always crawls with field scope fqdn (see
+      the katana tool's footgun). The column is kept so an upgrade or a rollback
+      never drops data; it is closed on every surface and has no input.
   katanaTimeout:
     tool: katana
     runtime_key: "KATANA_TIMEOUT"
@@ -5268,8 +5544,11 @@ fields:
     bounds: { min: 60, max: 86400 }
     group: unbounded
     meaning: >-
-      How long katana may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      How long katana may crawl, in seconds: passed as katana's -crawl-duration
+      (its limit for crawling a target), and the whole Katana run, every seed
+      included, is stopped with its container once this value plus 60 seconds have
+      passed, or after 5 minutes with no output. A run that hits it keeps the URLs
+      katana had printed, and the scan goes on.
   kiterunnerBruteforceMethods:
     tool: kiterunner
     runtime_key: "KITERUNNER_BRUTEFORCE_METHODS"
@@ -5331,6 +5610,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: not-tuning
     meaning: >-
@@ -5401,8 +5681,10 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long kiterunner may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long httpx waits for one
+      method-detection request on an endpoint Kiterunner found (the OPTIONS
+      probe, or each method tried in bruteforce mode; httpx's -timeout), NOT a
+      cap on the whole detection run.
   kiterunnerMethodDetectionMode:
     tool: kiterunner
     runtime_key: "KITERUNNER_METHOD_DETECTION_MODE"
@@ -5455,8 +5737,13 @@ fields:
     bounds: { min: 1, max: 100000 }
     group: unbounded
     meaning: >-
-      Requests per second kiterunner sends. Capped to the engagement ceiling at
-      scan start, so a value above the ceiling is rewritten rather than refused.
+      Meant as the requests per second kiterunner sends, but it limits nothing:
+      RedAmon passes it as kr's --delay, which kr v1.0.2 (the release RedAmon runs)
+      parses and never applies, so with no RoE rate ceiling kiterunner sends as fast
+      as kiterunnerConnections and kiterunnerThreads let it. Under an RoE rate
+      ceiling (a non-zero roeGlobalMaxRps) kiterunner does not run at all, in full
+      and partial recon: it returns no endpoints and the run records a coverage gap,
+      because nothing can hold kr to the ceiling.
   kiterunnerScanTimeout:
     tool: kiterunner
     runtime_key: "KITERUNNER_SCAN_TIMEOUT"
@@ -5468,8 +5755,11 @@ fields:
     bounds: { min: 60, max: 86400 }
     group: unbounded
     meaning: >-
-      How long kiterunner may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on one Kiterunner run (one wordlist against
+      every target, in full and partial recon): kr is killed once this value plus
+      60 seconds have passed. A run that hits it adds nothing: kr's output is
+      read only once it exits, so that wordlist contributes no endpoints and the
+      run is recorded as a Kiterunner coverage gap. The scan goes on.
   kiterunnerThreads:
     tool: kiterunner
     runtime_key: "KITERUNNER_THREADS"
@@ -5496,8 +5786,9 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long kiterunner may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds: how long kr waits for the answer to one
+      request (kr's -t), NOT a cap on the whole run. The wall-clock cap for a run
+      is kiterunnerScanTimeout.
   kiterunnerWordlists:
     tool: kiterunner
     runtime_key: "KITERUNNER_WORDLISTS"
@@ -5674,6 +5965,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: gate
     deny_reason: escalation
     group: escalation
     meaning: >-
@@ -5848,6 +6140,27 @@ fields:
     bounds: { min: 0, max: 10 }
     meaning: >-
       How many times naabu retries a failed request before giving up on it.
+  naabuRunTimeout:
+    tool: naabu
+    runtime_key: "NAABU_RUN_TIMEOUT"
+    unit: seconds
+    phase: port_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 1, max: 86400 }
+    group: unbounded
+    meaning: >-
+      Wall-clock cap, in seconds, on one naabu run over every port-scan target
+      (the CONNECT scan naabu falls back to after a failed SYN scan gets its own).
+      A run that hits it is stopped with its container (not just the docker
+      client) and is not retried: the open ports naabu had written by then are
+      kept, and every target it wrote none for is recorded as not checked, so its
+      earlier findings are kept rather than pruned and none of its ports is read
+      as closed. A run cut before it wrote any port leaves no port data, as a
+      failed scan does. The scan goes on. A low naabuRateLimit, or the engagement
+      ceiling that caps it, makes the run slower, so a long target list may need
+      more than the default.
   naabuScanType:
     tool: naabu
     runtime_key: "NAABU_SCAN_TYPE"
@@ -5903,7 +6216,8 @@ fields:
     meaning: >-
       How long naabu waits for a port to answer, in MILLISECONDS. At the default
       of 10000 a full sweep of an unresponsive host is slow; below about 1000 a
-      distant host starts reading as closed.
+      distant host starts reading as closed. NOT a cap on the whole run: that is
+      naabuRunTimeout.
   naabuTopPorts:
     tool: naabu
     runtime_key: "NAABU_TOP_PORTS"
@@ -6006,8 +6320,11 @@ fields:
     bounds: { min: 30, max: 86400 }
     group: unbounded
     meaning: >-
-      How long nmap may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      nmap's own per-IP limit, in seconds (its --host-timeout): nmap gives up on
+      an IP it has spent this long on. That IP is recorded as not scanned to
+      completion, so its earlier NSE findings are kept rather than pruned, and
+      whatever nmap wrote about it is still read. RedAmon's wall-clock cap on an
+      nmap run is nmapTimeout.
   nmapParallelism:
     tool: nmap
     runtime_key: "NMAP_PARALLELISM"
@@ -6021,9 +6338,11 @@ fields:
     governor: { model: ratio, floor: 1 }
     group: not-tuning
     meaning: >-
-      How many nmap operations run at once. The memory governor scales it down
-      when the host is short of RAM, so the effective value can be below what is
-      written here.
+      How many IPs nmap scans at once, one nmap process each. The memory governor
+      scales it down when the host is short of RAM, so the effective value can be
+      below what is written here. Under an RoE request ceiling (roeGlobalMaxRps)
+      it is forced to 1, because each nmap process gets the whole ceiling as its
+      --max-rate and two at once would double it.
   nmapScriptScan:
     tool: nmap
     runtime_key: "NMAP_SCRIPT_SCAN"
@@ -6035,7 +6354,13 @@ fields:
     stealth: { set: false }
     group: not-tuning
     meaning: >-
-      Run NSE vuln scripts
+      Runs the NSE vuln scripts (nmap --script vuln). In IP mode and while
+      roeExcludedHosts is non-empty the set is `vuln and not
+      http-cross-domain-policy` and nmap runs with -n: with no reverse-DNS name
+      for the target, nmap's HTTP library follows a redirect only to the target
+      address, while http-cross-domain-policy follows redirects to any host by a
+      rule of its own. The NSE requests then send the address, not the PTR name,
+      as Host.
   nmapTimeout:
     tool: nmap
     runtime_key: "NMAP_TIMEOUT"
@@ -6047,8 +6372,11 @@ fields:
     bounds: { min: 60, max: 86400 }
     group: unbounded
     meaning: >-
-      How long nmap may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on one nmap run, which scans one IP
+      (nmapParallelism IPs at a time). A run that hits it is killed and adds
+      nothing for that IP: its output is not read, and the IP is recorded as not
+      scanned, so its earlier NSE findings are kept rather than pruned. The scan
+      goes on.
   nmapTimingTemplate:
     tool: nmap
     runtime_key: "NMAP_TIMING_TEMPLATE"
@@ -6234,7 +6562,14 @@ fields:
     meaning: >-
       Follows a redirect while running a template rather than matching on the
       redirect itself. A template that expects its payload to land on the final
-      page needs this; one matching a redirect header does not.
+      page needs this; one matching a redirect header does not. nuclei
+      -follow-redirects; same host only (-follow-host-redirects) in IP mode and
+      while roeExcludedHosts is non-empty, in both vuln-scan passes and the
+      takeover templates, and when a session is attached. The same-host flag also
+      holds a template that sets its own redirects: true. Off, -disable-redirects
+      is passed in IP mode, while roeExcludedHosts is non-empty and when a
+      session is attached, since such a template would otherwise still follow
+      its redirects to any host; otherwise no flag is passed.
   nucleiHeadless:
     tool: nuclei
     runtime_key: "NUCLEI_HEADLESS"
@@ -6408,8 +6743,12 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long nuclei may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on the takeover scan's one nuclei run (the
+      takeover and DNS templates against every candidate URL); a value under 120
+      counts as 120. A run that hits it is stopped with its container and keeps
+      the findings nuclei had already written, and every URL it was given is
+      recorded as not checked by that layer, so their hosts' earlier takeover
+      findings are kept rather than pruned. The scan goes on.
   nucleiTakeoversEnabled:
     tool: nuclei
     runtime_key: "NUCLEI_TAKEOVERS_ENABLED"
@@ -6569,9 +6908,13 @@ fields:
     bounds: { min: 1, max: 60 }
     group: egress
     meaning: >-
-      How long Origin discovery may spend before it is abandoned, in seconds. A
-      run that hits it contributes whatever it found so far rather than failing
-      the scan.
+      Per-request timeout, in seconds: how long origin discovery waits for each
+      request it sends, to its candidate sources and to the candidate origin
+      addresses it checks, NOT a cap on the whole run. Each TLS handshake gets at
+      most 5 seconds of it and each open-port pre-check a fifth of it (2 to 5
+      seconds). A source lookup that times out counts as a miss for that host
+      rather than an answer, and a candidate whose check times out is not
+      confirmed.
   originDiscoveryWorkers:
     tool: origin_discovery
     runtime_key: "ORIGIN_DISCOVERY_WORKERS"
@@ -6635,13 +6978,17 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: secret
     readable: false
     validator: free_text
     read_deny_reason: credential
     group: scope
     meaning: >-
       The secret published in the ownership TXT record. Compared against what DNS
-      returns, so it proves the scope rather than configuring a tool.
+      returns, so it proves the scope rather than configuring a tool. Each project
+      gets its own random token when it is created: a create that sends none, an
+      empty one or the old shared placeholder gets a fresh one, and nothing serves
+      a default.
   ownershipTxtPrefix:
     tool: targeting
     runtime_key: "OWNERSHIP_TXT_PREFIX"
@@ -6650,6 +6997,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     validator: free_text
     group: scope
     meaning: >-
@@ -6692,9 +7040,10 @@ fields:
     bounds: { min: 10, max: 86400 }
     group: unbounded
     meaning: >-
-      How long paramspider may spend before it is abandoned, in seconds. A run
-      that hits it contributes whatever it found so far rather than failing the
-      scan.
+      Wall-clock cap, in seconds, on one ParamSpider run, which covers one domain
+      (paramspiderWorkers domains at a time). A run that hits it is killed and
+      adds nothing for that domain: what it had printed is dropped and the run is
+      recorded as a ParamSpider failure. The scan goes on.
   paramspiderWorkers:
     tool: paramspider
     runtime_key: "PARAMSPIDER_WORKERS"
@@ -6803,9 +7152,10 @@ fields:
     bounds: { min: 1, max: 120 }
     group: attack
     meaning: >-
-      How long Path traversal may spend before it is abandoned, in seconds. A run
-      that hits it contributes whatever it found so far rather than failing the
-      scan.
+      Per-request timeout, in seconds, that the path traversal skill's prompt
+      gives the agent: its example curl probes use it as --max-time. It is
+      guidance the agent follows when it writes its commands, not a cap a tool
+      enforces, and NOT a limit on the whole attack.
   pathTraversalValidateSecretsEnabled:
     tool: path_traversal
     runtime_key: null
@@ -6828,6 +7178,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     roe_parse: deny
     readable: false
     validator: free_text
@@ -7082,6 +7433,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     group: engagement_limits
     meaning: >-
       Whether a technique that can lock a real account out is permitted. Off keeps
@@ -7096,6 +7448,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     group: engagement_record
     meaning: >-
       Whether a finding may be proven by moving data off the target. Part of the
@@ -7111,6 +7464,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     group: engagement_limits
     meaning: >-
       Whether denial-of-service techniques are permitted. Off means the DoS path is
@@ -7125,6 +7479,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     group: engagement_record
     meaning: >-
       Whether the engagement covers physical access. Recorded for the report;
@@ -7139,6 +7494,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     group: engagement_record
     meaning: >-
       Whether production systems are in scope. Off is a statement the operator
@@ -7154,6 +7510,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     group: engagement_limits
     meaning: >-
       Whether techniques aimed at people rather than systems are permitted. Off
@@ -7167,6 +7524,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     roe_parse: allow
     readable: false
     validator: free_text
@@ -7184,6 +7542,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     roe_parse: allow
     readable: false
     validator: free_text
@@ -7201,6 +7560,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     roe_parse: allow
     readable: false
     validator: free_text
@@ -7218,6 +7578,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     roe_parse: allow
     readable: false
     validator: free_text
@@ -7281,6 +7642,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     readable: false
     validator: free_text
     deny_reason: upload-managed
@@ -7302,6 +7664,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     readable: false
     validator: free_text
     read_deny_reason: document_blob
@@ -7319,6 +7682,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     readable: false
     validator: free_text
     read_deny_reason: document_blob
@@ -7336,6 +7700,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     roe_parse: allow
     readable: false
     validator: free_text
@@ -7353,6 +7718,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     group: engagement_limits
     meaning: >-
       DERIVED, never written. Engagement limits apply when there is a limit to
@@ -7374,6 +7740,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_record
@@ -7389,6 +7756,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_record
@@ -7421,6 +7789,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_limits
@@ -7436,8 +7805,9 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
-    validator: free_text
+    validator: roe_exclusion
     group: engagement_limits
     meaning: >-
       Hosts that must never be touched even though they fall inside the target
@@ -7456,6 +7826,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     values: ["brute_force", "dos", "social_engineering", "physical", "exploitation"]
     validator: free_text
@@ -7486,6 +7857,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     values: ["bloodhound_ingest", "cve_intel", "execute_amass", "execute_arjun", "execute_code", "execute_curl", "execute_ffuf", "execute_gau", "execute_guarddog", "execute_httpx", "execute_hydra", "execute_jsluice", "execute_katana", "execute_naabu", "execute_nmap", "execute_nuclei", "execute_osv_scanner", "execute_playwright", "execute_subfinder", "execute_wpscan", "google_dork", "graph_diff", "kali_shell", "metasploit_console", "mimikatz_parse", "msf_restart", "proxy_brain", "query_graph", "shodan", "tradecraft_lookup", "web_search"]
     validator: free_text
@@ -7506,6 +7878,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     bounds: { min: 0, max: 10000 }
     zero_means: literal
     group: engagement_limits
@@ -7539,6 +7912,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     group: engagement_limits
     meaning: >-
       The most severe phase the engagement permits, which bounds how far an attack
@@ -7568,6 +7942,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     readable: false
     validator: json_object
     read_deny_reason: document_blob
@@ -7586,6 +7961,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: secret
     readable: false
     validator: free_text
     read_deny_reason: document_blob
@@ -7617,6 +7993,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: never
+    share: scope
     roe_parse: allow
     values: ["no_access", "prove_access_only", "limited_collection", "full_access"]
     validator: free_text
@@ -7666,12 +8043,14 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_limits
     meaning: >-
       Days of the week on which scanning is permitted, lower-case English names.
-      Empty means every day, once the window is switched on.
+      Empty means no day: once the window is switched on, every reader refuses
+      a scan on a day the list does not name.
     form_section: "TargetSection"
   roeTimeWindowEnabled:
     tool: roe
@@ -7681,6 +8060,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     group: engagement_limits
     meaning: >-
       Whether scanning is restricted to an agreed time window. The recon pipeline
@@ -7696,12 +8076,14 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_limits
     meaning: >-
-      Local end of the permitted scanning window, as HH:MM. An end before the start
-      is read as a window that crosses midnight.
+      Local end of the permitted scanning window, as HH:MM; the end minute is
+      inside the window. An end before the start is read as a window that crosses
+      midnight.
     form_section: "TargetSection"
   roeTimeWindowStartTime:
     tool: roe
@@ -7711,6 +8093,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_limits
@@ -7725,6 +8108,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: settable
+    share: scope
     roe_parse: allow
     validator: free_text
     group: engagement_limits
@@ -7834,9 +8218,12 @@ fields:
     meaning: >-
       Requests per second the route exposure scan sends across all hosts, shared by
       every worker and counting control requests, logged-in comparisons and backup
-      reads. It runs at the same time as the other Phase A scanners (nuclei, cache
-      poisoning, GraphQL), so the load on a target is the sum of their rates. One
-      clock serves the whole run, so a Domain batch's groups never reset it.
+      reads. Under an RoE rate ceiling every request also takes a slot on the
+      ceiling's own clock, which every in-process requester shares, and Phase A runs
+      its scanners one at a time; with no ceiling it runs at the same time as the
+      other Phase A scanners (nuclei, cache poisoning, GraphQL), so the load on a
+      target is the sum of their rates. The scan's own clock serves the whole run,
+      so a Domain batch's groups never reset it.
   routeExposurePiiDetection:
     tool: route_exposure
     runtime_key: "ROUTE_EXPOSURE_PII_DETECTION"
@@ -8397,7 +8784,10 @@ fields:
     meaning: >-
       Whether this individual check runs during the security-check pass. Each
       check is one condition tested against what the earlier phases already found;
-      turning it off removes that finding class without affecting the rest.
+      turning it off removes that finding class without affecting the rest. Under
+      an RoE rate ceiling it does not run whatever this says, in full and partial
+      recon: its burst of login attempts would break the ceiling, so the run records
+      it as not checked and keeps its earlier findings.
   securityCheckOpenConsoles:
     tool: security_check
     runtime_key: "SECURITY_CHECK_OPEN_CONSOLES"
@@ -8601,9 +8991,10 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long Security checks may spend before it is abandoned, in seconds. A run
-      that hits it contributes whatever it found so far rather than failing the
-      scan.
+      Per-request timeout, in seconds: how long a security-check probe waits for
+      its answer (each HTTP request, TLS handshake, zone-transfer query and Redis
+      or SMTP probe), NOT a cap on the whole pass. A probe that times out produces
+      no finding from that check.
   securityCheckTlsExpired:
     tool: security_check
     runtime_key: "SECURITY_CHECK_TLS_EXPIRED"
@@ -9034,8 +9425,11 @@ fields:
     bounds: { min: 1, max: 120 }
     group: egress
     meaning: >-
-      How long ssrf may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-request timeout, in seconds, that the SSRF skill's prompt gives the
+      agent: its example curl probes use it as --max-time, and its internal port
+      sweep as --connect-timeout. It is guidance the agent follows when it writes
+      its commands, not a cap a tool enforces, and NOT a limit on the whole
+      attack.
   stealthMode:
     tool: pipeline
     runtime_key: "STEALTH_MODE"
@@ -9077,6 +9471,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     validator: free_text
     coerce: strip_list
     group: scope
@@ -9191,8 +9586,11 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long subjack may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on the takeover scan's one subjack run over
+      every name; a value under 60 counts as 60. A run that hits it is killed and
+      keeps the rows subjack had already written; subjack never says which names
+      it reached, so every name is recorded as not checked and keeps its earlier
+      takeover findings rather than having them pruned. The scan goes on.
   subjackSsl:
     tool: subjack
     runtime_key: "SUBJACK_SSL"
@@ -9230,8 +9628,9 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long subjack may spend before it is abandoned, in seconds. A run that
-      hits it contributes whatever it found so far rather than failing the scan.
+      Per-connection timeout, in seconds: how long subjack waits for one
+      connection (subjack's -timeout), NOT a cap on the whole run. The wall-clock
+      cap for the run is subjackRunTimeout.
   supplyChainDeepAnalysisEnabled:
     tool: supply_chain
     runtime_key: null
@@ -9328,6 +9727,7 @@ fields:
     traffic: passive
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: free_text
     group: othertarget
@@ -9398,6 +9798,7 @@ fields:
     traffic: passive
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: free_text
     group: othertarget
@@ -9412,6 +9813,7 @@ fields:
     traffic: passive
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: free_text
     group: othertarget
@@ -9426,6 +9828,7 @@ fields:
     traffic: passive
     roe_capped: false
     mcp: create_only
+    share: scope
     rescope: true
     validator: free_text
     group: othertarget
@@ -9564,6 +9967,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     validator: free_text
     coerce: strip
     group: scope
@@ -9581,6 +9985,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     group: scope
     meaning: >-
       The hard guardrail that refuses to scan a host outside the declared scope.
@@ -9595,6 +10000,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     validator: free_text
     coerce: strip_list
     group: scope
@@ -9779,8 +10185,11 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: unbounded
     meaning: >-
-      How long tlsx may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Wall-clock cap, in seconds, on the one tlsx run over every TLS target. A run
+      that hits it is stopped with its container (not just the docker client):
+      the certificates tlsx had printed by then are kept, and every target it had
+      not answered is recorded as not checked, so its earlier security-check
+      findings are kept rather than pruned. The scan goes on.
   tlsxScanMode:
     tool: tlsx
     runtime_key: "TLSX_SCAN_MODE"
@@ -9804,8 +10213,9 @@ fields:
     mcp: settable
     bounds: { min: 1, max: 60 }
     meaning: >-
-      How long tlsx may spend before it is abandoned, in seconds. A run that hits
-      it contributes whatever it found so far rather than failing the scan.
+      Per-connection timeout, in seconds: how long tlsx waits for one TLS
+      connection (tlsx's -timeout), NOT a cap on the whole run. The wall-clock cap
+      for the run is tlsxRunTimeout.
   tlsxVersionEnum:
     tool: tlsx
     runtime_key: "TLSX_VERSION_ENUM"
@@ -10214,9 +10624,11 @@ fields:
     mcp: settable
     meaning: >-
       Checks the URLs urlscan already returned for passwords, API keys, tokens and
-      JWTs written in the address. Each one becomes a Secret (source urlscan) stored
-      masked: its length and an HMAC, never the value. Such a URL is quarantined
-      whatever this switch says. No extra searches.
+      JWTs written in the address. Each one becomes a Secret (source urlscan) keyed
+      by an HMAC of its value; the value and the full URL are shown in the Secrets
+      table (the last four characters, a copy button for the rest) and never reach
+      the agent. Such a URL is quarantined whatever this switch says. No extra
+      searches.
   urlscanSensitiveFiles:
     tool: urlscan
     runtime_key: "URLSCAN_SENSITIVE_FILES"
@@ -10330,6 +10742,7 @@ fields:
     traffic: none
     roe_capped: false
     mcp: create_only
+    share: scope
     group: scope
     meaning: >-
       Requires a DNS TXT record proving control of the target before any active
@@ -10448,9 +10861,10 @@ fields:
     mcp: settable
     bounds: { min: 1, max: 30 }
     meaning: >-
-      How long Vhost / SNI enumeration may spend before it is abandoned, in
-      seconds. A run that hits it contributes whatever it found so far rather than
-      failing the scan.
+      Per-probe timeout, in seconds: how long each virtual-host probe waits to
+      connect (curl's --connect-timeout), with three times this value for the
+      whole request (--max-time), NOT a cap on the whole run. A probe that times
+      out counts as no answer for that candidate name.
   vhostSniUseDefaultWordlist:
     tool: vhost_sni
     runtime_key: "VHOST_SNI_USE_DEFAULT_WORDLIST"
@@ -10474,9 +10888,11 @@ fields:
     mcp: settable
     group: not-tuning
     meaning: >-
-      Pull hostnames from existing Subdomain, ExternalDomain, TLS SAN list, CNAME
-      targets and reverse-DNS PTR records resolving to each target IP. Highest
-      signal source. Default true.
+      Pull hostnames already known on each target IP (Subdomain, ExternalDomain,
+      TLS SAN list, CNAME targets). In an IP-mode project they are the hostnames
+      the run recorded on that IP (reverse DNS, certificates, passive DNS), never
+      tried on a shared CDN edge IP, and none when Hostnames on target IPs is
+      ip_only (forced off). Highest signal source. Default true.
   virusTotalEnabled:
     tool: virustotal
     runtime_key: "VIRUSTOTAL_ENABLED"
@@ -10787,10 +11203,14 @@ fields:
     zero_means: unlimited
     group: attack
     meaning: >-
-      Requests per second the web-cache-poisoning scan sends to any ONE host. ZERO
-      MEANS UNLIMITED, so 0 is the most aggressive value available and not the
-      safest. Under an engagement ceiling a 0 here is rewritten to the ceiling at
-      scan start.
+      Requests per second of the web-cache-poisoning breadth sweep (WCVS -rr).
+      Despite the name it is NOT per host: it is one rate for the whole WCVS
+      process, shared by every thread and URL. ZERO MEANS UNLIMITED, so 0 is the
+      most aggressive value available and not the safest. Under an engagement
+      ceiling a 0 here is rewritten to the ceiling at scan start, and WCVS then
+      runs one thread at a rate below the ceiling (ceiling - 1 from 2 rps up,
+      1 / (2 + 1/ceiling) below 2), or at this value when it is lower, because
+      its cache-buster checks can send two requests together.
   webCachePoisonMinConfidence:
     tool: web_cache_poison
     runtime_key: "WEB_CACHE_POISON_MIN_CONFIDENCE"
@@ -10830,9 +11250,12 @@ fields:
     bounds: { min: 1, max: 86400 }
     group: attack
     meaning: >-
-      How long Web cache poisoning may spend before it is abandoned, in seconds. A
-      run that hits it contributes whatever it found so far rather than failing
-      the scan.
+      Wall-clock cap, in seconds, on the WCVS breadth sweep over every target URL,
+      NOT on the native confirmation that follows (its per-request timeout is
+      webCachePoisonTimeoutPerReq). A sweep that hits it is stopped with its
+      container; the candidates in whatever report WCVS had written still go on to
+      confirmation, and every target host keeps its earlier cache-poisoning
+      findings rather than having them pruned.
   webCachePoisonTimeoutPerReq:
     tool: web_cache_poison
     runtime_key: "WEB_CACHE_POISON_TIMEOUT_PER_REQ"
@@ -10922,6 +11345,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
+    share: secret
     validator: http_header
     group: headers
     meaning: >-

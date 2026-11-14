@@ -62,7 +62,7 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(vs, "is_docker_running", lambda: True)
     monkeypatch.setattr(vs, "pull_nuclei_docker_image", lambda image: True)
     monkeypatch.setattr(vs, "ensure_templates_volume", lambda image, auto: True)
-    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd: ([], ["www.example.com"], {}))
+    monkeypatch.setattr(vs, "extract_targets_from_recon", lambda rd, *_a, **_k: ([], ["www.example.com"], {}))
     monkeypatch.setattr(vs, "build_target_urls",
                         lambda h, i, rd, scan_all_ips=False,
                         admission_report=None, declared_report=None: ["https://www.example.com"])
@@ -153,7 +153,7 @@ class TestThePruneKeepsUncheckedNucleiFindings:
                 return True
 
             def prune_unseen_findings(self, user_id, project_id, sources, since, keep_hosts=(),
-                                      keep_unproven=False):
+                                      keep_unproven=False, *, only_hosts=None, types=None, exclude_types=None):
                 prunes.append(list(sources))
 
         monkeypatch.setattr("graph_db.Neo4jClient", _Graph())

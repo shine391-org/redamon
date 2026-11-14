@@ -6,6 +6,7 @@
  */
 import { describe, test, expect, vi, beforeEach } from 'vitest'
 import neo4j from 'neo4j-driver'
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProject()))
 vi.mock('@/lib/access', () => ({ guardProject: vi.fn().mockResolvedValue(null) }))
 
 const runCalls: string[] = []
@@ -65,5 +66,14 @@ describe('Chain Findings Node ID', () => {
     ]
     const body = await (await route.GET(request('p1'))).json()
     expect(body.topFindings.map((f: { nodeId: unknown }) => f.nodeId)).toEqual(['4711', null])
+  })
+})
+
+describe('Chain summary steps', () => {
+  test('a chain step joins on the chain id, the tenant and the project, never the id alone', async () => {
+    await route.GET(request('p1'))
+    const summary = runCalls.find(c => c.includes('MATCH (ac:AttackChain {project_id: $pid})') && c.includes('ChainStep'))!
+    expect(summary).toContain('OPTIONAL MATCH (step:ChainStep {chain_id: ac.chain_id, user_id: ac.user_id, project_id: $pid})')
+    expect(summary).not.toMatch(/ChainStep \{chain_id: ac\.chain_id\}/)
   })
 })

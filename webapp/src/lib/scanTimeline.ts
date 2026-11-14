@@ -26,6 +26,7 @@ import {
   defaultVersionLabel,
   type ScanVersionRow,
 } from '@/lib/scanSnapshot'
+import { CurrentVersionMovedError } from '@/lib/projectGraphLock'
 
 export type ScanMode = 'new' | 'overwrite'
 export type ScanTrigger = 'manual' | 'scheduled'
@@ -179,11 +180,14 @@ const ROTATE_ATTEMPTS = 4
 /**
  * Demote `demoteVersionId` and open the next version, atomically.
  *
- * Two writers can read the same max(seq) and both try to create seq+1 (a
- * double-clicked Start, or a scan racing "save current as a version"). The
- * `@@unique([projectId, seq])` constraint is what keeps version numbering from
- * forking - but the loser used to surface as a 500 AFTER its snapshot had already
- * been frozen. Retrying with a recomputed seq turns that race into a queue.
+ * The scan start and "save current as a version" both read the current version,
+ * freeze it, then rotate; the project graph lock (projectGraphLock.ts) keeps them
+ * from interleaving in this process. Two guards stay for a writer the lock does
+ * not see. The demote matches only a version that is still current: a writer
+ * that read the same current and lost the race gets CurrentVersionMovedError
+ * rather than minting a second current version. And a seq taken under
+ * `@@unique([projectId, seq])` is retried with a recomputed seq, rather than
+ * failing after the snapshot was already frozen.
  */
 export async function rotateToNextVersion(
   projectId: string,
@@ -194,7 +198,11 @@ export async function rotateToNextVersion(
     const nextSeq = await nextVersionSeq(projectId)
     try {
       return await prisma.$transaction(async tx => {
-        await tx.scanVersion.update({ where: { id: demoteVersionId }, data: { isCurrent: false } })
+        const demoted = await tx.scanVersion.updateMany({
+          where: { id: demoteVersionId, isCurrent: true },
+          data: { isCurrent: false },
+        })
+        if (demoted.count === 0) throw new CurrentVersionMovedError(demoteVersionId)
         return tx.scanVersion.create({
           data: {
             projectId,
@@ -339,7 +347,9 @@ export async function persistPlanManifest(input: {
  * Record a non-full-recon scan that the orchestrator just accepted.
  *
  * Deliberately never throws: history is a side effect of starting a scan, and a
- * failure to write it must not fail the start the operator asked for.
+ * failure to write it must not fail the start the operator asked for. Returns
+ * the row's id, or null when it could not be written; the queue links its row
+ * to it so the same scan is not listed twice.
  */
 export async function recordScanStart(input: {
   projectId: string
@@ -347,13 +357,15 @@ export async function recordScanStart(input: {
   runId?: string
   initiatedByUserId?: string | null
   scheduleId?: string | null
+  /** Defaults to 'scheduled' with a scheduleId, else 'manual'. */
+  trigger?: ScanTrigger
   /** The roots the run covers (partial recon reports them). */
   targets?: string[]
   /** Read before the orchestrator was called, so a replace cannot misattribute the run. */
   roeTextSha256?: string | null
-}): Promise<void> {
+}): Promise<string | null> {
   try {
-    await createScanJob({
+    const job = await createScanJob({
       projectId: input.projectId,
       versionId: null,
       kind: input.kind,
@@ -361,13 +373,15 @@ export async function recordScanStart(input: {
       targets: input.targets ?? [],
       roeTextSha256: input.roeTextSha256 ?? null,
       // These kinds do not version the graph, so there is no mode to record.
-      trigger: input.scheduleId ? 'scheduled' : 'manual',
+      trigger: input.trigger ?? (input.scheduleId ? 'scheduled' : 'manual'),
       mode: null,
       initiatedByUserId: input.initiatedByUserId ?? null,
       scheduleId: input.scheduleId ?? null,
     })
+    return job.id
   } catch (err) {
     console.error(`[scanTimeline] could not record ${input.kind} start (continuing):`, err)
+    return null
   }
 }
 
@@ -438,13 +452,15 @@ export async function reconcileScanJobStatus(
 }
 
 /**
- * Close out the run-keyed kinds (partial_recon, ai_attack) from the one list poll
- * the UI already makes, instead of a status call per run.
+ * Close out the run-keyed kinds (partial_recon, ai_attack, trufflehog) from the
+ * one list poll the UI already makes, instead of a status call per run.
  *
  * Only an explicitly TERMINAL live status closes a row. A run that has simply
  * disappeared from the orchestrator's list is left alone: it also disappears when
  * the orchestrator restarts, and calling that "completed" would invent an outcome.
- * Such a row stays `running` until something else reconciles it.
+ * Such a row is closed by the partial_recon / ai_attack stop route
+ * (recordRunStopped) or, for every run-keyed kind, by the reaper's run-keyed
+ * sweep (api/internal/job-queue/reconcile).
  */
 export async function reconcileRunScanJobs(
   projectId: string,
@@ -481,6 +497,36 @@ export async function reconcileRunScanJobs(
     }))
   } catch (err) {
     console.error(`[scanTimeline] ${kind} run reconcile failed (continuing):`, err)
+  }
+}
+
+/**
+ * Close a run-keyed row from the orchestrator's answer to a Stop.
+ *
+ * The orchestrator drops a stopped run from its listing once the drain ends, so
+ * the list reconcile never sees it end: this answer is the last word on it.
+ * `stopping`, and `idle` (a run it no longer has), are canceled; a run that had
+ * already ended keeps its real outcome. Never throws: the stop itself worked.
+ */
+export async function recordRunStopped(
+  projectId: string,
+  kind: string,
+  runId: string,
+  orchestratorStatus: unknown
+): Promise<void> {
+  const mapped =
+    orchestratorStatus === 'completed' ? 'completed'
+    : orchestratorStatus === 'error' ? 'failed'
+    : orchestratorStatus === 'stopping' || orchestratorStatus === 'idle' ? 'canceled'
+    : null
+  if (!mapped || !runId) return
+  try {
+    await prisma.scanJob.updateMany({
+      where: { projectId, kind, runId, status: 'running' },
+      data: { status: mapped, finishedAt: new Date() },
+    })
+  } catch (err) {
+    console.error(`[scanTimeline] could not close the stopped ${kind} run (continuing):`, err)
   }
 }
 

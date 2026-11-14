@@ -21,10 +21,11 @@
  *    preset audits its settings, which is the only undo there is.
  */
 import prisma from '@/lib/prisma'
+import { ACTIVATION_STATE_TRANSFERRING, TRANSFER_IN_PROGRESS_MESSAGE, holdOf } from '@/lib/graphHold'
 import { writeAudit } from '@/lib/audit'
 import { canonicalJson } from '@/lib/fingerprint'
 import { RECON_PRESETS, getPresetById, type ReconPreset } from '@/lib/recon-presets'
-import { assertMcpProjectAccess, requireScope } from '@/lib/mcpAuth'
+import { assertMcpProjectAccess, mcpProjectAccess, requireScope } from '@/lib/mcpAuth'
 import { assertReadableSelect } from '@/lib/mcpReadableFields'
 import { describeLiveGraphWriters } from '@/lib/graphWriters'
 import { PRESET_FIELD_KEYS, extractPresetSettings } from '@/lib/project-preset-utils'
@@ -32,6 +33,8 @@ import { auditableKey } from '@/lib/reconSettings/filter'
 import { field } from '@/lib/reconSettings/registry'
 import { validateValue } from '@/lib/reconSettings/validators'
 import { writeFireteamAudit } from '@/lib/reconSettings/crossField'
+import { ipHostnameModeOf } from '@/lib/scopeGroups'
+import { IP_PRESETS_RELYING_ON_HOSTNAMES } from '@/lib/recon-presets/targeting'
 import {
   DefaultsUnavailable,
   MAX_USER_PRESETS,
@@ -51,7 +54,9 @@ import {
 import { clearPresetBadges, renamePresetBadges } from '@/lib/reconPresets/badges'
 import { McpToolError } from '@/lib/mcp/errors'
 import { enforceRate, type McpContext } from '@/lib/mcp/tools'
-import { busyHint, casVersion, countQueuedJobsNeedingReview, describeAffectedSchedules } from '@/lib/mcp/writeTools'
+import {
+  busyHint, casVersion, countQueuedJobsNeedingReview, describeAffectedSchedules, refuseSettingsChange,
+} from '@/lib/mcp/writeTools'
 
 /** How many changed keys a response lists before it only counts them. */
 const UPDATE_DIFF_CAP = 50
@@ -213,7 +218,7 @@ async function assertNameFree(userId: string, name: string, exceptId?: string) {
 
 /** A project's preset fields, minus upload paths that only that project may read. */
 async function captureFromProject(ctx: McpContext, projectId: string) {
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  await assertMcpProjectAccess(ctx.token, projectId)
   const select = Object.fromEntries(PRESET_FIELD_KEYS.map(k => [k, true]))
   assertReadableSelect(select, 'create_recon_preset')
   const row = await prisma.project.findUnique({ where: { id: projectId }, select })
@@ -490,7 +495,18 @@ export async function deleteReconPreset(
 // --- apply_recon_preset ----------------------------------------------------------------
 
 /** Read for the apply, beside every preset field: the badge, and what the target is. */
-const APPLY_CONTEXT_FIELDS = ['loadedPreset', 'ipMode', 'domainBatchMode'] as const
+const APPLY_CONTEXT_FIELDS = ['loadedPreset', 'ipMode', 'domainBatchMode', 'ipHostnameMode'] as const
+
+export { IP_PRESETS_RELYING_ON_HOSTNAMES }
+
+function hostnameModeNote(preset: ResolvedPreset, row: Record<string, unknown>): string | undefined {
+  if (preset.source !== 'builtin' || !IP_PRESETS_RELYING_ON_HOSTNAMES.has(preset.builtin.id)) return undefined
+  if (row.ipMode !== true || ipHostnameModeOf(row.ipHostnameMode) !== 'ip_only') return undefined
+  return `'${preset.name}' expects hostnames found on the target IPs (reverse DNS), but this project's ` +
+    'Hostnames on target IPs is ip_only, so no hostname is looked up and none is recorded. A preset ' +
+    'never changes that mode: to record names, set ipHostnameMode to record_only (or a scanning mode) ' +
+    'with update_project_scope.'
+}
 
 function targetMismatch(preset: ResolvedPreset, row: Record<string, unknown>): string | undefined {
   if (preset.source !== 'builtin') return undefined
@@ -511,7 +527,8 @@ export async function applyReconPreset(
   args: { projectId: string; presetId: string; dryRun?: boolean; expectedUpdatedAt?: string }
 ) {
   requireScope(ctx.token, 'preset:apply')
-  await assertMcpProjectAccess(ctx.token.userId, args.projectId)
+  // preset:apply (W); a collaborator's apply is judged like the project save.
+  const { access } = await mcpProjectAccess(ctx.token, args.projectId, 'W')
   enforceRate(ctx, 'write')
 
   // The LIVE writers, not only the scans: the in-app agent re-reads project
@@ -547,12 +564,16 @@ export async function applyReconPreset(
 
   const select = {
     ...Object.fromEntries([...PRESET_FIELD_KEYS, ...APPLY_CONTEXT_FIELDS].map(k => [k, true])),
-    updatedAt: true,
+    updatedAt: true, activationState: true, activationStartedAt: true,
   }
   assertReadableSelect(select, 'apply_recon_preset')
   const row = await prisma.project.findUnique({ where: { id: args.projectId }, select }) as
     (Record<string, unknown> & { updatedAt: Date }) | null
   if (!row) throw new McpToolError('Project not found', 'not_found')
+  // A transfer clears the old owner's providers and templates from the row (step 5.12): no preset meanwhile.
+  if (holdOf(row as { activationState?: string; activationStartedAt?: Date | null }) === ACTIVATION_STATE_TRANSFERRING) {
+    throw new McpToolError(TRANSFER_IN_PROGRESS_MESSAGE, 'project_transfer_in_progress')
+  }
 
   const application = computePresetApplication(row, preset.settings, defaults, preset)
   const problem = await validateApplication(application, row, args.projectId, ctx.token.userId)
@@ -573,7 +594,11 @@ export async function applyReconPreset(
     )
   }
 
+  // Judged before the dry run answers, so a dry run tells a collaborator what applying would be refused.
+  refuseSettingsChange(row, { ...application.data, loadedPreset: application.loadedPreset }, access, 'preset:apply')
+
   const mismatch = targetMismatch(preset, row)
+  const hostnameNote = hostnameModeNote(preset, row)
   const report = {
     preset: { id: preset.id, source: preset.source, name: preset.name },
     changedCount: application.changed.length,
@@ -583,6 +608,7 @@ export async function applyReconPreset(
     keptAsIs: application.keptAsIs,
     unchangedCount: application.unchangedCount,
     ...(mismatch ? { targetMismatch: mismatch } : {}),
+    ...(hostnameNote ? { hostnameModeNote: hostnameNote } : {}),
   }
 
   if (args.dryRun) {

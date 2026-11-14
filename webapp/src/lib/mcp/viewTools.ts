@@ -28,7 +28,9 @@ import { assertViewInProject } from '@/lib/mcp/childAccess'
 import { execCypher } from '@/lib/mcp/graphClient'
 import { enforceRate, guardGraphResult, type McpContext } from '@/lib/mcp/tools'
 import { assertReadableSelect } from '@/lib/mcpReadableFields'
-import { type ScopeGroup, resolveScopeGroups } from '@/lib/scopeGroups'
+import {
+  IP_HOSTNAME_SELECT, type ScopeGroup, ipHostnamePolicySummary, resolveScopeGroups,
+} from '@/lib/scopeGroups'
 import { viewMayNeedUpdate } from '@/lib/graphViewScope'
 
 export const VIEWS_MAX = 100
@@ -53,7 +55,7 @@ async function viewsNeedingUpdate(projectId: string, groups: readonly ScopeGroup
 export async function listGraphViews(ctx: McpContext, projectId: string) {
   requireScope(ctx.token, 'recon:read')
   enforceRate(ctx, 'read')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
+  await assertMcpProjectAccess(ctx.token, projectId, 'R')
 
   const views = await prisma.graphView.findMany({
     where: { projectId },
@@ -63,13 +65,19 @@ export async function listGraphViews(ctx: McpContext, projectId: string) {
   })
   // A view written for a Domain the graph no longer has (WEB-30). The helper
   // reads the queries itself and hands back only view ids.
-  const scopeSelect = { ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true }
+  const scopeSelect = {
+    ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true,
+    ...IP_HOSTNAME_SELECT,
+  }
   assertReadableSelect(scopeSelect, 'list_graph_views')
   const project = await prisma.project.findUnique({ where: { id: projectId }, select: scopeSelect })
   const stale = await viewsNeedingUpdate(projectId, project ? resolveScopeGroups(project).groups : [])
 
   return {
     projectId,
+    // An IP project's names are recorded or scanned by its hostname policy, so a
+    // view over hostnames reads differently per mode.
+    ...(project?.ipMode ? { hostnamePolicy: ipHostnamePolicySummary(project) } : {}),
     views: views.map(v => ({
       viewId: v.id,
       name: v.name,
@@ -107,7 +115,11 @@ export async function runGraphView(ctx: McpContext, projectId: string, viewId: s
 
   // Scoped by projectId in the lookup rather than by trusting `view.projectId`
   // afterwards, so a foreign id is the same flat answer as a missing one.
-  const view = await assertViewInProject(ctx.token.userId, projectId, viewId)
+  // `R*`: a stored query can return attack-chain step content (raw data) in any
+  // column, and no rule over the answer tells it apart (graphReadView.ts), so on
+  // a shared project a view runs only for a share with Raw data & files.
+  const view = await assertViewInProject(ctx.token, projectId, viewId, 'R*')
+  const project = { id: projectId, userId: view.ownerId }
 
   const cypher = (view.cypherQuery ?? '').trim()
   if (!cypher) {
@@ -119,7 +131,7 @@ export async function runGraphView(ctx: McpContext, projectId: string, viewId: s
 
   let result
   try {
-    result = await execCypher(ctx.token.userId, projectId, cypher)
+    result = await execCypher(project.userId, projectId, cypher)
   } catch (err) {
     // A refusal here is usually not a broken tool, and saying so is the
     // difference between the operator fixing the view and concluding MCP is
@@ -140,7 +152,7 @@ export async function runGraphView(ctx: McpContext, projectId: string, viewId: s
     throw err
   }
 
-  const guarded = guardGraphResult(result, ctx, projectId, 'run_graph_view')
+  const guarded = guardGraphResult(result, ctx, project, 'run_graph_view')
   return {
     projectId,
     view: { viewId: view.id, name: view.name },

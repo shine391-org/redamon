@@ -4,7 +4,9 @@ RedAmon can expose itself to **external AI agents** over the Model Context
 Protocol. A customer's own agent, an MCP-capable client, or a scripted pipeline
 connects in, authenticates as **one RedAmon user**, and can do three things
 scoped to that user's own projects: start a full recon pipeline, change a narrow
-set of recon tuning settings, and query the attack-surface graph.
+set of recon tuning settings, and query the attack-surface graph. A token that
+opts in also reads the projects other people shared with its user (see "Shared
+projects reach a token only when it opts in").
 
 > **Two MCP features, opposite directions.** Do not confuse them.
 >
@@ -71,7 +73,7 @@ set of recon tuning settings, and query the attack-surface graph.
 | `mute_findings` | Mute 1-5000 findings with a reason. Never a proven or kept-visible one, never over an existing mute; no cap on a token's total; stamped `muted_channel=mcp` + token prefix. | `triage:mute` |
 | `unmute_findings` | Unmute 1-5000 findings from the muted list, writing the Mute Rules exemption FIRST. A rule's mute only with `includeRuleMutes`, never during a recon scan. | `triage:mute` |
 | `search_muted_findings` | Page every muted finding with the Muted Nodes filters (who muted, rule, token, text), with exact facets. The only source of a muted finding's id. | `triage:read` |
-| `update_project_scope` | Change an existing project's eight target LISTS (batch hosts, GitHub org/repos, GVM strategy, supply-chain org/repo/ref/scope). Guardrail on every listed host, scan root and registrable domain, and the refusal names the host; a third-party widening (a host the old list did not admit) needs an authorization record. | `project:rescope` (+ `engagement:authorize` to pass `authorization`) |
+| `update_project_scope` | Change an existing project's target LISTS (batch hosts, GitHub org/repos, GVM strategy, supply-chain org/repo/ref/scope, and an IP project's hostname policy: `ipHostnameMode`, its include/exclude filters, passive expansion, the scan_all confirmation and the two caps). Guardrail on every listed host, scan root, registrable domain and hostname include entry, and the refusal names the host; a third-party widening (a host the old list did not admit, a hostname policy that scans more) needs an authorization record, and `scan_all` is refused on a third-party engagement outright. | `project:rescope` (+ `engagement:authorize` to pass `authorization`) |
 
 **Deliberately not exposed:** the agent chat, partial recon, project
 delete/import, secrets and LLM keys, re-pointing an existing project's target
@@ -250,6 +252,12 @@ Agent-side bounds (the agent **does** have an `env_file`, so `.env` reaches it):
   discarding the current graph.
 - **An Agent Profile picks the starting permission set** (§3.1). It is a label
   and a suggestion, never an authorization input.
+- **With `RBAC_PERMISSIONS_ENABLED` on, you tick only what you may do yourself**
+  (§6, "Your own permissions cap every token"): a scope whose RedAmon permission
+  you lack is shown disabled, tagged "limited by your permissions" with the
+  permission it needs, and the mint refuses it before asking for your password.
+  Minting at all needs `self:mcp_tokens` (gone for everyone while
+  `MCP_SERVER_ENABLED` is off).
 - **`triage:write` is the verdict write**, and a verdict cannot be undone from
   this surface except by another verdict. It writes
   `triage_source = 'human'` deliberately: a third provenance value would make
@@ -559,20 +567,105 @@ tokens. Every project-scoped tool calls an ownership check first, and a project
 that does not exist and one owned by someone else give the **same** answer, so a
 token holder cannot enumerate other users' project ids.
 
-That check deliberately does **not** honour `ACCESS_ENFORCE`. The shared
-browser-facing guard degrades an ownership violation to a logged warning when
-`ACCESS_ENFORCE=0`; on a credentialed, internet-reachable surface that would be a
-cross-tenant data breach toggled by an environment variable.
+That check takes the token's user id, never a browser session or the act-as
+cookie. The browser-side *writers* that produce some of the rows those reads
+return - saved graph views, remediations, queued jobs - answer 404 for another
+user's project too: the shared browser guard has no log-only mode
+(`ACCESS_ENFORCE` is ignored), so a different user cannot plant a row in this
+project for a token to execute later through `run_graph_view`.
 
-**`ACCESS_ENFORCE=0` and `MCP_SERVER_ENABLED=true` are not a supported
-combination**, and this is a known, accepted asymmetry rather than a fix
-pending. The hard check above covers the READ side. The browser-side *writers*
-that produce some of the rows those reads return - saved graph views,
-remediations, queued jobs - authorise with the shared guard, which in that mode
-degrades to log-and-allow. The sharpest case is a saved graph view: a different
-user could plant a row in this project and an MCP token would later execute it
-through `run_graph_view`. The guarantee on the read side cannot be stronger than
-the write that created the row.
+### Your own permissions cap every token
+
+A token is a machine acting for one person, so it never does more than that
+person could. With `RBAC_PERMISSIONS_ENABLED` on (identity switch on too), each
+scope maps onto the RedAmon permissions whose registry entry names it
+(`webapp/src/lib/mcp/scopePermissions.ts`; `recon:read` needs `recon:read` and
+`graph:read`, `kali:exec` needs `agent:kali_exec`, and so on), and a scope needs
+ALL of them; a scope no permission maps to is never usable.
+
+- **Mint and widen.** A scope the owner cannot use is refused with 403
+  `{error, code: 'forbidden', permission, scope}`, read fresh (a credential is
+  being granted), after the body checks and before the password, so it spends
+  no step-up attempt. A widening edit asks only about the scopes it adds;
+  narrowing and revoking are never refused.
+- **Every call.** `resolveMcpToken` keeps only the minted scopes the owner can
+  use now (`usableScopes`): a set change, a deny override, an instance cap or a
+  disabled account stops the token's next call, within the authorization cache
+  bound, with the usual "This token is missing the required scope" error, and
+  the scope comes back with the permission. The token row is never rewritten.
+  If the owner's permissions cannot be read the call is refused (JSON-RPC
+  -32603 / HTTP 500) and the webapp logs `[rbac] mcp_scope_cap_failed`; it never
+  falls back to the minted scopes.
+- **The token screen.** `GET /api/users/[id]/mcp-tokens` adds
+  `ungrantableScopes` (scope -> the permissions it lacks) with the switch on;
+  the scope checklist, the Agent Profile ticks and the onboarding pack skip
+  those scopes.
+- **No act-as.** A token's owner's own permissions decide, never an admin's
+  who acts as them; minting stays self-only.
+
+With the switch off nothing is read and the minted scopes are the usable ones,
+as before.
+
+### Shared projects reach a token only when it opts in
+
+With project sharing in force (`RBAC_SHARING_ENABLED` and Root's
+`sharingPolicy.enabled`), `McpAccessToken.includeSharedProjects` and
+`projectAllowlist` decide whether a token also reaches the projects shared with
+its user (step 4.10, SH-42). Every existing token keeps both at their defaults
+(off, empty) and reaches only its owner's projects.
+
+- **The check.** `mcpProjectAccess(token, projectId, needed)` / `assertMcpProjectAccess`
+  (`webapp/src/lib/mcpAuth.ts`) ask `projectAccess()` for the token's user. The
+  owner reaches every level. Anyone else's project is admitted only through a
+  live share (`via: 'share'`; oversight and break-glass never reach a token),
+  only when the token opted in, and only when its allowlist is empty or names
+  the project. Then the share must meet the tool's level: `R` for the read
+  tools, `R*` for raw Cypher (`query_graph` with `cypher`) and `run_graph_view`
+  (an arbitrary answer can carry attack-chain step content, which is raw data),
+  and for the write tools the level of the permission behind them, as the app's
+  route asks it (step 5.2, with write sharing in force): `W` for
+  `update_recon_settings`, `apply_recon_preset`, `set_finding_verdict`,
+  `submit_finding_review`, `mute_findings` and `unmute_findings`; `W+S` (Run
+  scans) for `start_recon`, `stop_recon`, `queue_recon` and `cancel_queued_scan`;
+  `M` (Manage) for `update_project_scope` and `list_engagement_authorizations`;
+  `W+A` (Use AI agent) for `start_triage_run` / `stop_triage_run` (the run reads
+  the owner's graph and names the token's user as its person, `actor_user_id`,
+  whom the webapp checks again and records as spending the owner's model, step
+  5.10); `W+X` (Exploitation & shells) for `kali_exec`, `kali_output` and
+  `kali_cancel` (with the `kali:exec` scope, which needs `agent:kali_exec`, and
+  the project's own sandbox opt-in; the sandbox is shared by every project on the
+  server, as the share dialog's notice says). The owner's alone:
+  `attach_engagement_authorization` (and `update_project_scope`'s
+  `authorization`) and capturing a project into a preset. A collaborator's settings, preset and scope changes are
+  judged key by key as the project save judges them (step 5.1b). A level
+  shortfall answers its own message naming the toggle the share lacks
+  (`McpLevelDenied`, audited `level_denied`); a project the token does not reach
+  is still `Project not found`. A revoked or expired share fails the next call
+  (nothing is cached).
+- **The tenant.** Every graph, finding, mute and triage read passes the
+  project's owner (the check's `userId`) to the agent, never the token's user,
+  and the result check holds the rows to the owner.
+- **What a reader does not get.** `query_graph` with `question` is refused (it
+  spends the owner's provider key: the browser's `agent:assistants`, `W+A`);
+  `get_recon_settings` drops the `share: secret` columns (the custom header
+  lists); `preflight_scope_check` withholds the authorization record
+  (`authorizationWithheld: true`; `engagement.hasAuthorization` still says one
+  exists); `list_engagement_authorizations` needs Manage, as the app's list asks
+  `M`.
+- **`list_projects`.** Owned projects, plus the live shares when the token
+  opted in (narrowed by the allowlist), each row with `myAccess` while the
+  sharing switch is on.
+- **Agent in the Loop.** The project list a driver sends the agent is the
+  projects where its user may use the loop (step 5.10): owned ones, and with the
+  opt-in (narrowed by the allowlist) the shared ones where `agent:loop`'s `W+A`
+  holds. The broker serves only the steps of runs that user started, so on a
+  shared project a driver never claims the owner's or another collaborator's
+  steps; approvals stay a person's in the app.
+- **Mint and edit.** The token screen offers **Include projects shared with me**
+  and the shared projects to limit it to, only while `/api/auth/me` reports
+  sharing in force. Opting in, emptying the allowlist or naming another project
+  is a widening (the mint's password, self-only); opting out or naming fewer
+  narrows. With the switch off the routes neither read nor list the two fields.
 
 ### The route is bearer-only
 
@@ -613,9 +706,9 @@ may write:
 
 | Disposition | Count | What it means |
 | --- | --- | --- |
-| `settable` | 673 | write at any time through `update_recon_settings` |
-| `create_only` | 19 | the engagement scope: written once by `create_project`, refused by name afterwards |
-| `never` | 49 | not a pipeline parameter at all; refused with its class. 20 of these are the engagement RECORD (`engagement-record`); the record's uploaded RoE document and its parse are 5 more, `upload-managed` |
+| `settable` | 703 | write at any time through `update_recon_settings` |
+| `create_only` | 26 | the engagement scope: written once by `create_project`, refused by name by `update_recon_settings`; the 15 marked `rescope: true` (the target lists, below) move only through `update_project_scope` |
+| `never` | 53 | not a pipeline parameter at all; refused with its class. 20 of these are the engagement RECORD (`engagement-record`); the record's uploaded RoE document and its parse are 5 more, `upload-managed` |
 
 There used to be a fourth, `tighten_only`, holding the Rules of Engagement under
 a write-time direction rule. It is deleted rather than migrated. The rule bought
@@ -623,13 +716,15 @@ the appearance of a guarantee and not the guarantee: five of the fields it
 covered - the whole time window - accepted a WIDENING while reporting a
 tightening, because `narrow` has no machine-checkable direction.
 
-What replaced it is that the engagement splits in two. Its 15 LIMITS - the
+What replaced it is that the engagement splits in two. Its 14 LIMITS - the
 rate ceiling, the never-touch hosts, the scanning window, the agent's denylists -
-are ordinary `settable` fields in the `engagement_limits` group, reachable from
+are ordinary `settable` fields in the `engagement_limits` group (whose 15th
+field, `roeEnabled`, is derived from them and never written: `deny_reason: derived`), reachable from
 the project form and from `update_recon_settings` alike, in either direction.
 What makes them safe is that every one is ENFORCED at scan start whatever the
-setting says. Its 24 RECORD columns - the client, the contacts, the dates,
-the uploaded document - are `never`, with `deny_reason: engagement-record`: a
+setting says. Its 25 RECORD columns - the client, the contacts, the dates,
+the uploaded document - are `never`, with `deny_reason: engagement-record` (20)
+or `upload-managed` (the document and its parse, 5): a
 person writes them, a model reads them, nothing enforces them, and they carry a
 third party's personal data.
 
@@ -737,17 +832,25 @@ badge. The unversioned digests written before (over the field set before and
 after `mcpKaliExecEnabled` and `updateGraphDb` left presets) are still accepted:
 that is the backfill, with no migration step to run.
 
-**Rescope.** `update_project_scope` reopens eight `create_only` fields, the
-registry's `rescope: true`, which are the target lists the project form already
-lets a person edit after creation. The target domain, the address list, the
-targeting mode, ownership verification and the target guardrail stay refused
-whatever the token holds.
+**Rescope.** `update_project_scope` reopens the `create_only` fields the
+registry marks `rescope: true`, which are the target lists the project form
+already lets a person edit after creation: a batch project's host list, the
+other scanners' targets (GitHub, GVM, supply chain) and an IP project's hostname
+policy (`ipHostname*`: the mode, the include/exclude filters, passive expansion,
+the scan_all confirmation and the two caps). The target domain, the address
+list, the targeting mode, ownership verification and the target guardrail stay
+refused whatever the token holds.
 
-A batch that gains a host or wildcard entry pauses every enabled `ScanSchedule`
-of the project in the same transaction (`pausedSchedules` in the result,
-`pausedScheduleIds` in the audit). A scheduled run is a full recon of the whole
-batch that nobody watches start, so it must not be the first thing to reach a
-host an agent added; a person resumes the schedules in the Scans tab. A
+A batch that gains a host or wildcard entry, or a hostname policy that widens (a
+mode that scans more names, an include entry added, an exclude entry removed,
+passive expansion turned on, a cap raised; `ip_only` -> `record_only` is not
+one), pauses every enabled `ScanSchedule` of the project in the same transaction
+(`pausedSchedules` in the result, `pausedScheduleIds` in the audit). A scheduled
+run is a full recon that nobody watches start, so it must not be the first thing
+to reach a host an agent added; a person resumes the schedules in the Scans tab.
+Only this MCP path pauses: a widening saved from the project form shows a
+warning counting the enabled schedules and pauses nothing (decision D-24). A
+narrowing of the hostname policy returns `hostnamePolicyMarked` instead. A
 narrowing, the GitHub and supply-chain targets (no scheduled run reads them),
 `apply_recon_preset` and `update_recon_settings` pause nothing and only report
 `affectedSchedules`: those change how a run scans, capped by the engagement's
@@ -763,8 +866,8 @@ the agent does not hold with a compare-and-swap on the row's `updatedAt`. There
 is no time-to-live, because a run lasts hours. An agent that cannot answer
 leaves a set flag counting as a running session: fail closed.
 The endpoint takes the MASTER internal key only (`require_master_internal_auth`):
-the kali sandbox holds `SCANNER_API_KEY` and faces the target, and a live
-session id is all the unauthenticated `/agent-session/stop` needs.
+the kali sandbox faces the target, and a live session id is all the
+unauthenticated `/agent-session/stop` needs.
 
 **Residual, stated plainly.** A token holding both `project:rescope` and
 `engagement:authorize` can record an authorization for any document digest and

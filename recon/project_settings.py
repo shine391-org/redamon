@@ -42,6 +42,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'SUBDOMAIN_LIST': [],
     'IP_MODE': False,
     'TARGET_IPS': [],
+    # Hostnames on target IPs (IP mode only): what a run does with the names it
+    # sees on the target addresses. Re-validated at load by
+    # _resolve_ip_hostname_policy; apply_ip_hostname_overrides forces the
+    # settings that would send a name the mode does not allow.
+    'IP_HOSTNAME_MODE': 'ip_only',
+    'IP_HOSTNAME_INCLUDE': [],
+    'IP_HOSTNAME_EXCLUDE': [],
+    'IP_HOSTNAME_PASSIVE_EXPAND': True,
+    'IP_HOSTNAME_SCAN_ALL_CONFIRMED': False,
+    'IP_HOSTNAME_MAX_SCANNED': 100,
+    'IP_HOSTNAME_PASSIVE_MAX_NAMES': 500,
     # Domain batch: the third targeting mode. SCOPE_GROUPS is the project's scope
     # as the webapp derived it (`scopeGroups`), one group per scan root, in run
     # order: [{'scanRoot', 'orgDomain', 'mode': 'enumerate'|'exact',
@@ -52,7 +63,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'DOMAIN_BATCH_GROUPS': [],
     'SCOPE_GROUPS': [],
     'VERIFY_DOMAIN_OWNERSHIP': False,
-    'OWNERSHIP_TOKEN': 'your-secret-token-here',
+    # No shared default: each project gets its own random token when it is
+    # created (Prisma @default(uuid())). A default printed here would be a value
+    # anyone can publish to pass every project that kept it.
+    'OWNERSHIP_TOKEN': '',
     'OWNERSHIP_TXT_PREFIX': '_redamon-verify',
 
     # Scan Modules
@@ -98,6 +112,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'NAABU_THREADS': 25,
     'NAABU_TIMEOUT': 10000,
     'NAABU_RETRIES': 1,
+    'NAABU_RUN_TIMEOUT': 1800,
     'NAABU_SCAN_TYPE': 's',
     'NAABU_EXCLUDE_CDN': False,
     'NAABU_DISPLAY_CDN': True,
@@ -336,7 +351,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'AI_SURFACE_RECON_VECTOR_DB_READ_ENABLED': True,
     'AI_SURFACE_RECON_JULIUS_PROBE_PACK_ENABLED': True,
     'AI_SURFACE_RECON_LATENCY_BASELINE_ENABLED': True,
-    'AI_SURFACE_RECON_CACHE_ENABLED': True,
     'AI_SURFACE_RECON_PROBE_PACK_VERSION': 'latest',
 
     # Katana Web Crawler
@@ -541,8 +555,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'JS_RECON_INCLUDE_FRAMEWORK_JS': True,
     'JS_RECON_INCLUDE_ARCHIVED_JS': True,
     'JS_RECON_MIN_CONFIDENCE': 'low',
-    'JS_RECON_STANDALONE_CRAWL_DEPTH': 3,
-    'JS_RECON_STANDALONE_CRAWL_SCOPE': 'subdomain',
     'JS_RECON_UPLOADED_FILES': [],
     'JS_RECON_CUSTOM_PATTERNS': '',
     'JS_RECON_CUSTOM_SOURCEMAP_PATHS': '',
@@ -1011,21 +1023,27 @@ def apply_roe_rate_cap(settings: dict[str, Any]) -> dict[str, Any]:
       * `WEB_CACHE_POISON_MAX_RPS_PER_HOST` has the same 0-means-unlimited
         default and was in neither list.
 
-    Deriving both from `roe_capped` and `zero_means` closes all three, and the
+    Deriving the key list from `roe_capped` closes all three, and the
     registry's own tests make it impossible to add a fourth: an active `rps`
     field that is not `roe_capped` fails the build.
+
+    A value at or below 0 is raised to the ceiling for EVERY capped key, not
+    only the ones marked `zero_means: unlimited`. The readers decide what a 0
+    does, not the registry: graphql's delay is 0 at rate 0, and a nuclei or
+    httpx command built from a 0 carries no rate flag, so the tool's own
+    default applies. A REST save or an import that writes 0 must not turn a
+    3 rps engagement into an unthrottled one.
     """
     roe_max_rps = settings.get('ROE_GLOBAL_MAX_RPS', 0)
     if not settings.get('ROE_ENABLED', False) or not roe_max_rps or roe_max_rps <= 0:
         return settings
 
-    unlimited_at_zero = _registry.unlimited_zero_runtime_keys()
     for key in _registry.roe_capped_runtime_keys():
         value = settings.get(key)
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             continue
-        if value == 0 and key in unlimited_at_zero:
-            logger.info(f"RoE: capping {key} from unlimited (0) to {roe_max_rps} rps")
+        if value <= 0:
+            logger.info(f"RoE: capping {key} from {value} (no limit) to {roe_max_rps} rps")
             settings[key] = roe_max_rps
         elif value > roe_max_rps:
             logger.info(f"RoE: capping {key} from {value} to {roe_max_rps} rps")
@@ -1186,8 +1204,8 @@ def _fetch_user_api_key(user_id: str, webapp_url: str, key_name: str) -> str:
     import requests as _req
     try:
         url = f"{webapp_url.rstrip('/')}/api/users/{user_id}/settings?internal=true"
-        _headers = {"X-Internal-Key": (os.environ.get("SCANNER_API_KEY") or os.environ.get("INTERNAL_API_KEY", ""))}
-        resp = _req.get(url, timeout=10, headers=_headers)
+        from recon.helpers.scan_auth import scan_auth_headers
+        resp = _req.get(url, timeout=10, headers=scan_auth_headers())
         resp.raise_for_status()
         return resp.json().get(key_name, '')
     except Exception as e:
@@ -1200,8 +1218,8 @@ def _fetch_user_settings_full(user_id: str, webapp_url: str) -> dict:
     import requests as _req
     try:
         url = f"{webapp_url.rstrip('/')}/api/users/{user_id}/settings?internal=true"
-        _headers = {"X-Internal-Key": (os.environ.get("SCANNER_API_KEY") or os.environ.get("INTERNAL_API_KEY", ""))}
-        resp = _req.get(url, timeout=10, headers=_headers)
+        from recon.helpers.scan_auth import scan_auth_headers
+        resp = _req.get(url, timeout=10, headers=scan_auth_headers())
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -1372,16 +1390,93 @@ def _single_domain_group(target: str, subdomain_list: list[str]) -> dict[str, An
             'includeRoot': info['include_root_domain'], 'exactHosts': exact}
 
 
+def _ip_hostname_cap(settings: dict[str, Any], key: str) -> None:
+    """A cap outside its registry bound never came through a write path, so it
+    is pulled back inside the bound rather than trusted."""
+    value = settings.get(key)
+    low, high = _registry.bounds_for(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        print(f"[!][IpNames] {key} {str(value)[:20]!r} is not a whole number: using {DEFAULT_SETTINGS[key]}.")
+        settings[key] = DEFAULT_SETTINGS[key]
+    elif not low <= value <= high:
+        settings[key] = int(min(max(value, low), high))
+        print(f"[!][IpNames] {key} {value} is outside {int(low)}-{int(high)}: using {settings[key]}.")
+
+
+def _resolve_ip_hostname_policy(project: dict[str, Any], settings: dict[str, Any]) -> None:
+    """Re-validate an IP-mode project's hostname policy, or refuse the run.
+
+    Every webapp write path validates the policy (reconSettings/crossField.ts);
+    this is the second look at the trust boundary, for a row edited in the
+    database, imported from an older release or restored. It never narrows a
+    refusal into a quieter run: an unknown mode reads as ip_only, which looks no
+    name up (I-7), but scan_all without its confirmation, scan_all on a
+    third_party engagement and record_filter with no usable include entry each
+    refuse the run rather than scan names the operator did not approve.
+
+    Include entries that do not parse, or are a public suffix, are dropped with a
+    log line (that only narrows). Exclude entries that do not parse are KEPT:
+    the rule then gives every name invalid_filter, because dropping an exclude
+    entry would widen what is scanned (I-6).
+    """
+    from recon_settings.ip_hostnames import MODES, parse_entries
+
+    mode = settings.get('IP_HOSTNAME_MODE')
+    if mode not in MODES:
+        print(f"[!][IpNames] Unknown hostname mode {str(mode)[:40]!r}: using ip_only, which looks no name up.")
+        mode = 'ip_only'
+    settings['IP_HOSTNAME_MODE'] = mode
+    settings['IP_HOSTNAME_SCAN_ALL_CONFIRMED'] = settings.get('IP_HOSTNAME_SCAN_ALL_CONFIRMED') is True
+    if not isinstance(settings.get('IP_HOSTNAME_PASSIVE_EXPAND'), bool):
+        settings['IP_HOSTNAME_PASSIVE_EXPAND'] = DEFAULT_SETTINGS['IP_HOSTNAME_PASSIVE_EXPAND']
+    for key in ('IP_HOSTNAME_MAX_SCANNED', 'IP_HOSTNAME_PASSIVE_MAX_NAMES'):
+        _ip_hostname_cap(settings, key)
+
+    raw_include = settings.get('IP_HOSTNAME_INCLUDE')
+    raw_exclude = settings.get('IP_HOSTNAME_EXCLUDE')
+    if not isinstance(raw_exclude, list):
+        if mode == 'record_filter':
+            print("[!][IpNames] The exclude list cannot be read: refusing the run.")
+            raise ScopeRefused('the hostname exclude list cannot be read')
+        raw_exclude = []
+    patterns, invalid = parse_entries(raw_include if isinstance(raw_include, list) else [])
+    for bad in invalid:
+        print(f"[!][IpNames] Ignoring include entry {bad.entry[:80]!r}: {bad.reason}.")
+    if mode == 'record_filter' and patterns:
+        psl = _psl()
+        for p in [p for p in patterns if psl.org_domain(p.host) is None]:
+            print(f"[!][IpNames] Ignoring include entry {p.token!r}: a public suffix reaches every registrant.")
+            patterns.remove(p)
+    settings['IP_HOSTNAME_INCLUDE'] = [p.token for p in patterns]
+    excluded, unreadable = parse_entries(raw_exclude)
+    for bad in unreadable:
+        print(f"[!][IpNames] Exclude entry {bad.entry[:80]!r} cannot be read ({bad.reason}): "
+              f"no hostname is scanned this run.")
+    settings['IP_HOSTNAME_EXCLUDE'] = [p.token for p in excluded] + [bad.entry for bad in unreadable]
+
+    if mode == 'scan_all' and not settings['IP_HOSTNAME_SCAN_ALL_CONFIRMED']:
+        print("[!][IpNames] Mode scan_all without its confirmation: refusing the run.")
+        raise ScopeRefused('hostname mode scan_all is not confirmed')
+    if mode == 'scan_all' and project.get('engagementKind') == 'third_party':
+        print("[!][IpNames] Mode scan_all on a third_party engagement: refusing the run.")
+        raise ScopeRefused('hostname mode scan_all is refused on a third_party engagement')
+    if mode == 'record_filter' and not settings['IP_HOSTNAME_INCLUDE']:
+        print("[!][IpNames] Mode record_filter with no usable include entry: refusing the run.")
+        raise ScopeRefused('hostname mode record_filter has no usable include entry')
+
+
 def _resolve_scope(project: dict[str, Any], settings: dict[str, Any]) -> None:
     """Fill TARGET_DOMAIN, SCOPE_GROUPS and DOMAIN_BATCH_GROUPS, or refuse.
 
     Fails closed: a batch with no group left, or a single-domain target that is
     not a usable name or is a public suffix, raises ScopeRefused. Before this,
     an empty batch fell through to a single-domain run with an empty target,
-    and a suffix target ran its full enumeration.
+    and a suffix target ran its full enumeration. An IP-mode project's
+    hostname policy is re-validated the same way (_resolve_ip_hostname_policy).
     """
     has_groups = isinstance(project.get('scopeGroups'), list)
     if settings['IP_MODE']:
+        _resolve_ip_hostname_policy(project, settings)
         settings['SCOPE_GROUPS'] = []
         settings['DOMAIN_BATCH_GROUPS'] = (
             [] if has_groups else _parse_domain_batch_groups(project.get('domainBatchGroups')))
@@ -1507,8 +1602,8 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     url = f"{webapp_url.rstrip('/')}/api/projects/{project_id}"
     logger.info(f"Fetching project settings from {url}")
 
-    _internal_headers = {"X-Internal-Key": (os.environ.get("SCANNER_API_KEY") or os.environ.get("INTERNAL_API_KEY", ""))}
-    response = requests.get(url, timeout=30, headers=_internal_headers)
+    from recon.helpers.scan_auth import scan_auth_headers
+    response = requests.get(url, timeout=30, headers=scan_auth_headers())
     response.raise_for_status()
     project = response.json()
 
@@ -1527,6 +1622,14 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['IP_MODE'] = project.get('ipMode', DEFAULT_SETTINGS['IP_MODE'])
     raw_ips = project.get('targetIps', DEFAULT_SETTINGS['TARGET_IPS'])
     settings['TARGET_IPS'] = [ip.strip() for ip in raw_ips if ip.strip()]
+    # Read before _resolve_scope, whose IP branch re-validates them.
+    settings['IP_HOSTNAME_MODE'] = project.get('ipHostnameMode', DEFAULT_SETTINGS['IP_HOSTNAME_MODE'])
+    settings['IP_HOSTNAME_INCLUDE'] = project.get('ipHostnameInclude', DEFAULT_SETTINGS['IP_HOSTNAME_INCLUDE'])
+    settings['IP_HOSTNAME_EXCLUDE'] = project.get('ipHostnameExclude', DEFAULT_SETTINGS['IP_HOSTNAME_EXCLUDE'])
+    settings['IP_HOSTNAME_PASSIVE_EXPAND'] = project.get('ipHostnamePassiveExpand', DEFAULT_SETTINGS['IP_HOSTNAME_PASSIVE_EXPAND'])
+    settings['IP_HOSTNAME_SCAN_ALL_CONFIRMED'] = project.get('ipHostnameScanAllConfirmed', DEFAULT_SETTINGS['IP_HOSTNAME_SCAN_ALL_CONFIRMED'])
+    settings['IP_HOSTNAME_MAX_SCANNED'] = project.get('ipHostnameMaxScanned', DEFAULT_SETTINGS['IP_HOSTNAME_MAX_SCANNED'])
+    settings['IP_HOSTNAME_PASSIVE_MAX_NAMES'] = project.get('ipHostnamePassiveMaxNames', DEFAULT_SETTINGS['IP_HOSTNAME_PASSIVE_MAX_NAMES'])
     settings['DOMAIN_BATCH_MODE'] = project.get(
         'domainBatchMode', DEFAULT_SETTINGS['DOMAIN_BATCH_MODE'])
     _resolve_scope(project, settings)
@@ -1556,6 +1659,7 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['NAABU_THREADS'] = project.get('naabuThreads', DEFAULT_SETTINGS['NAABU_THREADS'])
     settings['NAABU_TIMEOUT'] = project.get('naabuTimeout', DEFAULT_SETTINGS['NAABU_TIMEOUT'])
     settings['NAABU_RETRIES'] = project.get('naabuRetries', DEFAULT_SETTINGS['NAABU_RETRIES'])
+    settings['NAABU_RUN_TIMEOUT'] = project.get('naabuRunTimeout', DEFAULT_SETTINGS['NAABU_RUN_TIMEOUT'])
     settings['NAABU_SCAN_TYPE'] = project.get('naabuScanType', DEFAULT_SETTINGS['NAABU_SCAN_TYPE'])
     settings['NAABU_EXCLUDE_CDN'] = project.get('naabuExcludeCdn', DEFAULT_SETTINGS['NAABU_EXCLUDE_CDN'])
     settings['NAABU_DISPLAY_CDN'] = project.get('naabuDisplayCdn', DEFAULT_SETTINGS['NAABU_DISPLAY_CDN'])
@@ -1773,7 +1877,6 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['AI_SURFACE_RECON_VECTOR_DB_READ_ENABLED'] = project.get('aiSurfaceReconVectorDbReadEnabled', DEFAULT_SETTINGS['AI_SURFACE_RECON_VECTOR_DB_READ_ENABLED'])
     settings['AI_SURFACE_RECON_JULIUS_PROBE_PACK_ENABLED'] = project.get('aiSurfaceReconJuliusProbePackEnabled', DEFAULT_SETTINGS['AI_SURFACE_RECON_JULIUS_PROBE_PACK_ENABLED'])
     settings['AI_SURFACE_RECON_LATENCY_BASELINE_ENABLED'] = project.get('aiSurfaceReconLatencyBaselineEnabled', DEFAULT_SETTINGS['AI_SURFACE_RECON_LATENCY_BASELINE_ENABLED'])
-    settings['AI_SURFACE_RECON_CACHE_ENABLED'] = project.get('aiSurfaceReconCacheEnabled', DEFAULT_SETTINGS['AI_SURFACE_RECON_CACHE_ENABLED'])
     settings['AI_SURFACE_RECON_PROBE_PACK_VERSION'] = project.get('aiSurfaceReconProbePackVersion', DEFAULT_SETTINGS['AI_SURFACE_RECON_PROBE_PACK_VERSION'])
 
     # Katana Web Crawler
@@ -1881,8 +1984,6 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['JS_RECON_INCLUDE_FRAMEWORK_JS'] = project.get('jsReconIncludeFrameworkJs', DEFAULT_SETTINGS['JS_RECON_INCLUDE_FRAMEWORK_JS'])
     settings['JS_RECON_INCLUDE_ARCHIVED_JS'] = project.get('jsReconIncludeArchivedJs', DEFAULT_SETTINGS['JS_RECON_INCLUDE_ARCHIVED_JS'])
     settings['JS_RECON_MIN_CONFIDENCE'] = project.get('jsReconMinConfidence', DEFAULT_SETTINGS['JS_RECON_MIN_CONFIDENCE'])
-    settings['JS_RECON_STANDALONE_CRAWL_DEPTH'] = project.get('jsReconStandaloneCrawlDepth', DEFAULT_SETTINGS['JS_RECON_STANDALONE_CRAWL_DEPTH'])
-    settings['JS_RECON_STANDALONE_CRAWL_SCOPE'] = project.get('jsReconStandaloneCrawlScope', DEFAULT_SETTINGS['JS_RECON_STANDALONE_CRAWL_SCOPE'])
     settings['JS_RECON_UPLOADED_FILES'] = project.get('jsReconUploadedFiles', DEFAULT_SETTINGS['JS_RECON_UPLOADED_FILES'])
     settings['JS_RECON_CUSTOM_PATTERNS'] = project.get('jsReconCustomPatterns', DEFAULT_SETTINGS['JS_RECON_CUSTOM_PATTERNS'])
     settings['JS_RECON_CUSTOM_SOURCEMAP_PATHS'] = project.get('jsReconCustomSourcemapPaths', DEFAULT_SETTINGS['JS_RECON_CUSTOM_SOURCEMAP_PATHS'])
@@ -2449,8 +2550,10 @@ def fetch_node_filters(project_id: str, webapp_url: str | None = None) -> dict |
     scan start, so it never applies rules older than the operator's latest save:
     a long partial recon must not undo an apply made while it ran.
 
-    Returns None when the project has no filters. Raises on a failed request,
-    and the caller treats that as "filter nothing", never as "no exemptions".
+    Returns None when the project has no filters. Raises on a failed request, a
+    refused job credential included (a scan resumed after its credential expired):
+    the sweep records that as its error and leaves every mute state as it was,
+    never reading it as "no filters" or "no exemptions".
     """
     import requests
 
@@ -2458,8 +2561,8 @@ def fetch_node_filters(project_id: str, webapp_url: str | None = None) -> dict |
     if not project_id or not webapp_url:
         return None
     url = f"{webapp_url.rstrip('/')}/api/projects/{project_id}"
-    headers = {"X-Internal-Key": (os.environ.get("SCANNER_API_KEY") or os.environ.get("INTERNAL_API_KEY", ""))}
-    response = requests.get(url, timeout=30, headers=headers)
+    from recon.helpers.scan_auth import scan_auth_headers
+    response = requests.get(url, timeout=30, headers=scan_auth_headers())
     response.raise_for_status()
     node_filter = response.json().get('nodeFilter')
     if node_filter is None:
@@ -2500,6 +2603,7 @@ def get_settings() -> dict[str, Any]:
     # stealth makes FFUF_AI_EXTENSIONS moot). Both functions are pure and
     # idempotent.
     settings = apply_stealth_overrides(settings)
+    settings = apply_ip_hostname_overrides(settings)
     settings = apply_ai_pipeline_overrides(settings)
     # The RoE ceiling again, after stealth: the stealth profile `set`s some
     # roe_capped rates (naabu 10, nuclei 5), which would otherwise overwrite the
@@ -2537,6 +2641,59 @@ def reload_settings() -> dict[str, Any]:
     global _settings
     _settings = get_settings()
     return _settings
+
+
+# =============================================================================
+# HOSTNAMES ON TARGET IPS: THE SETTINGS THE MODE FORCES
+# =============================================================================
+
+#: Per mode, the settings that would look up or send a name the mode does not
+#: allow, with the value forced. tlsx -rps sends each IP's PTR answer as SNI,
+#: which no mode allows: a name reaches a tool only after the selection rule
+#: admitted it. ip_only sends nothing name-related at all (I-7), so it also stops
+#: Shodan's reverse DNS and the graph names vhost/SNI would try on target IPs.
+#: An unknown mode gets the ip_only row. The webapp's copy
+#: (webapp/src/lib/ipHostnameOverrides.ts) is pinned to this table by
+#: recon/tests/test_ip_hostname_overrides.py.
+_IP_HOSTNAME_FORCED: dict[str, dict[str, Any]] = {
+    'ip_only': {
+        'TLSX_REV_PTR_SNI': False,
+        'SHODAN_REVERSE_DNS': False,
+        'VHOST_SNI_USE_GRAPH_CANDIDATES': False,
+    },
+    'record_only': {'TLSX_REV_PTR_SNI': False},
+    'record_filter': {'TLSX_REV_PTR_SNI': False},
+    'scan_all': {'TLSX_REV_PTR_SNI': False},
+}
+
+
+def ip_hostname_overrides(settings: dict[str, Any]) -> dict[str, Any]:
+    """{runtime key: forced value} for this run's hostname mode; empty outside
+    IP mode. The one answer both apply_ip_hostname_overrides and the
+    "(forced by ...)" marker of print_effective_settings use."""
+    if not settings.get('IP_MODE'):
+        return {}
+    mode = settings.get('IP_HOSTNAME_MODE')
+    return dict(_IP_HOSTNAME_FORCED.get(mode, _IP_HOSTNAME_FORCED['ip_only']))
+
+
+def apply_ip_hostname_overrides(settings: dict[str, Any]) -> dict[str, Any]:
+    """Force the settings the hostname mode does not allow (pure: a new dict).
+
+    Applied after the stealth profile, so neither stealth nor a stored toggle
+    can turn back on what the mode forbids; every forced value only removes a
+    name lookup or a name sent to a target, so the later passes (RoE cap,
+    memory governor) have nothing to undo.
+    """
+    forced = ip_hostname_overrides(settings)
+    if not forced:
+        return settings
+    out = dict(settings)
+    for key, value in forced.items():
+        if out.get(key) != value:
+            logger.info(f"Hostnames on target IPs ({settings.get('IP_HOSTNAME_MODE')}) forces {key}={value}")
+        out[key] = value
+    return out
 
 
 # =============================================================================

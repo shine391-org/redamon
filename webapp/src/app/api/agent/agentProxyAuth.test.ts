@@ -13,6 +13,7 @@
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProjectOrCapability()))
 vi.mock('@/lib/access', () => ({
   guardProject: vi.fn(async () => null),
   requireProjectAccess: vi.fn(async () => ({ project: { id: 'p1', userId: 'u1' } })),
@@ -22,8 +23,15 @@ vi.mock('@/lib/access', () => ({
 vi.mock('@/lib/prisma', () => ({
   default: {
     userSettings: { findUnique: vi.fn(async () => ({ githubAccessToken: '' })) },
+    // The session and job routes read the account (HD-01): u1 holds every session.
+    user: {
+      findUnique: vi.fn(async () => ({
+        id: 'u1', email: 'u1@x', role: 'user', password: 'h', createdAt: new Date(0), legacyGrants: ['shell_sessions'],
+      })),
+    },
     conversation: {
       findUnique: vi.fn(async () => ({ sessionId: 's1', userId: 'u1', projectId: 'p1' })),
+      findMany: vi.fn(async () => [{ sessionId: 's1', projectId: 'p1', project: { userId: 'u1' } }]),
       delete: vi.fn(async () => ({})),
     },
   },
@@ -32,6 +40,8 @@ vi.mock('@/lib/audit', () => ({ writeAudit: vi.fn(async () => {}) }))
 vi.mock('@/lib/session', () => ({
   getSession: vi.fn(async () => ({ userId: 'u1', role: 'user' })),
   getEffectiveUser: vi.fn(async () => ({ userId: 'u1' })),
+  // The Metasploit-session and job proxies read the session first (HD-10).
+  requireSession: vi.fn(async () => ({ userId: 'u1', role: 'user' })),
 }))
 vi.mock('../graph/neo4j', () => ({
   getGraphSession: () => ({ run: vi.fn(async () => ({ records: [] })), close: vi.fn(async () => {}) }),
@@ -137,7 +147,7 @@ const CASES: Case[] = [
   // Its first agent call reads the folder's import record (the mock has none).
   { name: 'workspace import-url resync', agentPath: '/workspace/properties',
     call: () => wsImportResync.POST(json('/x', { projectId: 'p1', path: 'uploads/r' })) },
-  { name: 'sessions list', agentPath: '/sessions', call: () => sessions.GET() },
+  { name: 'sessions list', agentPath: '/sessions', call: () => sessions.GET(new NextRequest('http://x/api/agent/sessions')) },
   { name: 'session interact', agentPath: '/sessions/1/interact', call: () => sessionInteract.POST(json('/x', { command: 'id' }), idParams('1')) },
   { name: 'session kill', agentPath: '/sessions/1/kill', call: () => sessionKill.POST(new NextRequest(`${BASE}/x`, { method: 'POST' }), idParams('1')) },
   { name: 'msf job kill', agentPath: '/jobs/1/kill', call: () => jobKill.POST(new NextRequest(`${BASE}/x`, { method: 'POST' }), idParams('1')) },
@@ -155,7 +165,11 @@ beforeEach(() => {
   vi.stubEnv('INTERNAL_API_KEY', KEY)
   vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: RequestInit) => {
     calls.push({ url: String(url), init })
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    // Interact and kill look their target up in the session list first (HD-01).
+    const body = String(url).endsWith('/sessions')
+      ? { sessions: [{ id: 1, chat_session_id: 's1' }], jobs: [{ id: 1 }], non_msf_sessions: [] }
+      : { ok: true }
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
   }))
 })
 

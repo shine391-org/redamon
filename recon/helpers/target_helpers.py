@@ -4,10 +4,13 @@ RedAmon - Target Extraction Helpers
 Functions for extracting and building target URLs from reconnaissance data.
 """
 
-import ipaddress
 import re
+import ipaddress
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+
+from recon.helpers.ip_placeholders import is_placeholder
+from recon.helpers.target_admission import admit_host_targets
 
 
 def http_url_rejection(url) -> Optional[str]:
@@ -102,9 +105,15 @@ def _as_str_list(value) -> List[str]:
     return []
 
 
-def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
+def extract_targets_from_recon(recon_data: dict, settings: Optional[dict] = None, *,
+                               module: str = "dns_targets") -> Tuple[Set[str], Set[str], Dict[str, List[str]]]:
     """
     Extract all unique IPs, hostnames, and build IP-to-hostname mapping.
+
+    The result passes the RoE admission gate (``settings``, else the
+    ``metadata.roe`` a partial builder stamps). The tools fed from it resolve
+    names themselves, so a name with an excluded address, or with no known
+    address while an IP or CIDR exclusion is set, is not in ``hostnames``.
 
     Honors recon_data["metadata"]["include_root_domain"]: when explicitly
     False, the apex/root domain is NOT added to the hostname set, even when
@@ -178,7 +187,11 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
                 if subdomain not in ip_to_hostnames.setdefault(ip, []):
                     ip_to_hostnames[ip].append(subdomain)
 
-    return ips, hostnames, ip_to_hostnames
+    # Filter out empty strings
+    ips = {ip for ip in ips if ip}
+    hostnames = {h for h in hostnames if h}
+
+    return admit_host_targets(settings, recon_data, ips, hostnames, ip_to_hostnames, module=module)
 
 
 # =============================================================================
@@ -556,37 +569,10 @@ def _hosts_in_urls(urls: Set[str]) -> Set[str]:
     return hosts
 
 
-# Mock hostnames minted for IPs with no PTR record: recon/main.py replaces the
-# separators with dashes ("192.88.99.10" -> "192-88-99-10", "fe80::1" ->
-# "fe80--1"). They exist so the graph can label the host; they are NOT
-# resolvable and must never reach a crawler. See build_target_urls source 3.
-_MOCK_IPV4_RE = re.compile(r"^\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}$")
-
-
-def _is_mock_ip_hostname(hostname: str) -> bool:
-    """True when `hostname` is a dashed-IP placeholder rather than a real host.
-
-    Deliberately narrow: only a label that is ENTIRELY digits and dashes (or
-    hex and dashes, for IPv6) and that maps back to a valid IP literal. A real
-    domain like "mail-01.example.com" contains dots and is never matched.
-    """
-    if not hostname or "." in hostname:
-        return False
-    candidate = hostname.strip().lower()
-    if _MOCK_IPV4_RE.match(candidate):
-        try:
-            ipaddress.ip_address(candidate.replace("-", "."))
-            return True
-        except ValueError:
-            return False
-    # IPv6 placeholders: only hex digits and dashes, and round-trips to an IP.
-    if candidate and all(c in "0123456789abcdef-" for c in candidate) and "-" in candidate:
-        try:
-            ipaddress.ip_address(candidate.replace("-", ":"))
-            return True
-        except ValueError:
-            return False
-    return False
+# The dashed IP-mode labels ("192-88-99-10") are not resolvable and must never
+# reach a crawler (build_target_urls source 3). Kept under its old name for the
+# callers that import it.
+_is_mock_ip_hostname = is_placeholder
 
 
 def build_target_urls(
@@ -672,7 +658,10 @@ def build_target_urls(
 
     # Source 3: hostnames not covered by httpx/resource_enum → both schemes.
     # This catches newly discovered subdomains that haven't been probed yet.
-    for hostname in sorted(hostnames):
+    # Never in IP mode: the targets are addresses, and a name httpx did not
+    # reach was never checked to resolve to one of them (B-21).
+    ip_mode = bool(((recon_data or {}).get("metadata") or {}).get("ip_mode"))
+    for hostname in sorted(hostnames) if not ip_mode else ():
         if not hostname or hostname.lower() in covered_hosts:
             continue
         if http_url_rejection(f"http://{hostname}") is not None or any(c in hostname for c in '/?#@:'):
@@ -831,11 +820,13 @@ def _resolves_to_routable(hostname: str) -> bool:
     if cache is not None:
         found, value = cache.get(hostname)
         if found:
-            return value
+            return value[0]
 
-    def _remember(result: bool) -> bool:
+    # The addresses are kept for the RoE address gate (_looked_up_addresses),
+    # so it judges the name on this answer instead of asking DNS again.
+    def _remember(result: bool, addresses=()) -> bool:
         if cache is not None:
-            cache.put(hostname, result)
+            cache.put(hostname, (result, tuple(addresses)))
         return result
 
     # A resolver already proven down would make every getaddrinfo a timeout.
@@ -853,6 +844,7 @@ def _resolves_to_routable(hostname: str) -> bool:
         infos = socket.getaddrinfo(hostname, None)
     except Exception:
         return _remember(True)
+    addresses = []
     for info in infos:
         try:
             addr = info[4][0]
@@ -860,7 +852,55 @@ def _resolves_to_routable(hostname: str) -> bool:
             continue
         if is_non_routable_ip(addr):
             return _remember(False)
-    return _remember(True)
+        if addr not in addresses:
+            addresses.append(addr)
+    return _remember(True, addresses)
+
+
+def _looked_up_addresses(hostname: str) -> list:
+    """The addresses ``_resolves_to_routable`` saw for ``hostname`` this run,
+    read from its cache: never a lookup of its own."""
+    cache = _san_resolve_cache()
+    if cache is None:
+        return []
+    found, value = cache.get(hostname)
+    return list(value[1]) if found else []
+
+
+def _late_name_gate_applies(settings: Optional[dict], combined_result: dict) -> bool:
+    """A domain run with an RoE exclusion in force. Otherwise the by-name RoE
+    check is all there is: with no exclusion, or in IP mode, whose late names
+    are the hostname rule's pinned answers, judged against the target list
+    there."""
+    if ((combined_result or {}).get("metadata") or {}).get("ip_mode"):
+        return False
+    from recon.helpers.target_admission import admission_context
+    return bool(admission_context(settings, combined_result).excluded)
+
+
+def _admit_late_names(combined_result: dict, names: list, settings: Optional[dict],
+                      source: str) -> list:
+    """The ``names`` the admission gate admits whole, in order.
+
+    Each name is judged on the addresses the merge's own lookup saw and the
+    ones the run's DNS data already holds for it. A name with any excluded
+    address is refused, never narrowed: httpx, Nuclei and the crawlers resolve
+    it themselves and could reach it there, and the late-name step would
+    write the excluded address under it. A name with no address is refused
+    while RoE IP or CIDR entries exist, recorded as not checked. The gate
+    notes each refusal under ``roe_excluded``, with ``source`` as the module.
+    """
+    from recon.helpers.target_admission import admit_targets, known_addresses
+    try:
+        known = known_addresses(combined_result)
+    except (AttributeError, TypeError):
+        # Partial JS Recon hands its graph subdomains over as a list, which
+        # the merge replaces; the lookup's own answer still judges each name.
+        known = {}
+    given = {n: list(dict.fromkeys([*_looked_up_addresses(n), *known.get(n, [])])) for n in names}
+    admission = admit_targets(settings, combined_result, names=given, module=source,
+                              resolves_names=True)
+    return [n for n in names if n in admission.names]
 
 
 def injection_scope(recon_data: dict) -> Optional[dict]:
@@ -900,12 +940,17 @@ def merge_discovered_hostnames(
          ends with ``"." + root_domain`` (``root_domain`` may be a list of roots,
          matched one by one). Every other name is recorded in
          ``discovered_external_domains`` and never becomes an active-scan target.
-      2. RoE narrowing (``_filter_roe_excluded``) — additive, never sufficient
-         on its own (it is off by default).
+      2. RoE narrowing by name (``_filter_roe_excluded``) — additive, never
+         sufficient on its own (it is off by default).
       3. Hostname syntax validation (``\\Z``-anchored; blocks newline injection
          into the newline-delimited target files).
-      4. Resolve-and-check: drop any name resolving to a non-routable IP.
-      5. Cap the injected count (``max_injected``).
+      4. Cap the injected count (``max_injected``).
+      5. Resolve-and-check: drop any name resolving to a non-routable IP.
+         5b. Domain mode, with an RoE exclusion in force: the admission gate
+         (``_admit_late_names``, D2) refuses a name with any excluded address,
+         or with none while IP/CIDR entries exist, and notes each refusal as
+         ``roe_excluded`` coverage. Step 2's by-name refusals stay a log
+         line, as discovery's are.
       6. Wildcard DNS (``wildcard_control``): drop a name that answers only
          through its zone's wildcard. The zones checked are recorded in
          ``combined_result["wildcard_zones"]``.
@@ -997,6 +1042,11 @@ def merge_discovered_hostnames(
 
     # 5. Resolve-and-check (SAN-derived names only, never the port-scan list).
     in_scope = [n for n in in_scope if _resolves_to_routable(n)]
+
+    # 5b. RoE on the addresses (D2), ahead of the wildcard probes: a refused
+    # name costs no further query.
+    if in_scope and _late_name_gate_applies(settings, result):
+        in_scope = _admit_late_names(result, in_scope, settings, source)
 
     # 6. Wildcard DNS: these names arrive after puredns, so they get RedAmon's
     # own check. A name that answers only through its zone's wildcard is no

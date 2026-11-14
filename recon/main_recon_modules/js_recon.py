@@ -5,10 +5,11 @@ Orchestrates all 6 analysis modules (patterns, validators, sourcemap,
 dependency, endpoints, framework) against JS files discovered by the
 recon pipeline. Runs as a post-resource_enum phase.
 
-Three modes:
-  1. Post-recon: analyze JS URLs from combined_result['resource_enum']
-  2. Standalone: crawl target domain then analyze
-  3. Manual upload: analyze user-uploaded JS files
+Two input sources, read together in one run:
+  1. JS URLs from combined_result['resource_enum'] (the full pipeline, or the
+     graph-built result partial recon passes in)
+  2. Manual upload: user-uploaded JS files
+It never crawls a target on its own to find more JS files.
 """
 
 import atexit
@@ -28,6 +29,7 @@ from urllib.parse import urljoin, urlparse
 from typing import NamedTuple, Optional
 
 from recon.helpers import catchall
+from recon.helpers import request_pacer
 from recon.helpers.roe_scope import _is_roe_excluded
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -36,6 +38,10 @@ from recon.helpers.js_recon.patterns import (
 )
 from recon.helpers.js_recon.validators import validate_secret
 from recon.helpers.js_recon import trufflehog_bridge
+from recon.helpers.js_recon.hop_guard import (
+    REDIRECT_STATUSES, ROE_EXCLUDED, TOO_MANY_REDIRECTS, UNSAFE, admit_any, fetch_hop_by_hop,
+)
+from recon.helpers.target_admission import ip_mode_url_admission
 from recon.helpers.js_recon.sourcemap import discover_and_analyze_sourcemaps, pseudo_file_base
 from recon.helpers.js_recon.dependency import detect_dependency_confusion
 from recon.helpers.js_recon.endpoints import extract_endpoints
@@ -195,42 +201,61 @@ def _capture_session(tool="js_recon"):
     return session, True
 
 
-def _safe_redirect_get(url, *, timeout, headers, max_redirects=5,
+_HOP_REFUSAL_LOG = {
+    UNSAFE: 'blocked (SSRF guard)',
+    ROE_EXCLUDED: 'blocked (RoE exclusion)',
+}
+
+# The run's own rule for every URL it fetches or probes: a download and each of
+# its redirect hops, a source map, an endpoint probe. IP mode admits only a
+# target address or a run name whose every current address is a target (B-10);
+# domain mode admits everything here. Set for the duration of run_js_recon
+# like _JS_SCOPE.
+_ADMIT = admit_any
+
+
+def _admit_none(url: str) -> bool:
+    return False
+
+
+def _safe_redirect_get(url, *, timeout, headers, max_redirects=5, settings=None,
                        extra_headers=None, session=None):
-    """GET that validates the SSRF guard on every hop (STRIDE I14).
+    """GET a target-derived JS URL, following its redirects hop by hop
+    (STRIDE I14, R-14).
 
-    Follows redirects manually (allow_redirects=False) so a target-hosted JS URL
-    that 3xx-redirects into cloud metadata / an internal host is refused, while
-    legitimate CDN redirects to public hosts still resolve. Returns the final
-    ``requests.Response`` or ``None`` if a hop is unsafe / exceeds the hop cap.
-
-    ``extra_headers`` (engagement identity) is merged into every hop with
-    the caller's per-request headers taking precedence (case-insensitively),
-    so attribution survives a redirect without ever duplicating a name.
-    ``session`` is the caller's capture-aware session when one was created.
+    Every hop, the first URL included, is checked before it is sent: the RoE
+    of ``settings`` and the address rule ``_download_allowed``. A bundle that
+    3xx-redirects into cloud metadata, an internal host or an excluded host is
+    refused, while legitimate CDN redirects to public hosts still resolve.
+    Returns the final ``requests.Response``, or ``None`` when a hop is
+    refused, a redirect has no Location, or more than ``max_redirects``
+    redirects come.
     """
     from recon.helpers.auth_profile import merge_identity_headers
     merged = merge_identity_headers(headers or {}, extra_headers or {})
     client = session if session is not None else requests
-    current = url
-    for _hop in range(max_redirects + 1):
-        if not _download_allowed(current):
-            print(f"[!][JsRecon] {current} -- blocked (SSRF guard)")
-            return None
-        # The target's own files: its certificate may be self-signed or from an
-        # internal CA, as httpx and katana already accepted. Never the key
-        # validators, which send a secret to a third party.
-        resp = client.get(current, timeout=timeout, headers=merged, allow_redirects=False,
-                          verify=False)
-        if resp.status_code in (301, 302, 303, 307, 308):
-            loc = resp.headers.get('Location') or resp.headers.get('location')
-            if not loc:
-                return None
-            current = urljoin(current, loc)
-            continue
-        return resp
-    print(f"[!][JsRecon] {url} -- too many redirects")
-    return None
+
+    def send(method, target, *, timeout, headers, allow_redirects):
+        return getattr(client, method.lower())(target, timeout=timeout, headers=headers,
+                                              allow_redirects=allow_redirects, verify=False)
+
+    refusal: dict = {}
+    # The target's own files: its certificate may be self-signed or from an
+    # internal CA, as httpx and katana already accepted. Never the key
+    # validators, which send a secret to a third party.
+    resp = fetch_hop_by_hop('GET', url, timeout=timeout, headers=merged, settings=settings,
+                            admit=_ADMIT, url_guard=_download_allowed, max_redirects=max_redirects,
+                            refusal=refusal, send=send, verify=False)
+    if resp is None:
+        reason = refusal.get('reason')
+        if reason == TOO_MANY_REDIRECTS:
+            print(f"[!][JsRecon] {url} -- too many redirects")
+        else:
+            print(f"[!][JsRecon] {refusal.get('url', url)} -- {_HOP_REFUSAL_LOG.get(reason, f'blocked ({reason})')}")
+        return None
+    if resp.status_code in REDIRECT_STATUSES:
+        return None
+    return resp
 
 
 # The run's own hosts for a JS download; set for the duration of run_js_recon
@@ -828,7 +853,8 @@ def _download_js_files(
     empty body, a non-JS answer, or a request that raised. Each of those also
     gets a FetchOutcome, whose status is the reason code `_js_coverage` names.
     `settings`, when given, supplies the validated engagement identity header
-    (attrbuted like every other target request).
+    (attributed like every other target request).
+    The RoE and IP admission rules are checked on every redirect hop.
 
     `download_cache` (a DownloadCache) skips a URL this run already fetched;
     `metrics` counts attempts/bytes/cache hits; `outcomes` receives one
@@ -887,6 +913,7 @@ def _download_js_files(
                     url,
                     timeout=min(timeout // 10, 30),
                     headers={'User-Agent': 'Mozilla/5.0 (compatible; RedAmon/1.0)'},
+                    settings=settings,
                     extra_headers=identity_headers,
                     session=fetch_session,
                 )
@@ -997,9 +1024,13 @@ def _download_js_files(
 
 
 def _run_analysis(js_files: list, settings: dict, parse_cache=None,
-                  metrics: Optional[FetchMetrics] = None) -> dict:
+                  metrics: Optional[FetchMetrics] = None,
+                  map_scope: Optional[_ProbeScope] = None) -> dict:
     """
     Run all enabled analysis modules in parallel.
+
+    ``map_scope`` (``_endpoint_probe_scope``) admits a source map, and each of
+    its redirect hops, on a host of the run beyond those its JS came from.
 
     Returns dict with all finding categories.
     """
@@ -1057,6 +1088,8 @@ def _run_analysis(js_files: list, settings: dict, parse_cache=None,
                 discover_and_analyze_sourcemaps, served_files, settings,
                 pseudo_files=recovered, skipped=not_checked,
                 deadline=started + analysis_budget * _SOURCE_MAP_BUDGET_SHARE,
+                in_scope=(lambda url: _in_probe_scope(url, map_scope)) if map_scope is not None else None,
+                admit=_ADMIT,
             )
             try:
                 results['source_maps'] = future.result(timeout=max(1.0, deadline - time.monotonic()))
@@ -1114,9 +1147,10 @@ def _run_analysis(js_files: list, settings: dict, parse_cache=None,
             futures['patterns'] = executor.submit(run_patterns)
 
         # 3. Dependency confusion
+        npm_unchecked: list = []
         if settings.get('JS_RECON_DEPENDENCY_CHECK', True):
             futures['dependencies'] = executor.submit(
-                detect_dependency_confusion, js_files, settings
+                detect_dependency_confusion, js_files, settings, unchecked=npm_unchecked
             )
 
         # 4. Endpoint extraction. Behind the content-addressed cache: the same
@@ -1240,6 +1274,17 @@ def _run_analysis(js_files: list, settings: dict, parse_cache=None,
 
                 elif name == 'dependencies':
                     results['dependencies'] = result
+                    if npm_unchecked:
+                        # A package the registry did not answer for is not
+                        # "gone": its importing hosts keep their findings. One
+                        # only an upload or the custom-package list names has
+                        # no host to match, so the whole source is kept.
+                        importers = [[u for u in urls if isinstance(u, str)
+                                      and u.startswith(('http://', 'https://'))]
+                                     for urls in npm_unchecked]
+                        _note_unchecked("npm registry did not answer",
+                                        [u for urls in importers for u in urls]
+                                        if all(importers) else None)
 
                 elif name == 'endpoints':
                     results['endpoints'] = result
@@ -1571,6 +1616,18 @@ def _validate_secrets(secrets: list, settings: dict) -> list:
     return secrets
 
 
+def _paced(send):
+    """``send`` behind a slot of the process-wide RoE pacer, so the whole
+    endpoint pool, catch-all controls included, stays under the ceiling. No
+    endpoint probe follows a redirect: one call is one request."""
+    def paced(*args, **kwargs):
+        request_pacer.acquire()
+        response = send(*args, **kwargs)
+        request_pacer.back_off_on_429(response)
+        return response
+    return paced
+
+
 def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _ProbeScope, request_func=None) -> list:
     """Validate extracted endpoints with lightweight non-following HTTP probes.
 
@@ -1623,7 +1680,7 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
     # Dedicated parallelism dial for endpoint probes, independent of the shared
     # JS_RECON_CONCURRENCY used for downloads/secret validation.
     workers = _clamp_int(settings.get('JS_RECON_ENDPOINT_CONCURRENCY', 10), 10, 1, 20)
-    requester = request_func or requests.request
+    requester = _paced(request_func or requests.request)
     # One cache per probe method: a HEAD or OPTIONS control says nothing
     # about a GET hit.
     controls = {m: catchall.ControlCache() for m in ('GET', 'HEAD', 'OPTIONS')}
@@ -1654,6 +1711,10 @@ def _validate_extracted_endpoints(endpoints: list, settings: dict, scope: _Probe
         if not _in_probe_scope(resolved_url, scope):
             endpoint['validation_status'] = 'unvalidated'
             endpoint['validation_error'] = 'out_of_scope'
+            return
+        if not _ADMIT(resolved_url):
+            endpoint['validation_status'] = 'unvalidated'
+            endpoint['validation_error'] = 'not_admitted'
             return
         if _js_skip(resolved_url):
             # Host đã được một module khác đánh là unreachable (đã đạt ngưỡng
@@ -2094,14 +2155,19 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
     # supply-chain stage reads it (via 'work_dir' below) as this run's JS only.
     work_dir = Path(f'/tmp/redamon/js_recon_{uuid.uuid4().hex[:12]}')
 
-    global _JS_SCOPE, _OWN_HOSTS
+    global _JS_SCOPE, _OWN_HOSTS, _ADMIT
     from recon.helpers import circuit_breaker as _cb
-    _JS_SCOPE = _cb.scope((), label="JsRecon", unit="host(s)")
+    _JS_SCOPE = _cb.scope(("npm",), label="JsRecon", unit="package(s)")
     try:
         _OWN_HOSTS = _own_hosts(combined_result, settings)
     except Exception as e:  # noqa: BLE001 - every download then takes the strict rule
         print(f"[!][JsRecon] Run hosts unavailable ({type(e).__name__}); private hosts are not fetched")
         _OWN_HOSTS = None
+    try:
+        _ADMIT = ip_mode_url_admission(combined_result) or admit_any
+    except Exception as e:  # noqa: BLE001 - a target check that cannot run admits nothing
+        print(f"[!][JsRecon] Target check unavailable ({type(e).__name__}); nothing is fetched")
+        _ADMIT = _admit_none
 
     print("\n" + "=" * 60)
     print("[*][JsRecon] JS Recon Scanner -- Starting")
@@ -2253,9 +2319,11 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
         print(f"[*][JsRecon] Running analysis on {len(js_files)} JS files "
               f"({len(js_files) - len(uploaded_files)} from pipeline, {len(uploaded_files)} uploaded)...")
 
-        # 3. Run all analysis modules
-        results = _run_analysis(js_files, settings, parse_cache=parse_cache,
-                                metrics=fetch_metrics)
+        # Keep private parse/metrics and upstream multi-host source-map scope.
+        results = _run_analysis(
+            js_files, settings, parse_cache=parse_cache, metrics=fetch_metrics,
+            map_scope=_endpoint_probe_scope(combined_result, js_files, settings),
+        )
         trufflehog = results.pop('_trufflehog', None)
         trufflehog_urls = trufflehog.pop('_input_urls', []) if trufflehog else []
         trufflehog_reason = (f"trufflehog {trufflehog['status']}: {trufflehog['reason']}"
@@ -2457,6 +2525,7 @@ def run_js_recon(combined_result: dict, settings: dict) -> dict:
             pass
         _JS_SCOPE = None
         _OWN_HOSTS = None
+        _ADMIT = admit_any
         # Cleanup temp files. NOT when supply-chain recon is enabled: GROUP 5.5
         # runs after us and needs these exact bytes for the retire.js pass (it
         # must never re-fetch - that would add target traffic and an SSRF

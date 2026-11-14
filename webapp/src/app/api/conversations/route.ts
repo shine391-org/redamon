@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { internalError } from '@/lib/routeErrors'
 import prisma from '@/lib/prisma'
-import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
+import { conversationListScope } from '@/lib/authz/conversationAccess'
 
-// GET /api/conversations?projectId=X (conversations are scoped to the effective
-// user; the client-supplied userId is ignored as an auth input).
+// GET /api/conversations?projectId=X: the effective user's own conversations (the client-supplied userId
+// is ignored as an auth input) and, with write sharing in force, the others' they may read, each with its
+// `access` view (step 5.8, conversationAccess.ts).
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
@@ -17,15 +19,15 @@ export async function GET(request: NextRequest) {
       )
     }
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, projectId)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'agent:chat', { projectId })
+    const scope = await conversationListScope(request, projectId, auth)
+    if (scope instanceof NextResponse) return scope
 
     const conversations = await prisma.conversation.findMany({
-      where: { projectId, userId: eff.userId },
+      where: scope.where,
       orderBy: { updatedAt: 'desc' },
       select: {
+        ...scope.select,
         id: true,
         sessionId: true,
         title: true,
@@ -40,7 +42,7 @@ export async function GET(request: NextRequest) {
       },
     })
 
-    return NextResponse.json(conversations)
+    return NextResponse.json(scope.present(conversations))
   } catch (error) {
     return internalError(error, 'Failed to fetch conversations')
   }
@@ -59,10 +61,9 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, projectId)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'agent:chat', { projectId })
+    if (auth instanceof NextResponse) return auth
+    const eff = auth.effective
 
     // Owner is the effective user, never a client-supplied body value.
     const conversation = await prisma.conversation.create({

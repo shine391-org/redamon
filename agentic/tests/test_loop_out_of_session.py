@@ -13,7 +13,10 @@ from agent_in_the_loop.broker import StepBroker
 from agent_in_the_loop.model import LoopChatModel
 from orchestrator_helpers.model_providers import fetch_all_models
 
-ON = {"AGENT_IN_THE_LOOP_ENABLED": "true", "INTERNAL_API_KEY": ""}
+# The guardrail, NL-query and model-list routes take the configured master key only
+# (NF-01, step 1.9): the webapp's calls carry it.
+MASTER = "loop-test-master-key"
+ON = {"AGENT_IN_THE_LOOP_ENABLED": "true", "INTERNAL_API_KEY": MASTER}
 
 
 class Api(unittest.TestCase):
@@ -27,7 +30,7 @@ class Api(unittest.TestCase):
             import api as api_module
             from fastapi.testclient import TestClient
         cls.api = api_module
-        cls.client = TestClient(api_module.app)
+        cls.client = TestClient(api_module.app, headers={"x-internal-key": MASTER})
 
     def setUp(self):
         env = mock.patch.dict(os.environ, ON)
@@ -56,10 +59,13 @@ class Api(unittest.TestCase):
 
     def nl_routes(self):
         settings = {"OPENAI_MODEL": "loop/mcp"}
+        # /text-to-cypher fails closed without a master key (RBAC 1.15): the webapp's call.
+        master = {"INTERNAL_API_KEY": "loop-test-master-key"}
         with mock.patch("project_settings.fetch_agent_settings", return_value=settings), \
                 mock.patch("requests.get", side_effect=AssertionError("providers must not be fetched")):
-            yield self.client.post("/text-to-cypher", json={
-                "question": "list domains", "user_id": "u1", "project_id": "p1"})
+            with mock.patch.dict(os.environ, master):
+                yield self.client.post("/text-to-cypher", headers={"x-internal-key": master["INTERNAL_API_KEY"]},
+                                       json={"question": "list domains", "user_id": "u1", "project_id": "p1"})
             yield self.client.post("/graph/nl-query", json={
                 "question": "list domains", "user_id": "u1", "project_id": "p1"})
 

@@ -17,7 +17,10 @@ const h = vi.hoisted(() => ({
   existsSync: vi.fn(),
 }))
 
+vi.mock('@/lib/authz/guards', () => import('@/lib/authz/__testing__/routeGuardDoubles').then(m => m.overGuardProject()))
 vi.mock('@/lib/access', () => ({ guardProject: (...a: unknown[]) => h.guard(...a) }))
+// GET available reads the session first (HD-10); these tests are about a signed-in account.
+vi.mock('@/lib/session', () => ({ requireSession: async () => ({ userId: 'u1', role: 'standard' }) }))
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
 vi.mock('@/lib/scanTimeline', () => ({ reconcileScanJobStatus: (...a: unknown[]) => h.reconcile(...a) }))
 vi.mock('@/lib/prisma', () => ({

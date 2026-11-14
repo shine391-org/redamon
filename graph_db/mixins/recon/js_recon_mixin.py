@@ -48,12 +48,57 @@ def _displayable_map_url(map_url: str) -> str:
     return map_url[:2000]
 
 
+def _dependency_sources(finding: dict) -> tuple:
+    """``(source_url, source_urls)`` of a dependency-confusion finding.
+
+    The producer names every file that imports the package in ``source_urls``
+    (``custom_packages_file`` when only the project's internal-package list
+    names it), never ``source_url``. The list is sorted because files download
+    in completion order: unsorted, the finding's host could move between two
+    runs over the same files. Its first entry naming a fetched or uploaded file
+    gives the finding its file and host; a package no file imports has neither.
+    """
+    listed = finding.get("source_urls")
+    urls = sorted({u for u in listed if isinstance(u, str) and u}) if isinstance(listed, list) else []
+    legacy = finding.get("source_url") or finding.get("js_url") or ""
+    if not urls and legacy:
+        urls = [legacy]
+    first = legacy or next((u for u in urls if u.startswith(("http://", "https://", "upload://"))), "")
+    return first, urls
+
+
+def _dependency_answer(finding: dict) -> dict:
+    """``package_scope``, ``npm_exists`` and ``recommendation`` of a
+    dependency-confusion finding.
+
+    ``npm_exists`` stays tri-state: anything but the registry's own yes or no
+    is None, which ``SET jf += $props`` leaves absent, and readers show absent
+    as unknown. Coerced to False, a lookup that never answered would read as
+    "not published". The scope is named ``package_scope`` beside
+    ``package_name``, since a bare ``scope`` reads as the engagement scope; a
+    finding without one gets it by the producer's rule, the part before the
+    slash."""
+    scope = finding.get("scope")
+    if scope is None:
+        name = finding.get("package_name")
+        scope = name.split("/")[0] if isinstance(name, str) and "/" in name else ""
+    npm_exists = finding.get("npm_exists")
+    recommendation = finding.get("recommendation")
+    return {
+        "package_scope": scope if isinstance(scope, str) and scope else None,
+        "npm_exists": npm_exists if isinstance(npm_exists, bool) else None,
+        "recommendation": recommendation if isinstance(recommendation, str) and recommendation else None,
+    }
+
+
 def _finding_type_props(data_key: str, finding: dict) -> dict:
     """The fields one finding kind carries beyond the shared title/detail/
     evidence, flattened to scalars and string lists (a property cannot hold a
     map). A source map's first-party sources are analyzed as files of their
     own (source_url ``<map_url>#<source>``), so a key in them is a Secret node
     under that file; ``secrets_in_source`` counts those Secrets."""
+    if data_key == "dependencies":
+        return {"source_urls": _dependency_sources(finding)[1], **_dependency_answer(finding)}
     if data_key == "source_maps":
         map_url = _displayable_map_url(finding.get("map_url") or "")
         first_party = int(finding.get("first_party_files") or 0)
@@ -217,7 +262,8 @@ class JsReconMixin:
                              "emails", "ip_addresses", "object_references", "cloud_assets",
                              "dev_references"):
                 for f in js_recon_data.get(data_key, []):
-                    url = f.get("source_url", f.get("js_url", ""))
+                    url = (_dependency_sources(f)[0] if data_key == "dependencies"
+                           else f.get("source_url", f.get("js_url", "")))
                     if url:
                         all_source_urls.add(url)
             for f in js_recon_data.get("frameworks", []):
@@ -382,7 +428,8 @@ class JsReconMixin:
                             continue
 
                         node_id = f"jsrf-{user_id}-{project_id}-{finding_id}"
-                        source_url = finding.get("source_url", finding.get("js_url", ""))
+                        source_url = (_dependency_sources(finding)[0] if data_key == "dependencies"
+                                      else finding.get("source_url", finding.get("js_url", "")))
                         base_url = _derive_base_url(source_url)
 
                         props = {
@@ -750,7 +797,8 @@ class JsReconMixin:
                             MATCH (s:Secret {user_id: $uid, project_id: $pid, source: 'js_recon'})
                             WHERE s.id IN $ids
                             RETURN s.id AS id, s.alternate_names AS alternate_names,
-                                   s.validation_info AS validation_info
+                                   s.validation_info AS validation_info,
+                                   s.paired_secret AS paired_secret
                             """,
                             uid=user_id, pid=project_id, ids=ids):
                         stored_trufflehog[record["id"]] = dict(record)
@@ -772,8 +820,10 @@ class JsReconMixin:
                     base_url = _derive_base_url(source_url)
                     validation = secret.get("validation", {})
                     alternate_names = [str(a) for a in secret.get("alternate_names") or []]
+                    paired_secret = secret.get("paired_secret") or None
                     if node_id in stored_trufflehog:
                         alternate_names, validation = _keep_trufflehog_data(secret, stored_trufflehog[node_id])
+                        paired_secret = paired_secret or stored_trufflehog[node_id].get("paired_secret")
                     line_number = secret.get("line_number")
 
                     session.run(
@@ -793,8 +843,11 @@ class JsReconMixin:
                             s.key_type = $key_type,
                             s.validation_status = $validation_status,
                             s.matched_text = $matched_text,
+                            s.secret_value = $secret_value,
+                            s.paired_secret = $paired_secret,
                             s.validation_info = $validation_info,
                             s.context = $context,
+                            s.raw_context = $raw_context,
                             s.public_client_key = $public_client_key,
                             s.line_number = $line_number,
                             s.alternate_names = $alternate_names,
@@ -807,6 +860,9 @@ class JsReconMixin:
                         alternate_names=alternate_names,
                         # Already masked by the detector; the cap guards the node.
                         context=(secret.get("context") or "")[:400],
+                        raw_context=(secret.get("raw_context") or "")[:400] or None,
+                        secret_value=secret.get("secret_value") or secret.get("matched_text") or None,
+                        paired_secret=paired_secret,
                         secret_type=secret.get("name", "unknown"),
                         severity=secret.get("severity", "info"),
                         source_url=source_url,
@@ -1012,6 +1068,7 @@ class JsReconMixin:
                         "detail": finding.get("matched_text", "")[:500],
                         "evidence": finding.get("matched_text", "")[:500],
                         "sample": finding.get("sample", ""),
+                        "secret_value": finding.get("captured_value") or None,
                         "sdk_name": sdk_name,
                         "ai_provider": sdk_name,
                         "byte_offset": int(finding.get("byte_offset", 0)),

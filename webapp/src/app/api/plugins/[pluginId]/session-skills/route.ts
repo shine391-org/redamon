@@ -3,12 +3,15 @@ import prisma from '@/lib/prisma'
 import { sessionRunningCheck } from '@/lib/agentSessions'
 import { getEffectiveUser } from '@/lib/session'
 import { strictContext } from '@/lib/plugins/actions'
+import { PLUGIN_NOT_ALLOWED_MESSAGE, pluginAllowedFor } from '@/lib/plugins/accessRules'
+import { pluginLevels } from '@/lib/plugins/gateway'
 import { isValidPluginId } from '@/lib/plugins/ids'
 import { pluginRoute } from '@/lib/plugins/lifecycleRoutes'
 import * as ov from '@/lib/plugins/overrides'
 import { findInstall, servesActions } from '@/lib/plugins/registry'
 import { pickableSessionSkills } from '@/lib/plugins/sessionPick'
 import { suggestedSkill } from '@/lib/plugins/sessionSkills'
+import { requirePermission } from '@/lib/authz/guards'
 
 /**
  * GET /api/plugins/[pluginId]/session-skills?sessionId=&projectId= - the skill picker's
@@ -16,9 +19,11 @@ import { suggestedSkill } from '@/lib/plugins/sessionSkills'
  * and declares, with why a skill cannot be picked (deleted, credentials, quarantined),
  * whether the agent is running in the session, and the suggested pick.
  *
- * The same ownership check as an action start, and the same answers when the plugin does
- * not serve, except that an unknown plugin is `plugin_not_found`: the picker tells it from a
- * session that has no conversation yet, which is `not_found`. A built-in skill carries the
+ * The same project and session check as an action start (the plugin's levels on a shared
+ * project, step 5.10), and the same answers when the plugin does
+ * not serve or is not available to the person (403 `plugin_not_allowed`, accessRules.ts),
+ * except that an unknown plugin is `plugin_not_found`: the picker tells it from a session
+ * that has no conversation yet, which is `not_found`. A built-in skill carries the
  * version that applies in the project.
  */
 export const runtime = 'nodejs'
@@ -30,6 +35,8 @@ export const GET = pluginRoute('session skills', 'The skills of this session cou
   request: NextRequest,
   { params }: { params: Promise<{ pluginId: string }> },
 ) => {
+  const auth = await requirePermission(request, 'plugins:use')
+  if (auth instanceof NextResponse) return auth
   const eff = await getEffectiveUser()
   if (!eff) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   const { pluginId } = await params
@@ -38,6 +45,7 @@ export const GET = pluginRoute('session skills', 'The skills of this session cou
   if (!plugin || ['available', 'installing', 'uninstalling'].includes(plugin.status)) {
     return refuse(404, 'plugin_not_found', 'No such plugin.')
   }
+  if (!(await pluginAllowedFor(eff.userId, pluginId))) return refuse(403, 'plugin_not_allowed', PLUGIN_NOT_ALLOWED_MESSAGE)
   if (plugin.revokedReason == null && plugin.enabled && plugin.status === 'updating') {
     return refuse(409, 'plugin_updating', 'This plugin is being updated; try again in a moment.')
   }
@@ -46,7 +54,10 @@ export const GET = pluginRoute('session skills', 'The skills of this session cou
   const qs = request.nextUrl.searchParams
   const sessionId = qs.get('sessionId')
   if (!sessionId) return refuse(400, 'invalid_context', 'sessionId is required')
-  const context = await strictContext({ projectId: qs.get('projectId'), sessionId }, eff.userId)
+  const context = await strictContext({ projectId: qs.get('projectId'), sessionId }, eff.userId, {
+    levels: pluginLevels(plugin),
+    actingAs: !!auth.actingAs,
+  })
   if (context instanceof NextResponse) return context
   const conversation = await prisma.conversation.findUnique({
     where: { id: context.conversationId! },

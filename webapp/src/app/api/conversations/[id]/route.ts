@@ -3,6 +3,8 @@ import { internalError, safeErrorCode, upstreamFailure } from '@/lib/routeErrors
 import prisma from '@/lib/prisma'
 import { getGraphSession } from '../../graph/neo4j'
 import { requireEffectiveUser, requireConversationAccess } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
+import { readOnlyConversationRefusal, requireConversationRead } from '@/lib/authz/conversationAccess'
 import { agentFetch, AgentUnreachableError } from '@/lib/agentFetch'
 
 /** A cleanup step that failed while the conversation itself was deleted. */
@@ -13,7 +15,8 @@ interface DeleteWarning {
   status?: number
 }
 
-// GET /api/conversations/[id] - Get conversation with all messages
+// GET /api/conversations/[id] - Get conversation with all messages: the author's at agent:chat as before;
+// another person's, read-only, when write sharing is in force and step 5.8's rules let them read it.
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -23,8 +26,8 @@ export async function GET(
 
     const eff = await requireEffectiveUser()
     if (eff instanceof NextResponse) return eff
-    const guard = await requireConversationAccess(eff, id)
-    if (guard instanceof NextResponse) return guard
+    const read = await requireConversationRead(request, eff, { id })
+    if (read instanceof NextResponse) return read
 
     const conversation = await prisma.conversation.findUnique({
       where: { id },
@@ -42,7 +45,7 @@ export async function GET(
       )
     }
 
-    return NextResponse.json(conversation)
+    return NextResponse.json(read.view ? { ...conversation, access: read.view } : conversation)
   } catch (error) {
     return internalError(error, 'Failed to fetch conversation')
   }
@@ -60,6 +63,10 @@ export async function PATCH(
     if (eff instanceof NextResponse) return eff
     const guard = await requireConversationAccess(eff, id)
     if (guard instanceof NextResponse) return guard
+    const auth = await requirePermission(request, 'agent:chat', { projectId: guard.conversation.projectId })
+    if (auth instanceof NextResponse) return auth
+    const readOnly = await readOnlyConversationRefusal(id)
+    if (readOnly) return readOnly
 
     const body = await request.json()
 
@@ -94,6 +101,8 @@ export async function DELETE(
     if (eff instanceof NextResponse) return eff
     const guard = await requireConversationAccess(eff, id)
     if (guard instanceof NextResponse) return guard
+    const auth = await requirePermission(request, 'agent:chat', { projectId: guard.conversation.projectId })
+    if (auth instanceof NextResponse) return auth
 
     // Fetch conversation to get sessionId (= chain_id in Neo4j)
     const conversation = await prisma.conversation.findUnique({
@@ -104,6 +113,11 @@ export async function DELETE(
     if (!conversation) {
       return NextResponse.json({ error: 'Conversation not found' }, { status: 404 })
     }
+
+    // The graph tenant: the project's owner, whose id every chain node carries whoever ran it
+    // (step 5.3), from the access the guard read. The agent's run is keyed on its person, the
+    // author, so the stop below names them. Without an owner, the author: what it deleted before.
+    const tenantUserId = auth.access?.project.userId || conversation.userId
 
     // STOP the running agent task for this session FIRST. Deleting a conversation
     // used to leave its agent loop running headlessly: it kept iterating and
@@ -148,7 +162,7 @@ export async function DELETE(
            DETACH DELETE n`,
           {
             chainId: conversation.sessionId,
-            userId: conversation.userId,
+            userId: tenantUserId,
             projectId: conversation.projectId,
           }
         )

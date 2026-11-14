@@ -1,8 +1,10 @@
 /**
  * GET / PUT /api/projects/[id]/node-filters — the project's node-filter rules.
  *
- * Owner only, strictly (404 otherwise, whatever ACCESS_ENFORCE says): these
- * rules decide what the AI agent can see. PUT refuses any document the engine
+ * GET is `triage:read`, so a person the project is shared with at Read sees the
+ * rules; PUT is `node_filters:manage`, at the write level, because these rules
+ * decide what the AI agent can see. Anyone the project is not visible to gets
+ * 404. PUT refuses any document the engine
  * would not run as written, and a stale `revision` (409: someone saved in
  * between; resend with `force: true` to overwrite, which is audited as such).
  * PUT never arms or disarms: that is Apply's and Disarm's job.
@@ -14,11 +16,13 @@
  * from the request, so it always describes exactly what was saved.
  */
 import { NextRequest, NextResponse } from 'next/server'
+import { requirePermission } from '@/lib/authz/guards'
+import { triageCaller } from '@/lib/triage/routeCaller'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { writeAudit } from '@/lib/audit'
 import { readJsonBody } from '@/lib/jsonBody'
-import { requireProjectOwner, realActorUserId } from '@/lib/triageClient'
+import { realActorUserId } from '@/lib/triageClient'
 import { allErrors, validateNodeFilters } from '@/lib/nodeFilters/validate'
 import { coerceDoc, type NodeFilterMode } from '@/lib/nodeFilters/model'
 import { muteRulesFingerprint, parseLoadedPresetInput } from '@/lib/nodeFilters/presets'
@@ -31,10 +35,11 @@ interface RouteParams {
   params: Promise<{ id: string }>
 }
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id } = await params
-  const caller = await requireProjectOwner(id)
-  if (caller instanceof NextResponse) return caller
+  const auth = await requirePermission(request, 'triage:read', { projectId: id })
+  if (auth instanceof NextResponse) return auth
+  const caller = triageCaller(auth)
 
   const [stored, exemptions, version, lastRun, lastCompleted, live] = await Promise.all([
     loadNodeFilter(caller.projectId),
@@ -63,8 +68,9 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
   const { id } = await params
   const parsed = await readJsonBody(request)
   if (parsed instanceof NextResponse) return parsed
-  const caller = await requireProjectOwner(id)
-  if (caller instanceof NextResponse) return caller
+  const auth = await requirePermission(request, 'node_filters:manage', { projectId: id })
+  if (auth instanceof NextResponse) return auth
+  const caller = triageCaller(auth)
 
   const { mode, rules, revision, force } = parsed.body as {
     mode?: unknown; rules?: unknown; revision?: unknown; force?: unknown

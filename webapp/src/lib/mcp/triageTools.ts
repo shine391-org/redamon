@@ -25,7 +25,7 @@
  * message text reaches an MCP client; the code and its details go to the audit
  * row through `McpToolError`'s `audit` argument.
  */
-import { requireScope, assertMcpProjectAccess } from '@/lib/mcpAuth'
+import { requireScope, assertMcpProjectAccess, mcpProjectAccess } from '@/lib/mcpAuth'
 import { McpToolError } from '@/lib/mcp/errors'
 import { enforceRate, type McpContext } from '@/lib/mcp/tools'
 import {
@@ -85,8 +85,8 @@ export async function getFindingTriage(
 ) {
   requireScope(ctx.token, 'triage:read')
   enforceRate(ctx, 'read')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
-  const tenant: TriageTenant = { userId: ctx.token.userId, projectId }
+  const { userId: owner } = await assertMcpProjectAccess(ctx.token, projectId, 'R')
+  const tenant: TriageTenant = { userId: owner, projectId }
 
   let detail: Record<string, unknown>
   try {
@@ -206,8 +206,8 @@ export async function getFindingEvidence(
 ) {
   requireScope(ctx.token, 'triage:read')
   enforceRate(ctx, 'read')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
-  const tenant: TriageTenant = { userId: ctx.token.userId, projectId }
+  const { userId: owner } = await assertMcpProjectAccess(ctx.token, projectId, 'R')
+  const tenant: TriageTenant = { userId: owner, projectId }
 
   let body: Record<string, unknown>
   try {
@@ -258,8 +258,9 @@ export async function submitFindingReview(
 ) {
   requireScope(ctx.token, 'triage:review')
   enforceRate(ctx, 'write')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
-  const tenant: TriageTenant = { userId: ctx.token.userId, projectId }
+  // triage:review (W): an agent's review on a Read + Write share; the graph stays the owner's.
+  const { userId: owner } = await assertMcpProjectAccess(ctx.token, projectId, 'W')
+  const tenant: TriageTenant = { userId: owner, projectId }
 
   let result
   try {
@@ -311,8 +312,8 @@ export async function submitFindingReview(
 export async function getTriageStatus(ctx: McpContext, projectId: string) {
   requireScope(ctx.token, 'triage:read')
   enforceRate(ctx, 'read')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
-  const tenant: TriageTenant = { userId: ctx.token.userId, projectId }
+  const { userId: owner } = await assertMcpProjectAccess(ctx.token, projectId, 'R')
+  const tenant: TriageTenant = { userId: owner, projectId }
 
   const [preflight, recent, facets] = await Promise.all([
     computePreflight(tenant, 'mcp'),
@@ -365,9 +366,13 @@ export async function startTriageRun(ctx: McpContext, projectId: string) {
   // able to consume a project's window. The cheap refusals (a live run, the
   // spacing and the daily cap) come before the rate token and cost nothing;
   // the preflight, which reads the graph, only after it, so a caller looping
-  // on a refusal cannot run it unmetered.
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
-  const tenant: TriageTenant = { userId: ctx.token.userId, projectId }
+  // on a refusal cannot run it unmetered. triage:run's level (W+A, Use AI agent with the owner's
+  // consent) on a shared project, step 5.10: the run reads the owner's graph and names the token's
+  // user as its person, whom the webapp checks again and records as spending the owner's model.
+  const { project, access } = await mcpProjectAccess(ctx.token, projectId, 'W+A')
+  const tenant: TriageTenant = { userId: project.userId, projectId }
+  // The owner's own run names nobody beside the tenant, as before.
+  const actor = access.level === 'owner' ? {} : { actorUserId: ctx.token.userId }
 
   let live
   try {
@@ -421,7 +426,7 @@ export async function startTriageRun(ctx: McpContext, projectId: string) {
   let started
   try {
     started = await startRun(tenant, {
-      trigger: 'mcp', tokenId: ctx.token.tokenId, maxReviewBudget,
+      trigger: 'mcp', tokenId: ctx.token.tokenId, maxReviewBudget, ...actor,
     })
   } catch (err) {
     refused(err)
@@ -443,8 +448,9 @@ export async function startTriageRun(ctx: McpContext, projectId: string) {
 
 export async function stopTriageRun(ctx: McpContext, projectId: string) {
   requireScope(ctx.token, 'triage:run')
-  await assertMcpProjectAccess(ctx.token.userId, projectId)
-  const tenant: TriageTenant = { userId: ctx.token.userId, projectId }
+  // The project's run, whoever started it: a person who may start one may stop it, as in the app.
+  const { userId: owner } = await assertMcpProjectAccess(ctx.token, projectId, 'W+A')
+  const tenant: TriageTenant = { userId: owner, projectId }
 
   let live
   try {

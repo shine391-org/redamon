@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 
 from cypherfix_errors import safe_error
+from decision_check import UNAVAILABLE as DECISION_CHECK_UNAVAILABLE, authorize_decision
 from llm_builder import provider_error_details
 from . import sandbox_client
 from .state import CodeFixState, CodeFixSettings
@@ -26,6 +27,7 @@ from .tools.symbols_tool import github_symbols
 from .tools.find_definition_tool import github_find_definition
 from .tools.find_references_tool import github_find_references
 from .tools.repo_map_tool import github_repo_map
+from .tools.review_gate import accept_change, prepare_commit, reject_change
 from .prompts.system import build_codefix_system_prompt
 from .project_settings import load_cypherfix_settings
 
@@ -385,7 +387,7 @@ class CodeFixOrchestrator:
                             await self.callback.on_block_status(block_id, "rejected")
                     else:
                         logger.info(f"[APPROVAL] Block {block_id} ACCEPTED")
-                        self.state.block_backups.pop(block_id, None)
+                        accept_change(self.state, block_id)
                         if block_id:
                             await self.callback.on_block_status(block_id, "accepted")
                     self.state.pending_approval = False
@@ -458,25 +460,8 @@ class CodeFixOrchestrator:
         }
 
     def _revert_block(self, block_id: Optional[str]) -> None:
-        """Undo a rejected edit on disk so only approved changes get committed.
-
-        Edits are sequential and the decision is awaited immediately after the
-        write, so nothing else has touched the file in between.
-        """
-        backup = self.state.block_backups.pop(block_id, None)
-        if not backup:
-            return
-        file_path, previous, was_modified = backup
-        try:
-            (self.state.repo_path / file_path).write_text(previous, encoding="utf-8")
-        except Exception as e:
-            logger.error(f"Could not revert rejected block {block_id}: {e}")
-            return
-        if not was_modified:
-            self.state.files_modified.discard(file_path)
-        for block in self.state.diff_blocks:
-            if block.block_id == block_id:
-                block.status = "rejected"
+        """Undo a rejected change on disk; it never becomes committable."""
+        reject_change(self.state, block_id)
 
     async def _await_block_approval(self, timeout: float = 300) -> Optional[dict]:
         """Wait for user to accept/reject a diff block."""
@@ -502,7 +487,9 @@ class CodeFixOrchestrator:
         logger.info(f"Files modified: {list(self.state.files_modified) if self.state.files_modified else 'NONE'}")
         logger.info(f"Diff blocks: {len(self.state.diff_blocks)}")
 
-        if self.state.files_modified and self.repo_manager:
+        if self.state.committable and self.repo_manager and not await self._push_allowed(remediation_id):
+            return
+        if self.state.committable and self.repo_manager:
             step = "commit"
             try:
                 rem_title = self.state.remediation_title or "security remediation"
@@ -510,10 +497,12 @@ class CodeFixOrchestrator:
                 logger.info(f"Committing {len(self.state.diff_blocks)} change(s)...")
                 for i, block in enumerate(self.state.diff_blocks, 1):
                     logger.info(f"  Change {i}: {block.file_path} ({block.status})")
-                # Stage ONLY the files the LLM edited (approved), never `git add -A`,
-                # so anything a malicious build wrote into the worktree stays out of
-                # the PR (T6/E10).
-                self.repo_manager.commit(title, list(self.state.files_modified))
+                # The reviewed content of the reviewed files only, never `git add -A`
+                # and never the worktree as a build left it (T6/E10, GHSA-vhjw-gfmx-j3fx).
+                staged, restored = prepare_commit(self.state)
+                if restored:
+                    logger.warning(f"Changes made outside the edit tools left out of the PR: {restored}")
+                self.repo_manager.commit(title, staged)
                 logger.info(f"Pushing branch {self.state.branch_name}...")
                 step = "push"
                 self.repo_manager.push(self.state.branch_name)
@@ -537,6 +526,8 @@ class CodeFixOrchestrator:
                     "prStatus": "open",
                     "fixBranch": self.state.branch_name,
                     "fileChanges": [b.model_dump() for b in self.state.diff_blocks],
+                    **({"agentNotes": "Left out of the PR because nobody reviewed them: changes a "
+                                      "command made to " + ", ".join(restored) + "."} if restored else {}),
                 })
                 self.state.status = "completed"
                 await self.callback.on_complete(remediation_id, "pr_created", pr_data["pr_url"])
@@ -566,6 +557,37 @@ class CodeFixOrchestrator:
             })
             self.state.status = "completed"
             await self.callback.on_complete(remediation_id, "no_fix")
+
+    async def _push_allowed(self, remediation_id: str) -> bool:
+        """Whether the person running the fix may push with the project's token now (step 5.4).
+
+        Opening a branch and a PR with the owner's GitHub token is Manage's (phase file 5.2),
+        asked of the webapp when it happens, for the ticket's person (a state from before the
+        actor was recorded asks for the tenant). Refused or unanswered: nothing is committed or
+        pushed, and the approved changes stay on the remediation for the owner.
+        """
+        check = await authorize_decision(
+            kind="codefix_push", user_id=self.state.actor_user_id or self.state.user_id,
+            project_id=self.state.project_id, session_id=self.state.session_id,
+            actor_id=self.state.real_actor_user_id, permissions=("codefix:run",))
+        if check.allowed:
+            return True
+        logger.warning("[rbac] codefix push refused code=%s reason=%s session=%s",
+                       check.code, check.reason, self.state.session_id)
+        await self._update_remediation(remediation_id, {
+            "status": "pending",
+            "agentSessionId": "",
+            "agentNotes": ("The fix was not pushed: RedAmon could not check that the person who ran it may push."
+                           if check.code == DECISION_CHECK_UNAVAILABLE else
+                           "The fix was not pushed: the person who ran it may not push with the project's token."),
+            "fileChanges": [b.model_dump() for b in self.state.diff_blocks],
+        })
+        await self.callback.on_error(
+            safe_error(check.code, codefix=True), recoverable=False, code=check.code,
+            **({"permission": check.permission} if check.permission else {}))
+        self.state.status = "error"
+        await self.callback.on_complete(remediation_id, "error")
+        return False
 
     async def _load_remediation(self, remediation_id: str) -> Optional[dict]:
         """The remediation, or None when the webapp has none with this id.

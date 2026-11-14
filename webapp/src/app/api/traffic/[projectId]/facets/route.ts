@@ -1,23 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/prisma'
 import { internalError } from '@/lib/routeErrors'
-import { requireEffectiveUser, requireProjectAccess, ownerScope } from '@/lib/access'
+import { requirePermission } from '@/lib/authz/guards'
+import { trafficRows } from '../trafficTenant'
 
 // GET /api/traffic/[projectId]/facets - distinct values for the filter dropdowns
-// (tools, hosts, runs, sessions), scoped to the caller's own rows in this project.
+// (tools, hosts, runs, sessions), over the project's rows under its owner (trafficRows).
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ projectId: string }> },
 ) {
   try {
     const { projectId } = await params
 
-    const eff = await requireEffectiveUser()
-    if (eff instanceof NextResponse) return eff
-    const access = await requireProjectAccess(eff, projectId)
-    if (access instanceof NextResponse) return access
+    const auth = await requirePermission(request, 'traffic:read', { projectId })
+    if (auth instanceof NextResponse) return auth
 
-    const where = { projectId, ...ownerScope(eff) }
+    const where = trafficRows(projectId, auth)
 
     const [tools, hosts, runs, sessions] = await Promise.all([
       prisma.capturedHttpTransaction.findMany({
