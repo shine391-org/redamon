@@ -1250,7 +1250,7 @@ async def get_recon_status(project_id: str):
 async def get_recon_diagnostics(project_id: str, run_id: Optional[str] = None):
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    from recon_evidence import diagnostics, identifier
+    from recon_evidence import diagnostics, identifier, recon_output_path
     try:
         identifier(project_id)
         if run_id is not None:
@@ -1260,7 +1260,7 @@ async def get_recon_diagnostics(project_id: str, run_id: Optional[str] = None):
     state = await container_manager.get_status(project_id)
     active = state.status in (ReconStatus.STARTING, ReconStatus.RUNNING,
                               ReconStatus.PAUSED, ReconStatus.STOPPING)
-    result = await asyncio.to_thread(diagnostics, Path(RECON_PATH) / "output",
+    result = await asyncio.to_thread(diagnostics, recon_output_path(),
                                      project_id, run_id or state.run_id, None, active)
     continuation = (result.get("checkpoint") or {}).get("continuation", {})
     if continuation.get("eligible"):
@@ -1270,7 +1270,7 @@ async def get_recon_diagnostics(project_id: str, run_id: Optional[str] = None):
             project = _fetch_project_for_preflight(project_id)
             _check_roe_time_window(project)
             from recon_evidence import continuation_work, project_revision
-            continuation_work(Path(RECON_PATH) / "output", project_id, result["run_id"],
+            continuation_work(recon_output_path(), project_id, result["run_id"],
                               project.get("userId"), project_revision(project))
         except Exception:
             continuation.update(eligible=False, reason="preflight_incompatible_or_unavailable")
@@ -1281,7 +1281,7 @@ async def get_recon_diagnostics(project_id: str, run_id: Optional[str] = None):
 async def continue_recon(project_id: str, request: Request):
     if not container_manager:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    from recon_evidence import identifier, continuation_work, project_revision
+    from recon_evidence import identifier, continuation_work, project_revision, recon_output_path
     try:
         body = await request.json()
         identifier(project_id)
@@ -1306,7 +1306,7 @@ async def continue_recon(project_id: str, request: Request):
     _check_roe_time_window(project)
     revision = project_revision(project)
     try:
-        continuation_work(Path(RECON_PATH) / "output", project_id, body["run_id"],
+        continuation_work(recon_output_path(), project_id, body["run_id"],
                           project["userId"], revision)
         state = await container_manager.start_recon(
             project_id=project_id, user_id=project["userId"],
@@ -1326,12 +1326,12 @@ _PLAN_MANIFEST_PREFIX = "/app/recon/output/planner_manifests/"
 
 
 def _host_manifest_path(container_path: str) -> Optional[str]:
-    """Map a container manifest path to the host path, or None if it escapes.
+    """Map a worker manifest path to a local read path, or None if it escapes.
 
     The pointer records the path as the container saw it (under
     /app/recon/output/planner_manifests). The orchestrator reads the same file
-    through its own bind mount, so the /app/recon prefix is replaced by the
-    detected host path. A path outside the manifest prefix is refused.
+    through its own bind mount, not through Docker's host mount source.
+    A path outside the manifest prefix is refused.
     """
     if not isinstance(container_path, str) or \
             not container_path.startswith(_PLAN_MANIFEST_PREFIX):
@@ -1339,7 +1339,14 @@ def _host_manifest_path(container_path: str) -> Optional[str]:
     remainder = container_path[len(_PLAN_MANIFEST_PREFIX):]
     if not remainder or ".." in Path(remainder).parts:
         return None
-    return str(Path(RECON_PATH) / "output" / "planner_manifests" / remainder)
+    from recon_evidence import recon_output_path
+    base = recon_output_path() / "planner_manifests"
+    candidate = base / remainder
+    try:
+        candidate.resolve().relative_to(base.resolve())
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return str(candidate)
 
 
 @app.get("/recon/{project_id}/plan-manifest")
@@ -1367,12 +1374,8 @@ async def get_recon_plan_manifest(
     if not sha256:
         return {"status": "unknown", "reason": "manifest_digest_missing"}
 
-    import sys
-    recon_path = Path("/app/recon")
-    if str(recon_path) not in sys.path:
-        sys.path.insert(0, str(recon_path))
     try:
-        from recon.helpers.planner_manifest import read_manifest_in_context
+        from recon_evidence import read_manifest_in_context
     except Exception as e:  # noqa: BLE001 - a missing helper is unknown
         return {"status": "unknown",
                 "reason": f"manifest_reader_unavailable: {e}"}

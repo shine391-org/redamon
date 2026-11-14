@@ -3,7 +3,7 @@ Docker container lifecycle management for recon processes
 """
 import asyncio
 import functools
-from recon_evidence import diagnostics, identifier
+from recon_evidence import diagnostics, identifier, recon_output_path
 import json
 import logging
 import threading
@@ -1083,7 +1083,7 @@ class ContainerManager:
         identifier(project_id)
         state = await self._run_blocking(self._get_status_sync, project_id)
         evidence = await self._run_blocking(
-            diagnostics, Path(getattr(self, "recon_host_path", "")) / "output", project_id,
+            diagnostics, recon_output_path(), project_id,
             getattr(state, "run_id", None), None,
             state.status in (ReconStatus.RUNNING, ReconStatus.STARTING, ReconStatus.PAUSED, ReconStatus.STOPPING))
         state.coverage_summary = evidence["coverage_summary"]
@@ -1111,8 +1111,7 @@ class ContainerManager:
         """
         pointers: list = []
         try:
-            base = Path(getattr(self, "recon_host_path", "")
-                        ) / "output" / "planner_manifests"
+            base = recon_output_path() / "planner_manifests"
             if not base.is_dir():
                 return pointers
             project_dir = base / project_id

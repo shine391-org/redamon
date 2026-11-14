@@ -22,21 +22,6 @@ _docker.errors.APIError = _DockerError
 sys.modules.setdefault("docker", _docker)
 sys.modules.setdefault("docker.errors", _docker.errors)
 
-# Stub `dns` (dnspython) so `recon.helpers` can import in this local run.
-import types as _types
-_dns = _types.ModuleType("dns")
-_dns.__path__ = []
-_dns.resolver = _types.ModuleType("dns.resolver")
-_dns.zone = _types.ModuleType("dns.zone")
-_dns.query = _types.ModuleType("dns.query")
-_dns.exception = _types.ModuleType("dns.exception")
-_dns.rdatatype = _types.ModuleType("dns.rdatatype")
-_dns.rdataclass = _types.ModuleType("dns.rdataclass")
-_dns.name = _types.ModuleType("dns.name")
-sys.modules.setdefault("dns", _dns)
-for _sub in ("resolver", "zone", "query", "exception", "rdatatype", "rdataclass", "name"):
-    sys.modules.setdefault(f"dns.{_sub}", getattr(_dns, _sub))
-
 import pytest
 
 # Make sibling packages importable from this test root, as they are in the
@@ -67,7 +52,12 @@ def mock_docker_client():
 
 
 @pytest.fixture
-def wired_manager(mock_docker_client):
+def wired_manager(mock_docker_client, monkeypatch):
+    import recon_evidence
+    monkeypatch.setattr(recon_evidence, "recon_output_path",
+                        lambda: Path(os.environ["RECON_PATH"]) / "output")
+    monkeypatch.setattr("container_manager.recon_output_path",
+                        recon_evidence.recon_output_path)
     with patch("container_manager.docker") as mock_docker_mod:
         mock_docker_mod.from_env.return_value = mock_docker_client
         mgr = ContainerManager()
