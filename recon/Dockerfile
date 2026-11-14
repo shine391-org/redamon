@@ -49,6 +49,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git -c advice.detachedHead=false checkout 94e118ccd26c2fb263fb2fe731043f7b3240723c \
     && make -j$(nproc)
 
+# Stage 1f: Build a proxy-capable Kiterunner from the pinned v1.0.2 release.
+# The stock binary rejects --proxy and its fasthttp transport has no dialer
+# hook. The local build script applies only the CONNECT dialer patch; it does
+# not vendor or redistribute the upstream source tree.
+FROM golang:1.22-alpine AS kiterunner-capture-builder
+RUN env -u HTTPS_PROXY -u HTTP_PROXY -u NO_PROXY \
+    apk add --no-cache python3 git tar gzip ca-certificates
+WORKDIR /build-kr
+COPY recon/helpers/resource_enum/kiterunner_proxy/ /build-kr/
+RUN env -u HTTPS_PROXY -u HTTP_PROXY -u NO_PROXY \
+    python3 /build-kr/build.py --out /out/kr-capture
+
 # Stage 2: Main recon image
 FROM python:3.11-slim-bookworm
 
@@ -112,6 +124,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy masscan binary from builder stage
 COPY --from=masscan-builder /masscan/bin/masscan /usr/local/bin/masscan
+COPY --from=kiterunner-capture-builder /out/kr-capture /home/redamon/.redamon/tools/kiterunner/kr-capture
+RUN chmod 0755 /home/redamon/.redamon/tools/kiterunner/kr-capture
 
 # Create non-root user for security (but allow Docker access)
 RUN groupadd -f docker && \

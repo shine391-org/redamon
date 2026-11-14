@@ -1,0 +1,3 @@
+Kiterunner is Copyright (c) Assetnote Pty Ltd and licensed under the MIT License.
+This local patch adds only the HTTP CONNECT dialer above; it does not vendor,
+copy or redistribute the upstream source tree.
