@@ -5,6 +5,7 @@ API endpoint bruteforcing using Kiterunner.
 """
 
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -86,40 +87,46 @@ def ensure_kiterunner_binary(wordlist_name: str) -> Tuple[Optional[str], Optiona
     binary_path = kr_dir / binary_name
     wordlist_path = kr_dir / f"{wordlist_name}.kite"
 
-    # Download binary if not present
+    # Download binary if not present. The stock v1.0.2 release cannot honour
+    # --proxy; the image build stage applies the local CONNECT dialer patch and
+    # installs it as kr-capture. The unpatched release remains the fallback so
+    # a stock-only environment is visible and can be reported as unsupported.
     if not binary_path.exists():
         print(f"[*][Kiterunner] Downloading Kiterunner binary...")
         download_url = f"https://github.com/assetnote/kiterunner/releases/download/v1.0.2/{asset_name}"
-
         try:
             archive_path = kr_dir / asset_name
-
-            # Download archive with User-Agent header
             request = urllib.request.Request(
                 download_url,
                 headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) RedAmon/1.0'}
             )
-            # A GitHub/CDN download that hangs must not stall the whole scan.
             with urllib.request.urlopen(request, timeout=30) as response:
-                with open(archive_path, 'wb') as f:
-                    f.write(response.read())
-
-            # Extract archive
+                payload = response.read()
+            # A truncated archive must not be installed as a working binary.
+            if len(payload) < 1024:
+                raise ValueError("release archive too small")
+            with open(archive_path, 'wb') as f:
+                f.write(payload)
             if asset_name.endswith(".tar.gz"):
                 with tarfile.open(archive_path, "r:gz") as tar:
-                    tar.extractall(path=kr_dir)
+                    base = kr_dir.resolve()
+                    for member in tar.getmembers():
+                        target = (kr_dir / member.name).resolve()
+                        if base not in target.parents and target != base:
+                            raise ValueError("unsafe archive path")
+                        tar.extract(member, path=kr_dir)
             elif asset_name.endswith(".zip"):
                 with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                    base = kr_dir.resolve()
+                    for name in zip_ref.namelist():
+                        target = (kr_dir / name).resolve()
+                        if base not in target.parents and target != base:
+                            raise ValueError("unsafe archive path")
                     zip_ref.extractall(kr_dir)
-
-            # Make binary executable
             if binary_path.exists():
                 binary_path.chmod(0o755)
                 print(f"[+][Kiterunner] Binary installed: {binary_path}")
-
-            # Cleanup archive
-            archive_path.unlink()
-
+            archive_path.unlink(missing_ok=True)
         except Exception as e:
             print(f"[!][Kiterunner] Failed to download Kiterunner: {e}")
             return None, None
@@ -304,7 +311,16 @@ def run_kiterunner_discovery(
         from helpers.proxy_routing import get_capture_routing
         _cap_url, _cap_token = get_capture_routing("kiterunner")
         if _cap_url and _cap_token:
-            cmd.extend(["--proxy", _cap_url, "-H", f"X-Redamon-Ctx: {_cap_token}"])
+            # Only the patched transport understands --proxy. A stock binary
+            # would exit 1 with "unknown flag"; sending it direct instead would
+            # lose capture and hand the context header to the origin.
+            patched = Path(binary_path).with_name("kr-capture")
+            if patched.exists() and os.access(patched, os.X_OK):
+                cmd[0] = str(patched)
+                cmd.extend(["--proxy", _cap_url, "-H", f"X-Redamon-Ctx: {_cap_token}"])
+            else:
+                print("[!][Kiterunner] Capture route requested but proxy-capable binary is unavailable")
+                return []
 
         from recon.helpers.resource_enum import tool_health
         started = time.time()
