@@ -78,4 +78,16 @@ describe('readPlanManifest', () => {
     const url = fetchMock.mock.calls[0][0]
     expect(url).toContain('run_id=summary-run')
   })
+
+  // A stale pointer left by an earlier run must never be presented as this
+  // run's plan, even though the manifest file itself is perfectly valid.
+  test('a pointer whose run_id disagrees with the row is unknown', async () => {
+    const out = await readPlanManifest('p1', {
+      ...job,
+      runId: 'runNEW',
+      planManifestSummary: { run_id: 'runOLD', group_id: 'g1' },
+    }, 't1')
+    expect(out).toEqual({ status: 'unknown', reason: 'manifest_run_mismatch' })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
 })

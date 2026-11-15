@@ -15,7 +15,7 @@ const prismaMock = vi.hoisted(() => ({
     update: vi.fn(), updateMany: vi.fn(), create: vi.fn(), findFirst: vi.fn(), findUnique: vi.fn(),
     delete: vi.fn(), findMany: vi.fn(),
   },
-  scanJob: { create: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), update: vi.fn() },
+  scanJob: { create: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   $transaction: vi.fn(),
 }))
 const snapshotMock = vi.hoisted(() => ({
@@ -236,6 +236,24 @@ describe('createScanJob', () => {
     expect(data.status).toBe('deferred_ram')
     expect(data.ramReason).toBe('graph busy')
     expect(data.startedAt).toBeNull()
+  })
+
+  // A new history row must never inherit a plan manifest from an earlier run:
+  // the pointer belongs to the run that produced it, and only
+  // persistPlanManifest writes one.
+  test('never inherits plan-manifest fields from its input', async () => {
+    prismaMock.scanJob.create.mockResolvedValue({ id: 'j1' })
+    await createScanJob({
+      projectId: 'p1', trigger: 'manual', mode: 'new',
+      // Cast: the whole point is that a caller cannot smuggle these in.
+      planManifestPath: '/out/planner_manifests/t1/p1/runOLD/g1/plan_manifest.json',
+      planManifestSha256: 'b'.repeat(64),
+      planManifestSummary: { run_id: 'runOLD' },
+    } as never)
+    const data = prismaMock.scanJob.create.mock.calls[0][0].data
+    expect(data.planManifestPath).toBeNull()
+    expect(data.planManifestSha256).toBeNull()
+    expect(data.planManifestSummary).toBeUndefined()
   })
 })
 
@@ -462,61 +480,325 @@ describe('P0-2: prepare no longer runs retention', () => {
 })
 
 describe('persistPlanManifest', () => {
+  const pathFor = (runId: string, projectId = 'p1', tenant = 't1', group = 'g1') =>
+    `/out/planner_manifests/${tenant}/${projectId}/${runId}/${group}/plan_manifest.json`
+  const pointerFor = (runId: string, extra: Record<string, unknown> = {}) => ({
+    plan_manifest_path: pathFor(runId),
+    plan_manifest_sha256: 'a'.repeat(64),
+    plan_manifest_summary: {
+      run_id: runId,
+      group_id: 'g1',
+      created_at: '2026-01-02T00:00:00Z',
+      ...extra,
+    },
+  })
+  const row = (over: Record<string, unknown> = {}) => ({
+    id: 'j1', planManifestPath: null, planManifestSha256: null, planManifestSummary: null, ...over,
+  })
+
   beforeEach(() => {
     prismaMock.scanJob.findFirst.mockResolvedValue(null)
-    prismaMock.scanJob.update.mockResolvedValue({})
+    prismaMock.scanJob.updateMany.mockResolvedValue({ count: 1 })
   })
 
-  test('writes pointer + digest + bounded summary onto the open running row', async () => {
-    prismaMock.scanJob.findFirst.mockResolvedValue({
-      id: 'j1', planManifestPath: null,
+  test('writes pointer + digest + bounded summary onto the open row of the manifest\'s run', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row())
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', pointer: pointerFor('run9'),
     })
-    await persistPlanManifest({
+    expect(res.persisted).toBe(true)
+    // Attributed by the manifest's own run id, not by "newest open row".
+    expect(prismaMock.scanJob.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        projectId: 'p1', kind: 'full_recon',
+        status: { in: ['running', 'queued'] },
+        runId: 'run9',
+      },
+    }))
+    expect(prismaMock.scanJob.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'j1', runId: 'run9' }),
+      data: {
+        planManifestPath: pathFor('run9'),
+        planManifestSha256: 'a'.repeat(64),
+        planManifestSummary: { run_id: 'run9', group_id: 'g1', created_at: '2026-01-02T00:00:00Z' },
+      },
+    }))
+  })
+
+  // The reported defect: the row carried run28505fa3's pointer while the run is
+  // 7400658f. The old code returned early on any existing pointer, so the
+  // correct same-run pointer could never replace the stale one.
+  test('replaces a stale pointer left by a different run on the same row', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row({
+      planManifestPath: pathFor('runOLD'),
+      planManifestSummary: { run_id: 'runOLD', group_id: 'g1', created_at: '2026-01-01T00:00:00Z' },
+    }))
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', pointer: pointerFor('run9'),
+    })
+    expect(res.persisted).toBe(true)
+    expect(prismaMock.scanJob.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'j1', runId: 'run9' }),
+      data: expect.objectContaining({ planManifestPath: pathFor('run9') }),
+    }))
+  })
+
+  test('never writes a pointer whose run id has no open row', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(null)
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', pointer: pointerFor('runOTHER'),
+    })
+    expect(res).toEqual({ persisted: false, reason: 'no_open_job' })
+    expect(prismaMock.scanJob.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ runId: 'runOTHER' }),
+    }))
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a caller run id that disagrees with the manifest is rejected', async () => {
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', runId: 'runCALLER',
+      pointer: pointerFor('run9'),
+    })
+    expect(res).toEqual({ persisted: false, reason: 'run_mismatch' })
+    expect(prismaMock.scanJob.findFirst).not.toHaveBeenCalled()
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a pointer path naming another project is rejected', async () => {
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: { ...pointerFor('run9'), plan_manifest_path: pathFor('run9', 'p2') },
+    })
+    expect(res).toEqual({ persisted: false, reason: 'context_mismatch' })
+    expect(prismaMock.scanJob.findFirst).not.toHaveBeenCalled()
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a pointer path naming another run is rejected', async () => {
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: { ...pointerFor('run9'), plan_manifest_path: pathFor('runPATH') },
+    })
+    expect(res).toEqual({ persisted: false, reason: 'context_mismatch' })
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a pointer path naming another tenant is rejected', async () => {
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', tenant: 't1',
+      pointer: { ...pointerFor('run9'), plan_manifest_path: pathFor('run9', 'p1', 't2') },
+    })
+    expect(res).toEqual({ persisted: false, reason: 'context_mismatch' })
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a path that is not a run-scoped manifest is rejected', async () => {
+    for (const plan_manifest_path of [
+      '/etc/passwd',
+      '/out/planner_manifests/t1/p1/run9/g1/other.json',
+      '/out/planner_manifests/t1/p1/run9/g1',
+      '/out/planner_manifests/t1/p1/../p1/run9/g1/plan_manifest.json',
+    ]) {
+      prismaMock.scanJob.findFirst.mockClear()
+      prismaMock.scanJob.updateMany.mockClear()
+      const res = await persistPlanManifest({
+        projectId: 'p1', kind: 'full_recon',
+        pointer: { ...pointerFor('run9'), plan_manifest_path },
+      })
+      expect(res.persisted).toBe(false)
+      expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+    }
+  })
+
+  test('a hex-leading domain group is matched by canonical encoding', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row())
+    const group = 'domain:abc'
+    const res = await persistPlanManifest({
       projectId: 'p1', kind: 'full_recon',
       pointer: {
-        plan_manifest_path: '/out/planner_manifests/t1/p1/run9/g1/plan_manifest.json',
-        plan_manifest_sha256: 'a'.repeat(64),
-        plan_manifest_summary: { run_id: 'run9', group_id: 'g1', settings_hash_prefix: 'abc' },
+        ...pointerFor('run9'),
+        plan_manifest_path: pathFor('run9', 'p1', 't1', 'domain%3Aabc'),
+        plan_manifest_summary: { run_id: 'run9', group_id: group, created_at: '2026-01-02T00:00:00Z' },
       },
     })
-    expect(prismaMock.scanJob.update).toHaveBeenCalledWith({
-      where: { id: 'j1' },
-      data: {
-        planManifestPath: '/out/planner_manifests/t1/p1/run9/g1/plan_manifest.json',
-        planManifestSha256: 'a'.repeat(64),
-        planManifestSummary: { run_id: 'run9', group_id: 'g1', settings_hash_prefix: 'abc' },
-      },
-    })
+    expect(res.persisted).toBe(true)
+    expect(prismaMock.scanJob.updateMany).toHaveBeenCalledOnce()
   })
 
-  test('does not overwrite a row that already carries a pointer', async () => {
-    prismaMock.scanJob.findFirst.mockResolvedValue({
-      id: 'j1', planManifestPath: '/existing/path.json',
-    })
-    await persistPlanManifest({
+  test('a Unicode/non-ASCII group is matched by canonical encoding', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row())
+    const group = 'grüp-é'
+    const res = await persistPlanManifest({
       projectId: 'p1', kind: 'full_recon',
-      pointer: { plan_manifest_path: '/new/path.json', plan_manifest_sha256: 'b'.repeat(64), plan_manifest_summary: {} },
+      pointer: {
+        ...pointerFor('run9'),
+        plan_manifest_path: pathFor('run9', 'p1', 't1', 'gr%FCp-%E9'),
+        plan_manifest_summary: { run_id: 'run9', group_id: group, created_at: '2026-01-02T00:00:00Z' },
+      },
     })
-    expect(prismaMock.scanJob.update).not.toHaveBeenCalled()
+    expect(res.persisted).toBe(true)
   })
 
-  test('a run-keyed kind matches the manifest\'s own run id', async () => {
-    prismaMock.scanJob.findFirst.mockResolvedValue({ id: 'j2', runId: 'r1', planManifestPath: null })
+  test('a summary group that disagrees with the path group is rejected', async () => {
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: {
+        ...pointerFor('run9'),
+        plan_manifest_summary: { run_id: 'run9', group_id: 'g2', created_at: '2026-01-02T00:00:00Z' },
+      },
+    })
+    expect(res).toEqual({ persisted: false, reason: 'context_mismatch' })
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a manifest path with a trailing or missing segment is rejected', async () => {
+    for (const plan_manifest_path of [
+      pathFor('run9') + '/extra',
+      pathFor('run9') + '/',
+      '/out/planner_manifests/t1/p1/run9/plan_manifest.json',
+    ]) {
+      prismaMock.scanJob.updateMany.mockClear()
+      const res = await persistPlanManifest({
+        projectId: 'p1', kind: 'full_recon',
+        pointer: { ...pointerFor('run9'), plan_manifest_path },
+      })
+      expect(res.persisted).toBe(false)
+      expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+    }
+  })
+
+  test('recency is compared as epoch milliseconds, not lexical strings', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row({
+      planManifestPath: pathFor('run9'),
+      planManifestSha256: 'd'.repeat(64),
+      planManifestSummary: { run_id: 'run9', group_id: 'g1', created_at: '2026-01-02T00:00:00Z' },
+    }))
+    // Lexically "+" < "Z", but the instants are equal.
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: pointerFor('run9', { created_at: '2026-01-02T00:00:00+00:00' }),
+    })
+    expect(res.persisted).toBe(true)
+  })
+
+  test('a known newer pointer is not overwritten by one with no timestamp', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row({
+      planManifestPath: pathFor('run9'),
+      planManifestSha256: 'd'.repeat(64),
+      planManifestSummary: { run_id: 'run9', group_id: 'g1', created_at: '2026-01-03T00:00:00Z' },
+    }))
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: { ...pointerFor('run9'), plan_manifest_summary: { run_id: 'run9', group_id: 'g1' } },
+    })
+    expect(res).toEqual({ persisted: false, reason: 'pointer_newer' })
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a pointer with no run id is dropped, never guessed onto a row', async () => {
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon',
+      pointer: { plan_manifest_path: pathFor('run9'), plan_manifest_sha256: 'a'.repeat(64), plan_manifest_summary: { group_id: 'g1' } },
+    })
+    expect(res).toEqual({ persisted: false, reason: 'no_run_id' })
+    expect(prismaMock.scanJob.findFirst).not.toHaveBeenCalled()
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('a late poll does not regress a newer same-run pointer', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row({
+      planManifestPath: pathFor('run9'),
+      planManifestSummary: { run_id: 'run9', group_id: 'g1', created_at: '2026-01-03T00:00:00Z' },
+    }))
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', pointer: pointerFor('run9'),
+    })
+    expect(res).toEqual({ persisted: false, reason: 'pointer_newer' })
+    expect(prismaMock.scanJob.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('an older same-run pointer is replaced by a newer one', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row({
+      planManifestPath: pathFor('run9'),
+      planManifestSummary: { run_id: 'run9', group_id: 'g0', created_at: '2026-01-01T00:00:00Z' },
+    }))
+    const res = await persistPlanManifest({
+      projectId: 'p1', kind: 'full_recon', pointer: pointerFor('run9'),
+    })
+    expect(res.persisted).toBe(true)
+    expect(prismaMock.scanJob.updateMany).toHaveBeenCalledOnce()
+  })
+
+  // Real race, not a mocked count 0: both writers read the same row (same
+  // path, old digest), the newer manifest writes first, and the older writer's
+  // compare-and-set must miss on the digest and then decline to overwrite.
+  test('a concurrent same-path write cannot regress a newer digest', async () => {
+    const P = pathFor('run9')
+    const state = {
+      id: 'j1', runId: 'run9', status: 'running',
+      planManifestPath: P,
+      planManifestSha256: 'a'.repeat(64),
+      planManifestSummary: { run_id: 'run9', group_id: 'g1', created_at: '2026-01-01T00:00:00Z' },
+    }
+    prismaMock.scanJob.findFirst.mockImplementation(async () => ({ ...state }))
+    let releaseOlder: ((v: { count: number }) => void) | null = null
+    const olderGate = new Promise<{ count: number }>((resolve) => { releaseOlder = resolve })
+    prismaMock.scanJob.updateMany.mockImplementation(async (args: any) => {
+      const sha = args.data.planManifestSha256 as string
+      if (sha === 'b'.repeat(64)) return olderGate
+      if (args.where.planManifestPath !== state.planManifestPath) return { count: 0 }
+      if (args.where.planManifestSha256 !== state.planManifestSha256) return { count: 0 }
+      Object.assign(state, args.data)
+      return { count: 1 }
+    })
+    const older = {
+      ...pointerFor('run9', { created_at: '2026-01-02T00:00:00Z' }),
+      plan_manifest_sha256: 'b'.repeat(64),
+    }
+    const newer = {
+      ...pointerFor('run9', { created_at: '2026-01-03T00:00:00Z' }),
+      plan_manifest_sha256: 'c'.repeat(64),
+    }
+    const olderCall = persistPlanManifest({ projectId: 'p1', kind: 'full_recon', pointer: older })
+    const newerCall = persistPlanManifest({ projectId: 'p1', kind: 'full_recon', pointer: newer })
+    // Let the newer writer land while the older one is parked before its
+    // compare-and-set.
+    await vi.waitFor(() => expect(state.planManifestSha256).toBe('c'.repeat(64)))
+    releaseOlder!({ count: 0 })
+    const [olderRes, newerRes] = await Promise.all([olderCall, newerCall])
+    expect(newerRes.persisted).toBe(true)
+    expect(olderRes).toEqual({ persisted: false, reason: 'pointer_newer' })
+    expect(state.planManifestSha256).toBe('c'.repeat(64))
+    expect(state.planManifestSummary).toMatchObject({ created_at: '2026-01-03T00:00:00Z' })
+  })
+
+  test('the compare-and-set pins the path, digest and summary it read', async () => {
+    prismaMock.scanJob.findFirst.mockResolvedValue(row({
+      planManifestPath: pathFor('runOLD'),
+      planManifestSha256: 'd'.repeat(64),
+      planManifestSummary: { run_id: 'runOLD', created_at: '2026-01-01T00:00:00Z' },
+    }))
     await persistPlanManifest({
-      projectId: 'p1', kind: 'partial_recon', runId: 'r1',
-      pointer: { plan_manifest_path: '/p.json', plan_manifest_sha256: 'c'.repeat(64), plan_manifest_summary: {} },
+      projectId: 'p1', kind: 'full_recon', pointer: pointerFor('run9'),
     })
-    expect(prismaMock.scanJob.update).toHaveBeenCalledWith({
-      where: { id: 'j2' },
-      data: expect.objectContaining({ planManifestPath: '/p.json' }),
+    const where = prismaMock.scanJob.updateMany.mock.calls[0][0].where
+    expect(where).toMatchObject({
+      id: 'j1', projectId: 'p1', kind: 'full_recon', runId: 'run9',
+      status: { in: ['running', 'queued'] },
+      planManifestPath: pathFor('runOLD'),
+      planManifestSha256: 'd'.repeat(64),
+      planManifestSummary: { equals: { run_id: 'runOLD', created_at: '2026-01-01T00:00:00Z' } },
     })
+    // No OR-null escape hatch once the row carries a pointer: a concurrent
+    // clear or re-point must make the CAS miss, not match.
+    expect(where.OR).toBeUndefined()
   })
 
   test('a DB failure never propagates to the caller', async () => {
     prismaMock.scanJob.findFirst.mockRejectedValue(new Error('db down'))
     await expect(
-      persistPlanManifest({ projectId: 'p1', kind: 'full_recon',
-        pointer: { plan_manifest_path: '/p.json', plan_manifest_sha256: 'd'.repeat(64), plan_manifest_summary: {} } }),
-    ).resolves.toBeUndefined()
+      persistPlanManifest({ projectId: 'p1', kind: 'full_recon', pointer: pointerFor('run9') }),
+    ).resolves.toEqual({ persisted: false, reason: 'db_error' })
   })
 })

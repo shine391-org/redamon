@@ -253,7 +253,8 @@ class TestSecurityCheckCoverage:
         assert nuclei and all(set(keep) == {IP, NAME} for keep in nuclei)
         redis = [kw for sources, _, kw in prunes
                  if sources == ["security_check"] and kw.get("types") == ("redis_no_auth",)]
-        assert redis == [{"only_hosts": (IP,), "types": ("redis_no_auth",)}]
+        assert redis == [{"only_hosts": (IP,), "types": ("redis_no_auth",),
+                          "keep_unproven": False}]
 
 
 class TestSwitchedOffByConfiguration:

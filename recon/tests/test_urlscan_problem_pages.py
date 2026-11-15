@@ -237,7 +237,7 @@ class TestWiring:
         httpx = self.SRC.index("combined_result = run_http_probe(combined_result", start)
         httpx_except = self.SRC.index("_note_phase_error(\"http_probe\")", httpx)
         verdict = self.SRC.index("run_takeover_verdict(combined_result, _settings)", start)
-        phase_a = self.SRC.index("_run_phase_a_fan_out(phase_a_tools", start)
+        phase_a = self.SRC.index("_run_phase_a_fan_out(", start)
         assert httpx_except < verdict < phase_a
         assert self.SRC.count('"update_graph_from_urlscan_takeover"') == 1
 

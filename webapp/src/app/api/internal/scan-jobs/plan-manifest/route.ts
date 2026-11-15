@@ -45,16 +45,43 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Bad request' }, { status: 400 })
   }
 
-  await persistPlanManifest({
+  // The tenant is resolved from the project, never from the body: the pointer
+  // path must name this project's owner, so a scanner key cannot attribute a
+  // manifest to a project it does not belong to.
+  let project: { userId: string } | null
+  try {
+    project = await prisma.project.findUnique({
+      where: { id: body.projectId },
+      select: { userId: true },
+    })
+  } catch (err) {
+    console.error('[plan-manifest] could not resolve the project (continuing):', err)
+    return NextResponse.json({ ok: false, reason: 'db_error' }, { status: 500 })
+  }
+  if (!project) {
+    return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+  }
+
+  const result = await persistPlanManifest({
     projectId: body.projectId,
     kind: typeof body.kind === 'string' ? body.kind : 'full_recon',
     runId: typeof body.runId === 'string' ? body.runId : undefined,
+    tenant: project.userId,
     pointer: {
       plan_manifest_path: p.plan_manifest_path,
       plan_manifest_sha256: p.plan_manifest_sha256,
       plan_manifest_summary: p.plan_manifest_summary ?? {},
     },
   })
+  if (!result.persisted) {
+    // Best-effort for the scan (it never retries), but an explicit answer: a
+    // pointer that names another run/project/tenant, or a row that is not the
+    // open run, is rejected rather than silently dropped.
+    return NextResponse.json(
+      { ok: false, reason: result.reason },
+      { status: result.reason === 'db_error' ? 500 : 409 },
+    )
+  }
 
   return NextResponse.json({ ok: true })
 }

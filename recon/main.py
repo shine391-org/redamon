@@ -1914,7 +1914,7 @@ def _fan_out_snapshot(combined_result: dict) -> dict:
 
 
 def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
-                         output_file, group_id: str = "") -> None:
+                         output_file, group_id: str = "") -> set:
     """GROUP 6 Phase A: run the active scanners on their own deep copies.
 
     Each answer is merged as soon as it lands, before its graph update is
@@ -1928,9 +1928,13 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
     the answer merges and saves, the chunk is marked completed only when its
     output AND its queued graph update are durable. A failed chunk is deferred
     (uncertain, safe-policy retry), never silently replayed.
+
+    Returns the tool keys this call accounted for: dispatched (it ran, or it
+    failed) or already complete on resume. A tool left out was enabled and
+    re-checked nothing, so the caller records it as a coverage cut.
     """
     if not tools:
-        return
+        return set()
     import uuid
     group_id = group_id or _checkpoint_group
     _checkpoint_prepare_phase_a(tools, combined_result, settings, output_file, group_id)
@@ -1955,6 +1959,7 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
     for entry in _checkpoint_report_uncertain():
         print(f"    [checkpoint] uncertain chunk {entry.origin}:{entry.chunk_index} "
               f"(status={entry.status}) -> reported for safe-policy retry")
+    accounted: set[str] = set()
     with ThreadPoolExecutor(max_workers=1 if sequential else len(tools)) as pool:
         # One shared copy of combined_result handed to every worker: a wrapper
         # deep-copies its input before its module runs, so the main thread can
@@ -1967,6 +1972,9 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
             chunk_index = 0
             budget_origin = group_id or key
             if _checkpoint_journal is not None and _checkpoint_journal.is_done(origin, chunk_index):
+                # Completed earlier in this run: its findings are already merged
+                # and saved, so it is not a coverage gap.
+                accounted.add(key)
                 continue
             if not _checkpoint_budget_admit(budget_origin, key):
                 print(f"    [checkpoint] {key}: budget exhausted, deferred "
@@ -1980,6 +1988,7 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                 continue
             _checkpoint_budget_record(budget_origin, key, admitted=True)
             futures[pool.submit(fn, snapshot, settings)] = key
+            accounted.add(key)
         for fut in as_completed(futures):
             key = futures[fut]
             origin = _checkpoint_chunk_origin(group_id, key)
@@ -2002,6 +2011,21 @@ def _run_phase_a_fan_out(tools: dict, combined_result: dict, settings: dict,
                 save_recon_file(combined_result, output_file)
                 _checkpoint_chunk_defer(key, origin=origin, chunk_index=0,
                                         reason=str(e))
+    return accounted
+
+
+def _note_phase_a_undispatched(phase_a_tools: dict, accounted: set) -> None:
+    """Record Phase A tools that were enabled but never ran this group.
+
+    The fan-out accounts for every tool it dispatched (or found already
+    complete on resume). One left over was enabled and re-checked nothing - a
+    budget deferral, a chunk lease another worker holds, or a caller that never
+    dispatched the group - so its findings are kept, the same rule a crashed
+    phase follows, and the prune cannot read "not reported" as "gone".
+    """
+    for key in phase_a_tools:
+        if key not in accounted:
+            _note_phase_error(key, reason="enabled but not dispatched this run")
 
 
 # ---------------------------------------------------------------------------
@@ -2556,6 +2580,7 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
     combined_result = _maybe_run_supply_chain(combined_result, settings, output_file)
 
     ip_phase_a: dict = {}
+    ip_phase_a_accounted: set = set()
     if not skip_active_scans:
         if "vuln_scan" in SCAN_MODULES:
             print(f"\n[*][Pipeline] GROUP 6: Vulnerability Scanning (Nuclei, then MITRE)")
@@ -2606,14 +2631,19 @@ def run_ip_recon(target_ips: list, settings: dict) -> dict:
         if settings.get('ROUTE_EXPOSURE_ENABLED', False):
             from recon.route_exposure import run_route_exposure_isolated
             ip_phase_a['route_exposure'] = run_route_exposure_isolated
+
+        ip_phase_a_accounted = _run_phase_a_fan_out(
+            ip_phase_a, combined_result, settings, output_file, group_id="ip")
     elif settings.get('SUBDOMAIN_TAKEOVER_ENABLED', False):
         # Takeover reads the names and their CNAMEs, not live URLs: a host set
         # with no web server is still checked (R-22).
         from recon.main_recon_modules.subdomain_takeover import run_subdomain_takeover_isolated
         ip_phase_a['subdomain_takeover'] = run_subdomain_takeover_isolated
 
-        _run_phase_a_fan_out(ip_phase_a, combined_result, settings, output_file,
-                             group_id="ip")
+        ip_phase_a_accounted = _run_phase_a_fan_out(
+            ip_phase_a, combined_result, settings, output_file, group_id="ip")
+    # Enabled but undispatched tools keep their findings (domain mode's rule).
+    _note_phase_a_undispatched(ip_phase_a, ip_phase_a_accounted)
 
     # External Domains -- aggregate from all sources and persist
     try:
@@ -3362,6 +3392,7 @@ def run_domain_recon(target: str, bruteforce: bool = False,
     combined_result = _maybe_run_supply_chain(combined_result, _settings, output_file)
 
     phase_a_tools: dict = {}
+    phase_a_accounted: set = set()
     if not skip_active_scans:
         # ================================================================
         # GROUP 6 Phase A — Parallel active vuln scanners
@@ -3397,19 +3428,29 @@ def run_domain_recon(target: str, bruteforce: bool = False,
         if _settings.get('ROUTE_EXPOSURE_ENABLED', False):
             from recon.route_exposure import run_route_exposure_isolated
             phase_a_tools['route_exposure'] = run_route_exposure_isolated
-    elif _settings.get('SUBDOMAIN_TAKEOVER_ENABLED', False):
-        # Takeover reads the names and their CNAMEs, not live URLs: a group of
-        # dangling names, the case it exists for, is still checked (R-22).
-        from recon.main_recon_modules.subdomain_takeover import run_subdomain_takeover_isolated
-        phase_a_tools['subdomain_takeover'] = run_subdomain_takeover_isolated
 
         # Planner job context flows into the actual vuln_scan boundary via the
         # phase-A fan-out settings; the detailed run-scoped manifest is written
         # there, never by an outer pre-target writer.
         staged = _inject_planner_job_context(_settings)
         staged["PLANNER_GROUP_ID"] = f"domain:{root_domain}"
-        _run_phase_a_fan_out(phase_a_tools, combined_result, staged, output_file,
-                             group_id=str(root_domain or ""))
+        phase_a_accounted = _run_phase_a_fan_out(
+            phase_a_tools, combined_result, staged, output_file,
+            group_id=str(root_domain or ""))
+    elif _settings.get('SUBDOMAIN_TAKEOVER_ENABLED', False):
+        # Takeover reads the names and their CNAMEs, not live URLs: a group of
+        # dangling names, the case it exists for, is still checked (R-22).
+        from recon.main_recon_modules.subdomain_takeover import run_subdomain_takeover_isolated
+        phase_a_tools['subdomain_takeover'] = run_subdomain_takeover_isolated
+
+        staged = _inject_planner_job_context(_settings)
+        staged["PLANNER_GROUP_ID"] = f"domain:{root_domain}"
+        phase_a_accounted = _run_phase_a_fan_out(
+            phase_a_tools, combined_result, staged, output_file,
+            group_id=str(root_domain or ""))
+    # A tool that was enabled but never dispatched re-checked nothing; record
+    # it so the prune keeps its findings (see _note_phase_a_undispatched).
+    _note_phase_a_undispatched(phase_a_tools, phase_a_accounted)
 
     if not skip_active_scans:
         # ================================================================

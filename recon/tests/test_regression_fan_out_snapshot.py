@@ -107,7 +107,7 @@ class TestPhaseAMergesWhileAWorkerCopies:
             snapshot["origin_discovery"] = {"candidates": []}
             return snapshot
 
-        def slow_nuclei(snapshot, output_file=None, settings=None):
+        def slow_nuclei(snapshot, output_file=None, settings=None, plan_output_file=None):
             snapshot["vuln_scan"] = dict(VULN)
             return snapshot
 
@@ -161,7 +161,7 @@ class _Recorder:
     def __init__(self, calls, key, answer):
         self.calls, self.key, self.answer = calls, key, answer
 
-    def __call__(self, combined, settings=None):
+    def __call__(self, combined, settings=None, output_file=None):
         self.calls.append((self.key, combined, copy.deepcopy(combined)))
         return copy.deepcopy(self.answer)
 

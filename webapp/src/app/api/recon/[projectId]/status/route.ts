@@ -36,13 +36,14 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     const data = await response.json()
 
-    // Scan Timeline: mirror a terminal orchestrator status onto the open ScanJob
-    // history row. The orchestrator remains the source of truth for liveness;
-    // this is best-effort bookkeeping and never affects the response.
-    await reconcileScanJobStatus(projectId, data?.status)
-
     // G2-R3: persist the plan-manifest pointer(s) the orchestrator read from
-    // the run's manifest index, so the plan is traceable on the ScanJob row.
+    // the project's manifest index, so the plan is traceable on the ScanJob
+    // row. This runs BEFORE the terminal reconcile: the pointer belongs on the
+    // open run row, and a terminal poll that closed the row first would drop a
+    // valid pointer. The index aggregates every run's pointers, so each one is
+    // attributed by its own summary run id; the tenant is the project owner
+    // the permission check already resolved. A pointer for another run is
+    // ignored, never written onto this run's row.
     try {
       const pointers = Array.isArray(data?.plan_manifest_pointers)
         ? data.plan_manifest_pointers
@@ -53,6 +54,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
           await persistPlanManifest({
             projectId,
             kind: 'full_recon',
+            tenant: auth.access?.project.userId,
             pointer: p,
           })
         }
@@ -60,6 +62,11 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     } catch (err) {
       console.error('[recon status] plan-manifest persist (continuing):', err)
     }
+
+    // Scan Timeline: mirror a terminal orchestrator status onto the open ScanJob
+    // history row. The orchestrator remains the source of truth for liveness;
+    // this is best-effort bookkeeping and never affects the response.
+    await reconcileScanJobStatus(projectId, data?.status)
 
     return NextResponse.json(data)
 

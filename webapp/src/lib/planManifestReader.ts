@@ -40,7 +40,14 @@ export async function readPlanManifest(
     return { status: 'unknown', reason: 'invalid_manifest_summary' }
   }
   const summary = (rawSummary ?? {}) as Record<string, unknown>
-  const runId = typeof summary.run_id === 'string' ? summary.run_id : (job.runId ?? '')
+  const summaryRunId = typeof summary.run_id === 'string' ? summary.run_id : ''
+  const jobRunId = typeof job.runId === 'string' ? job.runId : ''
+  // A pointer left by another run is stale attribution, not this run's plan.
+  // The reader must not present it as the current run's evidence.
+  if (summaryRunId && jobRunId && summaryRunId !== jobRunId) {
+    return { status: 'unknown', reason: 'manifest_run_mismatch' }
+  }
+  const runId = summaryRunId || jobRunId
   const groupId = typeof summary.group_id === 'string' ? summary.group_id : ''
   const query = new URLSearchParams({
     path,

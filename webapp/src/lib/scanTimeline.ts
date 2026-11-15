@@ -256,14 +256,6 @@ export interface CreateScanJobInput {
   targets?: string[]
   /** digestScopeDocument of the RoE text in force when the run started. */
   roeTextSha256?: string | null
-  /**
-   * G2-R3: pointer to the run-scoped plan manifest written before the
-   * vuln_scan tool launched. Only the pointer, its sha256 digest and a bounded
-   * summary -- never the full manifest and never credentials.
-   */
-  planManifestPath?: string | null
-  planManifestSha256?: string | null
-  planManifestSummary?: Prisma.InputJsonObject | null
 }
 
 export async function createScanJob(input: CreateScanJobInput): Promise<{ id: string }> {
@@ -284,9 +276,12 @@ export async function createScanJob(input: CreateScanJobInput): Promise<{ id: st
       authorizationId: input.authorizationId ?? null,
       targets: input.targets ?? [],
       roeTextSha256: input.roeTextSha256 ?? null,
-      planManifestPath: input.planManifestPath ?? null,
-      planManifestSha256: input.planManifestSha256 ?? null,
-      planManifestSummary: input.planManifestSummary ?? undefined,
+      // Deliberately NOT copied from the input: a new ScanJob row must never
+      // inherit a plan manifest from an earlier run. The pointer is written
+      // only by persistPlanManifest, for the run that actually produced it.
+      planManifestPath: null,
+      planManifestSha256: null,
+      planManifestSummary: undefined,
       startedAt: status === 'running' ? new Date() : null,
     },
     select: { id: true },
@@ -294,52 +289,221 @@ export async function createScanJob(input: CreateScanJobInput): Promise<{ id: st
 }
 
 /**
+ * G2-R3: the manifest tree's directory and file name, exactly as the recon
+ * helper writes them:
+ * `planner_manifests/<tenant>/<project>/<run>/<group>/plan_manifest.json`.
+ * The path is the only place the tenant and project appear, so it is what a
+ * pointer is validated against before it is persisted.
+ */
+const MANIFEST_DIR_SEGMENT = 'planner_manifests'
+const MANIFEST_FILE_NAME = 'plan_manifest.json'
+
+/**
+ * Encode one manifest path component exactly the way recon's `_encode_component`
+ * writes it: every safe character `[A-Za-z0-9_.-]` verbatim, every other code
+ * point as `%` + its uppercase hex (at least two digits). Encoding the input
+ * context and comparing it to the path segment is unambiguous; decoding the
+ * segment is not, because a group such as `domain:abc` is written
+ * `domain%3Aabc` and a greedy decoder would read `%3Aab` as one code point.
+ */
+function encodeManifestComponent(value: string): string {
+  let out = ''
+  for (const ch of value) {
+    if (/[A-Za-z0-9_.-]/.test(ch)) {
+      out += ch
+    } else {
+      out += '%' + ch.codePointAt(0)!.toString(16).toUpperCase().padStart(2, '0')
+    }
+  }
+  return out
+}
+
+/** Epoch milliseconds for a manifest timestamp, or null when absent/invalid. */
+function parseManifestTime(value: string): number | null {
+  if (!value) return null
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
+}
+
+/** The tenant/project/run/group a pointer path claims. */
+function manifestPointerContext(path: string): {
+  tenant: string
+  projectId: string
+  runId: string
+  groupId: string
+} | null {
+  const segments = path.split('/')
+  const base = segments.lastIndexOf(MANIFEST_DIR_SEGMENT)
+  if (base < 0) return null
+  // Exactly one run-scoped manifest file below the directory: a trailing
+  // segment (or a missing one) is not a manifest this writer produced.
+  const rest = segments.slice(base + 1)
+  if (rest.length !== 5) return null
+  const [tenant, projectId, runId, groupId, file] = rest
+  if (file !== MANIFEST_FILE_NAME) return null
+  if (!tenant || !projectId || !runId || !groupId) return null
+  if ([tenant, projectId, runId, groupId].some(
+    (part) => part === '.' || part === '..' || part.includes('\\'),
+  )) return null
+  return { tenant, projectId, runId, groupId }
+}
+
+/**
+ * A pointer may only be persisted on a row whose project/run/tenant it names.
+ * The run must equal the manifest summary's own run id; the project and tenant
+ * are read from the path, because the summary carries neither.
+ */
+function pointerMatchesJobContext(input: {
+  path: string
+  projectId: string
+  runId: string
+  groupId: string
+  tenant?: string
+}): boolean {
+  const ctx = manifestPointerContext(input.path)
+  if (!ctx) return false
+  if (ctx.projectId !== encodeManifestComponent(input.projectId)) return false
+  if (ctx.runId !== encodeManifestComponent(input.runId)) return false
+  if (ctx.groupId !== encodeManifestComponent(input.groupId)) return false
+  if (input.tenant !== undefined && ctx.tenant !== encodeManifestComponent(input.tenant)) {
+    return false
+  }
+  return true
+}
+
+export interface PlanManifestPersistResult {
+  persisted: boolean
+  /**
+   * Why nothing was written, when `persisted` is false. Callers that mirror a
+   * status poll ignore it; the internal POST reports it so a mismatched
+   * pointer is a visible rejection rather than a silent no-op.
+   */
+  reason?: 'no_run_id' | 'run_mismatch' | 'context_mismatch' | 'no_open_job' | 'pointer_newer' | 'db_error'
+}
+
+/**
  * G2-R3: persist a run-scoped plan-manifest pointer on the open ScanJob row.
  *
- * The orchestrator reports the pointers it read from the run's manifest index
- * on every status poll; this writes the first one (or the one matching the
- * run) onto the history row so the plan is traceable after the run ends. The
- * full manifest is never stored here -- only pointer + digest + bounded
- * summary. Best-effort: a failure is logged and swallowed, because history
- * bookkeeping must never break a status poll.
+ * The orchestrator reports every pointer it read from the project's manifest
+ * index on each status poll -- across runs and groups -- and the recon
+ * container posts its own pointer before the vuln_scan tool launches. A
+ * pointer is attributed by its own summary run id: it is written only onto the
+ * open row of that run, and only when its path names the same project, run and
+ * tenant. A pointer left by a different run is stale and is replaced; a newer
+ * same-run pointer is never regressed by a late poll. The full manifest is
+ * never stored here -- only pointer + digest + bounded summary. Best-effort: a
+ * failure is logged and swallowed, because history bookkeeping must never break
+ * a status poll.
  */
 export async function persistPlanManifest(input: {
   projectId: string
   kind: string
   runId?: string
+  /** The project owner (tenant) the manifest path must be scoped to. */
+  tenant?: string
   pointer: {
     plan_manifest_path: string
     plan_manifest_sha256: string
     plan_manifest_summary: Prisma.InputJsonObject
   }
-}): Promise<void> {
+}): Promise<PlanManifestPersistResult> {
   try {
-    const summary = input.pointer.plan_manifest_summary ?? {}
+    const summary = (input.pointer.plan_manifest_summary ?? {}) as Record<string, unknown>
     const pointerRunId = typeof summary.run_id === 'string' ? summary.run_id : ''
-    const open = await prisma.scanJob.findFirst({
-      where: {
+    const pointerGroupId = typeof summary.group_id === 'string' ? summary.group_id : ''
+    // The manifest's own run id is the only honest attribution key. Without it
+    // there is no telling which open run row this pointer belongs to, so it is
+    // dropped rather than guessed -- a guessed pointer is a fake current plan.
+    if (!pointerRunId) return { persisted: false, reason: 'no_run_id' }
+    // A caller-supplied run must agree with the manifest's own run id.
+    if (input.runId && input.runId !== pointerRunId) {
+      return { persisted: false, reason: 'run_mismatch' }
+    }
+    if (!pointerMatchesJobContext({
+      path: input.pointer.plan_manifest_path,
+      projectId: input.projectId,
+      runId: pointerRunId,
+      groupId: pointerGroupId,
+      tenant: input.tenant,
+    })) {
+      return { persisted: false, reason: 'context_mismatch' }
+    }
+
+    const data = {
+      planManifestPath: input.pointer.plan_manifest_path,
+      planManifestSha256: input.pointer.plan_manifest_sha256,
+      planManifestSummary: input.pointer.plan_manifest_summary ?? {},
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const open = await prisma.scanJob.findFirst({
+        where: {
+          projectId: input.projectId,
+          kind: input.kind,
+          status: { in: ['running', 'queued'] },
+          runId: pointerRunId,
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          planManifestPath: true,
+          planManifestSha256: true,
+          planManifestSummary: true,
+        },
+      })
+      if (!open) return { persisted: false, reason: 'no_open_job' }
+
+      const existing = (open.planManifestSummary ?? null) as Record<string, unknown> | null
+      const existingRunId = typeof existing?.run_id === 'string' ? existing.run_id : ''
+      const existingMs = parseManifestTime(
+        typeof existing?.created_at === 'string' ? existing.created_at : '',
+      )
+      const incomingMs = parseManifestTime(
+        typeof summary.created_at === 'string' ? summary.created_at : '',
+      )
+      // A pointer left by another run is stale: this row is the current run's,
+      // so the correct pointer replaces it. A pointer from the same run is
+      // replaced only by one that is not older, so a late status poll cannot
+      // regress the row to an earlier manifest. Recency is compared as parsed
+      // epoch milliseconds -- `Z` and `+00:00` are the same instant, and a
+      // lexical compare would misorder them. A known existing timestamp is
+      // never treated as older than an incoming pointer with no timestamp.
+      const stale = !open.planManifestPath || !existingRunId || existingRunId !== pointerRunId
+      const notOlder = existingMs === null || (incomingMs !== null && incomingMs >= existingMs)
+      if (!stale && !notOlder) return { persisted: false, reason: 'pointer_newer' }
+
+      // Compare-and-set: the row must still be the open run row carrying the
+      // exact pointer just read. The path alone is not enough -- a group's
+      // path is stable while its digest and summary change, so two polls that
+      // both read an older manifest would otherwise let the later writer
+      // overwrite the newer one. Pin the digest (and the summary when present)
+      // as well; a concurrent change makes count 0, and the loop re-reads and
+      // decides on the new state instead of overwriting. When the row has no
+      // pointer yet, pin null; the OR-null form is deliberately not used once a
+      // pointer exists, because it would match a concurrent clear.
+      const where: Prisma.ScanJobWhereInput = {
+        id: open.id,
         projectId: input.projectId,
         kind: input.kind,
+        runId: pointerRunId,
         status: { in: ['running', 'queued'] },
-        // The manifest's own run id is authoritative when the row has none
-        // (full_recon rows carry runId=''). A row-keyed kind must match it.
-        ...(input.runId ? { runId: input.runId } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true, planManifestPath: true },
-    })
-    if (!open || open.planManifestPath) return
-    await prisma.scanJob.update({
-      where: { id: open.id },
-      data: {
-        planManifestPath: input.pointer.plan_manifest_path,
-        planManifestSha256: input.pointer.plan_manifest_sha256,
-        planManifestSummary: summary,
-      },
-    })
-    void pointerRunId
+        planManifestPath: open.planManifestPath,
+      }
+      if (open.planManifestPath !== null) {
+        where.planManifestSha256 = open.planManifestSha256
+        if (open.planManifestSummary !== null) {
+          where.planManifestSummary = {
+            equals: open.planManifestSummary as Prisma.InputJsonValue,
+          }
+        }
+      }
+      const updated = await prisma.scanJob.updateMany({ where, data })
+      if (updated.count > 0) return { persisted: true }
+    }
+    return { persisted: false, reason: 'no_open_job' }
   } catch (err) {
     console.error('[scanTimeline] could not persist plan manifest (continuing):', err)
+    return { persisted: false, reason: 'db_error' }
   }
 }
 
