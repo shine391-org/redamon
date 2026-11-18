@@ -136,6 +136,36 @@ def test_missing_origin_and_oversize_are_compatibility(tmp_path):
     assert files['targets_legacy.txt'] == targets
 
 
+def test_routing_enforce_with_planner_off_uses_compatibility_targets(tmp_path):
+    """Routing enforce with no planner route must not abort the module.
+
+    ``planner_routing`` is None whenever the planner is off, so the routed
+    branch falls back to ``_classify_and_route_templates``. That fallback must
+    receive only its declared arguments; a TypeError here aborts the whole
+    vuln_scan module before Nuclei and the security checks run.
+    """
+    opts = settings(PLANNER_MODE='off', NUCLEI_ROUTING_MODE='enforce', NUCLEI_TAGS=['mystery'])
+    files, calls, _, _ = execute(tmp_path, opts)
+    assert files['targets_unknown.txt'] == ['https://example.com', 'https://example.com/app?q=a%26b']
+    assert 'targets_legacy.txt' not in files
+
+
+def test_routing_enforce_with_oversize_plan_uses_compatibility_targets(tmp_path):
+    """An oversize plan is a compatibility route; routing enforce must still run.
+
+    The planner deliberately falls back to legacy when its plan is bounded, but
+    routing enforce is an independent consumer. The fallback must dispatch the
+    admitted URLs instead of raising before either scanner or the security
+    checks start.
+    """
+    opts = settings(PLANNER_MODE='enforce', PLANNER_CONSUMER_TARGET_SELECTION=True,
+                    NUCLEI_ROUTING_MODE='enforce', NUCLEI_TAGS=['mystery'])
+    targets = [f'https://example.com/p{i}' for i in range(70)]
+    files, calls, _, _ = execute(tmp_path, opts, targets=targets)
+    assert calls[0]['manifest']['oversize'] is True
+    assert files['targets_unknown.txt'] == targets
+
+
 def test_partial_caller_supplies_canonical_context_and_calls_same_boundary(monkeypatch):
     from recon.partial_recon_modules import vulnerability_scanning as partial
     monkeypatch.setenv('USER_ID', 'tenant-test')

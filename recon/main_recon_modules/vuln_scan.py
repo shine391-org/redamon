@@ -1550,22 +1550,6 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     resource_enum_data=recon_data.get("resource_enum"),
                     http_probe_data=recon_data.get("http_probe"),
                     admitted_targets=target_urls,
-                    rate_limit=NUCLEI_RATE_LIMIT,
-                    bulk_size=NUCLEI_BULK_SIZE,
-                    concurrency=NUCLEI_CONCURRENCY,
-                    timeout=NUCLEI_TIMEOUT,
-                    retries=NUCLEI_RETRIES,
-                    dast_mode=False,
-                    new_templates_only=NUCLEI_NEW_TEMPLATES_ONLY,
-                    headless=NUCLEI_HEADLESS,
-                    system_resolvers=NUCLEI_SYSTEM_RESOLVERS,
-                    follow_redirects=NUCLEI_FOLLOW_REDIRECTS,
-                    max_redirects=NUCLEI_MAX_REDIRECTS,
-                    interactsh=NUCLEI_INTERACTSH,
-                    auth_headers=_nuclei_auth,
-                    max_host_error=NUCLEI_MAX_HOST_ERROR,
-                    ip_mode=nuclei_ip_mode,
-                    roe_exclusions=nuclei_roe_exclusions,
                 )
                 
                 # Log routing summary
