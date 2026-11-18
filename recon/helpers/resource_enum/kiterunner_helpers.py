@@ -238,6 +238,44 @@ def _note_not_run_under_ceiling(target_urls: List[str], ceiling: float) -> None:
         pass
 
 
+def _kiterunner_endpoint_url(target: str, path: str) -> Optional[str]:
+    """The endpoint URL on ``target``, or None when ``path`` is not a route.
+
+    Kiterunner reports a scan target and a route. The wordlist can carry a route
+    without its leading slash (routes-large has ``returnjet.com`` and
+    ``api.calorieninjas.com/v1/nutrition``), so the separator is added here
+    rather than concatenated blindly. An absolute URL or a network-path
+    reference is not a route on the target: accepting it would mint a BaseURL
+    for another host and then send that host to the scanners. The final host is
+    checked as well, so no path can change the authority.
+    """
+    if not isinstance(target, str) or not isinstance(path, str):
+        return None
+    target = target.strip()
+    path = path.strip()
+    if not target or not path:
+        return None
+    try:
+        target_parts = urlparse(target)
+        path_parts = urlparse(path)
+    except ValueError:
+        return None
+    if target_parts.scheme not in ("http", "https") or not target_parts.hostname:
+        return None
+    if path.startswith("//") or path_parts.scheme:
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+    try:
+        url = target.rstrip("/") + path
+        parts = urlparse(url)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or parts.hostname != target_parts.hostname:
+        return None
+    return url
+
+
 def run_kiterunner_discovery(
     target_urls: List[str],
     binary_path: str,
@@ -458,15 +496,10 @@ def run_kiterunner_discovery(
                             status = first_response.get('sc', 0)  # 'sc' = status code
                             content_length = first_response.get('len', 0)  # 'len' = content length
 
-                        # Build full URL from target + path
-                        if target and path:
-                            url = target.rstrip('/') + path
-                        elif target:
-                            url = target
-                        else:
-                            url = ''
-
-                        if path and target:
+                        # Build the route URL on the target. A wordlist entry
+                        # without a slash is still a route, never a new host.
+                        url = _kiterunner_endpoint_url(target, path)
+                        if url:
                             endpoint = {
                                 'method': method,
                                 'status': status,
@@ -554,7 +587,8 @@ def merge_kiterunner_into_by_base_url(
         "kr_overlap": 0,
         "kr_methods": {},
         "kr_methods_detected": 0,
-        "kr_with_multiple_methods": 0
+        "kr_with_multiple_methods": 0,
+        "kr_rejected_unknown_host": 0
     }
 
     for result in kr_results:
@@ -585,6 +619,20 @@ def merge_kiterunner_into_by_base_url(
             parsed = urlparse(url)
             base = f"{parsed.scheme}://{parsed.netloc}"
         except Exception:
+            continue
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            continue
+
+        # Defense in depth: Kiterunner may only add endpoints to a base host the
+        # run already admitted. A malformed result must never create a new
+        # BaseURL for a foreign host and carry it into the scanner target list.
+        known_hosts = {
+            (urlparse(existing).hostname or "").lower()
+            for existing in by_base_url
+            if isinstance(existing, str)
+        }
+        if known_hosts and (parsed.hostname or "").lower() not in known_hosts:
+            stats["kr_rejected_unknown_host"] += 1
             continue
 
         # Initialize base URL if not exists
