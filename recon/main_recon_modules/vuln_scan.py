@@ -74,6 +74,7 @@ from recon.helpers import (
     # Target extraction
     extract_targets_from_recon,
     build_target_urls,
+    filter_nuclei_detection_targets,
     # Nuclei helpers
     build_nuclei_command,
     NucleiEmptySelectionError,
@@ -1090,6 +1091,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         # and which it refused, instead of leaving the gap silent.
         _target_admission = {}
         _declared_report = {}
+        _target_filter = {}
         target_urls = build_target_urls(
             hostnames, ips, recon_data, scan_all_ips=NUCLEI_SCAN_ALL_IPS,
             admission_report=_target_admission, declared_report=_declared_report)
@@ -1097,10 +1099,15 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
         # whatever host those tools reached, a redirect or a link included, not
         # only the gated DNS targets; Nuclei resolves each host itself.
         target_urls, _ = admit_urls(settings, recon_data, target_urls, module="nuclei")
+        # Crawler inventory is not an application-target list: static assets and
+        # measured CDN edge addresses only spend requests and memory. Drop them
+        # before the planner/routing see the list so coverage and execution
+        # account for the same targets.
+        target_urls, _target_filter = filter_nuclei_detection_targets(target_urls, recon_data)
         target_urls_after_admission = list(target_urls)
         if not target_urls:
-            print("[-][Nuclei] No target URL is left after the Rules of Engagement and the "
-                  "target list - skipping Nuclei")
+            print("[-][Nuclei] No target URL is left after the Rules of Engagement, the "
+                  "target list and the detection-target filter - skipping Nuclei")
             run_nuclei = False
 
     if run_nuclei:
@@ -1745,6 +1752,7 @@ def run_vuln_scan(recon_data: dict, output_file: Path = None, settings: dict = N
                     "http_admission": recon_data.get("metadata", {}).get("http_admission", {}),
                     # F08: the detection consumer's own input accounting.
                     "target_admission": _target_admission,
+                    "target_filter": _target_filter,
                     "declared_only": _declared_report,
                     "dast_urls_discovered": len(dast_urls) if NUCLEI_DAST_MODE else 0,
                     # F03: the DAST pass is a separate consumer of the operator's

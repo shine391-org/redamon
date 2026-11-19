@@ -35,6 +35,7 @@ from .target_helpers import (
     build_target_urls_from_httpx,
     build_target_urls_from_resource_enum,
     build_target_urls,
+    filter_nuclei_detection_targets,
 )
 
 # Nuclei-specific helpers
@@ -121,6 +122,7 @@ __all__ = [
     "build_target_urls_from_httpx",
     "build_target_urls_from_resource_enum",
     "build_target_urls",
+    "filter_nuclei_detection_targets",
     # Nuclei
     "build_nuclei_command",
     "NucleiEmptySelectionError",

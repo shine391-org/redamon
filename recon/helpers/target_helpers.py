@@ -259,6 +259,139 @@ def _observed_http_verdict(entry: dict):
     return "edge_error_page_cloudflare_1003"
 
 
+# =============================================================================
+# Nuclei detection-target noise filter
+# =============================================================================
+
+#: Path suffixes that are assets, not application routes. A vulnerability
+#: template run against a CSS/JS/image/font URL only spends requests; the DAST
+#: pass still reaches parameterized endpoints. ``.json``/``.xml``/``.html`` are
+#: deliberately absent: they can be API or application responses.
+_STATIC_ASSET_SUFFIXES = (
+    ".css", ".js", ".mjs", ".cjs", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif", ".bmp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp4", ".webm", ".ogg", ".mp3", ".wav", ".mov", ".avi",
+)
+
+#: CDN responses that mean "this origin/port is not serving the application":
+#: Cloudflare's 52x family is an origin connection failure or timeout page.
+_CDN_ORIGIN_ERROR_STATUSES = frozenset({521, 522, 523, 524, 525, 526, 527, 530})
+
+
+def _url_origin(url: str) -> Optional[str]:
+    """scheme://netloc for a URL, or None when it has no usable authority."""
+    try:
+        parts = urlparse(url)
+    except (ValueError, TypeError):
+        return None
+    if not parts.scheme or not parts.netloc:
+        return None
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _static_asset_path(url: str) -> bool:
+    try:
+        hostname = urlparse(url).hostname
+    except (ValueError, TypeError):
+        return False
+    # An origin probe ("https://app.test/") is not an asset even when the
+    # hostname itself ends in a suffix-like token.
+    if not hostname:
+        return False
+    try:
+        path = urlparse(url).path.lower()
+    except (ValueError, TypeError):
+        return False
+    if path in ("", "/"):
+        return False
+    return path.endswith(_STATIC_ASSET_SUFFIXES)
+
+
+def _cdn_edge_error_reason(entry: dict) -> Optional[str]:
+    """Why a measured CDN response proves the origin is not the application.
+
+    Narrow on purpose: only an origin-failure 52x status, or a tiny untitled
+    403 from a CDN-attributed response, is treated as an edge denial. A real
+    application 401/403 (a titled page, a larger body) stays a target.
+    """
+    if not isinstance(entry, dict):
+        return None
+    is_cdn = entry.get("is_cdn") is True or bool(str(entry.get("cdn") or "").strip())
+    if not is_cdn:
+        return None
+    status = entry.get("status_code")
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    if status in _CDN_ORIGIN_ERROR_STATUSES:
+        return "cdn_origin_error"
+    if status == 403 and not entry.get("title"):
+        length = entry.get("content_length")
+        if isinstance(length, int) and not isinstance(length, bool) and length <= 64:
+            return "cdn_edge_denied"
+    return None
+
+
+def filter_nuclei_detection_targets(
+        target_urls: List[str], recon_data: Optional[dict] = None
+) -> Tuple[List[str], dict]:
+    """Drop targets that cannot be application-vulnerability targets.
+
+    The DETECTION pass runs request templates against every admitted URL, so it
+    inherits crawler inventory (static assets) and CDN edge addresses. Both are
+    noise: a CSS file is not an application route, and a CDN 403/52x proves the
+    address is not serving this application. The DAST pass keeps its own
+    parameterized target list and is not filtered here.
+
+    Evidence comes only from the exact URL's ``http_probe`` entry (or its
+    origin's entry when the URL is a root). An unmeasured address is always
+    kept: this filter never extrapolates from another host or from a CDN range.
+
+    Returns ``(kept, report)``; ``report`` carries counts and reasons, never
+    the dropped URLs themselves.
+    """
+    urls = []
+    for url in target_urls or []:
+        if isinstance(url, str) and url and url not in urls:
+            urls.append(url)
+
+    by_url = {}
+    if isinstance(recon_data, dict):
+        http_probe = recon_data.get("http_probe")
+        if isinstance(http_probe, dict) and isinstance(http_probe.get("by_url"), dict):
+            by_url = http_probe["by_url"]
+
+    dropped = {"static_asset": 0, "cdn_edge_error": 0}
+    kept = []
+    for url in urls:
+        if _static_asset_path(url):
+            dropped["static_asset"] += 1
+            continue
+        entry = by_url.get(url) if by_url else None
+        if not isinstance(entry, dict):
+            origin = _url_origin(url)
+            if origin:
+                entry = by_url.get(origin) or by_url.get(origin + "/")
+        if _cdn_edge_error_reason(entry) is not None:
+            dropped["cdn_edge_error"] += 1
+            continue
+        kept.append(url)
+
+    report = {
+        "input": len(urls),
+        "kept": len(kept),
+        "dropped": {k: v for k, v in dropped.items() if v},
+        "dropped_total": len(urls) - len(kept),
+        "policy": "static assets and measured CDN edge-error origins are not detection targets",
+    }
+    if report["dropped_total"]:
+        reasons = ", ".join(f"{k}={v}" for k, v in report["dropped"].items())
+        print(f"[*][Nuclei] Target filter: {report['input']} -> {report['kept']} ({reasons})")
+    if urls and not kept:
+        print("[!][Nuclei] Target filter removed every admitted target; nothing to scan")
+    return kept, report
+
+
 def build_target_urls_from_httpx(httpx_data: Optional[dict], report=None) -> List[str]:
     """
     Build list of target URLs from httpx scan results.
