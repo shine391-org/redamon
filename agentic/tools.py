@@ -2219,14 +2219,12 @@ TOOL_DEADLINES_S: Dict[str, float] = {
         # MSF_RUN_TIMEOUT, plus up to 10 min queued behind the single console lock.
         "metasploit_console": 2400,
         # In-process tools: bounded by their own HTTP/LLM timeouts, which can
-        # chain (query_graph retries Cypher generation; a tradecraft read may fall
-        # back to the browser after its plain fetch).
+        # chain (query_graph retries Cypher generation; tradecraft may run an
+        # LLM section picker before its fetch).
         "query_graph": 540,
         "graph_schema": 60,
         "graph_summary": 120,
         "tradecraft_lookup": 240,
-        "tradecraft_search": 60,
-        "tradecraft_ask": 150,
         "web_search": 120,
         "shodan": 60,
         "google_dork": 60,
@@ -2302,6 +2300,7 @@ class PhaseAwareToolExecutor:
         web_search_tool: Optional[callable] = None,
         shodan_tool: Optional[callable] = None,
         google_dork_tool: Optional[callable] = None,
+        tradecraft_tool: Optional[callable] = None,
         graph_schema_tool: Optional[callable] = None,
         graph_summary_tool: Optional[callable] = None,
     ):
@@ -2325,6 +2324,24 @@ class PhaseAwareToolExecutor:
             if graph_summary_tool:
                 self._all_tools["graph_summary"] = graph_summary_tool
 
+      # graph_diff: read-only Scan Timeline delta tool (Type D, WI-1). The
+        # factory imports langchain/psycopg lazily and live-side capture only
+        # needs manager.graph.query when it exists, so registration is
+        # unconditional — saved-version diffs work even without a graph session.
+        from graph_diff_tool import build_graph_diff_tool
+        self._all_tools["graph_diff"] = build_graph_diff_tool(self)
+
+        # bloodhound_ingest: BloodHound collector import (Type D, WI-2). Lazy
+        # imports only; the tool opens its own Neo4j connection at call time,
+        # so registration is unconditional.
+        from bloodhound_ingest_tool import build_bloodhound_ingest_tool
+        self._all_tools["bloodhound_ingest"] = build_bloodhound_ingest_tool()
+
+        # mimikatz_parse: transcript -> Credential nodes (Type D, WI-3). Lazy
+        # imports only; opens its own Neo4j connection at call time.
+        from mimikatz_parse_tool import build_mimikatz_parse_tool
+        self._all_tools["mimikatz_parse"] = build_mimikatz_parse_tool()
+
         # Register web search tool
         if web_search_tool:
             self._all_tools["web_search"] = web_search_tool
@@ -2337,11 +2354,9 @@ class PhaseAwareToolExecutor:
         if google_dork_tool:
             self._all_tools["google_dork"] = google_dork_tool
 
-        # The Tradecraft tools stay registered; runtime.py answers them only in a run whose
-        # catalog is bound, and the phase list offers them only then. The stand-ins import
-        # the real tools when called, so building the executor imports no langchain.
-        from tradecraft.tool_proxies import registered_tools as _tradecraft_v2_tools
-        self._all_tools.update(_tradecraft_v2_tools())
+        # Register Tradecraft Lookup tool (conditional on enabled resources)
+        if tradecraft_tool:
+            self._all_tools["tradecraft_lookup"] = tradecraft_tool
 
         # The captured-traffic corpus is reached ONLY through proxy_brain now
         # (the kali code tool + its /traffic/exec + /traffic/replay broker). The
@@ -2421,6 +2436,18 @@ class PhaseAwareToolExecutor:
         else:
             self._all_tools.pop("shodan", None)
 
+    def update_tradecraft_tool(self, tool: Optional[callable]) -> None:
+        """Replace or remove the Tradecraft Lookup tool.
+
+        Called from `_apply_project_settings()` whenever the user's
+        tradecraft resource catalog changes. None -> tool unregistered
+        (zero enabled resources).
+        """
+        if tool:
+            self._all_tools["tradecraft_lookup"] = tool
+        else:
+            self._all_tools.pop("tradecraft_lookup", None)
+
     def set_wpscan_api_token(self, token: str) -> None:
         """Store WPScan API token for auto-injection into execute_wpscan args."""
         self._wpscan_api_token = token
@@ -2451,7 +2478,6 @@ class PhaseAwareToolExecutor:
         from ContextVars, never from LLM args. Returns "" if we can't/shouldn't tag.
         """
         try:
-            from agent_context import current_log_session_id
             from redamon_ctx import sign_tag
             key = os.environ.get("INTERNAL_API_KEY", "")
             if not key:
@@ -2460,9 +2486,7 @@ class PhaseAwareToolExecutor:
                 "source": "agent",
                 "project_id": current_project_id.get(),
                 "user_id": current_user_id.get(),
-                # A node-level set_tenant_context can blank the session id mid-run; the
-                # per-turn log session id is the same chat.
-                "session_id": current_session_id.get() or current_log_session_id.get() or None,
+                "session_id": current_session_id.get() or None,
                 "tool": tool_name,
                 "phase": current_phase.get(),
             }
@@ -2778,9 +2802,9 @@ class PhaseAwareToolExecutor:
                 # Agent-native (not MCP): single "args" string, dispatched to the
                 # orchestrator analyzer via the webapp internal lane.
                 output = await active_tool.ainvoke(tool_args.get("args", ""))
-            elif tool_name in ("tradecraft_lookup", "tradecraft_search", "tradecraft_ask"):
-                # Pass the structured args through: the tool picks them up by name (page,
-                # section, part, resource_id, query, cve_id, ...).
+            elif tool_name == "tradecraft_lookup":
+                # Pass the structured args through. The tool function picks them up
+                # by name (resource_id, query, cve_id, section_path, force_refresh).
                 output = await active_tool.ainvoke(tool_args)
             elif tool_name == "execute_wpscan":
                 # Inject WPScan API token if configured and not already in args.
@@ -2818,6 +2842,19 @@ class PhaseAwareToolExecutor:
                 else:
                     adjusted = tool_args
                 output = await active_tool.ainvoke(adjusted)
+            elif tool_name == "graph_diff":
+                # Type D in-process tool; flat dict args pass through as-is.
+                output = await active_tool.ainvoke(tool_args)
+            elif tool_name == "bloodhound_ingest":
+                # Type D in-process tool; flat dict args pass through as-is
+                # (the acknowledged=true refusal lives inside the tool).
+                output = await active_tool.ainvoke(tool_args)
+            elif tool_name == "mimikatz_parse":
+                # Type D in-process tool; flat dict args pass through as-is
+                # (the acknowledged=true refusal lives inside the tool).
+                # Type D in-process tool; flat dict args pass through as-is
+                # (the acknowledged=true refusal lives inside the tool).
+                output = await active_tool.ainvoke(tool_args)
             else:
                 output = await active_tool.ainvoke(tool_args)
             # Extract clean text from MCP response (list of content blocks, etc.)

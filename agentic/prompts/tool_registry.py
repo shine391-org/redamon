@@ -13,14 +13,15 @@ from typing import Optional
 # load, so a subsequent load can remove them cleanly before applying the new set.
 _mcp_injected_keys: set = set()
 
-# Per-session tradecraft entries ({tool name: entry}): the `tradecraft_*` registry entries
-# render the run's own resource catalog into the system prompt, so they must NOT be stored on
-# the shared global dict (concurrent projects raced, leaking one project's catalog into
-# another's prompt). They are bound to the current asyncio task via this ContextVar; prompt
-# builders read the merged view (visible_registry). Default None == no tradecraft entry, and
-# visible_registry() then returns the global dict unchanged.
-_tradecraft_v2_overlay: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
-    "tradecraft_v2_overlay", default=None
+# Per-session tradecraft catalog. The `tradecraft_lookup` registry entry is the
+# per-PROJECT resource catalog rendered into the system prompt, so it must NOT be
+# stored on the shared global dict (concurrent projects raced, leaking one
+# project's catalog into another's prompt). It is bound to the current asyncio
+# task via this ContextVar; prompt builders read the merged view (visible_registry).
+# Default None == no tradecraft entry, and visible_registry() then returns the
+# global dict unchanged (byte-identical to the pre-overlay behaviour).
+_tradecraft_overlay: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "tradecraft_overlay", default=None
 )
 
 # Serialises mutations (apply / remove) so concurrent fireteam reads never
@@ -1006,45 +1007,125 @@ TOOL_REGISTRY = {
             '   - Use only when you need a completely clean state'
         ),
     },
+  "graph_diff": {
+        "purpose": "Diff the project graph between two Scan Timeline points",
+        "when_to_use": "After a scan: what is new, gone or changed since the last saved version",
+        "args_format": '"mode": "last_two" | "versions", "from_version": "current|<id|seq>", "to_version": "current|<id|seq>"',
+        "description": (
+            '**graph_diff** (graph orientation)\n'
+            '   - Compare the attack-surface graph between two points of the Scan '
+            'Timeline: the live graph vs the most recent saved version (mode '
+            '"last_two"), or two explicit versions by id/seq/"current" (mode '
+            '"versions").\n'
+            '   - Read-only. Nodes are matched by identity (an IP is its address), '
+            'never by internal ids; volatile scan stamps are ignored so a re-scan '
+            'is not reported as a wall of changes.\n'
+            '   - Returns JSON: nodes added/removed/changed grouped by label with '
+            'counts and examples, plus relationship add/remove by type and a '
+            'one-line summary for a quick read.\n'
+            '   - Use it to see what the latest scan actually brought before '
+            'planning the next move'
+        ),
+    },
+   "bloodhound_ingest": {
+        "purpose": "Import BloodHound collector JSON into the graph as AD nodes",
+        "when_to_use": "Post-exploitation AD mapping once a domain credential produced collector files",
+        "args_format": '"path": "<workspace path to *_users/groups/computers.json or their dir>", "acknowledged": true',
+        "description": (
+            '**bloodhound_ingest** (AD mapping — DANGEROUS, approval per run)\n'
+            '   - Imports BloodHound 4 collector files (bloodhound-python / SharpHound) '
+            'from the workspace into the project graph as ADUser / ADGroup / ADComputer '
+            'nodes with MEMBER_OF, HAS_MEMBER and HAS_SESSION relationships, keyed by '
+            'the collector SIDs — re-running the same import is idempotent.\n'
+            '   - PRECONDITION: a valid domain credential already in the graph (check '
+            'with query_graph first). Collecting is NOT part of this tool: it only '
+            'imports files already in the workspace (e.g. produced via kali_shell '
+            'bloodhound-python).\n'
+            '   - Dangerous: per-run approval, and the call must pass '
+            '"acknowledged": true — without it the tool refuses and the graph is '
+            'left untouched.\n'
+            '   - Returns a counts summary only (nodes/relationships by type, skipped '
+            'records); query_graph for the imported AD data afterwards'
+        ),
+    },
+    "mimikatz_parse": {
+        "purpose": "Parse a mimikatz transcript into Credential graph nodes",
+        "when_to_use": "Post-exploitation after dumping credentials over a session (transcript saved to workspace)",
+        "args_format": '"path": "<workspace .txt transcript>", "origin_host": "<hostname the dump came from>", "acknowledged": true',
+        "description": (
+            '**mimikatz_parse** (credential harvest — DANGEROUS, approval per run)\n'
+            '   - Parses a mimikatz transcript saved in the workspace (run mimikatz '
+            'via the existing session tools — metasploit_console/kiwi — and save '
+            'the output with fs_write first) into tenant-scoped Credential nodes '
+            '(NTLM / LM / SHA1 hashes, plaintext) with an ORIGIN edge to the '
+            'source host when the graph knows it. Re-parsing the same transcript '
+            'is idempotent.\n'
+            '   - Supported formats: sekurlsa::logonpasswords, lsadump::sam, '
+            'lsadump::dcsync. Garbage lines are skipped, never fatal.\n'
+            '   - Dangerous: per-run approval, and the call must pass '
+            '"acknowledged": true — without it the tool refuses and the graph is '
+            'left untouched.\n'
+            '   - The response carries COUNTS ONLY (e.g. NTLM: 12, plaintext: 2) — '
+            'secret values live in the graph/workspace, never in tool output'
+        ),
+    },
 }
 
 # =========================================================================
-# Tradecraft (dynamic registry entries)
+# Tradecraft Lookup (dynamic registry entry)
 # =========================================================================
 #
-# The tradecraft entries are rebuilt for each run from its catalog
-# (`tradecraft.overlay.build_entries`, bound by `tradecraft.runtime.bind_run_catalog`).
-# A run with no catalog has none, so the agent never sees an entry that promises
-# capabilities the tools cannot deliver.
+# The tradecraft_lookup tool's description is rebuilt at runtime from the
+# user's enabled tradecraft resources (see TradecraftLookupManager.build_registry_entry).
+# `swap_tradecraft_entry()` is called from the orchestrator's
+# `_apply_project_settings()` after resources are loaded.
+#
+# When zero resources: the entry is removed via `pop_tradecraft_entry()` so the
+# agent does not see a registry entry that promises capabilities the tool
+# cannot deliver.
 
-def swap_tradecraft_v2_entries(entries): _tradecraft_v2_overlay.set(dict(entries) if entries else None)
+def swap_tradecraft_entry(rich_entry: dict) -> None:
+    """Bind this session's per-resource tradecraft catalog to the current task.
+
+    `rich_entry` must contain keys: purpose, when_to_use, args_format, description.
+    Empty dict -> no tradecraft entry for this session.
+
+    Per-session (ContextVar) rather than a global mutation, so concurrent
+    projects never leak each other's resource catalog into the prompt.
+    """
+    _tradecraft_overlay.set(rich_entry or None)
+
+
+def pop_tradecraft_entry() -> None:
+    _tradecraft_overlay.set(None)
 
 
 def visible_registry() -> dict:
     """The tool registry as the CURRENT session sees it: the shared/global
     registry (built-ins + startup web_search swap + MCP-injected entries) with
-    this task's tradecraft entries merged in.
+    this task's `tradecraft_lookup` catalog merged in.
 
-    Returns the global dict object unchanged when no tradecraft entry is set,
-    so the default path is byte-identical to the pre-overlay behaviour. When
-    entries are set, they are inserted just before the first MCP-injected entry
-    (or appended when there are none) to preserve the historical tool order
-    [built-ins, tradecraft, mcp] and thus prompt-prefix stability.
+    Returns the global dict object unchanged when no tradecraft overlay is set,
+    so the default path is byte-identical to the pre-overlay behaviour. When an
+    overlay is set, `tradecraft_lookup` is inserted just before the first
+    MCP-injected entry (or appended when there are none) to preserve the
+    historical tool order [built-ins, tradecraft, mcp] and thus prompt-prefix
+    stability.
     """
-    entries = _tradecraft_v2_overlay.get()
-    if not entries:
+    tc = _tradecraft_overlay.get()
+    if not tc:
         return TOOL_REGISTRY
     merged: dict = {}
     inserted = False
     for name, info in TOOL_REGISTRY.items():
-        if name in entries or name == "tradecraft_lookup":
+        if name == "tradecraft_lookup":
             continue  # overlay is authoritative; never duplicate a stale global one
         if not inserted and name in _mcp_injected_keys:
-            merged.update(entries)
+            merged["tradecraft_lookup"] = tc
             inserted = True
         merged[name] = info
     if not inserted:
-        merged.update(entries)
+        merged["tradecraft_lookup"] = tc
     return merged
 
 

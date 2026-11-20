@@ -36,15 +36,6 @@ INTERNAL_HEADERS = {"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")}
 # traffic, and so have no stealth rule, RoE category or confirmation gate.
 GRAPH_COMPANION_TOOLS = frozenset({"graph_schema", "graph_summary"})
 
-# Tradecraft 2.0's search and the librarian follow tradecraft_lookup's phases, for the reasons
-# above, and only in a run whose catalog is 2.0; the librarian also only while its owner's
-# Librarian use is Agent decides (TRADECRAFT_ASK). That row defaults to every phase (owner
-# decision 2026-11-17): the three read only the run owner's library and its resources' own
-# sites, never the target, so none of them is dangerous in any phase. Projects that still held
-# the old default (exploitation and post-exploitation) are moved once by
-# webapp/scripts/backfill-tradecraft-phases.mjs; a row a person changed is kept.
-TRADECRAFT_COMPANION_TOOLS = frozenset({"tradecraft_search", "tradecraft_ask"})
-
 # =============================================================================
 # DANGEROUS TOOLS — require manual confirmation before execution
 # =============================================================================
@@ -61,6 +52,14 @@ DANGEROUS_TOOLS = frozenset({
     # Supply-chain L3: execute_guarddog downloads attacker-authored tarballs
     # (registry egress). execute_osv_scanner is passive/offline -> NOT dangerous.
     'execute_guarddog',
+  # Post-exploitation credential/AD import (WI-2): consumes foothold-derived
+    # collector output and imports directory data — approval per run, and the
+    # tool itself also requires acknowledged=true (defense in depth, WI-0 V2).
+    'bloodhound_ingest',
+    # Post-exploitation credential harvest (WI-3): parses foothold-derived
+    # mimikatz dumps into Credential nodes — approval per run, and the tool
+    # itself also requires acknowledged=true (defense in depth, WI-0 V2).
+    'mimikatz_parse',
 })
 
 
@@ -174,6 +173,18 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     'PAYLOAD_USE_HTTPS': False,
     'NGROK_TUNNEL_ENABLED': False,
     'CHISEL_TUNNEL_ENABLED': False,
+
+    # Tradecraft Lookup tool
+    # (Output truncation is delegated to the global TOOL_OUTPUT_MAX_CHARS so
+    # tradecraft results follow the same cap as every other tool.)
+    'TRADECRAFT_TOOL_ENABLED': True,
+    'TRADECRAFT_FETCH_TIMEOUT': 30,
+    'TRADECRAFT_DEFAULT_TTL_SEC': 86400,
+    'TRADECRAFT_TIER2_THRESHOLD_BYTES': 800,
+    'TRADECRAFT_CRAWL_MAX_PAGES': 30,
+    'TRADECRAFT_CRAWL_MAX_LLM_CALLS': 20,
+    'TRADECRAFT_CRAWL_TIME_BUDGET_SEC': 180,
+    'TRADECRAFT_CRAWL_MAX_DEPTH': 3,
 
     # Agent Limits
     'MAX_ITERATIONS': 100,
@@ -328,7 +339,16 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
         'execute_guarddog': ['informational', 'exploitation'],
         'shodan': ['informational', 'exploitation', 'post_exploitation'],
         'google_dork': ['informational'],
-        'tradecraft_lookup': ['informational', 'exploitation', 'post_exploitation'],
+        'tradecraft_lookup': ['exploitation', 'post_exploitation'],
+      # Read-only Scan Timeline delta (Type D, WI-1). Informational only:
+        # comparing graph versions sends no traffic and performs no writes.
+        'graph_diff': ['informational'],
+        # BloodHound collector import (Type D, WI-2). Post-exploitation only:
+        # it presumes a foothold with domain credentials. Dangerous + approval.
+        'bloodhound_ingest': ['post_exploitation'],
+        # mimikatz transcript parse (Type D, WI-3). Post-exploitation only:
+        # consumes foothold-derived dumps. Dangerous + approval + acknowledged.
+        'mimikatz_parse': ['post_exploitation'],
     },
 
     # User-managed MCP servers (UI-driven, see /settings/mcp). Stored as raw
@@ -419,7 +439,7 @@ DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     # Attack Skill Configuration
     'ATTACK_SKILL_CONFIG': {
         'builtIn': {
-            'cve_exploit': False,
+            'cve_exploit': True,
             'brute_force_credential_guess': False,
             'phishing_social_engineering': False,
             'denial_of_service': False,
@@ -820,30 +840,18 @@ def fetch_agent_settings(project_id: str, webapp_url: str, *,
             logger.warning(f"Failed to fetch user settings: {e}")
             settings['USER_SETTINGS'] = {}
 
-        # The run's tradecraft catalog (TD-9): the resources the run may read, never their maps,
-        # which the library reads from Postgres. An unknown project (the route's own
-        # `project_not_found`) and a catalog that cannot be read bind none: the run goes on
-        # without the tradecraft tools.
+        # Fetch user tradecraft resources (for the tradecraft_lookup tool catalog)
         try:
-            from tradecraft.runtime import catalog_query
             tc_resp = requests.get(
-                f"{webapp_url.rstrip('/')}/api/internal/agent/tradecraft/catalog",
-                params=catalog_query(project_id),
+                f"{webapp_url.rstrip('/')}/api/users/{user_id}/tradecraft-resources?internal=true",
                 headers=INTERNAL_HEADERS,
                 timeout=10,
             )
             tc_resp.raise_for_status()
-            catalog = tc_resp.json()
-            if not (isinstance(catalog, dict) and catalog.get('v2') is True):
-                catalog = None
-            settings['TRADECRAFT_CATALOG'] = catalog
-            settings['TRADECRAFT_V2'] = catalog is not None
-            settings['TRADECRAFT_ASK'] = catalog is not None and (catalog.get('search') or {}).get('librarian.use', 'agent') == 'agent'
+            settings['TRADECRAFT_RESOURCES'] = tc_resp.json()
         except Exception as e:
-            logger.warning(f"Failed to fetch the tradecraft catalog: {type(e).__name__}")
-            settings['TRADECRAFT_CATALOG'] = None
-            settings['TRADECRAFT_V2'] = False
-            settings['TRADECRAFT_ASK'] = False
+            logger.warning(f"Failed to fetch tradecraft resources: {e}")
+            settings['TRADECRAFT_RESOURCES'] = []
 
         # If selected model is custom/, extract its specific config
         model_id = settings.get('OPENAI_MODEL', '')
@@ -1382,9 +1390,6 @@ def is_tool_allowed_in_phase(tool_name: str, phase: str) -> bool:
     # {"query_graph": []} turns all three off.
     if tool_name in GRAPH_COMPANION_TOOLS:
         return is_tool_allowed_in_phase("query_graph", phase)
-    if tool_name in TRADECRAFT_COMPANION_TOOLS:
-        if tool_name == "tradecraft_ask" and not get_setting('TRADECRAFT_ASK', False): return False
-        return bool(get_setting('TRADECRAFT_V2', False)) and is_tool_allowed_in_phase("tradecraft_lookup", phase)
 
     tool_phase_map = get_setting('TOOL_PHASE_MAP', {})
     if tool_name in tool_phase_map:
@@ -1430,11 +1435,6 @@ def get_allowed_tools_for_phase(phase: str) -> list:
         allowed.update(GRAPH_COMPANION_TOOLS)
     else:
         allowed.difference_update(GRAPH_COMPANION_TOOLS)
-    if get_setting('TRADECRAFT_V2', False) and is_tool_allowed_in_phase("tradecraft_lookup", phase):
-        allowed.update(TRADECRAFT_COMPANION_TOOLS)
-    else:
-        allowed.difference_update(TRADECRAFT_COMPANION_TOOLS)
-    if not get_setting('TRADECRAFT_ASK', False): allowed.discard("tradecraft_ask")
 
     # Always include foundational workspace + job tools (mirror of the
     # fs_/job_ bypass in is_tool_allowed_in_phase). Import lazily to keep
