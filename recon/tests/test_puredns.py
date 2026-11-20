@@ -23,6 +23,24 @@ sys.path.insert(0, str(RECON_ROOT))
 TEST_TMP = Path("/tmp/test_puredns")
 
 
+def test_refresh_shared_resolvers_uses_content_not_mtime(tmp_path):
+    from recon.main_recon_modules.domain_recon import _refresh_shared_resolvers
+
+    source = tmp_path / "source.txt"
+    shared = tmp_path / "shared.txt"
+    source.write_text("192.0.2.1\n")
+    shared.write_text("192.0.2.2\n")
+    os.utime(source, (100, 100))
+    os.utime(shared, (200, 200))
+
+    _refresh_shared_resolvers(source, shared)
+    assert shared.read_bytes() == source.read_bytes()
+
+    with mock.patch("recon.main_recon_modules.domain_recon._atomic_install") as install:
+        _refresh_shared_resolvers(source, shared)
+        install.assert_not_called()
+
+
 def setup_test_env():
     """Create test temp dirs and resolver file."""
     TEST_TMP.mkdir(parents=True, exist_ok=True)

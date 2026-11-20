@@ -22,6 +22,8 @@ import os
 import shutil
 import subprocess  # noqa: F401 - the tool tests fake docker through uncover_enrich.subprocess
 import tempfile
+import time
+import uuid
 from typing import Any, Dict, Optional, Set
 from urllib.parse import urlparse
 
@@ -196,6 +198,27 @@ def _build_queries(domain: str, settings: dict, whois_org: str = '') -> list[str
     return queries
 
 
+def _cleanup_uncover_container(container_name: str) -> bool:
+    """Bounded, idempotent cleanup of this invocation's exact named child."""
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 or "no such container" in (result.stderr or "").lower():
+                return True  # --rm can have removed a normally finished child
+        except FileNotFoundError:
+            break  # docker itself is unavailable; do not retry the missing CLI
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if attempt < 2:
+            time.sleep(0.1)
+    # Never echo daemon/provider stderr, which may contain private configuration.
+    print(f"[!][Uncover] Cleanup not confirmed for {container_name}; inspect the child")
+    return False
+
+
 def _note_timed_out(queries: int) -> None:
     """A gap for a search cut short: what the engines had not answered is
     unknown. Uncover's results are assets, so there is no prune effect."""
@@ -223,9 +246,10 @@ def _run_uncover_docker(
     Returns list of parsed JSON result dicts.
     """
     output_file = os.path.join(temp_dir, "uncover_output.jsonl")
+    container_name = f"redamon-uncover-{uuid.uuid4().hex}"
 
     cmd = [
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "--name", container_name,
         "-v", f"{temp_dir}:/config:ro",
         "-v", f"{temp_dir}:/output",
         docker_image,
@@ -246,7 +270,11 @@ def _run_uncover_docker(
     from recon.helpers.docker_helpers import run_tool_container
     result = None
     try:
-        result = run_tool_container(cmd, tool="uncover", timeout=UNCOVER_TIMEOUT)
+        # The helper and finally must own the same UUID. Otherwise the helper
+        # prepends a second --name and its timeout kill targets the wrong one.
+        result = run_tool_container(
+            cmd, tool="uncover", timeout=UNCOVER_TIMEOUT, name=container_name,
+        )
 
         if result.timed_out:
             print("[!][Uncover] Timed out: stopped it, keeping the results it wrote")
@@ -265,6 +293,10 @@ def _run_uncover_docker(
     except Exception as e:
         print(f"[!][Uncover] Error: {e}")
         return []
+    finally:
+        # The helper kills the child on timeout; also clean up on other
+        # exits, including interruption/SystemExit.
+        _cleanup_uncover_container(container_name)
 
     results = []
     if os.path.isfile(output_file):
